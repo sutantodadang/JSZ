@@ -9,6 +9,7 @@ const val_mod = @import("../value/value.zig");
 const Value = val_mod.Value;
 const Heap = @import("../gc/heap.zig").Heap;
 const CollectStats = @import("../gc/heap.zig").CollectStats;
+const promise_mod = @import("../runtime/builtins/promise.zig");
 
 pub const InterpMode = enum { tree, bc };
 
@@ -65,9 +66,10 @@ pub const IsolateImpl = struct {
     pub fn evalWithMode(self: *IsolateImpl, source: []const u8, mode: InterpMode) !EvalOutcome {
         _ = self.eval_arena.reset(.free_all);
         const arena = self.eval_arena.allocator();
+        const transformed_source = try rewriteTemplateLiterals(arena, source);
 
         const parser_mod = @import("../parser/parser.zig");
-        var p = parser_mod.Parser.init(source, arena);
+        var p = parser_mod.Parser.init(transformed_source, arena);
         const parse_result = p.parseScript();
         const stmts = switch (parse_result) {
             .ok => |s| s,
@@ -86,6 +88,7 @@ pub const IsolateImpl = struct {
                 try vm.registerHeapCallback(&self.heap);
                 defer vm.unregisterHeapCallback(&self.heap);
                 const r = try vm.runScript(stmts);
+                promise_mod.runMicrotasks(arena);
                 return switch (r) {
                     .value => |v| EvalOutcome{ .ok = v },
                     .exception => |ex| EvalOutcome{ .exception = ex.message },
@@ -127,6 +130,7 @@ pub const IsolateImpl = struct {
                 try bc_vm.registerHeapCallback(&self.heap);
                 defer bc_vm.unregisterHeapCallback(&self.heap);
                 const outcome = try bc_vm.run(main_func, @ptrCast(realm.global_env));
+                promise_mod.runMicrotasks(arena);
                 return switch (outcome) {
                     .ok => |v| EvalOutcome{ .ok = v },
                     .exception => |msg| EvalOutcome{ .exception = msg },
@@ -136,6 +140,83 @@ pub const IsolateImpl = struct {
         }
     }
 };
+
+fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < source.len) {
+        if (source[i] != '`') {
+            try out.append(arena, source[i]);
+            i += 1;
+            continue;
+        }
+        i += 1; // consume opening backtick
+        try out.appendSlice(arena, "(");
+        var emitted_any = false;
+        var literal_buf = std.ArrayList(u8){};
+        while (i < source.len) {
+            if (source[i] == '\\' and i + 1 < source.len) {
+                try literal_buf.append(arena, source[i]);
+                try literal_buf.append(arena, source[i + 1]);
+                i += 2;
+                continue;
+            }
+            if (source[i] == '$' and i + 1 < source.len and source[i + 1] == '{') {
+                try emitTemplateLiteralSegment(arena, &out, literal_buf.items, emitted_any);
+                emitted_any = true;
+                literal_buf.clearRetainingCapacity();
+                i += 2; // skip ${
+                var depth: usize = 1;
+                const expr_start = i;
+                var expr_end = expr_start;
+                while (i < source.len and depth > 0) {
+                    const ch = source[i];
+                    if (ch == '{') {
+                        depth += 1;
+                    } else if (ch == '}') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            expr_end = i;
+                            i += 1; // consume closing }
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                if (emitted_any) try out.appendSlice(arena, " + ");
+                try out.appendSlice(arena, "(");
+                if (expr_end >= expr_start and expr_end <= source.len) {
+                    try out.appendSlice(arena, source[expr_start..expr_end]);
+                }
+                try out.appendSlice(arena, ")");
+                emitted_any = true;
+                continue;
+            }
+            if (source[i] == '`') {
+                i += 1; // consume closing backtick
+                break;
+            }
+            try literal_buf.append(arena, source[i]);
+            i += 1;
+        }
+        try emitTemplateLiteralSegment(arena, &out, literal_buf.items, emitted_any);
+        try out.appendSlice(arena, ")");
+    }
+    return out.items;
+}
+
+fn emitTemplateLiteralSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8), segment: []const u8, emitted_any: bool) !void {
+    if (segment.len == 0 and emitted_any) return;
+    if (emitted_any) try out.appendSlice(arena, " + ");
+    try out.append(arena, '"');
+    for (segment) |ch| {
+        if (ch == '"' or ch == '\\') {
+            try out.append(arena, '\\');
+        }
+        try out.append(arena, ch);
+    }
+    try out.append(arena, '"');
+}
 
 /// Native function exposed as __gc__() in JS. Triggers a manual collect.
 fn nativeGcCollect(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {

@@ -38,8 +38,8 @@ pub fn traceEnvironment(env: *Environment, mark_fn: *const fn (*JsObject) void) 
     var cur: ?*Environment = env;
     while (cur) |e| {
         var it = e.bindings.valueIterator();
-        while (it.next()) |vptr| {
-            traceValue(vptr.*, mark_fn);
+        while (it.next()) |bptr| {
+            traceValue(bptr.value, mark_fn);
         }
         cur = e.parent;
     }

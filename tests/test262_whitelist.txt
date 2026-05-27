@@ -1,0 +1,19 @@
+# Test262 whitelist (Phase 5 starter set).
+# Paths are relative to external/test262/test.
+# Keep at least one test in each bucket: built-ins, language, statements, expressions.
+
+# built-ins
+built-ins/Array/prototype/push/S15.4.4.7_A1_T1.js
+built-ins/Array/prototype/pop/S15.4.4.6_A1_T1.js
+built-ins/Object/prototype/toString/S15.2.4.2_A1_T1.js
+
+# language/statements
+language/statements/if/S12.5_A1.js
+language/statements/while/S12.6.2_A1.js
+
+# language/expressions
+language/expressions/addition/S11.6.1_A4_T1.js
+language/expressions/logical-and/S11.11.1_A2.1_T1.js
+
+# language (fallback bucket)
+language/global-code/S10.4.1_A1_T1.js

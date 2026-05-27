@@ -32,10 +32,13 @@ git submodule update --init --recursive
 Then run:
 
 ```sh
-zig build conformance
+zig build conformance-summary
+zig build conformance-delta
 ```
 
-Phase 1 will whitelist a small initial set of tests. See `src/test/test262_runner.zig`.
+Whitelist lives in `tests/test262_whitelist.txt`.
+Expected failures live in `tests/test262_known_failing.txt`.
+`zig build conformance-delta` fails CI on unexpected pass/fail flips.
 
 ## Differential testing
 
@@ -60,7 +63,7 @@ See [docs/CONTRIBUTING/adding-a-builtin.md](docs/CONTRIBUTING/adding-a-builtin.m
 
 - Fill out the PR template (conformance delta, CHANGELOG entry).
 - All tests must pass: `zig build test`.
-- No test262 regressions (per-category bucket counts must not drop).
+- No conformance flip regressions: `zig build conformance-delta`.
 
 ## Pre-commit checklist
 

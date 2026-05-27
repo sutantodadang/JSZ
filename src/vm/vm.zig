@@ -60,6 +60,8 @@ pub const Vm = struct {
     is_strict: bool = false,
     /// Phase 4d: Context interface pointer for callbacks.
     context: @import("../runtime/realm.zig").Context = undefined,
+    /// Active generator capture context while materializing a generator.
+    generator_capture: ?*GeneratorCapture = null,
 
     pub fn init(arena: std.mem.Allocator) !Vm {
         const realm = try Realm.init(arena);
@@ -74,7 +76,7 @@ pub const Vm = struct {
         const gc_fn = try val_mod.makeNativeFunction(arena, nativeGcNoop);
         try realm.global_env.define("__gc__", gc_fn);
         const undef_this = try val_mod.makeUndefined(arena);
-        return Vm{ .arena = arena, .realm = realm, .current_this = undef_this };
+        return Vm{ .arena = arena, .realm = realm, .current_this = undef_this, .generator_capture = null };
     }
 
     /// Init with an attached GC heap. Object literals will be heap-allocated.
@@ -92,7 +94,7 @@ pub const Vm = struct {
         const gc_fn = try val_mod.makeNativeFunction(arena, nativeGcCollect);
         try realm.global_env.define("__gc__", gc_fn);
         const undef_this = try val_mod.makeUndefined(arena);
-        return Vm{ .arena = arena, .realm = realm, .heap = heap, .current_this = undef_this };
+        return Vm{ .arena = arena, .realm = realm, .heap = heap, .current_this = undef_this, .generator_capture = null };
     }
 
     /// Register this Vm as a GC root-scan source.
@@ -151,6 +153,7 @@ pub const Vm = struct {
     fn hoistOne(self: *Vm, node: *Node, env: *Environment) !void {
         switch (node.kind) {
             .var_decl => {
+                if (node.data.var_decl.kind != .var_) return;
                 const name = node.data.var_decl.name;
                 if (env.bindings.get(name) == null) {
                     const undef = try self.makeUndefined();
@@ -170,9 +173,15 @@ pub const Vm = struct {
                 fv.* = FuncVal{
                     .name = fd.name,
                     .params = fd.params,
+                    .param_defaults = @as([*]?*anyopaque, @ptrCast(fd.param_defaults.ptr))[0..fd.param_defaults.len],
+                    .rest_param = fd.rest_param,
                     .body_ptr = undefined, // will be set below via FuncWrapper
                     .closure_env = @ptrCast(env),
                     .is_strict = fd.is_strict,
+                    .prototype_obj = try JsObject.create(self.arena, self.realm.object_prototype),
+                    .is_arrow = false,
+                    .lexical_this = Value{},
+                    .is_generator = fd.is_generator,
                 };
                 // Wrap body slice so callFunction can recover it.
                 const fw = try self.arena.create(FuncWrapper);
@@ -211,6 +220,22 @@ pub const Vm = struct {
                 if (ts.finalizer) |f| try self.hoistOne(f, env);
             },
             else => {},
+        }
+    }
+
+    fn predeclareLexicalsInBlock(self: *Vm, stmts: []*Node, env: *Environment) !void {
+        const undef = try self.makeUndefined();
+        for (stmts) |stmt| {
+            if (stmt.kind == .var_decl) {
+                const vd = stmt.data.var_decl;
+                if (vd.kind != .var_) {
+                    try env.defineLexical(vd.name, switch (vd.kind) {
+                        .let => .let,
+                        .const_ => .const_,
+                        .var_ => .var_,
+                    }, false, undef);
+                }
+            }
         }
     }
 
@@ -292,6 +317,8 @@ pub const Vm = struct {
         const global_env = self.realm.global_env;
         // Hoist top-level var / function declarations.
         try self.hoistDeclarations(stmts, global_env);
+        // Predeclare top-level lexical declarations in TDZ.
+        try self.predeclareLexicalsInBlock(stmts, global_env);
         var last = try self.makeUndefined();
         for (stmts) |stmt| {
             const r = try self.evalStatement(stmt, global_env);
@@ -319,26 +346,47 @@ pub const Vm = struct {
             },
             .var_decl => {
                 const vd = node.data.var_decl;
-                if (vd.init) |init_node| {
-                    const v = self.evalExpression(init_node, env) catch |e| switch (e) {
+                const init_val: Value = if (vd.init) |init_node|
+                    self.evalExpression(init_node, env) catch |e| switch (e) {
                         error.JsException => return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } },
                         else => return error.OutOfMemory,
-                    };
-                    env.assign(vd.name, v) catch |ae| switch (ae) {
-                        error.NotDefined => {
-                            // var may have been hoisted; define if missing
-                            try env.define(vd.name, v);
-                        },
-                        else => return error.OutOfMemory,
-                    };
+                    }
+                else
+                    try self.makeUndefined();
+
+                switch (vd.kind) {
+                    .var_ => {
+                        if (vd.init != null) {
+                            env.assign(vd.name, init_val) catch |ae| switch (ae) {
+                                error.NotDefined => try env.define(vd.name, init_val),
+                                else => return error.OutOfMemory,
+                            };
+                        }
+                    },
+                    .let, .const_ => {
+                        env.initialize(vd.name, init_val) catch |ae| switch (ae) {
+                            error.NotDefined => {
+                                try env.defineLexical(vd.name, if (vd.kind == .const_) .const_ else .let, true, init_val);
+                            },
+                            error.ConstAssignment, error.TemporalDeadZone => {
+                                const msg = try std.fmt.allocPrint(self.arena, "{s} cannot be accessed before initialization", .{vd.name});
+                                self.last_exception_msg = try std.fmt.allocPrint(self.arena, "ReferenceError: {s}", .{msg});
+                                self.last_exception_value = self.makeReferenceErrorObject(msg) catch Value{};
+                                return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } };
+                            },
+                            else => return error.OutOfMemory,
+                        };
+                    },
                 }
                 return StmtResult{ .value = try self.makeUndefined() };
             },
             .block_stmt => {
-                // If this is multiple var_decls wrapped by the parser, treat them as decls
+                // Blocks create a lexical environment for let/const and TDZ.
+                const block_env = try Environment.init(self.arena, env);
+                try self.predeclareLexicalsInBlock(node.data.block_stmt.body, block_env);
                 var last = try self.makeUndefined();
                 for (node.data.block_stmt.body) |stmt| {
-                    const r = try self.evalStatement(stmt, env);
+                    const r = try self.evalStatement(stmt, block_env);
                     switch (r) {
                         .value => |v| last = v,
                         else => return r,
@@ -375,8 +423,14 @@ pub const Vm = struct {
                     const r = try self.evalStatement(ws.body, env);
                     switch (r) {
                         .value => {},
-                        .break_ => |lbl| { _ = lbl; break; },
-                        .continue_ => |lbl| { _ = lbl; continue; },
+                        .break_ => |lbl| {
+                            _ = lbl;
+                            break;
+                        },
+                        .continue_ => |lbl| {
+                            _ = lbl;
+                            continue;
+                        },
                         else => return r,
                     }
                 }
@@ -388,8 +442,13 @@ pub const Vm = struct {
                     const r = try self.evalStatement(dw.body, env);
                     switch (r) {
                         .value => {},
-                        .break_ => |lbl| { _ = lbl; break; },
-                        .continue_ => |lbl| { _ = lbl; },
+                        .break_ => |lbl| {
+                            _ = lbl;
+                            break;
+                        },
+                        .continue_ => |lbl| {
+                            _ = lbl;
+                        },
                         else => return r,
                     }
                     const cond = self.evalExpression(dw.test_, env) catch |e| switch (e) {
@@ -421,8 +480,13 @@ pub const Vm = struct {
                     const r = try self.evalStatement(fs.body, env);
                     switch (r) {
                         .value => {},
-                        .break_ => |lbl| { if (lbl != null) return r; break; },
-                        .continue_ => |lbl| { if (lbl != null) return r; },
+                        .break_ => |lbl| {
+                            if (lbl != null) return r;
+                            break;
+                        },
+                        .continue_ => |lbl| {
+                            if (lbl != null) return r;
+                        },
                         else => return r,
                     }
                     if (fs.update) |update_node| {
@@ -472,33 +536,132 @@ pub const Vm = struct {
                                 }
                             }
                         },
+                        .string => |s| {
+                            if (fi.iterate_values) {
+                                for (s, 0..) |_, i| {
+                                    const key = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch continue;
+                                    if (!seen.contains(key)) {
+                                        try seen.put(self.arena, key, {});
+                                        try keys.append(self.arena, key);
+                                    }
+                                }
+                            }
+                        },
                         else => {},
                     }
                 }
-                // Iterate keys.
-                for (keys.items) |key| {
-                    const key_val = try val_mod.makeString(self.arena, key);
-                    // Assign key to loop variable.
+                var iter_values = std.ArrayList(Value){};
+                var use_iter_values = false;
+                if (fi.iterate_values and obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                    use_iter_values = self.collectIteratorValues(&iter_values, obj_val) catch |e| switch (e) {
+                        error.JsException => return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } },
+                        else => return error.OutOfMemory,
+                    };
+                }
+                if (fi.iterate_values and !use_iter_values) {
+                    if (obj_val.bits == 0) {
+                        self.last_exception_msg = "TypeError: value is not iterable";
+                        self.last_exception_value = self.makeTypeErrorObject("value is not iterable") catch Value{};
+                        return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } };
+                    }
+                    switch (obj_val.toPtr().*) {
+                        .string => {},
+                        .object => |obj| {
+                            if (!obj.is_array) {
+                                self.last_exception_msg = "TypeError: value is not iterable";
+                                self.last_exception_value = self.makeTypeErrorObject("value is not iterable") catch Value{};
+                                return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } };
+                            }
+                        },
+                        else => {
+                            self.last_exception_msg = "TypeError: value is not iterable";
+                            self.last_exception_value = self.makeTypeErrorObject("value is not iterable") catch Value{};
+                            return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } };
+                        },
+                    }
+                }
+                const iter_len: usize = if (use_iter_values) iter_values.items.len else keys.items.len;
+                var iter_idx: usize = 0;
+                while (iter_idx < iter_len) : (iter_idx += 1) {
+                    const iter_val: Value = if (use_iter_values)
+                        iter_values.items[iter_idx]
+                    else blk: {
+                        const key = keys.items[iter_idx];
+                        if (fi.iterate_values and obj_val.bits != 0 and obj_val.toPtr().* == .string) {
+                            const idx = std.fmt.parseInt(usize, key, 10) catch 0;
+                            const s = obj_val.toPtr().string;
+                            if (idx < s.len) {
+                                const one = [_]u8{s[idx]};
+                                break :blk try self.makeString(one[0..]);
+                            }
+                            break :blk try self.makeUndefined();
+                        }
+                        if (fi.iterate_values and obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                            break :blk obj_val.toPtr().object.get(key) orelse try self.makeUndefined();
+                        }
+                        break :blk try val_mod.makeString(self.arena, key);
+                    };
+
+                    var iter_env_for_body: *Environment = env;
+                    // Assign loop variable.
                     switch (fi.left.kind) {
                         .var_decl => {
-                            const name = fi.left.data.var_decl.name;
-                            env.assign(name, key_val) catch {
-                                try env.define(name, key_val);
-                            };
+                            const vd = fi.left.data.var_decl;
+                            const name = vd.name;
+                            if (vd.kind == .var_) {
+                                env.assign(name, iter_val) catch |e| switch (e) {
+                                    error.NotDefined => try env.define(name, iter_val),
+                                    error.ConstAssignment => {
+                                        const msg = try std.fmt.allocPrint(self.arena, "Assignment to constant variable '{s}'", .{name});
+                                        self.last_exception_msg = try std.fmt.allocPrint(self.arena, "TypeError: {s}", .{msg});
+                                        self.last_exception_value = self.makeTypeErrorObject(msg) catch Value{};
+                                        return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } };
+                                    },
+                                    error.TemporalDeadZone => {
+                                        const msg = try std.fmt.allocPrint(self.arena, "Cannot access '{s}' before initialization", .{name});
+                                        self.last_exception_msg = try std.fmt.allocPrint(self.arena, "ReferenceError: {s}", .{msg});
+                                        self.last_exception_value = self.makeReferenceErrorObject(msg) catch Value{};
+                                        return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } };
+                                    },
+                                    else => return error.OutOfMemory,
+                                };
+                            } else {
+                                const iter_scope = try Environment.init(self.arena, env);
+                                try iter_scope.defineLexical(name, if (vd.kind == .const_) .const_ else .let, true, iter_val);
+                                iter_env_for_body = iter_scope;
+                            }
                         },
                         .identifier => {
                             const name = fi.left.data.identifier;
-                            env.assign(name, key_val) catch {
-                                try env.define(name, key_val);
+                            env.assign(name, iter_val) catch |e| switch (e) {
+                                error.NotDefined => try env.define(name, iter_val),
+                                error.ConstAssignment => {
+                                    const msg = try std.fmt.allocPrint(self.arena, "Assignment to constant variable '{s}'", .{name});
+                                    self.last_exception_msg = try std.fmt.allocPrint(self.arena, "TypeError: {s}", .{msg});
+                                    self.last_exception_value = self.makeTypeErrorObject(msg) catch Value{};
+                                    return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } };
+                                },
+                                error.TemporalDeadZone => {
+                                    const msg = try std.fmt.allocPrint(self.arena, "Cannot access '{s}' before initialization", .{name});
+                                    self.last_exception_msg = try std.fmt.allocPrint(self.arena, "ReferenceError: {s}", .{msg});
+                                    self.last_exception_value = self.makeReferenceErrorObject(msg) catch Value{};
+                                    return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } };
+                                },
+                                else => return error.OutOfMemory,
                             };
                         },
                         else => {},
                     }
-                    const r = try self.evalStatement(fi.body, env);
+                    const r = try self.evalStatement(fi.body, iter_env_for_body);
                     switch (r) {
                         .value => {},
-                        .break_ => |lbl| { if (lbl != null) return r; break; },
-                        .continue_ => |lbl| { if (lbl != null) return r; },
+                        .break_ => |lbl| {
+                            if (lbl != null) return r;
+                            break;
+                        },
+                        .continue_ => |lbl| {
+                            if (lbl != null) return r;
+                        },
                         else => return r,
                     }
                 }
@@ -636,10 +799,18 @@ pub const Vm = struct {
             },
             .identifier => {
                 const name = node.data.identifier;
-                return env.lookup(name) catch {
-                    const msg = std.fmt.allocPrint(self.arena, "ReferenceError: {s} is not defined", .{name}) catch "ReferenceError";
-                    self.last_exception_msg = msg;
-                    return EvalError.JsException;
+                return env.lookup(name) catch |e| switch (e) {
+                    error.NotDefined => {
+                        const msg = std.fmt.allocPrint(self.arena, "ReferenceError: {s} is not defined", .{name}) catch "ReferenceError";
+                        self.last_exception_msg = msg;
+                        return EvalError.JsException;
+                    },
+                    error.TemporalDeadZone => {
+                        const msg = std.fmt.allocPrint(self.arena, "ReferenceError: Cannot access '{s}' before initialization", .{name}) catch "ReferenceError";
+                        self.last_exception_msg = msg;
+                        return EvalError.JsException;
+                    },
+                    else => return EvalError.OutOfMemory,
                 };
             },
             .unary_expr => return self.evalUnary(node.data.unary_expr, env),
@@ -664,6 +835,24 @@ pub const Vm = struct {
                 }
                 return last;
             },
+            .spread_expr => {
+                return self.evalExpression(node.data.spread_expr, env);
+            },
+            .yield_expr => {
+                if (self.generator_capture) |capture| {
+                    const yv = if (node.data.yield_expr) |yn|
+                        try self.evalExpression(yn, env)
+                    else
+                        try self.makeUndefined();
+                    try capture.yields.append(self.arena, yv);
+                    // Minimal subset: `yield` expression result (value sent by next(arg))
+                    // is not yet supported and always resolves to undefined.
+                    return self.makeUndefined();
+                }
+                self.last_exception_msg = "SyntaxError: yield is only valid inside generator functions";
+                self.last_exception_value = self.makeErrorObject("SyntaxError", "yield is only valid inside generator functions") catch Value{};
+                return EvalError.JsException;
+            },
             .call_expr => return self.evalCall(node.data.call_expr, env),
             .new_expr => {
                 return self.evalNewExpr(node.data.new_expr, env);
@@ -674,9 +863,15 @@ pub const Vm = struct {
                 fv.* = FuncVal{
                     .name = fe.name,
                     .params = fe.params,
+                    .param_defaults = @as([*]?*anyopaque, @ptrCast(fe.param_defaults.ptr))[0..fe.param_defaults.len],
+                    .rest_param = fe.rest_param,
                     .body_ptr = @ptrCast(fe.body.ptr),
                     .closure_env = @ptrCast(env),
                     .is_strict = fe.is_strict,
+                    .prototype_obj = if (fe.is_arrow) null else try JsObject.create(self.arena, self.realm.object_prototype),
+                    .is_arrow = fe.is_arrow,
+                    .lexical_this = if (fe.is_arrow) self.current_this else Value{},
+                    .is_generator = fe.is_generator,
                 };
                 // Store body length in a hidden way — we pack it via a wrapper.
                 // Actually we need to store body length. Let's use a FuncWrapper.
@@ -743,13 +938,157 @@ pub const Vm = struct {
             JsObject.createArrayOnHeap(heap, self.realm.array_prototype) catch return EvalError.OutOfMemory
         else
             JsObject.createArray(self.arena, self.realm.array_prototype) catch return EvalError.OutOfMemory;
-        for (al.elements, 0..) |elem, i| {
-            const v = try self.evalExpression(elem, env);
-            const key = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return EvalError.OutOfMemory;
-            arr.set(key, v) catch return EvalError.OutOfMemory;
+        var write_index: usize = 0;
+        for (al.elements) |elem| {
+            if (elem.kind == .spread_expr) {
+                const spread_src = try self.evalExpression(elem.data.spread_expr, env);
+                var spread_vals = std.ArrayList(Value){};
+                try self.collectSpreadValues(&spread_vals, spread_src);
+                for (spread_vals.items) |sv| {
+                    const key = std.fmt.allocPrint(self.arena, "{d}", .{write_index}) catch return EvalError.OutOfMemory;
+                    arr.set(key, sv) catch return EvalError.OutOfMemory;
+                    write_index += 1;
+                }
+            } else {
+                const v = try self.evalExpression(elem, env);
+                const key = std.fmt.allocPrint(self.arena, "{d}", .{write_index}) catch return EvalError.OutOfMemory;
+                arr.set(key, v) catch return EvalError.OutOfMemory;
+                write_index += 1;
+            }
         }
-        arr.array_length = @intCast(al.elements.len);
+        arr.array_length = @intCast(write_index);
         return val_mod.makeObject(self.arena, arr) catch return EvalError.OutOfMemory;
+    }
+
+    fn collectSpreadValues(self: *Vm, out: *std.ArrayList(Value), source: Value) EvalError!void {
+        if (source.bits == 0) return;
+        switch (source.toPtr().*) {
+            .object => |obj| {
+                if (try self.collectIteratorValues(out, source)) return;
+                if (obj.is_array) {
+                    const len = obj.getArrayLength();
+                    for (0..len) |i| {
+                        const key = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return EvalError.OutOfMemory;
+                        try out.append(self.arena, obj.get(key) orelse try self.makeUndefined());
+                    }
+                    return;
+                }
+                self.last_exception_msg = "TypeError: value is not iterable";
+                self.last_exception_value = self.makeTypeErrorObject("value is not iterable") catch Value{};
+                return EvalError.JsException;
+            },
+            .string => |s| {
+                for (s) |ch| {
+                    const one = [_]u8{ch};
+                    try out.append(self.arena, try self.makeString(one[0..]));
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn collectIteratorValues(self: *Vm, out: *std.ArrayList(Value), source: Value) EvalError!bool {
+        if (source.bits == 0 or source.toPtr().* != .object) return false;
+        const src_obj = source.toPtr().object;
+
+        var iter_obj: ?*JsObject = null;
+        var used_iterator_method = false;
+        if (src_obj.get("@@iterator")) |iter_fn| {
+            used_iterator_method = true;
+            if (!isCallable(iter_fn)) {
+                self.last_exception_msg = "TypeError: @@iterator is not callable";
+                self.last_exception_value = self.makeTypeErrorObject("@@iterator is not callable") catch Value{};
+                return EvalError.JsException;
+            }
+            const iter_val = try self.invokeCallable(source, iter_fn, &[_]Value{});
+            if (iter_val.bits == 0 or iter_val.toPtr().* != .object) {
+                self.last_exception_msg = "TypeError: iterator() must return object";
+                self.last_exception_value = self.makeTypeErrorObject("iterator() must return object") catch Value{};
+                return EvalError.JsException;
+            }
+            iter_obj = iter_val.toPtr().object;
+        } else if (src_obj.get("iterator")) |iter_fn| {
+            used_iterator_method = true;
+            if (!isCallable(iter_fn)) {
+                self.last_exception_msg = "TypeError: iterator is not callable";
+                self.last_exception_value = self.makeTypeErrorObject("iterator is not callable") catch Value{};
+                return EvalError.JsException;
+            }
+            const iter_val = try self.invokeCallable(source, iter_fn, &[_]Value{});
+            if (iter_val.bits == 0 or iter_val.toPtr().* != .object) {
+                self.last_exception_msg = "TypeError: iterator() must return object";
+                self.last_exception_value = self.makeTypeErrorObject("iterator() must return object") catch Value{};
+                return EvalError.JsException;
+            }
+            iter_obj = iter_val.toPtr().object;
+        } else if (src_obj.get("next")) |_| {
+            iter_obj = src_obj;
+        } else {
+            return false;
+        }
+
+        const it = iter_obj orelse {
+            if (used_iterator_method) {
+                self.last_exception_msg = "TypeError: iterator() must return object";
+                self.last_exception_value = self.makeTypeErrorObject("iterator() must return object") catch Value{};
+                return EvalError.JsException;
+            }
+            return false;
+        };
+        const next_fn = it.get("next") orelse {
+            self.last_exception_msg = "TypeError: iterator missing next method";
+            self.last_exception_value = self.makeTypeErrorObject("iterator missing next method") catch Value{};
+            return EvalError.JsException;
+        };
+        if (!isCallable(next_fn)) {
+            self.last_exception_msg = "TypeError: iterator next is not callable";
+            self.last_exception_value = self.makeTypeErrorObject("iterator next is not callable") catch Value{};
+            return EvalError.JsException;
+        }
+        var steps: usize = 0;
+        while (steps < 100000) : (steps += 1) {
+            const iter_this = val_mod.makeObject(self.arena, it) catch return EvalError.OutOfMemory;
+            const step_val = try self.invokeCallable(iter_this, next_fn, &[_]Value{});
+            if (step_val.bits == 0 or step_val.toPtr().* != .object) {
+                self.closeIteratorIfPresent(it) catch {};
+                self.last_exception_msg = "TypeError: iterator result is not an object";
+                self.last_exception_value = self.makeTypeErrorObject("iterator result is not an object") catch Value{};
+                return EvalError.JsException;
+            }
+            const step_obj = step_val.toPtr().object;
+            const done_val = step_obj.get("done") orelse try self.makeBool(false);
+            if (isTruthy(done_val)) break;
+            const value_val = step_obj.get("value") orelse try self.makeUndefined();
+            try out.append(self.arena, value_val);
+        }
+        if (steps >= 100000) {
+            self.closeIteratorIfPresent(it) catch {};
+            self.last_exception_msg = "RangeError: iterator exceeded step limit";
+            self.last_exception_value = self.makeErrorObject("RangeError", "iterator exceeded step limit") catch Value{};
+            return EvalError.JsException;
+        }
+        return true;
+    }
+
+    fn closeIteratorIfPresent(self: *Vm, iter_obj: *JsObject) EvalError!void {
+        const return_fn = iter_obj.get("return") orelse return;
+        if (!isCallable(return_fn)) return;
+        const iter_this = val_mod.makeObject(self.arena, iter_obj) catch return EvalError.OutOfMemory;
+        _ = self.invokeCallable(iter_this, return_fn, &[_]Value{}) catch {};
+    }
+
+    fn invokeCallable(self: *Vm, this_val: Value, fn_val: Value, args: []const Value) EvalError!Value {
+        if (fn_val.bits == 0) return EvalError.JsException;
+        switch (fn_val.toPtr().*) {
+            .function => |fv| return self.callFunction(fv, @constCast(args), this_val),
+            .native_function => |fn_ptr| {
+                return fn_ptr(self.arena, this_val, args) catch |e| {
+                    if (e == error.JsException) return EvalError.JsException;
+                    return EvalError.OutOfMemory;
+                };
+            },
+            else => return EvalError.JsException,
+        }
     }
 
     fn evalMemberExpr(self: *Vm, me: ast.MemberExpr, env: *Environment) EvalError!Value {
@@ -778,6 +1117,9 @@ pub const Vm = struct {
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength())) catch return EvalError.OutOfMemory;
                 }
+                if (obj.resolveOwnSlot(key)) |slot| {
+                    if (obj.getOwnBySlot(obj.shapePtr(), slot)) |v| return v;
+                }
                 if (obj.get(key)) |v| return v;
                 return self.makeUndefined();
             },
@@ -800,8 +1142,20 @@ pub const Vm = struct {
                 }
                 return self.makeUndefined();
             },
-            .function, .bc_function, .native_function => {
-                // Phase 4d: delegate to Function.prototype (call, apply, bind).
+            .function => |fv| {
+                if (std.mem.eql(u8, key, "prototype")) {
+                    if (fv.prototype_obj) |po| {
+                        return val_mod.makeObject(self.arena, po) catch return EvalError.OutOfMemory;
+                    }
+                    return self.makeUndefined();
+                }
+                const realm_mod = @import("../runtime/realm.zig");
+                if (realm_mod.active_function_proto) |proto| {
+                    if (proto.get(key)) |v| return v;
+                }
+                return self.makeUndefined();
+            },
+            .bc_function, .native_function => {
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
                     if (proto.get(key)) |v| return v;
@@ -820,7 +1174,20 @@ pub const Vm = struct {
         }
         switch (obj_val.toPtr().*) {
             .object => |obj| {
+                if (obj.resolveOwnSlot(key)) |slot| {
+                    if (obj.setOwnBySlot(obj.shapePtr(), slot, value)) {
+                        obj.props.put(obj.arena, key, value) catch return EvalError.OutOfMemory;
+                        return;
+                    }
+                }
                 obj.set(key, value) catch return EvalError.OutOfMemory;
+            },
+            .function => |fv| {
+                if (std.mem.eql(u8, key, "prototype")) {
+                    if (value.bits != 0 and value.toPtr().* == .object) {
+                        fv.prototype_obj = value.toPtr().object;
+                    }
+                }
             },
             else => {
                 // Silently ignore setting on non-objects (ES5 non-strict).
@@ -834,7 +1201,15 @@ pub const Vm = struct {
                 // Special: typeof on undefined identifier should return "undefined", not throw.
                 const v: Value = if (u.operand.kind == .identifier) blk: {
                     const name = u.operand.data.identifier;
-                    break :blk env.lookup(name) catch try self.makeUndefined();
+                    break :blk env.lookup(name) catch |e| switch (e) {
+                        error.NotDefined => try self.makeUndefined(),
+                        error.TemporalDeadZone => {
+                            const msg = std.fmt.allocPrint(self.arena, "ReferenceError: Cannot access '{s}' before initialization", .{name}) catch "ReferenceError";
+                            self.last_exception_msg = msg;
+                            return EvalError.JsException;
+                        },
+                        else => return EvalError.OutOfMemory,
+                    };
                 } else try self.evalExpression(u.operand, env);
                 const type_str = typeofValue(v);
                 return self.makeString(type_str);
@@ -1008,6 +1383,18 @@ pub const Vm = struct {
                         // Auto-create global
                         env.defineGlobal(name, value) catch return EvalError.OutOfMemory;
                     },
+                    error.ConstAssignment => {
+                        const msg = try std.fmt.allocPrint(self.arena, "Assignment to constant variable '{s}'", .{name});
+                        self.last_exception_msg = try std.fmt.allocPrint(self.arena, "TypeError: {s}", .{msg});
+                        self.last_exception_value = self.makeTypeErrorObject(msg) catch Value{};
+                        return EvalError.JsException;
+                    },
+                    error.TemporalDeadZone => {
+                        const msg = try std.fmt.allocPrint(self.arena, "Cannot access '{s}' before initialization", .{name});
+                        self.last_exception_msg = try std.fmt.allocPrint(self.arena, "ReferenceError: {s}", .{msg});
+                        self.last_exception_value = self.makeReferenceErrorObject(msg) catch Value{};
+                        return EvalError.JsException;
+                    },
                     else => return EvalError.OutOfMemory,
                 };
             },
@@ -1062,8 +1449,13 @@ pub const Vm = struct {
         // Evaluate arguments
         var arg_vals = std.ArrayList(Value){};
         for (c.args) |a| {
-            const av = try self.evalExpression(a, env);
-            try arg_vals.append(self.arena, av);
+            if (a.kind == .spread_expr) {
+                const spread_src = try self.evalExpression(a.data.spread_expr, env);
+                try self.collectSpreadValues(&arg_vals, spread_src);
+            } else {
+                const av = try self.evalExpression(a, env);
+                try arg_vals.append(self.arena, av);
+            }
         }
 
         // Dispatch based on callee type.
@@ -1151,13 +1543,54 @@ pub const Vm = struct {
         const body = fw.body;
         const closure_env: *Environment = @ptrCast(@alignCast(fv.closure_env));
 
+        if (fv.is_generator) {
+            return createGeneratorObject(self, fv, body, closure_env, args, this_val);
+        }
+
         // Create a new environment for the function call.
         const call_env = Environment.init(self.arena, closure_env) catch return EvalError.OutOfMemory;
 
+        // ES5/ES2015 interop: expose `arguments` as an array-like object.
+        const arguments_obj = if (self.heap) |heap|
+            JsObject.createArrayOnHeap(heap, self.realm.array_prototype) catch return EvalError.OutOfMemory
+        else
+            JsObject.createArray(self.arena, self.realm.array_prototype) catch return EvalError.OutOfMemory;
+        for (args, 0..) |av, i| {
+            const key = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return EvalError.OutOfMemory;
+            arguments_obj.set(key, av) catch return EvalError.OutOfMemory;
+        }
+        arguments_obj.array_length = @intCast(args.len);
+        const arguments_val = val_mod.makeObject(self.arena, arguments_obj) catch return EvalError.OutOfMemory;
+        call_env.define("arguments", arguments_val) catch return EvalError.OutOfMemory;
+
         // Bind parameters
+        const param_defaults: []?*Node = @as([*]?*Node, @ptrCast(fv.param_defaults.ptr))[0..fv.param_defaults.len];
         for (fv.params, 0..) |param, i| {
-            const av = if (i < args.len) args[i] else try self.makeUndefined();
+            var av = if (i < args.len) args[i] else try self.makeUndefined();
+            if (i < param_defaults.len and param_defaults[i] != null) {
+                const is_undef = av.bits == 0 or (av.bits != 0 and av.toPtr().* == .undefined_);
+                if (is_undef) {
+                    av = try self.evalExpression(param_defaults[i].?, call_env);
+                }
+            }
             call_env.define(param, av) catch return EvalError.OutOfMemory;
+        }
+        if (fv.rest_param) |rest_name| {
+            const rest_arr = if (self.heap) |heap|
+                JsObject.createArrayOnHeap(heap, self.realm.array_prototype) catch return EvalError.OutOfMemory
+            else
+                JsObject.createArray(self.arena, self.realm.array_prototype) catch return EvalError.OutOfMemory;
+            const start_index = fv.params.len;
+            var write_idx: usize = 0;
+            var i = start_index;
+            while (i < args.len) : (i += 1) {
+                const key = std.fmt.allocPrint(self.arena, "{d}", .{write_idx}) catch return EvalError.OutOfMemory;
+                rest_arr.set(key, args[i]) catch return EvalError.OutOfMemory;
+                write_idx += 1;
+            }
+            rest_arr.array_length = @intCast(write_idx);
+            const rest_val = val_mod.makeObject(self.arena, rest_arr) catch return EvalError.OutOfMemory;
+            call_env.define(rest_name, rest_val) catch return EvalError.OutOfMemory;
         }
 
         // Named function expression: bind the function name inside the body (ES5 §13).
@@ -1169,10 +1602,11 @@ pub const Vm = struct {
 
         // Hoist var/function declarations in the function body.
         self.hoistDeclarations(body, call_env) catch return EvalError.OutOfMemory;
+        self.predeclareLexicalsInBlock(body, call_env) catch return EvalError.OutOfMemory;
 
         // Phase 4d: strict mode this-binding.
         // In strict mode: this is as-is. In non-strict: null/undefined -> global (undefined here).
-        const effective_this = if (fv.is_strict) this_val else this_val;
+        const effective_this = if (fv.is_arrow) fv.lexical_this else if (fv.is_strict) this_val else this_val;
 
         // Save and set current_this and strict mode.
         const prev_this = self.current_this;
@@ -1203,6 +1637,125 @@ pub const Vm = struct {
             }
         }
         return self.makeUndefined();
+    }
+
+    fn createGeneratorObject(self: *Vm, fv: *FuncVal, body: []*Node, closure_env: *Environment, args: []Value, this_val: Value) EvalError!Value {
+        const state = self.arena.create(GeneratorState) catch return EvalError.OutOfMemory;
+        state.* = .{
+            .vm = self,
+            .func = fv,
+            .body = body,
+            .closure_env = closure_env,
+            .args = args,
+            .this_val = this_val,
+        };
+
+        const gen_obj = if (self.heap) |heap|
+            JsObject.createOnHeap(heap, self.realm.object_prototype) catch return EvalError.OutOfMemory
+        else
+            JsObject.create(self.arena, self.realm.object_prototype) catch return EvalError.OutOfMemory;
+        gen_obj.internal_slot = state;
+
+        const next_fn = val_mod.makeNativeFunction(self.arena, nativeGeneratorNext) catch return EvalError.OutOfMemory;
+        gen_obj.set("next", next_fn) catch return EvalError.OutOfMemory;
+        // Existing iterator paths already probe "iterator" / "@@iterator".
+        const self_iter_fn = val_mod.makeNativeFunction(self.arena, nativeGeneratorSelfIterator) catch return EvalError.OutOfMemory;
+        gen_obj.set("iterator", self_iter_fn) catch return EvalError.OutOfMemory;
+        gen_obj.set("@@iterator", self_iter_fn) catch return EvalError.OutOfMemory;
+
+        return val_mod.makeObject(self.arena, gen_obj) catch return EvalError.OutOfMemory;
+    }
+
+    fn materializeGenerator(self: *Vm, state: *GeneratorState) EvalError!void {
+        if (state.materialized) return;
+        state.materialized = true;
+
+        const call_env = Environment.init(self.arena, state.closure_env) catch return EvalError.OutOfMemory;
+
+        const arguments_obj = if (self.heap) |heap|
+            JsObject.createArrayOnHeap(heap, self.realm.array_prototype) catch return EvalError.OutOfMemory
+        else
+            JsObject.createArray(self.arena, self.realm.array_prototype) catch return EvalError.OutOfMemory;
+        for (state.args, 0..) |av, i| {
+            const key = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return EvalError.OutOfMemory;
+            arguments_obj.set(key, av) catch return EvalError.OutOfMemory;
+        }
+        arguments_obj.array_length = @intCast(state.args.len);
+        const arguments_val = val_mod.makeObject(self.arena, arguments_obj) catch return EvalError.OutOfMemory;
+        call_env.define("arguments", arguments_val) catch return EvalError.OutOfMemory;
+
+        const param_defaults: []?*Node = @as([*]?*Node, @ptrCast(state.func.param_defaults.ptr))[0..state.func.param_defaults.len];
+        for (state.func.params, 0..) |param, i| {
+            var av = if (i < state.args.len) state.args[i] else try self.makeUndefined();
+            if (i < param_defaults.len and param_defaults[i] != null) {
+                const is_undef = av.bits == 0 or (av.bits != 0 and av.toPtr().* == .undefined_);
+                if (is_undef) av = try self.evalExpression(param_defaults[i].?, call_env);
+            }
+            call_env.define(param, av) catch return EvalError.OutOfMemory;
+        }
+        if (state.func.rest_param) |rest_name| {
+            const rest_arr = if (self.heap) |heap|
+                JsObject.createArrayOnHeap(heap, self.realm.array_prototype) catch return EvalError.OutOfMemory
+            else
+                JsObject.createArray(self.arena, self.realm.array_prototype) catch return EvalError.OutOfMemory;
+            var write_idx: usize = 0;
+            var i = state.func.params.len;
+            while (i < state.args.len) : (i += 1) {
+                const key = std.fmt.allocPrint(self.arena, "{d}", .{write_idx}) catch return EvalError.OutOfMemory;
+                rest_arr.set(key, state.args[i]) catch return EvalError.OutOfMemory;
+                write_idx += 1;
+            }
+            rest_arr.array_length = @intCast(write_idx);
+            const rest_val = val_mod.makeObject(self.arena, rest_arr) catch return EvalError.OutOfMemory;
+            call_env.define(rest_name, rest_val) catch return EvalError.OutOfMemory;
+        }
+        if (state.func.name) |fname| {
+            const self_val = try val_mod.makeFunction(self.arena, state.func);
+            call_env.define(fname, self_val) catch return EvalError.OutOfMemory;
+        }
+        self.hoistDeclarations(state.body, call_env) catch return EvalError.OutOfMemory;
+        self.predeclareLexicalsInBlock(state.body, call_env) catch return EvalError.OutOfMemory;
+
+        const prev_this = self.current_this;
+        const prev_strict = self.is_strict;
+        const prev_call_env = self.current_call_env;
+        const prev_capture = self.generator_capture;
+        self.current_this = if (state.func.is_arrow) state.func.lexical_this else state.this_val;
+        self.is_strict = state.func.is_strict;
+        self.current_call_env = call_env;
+        self.generator_capture = &state.capture;
+        defer {
+            self.current_this = prev_this;
+            self.is_strict = prev_strict;
+            self.current_call_env = prev_call_env;
+            self.generator_capture = prev_capture;
+        }
+
+        for (state.body) |stmt| {
+            const r = self.evalStatement(stmt, call_env) catch return EvalError.OutOfMemory;
+            switch (r) {
+                .value => {},
+                .return_ => |rv| {
+                    state.return_value = rv;
+                    return;
+                },
+                .exception => |ex| {
+                    state.had_exception = true;
+                    state.exception = ex;
+                    return;
+                },
+                .break_, .continue_ => {
+                    // Unsupported control completion at top-level generator body.
+                    state.had_exception = true;
+                    state.exception = .{
+                        .message = "SyntaxError: unsupported control flow in generator body",
+                        .value = self.makeErrorObject("SyntaxError", "unsupported control flow in generator body") catch Value{},
+                    };
+                    return;
+                },
+            }
+        }
+        state.return_value = try self.makeUndefined();
     }
 
     fn evalNewExpr(self: *Vm, ne: ast.NewExpr, env: *Environment) EvalError!Value {
@@ -1310,12 +1863,8 @@ pub const Vm = struct {
     /// Get the [[Prototype]] that `new fn()` should use:
     /// reads fn.prototype if it is an object; else Object.prototype.
     fn getFuncProto(self: *Vm, fv: *FuncVal) ?*JsObject {
-        // FuncVal doesn't carry a prototype property directly.
-        // Phase 4a: look up "prototype" in the global env for the function's name.
-        // For native constructors the realm sets up prototypes in the global env.
         _ = self;
-        _ = fv;
-        return null; // fallback to object_prototype
+        return fv.prototype_obj;
     }
 
     /// Create a TypeError JsObject with the given message, using TypeError.prototype as proto.
@@ -1390,6 +1939,78 @@ pub const FuncWrapper = struct {
     body: []*Node,
 };
 
+const GeneratorCapture = struct {
+    yields: std.ArrayList(Value) = .{},
+};
+
+const GeneratorState = struct {
+    vm: *Vm,
+    func: *FuncVal,
+    body: []*Node,
+    closure_env: *Environment,
+    args: []Value,
+    this_val: Value,
+    capture: GeneratorCapture = .{},
+    materialized: bool = false,
+    index: usize = 0,
+    return_value: Value = Value{},
+    had_exception: bool = false,
+    exception: EvalException = .{ .message = "" },
+};
+
+fn makeIteratorResult(arena: std.mem.Allocator, vm: *Vm, value: Value, done: bool) !Value {
+    const obj = if (vm.heap) |heap|
+        JsObject.createOnHeap(heap, vm.realm.object_prototype) catch return error.OutOfMemory
+    else
+        JsObject.create(arena, vm.realm.object_prototype) catch return error.OutOfMemory;
+    obj.set("value", value) catch return error.OutOfMemory;
+    const done_val = val_mod.makeBool(arena, done) catch return error.OutOfMemory;
+    obj.set("done", done_val) catch return error.OutOfMemory;
+    return val_mod.makeObject(arena, obj);
+}
+
+fn nativeGeneratorSelfIterator(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return this_val;
+}
+
+fn nativeGeneratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.toPtr().* != .object) return val_mod.makeUndefined(arena);
+    const obj = this_val.toPtr().object;
+    if (obj.internal_slot == null) return val_mod.makeUndefined(arena);
+    const state: *GeneratorState = @ptrCast(@alignCast(obj.internal_slot.?));
+    const vm = state.vm;
+
+    vm.materializeGenerator(state) catch |e| switch (e) {
+        error.JsException => {
+            const realm_mod = @import("../runtime/realm.zig");
+            realm_mod.pending_exception = vm.last_exception_value;
+            return error.JsException;
+        },
+        else => return e,
+    };
+
+    if (state.had_exception) {
+        const realm_mod = @import("../runtime/realm.zig");
+        realm_mod.pending_exception = state.exception.value;
+        vm.last_exception_value = state.exception.value;
+        vm.last_exception_msg = state.exception.message;
+        return error.JsException;
+    }
+
+    if (state.index < state.capture.yields.items.len) {
+        const out = state.capture.yields.items[state.index];
+        state.index += 1;
+        return makeIteratorResult(arena, vm, out, false);
+    }
+
+    // Final completion result; once exhausted, remains done=true.
+    if (state.index == state.capture.yields.items.len) {
+        state.index += 1;
+        return makeIteratorResult(arena, vm, state.return_value, true);
+    }
+    return makeIteratorResult(arena, vm, try vm.makeUndefined(), true);
+}
+
 /// GC root-scan callback for the tree-walker Vm.
 /// Walks current_this and the global env chain (all live bindings).
 fn vmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
@@ -1445,6 +2066,15 @@ fn isStringOrObject(v: Value) bool {
     return switch (v.toPtr().*) {
         .string => true,
         .object => true,
+        else => false,
+    };
+}
+
+fn isCallable(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.toPtr().*) {
+        .function, .native_function, .bc_function => true,
+        .object => |obj| obj.get("__call__") != null,
         else => false,
     };
 }

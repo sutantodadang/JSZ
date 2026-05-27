@@ -13,6 +13,7 @@ const Op = @import("./opcodes.zig").Op;
 const ChunkBuilder = @import("./chunk.zig").ChunkBuilder;
 const BcFunction = @import("./function.zig").BcFunction;
 const BcClosure = @import("./function.zig").BcClosure;
+const ic_mod = @import("../vm/ic.zig");
 
 // ---------------------------------------------------------------- FnCompiler ---
 
@@ -211,6 +212,9 @@ const FnCompiler = struct {
                 }
                 return last;
             },
+            .spread_expr => {
+                return self.compileExpr(node.data.spread_expr);
+            },
             .call_expr => return self.compileCall(node.data.call_expr, line),
             .function_expr => return self.compileFuncExpr(node.data.function_expr, line),
             .member_expr => {
@@ -276,7 +280,7 @@ const FnCompiler = struct {
                 try self.emitOp(.NEW_INSTANCE, line);
                 try self.emitU8(base); // Rdst = base
                 try self.emitU8(base); // callee at base
-                try self.emitU8(2);    // nargs = 2
+                try self.emitU8(2); // nargs = 2
                 self.sp = base + 1;
                 return base;
             },
@@ -372,17 +376,9 @@ const FnCompiler = struct {
             .pre_inc => {
                 // ++x: load x, add 1, store back, result is new value.
                 const rsrc = try self.compileExpr(u.operand);
-                const r_one = self.allocReg();
-                const v_one = try val_mod.makeNumber(self.arena, 1.0);
-                const k_one = try self.addConstant(v_one);
-                try self.emitOp(.LOAD_K, line);
-                try self.emitU8(r_one);
-                try self.emitU16(k_one);
-                try self.emitOp(.ADD, line);
+                try self.emitOp(.INC, line);
                 try self.emitU8(rsrc);
                 try self.emitU8(rsrc);
-                try self.emitU8(r_one);
-                self.freeReg(); // free r_one
                 // store back
                 if (u.operand.kind == .identifier) {
                     try self.emitStore(u.operand.data.identifier, rsrc, line);
@@ -391,17 +387,9 @@ const FnCompiler = struct {
             },
             .pre_dec => {
                 const rsrc = try self.compileExpr(u.operand);
-                const r_one = self.allocReg();
-                const v_one = try val_mod.makeNumber(self.arena, 1.0);
-                const k_one = try self.addConstant(v_one);
-                try self.emitOp(.LOAD_K, line);
-                try self.emitU8(r_one);
-                try self.emitU16(k_one);
-                try self.emitOp(.SUB, line);
+                try self.emitOp(.DEC, line);
                 try self.emitU8(rsrc);
                 try self.emitU8(rsrc);
-                try self.emitU8(r_one);
-                self.freeReg(); // free r_one
                 if (u.operand.kind == .identifier) {
                     try self.emitStore(u.operand.data.identifier, rsrc, line);
                 }
@@ -532,6 +520,24 @@ const FnCompiler = struct {
 
     fn compileAssign(self: *Self, a: ast.AssignExpr, line: u32) error{OutOfMemory}!u8 {
         if (a.op == .assign) {
+            // Peephole: x = x + 1 / x = x - 1 -> INC/DEC
+            if (a.target.kind == .identifier and a.value.kind == .binary_expr) {
+                const target_name = a.target.data.identifier;
+                const b = a.value.data.binary_expr;
+                if ((b.op == .add or b.op == .sub) and
+                    b.left.kind == .identifier and
+                    std.mem.eql(u8, b.left.data.identifier, target_name) and
+                    b.right.kind == .number_literal and
+                    b.right.data.number_literal == 1.0)
+                {
+                    const rsrc = try self.compileExpr(a.target);
+                    try self.emitOp(if (b.op == .add) .INC else .DEC, line);
+                    try self.emitU8(rsrc);
+                    try self.emitU8(rsrc);
+                    try self.emitStore(target_name, rsrc, line);
+                    return rsrc;
+                }
+            }
             const rhs = try self.compileExpr(a.value);
             if (a.target.kind == .identifier) {
                 try self.emitStore(a.target.data.identifier, rhs, line);
@@ -590,6 +596,35 @@ const FnCompiler = struct {
             try self.emitU16(kidx);
             return rdst;
         } else {
+            // Computed with literal key can still be static.
+            if (me.property.kind == .string_literal) {
+                const prop_name = me.property.data.string_literal;
+                const sv = try val_mod.makeString(self.arena, prop_name);
+                const kidx = try self.addConstant(sv);
+                const rdst = robj;
+                self.sp = robj;
+                self.sp += 1;
+                try self.emitOp(.GET_PROP, line);
+                try self.emitU8(rdst);
+                try self.emitU8(robj);
+                try self.emitU16(kidx);
+                return rdst;
+            }
+            if (me.property.kind == .number_literal) {
+                const key_str = std.fmt.allocPrint(self.arena, "{d}", .{
+                    me.property.data.number_literal,
+                }) catch return error.OutOfMemory;
+                const sv = try val_mod.makeString(self.arena, key_str);
+                const kidx = try self.addConstant(sv);
+                const rdst = robj;
+                self.sp = robj;
+                self.sp += 1;
+                try self.emitOp(.GET_PROP, line);
+                try self.emitU8(rdst);
+                try self.emitU8(robj);
+                try self.emitU16(kidx);
+                return rdst;
+            }
             // Dynamic member access: GET_PROP_DYN Rdst Robj Rkey
             const rkey = try self.compileExpr(me.property);
             const rdst = robj;
@@ -614,6 +649,30 @@ const FnCompiler = struct {
             try self.emitU16(kidx);
             try self.emitU8(rval);
         } else {
+            if (me.property.kind == .string_literal) {
+                const prop_name = me.property.data.string_literal;
+                const sv = try val_mod.makeString(self.arena, prop_name);
+                const kidx = try self.addConstant(sv);
+                try self.emitOp(.SET_PROP, line);
+                try self.emitU8(robj);
+                try self.emitU16(kidx);
+                try self.emitU8(rval);
+                self.freeReg(); // free robj
+                return;
+            }
+            if (me.property.kind == .number_literal) {
+                const key_str = std.fmt.allocPrint(self.arena, "{d}", .{
+                    me.property.data.number_literal,
+                }) catch return error.OutOfMemory;
+                const sv = try val_mod.makeString(self.arena, key_str);
+                const kidx = try self.addConstant(sv);
+                try self.emitOp(.SET_PROP, line);
+                try self.emitU8(robj);
+                try self.emitU16(kidx);
+                try self.emitU8(rval);
+                self.freeReg(); // free robj
+                return;
+            }
             const rkey = try self.compileExpr(me.property);
             try self.emitOp(.SET_PROP_DYN, line);
             try self.emitU8(robj);
@@ -666,46 +725,30 @@ const FnCompiler = struct {
 
     fn compileUpdate(self: *Self, u: ast.UpdateExpr, line: u32) error{OutOfMemory}!u8 {
         const r_old = try self.compileExpr(u.operand);
-        const r_one = self.allocReg();
-        const v_one = try val_mod.makeNumber(self.arena, 1.0);
-        const k_one = try self.addConstant(v_one);
-        try self.emitOp(.LOAD_K, line);
-        try self.emitU8(r_one);
-        try self.emitU16(k_one);
 
         if (u.prefix) {
             // Pre: compute new value, store, return new.
             const r_new = r_old;
-            const op: Op = if (u.op == .inc) .ADD else .SUB;
-            try self.emitOp(op, line);
+            try self.emitOp(if (u.op == .inc) .INC else .DEC, line);
             try self.emitU8(r_new);
             try self.emitU8(r_old);
-            try self.emitU8(r_one);
-            self.freeReg(); // free r_one
             if (u.operand.kind == .identifier) {
                 try self.emitStore(u.operand.data.identifier, r_new, line);
             }
             return r_new;
         } else {
             // Post: compute new value, store, return OLD.
-            // We need to keep the old value. Use a temp for new.
-            const r_new = self.allocReg();
-            _ = r_new;
-            // Reuse r_one slot for r_new.
-            const op: Op = if (u.op == .inc) .ADD else .SUB;
-            // r_one is already allocated. We compute new into a fresh reg above r_one.
-            // Actually let's compute: new = old op 1, store new, return old.
-            // We need a scratch reg for new value.
             const r_scratch = self.allocReg();
-            try self.emitOp(op, line);
+            try self.emitOp(.MOVE, line);
             try self.emitU8(r_scratch);
             try self.emitU8(r_old);
-            try self.emitU8(r_one);
+            try self.emitOp(if (u.op == .inc) .INC else .DEC, line);
+            try self.emitU8(r_scratch);
+            try self.emitU8(r_scratch);
             if (u.operand.kind == .identifier) {
                 try self.emitStore(u.operand.data.identifier, r_scratch, line);
             }
             self.freeReg(); // free r_scratch
-            self.freeReg(); // free r_one
             return r_old; // return old value
         }
     }
@@ -834,6 +877,14 @@ const FnCompiler = struct {
                     const r = try self.compileExpr(init_node);
                     // Phase 4d: var declarations always define (not assign) — use DEFINE_GLOBAL
                     // so strict-mode functions don't throw ReferenceError for var bindings.
+                    try self.emitDefine(vd.name, r, line);
+                    self.freeReg();
+                } else if (vd.kind != .var_) {
+                    // Phase 7 baseline: emit explicit undefined initialization for let.
+                    // (TDZ for bc path will be added in a dedicated lexical-scope bytecode pass.)
+                    const r = self.allocReg();
+                    try self.emitOp(.LOAD_UNDEF, line);
+                    try self.emitU8(r);
                     try self.emitDefine(vd.name, r, line);
                     self.freeReg();
                 }
@@ -1066,9 +1117,7 @@ const FnCompiler = struct {
                         i -= 1;
                         if (std.mem.eql(u8, self.label_stack.items[i].name, lname)) {
                             try self.emitOp(.JMP, line);
-                            try self.label_stack.items[i].break_patches.append(
-                                self.arena, self.currentOffset()
-                            );
+                            try self.label_stack.items[i].break_patches.append(self.arena, self.currentOffset());
                             try self.emitI16(0);
                             break;
                         }
@@ -1115,7 +1164,7 @@ const FnCompiler = struct {
 
                 // Wait — freeReg pops the TOP which is rkeys now. Need different approach.
                 // Use robj_tmp directly as rkeys by overwriting it.
-// Keep rkeys (base_sp+1) live: set sp = base_sp+2 so ri/rlen allocate above rkeys.
+                // Keep rkeys (base_sp+1) live: set sp = base_sp+2 so ri/rlen allocate above rkeys.
                 // robj_tmp (base_sp) is effectively dead but its register is below rkeys.
                 self.sp = base_sp + 2; // rkeys = base_sp+1 is live
 
@@ -1137,16 +1186,11 @@ const FnCompiler = struct {
                 const loop_start = self.currentOffset();
 
                 // if ri >= rlen: exit
-                const rcond = self.allocReg();
-                try self.emitOp(.GE, line);
-                try self.emitU8(rcond);
+                try self.emitOp(.JGE, line);
                 try self.emitU8(ri);
                 try self.emitU8(rlen);
-                try self.emitOp(.JMP_IF_TRUE, line);
-                try self.emitU8(rcond);
                 const patch_exit = self.currentOffset();
                 try self.emitI16(0);
-                self.freeReg(); // free rcond
 
                 // rkey = keys[ri]
                 const rkey = self.allocReg();
@@ -1229,7 +1273,6 @@ const FnCompiler = struct {
 
                 var case_body_patches = try self.arena.alloc(usize, sw.cases.len);
                 var default_idx: ?usize = null;
-                const rtest = self.allocReg();
 
                 // Emit test chain.
                 for (sw.cases, 0..) |case, ci| {
@@ -1239,17 +1282,13 @@ const FnCompiler = struct {
                         continue;
                     }
                     const rcv = try self.compileExpr(case.test_.?);
-                    try self.emitOp(.SEQ, line);
-                    try self.emitU8(rtest);
+                    try self.emitOp(.JSEQ, line);
                     try self.emitU8(rdisc);
                     try self.emitU8(rcv);
                     self.freeReg(); // free rcv
-                    try self.emitOp(.JMP_IF_TRUE, line);
-                    try self.emitU8(rtest);
                     case_body_patches[ci] = self.currentOffset();
                     try self.emitI16(0);
                 }
-                self.freeReg(); // free rtest
                 self.freeReg(); // free rdisc
 
                 // JMP to default or end.
@@ -1395,6 +1434,14 @@ fn compileFunctionStrict(
     const num_regs = if (fc.max_regs > 0) fc.max_regs else 1;
 
     const f = try arena.create(BcFunction);
+    const ic_table = try arena.alloc(ic_mod.InlineCache, chunk.code.len);
+    for (ic_table) |*entry| entry.* = ic_mod.InlineCache{};
+    const arith_ic_table = try arena.alloc(ic_mod.ArithCache, chunk.code.len);
+    for (arith_ic_table) |*entry| entry.* = ic_mod.ArithCache{};
+    const typeof_ic_table = try arena.alloc(ic_mod.TypeofCache, chunk.code.len);
+    for (typeof_ic_table) |*entry| entry.* = ic_mod.TypeofCache{};
+    const instanceof_ic_table = try arena.alloc(ic_mod.InstanceofCache, chunk.code.len);
+    for (instanceof_ic_table) |*entry| entry.* = ic_mod.InstanceofCache{};
     f.* = BcFunction{
         .name = name,
         .arity = @intCast(params.len),
@@ -1403,6 +1450,10 @@ fn compileFunctionStrict(
         .child_functions = child_fns,
         .param_names = params,
         .is_strict = is_strict,
+        .ic_table = ic_table,
+        .arith_ic_table = arith_ic_table,
+        .typeof_ic_table = typeof_ic_table,
+        .instanceof_ic_table = instanceof_ic_table,
     };
     return f;
 }

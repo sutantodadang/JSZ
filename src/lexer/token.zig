@@ -19,6 +19,7 @@ pub const TokenKind = enum {
     colon,
     comma,
     dot,
+    ellipsis,
     question,
     // Operators
     plus,
@@ -98,6 +99,9 @@ pub const TokenKind = enum {
     kw_extends,
     kw_import,
     kw_super,
+    kw_yield,
+    kw_let,
+    kw_of,
     // Literal keywords
     kw_true,
     kw_false,
@@ -173,6 +177,9 @@ pub fn lookupKeyword(s: []const u8) ?TokenKind {
         .{ "extends", .kw_extends },
         .{ "import", .kw_import },
         .{ "super", .kw_super },
+        .{ "yield", .kw_yield },
+        .{ "let", .kw_let },
+        .{ "of", .kw_of },
         .{ "true", .kw_true },
         .{ "false", .kw_false },
         .{ "null", .kw_null },

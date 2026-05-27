@@ -67,9 +67,13 @@ jsz -i          # REPL (Phase 1)
 | `zig build test` | Run all unit tests |
 | `zig build fuzz` | Run fuzz harnesses (add `--fuzz` for fuzzing mode) |
 | `zig build conformance` | Run Test262 conformance suite |
+| `zig build conformance-summary` | Run Test262 with per-category bucket summary |
+| `zig build conformance-delta` | CI gate: fail on unexpected pass/fail flips |
+| `zig build conformance-dashboard` | Write `docs/CONFORMANCE_DASHBOARD.md` |
 | `zig build differential` | Run Node.js differential harness |
 | `zig build example-hello` | Build + run examples/hello.zig |
 | `zig build docs` | Generate API docs to zig-out/docs/ |
+| `zig build bench-phase6` | Run Phase 6 shape/IC property benchmarks |
 
 ---
 

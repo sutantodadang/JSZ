@@ -5,21 +5,54 @@ const std = @import("std");
 // ---------------------------------------------------------------- operators ---
 
 pub const BinaryOp = enum {
-    add, sub, mul, div, mod,
-    bit_and, bit_or, bit_xor, lshift, rshift, urshift,
-    lt, lte, gt, gte, instanceof, in,
-    eq, neq, strict_eq, strict_neq,
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    bit_and,
+    bit_or,
+    bit_xor,
+    lshift,
+    rshift,
+    urshift,
+    lt,
+    lte,
+    gt,
+    gte,
+    instanceof,
+    in,
+    eq,
+    neq,
+    strict_eq,
+    strict_neq,
 };
 
 pub const AssignOp = enum {
     assign,
-    add, sub, mul, div, mod,
-    bit_and, bit_or, bit_xor, lshift, rshift, urshift,
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    bit_and,
+    bit_or,
+    bit_xor,
+    lshift,
+    rshift,
+    urshift,
 };
 
 pub const UnaryOp = enum {
-    neg, pos, not, bit_not, typeof_, void_, delete_,
-    pre_inc, pre_dec,
+    neg,
+    pos,
+    not,
+    bit_not,
+    typeof_,
+    void_,
+    delete_,
+    pre_inc,
+    pre_dec,
 };
 
 pub const LogicalOp = enum { and_, or_ };
@@ -44,6 +77,8 @@ pub const NodeKind = enum {
     update_expr,
     conditional_expr,
     sequence_expr,
+    spread_expr,
+    yield_expr,
     call_expr,
     new_expr,
     member_expr,
@@ -101,6 +136,8 @@ pub const Data = union(NodeKind) {
     update_expr: UpdateExpr,
     conditional_expr: CondExpr,
     sequence_expr: SeqExpr,
+    spread_expr: *Node,
+    yield_expr: ?*Node,
     call_expr: CallExpr,
     new_expr: NewExpr,
     member_expr: MemberExpr,
@@ -192,7 +229,11 @@ pub const MemberExpr = struct {
 pub const FuncExpr = struct {
     name: ?[]const u8,
     params: [][]const u8,
+    param_defaults: []?*Node = &[_]?*Node{},
+    rest_param: ?[]const u8 = null,
     body: []*Node,
+    is_arrow: bool = false,
+    is_generator: bool = false,
     is_strict: bool = false,
 };
 
@@ -221,6 +262,7 @@ pub const RegexLiteral = struct {
 
 pub const Program = struct {
     body: []*Node,
+    is_generator: bool = false,
     is_strict: bool = false,
 };
 
@@ -228,7 +270,14 @@ pub const BlockStmt = struct {
     body: []*Node,
 };
 
+pub const VarKind = enum {
+    var_,
+    let,
+    const_,
+};
+
 pub const VarDecl = struct {
+    kind: VarKind = .var_,
     name: []const u8,
     init: ?*Node,
 };
@@ -236,7 +285,10 @@ pub const VarDecl = struct {
 pub const FuncDecl = struct {
     name: []const u8,
     params: [][]const u8,
+    param_defaults: []?*Node = &[_]?*Node{},
+    rest_param: ?[]const u8 = null,
     body: []*Node,
+    is_generator: bool = false,
     is_strict: bool = false,
 };
 
@@ -284,6 +336,7 @@ pub const ForInStmt = struct {
     left: *Node,
     right: *Node,
     body: *Node,
+    iterate_values: bool = false,
 };
 
 /// Phase 4d: single case in a switch statement.

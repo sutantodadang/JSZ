@@ -1,0 +1,8 @@
+# Test262 tests that are currently expected to fail.
+# Keep this list in sync with `tests/test262_whitelist.txt`.
+# CI will fail when:
+# - a listed test starts passing (unexpected pass flip)
+# - an unlisted test starts failing (unexpected fail flip)
+#
+# Start empty, then add entries intentionally after reviewing
+# `zig build conformance-summary` output.

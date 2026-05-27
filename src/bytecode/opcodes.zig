@@ -29,6 +29,8 @@
 //!  USHR            |   4   | op, Rdst u8, Rlhs u8, Rrhs u8
 //!  NEG             |   3   | op, Rdst u8, Rsrc u8
 //!  BIT_NOT         |   3   | op, Rdst u8, Rsrc u8
+//!  INC             |   3   | op, Rdst u8, Rsrc u8   (Rdst = ToNumber(Rsrc)+1)
+//!  DEC             |   3   | op, Rdst u8, Rsrc u8   (Rdst = ToNumber(Rsrc)-1)
 //!  EQ              |   4   | op, Rdst u8, Rlhs u8, Rrhs u8
 //!  NEQ             |   4   | op, Rdst u8, Rlhs u8, Rrhs u8
 //!  SEQ             |   4   | op, Rdst u8, Rlhs u8, Rrhs u8
@@ -42,6 +44,8 @@
 //!  JMP             |   3   | op, offset i16-LE (relative to next instr)
 //!  JMP_IF_TRUE     |   4   | op, Rcond u8, offset i16-LE
 //!  JMP_IF_FALSE    |   4   | op, Rcond u8, offset i16-LE
+//!  JSEQ            |   5   | op, Rlhs u8, Rrhs u8, offset i16-LE
+//!  JGE             |   5   | op, Rlhs u8, Rrhs u8, offset i16-LE
 //!  NEW_CLOSURE     |   4   | op, Rdst u8, funcIdx u16-LE
 //!  CALL            |   4   | op, base u8, nargs u8, retDst u8
 //!  RETURN          |   2   | op, Rsrc u8
@@ -96,6 +100,8 @@ pub const Op = enum(u8) {
     USHR,
     NEG,
     BIT_NOT,
+    INC,
+    DEC,
     EQ,
     NEQ,
     SEQ,
@@ -109,6 +115,8 @@ pub const Op = enum(u8) {
     JMP,
     JMP_IF_TRUE,
     JMP_IF_FALSE,
+    JSEQ,
+    JGE,
     NEW_CLOSURE,
     CALL,
     RETURN,
@@ -165,6 +173,8 @@ pub fn instrSize(op: Op) usize {
         .USHR => 4,
         .NEG => 3,
         .BIT_NOT => 3,
+        .INC => 3,
+        .DEC => 3,
         .EQ => 4,
         .NEQ => 4,
         .SEQ => 4,
@@ -178,6 +188,8 @@ pub fn instrSize(op: Op) usize {
         .JMP => 3,
         .JMP_IF_TRUE => 4,
         .JMP_IF_FALSE => 4,
+        .JSEQ => 5,
+        .JGE => 5,
         .NEW_CLOSURE => 4,
         .CALL => 4,
         .RETURN => 2,

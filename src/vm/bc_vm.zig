@@ -17,6 +17,7 @@ const Environment = @import("../runtime/execution_context.zig").Environment;
 const Realm = @import("../runtime/realm.zig").Realm;
 const Heap = @import("../gc/heap.zig").Heap;
 const gc_mod = @import("../gc/gc.zig");
+const ic_mod = @import("./ic.zig");
 
 /// Phase 4a: a try entry pushed by PUSH_TRY.
 pub const TryEntry = struct {
@@ -220,37 +221,49 @@ pub const BcVm = struct {
 
             switch (op) {
                 .LOAD_K => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
                     frame.registers[rdst] = frame.func.chunk.constants[kidx];
                 },
                 .LOAD_TRUE => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, true);
                 },
                 .LOAD_FALSE => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, false);
                 },
                 .LOAD_NULL => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
                     frame.registers[rdst] = try val_mod.makeNull(self.arena);
                 },
                 .LOAD_UNDEF => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
                     frame.registers[rdst] = try val_mod.makeUndefined(self.arena);
                 },
                 .MOVE => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rsrc = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
                     frame.registers[rdst] = frame.registers[rsrc];
                 },
                 .GET_GLOBAL => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
                     const name_val = frame.func.chunk.constants[kidx];
                     const name = name_val.toPtr().string;
@@ -262,10 +275,13 @@ pub const BcVm = struct {
                     };
                 },
                 .SET_GLOBAL => {
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
-                    const rsrc = code[frame.pc]; frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
                     const name_val = frame.func.chunk.constants[kidx];
                     const name = name_val.toPtr().string;
                     const value = frame.registers[rsrc];
@@ -292,10 +308,13 @@ pub const BcVm = struct {
                 .DEFINE_GLOBAL => {
                     // Phase 4d: always define (never throws ReferenceError in strict mode).
                     // Used for var declarations, catch-variable bindings, function declarations.
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
-                    const rsrc = code[frame.pc]; frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
                     const name_val = frame.func.chunk.constants[kidx];
                     const name = name_val.toPtr().string;
                     const value = frame.registers[rsrc];
@@ -309,193 +328,412 @@ pub const BcVm = struct {
                     };
                 },
                 .GET_LOCAL => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const slot = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const slot = code[frame.pc];
+                    frame.pc += 1;
                     // GET_LOCAL reads from registers[slot]. Also sync from env if defined there.
                     frame.registers[rdst] = frame.registers[slot];
                 },
                 .SET_LOCAL => {
-                    const slot = code[frame.pc]; frame.pc += 1;
-                    const rsrc = code[frame.pc]; frame.pc += 1;
+                    const slot = code[frame.pc];
+                    frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
                     frame.registers[slot] = frame.registers[rsrc];
                 },
                 .ADD => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
-                    frame.registers[rdst] = try self.jsAdd(lv, rv);
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv)) {
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, lv.toPtr().number + rv.toPtr().number);
+                    } else {
+                        frame.registers[rdst] = try self.jsAdd(lv, rv);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                    }
                 },
                 .SUB => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const r = toNumber(frame.registers[rlhs]) - toNumber(frame.registers[rrhs]);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        lv.toPtr().number - rv.toPtr().number
+                    else
+                        toNumber(lv) - toNumber(rv);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
                 },
                 .MUL => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const r = toNumber(frame.registers[rlhs]) * toNumber(frame.registers[rrhs]);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        lv.toPtr().number * rv.toPtr().number
+                    else
+                        toNumber(lv) * toNumber(rv);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
                 },
                 .DIV => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const r = toNumber(frame.registers[rlhs]) / toNumber(frame.registers[rrhs]);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        lv.toPtr().number / rv.toPtr().number
+                    else
+                        toNumber(lv) / toNumber(rv);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
                 },
                 .MOD => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const l = toNumber(frame.registers[rlhs]);
-                    const r = toNumber(frame.registers[rrhs]);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        lv.toPtr().number
+                    else
+                        toNumber(lv);
+                    const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        rv.toPtr().number
+                    else
+                        toNumber(rv);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
                     const res = std.math.mod(f64, l, r) catch std.math.nan(f64);
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, res);
                 },
                 .NEG => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rsrc = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, -toNumber(frame.registers[rsrc]));
                 },
                 .BIT_AND => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const r: i32 = toInt32(frame.registers[rlhs]) & toInt32(frame.registers[rrhs]);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                    else
+                        toInt32(lv);
+                    const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(i32, @intFromFloat(@trunc(rv.toPtr().number)))
+                    else
+                        toInt32(rv);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                    const r: i32 = l & r0;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
                 },
                 .BIT_OR => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const r: i32 = toInt32(frame.registers[rlhs]) | toInt32(frame.registers[rrhs]);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                    else
+                        toInt32(lv);
+                    const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(i32, @intFromFloat(@trunc(rv.toPtr().number)))
+                    else
+                        toInt32(rv);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                    const r: i32 = l | r0;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
                 },
                 .BIT_XOR => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const r: i32 = toInt32(frame.registers[rlhs]) ^ toInt32(frame.registers[rrhs]);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                    else
+                        toInt32(lv);
+                    const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(i32, @intFromFloat(@trunc(rv.toPtr().number)))
+                    else
+                        toInt32(rv);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                    const r: i32 = l ^ r0;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
                 },
                 .SHL => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const shift: u5 = @intCast(toUint32(frame.registers[rrhs]) & 0x1F);
-                    const r: i32 = toInt32(frame.registers[rlhs]) << shift;
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                    else
+                        toInt32(lv);
+                    const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(u32, @intFromFloat(@trunc(rv.toPtr().number)))
+                    else
+                        toUint32(rv)) & 0x1F);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                    const r: i32 = l << shift;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
                 },
                 .SHR => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const shift: u5 = @intCast(toUint32(frame.registers[rrhs]) & 0x1F);
-                    const r: i32 = toInt32(frame.registers[rlhs]) >> shift;
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                    else
+                        toInt32(lv);
+                    const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(u32, @intFromFloat(@trunc(rv.toPtr().number)))
+                    else
+                        toUint32(rv)) & 0x1F);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                    const r: i32 = l >> shift;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
                 },
                 .USHR => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const u: u32 = @bitCast(toInt32(frame.registers[rlhs]));
-                    const shift: u5 = @intCast(toUint32(frame.registers[rrhs]) & 0x1F);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                    else
+                        toInt32(lv);
+                    const u: u32 = @bitCast(l);
+                    const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                        @as(u32, @intFromFloat(@trunc(rv.toPtr().number)))
+                    else
+                        toUint32(rv)) & 0x1F);
+                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
                     const r: u32 = u >> shift;
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
                 },
                 .BIT_NOT => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rsrc = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
                     const r: i32 = ~toInt32(frame.registers[rsrc]);
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
                 },
+                .INC => {
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
+                    const r = toNumber(frame.registers[rsrc]) + 1.0;
+                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                },
+                .DEC => {
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
+                    const r = toNumber(frame.registers[rsrc]) - 1.0;
+                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                },
                 .EQ => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
                     const r = jsAbstractEqual(frame.registers[rlhs], frame.registers[rrhs]);
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
                 },
                 .NEQ => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
                     const r = !jsAbstractEqual(frame.registers[rlhs], frame.registers[rrhs]);
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
                 },
                 .SEQ => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
                     const r = jsStrictEqual(frame.registers[rlhs], frame.registers[rrhs]);
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
                 },
                 .SNEQ => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
                     const r = !jsStrictEqual(frame.registers[rlhs], frame.registers[rrhs]);
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
                 },
                 .LT => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
                     const r = jsLessThan(frame.registers[rlhs], frame.registers[rrhs]) orelse false;
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
                 },
                 .LE => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
                     // a <= b == !(b < a)
                     const r2 = jsLessThan(frame.registers[rrhs], frame.registers[rlhs]);
                     const r = if (r2) |v| !v else false;
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
                 },
                 .GT => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
                     const r = jsLessThan(frame.registers[rrhs], frame.registers[rlhs]) orelse false;
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
                 },
                 .GE => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
                     // a >= b == !(a < b)
                     const r2 = jsLessThan(frame.registers[rlhs], frame.registers[rrhs]);
                     const r = if (r2) |v| !v else false;
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
                 },
                 .NOT => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rsrc = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, !isTruthy(frame.registers[rsrc]));
                 },
                 .TYPEOF => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rsrc = code[frame.pc]; frame.pc += 1;
-                    const ts = typeofValue(frame.registers[rsrc]);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
+                    const tv = frame.registers[rsrc];
+                    const info = classifyTypeof(tv);
+                    const cache = &@constCast(frame.func.typeof_ic_table)[site_pc];
+                    const hit = cache.initialized and cache.tag == info.tag and
+                        (info.shape == null or cache.shape == info.shape);
+                    const ts = if (hit) cache.result else info.result;
+                    if (!hit) {
+                        cache.initialized = true;
+                        cache.tag = info.tag;
+                        cache.shape = info.shape;
+                        cache.result = info.result;
+                    }
                     frame.registers[rdst] = try val_mod.makeString(self.arena, ts);
                 },
                 .JMP => {
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
                     const new_pc: i64 = @intCast(frame.pc);
                     frame.pc = @intCast(new_pc + offset);
                 },
                 .JMP_IF_TRUE => {
-                    const rcond = code[frame.pc]; frame.pc += 1;
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const rcond = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
                     if (isTruthy(frame.registers[rcond])) {
                         const new_pc: i64 = @intCast(frame.pc);
@@ -503,19 +741,57 @@ pub const BcVm = struct {
                     }
                 },
                 .JMP_IF_FALSE => {
-                    const rcond = code[frame.pc]; frame.pc += 1;
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const rcond = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
                     if (!isTruthy(frame.registers[rcond])) {
                         const new_pc: i64 = @intCast(frame.pc);
                         frame.pc = @intCast(new_pc + offset);
                     }
                 },
+                .JSEQ => {
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
+                    const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
+                    if (jsStrictEqual(frame.registers[rlhs], frame.registers[rrhs])) {
+                        const new_pc: i64 = @intCast(frame.pc);
+                        frame.pc = @intCast(new_pc + offset);
+                    }
+                },
+                .JGE => {
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
+                    const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
+                    const lt = jsLessThan(frame.registers[rlhs], frame.registers[rrhs]);
+                    const ge = if (lt) |v| !v else false;
+                    if (ge) {
+                        const new_pc: i64 = @intCast(frame.pc);
+                        frame.pc = @intCast(new_pc + offset);
+                    }
+                },
                 .NEW_CLOSURE => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const fidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
                     const child_fn = frame.func.child_functions[fidx];
                     const closure = try self.arena.create(BcClosure);
@@ -528,9 +804,12 @@ pub const BcVm = struct {
                     frame.registers[rdst] = Value.fromPtr(jsv);
                 },
                 .CALL => {
-                    const base = code[frame.pc]; frame.pc += 1;
-                    const nargs = code[frame.pc]; frame.pc += 1;
-                    const ret_dst = code[frame.pc]; frame.pc += 1;
+                    const base = code[frame.pc];
+                    frame.pc += 1;
+                    const nargs = code[frame.pc];
+                    frame.pc += 1;
+                    const ret_dst = code[frame.pc];
+                    frame.pc += 1;
 
                     const callee_val = frame.registers[base];
                     const this_val = try val_mod.makeUndefined(self.arena); // CALL: this = undefined
@@ -552,9 +831,12 @@ pub const BcVm = struct {
                     }
                 },
                 .METHOD_CALL => {
-                    const base = code[frame.pc]; frame.pc += 1;
-                    const nargs = code[frame.pc]; frame.pc += 1;
-                    const ret_dst = code[frame.pc]; frame.pc += 1;
+                    const base = code[frame.pc];
+                    frame.pc += 1;
+                    const nargs = code[frame.pc];
+                    frame.pc += 1;
+                    const ret_dst = code[frame.pc];
+                    frame.pc += 1;
 
                     // R[base] = this object, R[base+1] = function value
                     const this_val = frame.registers[base];
@@ -576,7 +858,8 @@ pub const BcVm = struct {
                     }
                 },
                 .RETURN => {
-                    const rsrc = code[frame.pc]; frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
                     const result = frame.registers[rsrc];
                     const caller_idx = frame.caller_idx;
                     const ret_dst = frame.return_dst;
@@ -616,7 +899,8 @@ pub const BcVm = struct {
                 },
                 // -------------------------------------------------------- Phase 3a/3b ---
                 .NEW_OBJECT => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
                     const obj = if (self.heap) |heap|
                         try JsObject.createOnHeap(heap, self.realm.object_prototype)
                     else
@@ -624,8 +908,10 @@ pub const BcVm = struct {
                     frame.registers[rdst] = try val_mod.makeObject(self.arena, obj);
                 },
                 .NEW_ARRAY => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    _ = code[frame.pc]; frame.pc += 1; // length hint (unused in runtime)
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    _ = code[frame.pc];
+                    frame.pc += 1; // length hint (unused in runtime)
                     const arr = if (self.heap) |heap|
                         try JsObject.createArrayOnHeap(heap, self.realm.array_prototype)
                     else
@@ -633,54 +919,145 @@ pub const BcVm = struct {
                     frame.registers[rdst] = try val_mod.makeObject(self.arena, arr);
                 },
                 .GET_PROP => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const robj = code[frame.pc]; frame.pc += 1;
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const robj = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
                     const key_val = frame.func.chunk.constants[kidx];
                     const key = key_val.toPtr().string;
                     const obj_val = frame.registers[robj];
-                    frame.registers[rdst] = try self.getProp(obj_val, key);
+                    const site_cache = &@constCast(frame.func.ic_table)[site_pc];
+                    if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                        const obj = obj_val.toPtr().object;
+                        if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
+                            if (site_cache.lookup(key, obj.shapePtr())) |slot| {
+                                if (obj.getOwnBySlot(obj.shapePtr(), slot)) |cached| {
+                                    frame.registers[rdst] = cached;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    const result = try self.getProp(obj_val, key);
+                    frame.registers[rdst] = result;
+                    if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                        const obj = obj_val.toPtr().object;
+                        if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
+                            if (obj.resolveOwnSlot(key)) |slot| {
+                                site_cache.record(key, obj.shapePtr(), slot);
+                            }
+                        }
+                    }
                 },
                 .GET_PROP_DYN => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const robj = code[frame.pc]; frame.pc += 1;
-                    const rkey = code[frame.pc]; frame.pc += 1;
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const robj = code[frame.pc];
+                    frame.pc += 1;
+                    const rkey = code[frame.pc];
+                    frame.pc += 1;
                     const obj_val = frame.registers[robj];
                     const key_val = frame.registers[rkey];
-                    const key = try valueToStringArena(self.arena, key_val);
-                    frame.registers[rdst] = try self.getProp(obj_val, key);
+                    if (key_val.bits != 0 and key_val.toPtr().* == .string) {
+                        const key = key_val.toPtr().string;
+                        const site_cache = &@constCast(frame.func.ic_table)[site_pc];
+                        if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                            const obj = obj_val.toPtr().object;
+                            if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
+                                if (site_cache.lookup(key, obj.shapePtr())) |slot| {
+                                    if (obj.getOwnBySlot(obj.shapePtr(), slot)) |cached| {
+                                        frame.registers[rdst] = cached;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        const result = try self.getProp(obj_val, key);
+                        frame.registers[rdst] = result;
+                        if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                            const obj = obj_val.toPtr().object;
+                            if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
+                                if (obj.resolveOwnSlot(key)) |slot| {
+                                    site_cache.record(key, obj.shapePtr(), slot);
+                                }
+                            }
+                        }
+                    } else {
+                        const key = try valueToStringArena(self.arena, key_val);
+                        frame.registers[rdst] = try self.getProp(obj_val, key);
+                    }
                 },
                 .SET_PROP => {
-                    const robj = code[frame.pc]; frame.pc += 1;
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const site_pc = frame.pc - 1;
+                    const robj = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
-                    const rval = code[frame.pc]; frame.pc += 1;
+                    const rval = code[frame.pc];
+                    frame.pc += 1;
                     const key_val = frame.func.chunk.constants[kidx];
                     const key = key_val.toPtr().string;
                     const obj_val = frame.registers[robj];
                     const val = frame.registers[rval];
                     try self.setProp(obj_val, key, val);
+                    const site_cache = &@constCast(frame.func.ic_table)[site_pc];
+                    if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                        const obj = obj_val.toPtr().object;
+                        if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
+                            if (obj.resolveOwnSlot(key)) |slot| {
+                                site_cache.record(key, obj.shapePtr(), slot);
+                            }
+                        }
+                    }
                 },
                 .SET_PROP_DYN => {
-                    const robj = code[frame.pc]; frame.pc += 1;
-                    const rkey = code[frame.pc]; frame.pc += 1;
-                    const rval = code[frame.pc]; frame.pc += 1;
+                    const site_pc = frame.pc - 1;
+                    const robj = code[frame.pc];
+                    frame.pc += 1;
+                    const rkey = code[frame.pc];
+                    frame.pc += 1;
+                    const rval = code[frame.pc];
+                    frame.pc += 1;
                     const obj_val = frame.registers[robj];
                     const key_val = frame.registers[rkey];
                     const val = frame.registers[rval];
-                    const key = try valueToStringArena(self.arena, key_val);
-                    try self.setProp(obj_val, key, val);
+                    if (key_val.bits != 0 and key_val.toPtr().* == .string) {
+                        const key = key_val.toPtr().string;
+                        try self.setProp(obj_val, key, val);
+                        const site_cache = &@constCast(frame.func.ic_table)[site_pc];
+                        if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                            const obj = obj_val.toPtr().object;
+                            if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
+                                if (obj.resolveOwnSlot(key)) |slot| {
+                                    site_cache.record(key, obj.shapePtr(), slot);
+                                }
+                            }
+                        }
+                    } else {
+                        const key = try valueToStringArena(self.arena, key_val);
+                        try self.setProp(obj_val, key, val);
+                    }
                 },
                 .GET_THIS => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
                     frame.registers[rdst] = frame.this_val;
                 },
                 // -------------------------------------------------------- Phase 4a ---
                 .THROW => {
-                    const rsrc = code[frame.pc]; frame.pc += 1;
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
                     const thrown_val = frame.registers[rsrc];
                     self.last_exception_value = thrown_val;
 
@@ -713,9 +1090,12 @@ pub const BcVm = struct {
                     }
                 },
                 .PUSH_TRY => {
-                    const rexc = code[frame.pc]; frame.pc += 1;
-                    const lo = code[frame.pc]; frame.pc += 1;
-                    const hi = code[frame.pc]; frame.pc += 1;
+                    const rexc = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
                     const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
                     const handler_pc: usize = @intCast(@as(i64, @intCast(frame.pc)) + offset);
                     try frame.try_stack.append(self.arena, TryEntry{
@@ -729,9 +1109,12 @@ pub const BcVm = struct {
                     }
                 },
                 .NEW_INSTANCE => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const base = code[frame.pc]; frame.pc += 1;
-                    const nargs = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const base = code[frame.pc];
+                    frame.pc += 1;
+                    const nargs = code[frame.pc];
+                    frame.pc += 1;
                     const callee_val = frame.registers[base];
                     const outcome = try self.doConstruct(callee_val, base, nargs, rdst);
                     if (outcome) |msg| {
@@ -748,16 +1131,42 @@ pub const BcVm = struct {
                     }
                 },
                 .INSTANCEOF => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const rlhs = code[frame.pc]; frame.pc += 1;
-                    const rrhs = code[frame.pc]; frame.pc += 1;
-                    const result = jsInstanceof(frame.registers[rlhs], frame.registers[rrhs]);
+                    const site_pc = frame.pc - 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lhs = frame.registers[rlhs];
+                    const rhs = frame.registers[rrhs];
+                    var result = false;
+                    const cache = &@constCast(frame.func.instanceof_ic_table)[site_pc];
+                    if (rhs.bits != 0 and rhs.toPtr().* == .object) {
+                        const rhs_obj = rhs.toPtr().object;
+                        var target_proto: ?*JsObject = null;
+                        if (cache.initialized and cache.rhs_obj != null and cache.rhs_obj.? == @as(*anyopaque, @ptrCast(rhs_obj))) {
+                            if (cache.target_proto) |tp| target_proto = @ptrCast(@alignCast(tp));
+                        } else {
+                            if (rhs_obj.get("prototype")) |pv| {
+                                if (pv.bits != 0 and pv.toPtr().* == .object) target_proto = pv.toPtr().object;
+                            }
+                            cache.initialized = true;
+                            cache.rhs_obj = @ptrCast(rhs_obj);
+                            cache.target_proto = if (target_proto) |tp| @ptrCast(tp) else null;
+                        }
+                        result = jsInstanceofWithTarget(lhs, target_proto);
+                    } else {
+                        result = false;
+                    }
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, result);
                 },
                 // Phase 4d
                 .GET_KEYS => {
-                    const rdst = code[frame.pc]; frame.pc += 1;
-                    const robj = code[frame.pc]; frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const robj = code[frame.pc];
+                    frame.pc += 1;
                     const obj_val = frame.registers[robj];
                     const arr_obj = if (self.heap) |heap|
                         try JsObject.createOnHeap(heap, self.realm.array_prototype)
@@ -954,6 +1363,9 @@ pub const BcVm = struct {
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength()));
                 }
+                if (obj.resolveOwnSlot(key)) |slot| {
+                    if (obj.getOwnBySlot(obj.shapePtr(), slot)) |v| return v;
+                }
                 if (obj.get(key)) |v| return v;
                 return val_mod.makeUndefined(self.arena);
             },
@@ -985,6 +1397,12 @@ pub const BcVm = struct {
         if (obj_val.bits == 0) return;
         switch (obj_val.toPtr().*) {
             .object => |obj| {
+                if (obj.resolveOwnSlot(key)) |slot| {
+                    if (obj.setOwnBySlot(obj.shapePtr(), slot, value)) {
+                        try obj.props.put(obj.arena, key, value);
+                        return;
+                    }
+                }
                 try obj.set(key, value);
             },
             else => {},
@@ -1020,7 +1438,10 @@ pub const BcVm = struct {
                 if (fn_ptr.name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
-                        if (std.mem.eql(u8, p, fname)) { is_param = true; break; }
+                        if (std.mem.eql(u8, p, fname)) {
+                            is_param = true;
+                            break;
+                        }
                     }
                     if (!is_param) {
                         call_env.define(fname, callee_val) catch {};
@@ -1047,7 +1468,10 @@ pub const BcVm = struct {
                 if (fn_ptr.name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
-                        if (std.mem.eql(u8, p, fname)) { is_param = true; break; }
+                        if (std.mem.eql(u8, p, fname)) {
+                            is_param = true;
+                            break;
+                        }
                     }
                     if (!is_param) {
                         const nfe_slot = fn_ptr.param_names.len;
@@ -1185,7 +1609,10 @@ pub const BcVm = struct {
                 if (fn_ptr.name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
-                        if (std.mem.eql(u8, p, fname)) { is_param = true; break; }
+                        if (std.mem.eql(u8, p, fname)) {
+                            is_param = true;
+                            break;
+                        }
                     }
                     if (!is_param) {
                         call_env.define(fname, callee_val) catch {};
@@ -1210,7 +1637,10 @@ pub const BcVm = struct {
                 if (fn_ptr.name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
-                        if (std.mem.eql(u8, p, fname)) { is_param = true; break; }
+                        if (std.mem.eql(u8, p, fname)) {
+                            is_param = true;
+                            break;
+                        }
                     }
                     if (!is_param) {
                         const nfe_slot = fn_ptr.param_names.len;
@@ -1323,6 +1753,45 @@ fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
 
 // ---------------------------------------------------------------- semantics helpers ---
 // Mirror vm.zig exactly. These MUST stay in sync.
+
+fn isNumberValue(v: Value) bool {
+    return v.bits != 0 and v.toPtr().* == .number;
+}
+
+fn classifyTypeof(v: Value) struct {
+    tag: ic_mod.TypeofTag,
+    shape: ?*anyopaque,
+    result: []const u8,
+} {
+    if (v.bits == 0) return .{ .tag = .undefined_, .shape = null, .result = "undefined" };
+    return switch (v.toPtr().*) {
+        .undefined_ => .{ .tag = .undefined_, .shape = null, .result = "undefined" },
+        .null_ => .{ .tag = .null_, .shape = null, .result = "object" },
+        .boolean => .{ .tag = .boolean, .shape = null, .result = "boolean" },
+        .number => .{ .tag = .number, .shape = null, .result = "number" },
+        .string => .{ .tag = .string, .shape = null, .result = "string" },
+        .function, .bc_function, .native_function => .{ .tag = .function_like, .shape = null, .result = "function" },
+        .object => |obj| blk: {
+            const callable = obj.get("__call__") != null;
+            break :blk .{
+                .tag = if (callable) .function_like else .object_like,
+                .shape = obj.shapePtr(),
+                .result = if (callable) "function" else "object",
+            };
+        },
+    };
+}
+
+fn jsInstanceofWithTarget(lhs: Value, target_proto: ?*JsObject) bool {
+    if (lhs.bits == 0 or target_proto == null) return false;
+    if (lhs.toPtr().* != .object) return false;
+    var cur: ?*JsObject = lhs.toPtr().object;
+    while (cur) |obj| {
+        if (obj == target_proto.?) return true;
+        cur = obj.proto;
+    }
+    return false;
+}
 
 pub fn isTruthy(v: Value) bool {
     if (v.bits == 0) return false;

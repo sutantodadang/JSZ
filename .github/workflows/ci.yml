@@ -18,6 +18,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Zig 0.15.2
         uses: goto-bus-stop/setup-zig@v2
@@ -29,3 +31,7 @@ jobs:
 
       - name: Test
         run: zig build test -Doptimize=${{ matrix.optimize }}
+
+      - name: Conformance delta (known-failing flip gate)
+        if: matrix.os == 'ubuntu-latest' && matrix.optimize == 'Debug'
+        run: zig build conformance-delta -Doptimize=${{ matrix.optimize }}

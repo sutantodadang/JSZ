@@ -244,7 +244,17 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer allocator.free(file_source);
-            try runEval(allocator, file_source, args.script_path, args.interp, args.dump_bytecode, args.gc_stats, args.gc_after_eval);
+            const cjs_wrapped = std.fmt.allocPrint(
+                allocator,
+                "var module = {{ exports: {{}} }}; var exports = module.exports; {s}\nmodule.exports;",
+                .{file_source},
+            ) catch {
+                try stderr.print("jsz: out of memory wrapping script\n", .{});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            defer allocator.free(cjs_wrapped);
+            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.gc_stats, args.gc_after_eval);
         },
     }
 }

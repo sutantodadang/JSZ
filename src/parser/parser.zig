@@ -16,6 +16,12 @@ const isAssignOp = prec_mod.isAssignOp;
 const recovery = @import("./recovery.zig");
 pub const ParseError = recovery.ParseError;
 
+const ParamParse = struct {
+    params: [][]const u8,
+    param_defaults: []?*Node,
+    rest_param: ?[]const u8,
+};
+
 pub const ParseResult = union(enum) {
     ok: []*Node,
     err: ParseError,
@@ -29,6 +35,7 @@ pub const Parser = struct {
     /// True if we hit an unrecoverable error.
     had_error: bool,
     error_info: ?ParseError,
+    in_generator_function: bool,
 
     pub fn init(source: []const u8, arena: std.mem.Allocator) Parser {
         var p = Parser{
@@ -37,6 +44,7 @@ pub const Parser = struct {
             .current = undefined,
             .had_error = false,
             .error_info = null,
+            .in_generator_function = false,
         };
         // Prime the lookahead.
         p.current = p.lexNext();
@@ -182,14 +190,11 @@ pub const Parser = struct {
                 // Not a label — restore by re-parsing as expr statement.
                 // We consumed the identifier, so construct an identifier node.
                 const ident_node = self.makeNode(.identifier, saved_tok.start, saved_tok.end, .{
-                    .identifier = if (std.mem.eql(u8, saved_tok.value_str, "undefined"))
-                        blk: {
-                            // It was an undefined literal but we already consumed it.
-                            // Just return an undefined literal stmt.
-                            break :blk saved_tok.value_str;
-                        }
-                    else
-                        saved_tok.value_str,
+                    .identifier = if (std.mem.eql(u8, saved_tok.value_str, "undefined")) blk: {
+                        // It was an undefined literal but we already consumed it.
+                        // Just return an undefined literal stmt.
+                        break :blk saved_tok.value_str;
+                    } else saved_tok.value_str,
                 }) orelse return null;
                 // Now parse the rest as an expression starting from ident_node.
                 const full_expr = self.parseExprFromIdent(ident_node) orelse return null;
@@ -200,6 +205,9 @@ pub const Parser = struct {
         return switch (self.current.kind) {
             .left_brace => self.parseBlock(),
             .kw_var => self.parseVarDeclStmt(),
+            .kw_let => self.parseLexicalDeclStmt(.let),
+            .kw_const => self.parseLexicalDeclStmt(.const_),
+            .kw_class => self.parseClassDeclStmt(),
             .kw_function => self.parseFunctionDecl(),
             .kw_if => self.parseIfStmt(),
             .kw_while => self.parseWhileStmt(),
@@ -314,10 +322,16 @@ pub const Parser = struct {
         // Comma
         if (self.check(.comma)) {
             var exprs = std.ArrayList(*Node){};
-            exprs.append(self.arena, base) catch { self.had_error = true; return null; };
+            exprs.append(self.arena, base) catch {
+                self.had_error = true;
+                return null;
+            };
             while (self.match(.comma)) {
                 const e = self.parseAssignmentExpr() orelse return null;
-                exprs.append(self.arena, e) catch { self.had_error = true; return null; };
+                exprs.append(self.arena, e) catch {
+                    self.had_error = true;
+                    return null;
+                };
             }
             base = self.makeNode(.sequence_expr, base.start, self.current.start, .{
                 .sequence_expr = .{ .exprs = exprs.items },
@@ -332,7 +346,10 @@ pub const Parser = struct {
         var body = std.ArrayList(*Node){};
         while (!self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
-            body.append(self.arena, s) catch { self.had_error = true; break; };
+            body.append(self.arena, s) catch {
+                self.had_error = true;
+                break;
+            };
         }
         _ = self.expect(.right_brace) orelse return null;
         const end = self.current.start;
@@ -343,59 +360,393 @@ pub const Parser = struct {
     fn parseVarDeclStmt(self: *Parser) ?*Node {
         const start = self.current.start;
         _ = self.advance(); // consume 'var'
-        return self.parseVarDeclarators(start);
+        return self.parseVarDeclarators(start, .var_, true);
+    }
+
+    fn parseLexicalDeclStmt(self: *Parser, kind: ast.VarKind) ?*Node {
+        const start = self.current.start;
+        _ = self.advance(); // consume let/const
+        return self.parseVarDeclarators(start, kind, true);
     }
 
     /// Parse one or more var declarators (comma separated). Returns a sequence
     /// if multiple, single VarDecl if one. For for-loop init this is fine.
-    fn parseVarDeclarators(self: *Parser, start: u32) ?*Node {
+    fn parseVarDeclarators(self: *Parser, start: u32, kind: ast.VarKind, consume_semicolon: bool) ?*Node {
         var decls = std.ArrayList(*Node){};
         while (true) {
-            const d = self.parseVarDeclarator() orelse return null;
-            decls.append(self.arena, d) catch { self.had_error = true; return null; };
+            const d = self.parseVarDeclarator(kind) orelse return null;
+            decls.append(self.arena, d) catch {
+                self.had_error = true;
+                return null;
+            };
             if (!self.match(.comma)) break;
         }
-        self.consumeSemicolon();
+        if (consume_semicolon) self.consumeSemicolon();
         if (decls.items.len == 1) return decls.items[0];
         // Multiple declarators: wrap in a block_stmt (not ideal, but works for eval)
         return self.makeNode(.block_stmt, start, self.current.start, .{ .block_stmt = .{ .body = decls.items } });
     }
 
-    fn parseVarDeclarator(self: *Parser) ?*Node {
+    fn parseVarDeclarator(self: *Parser, kind: ast.VarKind) ?*Node {
         const start = self.current.start;
+        if (self.check(.left_bracket) or self.check(.left_brace)) {
+            return self.parseDestructuringDeclarator(kind, start);
+        }
         const name_tok = self.expect(.identifier) orelse return null;
         const name = name_tok.value_str;
         var init_node: ?*Node = null;
         if (self.match(.eq)) {
             init_node = self.parseAssignmentExpr();
         }
+        if (kind == .const_ and init_node == null) {
+            if (!self.had_error) {
+                self.had_error = true;
+                self.error_info = ParseError{
+                    .message = "const declaration requires an initializer",
+                    .line = name_tok.line,
+                    .column = name_tok.column,
+                };
+            }
+            return null;
+        }
         const end = self.current.start;
-        return self.makeNode(.var_decl, start, end, .{ .var_decl = .{ .name = name, .init = init_node } });
+        return self.makeNode(.var_decl, start, end, .{ .var_decl = .{ .kind = kind, .name = name, .init = init_node } });
+    }
+
+    fn parseDestructuringDeclarator(self: *Parser, kind: ast.VarKind, start: u32) ?*Node {
+        var names = std.ArrayList([]const u8){};
+        const is_array = self.match(.left_bracket);
+        if (is_array) {
+            while (!self.check(.right_bracket) and !self.check(.eof) and !self.had_error) {
+                if (self.check(.comma)) {
+                    _ = self.advance();
+                    continue;
+                }
+                const t = self.expect(.identifier) orelse return null;
+                names.append(self.arena, t.value_str) catch return null;
+                if (!self.match(.comma)) break;
+            }
+            _ = self.expect(.right_bracket) orelse return null;
+        } else {
+            _ = self.expect(.left_brace) orelse return null;
+            while (!self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
+                const key = self.expect(.identifier) orelse return null;
+                var bind_name = key.value_str;
+                if (self.match(.colon)) {
+                    const alias = self.expect(.identifier) orelse return null;
+                    bind_name = alias.value_str;
+                }
+                names.append(self.arena, bind_name) catch return null;
+                if (!self.match(.comma)) break;
+            }
+            _ = self.expect(.right_brace) orelse return null;
+        }
+        _ = self.expect(.eq) orelse return null;
+        const rhs = self.parseAssignmentExpr() orelse return null;
+        const tmp_name = std.fmt.allocPrint(self.arena, "__destruct_{d}", .{start}) catch return null;
+
+        var body = std.ArrayList(*Node){};
+        const tmp_decl = self.makeNode(.var_decl, start, self.current.start, .{
+            .var_decl = .{ .kind = kind, .name = tmp_name, .init = rhs },
+        }) orelse return null;
+        body.append(self.arena, tmp_decl) catch return null;
+
+        for (names.items, 0..) |n, i| {
+            const tmp_id = self.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
+            const access = if (is_array) blk: {
+                const idx = self.makeNode(.number_literal, start, start, .{ .number_literal = @floatFromInt(i) }) orelse return null;
+                break :blk self.makeNode(.member_expr, start, start, .{
+                    .member_expr = .{ .object = tmp_id, .property = idx, .computed = true },
+                }) orelse return null;
+            } else blk: {
+                const prop = self.makeNode(.identifier, start, start, .{ .identifier = n }) orelse return null;
+                break :blk self.makeNode(.member_expr, start, start, .{
+                    .member_expr = .{ .object = tmp_id, .property = prop, .computed = false },
+                }) orelse return null;
+            };
+            const vd = self.makeNode(.var_decl, start, self.current.start, .{
+                .var_decl = .{ .kind = kind, .name = n, .init = access },
+            }) orelse return null;
+            body.append(self.arena, vd) catch return null;
+        }
+        return self.makeNode(.block_stmt, start, self.current.start, .{
+            .block_stmt = .{ .body = body.items },
+        });
     }
 
     fn parseFunctionDecl(self: *Parser) ?*Node {
         const start = self.current.start;
         _ = self.advance(); // consume 'function'
+        const is_generator = self.match(.star);
         const name_tok = self.expect(.identifier) orelse return null;
         const name = name_tok.value_str;
-        const params = self.parseFunctionParams() orelse return null;
-        const body = self.parseFunctionBody() orelse return null;
+        const parsed_params = self.parseFunctionParams() orelse return null;
+        const prev_gen = self.in_generator_function;
+        self.in_generator_function = is_generator;
+        const body = self.parseFunctionBody() orelse {
+            self.in_generator_function = prev_gen;
+            return null;
+        };
+        self.in_generator_function = prev_gen;
         const is_strict = hasUseStrict(body);
         return self.makeNode(.function_decl, start, self.current.start, .{
-            .function_decl = .{ .name = name, .params = params, .body = body, .is_strict = is_strict },
+            .function_decl = .{
+                .name = name,
+                .params = parsed_params.params,
+                .param_defaults = parsed_params.param_defaults,
+                .rest_param = parsed_params.rest_param,
+                .body = body,
+                .is_generator = is_generator,
+                .is_strict = is_strict,
+            },
         });
     }
 
-    fn parseFunctionParams(self: *Parser) ?[][]const u8 {
+    fn parseClassDeclStmt(self: *Parser) ?*Node {
+        const start = self.current.start;
+        _ = self.advance(); // class
+        const name_tok = self.expect(.identifier) orelse return null;
+        const class_name = name_tok.value_str;
+
+        var super_name: ?[]const u8 = null;
+        if (self.match(.kw_extends)) {
+            const s = self.expect(.identifier) orelse return null;
+            super_name = s.value_str;
+        }
+
+        _ = self.expect(.left_brace) orelse return null;
+        var ctor_params: [][]const u8 = &[_][]const u8{};
+        var ctor_body: []*Node = &[_]*Node{};
+        var methods = std.ArrayList(struct { name: []const u8, params: [][]const u8, body: []*Node }){};
+        while (!self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
+            if (!self.check(.identifier)) {
+                _ = self.advance();
+                continue;
+            }
+            const mname_tok = self.advance();
+            const mname = mname_tok.value_str;
+            const mparams = self.parseFunctionParams() orelse return null;
+            const mbody = self.parseFunctionBody() orelse return null;
+            if (std.mem.eql(u8, mname, "constructor")) {
+                ctor_params = mparams.params;
+                ctor_body = mbody;
+            } else {
+                methods.append(self.arena, .{ .name = mname, .params = mparams.params, .body = mbody }) catch return null;
+            }
+        }
+        _ = self.expect(.right_brace) orelse return null;
+
+        if (ctor_body.len == 0) {
+            if (super_name != null) {
+                // Derived class default constructor: super.call(this)
+                const id_super = self.makeNode(.identifier, start, start, .{ .identifier = "super" }) orelse return null;
+                const id_call = self.makeNode(.identifier, start, start, .{ .identifier = "call" }) orelse return null;
+                const super_call = self.makeNode(.member_expr, start, start, .{
+                    .member_expr = .{ .object = id_super, .property = id_call, .computed = false },
+                }) orelse return null;
+                const this_expr = self.makeNode(.this_expr, start, start, .{ .this_expr = {} }) orelse return null;
+                var super_args = std.ArrayList(*Node){};
+                super_args.append(self.arena, this_expr) catch return null;
+                const super_call_expr = self.makeNode(.call_expr, start, start, .{
+                    .call_expr = .{ .callee = super_call, .args = super_args.items },
+                }) orelse return null;
+                const super_stmt = self.makeNode(.expr_stmt, start, start, .{ .expr_stmt = super_call_expr }) orelse return null;
+                var body = std.ArrayList(*Node){};
+                body.append(self.arena, super_stmt) catch return null;
+                ctor_body = body.items;
+            } else {
+                ctor_body = &[_]*Node{};
+            }
+        }
+
+        var out = std.ArrayList(*Node){};
+
+        var ctor_body_effective = ctor_body;
+        if (super_name) |sname| {
+            // Allow `super(...)` in subclass constructors by binding local `super`.
+            const id_super_ctor = self.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
+            const super_decl = self.makeNode(.var_decl, start, start, .{
+                .var_decl = .{ .kind = .var_, .name = "super", .init = id_super_ctor },
+            }) orelse return null;
+            var ctor_stmts = std.ArrayList(*Node){};
+            ctor_stmts.append(self.arena, super_decl) catch return null;
+            for (ctor_body) |st| ctor_stmts.append(self.arena, st) catch return null;
+            ctor_body_effective = ctor_stmts.items;
+        }
+
+        // var ClassName = function ClassName(...) { ... }
+        const ctor_fn = self.makeNode(.function_expr, start, self.current.start, .{
+            .function_expr = .{
+                .name = class_name,
+                .params = ctor_params,
+                .param_defaults = &[_]?*Node{},
+                .rest_param = null,
+                .body = ctor_body_effective,
+                .is_arrow = false,
+                .is_strict = hasUseStrict(ctor_body_effective),
+            },
+        }) orelse return null;
+        const ctor_decl = self.makeNode(.var_decl, start, self.current.start, .{
+            .var_decl = .{ .kind = .var_, .name = class_name, .init = ctor_fn },
+        }) orelse return null;
+        out.append(self.arena, ctor_decl) catch return null;
+
+        if (super_name) |sname| {
+            // ClassName.prototype = Object.create(Super.prototype)
+            const id_class = self.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+            const id_proto = self.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
+            const lhs_proto = self.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = id_class, .property = id_proto, .computed = false },
+            }) orelse return null;
+
+            const id_obj = self.makeNode(.identifier, start, start, .{ .identifier = "Object" }) orelse return null;
+            const id_create = self.makeNode(.identifier, start, start, .{ .identifier = "create" }) orelse return null;
+            const callee_create = self.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = id_obj, .property = id_create, .computed = false },
+            }) orelse return null;
+
+            const id_super = self.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
+            const id_super_proto = self.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
+            const super_proto = self.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = id_super, .property = id_super_proto, .computed = false },
+            }) orelse return null;
+
+            var args_create = std.ArrayList(*Node){};
+            args_create.append(self.arena, super_proto) catch return null;
+            const rhs_create = self.makeNode(.call_expr, start, start, .{
+                .call_expr = .{ .callee = callee_create, .args = args_create.items },
+            }) orelse return null;
+
+            const assign_proto = self.makeNode(.assignment_expr, start, start, .{
+                .assignment_expr = .{ .op = .assign, .target = lhs_proto, .value = rhs_create },
+            }) orelse return null;
+            const stmt_proto = self.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign_proto }) orelse return null;
+            out.append(self.arena, stmt_proto) catch return null;
+        }
+
+        // ClassName.prototype.constructor = ClassName
+        const id_class_ctor = self.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+        const id_proto_ctor = self.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
+        const class_proto_ctor = self.makeNode(.member_expr, start, start, .{
+            .member_expr = .{ .object = id_class_ctor, .property = id_proto_ctor, .computed = false },
+        }) orelse return null;
+        const id_ctor_name = self.makeNode(.identifier, start, start, .{ .identifier = "constructor" }) orelse return null;
+        const ctor_slot = self.makeNode(.member_expr, start, start, .{
+            .member_expr = .{ .object = class_proto_ctor, .property = id_ctor_name, .computed = false },
+        }) orelse return null;
+        const id_class_value = self.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+        const assign_ctor = self.makeNode(.assignment_expr, start, start, .{
+            .assignment_expr = .{ .op = .assign, .target = ctor_slot, .value = id_class_value },
+        }) orelse return null;
+        const stmt_ctor = self.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign_ctor }) orelse return null;
+        out.append(self.arena, stmt_ctor) catch return null;
+
+        // prototype methods
+        for (methods.items) |m| {
+            const id_class = self.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+            const id_proto = self.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
+            const class_proto = self.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = id_class, .property = id_proto, .computed = false },
+            }) orelse return null;
+            const id_method = self.makeNode(.identifier, start, start, .{ .identifier = m.name }) orelse return null;
+            const lhs = self.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = class_proto, .property = id_method, .computed = false },
+            }) orelse return null;
+            var method_body = m.body;
+            if (super_name) |sname| {
+                // Allow `super.foo()` in subclass methods by binding `super = Super.prototype`.
+                const id_super_cls = self.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
+                const id_proto2 = self.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
+                const super_proto2 = self.makeNode(.member_expr, start, start, .{
+                    .member_expr = .{ .object = id_super_cls, .property = id_proto2, .computed = false },
+                }) orelse return null;
+                const super_decl2 = self.makeNode(.var_decl, start, start, .{
+                    .var_decl = .{ .kind = .var_, .name = "super", .init = super_proto2 },
+                }) orelse return null;
+                var body_with_super = std.ArrayList(*Node){};
+                body_with_super.append(self.arena, super_decl2) catch return null;
+                for (m.body) |st| body_with_super.append(self.arena, st) catch return null;
+                method_body = body_with_super.items;
+            }
+            const fn_expr = self.makeNode(.function_expr, start, self.current.start, .{
+                .function_expr = .{
+                    .name = null,
+                    .params = m.params,
+                    .param_defaults = &[_]?*Node{},
+                    .rest_param = null,
+                    .body = method_body,
+                    .is_arrow = false,
+                    .is_strict = hasUseStrict(method_body),
+                },
+            }) orelse return null;
+            const assign = self.makeNode(.assignment_expr, start, self.current.start, .{
+                .assignment_expr = .{ .op = .assign, .target = lhs, .value = fn_expr },
+            }) orelse return null;
+            const stmt = self.makeNode(.expr_stmt, start, self.current.start, .{ .expr_stmt = assign }) orelse return null;
+            out.append(self.arena, stmt) catch return null;
+        }
+
+        if (out.items.len == 1) return out.items[0];
+        return self.makeNode(.block_stmt, start, self.current.start, .{
+            .block_stmt = .{ .body = out.items },
+        });
+    }
+
+    fn parseFunctionParams(self: *Parser) ?ParamParse {
         _ = self.expect(.left_paren) orelse return null;
         var params = std.ArrayList([]const u8){};
+        var defaults = std.ArrayList(?*Node){};
+        var saw_rest = false;
+        var rest_param: ?[]const u8 = null;
         while (!self.check(.right_paren) and !self.check(.eof) and !self.had_error) {
+            var is_rest = false;
+            if (self.match(.ellipsis)) is_rest = true;
             const p = self.expect(.identifier) orelse return null;
-            params.append(self.arena, p.value_str) catch { self.had_error = true; return null; };
+            if (is_rest) {
+                saw_rest = true;
+                rest_param = p.value_str;
+                if (self.match(.eq)) {
+                    if (!self.had_error) {
+                        self.had_error = true;
+                        self.error_info = ParseError{
+                            .message = "rest parameter cannot have a default value",
+                            .line = self.current.line,
+                            .column = self.current.column,
+                        };
+                    }
+                    return null;
+                }
+                if (!self.check(.right_paren)) {
+                    if (!self.had_error) {
+                        self.had_error = true;
+                        self.error_info = ParseError{
+                            .message = "rest parameter must be last",
+                            .line = self.current.line,
+                            .column = self.current.column,
+                        };
+                    }
+                    return null;
+                }
+                break;
+            }
+            params.append(self.arena, p.value_str) catch {
+                self.had_error = true;
+                return null;
+            };
+            var default_expr: ?*Node = null;
+            if (self.match(.eq)) {
+                default_expr = self.parseAssignmentExpr() orelse return null;
+            }
+            defaults.append(self.arena, default_expr) catch return null;
+            if (saw_rest) break;
             if (!self.match(.comma)) break;
         }
         _ = self.expect(.right_paren) orelse return null;
-        return params.items;
+        return ParamParse{
+            .params = params.items,
+            .param_defaults = defaults.items,
+            .rest_param = rest_param,
+        };
     }
 
     fn parseFunctionBody(self: *Parser) ?[]*Node {
@@ -403,7 +754,10 @@ pub const Parser = struct {
         var body = std.ArrayList(*Node){};
         while (!self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
-            body.append(self.arena, s) catch { self.had_error = true; break; };
+            body.append(self.arena, s) catch {
+                self.had_error = true;
+                break;
+            };
         }
         _ = self.expect(.right_brace) orelse return null;
         return body.items;
@@ -466,52 +820,81 @@ pub const Parser = struct {
         _ = self.advance(); // consume 'for'
         _ = self.expect(.left_paren) orelse return null;
 
-        // Detect for-in: for (var x in obj) or for (x in obj)
-        if (self.check(.kw_var)) {
-            // save position: for (var NAME in ...) is for-in
-            _ = self.advance(); // consume 'var'
+        // Detect for-in: for (var/let/const x in obj) or for (x in obj)
+        if (self.check(.kw_var) or self.check(.kw_let) or self.check(.kw_const)) {
+            // save position: for (var/let/const NAME in ...) is for-in
+            const decl_kind: ast.VarKind = if (self.check(.kw_var)) .var_ else if (self.check(.kw_let)) .let else .const_;
+            _ = self.advance(); // consume declaration keyword
             if (self.check(.identifier)) {
                 const name_tok = self.current;
                 _ = self.advance(); // consume identifier
                 if (self.check(.kw_in)) {
-                    // It's for-in: for (var name in expr)
+                    // It's for-in: for (var/let/const name in expr)
                     _ = self.advance(); // consume 'in'
                     const right = self.parseExpression() orelse return null;
                     _ = self.expect(.right_paren) orelse return null;
                     const body = self.parseStatement() orelse return null;
                     // Create a var_decl node as the left side
                     const left = self.makeNode(.var_decl, name_tok.start, name_tok.end, .{
-                        .var_decl = .{ .name = name_tok.value_str, .init = null },
+                        .var_decl = .{ .kind = decl_kind, .name = name_tok.value_str, .init = null },
                     }) orelse return null;
                     return self.makeNode(.for_in_stmt, start, self.current.start, .{
-                        .for_in_stmt = .{ .left = left, .right = right, .body = body },
+                        .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = false },
+                    });
+                } else if (self.check(.kw_of)) {
+                    _ = self.advance(); // consume 'of'
+                    const right = self.parseExpression() orelse return null;
+                    _ = self.expect(.right_paren) orelse return null;
+                    const body = self.parseStatement() orelse return null;
+                    const left = self.makeNode(.var_decl, name_tok.start, name_tok.end, .{
+                        .var_decl = .{ .kind = decl_kind, .name = name_tok.value_str, .init = null },
+                    }) orelse return null;
+                    return self.makeNode(.for_in_stmt, start, self.current.start, .{
+                        .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = true },
                     });
                 } else if (self.check(.eq) or self.check(.comma) or self.check(.semicolon)) {
-                    // Normal for loop: for (var name = ...; ...)
+                    // Normal for loop: for (var/let/const name = ...; ...)
                     // Handle initializer if present
                     var init_val: ?*Node = null;
                     if (self.match(.eq)) {
                         init_val = self.parseAssignmentExpr();
                     }
+                    if (decl_kind == .const_ and init_val == null) {
+                        if (!self.had_error) {
+                            self.had_error = true;
+                            self.error_info = ParseError{
+                                .message = "const declaration requires an initializer",
+                                .line = name_tok.line,
+                                .column = name_tok.column,
+                            };
+                        }
+                        return null;
+                    }
                     const first_decl = self.makeNode(.var_decl, name_tok.start, self.current.start, .{
-                        .var_decl = .{ .name = name_tok.value_str, .init = init_val },
+                        .var_decl = .{ .kind = decl_kind, .name = name_tok.value_str, .init = init_val },
                     }) orelse return null;
                     var decls = std.ArrayList(*Node){};
-                    decls.append(self.arena, first_decl) catch { self.had_error = true; return null; };
+                    decls.append(self.arena, first_decl) catch {
+                        self.had_error = true;
+                        return null;
+                    };
                     while (self.match(.comma)) {
-                        const d = self.parseVarDeclarator() orelse return null;
-                        decls.append(self.arena, d) catch { self.had_error = true; return null; };
+                        const d = self.parseVarDeclarator(decl_kind) orelse return null;
+                        decls.append(self.arena, d) catch {
+                            self.had_error = true;
+                            return null;
+                        };
                     }
                     _ = self.expect(.semicolon) orelse return null;
-                    const init_node: ?*Node = if (decls.items.len == 1) decls.items[0]
-                        else self.makeNode(.block_stmt, start, self.current.start, .{
-                            .block_stmt = .{ .body = decls.items },
-                        });
+                    const init_node: ?*Node = if (decls.items.len == 1) decls.items[0] else self.makeNode(.block_stmt, start, self.current.start, .{
+                        .block_stmt = .{ .body = decls.items },
+                    });
                     return self.parseForTail(start, init_node);
                 } else {
-                    // Unexpected — treat as for (var name; ...)
+                    // Unexpected — treat as for (var/let name; ...).
+                    // const without initializer is invalid and already checked above.
                     const first_decl = self.makeNode(.var_decl, name_tok.start, name_tok.end, .{
-                        .var_decl = .{ .name = name_tok.value_str, .init = null },
+                        .var_decl = .{ .kind = decl_kind, .name = name_tok.value_str, .init = null },
                     }) orelse return null;
                     _ = self.expect(.semicolon) orelse return null;
                     return self.parseForTail(start, first_decl);
@@ -531,17 +914,32 @@ pub const Parser = struct {
                 _ = self.expect(.right_paren) orelse return null;
                 const body = self.parseStatement() orelse return null;
                 return self.makeNode(.for_in_stmt, start, self.current.start, .{
-                    .for_in_stmt = .{ .left = expr, .right = right, .body = body },
+                    .for_in_stmt = .{ .left = expr, .right = right, .body = body, .iterate_values = false },
+                });
+            }
+            if (self.check(.kw_of)) {
+                _ = self.advance(); // consume 'of'
+                const right = self.parseExpression() orelse return null;
+                _ = self.expect(.right_paren) orelse return null;
+                const body = self.parseStatement() orelse return null;
+                return self.makeNode(.for_in_stmt, start, self.current.start, .{
+                    .for_in_stmt = .{ .left = expr, .right = right, .body = body, .iterate_values = true },
                 });
             }
             // Normal for: consume remaining of init expr (may be comma-separated)
             var final_expr = expr;
             if (self.check(.comma)) {
                 var exprs = std.ArrayList(*Node){};
-                exprs.append(self.arena, expr) catch { self.had_error = true; return null; };
+                exprs.append(self.arena, expr) catch {
+                    self.had_error = true;
+                    return null;
+                };
                 while (self.match(.comma)) {
                     const e = self.parseAssignmentExpr() orelse return null;
-                    exprs.append(self.arena, e) catch { self.had_error = true; return null; };
+                    exprs.append(self.arena, e) catch {
+                        self.had_error = true;
+                        return null;
+                    };
                 }
                 final_expr = self.makeNode(.sequence_expr, expr.start, self.current.start, .{
                     .sequence_expr = .{ .exprs = exprs.items },
@@ -606,12 +1004,18 @@ pub const Parser = struct {
             // Parse case body statements until next case/default/}
             var body = std.ArrayList(*Node){};
             while (!self.check(.kw_case) and !self.check(.kw_default) and
-                   !self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
+                !self.check(.right_brace) and !self.check(.eof) and !self.had_error)
+            {
                 const s = self.parseStatement() orelse break;
-                body.append(self.arena, s) catch { self.had_error = true; break; };
+                body.append(self.arena, s) catch {
+                    self.had_error = true;
+                    break;
+                };
             }
-            cases.append(self.arena, ast.SwitchCase{ .test_ = test_node, .body = body.items })
-                catch { self.had_error = true; return null; };
+            cases.append(self.arena, ast.SwitchCase{ .test_ = test_node, .body = body.items }) catch {
+                self.had_error = true;
+                return null;
+            };
         }
         _ = self.expect(.right_brace) orelse return null;
         return self.makeNode(.switch_stmt, start, self.current.start, .{
@@ -732,10 +1136,16 @@ pub const Parser = struct {
         var left = self.parseAssignmentExpr() orelse return null;
         if (self.check(.comma)) {
             var exprs = std.ArrayList(*Node){};
-            exprs.append(self.arena, left) catch { self.had_error = true; return null; };
+            exprs.append(self.arena, left) catch {
+                self.had_error = true;
+                return null;
+            };
             while (self.match(.comma)) {
                 const e = self.parseAssignmentExpr() orelse return null;
-                exprs.append(self.arena, e) catch { self.had_error = true; return null; };
+                exprs.append(self.arena, e) catch {
+                    self.had_error = true;
+                    return null;
+                };
             }
             left = self.makeNode(.sequence_expr, start, self.current.start, .{
                 .sequence_expr = .{ .exprs = exprs.items },
@@ -748,6 +1158,38 @@ pub const Parser = struct {
         const start = self.current.start;
         // Conditional has higher precedence than assignment.
         const left = self.parseConditionalExpr() orelse return null;
+        // ES2015 arrow function: params => body
+        if (self.match(.arrow)) {
+            const params = self.extractArrowParams(left) orelse return null;
+            var body_nodes: []*Node = undefined;
+            if (self.check(.left_brace)) {
+                const blk = self.parseBlock() orelse return null;
+                body_nodes = blk.data.block_stmt.body;
+            } else {
+                const expr_body = self.parseAssignmentExpr() orelse return null;
+                const ret = self.makeNode(.return_stmt, expr_body.start, expr_body.end, .{
+                    .return_stmt = expr_body,
+                }) orelse return null;
+                var one = std.ArrayList(*Node){};
+                one.append(self.arena, ret) catch {
+                    self.had_error = true;
+                    return null;
+                };
+                body_nodes = one.items;
+            }
+            const is_strict = hasUseStrict(body_nodes);
+            return self.makeNode(.function_expr, start, self.current.start, .{
+                .function_expr = .{
+                    .name = null,
+                    .params = params,
+                    .param_defaults = &[_]?*Node{},
+                    .rest_param = null,
+                    .body = body_nodes,
+                    .is_arrow = true,
+                    .is_strict = is_strict,
+                },
+            });
+        }
         // Check for assignment operator.
         if (isAssignOp(self.current.kind)) {
             const op = tokenToAssignOp(self.current.kind);
@@ -758,6 +1200,49 @@ pub const Parser = struct {
             });
         }
         return left;
+    }
+
+    fn extractArrowParams(self: *Parser, lhs: *Node) ?[][]const u8 {
+        var params = std.ArrayList([]const u8){};
+        switch (lhs.kind) {
+            .identifier => {
+                params.append(self.arena, lhs.data.identifier) catch {
+                    self.had_error = true;
+                    return null;
+                };
+            },
+            .sequence_expr => {
+                for (lhs.data.sequence_expr.exprs) |e| {
+                    if (e.kind != .identifier) {
+                        if (!self.had_error) {
+                            self.had_error = true;
+                            self.error_info = ParseError{
+                                .message = "invalid arrow parameter list",
+                                .line = self.current.line,
+                                .column = self.current.column,
+                            };
+                        }
+                        return null;
+                    }
+                    params.append(self.arena, e.data.identifier) catch {
+                        self.had_error = true;
+                        return null;
+                    };
+                }
+            },
+            else => {
+                if (!self.had_error) {
+                    self.had_error = true;
+                    self.error_info = ParseError{
+                        .message = "invalid arrow parameter list",
+                        .line = self.current.line,
+                        .column = self.current.column,
+                    };
+                }
+                return null;
+            },
+        }
+        return params.items;
     }
 
     fn parseConditionalExpr(self: *Parser) ?*Node {
@@ -900,9 +1385,10 @@ pub const Parser = struct {
         while (true) {
             if (self.check(.left_paren)) {
                 const args = self.parseArgs() orelse return null;
-                base = self.makeNode(.call_expr, base.start, self.current.start, .{
+                const raw_call = self.makeNode(.call_expr, base.start, self.current.start, .{
                     .call_expr = .{ .callee = base, .args = args },
                 }) orelse return null;
+                base = self.rewriteSuperCall(raw_call) orelse return null;
             } else if (self.match(.dot)) {
                 const prop_tok = self.expect(.identifier) orelse return null;
                 const prop = self.makeNode(.identifier, prop_tok.start, prop_tok.end, .{
@@ -922,6 +1408,52 @@ pub const Parser = struct {
             }
         }
         return base;
+    }
+
+    /// Rewrite super call sites into explicit .call(this, ...) form.
+    /// - super(a, b) -> super.call(this, a, b)
+    /// - super.m(a)  -> super.m.call(this, a)
+    fn rewriteSuperCall(self: *Parser, call_node: *Node) ?*Node {
+        if (call_node.kind != .call_expr) return call_node;
+        const call = call_node.data.call_expr;
+        const start = call_node.start;
+        const end = call_node.end;
+
+        // Case 1: direct super(...)
+        if (call.callee.kind == .identifier and std.mem.eql(u8, call.callee.data.identifier, "super")) {
+            const id_call = self.makeNode(.identifier, start, end, .{ .identifier = "call" }) orelse return null;
+            const super_call = self.makeNode(.member_expr, start, end, .{
+                .member_expr = .{ .object = call.callee, .property = id_call, .computed = false },
+            }) orelse return null;
+            const this_expr = self.makeNode(.this_expr, start, end, .{ .this_expr = {} }) orelse return null;
+            var new_args = std.ArrayList(*Node){};
+            new_args.append(self.arena, this_expr) catch return null;
+            for (call.args) |a| new_args.append(self.arena, a) catch return null;
+            return self.makeNode(.call_expr, start, end, .{
+                .call_expr = .{ .callee = super_call, .args = new_args.items },
+            });
+        }
+
+        // Case 2: super.method(...)
+        if (call.callee.kind == .member_expr) {
+            const me = call.callee.data.member_expr;
+            const is_super_obj = me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super");
+            const is_explicit_call = (!me.computed and me.property.kind == .identifier and std.mem.eql(u8, me.property.data.identifier, "call"));
+            if (is_super_obj and !is_explicit_call) {
+                const id_call = self.makeNode(.identifier, start, end, .{ .identifier = "call" }) orelse return null;
+                const method_call = self.makeNode(.member_expr, start, end, .{
+                    .member_expr = .{ .object = call.callee, .property = id_call, .computed = false },
+                }) orelse return null;
+                const this_expr = self.makeNode(.this_expr, start, end, .{ .this_expr = {} }) orelse return null;
+                var new_args = std.ArrayList(*Node){};
+                new_args.append(self.arena, this_expr) catch return null;
+                for (call.args) |a| new_args.append(self.arena, a) catch return null;
+                return self.makeNode(.call_expr, start, end, .{
+                    .call_expr = .{ .callee = method_call, .args = new_args.items },
+                });
+            }
+        }
+        return call_node;
     }
 
     /// Parse a member expression without call expressions (for `new` callee).
@@ -954,8 +1486,16 @@ pub const Parser = struct {
         _ = self.expect(.left_paren) orelse return null;
         var args = std.ArrayList(*Node){};
         while (!self.check(.right_paren) and !self.check(.eof) and !self.had_error) {
-            const a = self.parseAssignmentExpr() orelse return null;
-            args.append(self.arena, a) catch { self.had_error = true; return null; };
+            const has_spread = self.match(.ellipsis);
+            const parsed = self.parseAssignmentExpr() orelse return null;
+            const a = if (has_spread)
+                (self.makeNode(.spread_expr, parsed.start, parsed.end, .{ .spread_expr = parsed }) orelse return null)
+            else
+                parsed;
+            args.append(self.arena, a) catch {
+                self.had_error = true;
+                return null;
+            };
             if (!self.match(.comma)) break;
         }
         _ = self.expect(.right_paren) orelse return null;
@@ -991,6 +1531,38 @@ pub const Parser = struct {
             .kw_this => {
                 _ = self.advance();
                 return self.makeNode(.this_expr, start, end, .{ .this_expr = {} });
+            },
+            .kw_super => {
+                _ = self.advance();
+                return self.makeNode(.identifier, start, end, .{ .identifier = "super" });
+            },
+            .kw_yield => {
+                if (!self.in_generator_function) {
+                    if (!self.had_error) {
+                        self.had_error = true;
+                        self.error_info = ParseError{
+                            .message = "yield is only valid inside generator functions",
+                            .line = self.current.line,
+                            .column = self.current.column,
+                        };
+                    }
+                    return null;
+                }
+                _ = self.advance();
+                if (self.match(.star)) {
+                    if (!self.had_error) {
+                        self.had_error = true;
+                        self.error_info = ParseError{
+                            .message = "yield* is not yet supported",
+                            .line = self.current.line,
+                            .column = self.current.column,
+                        };
+                    }
+                    return null;
+                }
+                const can_have_arg = !(self.current.line_terminator_before or self.check(.semicolon) or self.check(.right_brace) or self.check(.eof));
+                const yielded = if (can_have_arg) self.parseAssignmentExpr() orelse return null else null;
+                return self.makeNode(.yield_expr, start, self.current.start, .{ .yield_expr = yielded });
             },
             .identifier => {
                 const name = self.current.value_str;
@@ -1119,7 +1691,12 @@ pub const Parser = struct {
                 _ = self.advance(); // consume comma
                 continue;
             }
-            const elem = self.parseAssignmentExpr() orelse return null;
+            const has_spread = self.match(.ellipsis);
+            const parsed = self.parseAssignmentExpr() orelse return null;
+            const elem = if (has_spread)
+                (self.makeNode(.spread_expr, parsed.start, parsed.end, .{ .spread_expr = parsed }) orelse return null)
+            else
+                parsed;
             elements.append(self.arena, elem) catch {
                 self.had_error = true;
                 return null;
@@ -1136,16 +1713,32 @@ pub const Parser = struct {
     fn parseFunctionExpr(self: *Parser) ?*Node {
         const start = self.current.start;
         _ = self.advance(); // consume 'function'
+        const is_generator = self.match(.star);
         var name: ?[]const u8 = null;
         if (self.check(.identifier)) {
             name = self.current.value_str;
             _ = self.advance();
         }
-        const params = self.parseFunctionParams() orelse return null;
-        const body = self.parseFunctionBody() orelse return null;
+        const parsed_params = self.parseFunctionParams() orelse return null;
+        const prev_gen = self.in_generator_function;
+        self.in_generator_function = is_generator;
+        const body = self.parseFunctionBody() orelse {
+            self.in_generator_function = prev_gen;
+            return null;
+        };
+        self.in_generator_function = prev_gen;
         const is_strict = hasUseStrict(body);
         return self.makeNode(.function_expr, start, self.current.start, .{
-            .function_expr = .{ .name = name, .params = params, .body = body, .is_strict = is_strict },
+            .function_expr = .{
+                .name = name,
+                .params = parsed_params.params,
+                .param_defaults = parsed_params.param_defaults,
+                .rest_param = parsed_params.rest_param,
+                .body = body,
+                .is_arrow = false,
+                .is_generator = is_generator,
+                .is_strict = is_strict,
+            },
         });
     }
 
@@ -1218,13 +1811,24 @@ fn parseRegexRaw(raw: []const u8) RegexRaw {
     var in_class = false;
     while (i < raw.len) {
         const c = raw[i];
-        if (c == '[') { in_class = true; i += 1; continue; }
-        if (c == ']') { in_class = false; i += 1; continue; }
-        if (c == '\\') { i += 2; continue; } // skip escaped char
+        if (c == '[') {
+            in_class = true;
+            i += 1;
+            continue;
+        }
+        if (c == ']') {
+            in_class = false;
+            i += 1;
+            continue;
+        }
+        if (c == '\\') {
+            i += 2;
+            continue;
+        } // skip escaped char
         if (c == '/' and !in_class) {
             // Found closing slash at position i.
             const pattern = raw[1..i];
-            const flags = raw[i + 1..];
+            const flags = raw[i + 1 ..];
             return .{ .pattern = pattern, .flags = flags };
         }
         i += 1;

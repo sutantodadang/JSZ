@@ -39,6 +39,8 @@ pub const JsValue = union(enum) {
 pub const FuncVal = struct {
     name: ?[]const u8,
     params: [][]const u8,
+    param_defaults: []?*anyopaque = &[_]?*anyopaque{},
+    rest_param: ?[]const u8 = null,
     /// Pointer to the function's body statement list. Opaque pointer to []*Node
     /// to avoid circular imports; cast in the evaluator.
     body_ptr: *anyopaque,
@@ -46,6 +48,13 @@ pub const FuncVal = struct {
     closure_env: *anyopaque,
     /// Phase 4d: whether this function is in strict mode.
     is_strict: bool = false,
+    /// Phase 7: function prototype object used by `new` and class desugaring.
+    prototype_obj: ?*JsObject = null,
+    /// Phase 7: arrow function captures lexical `this`.
+    is_arrow: bool = false,
+    lexical_this: Value = Value{},
+    /// Phase 7: generator function (`function*`).
+    is_generator: bool = false,
 };
 
 /// Public handle — an opaque u64 whose bits are a *JsValue pointer.

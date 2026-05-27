@@ -11,6 +11,9 @@
 //! Arena objects are freed when the eval arena resets.
 const std = @import("std");
 const Value = @import("../value/value.zig").Value;
+const shape_mod = @import("../value/shape.zig");
+const Shape = shape_mod.Shape;
+const ShapeManager = shape_mod.ShapeManager;
 
 /// Maximum prototype chain depth before we give up (cycle guard, Phase 3a).
 const MAX_PROTO_DEPTH: usize = 64;
@@ -35,16 +38,25 @@ pub const JsObject = struct {
     /// Arena-allocated; MUST NOT be traversed by markObject.
     internal_slot: ?*anyopaque = null,
     /// Phase 4c/4d: discriminator for internal_slot type.
-    internal_kind: enum(u8) { none, regexp, bound_function, date } = .none,
+    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, promise } = .none,
     /// Allocator for property storage (the eval arena).
     arena: std.mem.Allocator,
+    /// Phase 6 hidden class manager (shared globally).
+    shape_manager: *ShapeManager,
+    /// Current hidden class for own properties.
+    shape: *Shape,
+    /// Slot values indexed by shape key_to_slot.
+    slots: std.ArrayListUnmanaged(Value) = .empty,
 
     /// Allocate a plain object with an optional prototype.
     pub fn create(arena: std.mem.Allocator, proto: ?*JsObject) !*JsObject {
         const obj = try arena.create(JsObject);
+        const manager = shape_mod.globalManager();
         obj.* = JsObject{
             .arena = arena,
             .proto = proto,
+            .shape_manager = manager,
+            .shape = manager.root(),
         };
         return obj;
     }
@@ -52,11 +64,14 @@ pub const JsObject = struct {
     /// Allocate an array-backed object.
     pub fn createArray(arena: std.mem.Allocator, proto: ?*JsObject) !*JsObject {
         const obj = try arena.create(JsObject);
+        const manager = shape_mod.globalManager();
         obj.* = JsObject{
             .arena = arena,
             .proto = proto,
             .is_array = true,
             .array_length = 0,
+            .shape_manager = manager,
+            .shape = manager.root(),
         };
         return obj;
     }
@@ -79,6 +94,9 @@ pub const JsObject = struct {
             // length is virtual for arrays.
             return null; // will be handled by getLength
         }
+        if (self.shape.key_to_slot.get(key)) |slot| {
+            if (slot < self.slots.items.len) return self.slots.items[slot];
+        }
         return self.props.get(key);
     }
 
@@ -93,7 +111,7 @@ pub const JsObject = struct {
         while (cur) |obj| {
             if (depth >= MAX_PROTO_DEPTH) break;
             depth += 1;
-            if (obj.props.get(key)) |v| return v;
+            if (obj.getOwn(key)) |v| return v;
             cur = obj.proto;
         }
         return null;
@@ -101,6 +119,22 @@ pub const JsObject = struct {
 
     /// Set own property. Updates array_length if key is an array index.
     pub fn set(self: *JsObject, key: []const u8, value: Value) !void {
+        if (self.shape.key_to_slot.get(key)) |slot| {
+            if (slot < self.slots.items.len) {
+                self.slots.items[slot] = value;
+            }
+        } else {
+            self.shape = try self.shape_manager.transitionAdd(self.shape, key);
+            const new_slot = self.shape.key_to_slot.get(key) orelse unreachable;
+            if (new_slot == self.slots.items.len) {
+                try self.slots.append(self.arena, value);
+            } else {
+                while (self.slots.items.len <= new_slot) {
+                    try self.slots.append(self.arena, Value{});
+                }
+                self.slots.items[new_slot] = value;
+            }
+        }
         try self.props.put(self.arena, key, value);
         if (self.is_array) {
             // If key parses as a non-negative integer, bump array_length.
@@ -113,7 +147,7 @@ pub const JsObject = struct {
 
     /// Has own property check.
     pub fn hasOwn(self: *JsObject, key: []const u8) bool {
-        return self.props.contains(key);
+        return self.shape.key_to_slot.contains(key) or self.props.contains(key);
     }
 
     /// Get length: for arrays returns cached length as a Value.
@@ -128,6 +162,42 @@ pub const JsObject = struct {
 
     pub fn getArrayLength(self: *JsObject) u32 {
         return self.array_length;
+    }
+
+    pub fn shapePtr(self: *JsObject) *anyopaque {
+        return @ptrCast(self.shape);
+    }
+
+    pub fn resolveOwnSlot(self: *JsObject, key: []const u8) ?u32 {
+        return self.shape.key_to_slot.get(key);
+    }
+
+    pub fn getOwnBySlot(self: *JsObject, expected_shape: *anyopaque, slot: u32) ?Value {
+        if (@as(*anyopaque, @ptrCast(self.shape)) != expected_shape) return null;
+        if (slot >= self.slots.items.len) return null;
+        return self.slots.items[slot];
+    }
+
+    pub fn setOwnBySlot(self: *JsObject, expected_shape: *anyopaque, slot: u32, value: Value) bool {
+        if (@as(*anyopaque, @ptrCast(self.shape)) != expected_shape) return false;
+        if (slot >= self.slots.items.len) return false;
+        self.slots.items[slot] = value;
+        return true;
+    }
+
+    /// Delete own property and transition shape if key exists.
+    pub fn deleteOwn(self: *JsObject, key: []const u8) !bool {
+        if (self.shape.key_to_slot.get(key) == null) return false;
+        _ = self.props.swapRemove(key);
+        self.shape = try self.shape_manager.transitionDelete(self.shape, key);
+
+        var new_slots: std.ArrayListUnmanaged(Value) = .empty;
+        for (self.shape.key_order.items) |k| {
+            const v = self.props.get(k) orelse Value{};
+            try new_slots.append(self.arena, v);
+        }
+        self.slots = new_slots;
+        return true;
     }
 };
 
@@ -145,6 +215,7 @@ test "JsObject create and set/get" {
     const got = obj.get("x");
     try std.testing.expect(got != null);
     try std.testing.expectEqual(@as(f64, 42.0), got.?.toF64());
+    try std.testing.expectEqual(@as(?u32, 0), obj.resolveOwnSlot("x"));
 }
 
 test "JsObject proto chain" {
@@ -177,4 +248,23 @@ test "JsObject array length" {
     try arr.set("1", v1);
     try arr.set("2", v2);
     try std.testing.expectEqual(@as(u32, 3), arr.getArrayLength());
+}
+
+test "JsObject shape delete compacts slots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val_mod = @import("../value/value.zig");
+
+    const obj = try JsObject.create(alloc, null);
+    const va = try val_mod.makeNumber(alloc, 1);
+    const vb = try val_mod.makeNumber(alloc, 2);
+    try obj.set("a", va);
+    try obj.set("b", vb);
+    try std.testing.expectEqual(@as(?u32, 0), obj.resolveOwnSlot("a"));
+    try std.testing.expectEqual(@as(?u32, 1), obj.resolveOwnSlot("b"));
+    _ = try obj.deleteOwn("a");
+    try std.testing.expect(obj.resolveOwnSlot("a") == null);
+    try std.testing.expectEqual(@as(?u32, 0), obj.resolveOwnSlot("b"));
+    try std.testing.expectEqual(@as(f64, 2), obj.get("b").?.toF64());
 }

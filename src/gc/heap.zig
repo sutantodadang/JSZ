@@ -20,6 +20,7 @@ const std = @import("std");
 const JsObject = @import("../object/object.zig").JsObject;
 const Value = @import("../value/value.zig").Value;
 const HandleScope = @import("./handle.zig").HandleScope;
+const shape_mod = @import("../value/shape.zig");
 
 /// Tag identifying the kind of payload following a GcHeader.
 /// MVP only uses js_object; others reserved for later phases.
@@ -87,6 +88,7 @@ pub const Heap = struct {
             if (hdr.kind == .js_object) {
                 const slot: *GcJsObjectSlot = @fieldParentPtr("header", hdr);
                 slot.object.props.deinit(self.backing_allocator);
+                slot.object.slots.deinit(self.backing_allocator);
                 self.backing_allocator.destroy(slot);
             }
             cur = next;
@@ -120,6 +122,8 @@ pub const Heap = struct {
             .arena = self.backing_allocator,
             .proto = proto,
             .is_gc_managed = true,
+            .shape_manager = shape_mod.globalManager(),
+            .shape = shape_mod.globalManager().root(),
         };
         self.all_objects_head = &slot.header;
 
@@ -293,6 +297,7 @@ pub const Heap = struct {
                 if (hdr.kind == .js_object) {
                     const slot: *GcJsObjectSlot = @fieldParentPtr("header", hdr);
                     slot.object.props.deinit(self.backing_allocator);
+                    slot.object.slots.deinit(self.backing_allocator);
                     self.backing_allocator.destroy(slot);
                 }
 

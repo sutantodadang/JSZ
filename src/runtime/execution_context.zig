@@ -7,12 +7,26 @@ const Value = @import("../value/value.zig").Value;
 pub const EnvError = error{
     OutOfMemory,
     NotDefined,
+    TemporalDeadZone,
+    ConstAssignment,
+};
+
+pub const BindingKind = enum {
+    var_,
+    let,
+    const_,
+};
+
+pub const Binding = struct {
+    value: Value,
+    kind: BindingKind,
+    initialized: bool,
 };
 
 /// A single lexical environment frame. Linked to parent.
 pub const Environment = struct {
     parent: ?*Environment,
-    bindings: std.StringHashMapUnmanaged(Value),
+    bindings: std.StringHashMapUnmanaged(Binding),
     arena: std.mem.Allocator,
 
     pub fn init(arena: std.mem.Allocator, parent: ?*Environment) !*Environment {
@@ -25,22 +39,52 @@ pub const Environment = struct {
         return env;
     }
 
-    /// Define a binding in THIS frame (var hoisting or block).
+    /// Define a var-style binding in THIS frame.
     pub fn define(self: *Environment, name: []const u8, value: Value) !void {
-        try self.bindings.put(self.arena, name, value);
+        try self.bindings.put(self.arena, name, .{
+            .value = value,
+            .kind = .var_,
+            .initialized = true,
+        });
+    }
+
+    /// Define a lexical binding in THIS frame. If `initialized` is false, the binding
+    /// is in TDZ and any lookup/assignment should throw until initialized.
+    pub fn defineLexical(self: *Environment, name: []const u8, kind: BindingKind, initialized: bool, value: Value) !void {
+        try self.bindings.put(self.arena, name, .{
+            .value = value,
+            .kind = kind,
+            .initialized = initialized,
+        });
+    }
+
+    /// Initialize an existing lexical binding in this frame or any parent frame.
+    pub fn initialize(self: *Environment, name: []const u8, value: Value) EnvError!void {
+        if (self.bindings.getPtr(name)) |b| {
+            b.value = value;
+            b.initialized = true;
+            return;
+        }
+        if (self.parent) |p| return p.initialize(name, value);
+        return EnvError.NotDefined;
     }
 
     /// Look up a binding in this frame or any parent.
     pub fn lookup(self: *Environment, name: []const u8) EnvError!Value {
-        if (self.bindings.get(name)) |v| return v;
+        if (self.bindings.get(name)) |b| {
+            if (!b.initialized) return EnvError.TemporalDeadZone;
+            return b.value;
+        }
         if (self.parent) |p| return p.lookup(name);
         return EnvError.NotDefined;
     }
 
     /// Assign an existing binding (walk up the chain).
     pub fn assign(self: *Environment, name: []const u8, value: Value) EnvError!void {
-        if (self.bindings.contains(name)) {
-            self.bindings.putAssumeCapacity(name, value);
+        if (self.bindings.getPtr(name)) |b| {
+            if (!b.initialized) return EnvError.TemporalDeadZone;
+            if (b.kind == .const_) return EnvError.ConstAssignment;
+            b.value = value;
             return;
         }
         if (self.parent) |p| return p.assign(name, value);
@@ -68,6 +112,31 @@ test "Environment: define and lookup" {
     try env.define("x", v);
     const got = try env.lookup("x");
     try std.testing.expectEqual(@as(f64, 42), got.toF64());
+}
+
+test "Environment: lexical TDZ and initialize" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const val = @import("../value/value.zig");
+    const env = try Environment.init(arena.allocator(), null);
+    const undef = try val.makeUndefined(arena.allocator());
+    try env.defineLexical("x", .let, false, undef);
+    try std.testing.expectError(EnvError.TemporalDeadZone, env.lookup("x"));
+    const one = try val.makeNumber(arena.allocator(), 1);
+    try env.initialize("x", one);
+    const got = try env.lookup("x");
+    try std.testing.expectEqual(@as(f64, 1), got.toF64());
+}
+
+test "Environment: const assignment rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const val = @import("../value/value.zig");
+    const env = try Environment.init(arena.allocator(), null);
+    const one = try val.makeNumber(arena.allocator(), 1);
+    try env.defineLexical("c", .const_, true, one);
+    const two = try val.makeNumber(arena.allocator(), 2);
+    try std.testing.expectError(EnvError.ConstAssignment, env.assign("c", two));
 }
 
 test "Environment: parent chain lookup" {

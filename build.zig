@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/test/fuzz/parser_fuzz.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "jsz", .module = mod } },
+        .imports = &.{.{ .name = "jsz", .module = mod }},
     });
     const parser_fuzz = b.addTest(.{ .root_module = parser_fuzz_mod });
     const run_parser_fuzz = b.addRunArtifact(parser_fuzz);
@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/test/fuzz/vm_fuzz.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "jsz", .module = mod } },
+        .imports = &.{.{ .name = "jsz", .module = mod }},
     });
     const vm_fuzz = b.addTest(.{ .root_module = vm_fuzz_mod });
     const run_vm_fuzz = b.addRunArtifact(vm_fuzz);
@@ -83,12 +83,29 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/test/test262_runner.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "jsz", .module = mod } },
+            .imports = &.{.{ .name = "jsz", .module = mod }},
         }),
     });
     const run_conformance = b.addRunArtifact(conformance_exe);
     const conformance_step = b.step("conformance", "Run Test262 conformance suite");
     conformance_step.dependOn(&run_conformance.step);
+
+    const run_conformance_summary = b.addRunArtifact(conformance_exe);
+    run_conformance_summary.addArg("--summary");
+    const conformance_summary_step = b.step("conformance-summary", "Run Test262 with category summary");
+    conformance_summary_step.dependOn(&run_conformance_summary.step);
+
+    const run_conformance_delta = b.addRunArtifact(conformance_exe);
+    run_conformance_delta.addArg("--summary");
+    const conformance_delta_step = b.step("conformance-delta", "Fail on unexpected pass/fail flips using known-failing list");
+    conformance_delta_step.dependOn(&run_conformance_delta.step);
+
+    const run_conformance_dashboard = b.addRunArtifact(conformance_exe);
+    run_conformance_dashboard.addArg("--summary");
+    run_conformance_dashboard.addArg("--dashboard");
+    run_conformance_dashboard.addArg("docs/CONFORMANCE_DASHBOARD.md");
+    const conformance_dashboard_step = b.step("conformance-dashboard", "Generate docs/CONFORMANCE_DASHBOARD.md from Test262 results");
+    conformance_dashboard_step.dependOn(&run_conformance_dashboard.step);
 
     // ---------------------------------------------------------------------------
     // Differential: zig build differential
@@ -99,7 +116,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/test/differential.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "jsz", .module = mod } },
+            .imports = &.{.{ .name = "jsz", .module = mod }},
         }),
     });
     const run_diff = b.addRunArtifact(diff_exe);
@@ -115,7 +132,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/hello.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "jsz", .module = mod } },
+            .imports = &.{.{ .name = "jsz", .module = mod }},
         }),
     });
     const run_hello = b.addRunArtifact(hello_exe);
@@ -143,12 +160,26 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("bench/fib20.zig"),
             .target = target,
             .optimize = .ReleaseFast,
-            .imports = &.{ .{ .name = "jsz", .module = mod } },
+            .imports = &.{.{ .name = "jsz", .module = mod }},
         }),
     });
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    const bench_phase6_exe = b.addExecutable(.{
+        .name = "bench-phase6-ic",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/phase6_ic.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "jsz", .module = mod }},
+        }),
+    });
+    const run_bench_phase6 = b.addRunArtifact(bench_phase6_exe);
+    const bench_phase6_step = b.step("bench-phase6", "Run Phase 6 shape/IC benchmarks");
+    bench_phase6_step.dependOn(&run_bench_phase6.step);
+    bench_step.dependOn(&run_bench_phase6.step);
 
     // ---------------------------------------------------------------------------
     // GC stress: zig build gc-stress
@@ -159,7 +190,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("bench/gc_stress.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "jsz", .module = mod } },
+            .imports = &.{.{ .name = "jsz", .module = mod }},
         }),
     });
     b.installArtifact(gc_stress_exe);

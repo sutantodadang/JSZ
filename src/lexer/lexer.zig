@@ -359,6 +359,50 @@ pub const Lexer = struct {
         return LexError.UnterminatedString;
     }
 
+    /// Lex a simple template literal as a string token.
+    /// Phase 7 baseline: supports plain templates and escape sequences, but does not
+    /// support `${...}` interpolation yet.
+    fn lexTemplateString(self: *Lexer, start: usize, start_col: u32, lt_before: bool) LexError!Token {
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(self.allocator);
+
+        while (self.pos < self.source.len) {
+            const c = self.source[self.pos];
+            if (c == '`') {
+                self.pos += 1;
+                self.column += 1;
+                const owned = self.allocator.dupe(u8, buf.items) catch return LexError.OutOfMemory;
+                var t = Token.initSimple(.string, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
+                t.value_str = owned;
+                self.prev_kind = .string;
+                return t;
+            }
+            if (c == '$' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{') {
+                return LexError.TemplateLiteralNotSupported;
+            }
+            if (c != '\\') {
+                buf.append(self.allocator, c) catch return LexError.OutOfMemory;
+                self.advance();
+                continue;
+            }
+            self.pos += 1;
+            self.column += 1;
+            if (self.pos >= self.source.len) return LexError.UnterminatedString;
+            const esc = self.source[self.pos];
+            self.pos += 1;
+            self.column += 1;
+            switch (esc) {
+                'n' => try buf.append(self.allocator, '\n'),
+                't' => try buf.append(self.allocator, '\t'),
+                'r' => try buf.append(self.allocator, '\r'),
+                '`' => try buf.append(self.allocator, '`'),
+                '\\' => try buf.append(self.allocator, '\\'),
+                else => try buf.append(self.allocator, esc),
+            }
+        }
+        return LexError.UnterminatedString;
+    }
+
     /// Lex a regex literal. We do minimal parsing: find the end.
     /// Pattern: /body/flags — body cannot contain unescaped / or line terminator.
     fn lexRegex(self: *Lexer, start: usize, start_col: u32, lt_before: bool) LexError!Token {
@@ -367,24 +411,39 @@ pub const Lexer = struct {
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
             if (isLineTerminator(c)) return LexError.UnterminatedString;
-            if (c == '[') { in_class = true; self.pos += 1; self.column += 1; continue; }
-            if (c == ']') { in_class = false; self.pos += 1; self.column += 1; continue; }
+            if (c == '[') {
+                in_class = true;
+                self.pos += 1;
+                self.column += 1;
+                continue;
+            }
+            if (c == ']') {
+                in_class = false;
+                self.pos += 1;
+                self.column += 1;
+                continue;
+            }
             if (c == '\\') {
-                self.pos += 1; self.column += 1;
+                self.pos += 1;
+                self.column += 1;
                 if (self.pos < self.source.len and !isLineTerminator(self.source[self.pos])) {
-                    self.pos += 1; self.column += 1;
+                    self.pos += 1;
+                    self.column += 1;
                 }
                 continue;
             }
             if (c == '/' and !in_class) {
-                self.pos += 1; self.column += 1;
+                self.pos += 1;
+                self.column += 1;
                 break;
             }
-            self.pos += 1; self.column += 1;
+            self.pos += 1;
+            self.column += 1;
         }
         // Consume flags
         while (self.pos < self.source.len and isIdentChar(self.source[self.pos])) {
-            self.pos += 1; self.column += 1;
+            self.pos += 1;
+            self.column += 1;
         }
         const slice = self.source[start..self.pos];
         var t = Token.initSimple(.regex, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
@@ -440,9 +499,11 @@ pub const Lexer = struct {
             return self.lexString(c, start, start_col, lt_before);
         }
 
-        // Template literal — reject
+        // Template literal
         if (c == '`') {
-            return LexError.TemplateLiteralNotSupported;
+            self.pos += 1;
+            self.column += 1;
+            return self.lexTemplateString(start, start_col, lt_before);
         }
 
         // Single-char and multi-char punctuators
@@ -461,58 +522,106 @@ pub const Lexer = struct {
             ',' => .comma,
             '~' => .tilde,
             '?' => .question,
-            '.' => .dot,
+            '.' => blk: {
+                if (self.pos + 1 < self.source.len and self.source[self.pos] == '.' and self.source[self.pos + 1] == '.') {
+                    self.pos += 2;
+                    self.column += 2;
+                    break :blk .ellipsis;
+                }
+                break :blk .dot;
+            },
             '+' => blk: {
                 if (self.pos < self.source.len) {
-                    if (self.source[self.pos] == '+') { self.pos += 1; self.column += 1; break :blk .plus_plus; }
-                    if (self.source[self.pos] == '=') { self.pos += 1; self.column += 1; break :blk .plus_eq; }
+                    if (self.source[self.pos] == '+') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .plus_plus;
+                    }
+                    if (self.source[self.pos] == '=') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .plus_eq;
+                    }
                 }
                 break :blk .plus;
             },
             '-' => blk: {
                 if (self.pos < self.source.len) {
-                    if (self.source[self.pos] == '-') { self.pos += 1; self.column += 1; break :blk .minus_minus; }
-                    if (self.source[self.pos] == '=') { self.pos += 1; self.column += 1; break :blk .minus_eq; }
+                    if (self.source[self.pos] == '-') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .minus_minus;
+                    }
+                    if (self.source[self.pos] == '=') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .minus_eq;
+                    }
                 }
                 break :blk .minus;
             },
             '*' => blk: {
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                    self.pos += 1; self.column += 1; break :blk .star_eq;
+                    self.pos += 1;
+                    self.column += 1;
+                    break :blk .star_eq;
                 }
                 break :blk .star;
             },
             '%' => blk: {
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                    self.pos += 1; self.column += 1; break :blk .percent_eq;
+                    self.pos += 1;
+                    self.column += 1;
+                    break :blk .percent_eq;
                 }
                 break :blk .percent;
             },
             '&' => blk: {
                 if (self.pos < self.source.len) {
-                    if (self.source[self.pos] == '&') { self.pos += 1; self.column += 1; break :blk .amp_amp; }
-                    if (self.source[self.pos] == '=') { self.pos += 1; self.column += 1; break :blk .amp_eq; }
+                    if (self.source[self.pos] == '&') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .amp_amp;
+                    }
+                    if (self.source[self.pos] == '=') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .amp_eq;
+                    }
                 }
                 break :blk .amp;
             },
             '|' => blk: {
                 if (self.pos < self.source.len) {
-                    if (self.source[self.pos] == '|') { self.pos += 1; self.column += 1; break :blk .pipe_pipe; }
-                    if (self.source[self.pos] == '=') { self.pos += 1; self.column += 1; break :blk .pipe_eq; }
+                    if (self.source[self.pos] == '|') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .pipe_pipe;
+                    }
+                    if (self.source[self.pos] == '=') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .pipe_eq;
+                    }
                 }
                 break :blk .pipe;
             },
             '^' => blk: {
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                    self.pos += 1; self.column += 1; break :blk .caret_eq;
+                    self.pos += 1;
+                    self.column += 1;
+                    break :blk .caret_eq;
                 }
                 break :blk .caret;
             },
             '!' => blk: {
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                    self.pos += 1; self.column += 1;
+                    self.pos += 1;
+                    self.column += 1;
                     if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                        self.pos += 1; self.column += 1; break :blk .bang_eq_eq;
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .bang_eq_eq;
                     }
                     break :blk .bang_eq;
                 }
@@ -521,25 +630,37 @@ pub const Lexer = struct {
             '=' => blk: {
                 if (self.pos < self.source.len) {
                     if (self.source[self.pos] == '=') {
-                        self.pos += 1; self.column += 1;
+                        self.pos += 1;
+                        self.column += 1;
                         if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                            self.pos += 1; self.column += 1; break :blk .eq_eq_eq;
+                            self.pos += 1;
+                            self.column += 1;
+                            break :blk .eq_eq_eq;
                         }
                         break :blk .eq_eq;
                     }
                     if (self.source[self.pos] == '>') {
-                        self.pos += 1; self.column += 1; break :blk .arrow;
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .arrow;
                     }
                 }
                 break :blk .eq;
             },
             '<' => blk: {
                 if (self.pos < self.source.len) {
-                    if (self.source[self.pos] == '=') { self.pos += 1; self.column += 1; break :blk .lt_eq; }
+                    if (self.source[self.pos] == '=') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .lt_eq;
+                    }
                     if (self.source[self.pos] == '<') {
-                        self.pos += 1; self.column += 1;
+                        self.pos += 1;
+                        self.column += 1;
                         if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                            self.pos += 1; self.column += 1; break :blk .lt_lt_eq;
+                            self.pos += 1;
+                            self.column += 1;
+                            break :blk .lt_lt_eq;
                         }
                         break :blk .lt_lt;
                     }
@@ -548,18 +669,28 @@ pub const Lexer = struct {
             },
             '>' => blk: {
                 if (self.pos < self.source.len) {
-                    if (self.source[self.pos] == '=') { self.pos += 1; self.column += 1; break :blk .gt_eq; }
+                    if (self.source[self.pos] == '=') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .gt_eq;
+                    }
                     if (self.source[self.pos] == '>') {
-                        self.pos += 1; self.column += 1;
+                        self.pos += 1;
+                        self.column += 1;
                         if (self.pos < self.source.len and self.source[self.pos] == '>') {
-                            self.pos += 1; self.column += 1;
+                            self.pos += 1;
+                            self.column += 1;
                             if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                                self.pos += 1; self.column += 1; break :blk .gt_gt_gt_eq;
+                                self.pos += 1;
+                                self.column += 1;
+                                break :blk .gt_gt_gt_eq;
                             }
                             break :blk .gt_gt_gt;
                         }
                         if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                            self.pos += 1; self.column += 1; break :blk .gt_gt_eq;
+                            self.pos += 1;
+                            self.column += 1;
+                            break :blk .gt_gt_eq;
                         }
                         break :blk .gt_gt;
                     }
@@ -572,7 +703,9 @@ pub const Lexer = struct {
                     return self.lexRegex(start, start_col, lt_before);
                 }
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
-                    self.pos += 1; self.column += 1; break :blk .slash_eq;
+                    self.pos += 1;
+                    self.column += 1;
+                    break :blk .slash_eq;
                 }
                 break :blk .slash;
             },
