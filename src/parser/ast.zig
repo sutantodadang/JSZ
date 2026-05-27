@@ -1,0 +1,310 @@
+// SPDX-License-Identifier: MIT
+//! ES5 AST nodes. Arena-allocated tagged unions. Phase 1.
+const std = @import("std");
+
+// ---------------------------------------------------------------- operators ---
+
+pub const BinaryOp = enum {
+    add, sub, mul, div, mod,
+    bit_and, bit_or, bit_xor, lshift, rshift, urshift,
+    lt, lte, gt, gte, instanceof, in,
+    eq, neq, strict_eq, strict_neq,
+};
+
+pub const AssignOp = enum {
+    assign,
+    add, sub, mul, div, mod,
+    bit_and, bit_or, bit_xor, lshift, rshift, urshift,
+};
+
+pub const UnaryOp = enum {
+    neg, pos, not, bit_not, typeof_, void_, delete_,
+    pre_inc, pre_dec,
+};
+
+pub const LogicalOp = enum { and_, or_ };
+
+pub const UpdateOp = enum { inc, dec };
+
+// ---------------------------------------------------------------- node enum ---
+
+pub const NodeKind = enum {
+    // Expressions
+    number_literal,
+    string_literal,
+    bool_literal,
+    null_literal,
+    undefined_literal,
+    identifier,
+    this_expr,
+    unary_expr,
+    binary_expr,
+    logical_expr,
+    assignment_expr,
+    update_expr,
+    conditional_expr,
+    sequence_expr,
+    call_expr,
+    new_expr,
+    member_expr,
+    function_expr,
+    // Phase 3a: object and array literals
+    object_literal,
+    array_literal,
+    // Statements
+    program,
+    expr_stmt,
+    block_stmt,
+    var_decl,
+    function_decl,
+    if_stmt,
+    while_stmt,
+    do_while_stmt,
+    for_stmt,
+    return_stmt,
+    break_stmt,
+    continue_stmt,
+    empty_stmt,
+    debugger_stmt,
+    // Phase 4a: exceptions
+    throw_stmt,
+    try_stmt,
+    // Phase 4c: regex literal
+    regex_literal,
+    // Phase 4d: for-in, switch, labels
+    for_in_stmt,
+    switch_stmt,
+    labeled_stmt,
+};
+
+// ---------------------------------------------------------------- node type ---
+
+pub const Node = struct {
+    kind: NodeKind,
+    start: u32,
+    end: u32,
+    data: Data,
+};
+
+pub const Data = union(NodeKind) {
+    number_literal: f64,
+    string_literal: []const u8,
+    bool_literal: bool,
+    null_literal: void,
+    undefined_literal: void,
+    identifier: []const u8,
+    this_expr: void,
+    unary_expr: UnaryExpr,
+    binary_expr: BinaryExpr,
+    logical_expr: LogicalExpr,
+    assignment_expr: AssignExpr,
+    update_expr: UpdateExpr,
+    conditional_expr: CondExpr,
+    sequence_expr: SeqExpr,
+    call_expr: CallExpr,
+    new_expr: NewExpr,
+    member_expr: MemberExpr,
+    function_expr: FuncExpr,
+    object_literal: ObjectLiteral,
+    array_literal: ArrayLiteral,
+    program: Program,
+    expr_stmt: *Node,
+    block_stmt: BlockStmt,
+    var_decl: VarDecl,
+    function_decl: FuncDecl,
+    if_stmt: IfStmt,
+    while_stmt: WhileStmt,
+    do_while_stmt: DoWhileStmt,
+    for_stmt: ForStmt,
+    return_stmt: ?*Node,
+    break_stmt: ?[]const u8,
+    continue_stmt: ?[]const u8,
+    empty_stmt: void,
+    debugger_stmt: void,
+    // Phase 4a
+    throw_stmt: *Node,
+    try_stmt: TryStmt,
+    // Phase 4c
+    regex_literal: RegexLiteral,
+    // Phase 4d
+    for_in_stmt: ForInStmt,
+    switch_stmt: SwitchStmt,
+    labeled_stmt: LabeledStmt,
+};
+
+// ---------------------------------------------------------------- payloads ---
+
+pub const UnaryExpr = struct {
+    op: UnaryOp,
+    operand: *Node,
+};
+
+pub const BinaryExpr = struct {
+    op: BinaryOp,
+    left: *Node,
+    right: *Node,
+};
+
+pub const LogicalExpr = struct {
+    op: LogicalOp,
+    left: *Node,
+    right: *Node,
+};
+
+pub const AssignExpr = struct {
+    op: AssignOp,
+    target: *Node,
+    value: *Node,
+};
+
+pub const UpdateExpr = struct {
+    op: UpdateOp,
+    operand: *Node,
+    prefix: bool,
+};
+
+pub const CondExpr = struct {
+    test_: *Node,
+    consequent: *Node,
+    alternate: *Node,
+};
+
+pub const SeqExpr = struct {
+    exprs: []*Node,
+};
+
+pub const CallExpr = struct {
+    callee: *Node,
+    args: []*Node,
+};
+
+pub const NewExpr = struct {
+    callee: *Node,
+    args: []*Node,
+};
+
+pub const MemberExpr = struct {
+    object: *Node,
+    property: *Node,
+    computed: bool,
+};
+
+pub const FuncExpr = struct {
+    name: ?[]const u8,
+    params: [][]const u8,
+    body: []*Node,
+    is_strict: bool = false,
+};
+
+/// Phase 3a: a single property in an object literal.
+pub const ObjectProp = struct {
+    /// Property key (always stored as a string, even for numeric keys).
+    key: []const u8,
+    value: *Node,
+};
+
+/// Phase 3a: object literal { key: value, ... }
+pub const ObjectLiteral = struct {
+    properties: []ObjectProp,
+};
+
+/// Phase 3a: array literal [ expr, expr, ... ]
+pub const ArrayLiteral = struct {
+    elements: []*Node,
+};
+
+/// Phase 4c: regex literal /pattern/flags
+pub const RegexLiteral = struct {
+    pattern: []const u8,
+    flags: []const u8,
+};
+
+pub const Program = struct {
+    body: []*Node,
+    is_strict: bool = false,
+};
+
+pub const BlockStmt = struct {
+    body: []*Node,
+};
+
+pub const VarDecl = struct {
+    name: []const u8,
+    init: ?*Node,
+};
+
+pub const FuncDecl = struct {
+    name: []const u8,
+    params: [][]const u8,
+    body: []*Node,
+    is_strict: bool = false,
+};
+
+pub const IfStmt = struct {
+    test_: *Node,
+    consequent: *Node,
+    alternate: ?*Node,
+};
+
+pub const WhileStmt = struct {
+    test_: *Node,
+    body: *Node,
+};
+
+pub const DoWhileStmt = struct {
+    body: *Node,
+    test_: *Node,
+};
+
+pub const ForStmt = struct {
+    init: ?*Node,
+    test_: ?*Node,
+    update: ?*Node,
+    body: *Node,
+};
+
+/// Phase 4a: catch clause for try statement.
+pub const CatchClause = struct {
+    param_name: []const u8,
+    body: *Node,
+};
+
+/// Phase 4a: try/catch/finally statement.
+pub const TryStmt = struct {
+    block: *Node,
+    handler: ?CatchClause,
+    finalizer: ?*Node,
+};
+
+/// Phase 4d: for-in statement.
+/// left: var_decl or identifier node (the loop variable)
+/// right: expression (the object to iterate)
+/// body: statement
+pub const ForInStmt = struct {
+    left: *Node,
+    right: *Node,
+    body: *Node,
+};
+
+/// Phase 4d: single case in a switch statement.
+pub const SwitchCase = struct {
+    /// null => default case
+    test_: ?*Node,
+    body: []*Node,
+};
+
+/// Phase 4d: switch statement.
+pub const SwitchStmt = struct {
+    discriminant: *Node,
+    cases: []SwitchCase,
+};
+
+/// Phase 4d: labeled statement.
+pub const LabeledStmt = struct {
+    name: []const u8,
+    body: *Node,
+};
+
+test "AST types compile" {
+    try std.testing.expect(true);
+}
