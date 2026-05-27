@@ -18,6 +18,7 @@ const Realm = @import("../runtime/realm.zig").Realm;
 const err_mod = @import("../runtime/error.zig");
 const Heap = @import("../gc/heap.zig").Heap;
 const gc_mod = @import("../gc/gc.zig");
+const promise_mod = @import("../runtime/builtins/promise.zig");
 
 // ------------------------------------------------------------------ EvalResult --
 
@@ -35,6 +36,8 @@ pub const StmtResult = union(enum) {
     break_: ?[]const u8,
     /// continue statement. Carries optional label (Phase 4d).
     continue_: ?[]const u8,
+    /// Generator yield suspended the current statement.
+    yield_suspend: void,
     /// Runtime exception.
     exception: EvalException,
 };
@@ -62,6 +65,58 @@ pub const Vm = struct {
     context: @import("../runtime/realm.zig").Context = undefined,
     /// Active generator capture context while materializing a generator.
     generator_capture: ?*GeneratorCapture = null,
+    /// Phase 7: derived constructor must call super before touching `this`.
+    derived_super_pending: bool = false,
+    derived_super_called: bool = false,
+
+    fn checkThisBeforeSuper(self: *Vm) EvalError!void {
+        if (self.derived_super_pending and !self.derived_super_called) {
+            const msg = "Must call super constructor in derived class before accessing 'this'";
+            self.last_exception_msg = try std.fmt.allocPrint(self.arena, "ReferenceError: {s}", .{msg});
+            self.last_exception_value = try self.makeReferenceErrorObject(msg);
+            return EvalError.JsException;
+        }
+    }
+
+    fn isSuperCall(c: ast.CallExpr) bool {
+        if (c.callee.kind != .member_expr) return false;
+        const me = c.callee.data.member_expr;
+        if (me.computed or me.object.kind != .identifier or me.property.kind != .identifier) return false;
+        return std.mem.eql(u8, me.object.data.identifier, "super") and
+            std.mem.eql(u8, me.property.data.identifier, "call");
+    }
+
+    fn genLoopTop(self: *Vm, stmt: *Node) ?*GenLoopFrame {
+        if (self.generator_capture) |cap| {
+            if (cap.loop_stack.items.len > 0) {
+                const top = &cap.loop_stack.items[cap.loop_stack.items.len - 1];
+                if (top.stmt == stmt) return top;
+            }
+        }
+        return null;
+    }
+
+    fn genLoopPush(self: *Vm, stmt: *Node) error{OutOfMemory}!void {
+        if (self.generator_capture) |cap| {
+            try cap.loop_stack.append(self.arena, .{ .stmt = stmt, .phase = .enter });
+        }
+    }
+
+    fn genLoopPop(self: *Vm) void {
+        if (self.generator_capture) |cap| {
+            _ = cap.loop_stack.pop();
+        }
+    }
+
+    fn takeGeneratorSuspend(self: *Vm) ?StmtResult {
+        if (self.generator_capture) |cap| {
+            if (cap.suspend_requested) {
+                cap.suspend_requested = false;
+                return StmtResult{ .yield_suspend = {} };
+            }
+        }
+        return null;
+    }
 
     pub fn init(arena: std.mem.Allocator) !Vm {
         const realm = try Realm.init(arena);
@@ -75,6 +130,8 @@ pub const Vm = struct {
         // Expose __gc__ noop in tree mode (called by tests; realm has no heap).
         const gc_fn = try val_mod.makeNativeFunction(arena, nativeGcNoop);
         try realm.global_env.define("__gc__", gc_fn);
+        const microtask_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeRunMicrotasks);
+        try realm.global_env.define("__runMicrotasks__", microtask_fn);
         const undef_this = try val_mod.makeUndefined(arena);
         return Vm{ .arena = arena, .realm = realm, .current_this = undef_this, .generator_capture = null };
     }
@@ -93,6 +150,8 @@ pub const Vm = struct {
         try realm.global_env.define("undefined", undef_val);
         const gc_fn = try val_mod.makeNativeFunction(arena, nativeGcCollect);
         try realm.global_env.define("__gc__", gc_fn);
+        const microtask_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeRunMicrotasks);
+        try realm.global_env.define("__runMicrotasks__", microtask_fn);
         const undef_this = try val_mod.makeUndefined(arena);
         return Vm{ .arena = arena, .realm = realm, .heap = heap, .current_this = undef_this, .generator_capture = null };
     }
@@ -328,6 +387,7 @@ pub const Vm = struct {
                 .break_ => return r,
                 .continue_ => return r,
                 .exception => return r,
+                .yield_suspend => return r,
             }
         }
         return StmtResult{ .value = last };
@@ -342,6 +402,7 @@ pub const Vm = struct {
                     error.JsException => return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } },
                     else => return error.OutOfMemory,
                 };
+                if (self.takeGeneratorSuspend()) |sr| return sr;
                 return StmtResult{ .value = v };
             },
             .var_decl => {
@@ -378,6 +439,7 @@ pub const Vm = struct {
                         };
                     },
                 }
+                if (self.takeGeneratorSuspend()) |sr| return sr;
                 return StmtResult{ .value = try self.makeUndefined() };
             },
             .block_stmt => {
@@ -414,12 +476,25 @@ pub const Vm = struct {
             },
             .while_stmt => {
                 const ws = node.data.while_stmt;
+                const in_gen = self.generator_capture != null;
+                var loop_frame = if (in_gen) self.genLoopTop(node) else null;
+                const resuming = loop_frame != null;
+                if (!resuming and in_gen) {
+                    try self.genLoopPush(node);
+                    loop_frame = self.genLoopTop(node);
+                }
                 while (true) {
+                    if (in_gen) {
+                        if (loop_frame) |lf| lf.phase = .cond;
+                    }
                     const cond = self.evalExpression(ws.test_, env) catch |e| switch (e) {
                         error.JsException => return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } },
                         else => return error.OutOfMemory,
                     };
                     if (!isTruthy(cond)) break;
+                    if (in_gen) {
+                        if (loop_frame) |lf| lf.phase = .body;
+                    }
                     const r = try self.evalStatement(ws.body, env);
                     switch (r) {
                         .value => {},
@@ -434,6 +509,7 @@ pub const Vm = struct {
                         else => return r,
                     }
                 }
+                if (in_gen) self.genLoopPop();
                 return StmtResult{ .value = try self.makeUndefined() };
             },
             .do_while_stmt => {
@@ -461,21 +537,37 @@ pub const Vm = struct {
             },
             .for_stmt => {
                 const fs = node.data.for_stmt;
-                // Execute init
-                if (fs.init) |init_node| {
-                    const r = try self.evalStatement(init_node, env);
-                    switch (r) {
-                        .value => {},
-                        else => return r,
+                const in_gen = self.generator_capture != null;
+                var loop_frame = if (in_gen) self.genLoopTop(node) else null;
+                const resuming = loop_frame != null;
+
+                if (!resuming) {
+                    if (fs.init) |init_node| {
+                        const r = try self.evalStatement(init_node, env);
+                        switch (r) {
+                            .value => {},
+                            else => return r,
+                        }
+                    }
+                    if (in_gen) {
+                        try self.genLoopPush(node);
+                        loop_frame = self.genLoopTop(node);
                     }
                 }
+
                 while (true) {
+                    if (in_gen) {
+                        if (loop_frame) |lf| lf.phase = .cond;
+                    }
                     if (fs.test_) |test_node| {
                         const cond = self.evalExpression(test_node, env) catch |e| switch (e) {
                             error.JsException => return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } },
                             else => return error.OutOfMemory,
                         };
                         if (!isTruthy(cond)) break;
+                    }
+                    if (in_gen) {
+                        if (loop_frame) |lf| lf.phase = .body;
                     }
                     const r = try self.evalStatement(fs.body, env);
                     switch (r) {
@@ -489,6 +581,9 @@ pub const Vm = struct {
                         },
                         else => return r,
                     }
+                    if (in_gen) {
+                        if (loop_frame) |lf| lf.phase = .update;
+                    }
                     if (fs.update) |update_node| {
                         _ = self.evalExpression(update_node, env) catch |e| switch (e) {
                             error.JsException => return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } },
@@ -496,6 +591,7 @@ pub const Vm = struct {
                         };
                     }
                 }
+                if (in_gen) self.genLoopPop();
                 return StmtResult{ .value = try self.makeUndefined() };
             },
             .break_stmt => return StmtResult{ .break_ = node.data.break_stmt },
@@ -840,13 +936,26 @@ pub const Vm = struct {
             },
             .yield_expr => {
                 if (self.generator_capture) |capture| {
+                    if (capture.skip_yields > 0) {
+                        capture.skip_yields -= 1;
+                        if (capture.resume_index < capture.resume_values.len) {
+                            const resumed = capture.resume_values[capture.resume_index];
+                            capture.resume_index += 1;
+                            return resumed;
+                        }
+                        return self.makeUndefined();
+                    }
                     const yv = if (node.data.yield_expr) |yn|
                         try self.evalExpression(yn, env)
                     else
                         try self.makeUndefined();
                     try capture.yields.append(self.arena, yv);
-                    // Minimal subset: `yield` expression result (value sent by next(arg))
-                    // is not yet supported and always resolves to undefined.
+                    capture.suspend_requested = true;
+                    if (capture.resume_index < capture.resume_values.len) {
+                        const resumed = capture.resume_values[capture.resume_index];
+                        capture.resume_index += 1;
+                        return resumed;
+                    }
                     return self.makeUndefined();
                 }
                 self.last_exception_msg = "SyntaxError: yield is only valid inside generator functions";
@@ -872,6 +981,7 @@ pub const Vm = struct {
                     .is_arrow = fe.is_arrow,
                     .lexical_this = if (fe.is_arrow) self.current_this else Value{},
                     .is_generator = fe.is_generator,
+                    .requires_super = fe.requires_super,
                 };
                 // Store body length in a hidden way — we pack it via a wrapper.
                 // Actually we need to store body length. Let's use a FuncWrapper.
@@ -1048,7 +1158,10 @@ pub const Vm = struct {
         var steps: usize = 0;
         while (steps < 100000) : (steps += 1) {
             const iter_this = val_mod.makeObject(self.arena, it) catch return EvalError.OutOfMemory;
-            const step_val = try self.invokeCallable(iter_this, next_fn, &[_]Value{});
+            const step_val = self.invokeCallable(iter_this, next_fn, &[_]Value{}) catch |e| {
+                self.closeIteratorIfPresent(it) catch {};
+                return e;
+            };
             if (step_val.bits == 0 or step_val.toPtr().* != .object) {
                 self.closeIteratorIfPresent(it) catch {};
                 self.last_exception_msg = "TypeError: iterator result is not an object";
@@ -1092,6 +1205,7 @@ pub const Vm = struct {
     }
 
     fn evalMemberExpr(self: *Vm, me: ast.MemberExpr, env: *Environment) EvalError!Value {
+        if (me.object.kind == .this_expr) try self.checkThisBeforeSuper();
         const obj_val = try self.evalExpression(me.object, env);
         // Resolve property key.
         const key = if (me.computed) blk: {
@@ -1400,6 +1514,7 @@ pub const Vm = struct {
             },
             .member_expr => {
                 const me = target.data.member_expr;
+                if (me.object.kind == .this_expr) try self.checkThisBeforeSuper();
                 const obj_val = try self.evalExpression(me.object, env);
                 const key = if (me.computed) blk: {
                     const key_val = try self.evalExpression(me.property, env);
@@ -1426,6 +1541,17 @@ pub const Vm = struct {
     }
 
     fn evalCall(self: *Vm, c: ast.CallExpr, env: *Environment) EvalError!Value {
+        if (c.callee.kind == .identifier and std.mem.eql(u8, c.callee.data.identifier, "__yield_star__")) {
+            if (self.generator_capture) |capture| {
+                if (c.args.len != 1) return self.makeUndefined();
+                const delegated = try self.evalExpression(c.args[0], env);
+                return self.evalYieldStar(capture, delegated);
+            }
+            self.last_exception_msg = "SyntaxError: yield* is only valid inside generator functions";
+            self.last_exception_value = self.makeErrorObject("SyntaxError", "yield* is only valid inside generator functions") catch Value{};
+            return EvalError.JsException;
+        }
+
         // Check if callee is a member expression (method call).
         const is_method = c.callee.kind == .member_expr;
         var this_val: Value = try self.makeUndefined();
@@ -1445,6 +1571,8 @@ pub const Vm = struct {
         } else {
             callee_val = try self.evalExpression(c.callee, env);
         }
+
+        if (isSuperCall(c)) self.derived_super_called = true;
 
         // Evaluate arguments
         var arg_vals = std.ArrayList(Value){};
@@ -1516,11 +1644,29 @@ pub const Vm = struct {
                         }
                     }
                 }
-                // Error constructor objects have a "__call__" property.
                 if (obj.get("__call__")) |call_val| {
                     if (call_val.bits != 0 and call_val.toPtr().* == .native_function) {
-                        // Call as constructor (ES5: error constructors are also callable).
-                        return self.doConstruct(callee_val, arg_vals.items);
+                        const fn_ptr2 = call_val.toPtr().native_function;
+                        if (obj.get("prototype") != null) {
+                            // Preserve legacy behavior for Error-like constructor objects.
+                            return self.doConstruct(callee_val, arg_vals.items);
+                        }
+                        return fn_ptr2(self.arena, callee_val, arg_vals.items) catch |e| {
+                            if (e == error.JsException) {
+                                const realm_mod = @import("../runtime/realm.zig");
+                                if (realm_mod.pending_exception.bits != 0) {
+                                    self.last_exception_value = realm_mod.pending_exception;
+                                    const fmsg = formatExceptionMessage(self.arena, self.last_exception_value) catch "error";
+                                    self.last_exception_msg = fmsg;
+                                    realm_mod.pending_exception = Value{};
+                                } else if (self.last_exception_value.bits != 0) {
+                                    const fmsg = formatExceptionMessage(self.arena, self.last_exception_value) catch "error";
+                                    self.last_exception_msg = fmsg;
+                                }
+                                return EvalError.JsException;
+                            }
+                            return EvalError.OutOfMemory;
+                        };
                     }
                 }
                 const msg = "object is not a function";
@@ -1535,6 +1681,125 @@ pub const Vm = struct {
                 return EvalError.JsException;
             },
         }
+    }
+
+    fn evalYieldStar(self: *Vm, capture: *GeneratorCapture, delegated: Value) EvalError!Value {
+        const state = capture.state orelse return self.makeUndefined();
+        if (capture.yield_star_iter == null and capture.yield_star_array == null) {
+            if (delegated.bits != 0 and delegated.toPtr().* == .object) {
+                const src_obj = delegated.toPtr().object;
+                if (src_obj.is_array) {
+                    capture.yield_star_array = src_obj;
+                    capture.yield_star_array_index = 0;
+                } else {
+                    var iter_obj: ?*JsObject = null;
+                    if (src_obj.get("@@iterator")) |iter_fn| {
+                        const iter_val = try self.invokeCallable(delegated, iter_fn, &[_]Value{});
+                        if (iter_val.bits != 0 and iter_val.toPtr().* == .object) iter_obj = iter_val.toPtr().object;
+                    } else if (src_obj.get("iterator")) |iter_fn| {
+                        const iter_val = try self.invokeCallable(delegated, iter_fn, &[_]Value{});
+                        if (iter_val.bits != 0 and iter_val.toPtr().* == .object) iter_obj = iter_val.toPtr().object;
+                    } else if (src_obj.get("next")) |_| {
+                        iter_obj = src_obj;
+                    }
+                    if (iter_obj == null) {
+                        self.last_exception_msg = "TypeError: value is not iterable";
+                        self.last_exception_value = self.makeTypeErrorObject("value is not iterable") catch Value{};
+                        return EvalError.JsException;
+                    }
+                    capture.yield_star_iter = iter_obj;
+                }
+            } else {
+                self.last_exception_msg = "TypeError: value is not iterable";
+                self.last_exception_value = self.makeTypeErrorObject("value is not iterable") catch Value{};
+                return EvalError.JsException;
+            }
+        }
+        if (capture.yield_star_array) |arr| {
+            const len = arr.getArrayLength();
+            if (capture.yield_star_array_index >= len) {
+                capture.yield_star_array = null;
+                capture.yield_star_array_index = 0;
+                return self.makeUndefined();
+            }
+            const key = std.fmt.allocPrint(self.arena, "{d}", .{capture.yield_star_array_index}) catch return EvalError.OutOfMemory;
+            const value_val = arr.get(key) orelse try self.makeUndefined();
+            capture.yield_star_array_index += 1;
+            try capture.yields.append(self.arena, value_val);
+            capture.suspend_requested = true;
+            return value_val;
+        }
+        const it = capture.yield_star_iter orelse return self.makeUndefined();
+        if (it.internal_slot != null) {
+            const gen_val = val_mod.makeObject(self.arena, it) catch return EvalError.OutOfMemory;
+            const step_val = nativeGeneratorNext(self.arena, gen_val, &[_]Value{}) catch |e| {
+                capture.yield_star_iter = null;
+                if (e == error.JsException) return EvalError.JsException;
+                return EvalError.OutOfMemory;
+            };
+            if (step_val.bits == 0 or step_val.toPtr().* != .object) {
+                capture.yield_star_iter = null;
+                self.last_exception_msg = "TypeError: iterator result is not an object";
+                self.last_exception_value = self.makeTypeErrorObject("iterator result is not an object") catch Value{};
+                return EvalError.JsException;
+            }
+            const step_obj = step_val.toPtr().object;
+            const done_val = step_obj.get("done") orelse try self.makeBool(false);
+            const value_val = step_obj.get("value") orelse try self.makeUndefined();
+            if (isTruthy(done_val)) {
+                capture.yield_star_iter = null;
+                const is_undef = value_val.bits == 0 or (value_val.bits != 0 and value_val.toPtr().* == .undefined_);
+                if (!is_undef) {
+                    state.return_value = value_val;
+                    capture.delegate_return = true;
+                    capture.suspend_requested = true;
+                }
+                return value_val;
+            }
+            try capture.yields.append(self.arena, value_val);
+            capture.suspend_requested = true;
+            return value_val;
+        }
+        const next_fn = it.get("next") orelse {
+            self.last_exception_msg = "TypeError: iterator missing next method";
+            self.last_exception_value = self.makeTypeErrorObject("iterator missing next method") catch Value{};
+            return EvalError.JsException;
+        };
+        if (!isCallable(next_fn)) {
+            self.last_exception_msg = "TypeError: iterator next is not callable";
+            self.last_exception_value = self.makeTypeErrorObject("iterator next is not callable") catch Value{};
+            return EvalError.JsException;
+        }
+        const iter_this = val_mod.makeObject(self.arena, it) catch return EvalError.OutOfMemory;
+        const step_val = self.invokeCallable(iter_this, next_fn, &[_]Value{}) catch |e| {
+            capture.yield_star_iter = null;
+            self.closeIteratorIfPresent(it) catch {};
+            return e;
+        };
+        if (step_val.bits == 0 or step_val.toPtr().* != .object) {
+            capture.yield_star_iter = null;
+            self.closeIteratorIfPresent(it) catch {};
+            self.last_exception_msg = "TypeError: iterator result is not an object";
+            self.last_exception_value = self.makeTypeErrorObject("iterator result is not an object") catch Value{};
+            return EvalError.JsException;
+        }
+        const step_obj = step_val.toPtr().object;
+        const done_val = step_obj.get("done") orelse try self.makeBool(false);
+        if (isTruthy(done_val)) {
+            capture.yield_star_iter = null;
+            const return_val = step_obj.get("value") orelse try self.makeUndefined();
+            const is_undef = return_val.bits == 0 or (return_val.bits != 0 and return_val.toPtr().* == .undefined_);
+            if (!is_undef) {
+                state.return_value = return_val;
+                capture.delegate_return = true;
+                capture.suspend_requested = true;
+            }
+            return return_val;
+        }
+        const value_val = step_obj.get("value") orelse try self.makeUndefined();
+        try capture.yields.append(self.arena, value_val);
+        capture.suspend_requested = true;
+        return value_val;
     }
 
     fn callFunction(self: *Vm, fv: *FuncVal, args: []Value, this_val: Value) EvalError!Value {
@@ -1621,6 +1886,15 @@ pub const Vm = struct {
         self.current_call_env = call_env;
         defer self.current_call_env = prev_call_env;
 
+        const prev_super_pending = self.derived_super_pending;
+        const prev_super_called = self.derived_super_called;
+        self.derived_super_pending = fv.requires_super;
+        self.derived_super_called = false;
+        defer {
+            self.derived_super_pending = prev_super_pending;
+            self.derived_super_called = prev_super_called;
+        }
+
         // Execute body
         for (body) |stmt| {
             const r = self.evalStatement(stmt, call_env) catch return EvalError.OutOfMemory;
@@ -1634,6 +1908,11 @@ pub const Vm = struct {
                 },
                 .break_ => break,
                 .continue_ => break,
+                .yield_suspend => {
+                    self.last_exception_msg = "SyntaxError: yield is only valid inside generator functions";
+                    self.last_exception_value = self.makeErrorObject("SyntaxError", "yield is only valid inside generator functions") catch Value{};
+                    return EvalError.JsException;
+                },
             }
         }
         return self.makeUndefined();
@@ -1658,6 +1937,10 @@ pub const Vm = struct {
 
         const next_fn = val_mod.makeNativeFunction(self.arena, nativeGeneratorNext) catch return EvalError.OutOfMemory;
         gen_obj.set("next", next_fn) catch return EvalError.OutOfMemory;
+        const return_fn = val_mod.makeNativeFunction(self.arena, nativeGeneratorReturn) catch return EvalError.OutOfMemory;
+        gen_obj.set("return", return_fn) catch return EvalError.OutOfMemory;
+        const throw_fn = val_mod.makeNativeFunction(self.arena, nativeGeneratorThrow) catch return EvalError.OutOfMemory;
+        gen_obj.set("throw", throw_fn) catch return EvalError.OutOfMemory;
         // Existing iterator paths already probe "iterator" / "@@iterator".
         const self_iter_fn = val_mod.makeNativeFunction(self.arena, nativeGeneratorSelfIterator) catch return EvalError.OutOfMemory;
         gen_obj.set("iterator", self_iter_fn) catch return EvalError.OutOfMemory;
@@ -1667,55 +1950,89 @@ pub const Vm = struct {
     }
 
     fn materializeGenerator(self: *Vm, state: *GeneratorState) EvalError!void {
-        if (state.materialized) return;
-        state.materialized = true;
+        state.had_exception = false;
+        state.capture.yields.clearRetainingCapacity();
+        state.capture.delegate_return = false;
+        state.capture.state = state;
 
-        const call_env = Environment.init(self.arena, state.closure_env) catch return EvalError.OutOfMemory;
+        if (!state.suspended) {
+            state.capture.loop_stack.clearRetainingCapacity();
+        }
 
-        const arguments_obj = if (self.heap) |heap|
-            JsObject.createArrayOnHeap(heap, self.realm.array_prototype) catch return EvalError.OutOfMemory
+        const resume_slot = if (state.sent_values.items.len > 0)
+            state.sent_values.items[state.sent_values.items.len - 1]
         else
-            JsObject.createArray(self.arena, self.realm.array_prototype) catch return EvalError.OutOfMemory;
-        for (state.args, 0..) |av, i| {
-            const key = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return EvalError.OutOfMemory;
-            arguments_obj.set(key, av) catch return EvalError.OutOfMemory;
-        }
-        arguments_obj.array_length = @intCast(state.args.len);
-        const arguments_val = val_mod.makeObject(self.arena, arguments_obj) catch return EvalError.OutOfMemory;
-        call_env.define("arguments", arguments_val) catch return EvalError.OutOfMemory;
+            try self.makeUndefined();
 
-        const param_defaults: []?*Node = @as([*]?*Node, @ptrCast(state.func.param_defaults.ptr))[0..state.func.param_defaults.len];
-        for (state.func.params, 0..) |param, i| {
-            var av = if (i < state.args.len) state.args[i] else try self.makeUndefined();
-            if (i < param_defaults.len and param_defaults[i] != null) {
-                const is_undef = av.bits == 0 or (av.bits != 0 and av.toPtr().* == .undefined_);
-                if (is_undef) av = try self.evalExpression(param_defaults[i].?, call_env);
-            }
-            call_env.define(param, av) catch return EvalError.OutOfMemory;
-        }
-        if (state.func.rest_param) |rest_name| {
-            const rest_arr = if (self.heap) |heap|
+        if (state.suspended and state.persistent_env != null) {
+            const slot = self.arena.alloc(Value, 1) catch return EvalError.OutOfMemory;
+            slot[0] = resume_slot;
+            state.capture.resume_values = slot[0..1];
+            state.capture.resume_index = 0;
+            state.capture.skip_yields = if (state.sent_values.items.len > 1) 1 else 0;
+        } else {
+            state.capture.resume_values = if (state.sent_values.items.len > 1)
+                state.sent_values.items[1..]
+            else
+                &[_]Value{};
+            state.capture.resume_index = 0;
+            state.capture.skip_yields = 0;
+            state.return_value = try self.makeUndefined();
+            state.suspended = false;
+            state.body_index = 0;
+            state.capture.yield_star_iter = null;
+            state.capture.yield_star_array = null;
+            state.capture.yield_star_array_index = 0;
+
+            const call_env = Environment.init(self.arena, state.closure_env) catch return EvalError.OutOfMemory;
+
+            const arguments_obj = if (self.heap) |heap|
                 JsObject.createArrayOnHeap(heap, self.realm.array_prototype) catch return EvalError.OutOfMemory
             else
                 JsObject.createArray(self.arena, self.realm.array_prototype) catch return EvalError.OutOfMemory;
-            var write_idx: usize = 0;
-            var i = state.func.params.len;
-            while (i < state.args.len) : (i += 1) {
-                const key = std.fmt.allocPrint(self.arena, "{d}", .{write_idx}) catch return EvalError.OutOfMemory;
-                rest_arr.set(key, state.args[i]) catch return EvalError.OutOfMemory;
-                write_idx += 1;
+            for (state.args, 0..) |av, i| {
+                const key = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return EvalError.OutOfMemory;
+                arguments_obj.set(key, av) catch return EvalError.OutOfMemory;
             }
-            rest_arr.array_length = @intCast(write_idx);
-            const rest_val = val_mod.makeObject(self.arena, rest_arr) catch return EvalError.OutOfMemory;
-            call_env.define(rest_name, rest_val) catch return EvalError.OutOfMemory;
-        }
-        if (state.func.name) |fname| {
-            const self_val = try val_mod.makeFunction(self.arena, state.func);
-            call_env.define(fname, self_val) catch return EvalError.OutOfMemory;
-        }
-        self.hoistDeclarations(state.body, call_env) catch return EvalError.OutOfMemory;
-        self.predeclareLexicalsInBlock(state.body, call_env) catch return EvalError.OutOfMemory;
+            arguments_obj.array_length = @intCast(state.args.len);
+            const arguments_val = val_mod.makeObject(self.arena, arguments_obj) catch return EvalError.OutOfMemory;
+            call_env.define("arguments", arguments_val) catch return EvalError.OutOfMemory;
 
+            const param_defaults: []?*Node = @as([*]?*Node, @ptrCast(state.func.param_defaults.ptr))[0..state.func.param_defaults.len];
+            for (state.func.params, 0..) |param, i| {
+                var av = if (i < state.args.len) state.args[i] else try self.makeUndefined();
+                if (i < param_defaults.len and param_defaults[i] != null) {
+                    const is_undef = av.bits == 0 or (av.bits != 0 and av.toPtr().* == .undefined_);
+                    if (is_undef) av = try self.evalExpression(param_defaults[i].?, call_env);
+                }
+                call_env.define(param, av) catch return EvalError.OutOfMemory;
+            }
+            if (state.func.rest_param) |rest_name| {
+                const rest_arr = if (self.heap) |heap|
+                    JsObject.createArrayOnHeap(heap, self.realm.array_prototype) catch return EvalError.OutOfMemory
+                else
+                    JsObject.createArray(self.arena, self.realm.array_prototype) catch return EvalError.OutOfMemory;
+                var write_idx: usize = 0;
+                var i = state.func.params.len;
+                while (i < state.args.len) : (i += 1) {
+                    const key = std.fmt.allocPrint(self.arena, "{d}", .{write_idx}) catch return EvalError.OutOfMemory;
+                    rest_arr.set(key, state.args[i]) catch return EvalError.OutOfMemory;
+                    write_idx += 1;
+                }
+                rest_arr.array_length = @intCast(write_idx);
+                const rest_val = val_mod.makeObject(self.arena, rest_arr) catch return EvalError.OutOfMemory;
+                call_env.define(rest_name, rest_val) catch return EvalError.OutOfMemory;
+            }
+            if (state.func.name) |fname| {
+                const self_val = try val_mod.makeFunction(self.arena, state.func);
+                call_env.define(fname, self_val) catch return EvalError.OutOfMemory;
+            }
+            self.hoistDeclarations(state.body, call_env) catch return EvalError.OutOfMemory;
+            self.predeclareLexicalsInBlock(state.body, call_env) catch return EvalError.OutOfMemory;
+            state.persistent_env = call_env;
+        }
+
+        const call_env = state.persistent_env.?;
         const prev_this = self.current_this;
         const prev_strict = self.is_strict;
         const prev_call_env = self.current_call_env;
@@ -1731,31 +2048,77 @@ pub const Vm = struct {
             self.generator_capture = prev_capture;
         }
 
-        for (state.body) |stmt| {
-            const r = self.evalStatement(stmt, call_env) catch return EvalError.OutOfMemory;
-            switch (r) {
-                .value => {},
+        if (state.suspended and state.capture.skip_yields > 0 and state.resume_stmt_index < state.body.len and state.capture.yield_star_iter == null and state.capture.yield_star_array == null) {
+            const replay = try self.evalStatement(state.body[state.resume_stmt_index], call_env);
+            state.capture.skip_yields = 0;
+            switch (replay) {
+                .yield_suspend => {
+                    state.suspended = true;
+                    return;
+                },
                 .return_ => |rv| {
                     state.return_value = rv;
+                    state.body_index = state.body.len;
+                    state.suspended = false;
                     return;
                 },
                 .exception => |ex| {
                     state.had_exception = true;
                     state.exception = ex;
+                    state.suspended = false;
+                    return;
+                },
+                else => {},
+            }
+        }
+
+        var i = state.body_index;
+        while (i < state.body.len) : (i += 1) {
+            const r = try self.evalStatement(state.body[i], call_env);
+            if (state.capture.delegate_return) {
+                state.capture.delegate_return = false;
+                state.body_index = state.body.len;
+                state.suspended = false;
+                return;
+            }
+            switch (r) {
+                .yield_suspend => {
+                    state.resume_stmt_index = i;
+                    if (state.capture.yield_star_iter != null or state.capture.yield_star_array != null) {
+                        state.body_index = i;
+                    } else {
+                        state.body_index = i + 1;
+                    }
+                    state.suspended = true;
+                    return;
+                },
+                .value => {},
+                .return_ => |rv| {
+                    state.return_value = rv;
+                    state.body_index = state.body.len;
+                    state.suspended = false;
+                    return;
+                },
+                .exception => |ex| {
+                    state.had_exception = true;
+                    state.exception = ex;
+                    state.suspended = false;
                     return;
                 },
                 .break_, .continue_ => {
-                    // Unsupported control completion at top-level generator body.
                     state.had_exception = true;
                     state.exception = .{
                         .message = "SyntaxError: unsupported control flow in generator body",
                         .value = self.makeErrorObject("SyntaxError", "unsupported control flow in generator body") catch Value{},
                     };
+                    state.suspended = false;
                     return;
                 },
             }
         }
         state.return_value = try self.makeUndefined();
+        state.body_index = state.body.len;
+        state.suspended = false;
     }
 
     fn evalNewExpr(self: *Vm, ne: ast.NewExpr, env: *Environment) EvalError!Value {
@@ -1941,6 +2304,23 @@ pub const FuncWrapper = struct {
 
 const GeneratorCapture = struct {
     yields: std.ArrayList(Value) = .{},
+    resume_values: []const Value = &[_]Value{},
+    resume_index: usize = 0,
+    suspend_requested: bool = false,
+    delegate_return: bool = false,
+    yield_star_iter: ?*JsObject = null,
+    yield_star_array: ?*JsObject = null,
+    yield_star_array_index: usize = 0,
+    skip_yields: usize = 0,
+    state: ?*GeneratorState = null,
+    loop_stack: std.ArrayList(GenLoopFrame) = .{},
+};
+
+const GenLoopPhase = enum { enter, cond, body, update };
+
+const GenLoopFrame = struct {
+    stmt: *Node,
+    phase: GenLoopPhase = .enter,
 };
 
 const GeneratorState = struct {
@@ -1951,11 +2331,17 @@ const GeneratorState = struct {
     args: []Value,
     this_val: Value,
     capture: GeneratorCapture = .{},
-    materialized: bool = false,
+    sent_values: std.ArrayList(Value) = .{},
     index: usize = 0,
+    closed: bool = false,
     return_value: Value = Value{},
     had_exception: bool = false,
     exception: EvalException = .{ .message = "" },
+    /// Incremental stepping: resume from this statement index with persistent env.
+    suspended: bool = false,
+    body_index: usize = 0,
+    resume_stmt_index: usize = 0,
+    persistent_env: ?*Environment = null,
 };
 
 fn makeIteratorResult(arena: std.mem.Allocator, vm: *Vm, value: Value, done: bool) !Value {
@@ -1973,12 +2359,18 @@ fn nativeGeneratorSelfIterator(_: std.mem.Allocator, this_val: Value, _: []const
     return this_val;
 }
 
-fn nativeGeneratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+fn nativeGeneratorNext(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.toPtr().* != .object) return val_mod.makeUndefined(arena);
     const obj = this_val.toPtr().object;
     if (obj.internal_slot == null) return val_mod.makeUndefined(arena);
     const state: *GeneratorState = @ptrCast(@alignCast(obj.internal_slot.?));
     const vm = state.vm;
+    const resume_arg = if (args.len > 0) args[0] else try vm.makeUndefined();
+    state.sent_values.append(vm.arena, resume_arg) catch return error.OutOfMemory;
+
+    if (state.closed) {
+        return makeIteratorResult(arena, vm, try vm.makeUndefined(), true);
+    }
 
     vm.materializeGenerator(state) catch |e| switch (e) {
         error.JsException => {
@@ -1990,6 +2382,7 @@ fn nativeGeneratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Val
     };
 
     if (state.had_exception) {
+        state.closed = true;
         const realm_mod = @import("../runtime/realm.zig");
         realm_mod.pending_exception = state.exception.value;
         vm.last_exception_value = state.exception.value;
@@ -1997,18 +2390,46 @@ fn nativeGeneratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Val
         return error.JsException;
     }
 
-    if (state.index < state.capture.yields.items.len) {
-        const out = state.capture.yields.items[state.index];
-        state.index += 1;
+    if (state.capture.yields.items.len > 0) {
+        const out = state.capture.yields.items[state.capture.yields.items.len - 1];
         return makeIteratorResult(arena, vm, out, false);
     }
 
-    // Final completion result; once exhausted, remains done=true.
-    if (state.index == state.capture.yields.items.len) {
-        state.index += 1;
+    if (!state.suspended) {
+        state.closed = true;
         return makeIteratorResult(arena, vm, state.return_value, true);
     }
+
     return makeIteratorResult(arena, vm, try vm.makeUndefined(), true);
+}
+
+fn nativeGeneratorReturn(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.toPtr().* != .object) return val_mod.makeUndefined(arena);
+    const obj = this_val.toPtr().object;
+    if (obj.internal_slot == null) return val_mod.makeUndefined(arena);
+    const state: *GeneratorState = @ptrCast(@alignCast(obj.internal_slot.?));
+    const vm = state.vm;
+    const rv = if (args.len > 0) args[0] else try vm.makeUndefined();
+    state.return_value = rv;
+    state.closed = true;
+    state.suspended = false;
+    return makeIteratorResult(arena, vm, rv, true);
+}
+
+fn nativeGeneratorThrow(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.toPtr().* != .object) return val_mod.makeUndefined(arena);
+    const obj = this_val.toPtr().object;
+    if (obj.internal_slot == null) return val_mod.makeUndefined(arena);
+    const state: *GeneratorState = @ptrCast(@alignCast(obj.internal_slot.?));
+    const vm = state.vm;
+    const thrown = if (args.len > 0) args[0] else try vm.makeUndefined();
+    state.closed = true;
+    state.suspended = false;
+    const realm_mod = @import("../runtime/realm.zig");
+    realm_mod.pending_exception = thrown;
+    vm.last_exception_value = thrown;
+    vm.last_exception_msg = "generator throw";
+    return error.JsException;
 }
 
 /// GC root-scan callback for the tree-walker Vm.

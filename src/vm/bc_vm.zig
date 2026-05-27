@@ -1547,7 +1547,6 @@ pub const BcVm = struct {
                         return null;
                     }
                 }
-                // Phase 4a: Error constructor objects have __call__ and can be invoked.
                 if (obj.get("__call__")) |call_val| {
                     if (call_val.bits != 0 and call_val.toPtr().* == .native_function) {
                         const fn_ptr = call_val.toPtr().native_function;
@@ -1556,21 +1555,36 @@ pub const BcVm = struct {
                         for (0..nargs) |i| {
                             args[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
                         }
-                        // Build new object with the constructor's prototype.
-                        var proto: ?*JsObject = self.realm.object_prototype;
-                        if (obj.get("prototype")) |pv| {
-                            if (pv.bits != 0 and pv.toPtr().* == .object) proto = pv.toPtr().object;
+                        if (obj.get("prototype") != null) {
+                            // Preserve legacy behavior for Error-like constructor objects.
+                            var proto: ?*JsObject = self.realm.object_prototype;
+                            if (obj.get("prototype")) |pv| {
+                                if (pv.bits != 0 and pv.toPtr().* == .object) proto = pv.toPtr().object;
+                            }
+                            const new_obj = if (self.heap) |heap|
+                                try JsObject.createOnHeap(heap, proto)
+                            else
+                                try JsObject.create(self.arena, proto);
+                            const this_val_call = try val_mod.makeObject(self.arena, new_obj);
+                            const result = fn_ptr(self.arena, this_val_call, args) catch {
+                                return "TypeError: Error constructor threw";
+                            };
+                            const final_result = if (result.bits != 0 and result.toPtr().* == .object) result else this_val_call;
+                            self.frames.items[self.frames.items.len - 1].registers[ret_dst] = final_result;
+                            return null;
                         }
-                        const new_obj = if (self.heap) |heap|
-                            try JsObject.createOnHeap(heap, proto)
-                        else
-                            try JsObject.create(self.arena, proto);
-                        const this_val_call = try val_mod.makeObject(self.arena, new_obj);
-                        const result = fn_ptr(self.arena, this_val_call, args) catch {
-                            return "TypeError: Error constructor threw";
+                        const result = fn_ptr(self.arena, callee_val, args) catch |e| {
+                            if (e == error.JsException) {
+                                const realm_mod = @import("../runtime/realm.zig");
+                                if (realm_mod.pending_exception.bits != 0) {
+                                    self.last_exception_value = realm_mod.pending_exception;
+                                    realm_mod.pending_exception = Value{};
+                                }
+                                return "__js_exception__";
+                            }
+                            return "TypeError: object call threw";
                         };
-                        const final_result = if (result.bits != 0 and result.toPtr().* == .object) result else this_val_call;
-                        self.frames.items[self.frames.items.len - 1].registers[ret_dst] = final_result;
+                        self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
                         return null;
                     }
                 }

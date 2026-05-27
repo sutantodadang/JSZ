@@ -197,3 +197,103 @@ pub fn nativeSetSize(arena: std.mem.Allocator, this_val: Value, _: []const Value
     const data = getSetData(this_val, .set) orelse return val_mod.makeNumber(arena, 0);
     return val_mod.makeNumber(arena, @floatFromInt(data.values.items.len));
 }
+
+const MapIterKind = enum { keys, values, entries };
+
+const MapIterData = struct {
+    map: *MapData,
+    index: usize = 0,
+    kind: MapIterKind,
+};
+
+const SetIterData = struct {
+    set: *SetData,
+    index: usize = 0,
+};
+
+fn makeIteratorResult(arena: std.mem.Allocator, value: Value, done: bool) !Value {
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    try obj.set("value", value);
+    try obj.set("done", try val_mod.makeBool(arena, done));
+    return val_mod.makeObject(arena, obj);
+}
+
+fn makeMapIterator(arena: std.mem.Allocator, data: *MapIterData) !Value {
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    obj.internal_slot = data;
+    try obj.set("next", try val_mod.makeNativeFunction(arena, nativeMapIteratorNext));
+    return val_mod.makeObject(arena, obj);
+}
+
+fn makeSetIterator(arena: std.mem.Allocator, data: *SetIterData) !Value {
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    obj.internal_slot = data;
+    try obj.set("next", try val_mod.makeNativeFunction(arena, nativeSetIteratorNext));
+    return val_mod.makeObject(arena, obj);
+}
+
+fn mapIteratorKind(arena: std.mem.Allocator, this_val: Value, expected: InternalKind, kind: MapIterKind) !Value {
+    const data = getMapData(this_val, expected) orelse return val_mod.makeUndefined(arena);
+    const iter = try arena.create(MapIterData);
+    iter.* = .{ .map = data, .index = 0, .kind = kind };
+    return makeMapIterator(arena, iter);
+}
+
+pub fn nativeMapKeys(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return mapIteratorKind(arena, this_val, .map, .keys);
+}
+
+pub fn nativeMapValues(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return mapIteratorKind(arena, this_val, .map, .values);
+}
+
+pub fn nativeMapEntries(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return mapIteratorKind(arena, this_val, .map, .entries);
+}
+
+pub fn nativeSetValues(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const data = getSetData(this_val, .set) orelse return val_mod.makeUndefined(arena);
+    const iter = try arena.create(SetIterData);
+    iter.* = .{ .set = data, .index = 0 };
+    return makeSetIterator(arena, iter);
+}
+
+pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.toPtr().* != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const obj = this_val.toPtr().object;
+    if (obj.internal_slot == null) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const iter: *MapIterData = @ptrCast(@alignCast(obj.internal_slot.?));
+    if (iter.index >= iter.map.keys.items.len) {
+        return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    }
+    const value: Value = switch (iter.kind) {
+        .keys => iter.map.keys.items[iter.index],
+        .values => iter.map.values.items[iter.index],
+        .entries => blk: {
+            const array_proto = realm_mod.active_array_proto;
+            const pair = if (realm_mod.active_heap) |h|
+                try JsObject.createArrayOnHeap(h, array_proto)
+            else
+                try JsObject.createArray(arena, array_proto);
+            pair.set("0", iter.map.keys.items[iter.index]) catch return error.OutOfMemory;
+            pair.set("1", iter.map.values.items[iter.index]) catch return error.OutOfMemory;
+            pair.array_length = 2;
+            break :blk try val_mod.makeObject(arena, pair);
+        },
+    };
+    iter.index += 1;
+    return makeIteratorResult(arena, value, false);
+}
+
+pub fn nativeSetIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.toPtr().* != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const obj = this_val.toPtr().object;
+    if (obj.internal_slot == null) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const iter: *SetIterData = @ptrCast(@alignCast(obj.internal_slot.?));
+    if (iter.index >= iter.set.values.items.len) {
+        return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    }
+    const value = iter.set.values.items[iter.index];
+    iter.index += 1;
+    return makeIteratorResult(arena, value, false);
+}

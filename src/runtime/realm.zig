@@ -95,15 +95,18 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
         } else |_| {}
         return val_mod.makeUndefined(arena);
     }
-    const registry = env.lookup("__modules__") catch return val_mod.makeUndefined(arena);
-    if (registry.bits == 0 or registry.toPtr().* != .object) return val_mod.makeUndefined(arena);
+    const registry = env.lookup("__modules__") catch return throwModuleNotFound(arena, name);
+    if (registry.bits == 0 or registry.toPtr().* != .object) return throwModuleNotFound(arena, name);
     const modules_obj = registry.toPtr().object;
     const resolved_name = resolveModuleName(arena, env, name) catch name;
     const lookup_name = if (modules_obj.get(resolved_name) != null) resolved_name else name;
     if (modules_obj.get(lookup_name)) |entry| {
         if (entry.bits != 0 and entry.toPtr().* == .object) {
             const mod_obj = entry.toPtr().object;
-            if (mod_obj.get("exports")) |exports_val| return exports_val;
+            if (mod_obj.get("exports")) |exports_val| {
+                try syncRequireCache(env, lookup_name, entry);
+                return exports_val;
+            }
         }
         if (isCallableValue(entry)) {
             // CommonJS-style factory module: factory(require, module, exports)
@@ -128,11 +131,46 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
             if (!std.mem.eql(u8, lookup_name, name)) {
                 try modules_obj.set(name, module_val);
             }
+            try syncRequireCache(env, lookup_name, module_val);
             return final_exports;
         }
+        try syncRequireCache(env, lookup_name, entry);
         return entry;
     }
-    return val_mod.makeUndefined(arena);
+    return throwModuleNotFound(arena, name);
+}
+
+fn throwModuleNotFound(arena: std.mem.Allocator, name: []const u8) !Value {
+    const msg = try std.fmt.allocPrint(arena, "Cannot find module '{s}'", .{name});
+    const err_obj = if (active_heap) |h|
+        try JsObject.createOnHeap(h, error_proto_Error)
+    else
+        try JsObject.create(arena, error_proto_Error);
+    try err_obj.set("message", try val_mod.makeString(arena, msg));
+    try err_obj.set("name", try val_mod.makeString(arena, "Error"));
+    pending_exception = try val_mod.makeObject(arena, err_obj);
+    return error.JsException;
+}
+
+fn syncRequireCache(env: *Environment, id: []const u8, module_val: Value) !void {
+    const cache_val = env.lookup("__require_cache__") catch return;
+    if (cache_val.bits == 0 or cache_val.toPtr().* != .object) return;
+    try cache_val.toPtr().object.set(id, module_val);
+}
+
+fn nativeRequireResolve(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].toPtr().* != .string) {
+        return val_mod.makeUndefined(arena);
+    }
+    const name = args[0].toPtr().string;
+    const env = active_global_env orelse return val_mod.makeUndefined(arena);
+    const resolved = resolveModuleName(arena, env, name) catch name;
+    const registry = env.lookup("__modules__") catch return throwModuleNotFound(arena, name);
+    if (registry.bits == 0 or registry.toPtr().* != .object) return throwModuleNotFound(arena, name);
+    const modules_obj = registry.toPtr().object;
+    if (modules_obj.get(resolved) != null) return val_mod.makeString(arena, resolved);
+    if (modules_obj.get(name) != null) return val_mod.makeString(arena, name);
+    return throwModuleNotFound(arena, name);
 }
 
 fn isCallableValue(v: Value) bool {
@@ -593,6 +631,10 @@ pub const Realm = struct {
             .{ "delete", es2015_collections_mod.nativeMapDelete },
             .{ "clear", es2015_collections_mod.nativeMapClear },
             .{ "size", es2015_collections_mod.nativeMapSize },
+            .{ "keys", es2015_collections_mod.nativeMapKeys },
+            .{ "values", es2015_collections_mod.nativeMapValues },
+            .{ "entries", es2015_collections_mod.nativeMapEntries },
+            .{ "@@iterator", es2015_collections_mod.nativeMapEntries },
         };
         inline for (map_fns) |pair| {
             const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
@@ -610,6 +652,8 @@ pub const Realm = struct {
             .{ "delete", es2015_collections_mod.nativeSetDelete },
             .{ "clear", es2015_collections_mod.nativeSetClear },
             .{ "size", es2015_collections_mod.nativeSetSize },
+            .{ "values", es2015_collections_mod.nativeSetValues },
+            .{ "@@iterator", es2015_collections_mod.nativeSetValues },
         };
         inline for (set_fns) |pair| {
             const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
@@ -663,7 +707,13 @@ pub const Realm = struct {
         try promise_ctor_obj.set("resolve", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseResolve));
         try promise_ctor_obj.set("reject", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseReject));
         try env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
-        try env.define("require", try val_mod.makeNativeFunction(arena, nativeRequire));
+        const require_cache_obj = try JsObject.create(arena, object_proto);
+        try env.define("__require_cache__", try val_mod.makeObject(arena, require_cache_obj));
+        const require_obj = try JsObject.create(arena, function_proto);
+        try require_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeRequire));
+        try require_obj.set("resolve", try val_mod.makeNativeFunction(arena, nativeRequireResolve));
+        try require_obj.set("cache", try val_mod.makeObject(arena, require_cache_obj));
+        try env.define("require", try val_mod.makeObject(arena, require_obj));
         const module_obj = try JsObject.create(arena, null);
         const exports_obj = try JsObject.create(arena, object_proto);
         const exports_val = try val_mod.makeObject(arena, exports_obj);

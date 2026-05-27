@@ -34,6 +34,39 @@ const ResolverData = struct {
 
 var microtasks: std.ArrayListUnmanaged(Job) = .empty;
 
+fn getThenMethod(v: Value) ?Value {
+    if (v.bits == 0 or v.toPtr().* != .object) return null;
+    const then_v = v.toPtr().object.get("then") orelse return null;
+    if (!isCallable(then_v)) return null;
+    return then_v;
+}
+
+fn makeResolverObject(arena: std.mem.Allocator, data: *ResolverData) !Value {
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    obj.internal_slot = data;
+    try obj.set("__call__", try val_mod.makeNativeFunction(arena, nativePromiseResolver));
+    return val_mod.makeObject(arena, obj);
+}
+
+fn assimilateThenable(arena: std.mem.Allocator, data: *PromiseData, thenable: Value) !bool {
+    const then_method = getThenMethod(thenable) orelse return false;
+    const resolve_data = try arena.create(ResolverData);
+    const reject_data = try arena.create(ResolverData);
+    resolve_data.* = .{ .promise = data, .resolve_mode = true };
+    reject_data.* = .{ .promise = data, .resolve_mode = false };
+    const resolve_val = try makeResolverObject(arena, resolve_data);
+    const reject_val = try makeResolverObject(arena, reject_data);
+    _ = fn_proto.invokeCallback(arena, thenable, then_method, &[_]Value{ resolve_val, reject_val }) catch |e| {
+        if (e == error.JsException) {
+            promiseRejectData(arena, data, realm_mod.pending_exception);
+            realm_mod.pending_exception = Value{};
+            return true;
+        }
+        return e;
+    };
+    return true;
+}
+
 fn makePromise(arena: std.mem.Allocator, state: PromiseState, value: Value) !Value {
     const proto = realm_mod.active_promise_proto;
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
@@ -98,6 +131,7 @@ fn adoptOrFulfill(arena: std.mem.Allocator, next_data: *PromiseData, v: Value) !
         flushReactions(arena, next_data);
         return;
     }
+    if (try assimilateThenable(arena, next_data, v)) return;
     settlePromise(next_data, .fulfilled, v);
     flushReactions(arena, next_data);
 }
@@ -127,6 +161,17 @@ fn promiseResolveData(arena: std.mem.Allocator, data: *PromiseData, v: Value) vo
         }
         settlePromise(data, inner.state, inner.value);
         flushReactions(arena, data);
+        return;
+    }
+    if (assimilateThenable(arena, data, v)) |assimilated| {
+        if (assimilated) return;
+    } else |e| {
+        if (e == error.JsException) {
+            promiseRejectData(arena, data, realm_mod.pending_exception);
+            realm_mod.pending_exception = Value{};
+            return;
+        }
+        promiseRejectData(arena, data, val_mod.makeString(arena, "TypeError: thenable assimilation failed") catch Value{});
         return;
     }
     settlePromise(data, .fulfilled, v);
@@ -188,7 +233,9 @@ pub fn nativePromiseCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
 pub fn nativePromiseResolve(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     if (getData(v) != null) return v;
-    return makePromise(arena, .fulfilled, v);
+    const p = try makePendingPromise(arena);
+    if (getData(p)) |d| promiseResolveData(arena, d, v);
+    return p;
 }
 
 pub fn nativePromiseReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
@@ -224,37 +271,49 @@ pub fn nativePromiseCatch(arena: std.mem.Allocator, this_val: Value, args: []con
     return nativePromiseThen(arena, this_val, &[_]Value{ Value{}, on_rejected });
 }
 
+fn runReactionJob(arena: std.mem.Allocator, job: Job) void {
+    if (job.input_state == .fulfilled) {
+        if (job.reaction.on_fulfilled.bits != 0 and isCallable(job.reaction.on_fulfilled)) {
+            const r = fn_proto.invokeCallback(arena, val_mod.makeUndefined(arena) catch Value{}, job.reaction.on_fulfilled, &[_]Value{job.input_value}) catch {
+                settlePromise(job.reaction.next_data, .rejected, realm_mod.pending_exception);
+                flushReactions(arena, job.reaction.next_data);
+                realm_mod.pending_exception = Value{};
+                return;
+            };
+            adoptOrFulfill(arena, job.reaction.next_data, r) catch {};
+        } else {
+            settlePromise(job.reaction.next_data, .fulfilled, job.input_value);
+            flushReactions(arena, job.reaction.next_data);
+        }
+    } else {
+        if (job.reaction.on_rejected.bits != 0 and isCallable(job.reaction.on_rejected)) {
+            const r = fn_proto.invokeCallback(arena, val_mod.makeUndefined(arena) catch Value{}, job.reaction.on_rejected, &[_]Value{job.input_value}) catch {
+                settlePromise(job.reaction.next_data, .rejected, realm_mod.pending_exception);
+                flushReactions(arena, job.reaction.next_data);
+                realm_mod.pending_exception = Value{};
+                return;
+            };
+            adoptOrFulfill(arena, job.reaction.next_data, r) catch {};
+        } else {
+            settlePromise(job.reaction.next_data, .rejected, job.input_value);
+            flushReactions(arena, job.reaction.next_data);
+        }
+    }
+}
+
 pub fn runMicrotasks(arena: std.mem.Allocator) void {
     var idx: usize = 0;
     while (idx < microtasks.items.len) : (idx += 1) {
-        const job = microtasks.items[idx];
-        if (job.input_state == .fulfilled) {
-            if (job.reaction.on_fulfilled.bits != 0 and isCallable(job.reaction.on_fulfilled)) {
-                const r = fn_proto.invokeCallback(arena, val_mod.makeUndefined(arena) catch Value{}, job.reaction.on_fulfilled, &[_]Value{job.input_value}) catch {
-                    settlePromise(job.reaction.next_data, .rejected, realm_mod.pending_exception);
-                    flushReactions(arena, job.reaction.next_data);
-                    realm_mod.pending_exception = Value{};
-                    continue;
-                };
-                adoptOrFulfill(arena, job.reaction.next_data, r) catch {};
-            } else {
-                settlePromise(job.reaction.next_data, .fulfilled, job.input_value);
-                flushReactions(arena, job.reaction.next_data);
-            }
-        } else {
-            if (job.reaction.on_rejected.bits != 0 and isCallable(job.reaction.on_rejected)) {
-                const r = fn_proto.invokeCallback(arena, val_mod.makeUndefined(arena) catch Value{}, job.reaction.on_rejected, &[_]Value{job.input_value}) catch {
-                    settlePromise(job.reaction.next_data, .rejected, realm_mod.pending_exception);
-                    flushReactions(arena, job.reaction.next_data);
-                    realm_mod.pending_exception = Value{};
-                    continue;
-                };
-                adoptOrFulfill(arena, job.reaction.next_data, r) catch {};
-            } else {
-                settlePromise(job.reaction.next_data, .rejected, job.input_value);
-                flushReactions(arena, job.reaction.next_data);
-            }
-        }
+        runReactionJob(arena, microtasks.items[idx]);
     }
     microtasks.clearRetainingCapacity();
+}
+
+pub fn clearMicrotasks() void {
+    microtasks.clearRetainingCapacity();
+}
+
+pub fn nativeRunMicrotasks(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    runMicrotasks(arena);
+    return val_mod.makeUndefined(arena);
 }

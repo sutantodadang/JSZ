@@ -363,6 +363,20 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const robj = code[new_pc]; new_pc += 1;
             try writer.print(" R{d} = keys(R{d})", .{ rdst, robj });
         },
+        .INC, .DEC => {
+            const rdst = code[new_pc]; new_pc += 1;
+            const rsrc = code[new_pc]; new_pc += 1;
+            try writer.print(" R{d} R{d}", .{ rdst, rsrc });
+        },
+        .JSEQ, .JGE => {
+            const rlhs = code[new_pc]; new_pc += 1;
+            const rrhs = code[new_pc]; new_pc += 1;
+            const lo = code[new_pc]; new_pc += 1;
+            const hi = code[new_pc]; new_pc += 1;
+            const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
+            const target: i64 = @intCast(new_pc);
+            try writer.print(" R{d} R{d} -> {d}", .{ rlhs, rrhs, target + offset });
+        },
         .DEFINE_GLOBAL => {
             const lo = code[new_pc]; new_pc += 1;
             const hi = code[new_pc]; new_pc += 1;

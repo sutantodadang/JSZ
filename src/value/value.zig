@@ -55,6 +55,8 @@ pub const FuncVal = struct {
     lexical_this: Value = Value{},
     /// Phase 7: generator function (`function*`).
     is_generator: bool = false,
+    /// Phase 7: derived class constructor must call `super` before `this`.
+    requires_super: bool = false,
 };
 
 /// Public handle — an opaque u64 whose bits are a *JsValue pointer.

@@ -65,6 +65,7 @@ pub const IsolateImpl = struct {
 
     pub fn evalWithMode(self: *IsolateImpl, source: []const u8, mode: InterpMode) !EvalOutcome {
         _ = self.eval_arena.reset(.free_all);
+        promise_mod.clearMicrotasks();
         const arena = self.eval_arena.allocator();
         const transformed_source = try rewriteTemplateLiterals(arena, source);
 
@@ -95,6 +96,7 @@ pub const IsolateImpl = struct {
                     .return_ => |v| EvalOutcome{ .ok = v },
                     .break_ => EvalOutcome{ .ok = try val_mod.makeUndefined(arena) },
                     .continue_ => EvalOutcome{ .ok = try val_mod.makeUndefined(arena) },
+                    .yield_suspend => EvalOutcome{ .ok = try val_mod.makeUndefined(arena) },
                 };
             },
             .bc => {
@@ -123,6 +125,8 @@ pub const IsolateImpl = struct {
                 // Expose __gc__ native function for JS-side collection trigger.
                 const gc_fn = try val_mod.makeNativeFunction(arena, nativeGcCollect);
                 try realm.global_env.define("__gc__", gc_fn);
+                const microtask_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeRunMicrotasks);
+                try realm.global_env.define("__runMicrotasks__", microtask_fn);
 
                 var bc_vm = BcVm.initWithHeap(arena, &realm, &self.heap);
                 // Register roots AFTER bc_vm/realm are in final stack location.

@@ -235,6 +235,7 @@ pub const FuncExpr = struct {
     is_arrow: bool = false,
     is_generator: bool = false,
     is_strict: bool = false,
+    requires_super: bool = false,
 };
 
 /// Phase 3a: a single property in an object literal.

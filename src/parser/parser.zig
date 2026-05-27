@@ -584,6 +584,7 @@ pub const Parser = struct {
                 .body = ctor_body_effective,
                 .is_arrow = false,
                 .is_strict = hasUseStrict(ctor_body_effective),
+                .requires_super = super_name != null,
             },
         }) orelse return null;
         const ctor_decl = self.makeNode(.var_decl, start, self.current.start, .{
@@ -1550,15 +1551,23 @@ pub const Parser = struct {
                 }
                 _ = self.advance();
                 if (self.match(.star)) {
-                    if (!self.had_error) {
-                        self.had_error = true;
-                        self.error_info = ParseError{
-                            .message = "yield* is not yet supported",
-                            .line = self.current.line,
-                            .column = self.current.column,
-                        };
-                    }
-                    return null;
+                    const delegated = self.parseAssignmentExpr() orelse {
+                        if (!self.had_error) {
+                            self.had_error = true;
+                            self.error_info = ParseError{
+                                .message = "expected expression after yield*",
+                                .line = self.current.line,
+                                .column = self.current.column,
+                            };
+                        }
+                        return null;
+                    };
+                    const helper = self.makeNode(.identifier, start, self.current.start, .{ .identifier = "__yield_star__" }) orelse return null;
+                    var args = std.ArrayList(*Node){};
+                    args.append(self.arena, delegated) catch return null;
+                    return self.makeNode(.call_expr, start, self.current.start, .{
+                        .call_expr = .{ .callee = helper, .args = args.items },
+                    });
                 }
                 const can_have_arg = !(self.current.line_terminator_before or self.check(.semicolon) or self.check(.right_brace) or self.check(.eof));
                 const yielded = if (can_have_arg) self.parseAssignmentExpr() orelse return null else null;
