@@ -18,9 +18,10 @@ pub const Prec = struct {
     pub const shift: u8 = 11;
     pub const additive: u8 = 12;
     pub const multiplicative: u8 = 13;
-    pub const unary: u8 = 14;
-    pub const postfix: u8 = 15;
-    pub const call_member: u8 = 16;
+    pub const exponentiation: u8 = 14;
+    pub const unary: u8 = 15;
+    pub const postfix: u8 = 16;
+    pub const call_member: u8 = 17;
 };
 
 /// Return the infix precedence for binary/logical/relational operators.
@@ -39,6 +40,7 @@ pub fn infixPrec(kind: TokenKind) u8 {
         .lt_lt, .gt_gt, .gt_gt_gt => Prec.shift,
         .plus, .minus => Prec.additive,
         .star, .slash, .percent => Prec.multiplicative,
+        .star_star => Prec.exponentiation,
         .left_paren, .left_bracket, .dot => Prec.call_member,
         else => 0,
     };
@@ -47,7 +49,7 @@ pub fn infixPrec(kind: TokenKind) u8 {
 /// Returns true if kind is a compound assignment operator.
 pub fn isAssignOp(kind: TokenKind) bool {
     return switch (kind) {
-        .eq, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq,
+        .eq, .plus_eq, .minus_eq, .star_eq, .star_star_eq, .slash_eq, .percent_eq,
         .amp_eq, .pipe_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq, .gt_gt_gt_eq => true,
         else => false,
     };

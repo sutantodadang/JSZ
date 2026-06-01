@@ -4,6 +4,7 @@
 # Paths are relative to external/test262/test.
 
 # expressions
+es6:language/expressions/exponentiation/
 language/expressions/addition/
 language/expressions/subtraction/
 language/expressions/multiplication/

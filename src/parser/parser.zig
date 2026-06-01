@@ -282,7 +282,7 @@ pub const Parser = struct {
             if (self.current.kind == .left_paren or self.current.kind == .left_bracket or self.current.kind == .dot) break;
             const op_kind = self.current.kind;
             _ = self.advance();
-            const right = self.parseBinaryExpr(p) orelse return null;
+            const right = self.parseBinaryExpr(if (op_kind == .star_star) p - 1 else p) orelse return null;
             const start = base.start;
             base = switch (op_kind) {
                 .amp_amp, .pipe_pipe => self.makeNode(.logical_expr, start, self.current.start, .{
@@ -1272,7 +1272,8 @@ pub const Parser = struct {
             }
             const op_kind = self.current.kind;
             _ = self.advance();
-            const right = self.parseBinaryExpr(p) orelse return null; // left-assoc
+            // Exponentiation is right-associative: recurse at p-1 so same-prec ** binds rightward.
+            const right = self.parseBinaryExpr(if (op_kind == .star_star) p - 1 else p) orelse return null;
             const start = left.start;
             left = switch (op_kind) {
                 .amp_amp, .pipe_pipe => self.makeNode(.logical_expr, start, self.current.start, .{
@@ -1773,6 +1774,7 @@ fn tokenToBinaryOp(kind: TokenKind) ast.BinaryOp {
         .plus => .add,
         .minus => .sub,
         .star => .mul,
+        .star_star => .exp,
         .slash => .div,
         .percent => .mod,
         .amp => .bit_and,
@@ -1852,6 +1854,7 @@ fn tokenToAssignOp(kind: TokenKind) ast.AssignOp {
         .plus_eq => .add,
         .minus_eq => .sub,
         .star_eq => .mul,
+        .star_star_eq => .exp,
         .slash_eq => .div,
         .percent_eq => .mod,
         .amp_eq => .bit_and,

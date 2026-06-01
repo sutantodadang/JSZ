@@ -53,7 +53,17 @@ fn getSetData(this_val: Value, expected: InternalKind) ?*SetData {
     return null;
 }
 
-pub fn nativeMapCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+/// Virtual ES2015 `size` accessor for Map/Set. Returns null for non-collections
+/// (WeakMap/WeakSet expose no `size`).
+pub fn collectionSize(obj: *JsObject) ?usize {
+    return switch (obj.internal_kind) {
+        .map => if (obj.internal_slot) |s| (@as(*MapData, @ptrCast(@alignCast(s)))).keys.items.len else 0,
+        .set => if (obj.internal_slot) |s| (@as(*SetData, @ptrCast(@alignCast(s)))).values.items.len else 0,
+        else => null,
+    };
+}
+
+pub fn nativeMapCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     var out = this_val;
     if (out.bits == 0 or out.toPtr().* != .object) {
         out = try makeObj(arena, null, .map);
@@ -63,6 +73,20 @@ pub fn nativeMapCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value
     d.* = .{};
     obj.internal_kind = .map;
     obj.internal_slot = d;
+    if (args.len > 0 and args[0].bits != 0 and args[0].toPtr().* == .object and args[0].toPtr().object.is_array) {
+        const src = args[0].toPtr().object;
+        var i: u32 = 0;
+        while (i < src.getArrayLength()) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            const ks = std.fmt.bufPrint(&kbuf, "{d}", .{i}) catch continue;
+            const pair_val = src.get(ks) orelse continue;
+            if (pair_val.bits == 0 or pair_val.toPtr().* != .object) continue;
+            const pair = pair_val.toPtr().object;
+            const k = pair.get("0") orelse continue;
+            const v = pair.get("1") orelse try val_mod.makeUndefined(arena);
+            _ = try nativeMapSet(arena, out, &.{ k, v });
+        }
+    }
     return out;
 }
 
@@ -77,7 +101,7 @@ pub fn nativeWeakMapCtor(arena: std.mem.Allocator, this_val: Value, _: []const V
     return out;
 }
 
-pub fn nativeSetCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+pub fn nativeSetCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     var out = this_val;
     if (out.bits == 0 or out.toPtr().* != .object) out = try makeObj(arena, null, .set);
     const obj = out.toPtr().object;
@@ -85,6 +109,16 @@ pub fn nativeSetCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value
     d.* = .{};
     obj.internal_kind = .set;
     obj.internal_slot = d;
+    if (args.len > 0 and args[0].bits != 0 and args[0].toPtr().* == .object and args[0].toPtr().object.is_array) {
+        const src = args[0].toPtr().object;
+        var i: u32 = 0;
+        while (i < src.getArrayLength()) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            const ks = std.fmt.bufPrint(&kbuf, "{d}", .{i}) catch continue;
+            const el = src.get(ks) orelse continue;
+            _ = try nativeSetAdd(arena, out, &.{el});
+        }
+    }
     return out;
 }
 

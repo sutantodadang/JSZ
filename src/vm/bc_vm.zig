@@ -437,6 +437,17 @@ pub const BcVm = struct {
                     const res = std.math.mod(f64, l, r) catch std.math.nan(f64);
                     frame.registers[rdst] = try val_mod.makeNumber(self.arena, res);
                 },
+                .EXP => {
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rlhs = code[frame.pc];
+                    frame.pc += 1;
+                    const rrhs = code[frame.pc];
+                    frame.pc += 1;
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, std.math.pow(f64, toNumber(lv), toNumber(rv)));
+                },
                 .NEG => {
                     const rdst = code[frame.pc];
                     frame.pc += 1;
@@ -1362,6 +1373,12 @@ pub const BcVm = struct {
                 // Special case: "length" on arrays.
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength()));
+                }
+                // ES2015 virtual "size" accessor on Map/Set.
+                if (std.mem.eql(u8, key, "size")) {
+                    if (@import("../runtime/builtins/es2015_collections.zig").collectionSize(obj)) |n| {
+                        return val_mod.makeNumber(self.arena, @floatFromInt(n));
+                    }
                 }
                 if (obj.resolveOwnSlot(key)) |slot| {
                     if (obj.getOwnBySlot(obj.shapePtr(), slot)) |v| return v;

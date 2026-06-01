@@ -214,7 +214,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const rsrc = code[new_pc]; new_pc += 1;
             try writer.print(" slot{d} R{d}", .{ slot, rsrc });
         },
-        .ADD, .SUB, .MUL, .DIV, .MOD,
+        .ADD, .SUB, .MUL, .DIV, .MOD, .EXP,
         .BIT_AND, .BIT_OR, .BIT_XOR, .SHL, .SHR, .USHR,
         .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE => {
             const rdst = code[new_pc]; new_pc += 1;

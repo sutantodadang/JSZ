@@ -1,5 +1,17 @@
-# Test262 tests expected to fail (auto-populated Phase 5).
+# Test262 tests expected to fail (auto-populated, Phase 5 + Phase 8 exponentiation).
 # In sync with whitelist. CI fails on unannounced pass/fail flips.
+language/expressions/exponentiation/applying-the-exp-operator_A7.js
+language/expressions/exponentiation/applying-the-exp-operator_A8.js
+language/expressions/exponentiation/bigint-and-number.js
+language/expressions/exponentiation/bigint-arithmetic.js
+language/expressions/exponentiation/bigint-errors.js
+language/expressions/exponentiation/bigint-negative-exponent-throws.js
+language/expressions/exponentiation/bigint-toprimitive.js
+language/expressions/exponentiation/bigint-wrapped-values.js
+language/expressions/exponentiation/bigint-zero-base-zero-exponent.js
+language/expressions/exponentiation/exp-operator-evaluation-order.js
+language/expressions/exponentiation/exp-operator-precedence-unary-expression-semantics.js
+language/expressions/exponentiation/order-of-evaluation.js
 language/expressions/addition/S11.6.1_A1.js
 language/expressions/addition/S11.6.1_A2.2_T1.js
 language/expressions/addition/S11.6.1_A2.2_T2.js

@@ -1269,6 +1269,12 @@ pub const Vm = struct {
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength())) catch return EvalError.OutOfMemory;
                 }
+                // ES2015 virtual "size" accessor on Map/Set.
+                if (std.mem.eql(u8, key, "size")) {
+                    if (@import("../runtime/builtins/es2015_collections.zig").collectionSize(obj)) |n| {
+                        return val_mod.makeNumber(self.arena, @floatFromInt(n)) catch return EvalError.OutOfMemory;
+                    }
+                }
                 if (obj.resolveOwnSlot(key)) |slot| {
                     if (obj.getOwnBySlot(obj.shapePtr(), slot)) |v| return v;
                 }
@@ -1454,6 +1460,7 @@ pub const Vm = struct {
                 const r = toNumber(right);
                 return self.makeNumber(std.math.mod(f64, l, r) catch std.math.nan(f64));
             },
+            .exp => return self.makeNumber(std.math.pow(f64, toNumber(left), toNumber(right))),
             .bit_and => return self.makeNumber(@floatFromInt(toInt32(left) & toInt32(right))),
             .bit_or => return self.makeNumber(@floatFromInt(toInt32(left) | toInt32(right))),
             .bit_xor => return self.makeNumber(@floatFromInt(toInt32(left) ^ toInt32(right))),
@@ -1536,6 +1543,7 @@ pub const Vm = struct {
             .mul => try self.makeNumber(toNumber(cur_val) * toNumber(rhs)),
             .div => try self.makeNumber(toNumber(cur_val) / toNumber(rhs)),
             .mod => try self.makeNumber(std.math.mod(f64, toNumber(cur_val), toNumber(rhs)) catch std.math.nan(f64)),
+            .exp => try self.makeNumber(std.math.pow(f64, toNumber(cur_val), toNumber(rhs))),
             .bit_and => try self.makeNumber(@floatFromInt(toInt32(cur_val) & toInt32(rhs))),
             .bit_or => try self.makeNumber(@floatFromInt(toInt32(cur_val) | toInt32(rhs))),
             .bit_xor => try self.makeNumber(@floatFromInt(toInt32(cur_val) ^ toInt32(rhs))),

@@ -174,6 +174,7 @@ pub const Lexer = struct {
             .plus_eq,
             .minus_eq,
             .star_eq,
+            .star_star_eq,
             .slash_eq,
             .percent_eq,
             .amp_eq,
@@ -185,6 +186,7 @@ pub const Lexer = struct {
             .plus,
             .minus,
             .star,
+            .star_star,
             .slash,
             .percent,
             .bang,
@@ -561,6 +563,16 @@ pub const Lexer = struct {
                 break :blk .minus;
             },
             '*' => blk: {
+                if (self.pos < self.source.len and self.source[self.pos] == '*') {
+                    self.pos += 1;
+                    self.column += 1;
+                    if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                        self.pos += 1;
+                        self.column += 1;
+                        break :blk .star_star_eq;
+                    }
+                    break :blk .star_star;
+                }
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
                     self.pos += 1;
                     self.column += 1;
