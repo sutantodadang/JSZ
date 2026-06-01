@@ -360,7 +360,43 @@ pub const Vm = struct {
             .ptr = self,
             .invoke_fn = vmInvokeJs,
         };
-        @import("../runtime/realm.zig").active_context = &self.context;
+        const realm_mod = @import("../runtime/realm.zig");
+        realm_mod.active_context = &self.context;
+        realm_mod.eval_hook = vmEvalHook;
+    }
+
+    /// Re-enter the interpreter for the global `eval(src)`. Runs in the global
+    /// scope (indirect-eval semantics, sufficient for ES5 conformance tests).
+    fn vmEvalHook(ctx_ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8) anyerror!Value {
+        const self: *Vm = @ptrCast(@alignCast(ctx_ptr));
+        const realm_mod = @import("../runtime/realm.zig");
+        const parser_mod = @import("../parser/parser.zig");
+        var p = parser_mod.Parser.init(source, arena);
+        const pr = p.parseScript();
+        const stmts = switch (pr) {
+            .ok => |s| s,
+            .err => |e| {
+                realm_mod.pending_exception = self.makeErrorObject("SyntaxError", e.message) catch Value{};
+                return error.JsException;
+            },
+        };
+        const global_env = self.realm.global_env;
+        try self.hoistDeclarations(stmts, global_env);
+        var last = try self.makeUndefined();
+        for (stmts) |stmt| {
+            const r = try self.evalStatement(stmt, global_env);
+            switch (r) {
+                .value => |v| last = v,
+                .exception => |ex| {
+                    self.last_exception_value = ex.value;
+                    self.last_exception_msg = ex.message;
+                    realm_mod.pending_exception = ex.value;
+                    return error.JsException;
+                },
+                else => {},
+            }
+        }
+        return last;
     }
 
     fn deactivateContext(_: *Vm) void {
@@ -897,13 +933,15 @@ pub const Vm = struct {
                 const name = node.data.identifier;
                 return env.lookup(name) catch |e| switch (e) {
                     error.NotDefined => {
-                        const msg = std.fmt.allocPrint(self.arena, "ReferenceError: {s} is not defined", .{name}) catch "ReferenceError";
-                        self.last_exception_msg = msg;
+                        const detail = std.fmt.allocPrint(self.arena, "{s} is not defined", .{name}) catch "is not defined";
+                        self.last_exception_msg = std.fmt.allocPrint(self.arena, "ReferenceError: {s}", .{detail}) catch "ReferenceError";
+                        self.last_exception_value = self.makeReferenceErrorObject(detail) catch Value{};
                         return EvalError.JsException;
                     },
                     error.TemporalDeadZone => {
-                        const msg = std.fmt.allocPrint(self.arena, "ReferenceError: Cannot access '{s}' before initialization", .{name}) catch "ReferenceError";
-                        self.last_exception_msg = msg;
+                        const detail = std.fmt.allocPrint(self.arena, "Cannot access '{s}' before initialization", .{name}) catch "TDZ";
+                        self.last_exception_msg = std.fmt.allocPrint(self.arena, "ReferenceError: {s}", .{detail}) catch "ReferenceError";
+                        self.last_exception_value = self.makeReferenceErrorObject(detail) catch Value{};
                         return EvalError.JsException;
                     },
                     else => return EvalError.OutOfMemory,
@@ -2566,8 +2604,10 @@ fn toNumber(v: Value) f64 {
 fn toInt32(v: Value) i32 {
     const n = toNumber(v);
     if (std.math.isNan(n) or std.math.isInf(n)) return 0;
-    const i: i64 = @intFromFloat(n);
-    return @intCast(i & 0xFFFFFFFF);
+    // ES5 ToInt32: truncate, take modulo 2^32, reinterpret as signed.
+    const m = @mod(@trunc(n), 4294967296.0); // [0, 2^32)
+    const u: u32 = @intFromFloat(m);
+    return @bitCast(u);
 }
 
 fn toUint32(v: Value) u32 {

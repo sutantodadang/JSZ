@@ -112,6 +112,88 @@ fn parseMeta(allocator: std.mem.Allocator, source: []const u8) !TestMeta {
     return meta;
 }
 
+/// Return the /*--- ---*/ frontmatter slice, or "" if absent.
+fn frontmatter(source: []const u8) []const u8 {
+    const start = std.mem.indexOf(u8, source, "/*---") orelse return "";
+    const rest = source[start + 5 ..];
+    const end = std.mem.indexOf(u8, rest, "---*/") orelse return "";
+    return rest[0..end];
+}
+
+/// Eligibility for auto-expansion: pure ES5 (has es5id), no unsupported
+/// harness includes, and no module/raw/async flags. Keeps the auto-grown
+/// set to tests our engine + minimal prelude (assert.js/sta.js) can run.
+fn isEligibleEs5(source: []const u8) bool {
+    const yaml = frontmatter(source);
+    if (yaml.len == 0) return false;
+    if (std.mem.indexOf(u8, yaml, "es5id:") == null) return false;
+    // Unsupported flags.
+    if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
+        const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
+        const flags = yaml[fi..line_end];
+        if (std.mem.indexOf(u8, flags, "module") != null) return false;
+        if (std.mem.indexOf(u8, flags, "raw") != null) return false;
+        if (std.mem.indexOf(u8, flags, "async") != null) return false;
+        if (std.mem.indexOf(u8, flags, "CanBlockIsFalse") != null) return false;
+    }
+    // Includes: only allow the prelude-provided harness files.
+    if (std.mem.indexOf(u8, yaml, "includes:")) |ii| {
+        const line_end = std.mem.indexOfScalarPos(u8, yaml, ii, '\n') orelse yaml.len;
+        const inc = yaml[ii..line_end];
+        // Allow assert.js / sta.js (provided by prelude); reject anything else.
+        var it = std.mem.tokenizeAny(u8, inc, " [],\r");
+        _ = it.next(); // skip "includes:"
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, "assert.js")) continue;
+            if (std.mem.eql(u8, tok, "sta.js")) continue;
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Append all eligible ES5 .js tests under `rel_dir` (relative to TEST262_PATH)
+/// to `out`, with paths allocated from `arena`. Skips _FIXTURE files.
+fn expandDir(arena: std.mem.Allocator, rel_dir: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var path_buf: [512]u8 = undefined;
+    const abs_dir = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ TEST262_PATH, rel_dir }) catch return;
+    var dir = std.fs.cwd().openDir(abs_dir, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".js")) continue;
+        if (std.mem.indexOf(u8, entry.path, "_FIXTURE") != null) continue;
+        var full_buf: [768]u8 = undefined;
+        const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ abs_dir, entry.path }) catch continue;
+        const src = std.fs.cwd().readFileAlloc(arena, full, 512 * 1024) catch continue;
+        if (!isEligibleEs5(src)) continue;
+        // Normalize Windows backslashes in entry.path to forward slashes.
+        const norm = try arena.dupe(u8, entry.path);
+        for (norm) |*c| {
+            if (c.* == '\\') c.* = '/';
+        }
+        const rel = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel_dir, norm });
+        try out.append(arena, rel);
+    }
+}
+
+/// Expand whitelist entries: entries ending in '/' are directory globs
+/// (recursively expanded, ES5-filtered); other entries are kept as-is.
+fn expandWhitelist(arena: std.mem.Allocator, raw: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (raw) |entry| {
+        if (std.mem.endsWith(u8, entry, "/")) {
+            const dir = entry[0 .. entry.len - 1];
+            try expandDir(arena, dir, &out);
+        } else {
+            try out.append(arena, entry);
+        }
+    }
+    return out.items;
+}
+
 fn runOneTest(allocator: std.mem.Allocator, path: []const u8, source: []const u8) !bool {
     const meta = try parseMeta(allocator, source);
     _ = path;
@@ -370,7 +452,11 @@ pub fn main() !void {
     var whitelist_data = try loadList(allocator, WHITELIST_PATH, 1 * 1024 * 1024);
     defer whitelist_data.entries.deinit(allocator);
     defer if (whitelist_data.source) |src| allocator.free(src);
-    const whitelist = whitelist_data.entries.items;
+
+    // Expand directory globs (entries ending in '/') into ES5-filtered tests.
+    var wl_arena = std.heap.ArenaAllocator.init(allocator);
+    defer wl_arena.deinit();
+    const whitelist = try expandWhitelist(wl_arena.allocator(), whitelist_data.entries.items);
 
     // Load known failing list.
     var known_data = try loadList(allocator, KNOWN_FAILING_PATH, 1 * 1024 * 1024);

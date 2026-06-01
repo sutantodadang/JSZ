@@ -1854,8 +1854,9 @@ pub fn typeofValue(v: Value) []const u8 {
 pub fn toInt32(v: Value) i32 {
     const n = toNumber(v);
     if (std.math.isNan(n) or std.math.isInf(n)) return 0;
-    const i: i64 = @intFromFloat(@trunc(n));
-    return @as(i32, @truncate(i));
+    const m = @mod(@trunc(n), 4294967296.0); // [0, 2^32)
+    const u: u32 = @intFromFloat(m);
+    return @bitCast(u);
 }
 
 pub fn toUint32(v: Value) u32 {

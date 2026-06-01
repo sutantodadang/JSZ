@@ -459,6 +459,21 @@ fn nativeParseInt(arena: std.mem.Allocator, _: Value, args: []const Value) anyer
     return val_mod.makeNumber(arena, if (neg) -f else f);
 }
 
+/// Hook set by the active VM so the global `eval` can re-enter the interpreter
+/// in the current realm/global scope. Returns the eval result or sets
+/// pending_exception and returns error.JsException.
+pub var eval_hook: ?*const fn (ctx_ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8) anyerror!Value = null;
+
+fn nativeEval(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0) return val_mod.makeUndefined(arena);
+    // eval of a non-string returns the argument unchanged (ES5 step 1).
+    if (args[0].bits == 0 or args[0].toPtr().* != .string) return args[0];
+    const src = args[0].toPtr().string;
+    const hook = eval_hook orelse return val_mod.makeUndefined(arena);
+    const ctx = active_context orelse return val_mod.makeUndefined(arena);
+    return hook(ctx.ptr, arena, src);
+}
+
 fn toBooleanCoerce(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.toPtr().*) {
@@ -950,6 +965,7 @@ pub const Realm = struct {
         try boolean_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBooleanCtor));
         try env.define("Boolean", try val_mod.makeObject(arena, boolean_ctor_obj));
         try env.define("isNaN", try val_mod.makeNativeFunction(arena, nativeIsNaN));
+        try env.define("eval", try val_mod.makeNativeFunction(arena, nativeEval));
         try env.define("isFinite", try val_mod.makeNativeFunction(arena, nativeIsFinite));
         try env.define("parseInt", try val_mod.makeNativeFunction(arena, nativeParseInt));
         try env.define("parseFloat", try val_mod.makeNativeFunction(arena, nativeParseFloat));
