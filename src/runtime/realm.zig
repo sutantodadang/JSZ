@@ -298,6 +298,207 @@ fn nativeReferenceErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []c
     return populateErrorThis(arena, this_val, "ReferenceError", extractMessage(args));
 }
 
+// ---- Phase 4: Array/String/Number constructors ----
+
+fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // new Object() / Object(): if arg is an object return it, else create new.
+    if (args.len > 0 and args[0].bits != 0 and args[0].toPtr().* == .object) {
+        return args[0];
+    }
+    if (this_val.bits != 0 and this_val.toPtr().* == .object) return this_val;
+    const obj = if (active_heap) |heap|
+        try JsObject.createOnHeap(heap, active_object_proto)
+    else
+        try JsObject.create(arena, active_object_proto);
+    return val_mod.makeObject(arena, obj);
+}
+
+fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const obj = if (this_val.bits != 0 and this_val.toPtr().* == .object)
+        this_val.toPtr().object
+    else if (active_heap) |heap|
+        try JsObject.createOnHeap(heap, active_array_proto)
+    else
+        try JsObject.create(arena, active_array_proto);
+    obj.is_array = true;
+    if (args.len == 1 and args[0].bits != 0 and args[0].toPtr().* == .number) {
+        const len = args[0].toPtr().number;
+        if (len >= 0 and len == @floor(len) and len < 4294967296) {
+            obj.array_length = @intFromFloat(len);
+        }
+    } else {
+        for (args, 0..) |arg, i| {
+            const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            try obj.set(key, arg);
+        }
+        obj.array_length = @intCast(args.len);
+    }
+    return val_mod.makeObject(arena, obj);
+}
+
+fn nativeArrayIsArray(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len > 0 and args[0].bits != 0 and args[0].toPtr().* == .object) {
+        return val_mod.makeBool(arena, args[0].toPtr().object.is_array);
+    }
+    return val_mod.makeBool(arena, false);
+}
+
+fn nativeStringCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0) return val_mod.makeString(arena, "");
+    const arg = args[0];
+    if (arg.bits == 0) return val_mod.makeString(arena, "undefined");
+    return switch (arg.toPtr().*) {
+        .string => |s| val_mod.makeString(arena, s),
+        .number => |n| blk: {
+            const vm_mod = @import("../vm/vm.zig");
+            break :blk val_mod.makeString(arena, try vm_mod.formatNumber(arena, n));
+        },
+        .boolean => |b| val_mod.makeString(arena, if (b) "true" else "false"),
+        .null_ => val_mod.makeString(arena, "null"),
+        .undefined_ => val_mod.makeString(arena, "undefined"),
+        else => val_mod.makeString(arena, "[object Object]"),
+    };
+}
+
+fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0) return val_mod.makeString(arena, "");
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    for (args) |arg| {
+        if (arg.bits != 0 and arg.toPtr().* == .number) {
+            const code: u32 = @intFromFloat(@mod(arg.toPtr().number, 65536));
+            if (code < 128 and len < buf.len) {
+                buf[len] = @intCast(code);
+                len += 1;
+            }
+        }
+    }
+    return val_mod.makeString(arena, try arena.dupe(u8, buf[0..len]));
+}
+
+fn toNumberCoerce(v: Value) f64 {
+    if (v.bits == 0) return std.math.nan(f64);
+    return switch (v.toPtr().*) {
+        .number => |n| n,
+        .boolean => |b| if (b) 1 else 0,
+        .null_ => 0,
+        .string => |s| blk: {
+            const t = std.mem.trim(u8, s, &std.ascii.whitespace);
+            if (t.len == 0) break :blk 0;
+            break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
+        },
+        else => std.math.nan(f64),
+    };
+}
+
+fn nativeIsNaN(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const n = if (args.len > 0) toNumberCoerce(args[0]) else std.math.nan(f64);
+    return val_mod.makeBool(arena, std.math.isNan(n));
+}
+
+fn nativeIsFinite(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const n = if (args.len > 0) toNumberCoerce(args[0]) else std.math.nan(f64);
+    return val_mod.makeBool(arena, !std.math.isNan(n) and !std.math.isInf(n));
+}
+
+fn nativeParseFloat(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].toPtr().* != .string) {
+        return val_mod.makeNumber(arena, std.math.nan(f64));
+    }
+    const s = std.mem.trimLeft(u8, args[0].toPtr().string, &std.ascii.whitespace);
+    // Find the longest valid float prefix.
+    var end: usize = 0;
+    var seen_dot = false;
+    var seen_e = false;
+    while (end < s.len) : (end += 1) {
+        const c = s[end];
+        if (c >= '0' and c <= '9') continue;
+        if (c == '.' and !seen_dot and !seen_e) {
+            seen_dot = true;
+            continue;
+        }
+        if ((c == 'e' or c == 'E') and !seen_e and end > 0) {
+            seen_e = true;
+            continue;
+        }
+        if ((c == '+' or c == '-') and (end == 0 or s[end - 1] == 'e' or s[end - 1] == 'E')) continue;
+        break;
+    }
+    if (end == 0) return val_mod.makeNumber(arena, std.math.nan(f64));
+    const parsed = std.fmt.parseFloat(f64, s[0..end]) catch std.math.nan(f64);
+    return val_mod.makeNumber(arena, parsed);
+}
+
+fn nativeParseInt(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].toPtr().* != .string) {
+        return val_mod.makeNumber(arena, std.math.nan(f64));
+    }
+    var s = std.mem.trimLeft(u8, args[0].toPtr().string, &std.ascii.whitespace);
+    var radix: u8 = 10;
+    if (args.len > 1 and args[1].bits != 0 and args[1].toPtr().* == .number) {
+        const r = args[1].toPtr().number;
+        if (r >= 2 and r <= 36) radix = @intFromFloat(r);
+    }
+    var neg = false;
+    if (s.len > 0 and (s[0] == '+' or s[0] == '-')) {
+        neg = s[0] == '-';
+        s = s[1..];
+    }
+    if ((radix == 16 or radix == 10) and s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
+        radix = 16;
+        s = s[2..];
+    }
+    var end: usize = 0;
+    while (end < s.len) : (end += 1) {
+        const d = std.fmt.charToDigit(s[end], radix) catch break;
+        _ = d;
+    }
+    if (end == 0) return val_mod.makeNumber(arena, std.math.nan(f64));
+    const val = std.fmt.parseInt(i64, s[0..end], radix) catch return val_mod.makeNumber(arena, std.math.nan(f64));
+    const f: f64 = @floatFromInt(val);
+    return val_mod.makeNumber(arena, if (neg) -f else f);
+}
+
+fn toBooleanCoerce(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.toPtr().*) {
+        .boolean => |b| b,
+        .number => |n| n != 0 and !std.math.isNan(n),
+        .string => |s| s.len > 0,
+        .null_, .undefined_ => false,
+        else => true,
+    };
+}
+
+fn nativeBooleanCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const b = if (args.len > 0) toBooleanCoerce(args[0]) else false;
+    // Called as `new Boolean(x)`: this_val is a fresh object — store primitive, return it.
+    if (this_val.bits != 0 and this_val.toPtr().* == .object) {
+        try this_val.toPtr().object.set("[[PrimitiveValue]]", try val_mod.makeBool(arena, b));
+        return this_val;
+    }
+    return val_mod.makeBool(arena, b);
+}
+
+fn nativeNumberCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0) return val_mod.makeNumber(arena, 0);
+    const arg = args[0];
+    if (arg.bits == 0) return val_mod.makeNumber(arena, std.math.nan(f64));
+    return switch (arg.toPtr().*) {
+        .number => |n| val_mod.makeNumber(arena, n),
+        .boolean => |b| val_mod.makeNumber(arena, if (b) 1 else 0),
+        .string => |s| blk: {
+            const trimmed = std.mem.trim(u8, s, &std.ascii.whitespace);
+            if (trimmed.len == 0) break :blk val_mod.makeNumber(arena, 0);
+            const parsed = std.fmt.parseFloat(f64, trimmed) catch std.math.nan(f64);
+            break :blk val_mod.makeNumber(arena, parsed);
+        },
+        .null_ => val_mod.makeNumber(arena, 0),
+        .undefined_ => val_mod.makeNumber(arena, std.math.nan(f64)),
+        else => val_mod.makeNumber(arena, std.math.nan(f64)),
+    };
+}
+
 // ---------------------------------------------------------------- Phase 4b registration helpers ---
 
 fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
@@ -435,6 +636,7 @@ pub const Realm = struct {
         const object_ctor = try JsObject.create(arena, null);
         const create_fn = try val_mod.makeNativeFunction(arena, nativeObjectCreate);
         try object_ctor.set("create", create_fn);
+        try object_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeObjectCtor));
 
         // Also expose Object.prototype on the constructor.
         const proto_val = try val_mod.makeObject(arena, object_proto);
@@ -720,6 +922,39 @@ pub const Realm = struct {
         try module_obj.set("exports", exports_val);
         try env.define("module", try val_mod.makeObject(arena, module_obj));
         try env.define("exports", exports_val);
+
+        // ---- Phase 4: Array, String, Number constructors ----
+        const array_ctor_obj = try JsObject.create(arena, null);
+        try array_ctor_obj.set("prototype", try val_mod.makeObject(arena, array_proto));
+        try array_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeArrayCtor));
+        try array_ctor_obj.set("isArray", try val_mod.makeNativeFunction(arena, nativeArrayIsArray));
+        try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
+
+        const string_ctor_obj = try JsObject.create(arena, null);
+        try string_ctor_obj.set("prototype", try val_mod.makeObject(arena, string_proto));
+        try string_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeStringCtor));
+        try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunction(arena, nativeStringFromCharCode));
+        try env.define("String", try val_mod.makeObject(arena, string_ctor_obj));
+
+        const number_ctor_obj = try JsObject.create(arena, null);
+        try number_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeNumberCtor));
+        try number_ctor_obj.set("MAX_VALUE", try val_mod.makeNumber(arena, 1.7976931348623157e+308));
+        try number_ctor_obj.set("MIN_VALUE", try val_mod.makeNumber(arena, 5e-324));
+        try number_ctor_obj.set("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)));
+        try number_ctor_obj.set("POSITIVE_INFINITY", try val_mod.makeNumber(arena, std.math.inf(f64)));
+        try number_ctor_obj.set("NEGATIVE_INFINITY", try val_mod.makeNumber(arena, -std.math.inf(f64)));
+        try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
+
+        // ---- Phase 4: global functions + value globals ----
+        const boolean_ctor_obj = try JsObject.create(arena, null);
+        try boolean_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBooleanCtor));
+        try env.define("Boolean", try val_mod.makeObject(arena, boolean_ctor_obj));
+        try env.define("isNaN", try val_mod.makeNativeFunction(arena, nativeIsNaN));
+        try env.define("isFinite", try val_mod.makeNativeFunction(arena, nativeIsFinite));
+        try env.define("parseInt", try val_mod.makeNativeFunction(arena, nativeParseInt));
+        try env.define("parseFloat", try val_mod.makeNativeFunction(arena, nativeParseFloat));
+        try env.define("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)));
+        try env.define("Infinity", try val_mod.makeNumber(arena, std.math.inf(f64)));
 
         // Set thread-locals for builtins that need them.
         active_array_proto = array_proto;

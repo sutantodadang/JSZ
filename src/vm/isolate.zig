@@ -60,10 +60,11 @@ pub const IsolateImpl = struct {
 
     /// Run one eval call in tree mode (Phase 1 default). Resets the eval arena on entry.
     pub fn eval(self: *IsolateImpl, source: []const u8) !EvalOutcome {
-        return self.evalWithMode(source, .tree);
+        return self.evalWithMode(source, .tree, &[_]val_mod.NativeBinding{});
     }
 
-    pub fn evalWithMode(self: *IsolateImpl, source: []const u8, mode: InterpMode) !EvalOutcome {
+    pub fn evalWithMode(self: *IsolateImpl, source: []const u8, mode: InterpMode, native_bindings: []const val_mod.NativeBinding) !EvalOutcome {
+        _ = native_bindings;
         _ = self.eval_arena.reset(.free_all);
         promise_mod.clearMicrotasks();
         const arena = self.eval_arena.allocator();
@@ -256,7 +257,7 @@ test "IsolateImpl eval 1+2" {
 test "IsolateImpl bc eval 1+2" {
     const impl = try IsolateImpl.init(std.testing.allocator);
     defer impl.deinit();
-    const r = try impl.evalWithMode("1+2", .bc);
+    const r = try impl.evalWithMode("1+2", .bc, &[_]val_mod.NativeBinding{});
     switch (r) {
         .ok => |v| try std.testing.expectEqual(@as(f64, 3), v.toF64()),
         else => return error.UnexpectedResult,
@@ -269,6 +270,7 @@ test "IsolateImpl bc eval fib(10)" {
     const r = try impl.evalWithMode(
         "(function fib(n){ return n<2 ? n : fib(n-1)+fib(n-2); })(10)",
         .bc,
+        &[_]val_mod.NativeBinding{},
     );
     switch (r) {
         .ok => |v| try std.testing.expectEqual(@as(f64, 55), v.toF64()),

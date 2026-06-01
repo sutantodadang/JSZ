@@ -7,3 +7,4 @@ zig-cache/
 .vscode/
 external/test262/
 tmp/
+.cursor/

@@ -25,7 +25,7 @@ zig build docs        # generate API docs to zig-out/docs/
 Test262 is not bundled. Add it manually once:
 
 ```sh
-git submodule add https://github.com/tc39/test262 external/test262
+git submodule add -f https://github.com/tc39/test262 external/test262
 git submodule update --init --recursive
 ```
 

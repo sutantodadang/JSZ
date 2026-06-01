@@ -1248,7 +1248,7 @@ pub const Parser = struct {
 
     fn parseConditionalExpr(self: *Parser) ?*Node {
         const start = self.current.start;
-        const test_ = self.parseBinaryExpr(Prec.logical_or) orelse return null;
+        const test_ = self.parseBinaryExpr(Prec.comma) orelse return null;
         if (self.match(.question)) {
             const consequent = self.parseAssignmentExpr() orelse return null;
             _ = self.expect(.colon) orelse return null;

@@ -316,8 +316,8 @@ pub const Vm = struct {
                     return error.OutOfMemory;
                 };
             },
-            .native_function => |fn_ptr| {
-                return fn_ptr(self.arena, this_val, args) catch |e| {
+            .native_function => |nf| {
+                return nf.invoke(self.arena, this_val, args) catch |e| {
                     if (e == error.JsException) return error.JsException;
                     return error.OutOfMemory;
                 };
@@ -336,8 +336,8 @@ pub const Vm = struct {
                 }
                 if (obj.get("__call__")) |call_val| {
                     if (call_val.bits != 0 and call_val.toPtr().* == .native_function) {
-                        const fn_ptr2 = call_val.toPtr().native_function;
-                        return fn_ptr2(self.arena, this_val, args) catch |e| {
+                        const nf2 = call_val.toPtr().native_function;
+                        return nf2.invoke(self.arena, this_val, args) catch |e| {
                             if (e == error.JsException) return error.JsException;
                             return error.OutOfMemory;
                         };
@@ -1194,8 +1194,8 @@ pub const Vm = struct {
         if (fn_val.bits == 0) return EvalError.JsException;
         switch (fn_val.toPtr().*) {
             .function => |fv| return self.callFunction(fv, @constCast(args), this_val),
-            .native_function => |fn_ptr| {
-                return fn_ptr(self.arena, this_val, args) catch |e| {
+            .native_function => |nf| {
+                return nf.invoke(self.arena, this_val, args) catch |e| {
                     if (e == error.JsException) return EvalError.JsException;
                     return EvalError.OutOfMemory;
                 };
@@ -1263,6 +1263,15 @@ pub const Vm = struct {
                     }
                     return self.makeUndefined();
                 }
+                if (std.mem.eql(u8, key, "name")) {
+                    return self.makeString(fv.name orelse "");
+                }
+                if (std.mem.eql(u8, key, "length")) {
+                    return val_mod.makeNumber(self.arena, @floatFromInt(fv.params.len)) catch return EvalError.OutOfMemory;
+                }
+                if (fv.own_props) |op| {
+                    if (op.get(key)) |v| return v;
+                }
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
                     if (proto.get(key)) |v| return v;
@@ -1288,6 +1297,22 @@ pub const Vm = struct {
         }
         switch (obj_val.toPtr().*) {
             .object => |obj| {
+                if (obj.is_array and std.mem.eql(u8, key, "length")) {
+                    if (value.bits != 0 and value.toPtr().* == .number) {
+                        const n = value.toPtr().number;
+                        if (n >= 0 and n == @floor(n) and n < 4294967296) {
+                            const new_len: u32 = @intFromFloat(n);
+                            // Clear indexed slots at or above new length.
+                            var i = new_len;
+                            while (i < obj.array_length) : (i += 1) {
+                                const k = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch break;
+                                obj.set(k, self.makeUndefined() catch Value{}) catch {};
+                            }
+                            obj.array_length = new_len;
+                        }
+                    }
+                    return;
+                }
                 if (obj.resolveOwnSlot(key)) |slot| {
                     if (obj.setOwnBySlot(obj.shapePtr(), slot, value)) {
                         obj.props.put(obj.arena, key, value) catch return EvalError.OutOfMemory;
@@ -1301,7 +1326,15 @@ pub const Vm = struct {
                     if (value.bits != 0 and value.toPtr().* == .object) {
                         fv.prototype_obj = value.toPtr().object;
                     }
+                    return;
                 }
+                if (fv.own_props == null) {
+                    fv.own_props = if (self.heap) |heap|
+                        JsObject.createOnHeap(heap, null) catch return EvalError.OutOfMemory
+                    else
+                        JsObject.create(self.arena, null) catch return EvalError.OutOfMemory;
+                }
+                fv.own_props.?.set(key, value) catch return EvalError.OutOfMemory;
             },
             else => {
                 // Silently ignore setting on non-objects (ES5 non-strict).
@@ -1598,7 +1631,7 @@ pub const Vm = struct {
                 return self.callFunction(inner.function, arg_vals.items, this_val);
             },
             .native_function => |fn_ptr| {
-                return fn_ptr(self.arena, this_val, arg_vals.items) catch |e| {
+                return fn_ptr.invoke(self.arena, this_val, arg_vals.items) catch |e| {
                     if (e == error.JsException) {
                         // Check for pending exception set by native code (e.g. JSON.parse).
                         const realm_mod = @import("../runtime/realm.zig");
@@ -1626,7 +1659,7 @@ pub const Vm = struct {
                         switch (bound_inner) {
                             .function => |fv| return self.callFunction(fv, combined, bd.this_val),
                             .native_function => |fn_ptr| {
-                                return fn_ptr(self.arena, bd.this_val, combined) catch |e| {
+                                return fn_ptr.invoke(self.arena, bd.this_val, combined) catch |e| {
                                     if (e == error.JsException) {
                                         const realm_mod = @import("../runtime/realm.zig");
                                         if (realm_mod.pending_exception.bits != 0) {
@@ -1651,7 +1684,7 @@ pub const Vm = struct {
                             // Preserve legacy behavior for Error-like constructor objects.
                             return self.doConstruct(callee_val, arg_vals.items);
                         }
-                        return fn_ptr2(self.arena, callee_val, arg_vals.items) catch |e| {
+                        return fn_ptr2.invoke(self.arena, callee_val, arg_vals.items) catch |e| {
                             if (e == error.JsException) {
                                 const realm_mod = @import("../runtime/realm.zig");
                                 if (realm_mod.pending_exception.bits != 0) {
@@ -2148,7 +2181,7 @@ pub const Vm = struct {
                 else
                     JsObject.create(self.arena, proto) catch return EvalError.OutOfMemory;
                 const this_val = val_mod.makeObject(self.arena, new_obj) catch return EvalError.OutOfMemory;
-                const result = fn_ptr(self.arena, this_val, args) catch return EvalError.OutOfMemory;
+                const result = fn_ptr.invoke(self.arena, this_val, args) catch return EvalError.OutOfMemory;
                 if (result.bits != 0 and result.toPtr().* == .object) {
                     return result;
                 }
@@ -2190,7 +2223,7 @@ pub const Vm = struct {
                         else
                             JsObject.create(self.arena, proto) catch return EvalError.OutOfMemory;
                         const this_val = val_mod.makeObject(self.arena, new_obj) catch return EvalError.OutOfMemory;
-                        const result = fn_ptr(self.arena, this_val, args) catch |e| {
+                        const result = fn_ptr.invoke(self.arena, this_val, args) catch |e| {
                             if (e == error.JsException) {
                                 const realm_m = @import("../runtime/realm.zig");
                                 if (realm_m.pending_exception.bits != 0) {

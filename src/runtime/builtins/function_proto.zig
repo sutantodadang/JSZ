@@ -38,7 +38,7 @@ pub fn invokeCallback(arena: std.mem.Allocator, this_val: Value, fn_val: Value, 
     const inner = fn_val.toPtr().*;
     switch (inner) {
         .native_function => |fn_ptr| {
-            return fn_ptr(arena, this_val, args) catch |e| {
+            return fn_ptr.invoke(arena, this_val, args) catch |e| {
                 if (e == error.JsException) return error.JsException;
                 return error.OutOfMemory;
             };

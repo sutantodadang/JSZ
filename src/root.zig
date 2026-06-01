@@ -208,7 +208,7 @@ pub const Context = struct {
     pub fn eval(self: *Context, source: []const u8, source_name: []const u8) EvalResult {
         _ = source_name;
         const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
-        const outcome = impl.evalWithMode(source, self.interp_mode) catch {
+        const outcome = impl.evalWithMode(source, self.interp_mode, &[_]val_mod.NativeBinding{}) catch {
             return EvalResult{ .exception = Exception{
                 .value = Value{},
                 .message = "out of memory",

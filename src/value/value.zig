@@ -16,6 +16,23 @@ const JsObject = @import("../object/object.zig").JsObject;
 /// We use a simpler form here to avoid circular imports: args are []Value, returns Value.
 pub const NativeFnPtr = *const fn (arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value;
 
+/// Side channel: set immediately before invoking a native_function entry so a
+/// shared trampoline can recover its per-registration userdata. Single-threaded.
+pub var g_active_native_data: ?*anyopaque = null;
+
+/// A native function plus optional host userdata. Builtins use data == null.
+pub const NativeFnEntry = struct {
+    call: NativeFnPtr,
+    data: ?*anyopaque = null,
+
+    pub fn invoke(self: NativeFnEntry, arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+        g_active_native_data = self.data;
+        return self.call(arena, this_val, args);
+    }
+};
+
+pub const NativeBinding = struct { name: []const u8, entry: NativeFnEntry };
+
 /// Internal tagged JavaScript value. Arena-allocated per eval call.
 pub const JsValue = union(enum) {
     undefined_,
@@ -30,7 +47,7 @@ pub const JsValue = union(enum) {
     /// Phase 3a: object (plain object or array).
     object: *JsObject,
     /// Phase 3a: native function (host-provided).
-    native_function: NativeFnPtr,
+    native_function: NativeFnEntry,
 
     pub const Tag = std.meta.Tag(JsValue);
 };
@@ -57,6 +74,8 @@ pub const FuncVal = struct {
     is_generator: bool = false,
     /// Phase 7: derived class constructor must call `super` before `this`.
     requires_super: bool = false,
+    /// Phase 4: own properties (functions are objects). Lazily allocated.
+    own_props: ?*JsObject = null,
 };
 
 /// Public handle — an opaque u64 whose bits are a *JsValue pointer.
@@ -181,7 +200,14 @@ pub fn makeObject(arena: std.mem.Allocator, obj: *JsObject) !Value {
 /// Phase 3a: wrap a native function pointer as a Value.
 pub fn makeNativeFunction(arena: std.mem.Allocator, fn_ptr: NativeFnPtr) !Value {
     const v = try arena.create(JsValue);
-    v.* = .{ .native_function = fn_ptr };
+    v.* = .{ .native_function = .{ .call = fn_ptr } };
+    return Value.fromPtr(v);
+}
+
+/// Wrap a native fn pointer plus host userdata as a Value.
+pub fn makeNativeFunctionData(arena: std.mem.Allocator, fn_ptr: NativeFnPtr, data: ?*anyopaque) !Value {
+    const v = try arena.create(JsValue);
+    v.* = .{ .native_function = .{ .call = fn_ptr, .data = data } };
     return Value.fromPtr(v);
 }
 

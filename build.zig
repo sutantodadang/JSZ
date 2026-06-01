@@ -45,9 +45,19 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const test262_runner_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/test/test262_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "jsz", .module = mod }},
+    });
+    const test262_runner_tests = b.addTest(.{ .root_module = test262_runner_tests_mod });
+    const run_test262_runner_tests = b.addRunArtifact(test262_runner_tests);
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_test262_runner_tests.step);
 
     // ---------------------------------------------------------------------------
     // Fuzz: zig build fuzz --fuzz
@@ -97,6 +107,7 @@ pub fn build(b: *std.Build) void {
 
     const run_conformance_delta = b.addRunArtifact(conformance_exe);
     run_conformance_delta.addArg("--summary");
+    run_conformance_delta.addArg("--fail-on-flips");
     const conformance_delta_step = b.step("conformance-delta", "Fail on unexpected pass/fail flips using known-failing list");
     conformance_delta_step.dependOn(&run_conformance_delta.step);
 

@@ -146,7 +146,7 @@ pub const BcVm = struct {
                 return self.result;
             },
             .native_function => |fn_ptr| {
-                return fn_ptr(self.arena, this_val, args) catch |e| {
+                return fn_ptr.invoke(self.arena, this_val, args) catch |e| {
                     if (e == error.JsException) return error.JsException;
                     return error.OutOfMemory;
                 };
@@ -1257,7 +1257,7 @@ pub const BcVm = struct {
                 else
                     try JsObject.create(self.arena, proto);
                 const this_val = try val_mod.makeObject(self.arena, new_obj);
-                const result = fn_ptr(self.arena, this_val, args) catch {
+                const result = fn_ptr.invoke(self.arena, this_val, args) catch {
                     return "native constructor threw";
                 };
                 frame.registers[rdst] = if (result.bits != 0 and result.toPtr().* == .object) result else this_val;
@@ -1283,7 +1283,7 @@ pub const BcVm = struct {
                         else
                             try JsObject.create(self.arena, proto);
                         const this_val = try val_mod.makeObject(self.arena, new_obj);
-                        const result = fn_ptr(self.arena, this_val, args) catch |e| {
+                        const result = fn_ptr.invoke(self.arena, this_val, args) catch |e| {
                             if (e == error.JsException) {
                                 const realm_m = @import("../runtime/realm.zig");
                                 if (realm_m.pending_exception.bits != 0) {
@@ -1499,7 +1499,7 @@ pub const BcVm = struct {
                 for (0..nargs) |i| {
                     args[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
                 }
-                const result = fn_ptr(self.arena, this_val, args) catch |e| {
+                const result = fn_ptr.invoke(self.arena, this_val, args) catch |e| {
                     if (e == error.JsException) {
                         // Phase 4b: check pending_exception (e.g. JSON.parse).
                         const realm_mod = @import("../runtime/realm.zig");
@@ -1566,14 +1566,14 @@ pub const BcVm = struct {
                             else
                                 try JsObject.create(self.arena, proto);
                             const this_val_call = try val_mod.makeObject(self.arena, new_obj);
-                            const result = fn_ptr(self.arena, this_val_call, args) catch {
+                            const result = fn_ptr.invoke(self.arena, this_val_call, args) catch {
                                 return "TypeError: Error constructor threw";
                             };
                             const final_result = if (result.bits != 0 and result.toPtr().* == .object) result else this_val_call;
                             self.frames.items[self.frames.items.len - 1].registers[ret_dst] = final_result;
                             return null;
                         }
-                        const result = fn_ptr(self.arena, callee_val, args) catch |e| {
+                        const result = fn_ptr.invoke(self.arena, callee_val, args) catch |e| {
                             if (e == error.JsException) {
                                 const realm_mod = @import("../runtime/realm.zig");
                                 if (realm_mod.pending_exception.bits != 0) {
@@ -1681,7 +1681,7 @@ pub const BcVm = struct {
                 for (0..nargs) |i| {
                     args[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
                 }
-                const result = fn_ptr(self.arena, this_val, args) catch |e| {
+                const result = fn_ptr.invoke(self.arena, this_val, args) catch |e| {
                     if (e == error.JsException) {
                         // Phase 4b: check pending_exception.
                         const realm_mod = @import("../runtime/realm.zig");
