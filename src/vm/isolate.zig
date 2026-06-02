@@ -21,6 +21,9 @@ pub const IsolateImpl = struct {
     eval_arena: std.heap.ArenaAllocator,
     /// Phase 3b: GC heap. Owned by the IsolateImpl.
     heap: Heap,
+    /// Phase 8: call-frame depth high-water mark of the most recent bc-mode
+    /// eval. Exposed for tail-call tests (stays small when PTC engages).
+    last_frame_high_water: usize = 0,
 
     pub fn init(backing: std.mem.Allocator) !*IsolateImpl {
         const impl = try backing.create(IsolateImpl);
@@ -109,40 +112,85 @@ pub const IsolateImpl = struct {
                         error.OutOfMemory => error.OutOfMemory,
                     };
                 };
-
-                // Set up realm with ES5 globals + Phase 3a/3b intrinsics.
-                const Realm = @import("../runtime/realm.zig").Realm;
-                var realm = try Realm.init(arena);
-                try realm.activateHeap(&self.heap);
-                defer realm.deinit();
-
-                const nan_val = try val_mod.makeNumber(arena, std.math.nan(f64));
-                const inf_val = try val_mod.makeNumber(arena, std.math.inf(f64));
-                const undef_val = try val_mod.makeUndefined(arena);
-                try realm.global_env.define("NaN", nan_val);
-                try realm.global_env.define("Infinity", inf_val);
-                try realm.global_env.define("undefined", undef_val);
-
-                // Expose __gc__ native function for JS-side collection trigger.
-                const gc_fn = try val_mod.makeNativeFunction(arena, nativeGcCollect);
-                try realm.global_env.define("__gc__", gc_fn);
-                const microtask_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeRunMicrotasks);
-                try realm.global_env.define("__runMicrotasks__", microtask_fn);
-
-                var bc_vm = BcVm.initWithHeap(arena, &realm, &self.heap);
-                // Register roots AFTER bc_vm/realm are in final stack location.
-                try realm.registerRoots();
-                try bc_vm.registerHeapCallback(&self.heap);
-                defer bc_vm.unregisterHeapCallback(&self.heap);
-                const outcome = try bc_vm.run(main_func, @ptrCast(realm.global_env));
-                promise_mod.runMicrotasks(arena);
-                return switch (outcome) {
-                    .ok => |v| EvalOutcome{ .ok = v },
-                    .exception => |msg| EvalOutcome{ .exception = msg },
-                    .exception_value => |ev| EvalOutcome{ .exception = ev.msg },
-                };
+                return self.runMainBc(arena, main_func);
             },
         }
+    }
+
+    /// Run a compiled `main_func` in the bytecode VM against a fresh realm.
+    /// Shared by `evalWithMode(.bc)` and snapshot restore.
+    fn runMainBc(self: *IsolateImpl, arena: std.mem.Allocator, main_func: *const @import("../bytecode/function.zig").BcFunction) !EvalOutcome {
+        // Set up realm with ES5 globals + Phase 3a/3b intrinsics.
+        const Realm = @import("../runtime/realm.zig").Realm;
+        var realm = try Realm.init(arena);
+        try realm.activateHeap(&self.heap);
+        defer realm.deinit();
+
+        const nan_val = try val_mod.makeNumber(arena, std.math.nan(f64));
+        const inf_val = try val_mod.makeNumber(arena, std.math.inf(f64));
+        const undef_val = try val_mod.makeUndefined(arena);
+        try realm.global_env.define("NaN", nan_val);
+        try realm.global_env.define("Infinity", inf_val);
+        try realm.global_env.define("undefined", undef_val);
+
+        // Expose __gc__ native function for JS-side collection trigger.
+        const gc_fn = try val_mod.makeNativeFunction(arena, nativeGcCollect);
+        try realm.global_env.define("__gc__", gc_fn);
+        const microtask_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeRunMicrotasks);
+        try realm.global_env.define("__runMicrotasks__", microtask_fn);
+        const await_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeAwait);
+        try realm.global_env.define("__await__", await_fn);
+
+        var bc_vm = BcVm.initWithHeap(arena, &realm, &self.heap);
+        // Register roots AFTER bc_vm/realm are in final stack location.
+        try realm.registerRoots();
+        try bc_vm.registerHeapCallback(&self.heap);
+        defer bc_vm.unregisterHeapCallback(&self.heap);
+        const outcome = try bc_vm.run(main_func, @ptrCast(realm.global_env));
+        self.last_frame_high_water = bc_vm.frame_high_water;
+        promise_mod.runMicrotasks(arena);
+        return switch (outcome) {
+            .ok => |v| EvalOutcome{ .ok = v },
+            .exception => |msg| EvalOutcome{ .exception = msg },
+            .exception_value => |ev| EvalOutcome{ .exception = ev.msg },
+        };
+    }
+
+    /// Phase 8: compile `source` to a sourceless bytecode image (snapshot).
+    /// Caller owns the returned bytes (allocated with `out_allocator`).
+    pub fn compileSnapshot(self: *IsolateImpl, out_allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+        _ = self.eval_arena.reset(.free_all);
+        const arena = self.eval_arena.allocator();
+        const transformed = try rewriteTemplateLiterals(arena, source);
+        const parser_mod = @import("../parser/parser.zig");
+        var p = parser_mod.Parser.init(transformed, arena);
+        const stmts = switch (p.parseScript()) {
+            .ok => |s| s,
+            .err => return error.SnapshotParseError,
+        };
+        const ast_mod = @import("../parser/ast.zig");
+        const prog = ast_mod.Program{ .body = stmts };
+        const main_func = try compiler_mod.compileProgram(arena, &prog, "<snapshot>");
+        const snapshot_mod = @import("../bytecode/snapshot.zig");
+        return snapshot_mod.serialize(out_allocator, main_func);
+    }
+
+    /// Phase 8: restore a bytecode image and run it (bytecode VM).
+    pub fn evalSnapshot(self: *IsolateImpl, image: []const u8) !EvalOutcome {
+        _ = self.eval_arena.reset(.free_all);
+        promise_mod.clearMicrotasks();
+        const arena = self.eval_arena.allocator();
+        const snapshot_mod = @import("../bytecode/snapshot.zig");
+        const main_func = snapshot_mod.deserialize(arena, image) catch |e| {
+            return EvalOutcome{ .exception = switch (e) {
+                error.BadMagic => "snapshot: bad magic",
+                error.UnsupportedVersion => "snapshot: unsupported version",
+                error.Truncated => "snapshot: truncated image",
+                error.UnsupportedConstant => "snapshot: unsupported constant",
+                error.OutOfMemory => return error.OutOfMemory,
+            } };
+        };
+        return self.runMainBc(arena, main_func);
     }
 };
 

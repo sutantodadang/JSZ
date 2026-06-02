@@ -595,6 +595,18 @@ pub fn nativeTrim(arena: std.mem.Allocator, this_val: Value, _: []const Value) a
     return val_mod.makeString(arena, try arena.dupe(u8, trimmed));
 }
 
+/// ES2019 String.prototype.trimStart.
+pub fn nativeTrimStart(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const trimmed = std.mem.trimLeft(u8, getThis(this_val), " \t\n\r");
+    return val_mod.makeString(arena, try arena.dupe(u8, trimmed));
+}
+
+/// ES2019 String.prototype.trimEnd.
+pub fn nativeTrimEnd(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const trimmed = std.mem.trimRight(u8, getThis(this_val), " \t\n\r");
+    return val_mod.makeString(arena, try arena.dupe(u8, trimmed));
+}
+
 fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
     if (std.math.isNan(n)) return "NaN";
     if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
@@ -602,4 +614,51 @@ fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
         return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
     }
     return std.fmt.allocPrint(arena, "{d}", .{n});
+}
+
+/// Build a pad filler of `count` bytes by repeating `pad`.
+fn buildFiller(arena: std.mem.Allocator, pad: []const u8, count: usize) ![]const u8 {
+    var buf = std.ArrayList(u8){};
+    while (buf.items.len < count) {
+        const remaining = count - buf.items.len;
+        try buf.appendSlice(arena, if (pad.len <= remaining) pad else pad[0..remaining]);
+    }
+    return buf.items;
+}
+
+fn padImpl(arena: std.mem.Allocator, this_val: Value, args: []const Value, at_start: bool) anyerror!Value {
+    const s = getThis(this_val);
+    const target: usize = if (args.len > 0 and args[0].bits != 0)
+        switch (args[0].toPtr().*) {
+            .number => |n| if (n <= 0 or std.math.isNan(n)) 0 else @intFromFloat(@trunc(n)),
+            else => 0,
+        }
+    else
+        0;
+    if (target <= s.len) return val_mod.makeString(arena, s);
+    const pad: []const u8 = if (args.len > 1 and args[1].bits != 0 and args[1].toPtr().* == .string)
+        args[1].toPtr().string
+    else
+        " ";
+    if (pad.len == 0) return val_mod.makeString(arena, s);
+    const filler = try buildFiller(arena, pad, target - s.len);
+    var buf = std.ArrayList(u8){};
+    if (at_start) {
+        try buf.appendSlice(arena, filler);
+        try buf.appendSlice(arena, s);
+    } else {
+        try buf.appendSlice(arena, s);
+        try buf.appendSlice(arena, filler);
+    }
+    return val_mod.makeString(arena, buf.items);
+}
+
+/// ES2017 String.prototype.padStart.
+pub fn nativePadStart(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return padImpl(arena, this_val, args, true);
+}
+
+/// ES2017 String.prototype.padEnd.
+pub fn nativePadEnd(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return padImpl(arena, this_val, args, false);
 }

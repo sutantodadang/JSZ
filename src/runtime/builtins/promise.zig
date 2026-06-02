@@ -90,7 +90,7 @@ fn settlePromise(data: *PromiseData, state: PromiseState, value: Value) void {
 fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.toPtr().*) {
-        .function, .native_function => true,
+        .function, .native_function, .bc_function => true,
         .object => |o| o.get("__call__") != null,
         else => false,
     };
@@ -310,7 +310,29 @@ pub fn runMicrotasks(arena: std.mem.Allocator) void {
 }
 
 pub fn clearMicrotasks() void {
-    microtasks.clearRetainingCapacity();
+    // Drop the backing slice (do NOT free — its arena was already reset by the caller).
+    // Retaining capacity would dangle into the freed eval arena and crash the next append.
+    microtasks = .empty;
+}
+
+/// Top-level-await for a single-threaded engine: drain the microtask queue until
+/// the awaited promise settles. Non-promises (and unsettleable pendings) pass through.
+pub fn awaitValue(arena: std.mem.Allocator, v: Value) anyerror!Value {
+    const data = getData(v) orelse return v;
+    runMicrotasks(arena);
+    return switch (data.state) {
+        .fulfilled => data.value,
+        .rejected => blk: {
+            realm_mod.pending_exception = data.value;
+            break :blk error.JsException;
+        },
+        .pending => try val_mod.makeUndefined(arena),
+    };
+}
+
+pub fn nativeAwait(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    return awaitValue(arena, v);
 }
 
 pub fn nativeRunMicrotasks(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {

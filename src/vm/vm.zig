@@ -132,6 +132,8 @@ pub const Vm = struct {
         try realm.global_env.define("__gc__", gc_fn);
         const microtask_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeRunMicrotasks);
         try realm.global_env.define("__runMicrotasks__", microtask_fn);
+        const await_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeAwait);
+        try realm.global_env.define("__await__", await_fn);
         const undef_this = try val_mod.makeUndefined(arena);
         return Vm{ .arena = arena, .realm = realm, .current_this = undef_this, .generator_capture = null };
     }
@@ -152,6 +154,8 @@ pub const Vm = struct {
         try realm.global_env.define("__gc__", gc_fn);
         const microtask_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeRunMicrotasks);
         try realm.global_env.define("__runMicrotasks__", microtask_fn);
+        const await_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeAwait);
+        try realm.global_env.define("__await__", await_fn);
         const undef_this = try val_mod.makeUndefined(arena);
         return Vm{ .arena = arena, .realm = realm, .heap = heap, .current_this = undef_this, .generator_capture = null };
     }

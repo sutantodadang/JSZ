@@ -117,6 +117,12 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
             try module_obj.set("id", try val_mod.makeString(arena, lookup_name));
             try module_obj.set("loaded", try val_mod.makeBool(arena, false));
             const module_val = try val_mod.makeObject(arena, module_obj);
+            // Cache BEFORE invoking the factory so cyclic require() sees the partial exports.
+            try modules_obj.set(lookup_name, module_val);
+            if (!std.mem.eql(u8, lookup_name, name)) {
+                try modules_obj.set(name, module_val);
+            }
+            try syncRequireCache(env, lookup_name, module_val);
             const require_fn = env.lookup("require") catch try val_mod.makeUndefined(arena);
             _ = function_proto_mod.invokeCallback(
                 arena,
@@ -126,12 +132,6 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
             ) catch return val_mod.makeUndefined(arena);
             const final_exports = module_obj.get("exports") orelse exports_val;
             try module_obj.set("loaded", try val_mod.makeBool(arena, true));
-            // Cache instantiated module back into registry.
-            try modules_obj.set(lookup_name, module_val);
-            if (!std.mem.eql(u8, lookup_name, name)) {
-                try modules_obj.set(name, module_val);
-            }
-            try syncRequireCache(env, lookup_name, module_val);
             return final_exports;
         }
         try syncRequireCache(env, lookup_name, entry);
@@ -176,7 +176,7 @@ fn nativeRequireResolve(arena: std.mem.Allocator, _: Value, args: []const Value)
 fn isCallableValue(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.toPtr().*) {
-        .function, .native_function => true,
+        .function, .native_function, .bc_function => true,
         .object => |o| o.get("__call__") != null,
         else => false,
     };
@@ -527,6 +527,10 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "split", string_proto_mod.nativeSplit },
         .{ "concat", string_proto_mod.nativeConcat },
         .{ "trim", string_proto_mod.nativeTrim },
+        .{ "padStart", string_proto_mod.nativePadStart },
+        .{ "padEnd", string_proto_mod.nativePadEnd },
+        .{ "trimStart", string_proto_mod.nativeTrimStart },
+        .{ "trimEnd", string_proto_mod.nativeTrimEnd },
         // Phase 4c: regex-aware string methods
         .{ "match", string_proto_mod.nativeMatch },
         .{ "replace", string_proto_mod.nativeReplace },
@@ -544,6 +548,9 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "pop", array_proto_mod.nativePop },
         .{ "slice", array_proto_mod.nativeSlice },
         .{ "indexOf", array_proto_mod.nativeIndexOf },
+        .{ "includes", array_proto_mod.nativeIncludes },
+        .{ "flat", array_proto_mod.nativeFlat },
+        .{ "flatMap", array_proto_mod.nativeFlatMap },
         .{ "join", array_proto_mod.nativeJoin },
         .{ "concat", array_proto_mod.nativeConcat },
         // Phase 4d: callback methods
@@ -755,6 +762,10 @@ pub const Realm = struct {
                 const values_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectValues);
                 try ctor_obj.set("keys", keys_fn);
                 try ctor_obj.set("values", values_fn);
+                const entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectEntries);
+                try ctor_obj.set("entries", entries_fn);
+                const from_entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFromEntries);
+                try ctor_obj.set("fromEntries", from_entries_fn);
             }
         }
         // hasOwnProperty on Object.prototype

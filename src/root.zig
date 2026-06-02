@@ -164,6 +164,38 @@ pub fn dumpBytecode(arena: std.mem.Allocator, source: []const u8, source_name: [
     try chunk_mod.disassemble(&f.chunk, writer);
 }
 
+/// Phase 8: debugger + source-map surface.
+pub const debug = @import("./runtime/debugger.zig");
+
+/// Phase 8: bytecode snapshot (cache) serializer/deserializer. Advanced
+/// embedding surface; most users go through `Context.compileSnapshot`/`evalSnapshot`.
+pub const snapshot = @import("./bytecode/snapshot.zig");
+
+/// Phase 8: compile `source` and write a bytecode→source JSON source map to
+/// `writer`. Maps each opcode (and nested function literals) back to a
+/// line/column in the original source. See `runtime/debugger.zig`.
+pub fn sourceMap(arena: std.mem.Allocator, source: []const u8, source_name: []const u8, writer: anytype) !void {
+    const parser_mod = @import("./parser/parser.zig");
+    var p = parser_mod.Parser.init(source, arena);
+    const parse_result = p.parseScript();
+    const stmts = switch (parse_result) {
+        .ok => |s| s,
+        .err => |e| {
+            try writer.print("SyntaxError: {s} (line {d}:{d})\n", .{ e.message, e.line, e.column });
+            return;
+        },
+    };
+    const ast_mod = @import("./parser/ast.zig");
+    const prog = ast_mod.Program{ .body = stmts };
+    const compiler_mod = @import("./bytecode/compiler.zig");
+    const f = compiler_mod.compileProgram(arena, &prog, source_name) catch {
+        try writer.print("compile error\n", .{});
+        return;
+    };
+    try debug.writeSourceMap(writer, source, source_name, f);
+    try writer.writeAll("\n");
+}
+
 /// The VM root object. Owns the heap, GC, atom table, and symbol registry.
 pub const Isolate = struct {
     allocator: std.mem.Allocator,
@@ -247,6 +279,48 @@ pub const Context = struct {
             .bytes_allocated = s.bytes_allocated,
             .bytes_freed = s.bytes_freed,
             .objects_alive = s.objects_alive,
+        };
+    }
+
+    /// Phase 8: call-frame depth high-water mark of the most recent bc-mode
+    /// eval. Mainly a test/inspection hook for proper tail calls: a strict
+    /// tail-recursive function keeps this O(1) regardless of recursion depth.
+    pub fn lastFrameHighWater(self: *Context) usize {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        return impl.last_frame_high_water;
+    }
+
+    /// Phase 8: compile `source` to a sourceless bytecode image (snapshot).
+    /// The returned bytes are allocated with `out_allocator` and owned by the
+    /// caller — they outlive the Context and can be persisted to disk.
+    pub fn compileSnapshot(self: *Context, out_allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        return impl.compileSnapshot(out_allocator, source);
+    }
+
+    /// Phase 8: restore a bytecode image (from `compileSnapshot`) and run it in
+    /// the bytecode VM against a fresh realm.
+    pub fn evalSnapshot(self: *Context, image: []const u8) EvalResult {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        const outcome = impl.evalSnapshot(image) catch {
+            return EvalResult{ .exception = Exception{
+                .value = Value{},
+                .message = "out of memory",
+                .stack = &[_]StackFrame{},
+            } };
+        };
+        return switch (outcome) {
+            .ok => |v| EvalResult{ .ok = Value{ .bits = v.bits } },
+            .exception => |msg| EvalResult{ .exception = Exception{
+                .value = Value{},
+                .message = msg,
+                .stack = &[_]StackFrame{},
+            } },
+            .parse_error => |pe| EvalResult{ .parse_error = ParseError{
+                .message = pe.message,
+                .line = pe.line,
+                .column = pe.column,
+            } },
         };
     }
 

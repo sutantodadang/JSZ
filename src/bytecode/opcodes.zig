@@ -146,6 +146,17 @@ pub const Op = enum(u8) {
     /// Always defines/assigns without strict-mode ReferenceError — used for
     /// catch-variable binding and var declarations in strict functions.
     DEFINE_GLOBAL,
+    // Phase 8 opcodes
+    /// TAIL_CALL: same encoding as CALL (op, Rbase u8, nargs u8, Rret u8).
+    /// ES2015 proper tail call (strict mode only). When the callee is a bytecode
+    /// function the current call frame is reused in place rather than pushing a
+    /// new one, giving O(1) call-stack growth for tail recursion. For native /
+    /// bound callees it degrades to a normal call followed by a return.
+    TAIL_CALL,
+    /// DEBUGGER: op only (1 byte). Compiled from the `debugger;` statement.
+    /// Fires the installed debug hook (runtime/debugger.zig active_hook); a
+    /// no-op when no debugger is attached.
+    DEBUGGER,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -215,6 +226,9 @@ pub fn instrSize(op: Op) usize {
         // Phase 4d
         .GET_KEYS => 3,
         .DEFINE_GLOBAL => 4,
+        // Phase 8
+        .TAIL_CALL => 4,
+        .DEBUGGER => 1,
     };
 }
 

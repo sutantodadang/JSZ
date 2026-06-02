@@ -249,7 +249,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const fidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
             try writer.print(" R{d} func[{d}]", .{ rdst, fidx });
         },
-        .CALL => {
+        .CALL, .TAIL_CALL => {
             const base = code[new_pc]; new_pc += 1;
             const nargs = code[new_pc]; new_pc += 1;
             const ret_dst = code[new_pc]; new_pc += 1;
@@ -259,7 +259,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const rsrc = code[new_pc]; new_pc += 1;
             try writer.print(" R{d}", .{rsrc});
         },
-        .RETURN_UNDEF, .HALT => {},
+        .RETURN_UNDEF, .HALT, .DEBUGGER => {},
         // Phase 3a
         .NEW_OBJECT => {
             const rdst = code[new_pc]; new_pc += 1;

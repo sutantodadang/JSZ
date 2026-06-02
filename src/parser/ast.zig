@@ -121,6 +121,8 @@ pub const Node = struct {
     start: u32,
     end: u32,
     data: Data,
+    /// True if this expression was wrapped in parentheses (affects `**` left-operand rule).
+    paren: bool = false,
 };
 
 pub const Data = union(NodeKind) {

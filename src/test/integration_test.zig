@@ -1277,3 +1277,366 @@ test "gc: 1000 iterations terminates with bounded heap (tree)" {
         else => return error.UnexpectedResult,
     }
 }
+
+// ---- Phase 8: ES2016/ES2017 builtins ----
+
+test "es2016: Array.prototype.includes finds value" {
+    try std.testing.expect(try evalToBool(std.testing.allocator, "[1,2,3].includes(2)"));
+}
+
+test "es2016: Array.prototype.includes missing value" {
+    try std.testing.expect(!try evalToBool(std.testing.allocator, "[1,2,3].includes(4)"));
+}
+
+test "es2016: Array.prototype.includes matches NaN (SameValueZero)" {
+    try std.testing.expect(try evalToBool(std.testing.allocator, "[1,NaN,3].includes(NaN)"));
+}
+
+test "es2017: String.prototype.padStart" {
+    const s = try evalToString(std.testing.allocator, "'5'.padStart(3,'0')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("005", s);
+}
+
+test "es2017: String.prototype.padEnd" {
+    const s = try evalToString(std.testing.allocator, "'5'.padEnd(3,'-')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("5--", s);
+}
+
+test "es2017: String.prototype.padStart no-op when long enough" {
+    const s = try evalToString(std.testing.allocator, "'abcd'.padStart(2,'0')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("abcd", s);
+}
+
+test "es2017: Object.entries" {
+    const s = try evalToString(std.testing.allocator, "JSON.stringify(Object.entries({a:1,b:2}))");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("[[\"a\",1],[\"b\",2]]", s);
+}
+
+
+test "es2019: Array.prototype.flat default depth 1" {
+    const s = try evalToString(std.testing.allocator, "JSON.stringify([1,[2,3],[4]].flat())");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("[1,2,3,4]", s);
+}
+
+test "es2019: Array.prototype.flat is shallow by default" {
+    const s = try evalToString(std.testing.allocator, "JSON.stringify([1,[2,[3]]].flat())");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("[1,2,[3]]", s);
+}
+
+test "es2019: Array.prototype.flatMap" {
+    const s = try evalToString(std.testing.allocator, "JSON.stringify([1,2,3].flatMap(function(x){return [x,x*2];}))");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("[1,2,2,4,3,6]", s);
+}
+
+test "es2019: String.prototype.trimStart" {
+    const s = try evalToString(std.testing.allocator, "'  hi  '.trimStart() + '|'");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("hi  |", s);
+}
+
+test "es2019: String.prototype.trimEnd" {
+    const s = try evalToString(std.testing.allocator, "'|' + '  hi  '.trimEnd()");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("|  hi", s);
+}
+
+test "es2019: Object.fromEntries round-trips Object.entries" {
+    const s = try evalToString(std.testing.allocator, "JSON.stringify(Object.fromEntries(Object.entries({a:1,b:2})))");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2}", s);
+}
+
+
+// ---- Phase 8: native ES module syntax (desugared onto require/exports) ----
+
+test "esm: export const + export function" {
+    const v = try evalToF64(std.testing.allocator, "var exports={}; export const x=5; export function f(){return 9;} exports.x + exports.f()");
+    try std.testing.expectEqual(@as(f64, 14), v);
+}
+
+test "esm: export named list with rename" {
+    const v = try evalToF64(std.testing.allocator, "var exports={}; var a=1; var b=2; export {a, b as c}; exports.a*10 + exports.c");
+    try std.testing.expectEqual(@as(f64, 12), v);
+}
+
+test "esm: export default" {
+    const v = try evalToF64(std.testing.allocator, "var exports={}; export default 42; exports['default']");
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+test "esm: import default + named with rename" {
+    const v = try evalToF64(std.testing.allocator, "var e={}; e['default']=7; e.a=9; var __modules__={m:({exports:e})}; import d, {a as aa} from 'm'; d+aa");
+    try std.testing.expectEqual(@as(f64, 16), v);
+}
+
+test "esm: import namespace" {
+    const v = try evalToF64(std.testing.allocator, "var __modules__={m:({exports:({k:3})})}; import * as ns from 'm'; ns.k");
+    try std.testing.expectEqual(@as(f64, 3), v);
+}
+
+test "esm: re-export from module" {
+    const v = try evalToF64(std.testing.allocator, "var exports={}; var __modules__={m:({exports:({a:4})})}; export {a as z} from 'm'; exports.z");
+    try std.testing.expectEqual(@as(f64, 4), v);
+}
+
+
+// ---- Phase 8: factory-form modules (both VMs) + cyclic require safety ----
+
+test "esm: factory module require works in tree+bc" {
+    const v = try evalToF64(std.testing.allocator, "var __modules__={m:function(require,module,exports){ exports.v=7; }}; require('m').v + require('m').v");
+    try std.testing.expectEqual(@as(f64, 14), v);
+}
+
+test "esm: cross-module factory require with memoization" {
+    const v = try evalToF64(std.testing.allocator,
+        "var __modules__={a:function(require,module,exports){ exports.x=1; exports.getB=function(){return require('b').y;}; }, b:function(require,module,exports){ exports.y=2; exports.getA=function(){return require('a').x;}; }}; require('a').getB() + require('b').getA()");
+    try std.testing.expectEqual(@as(f64, 3), v);
+}
+
+test "esm: circular require terminates with partial exports (cache-before-invoke)" {
+    const v = try evalToF64(std.testing.allocator,
+        "var __modules__={a:function(require,module,exports){ exports.fromB=require('b').val; exports.aval=10; }, b:function(require,module,exports){ var am=require('a'); exports.val=5; exports.aSeen=am.aval; }}; require('a').fromB");
+    try std.testing.expectEqual(@as(f64, 5), v);
+}
+
+
+// ---- Phase 8: top-level await (synchronous-drain) ----
+
+test "await: resolves a fulfilled promise" {
+    const v = try evalToF64(std.testing.allocator, "var r = await Promise.resolve(41); r + 1");
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+test "await: chained then" {
+    const v = try evalToF64(std.testing.allocator, "await Promise.resolve(3).then(function(x){ return x * 10; })");
+    try std.testing.expectEqual(@as(f64, 30), v);
+}
+
+test "await: rejection is catchable" {
+    const v = try evalToF64(std.testing.allocator, "var r = 0; try { await Promise.reject(5); } catch (e) { r = e + 1; } r");
+    try std.testing.expectEqual(@as(f64, 6), v);
+}
+
+test "await: non-promise passes through" {
+    const v = try evalToF64(std.testing.allocator, "await 99");
+    try std.testing.expectEqual(@as(f64, 99), v);
+}
+
+// ---- Phase 8: named-import live bindings (use-site rewrite) ----
+
+test "esm: named import is a live binding" {
+    const v = try evalToF64(std.testing.allocator, "var o={v:1}; var __modules__={m:({exports:o})}; import {v} from 'm'; o.v = 42; v");
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+test "esm: shadowed import name keeps snapshot (sound)" {
+    const v = try evalToF64(std.testing.allocator, "var __modules__={m:({exports:({x:5})})}; import {x} from 'm'; function f(){ var x=99; return x; } x + f()");
+    try std.testing.expectEqual(@as(f64, 104), v);
+}
+
+// ---- Phase 8: export-side live bindings + bc Promise.then callbacks ----
+
+test "esm: export let is a live binding (reassignment observed)" {
+    const v = try evalToF64(std.testing.allocator, "var exports={}; export let c = 1; function bump(){ c = c + 5; } bump(); exports.c");
+    try std.testing.expectEqual(@as(f64, 6), v);
+}
+
+test "esm: shadowed export name keeps snapshot (sound)" {
+    const v = try evalToF64(std.testing.allocator, "var exports={}; export let v = 1; function f(){ var v = 9; return v; } f(); exports.v");
+    try std.testing.expectEqual(@as(f64, 1), v);
+}
+
+test "promise: then callback runs under microtask drain (tree+bc)" {
+    const v = try evalToF64(std.testing.allocator, "var r=0; Promise.resolve(3).then(function(x){ return x*10; }).then(function(y){ r=y; }); __runMicrotasks__(); r");
+    try std.testing.expectEqual(@as(f64, 30), v);
+}
+
+// ---- Phase 8: proper tail calls (ES2015 PTC, strict mode, bc VM) ----
+
+/// Run `source` in bc mode and report both the numeric result and the
+/// call-frame depth high-water mark of that run.
+fn evalBcWithFrames(allocator: std.mem.Allocator, source: []const u8) !struct { value: f64, frames: usize } {
+    var iso = try Isolate.init(allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setInterpMode(.bc);
+    const result = ctx.eval(source, "<test>");
+    return switch (result) {
+        .ok => |v| .{ .value = v.toF64(), .frames = ctx.lastFrameHighWater() },
+        .exception => |e| {
+            std.debug.print("exception (bc): {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error (bc): {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+}
+
+// NOTE: strictness is per-function (the directive must be in the function's own
+// body — this engine does not inherit strictness from the enclosing scope), so
+// the `'use strict'` prologue lives inside each tail-recursive function.
+
+test "tco: strict tail recursion returns correct result (tree+bc)" {
+    // Accumulator-style tail recursion: sum(1..n). Small n so the tree-walker
+    // (no TCO, native recursion) does not overflow — correctness parity check.
+    const src = "function sum(n, acc){ 'use strict'; if (n === 0) return acc; return sum(n - 1, acc + n); } sum(100, 0)";
+    const v = try dualF64(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(f64, 5050), v);
+}
+
+test "tco: strict tail recursion keeps call stack O(1) in bc mode" {
+    const src = "function sum(n, acc){ 'use strict'; if (n === 0) return acc; return sum(n - 1, acc + n); } sum(20000, 0)";
+    const r = try evalBcWithFrames(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(f64, 200010000), r.value);
+    // Top-level frame + one reused callee frame. PTC must not grow per call.
+    try std.testing.expect(r.frames <= 4);
+}
+
+test "tco: non-strict recursion is NOT tail-optimized (stack grows)" {
+    // Same shape, sloppy mode: PTC does not apply, so frames grow with depth.
+    const src = "function sum(n, acc){ if (n === 0) return acc; return sum(n - 1, acc + n); } sum(4000, 0)";
+    const r = try evalBcWithFrames(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(f64, 8002000), r.value);
+    try std.testing.expect(r.frames > 1000);
+}
+
+test "tco: mutual tail recursion (strict) terminates" {
+    const src =
+        "function isEven(n){ 'use strict'; if (n === 0) return true; return isOdd(n - 1); }" ++
+        "function isOdd(n){ 'use strict'; if (n === 0) return false; return isEven(n - 1); }" ++
+        "isEven(50000) ? 1 : 0";
+    const r = try evalBcWithFrames(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(f64, 1), r.value);
+    try std.testing.expect(r.frames <= 4);
+}
+
+test "tco: call in try is not a tail call (correctness preserved)" {
+    // `return f()` inside try must still run finally and return correctly.
+    const src =
+        "function inner(){ return 7; }" ++
+        "function outer(){ 'use strict'; try { return inner(); } finally { } }" ++
+        "outer()";
+    const v = try dualF64(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(f64, 7), v);
+}
+
+// ---- Phase 8: source maps + debugger protocol stubs ----
+
+var dbg_hits: u32 = 0;
+var dbg_last_fn: []const u8 = "";
+
+fn captureDebugHook(_: ?*anyopaque, stop: root.debug.DebugStop) void {
+    dbg_hits += 1;
+    dbg_last_fn = stop.function_name;
+}
+
+test "debugger: `debugger;` statement is a no-op without a hook (tree+bc)" {
+    const v = try dualF64(std.testing.allocator, "function f(){ debugger; return 9; } f()");
+    try std.testing.expectEqual(@as(f64, 9), v);
+}
+
+test "debugger: DEBUGGER opcode fires the installed hook (bc)" {
+    dbg_hits = 0;
+    dbg_last_fn = "";
+    root.debug.installHook(captureDebugHook, null);
+    defer root.debug.clearHook();
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setInterpMode(.bc);
+    _ = ctx.eval("function f(){ debugger; return 1; } f()", "<test>");
+
+    try std.testing.expect(dbg_hits >= 1);
+    try std.testing.expectEqualStrings("f", dbg_last_fn);
+}
+
+test "source map: emits functions, mappings, and line info" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try root.sourceMap(arena.allocator(), "function add(a,b){ return a+b; } add(1,2)", "<sm>", &w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"functions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"add\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"line\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"source\":\"<sm>\"") != null);
+}
+
+// ---- Phase 8: bytecode caching + snapshot/restore ----
+
+test "snapshot: compile then restore runs correctly" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+
+    const image = try ctx.compileSnapshot(std.testing.allocator, "function add(a,b){ return a+b; } add(40, 2)");
+    defer std.testing.allocator.free(image);
+
+    switch (ctx.evalSnapshot(image)) {
+        .ok => |v| try std.testing.expectEqual(@as(f64, 42), v.toF64()),
+        else => return error.SnapshotEvalFailed,
+    }
+}
+
+test "snapshot: image is portable across isolates" {
+    // Build the image in one isolate, run it in a completely separate one.
+    var image: []u8 = undefined;
+    {
+        var iso = try Isolate.init(std.testing.allocator);
+        defer iso.deinit();
+        var ctx = try iso.newContext();
+        defer ctx.deinit();
+        image = try ctx.compileSnapshot(std.testing.allocator, "var x = 6; var y = 7; x * y");
+    }
+    defer std.testing.allocator.free(image);
+
+    var iso2 = try Isolate.init(std.testing.allocator);
+    defer iso2.deinit();
+    var ctx2 = try iso2.newContext();
+    defer ctx2.deinit();
+    switch (ctx2.evalSnapshot(image)) {
+        .ok => |v| try std.testing.expectEqual(@as(f64, 42), v.toF64()),
+        else => return error.SnapshotEvalFailed,
+    }
+}
+
+test "snapshot: string + closure survive round-trip" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+
+    const image = try ctx.compileSnapshot(std.testing.allocator, "function mk(p){ return function(s){ return p + s; }; } mk('a')('b').length");
+    defer std.testing.allocator.free(image);
+
+    switch (ctx.evalSnapshot(image)) {
+        .ok => |v| try std.testing.expectEqual(@as(f64, 2), v.toF64()),
+        else => return error.SnapshotEvalFailed,
+    }
+}
+
+test "snapshot: corrupt image yields an exception, not a crash" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    switch (ctx.evalSnapshot("not a real image")) {
+        .exception => {},
+        else => return error.ExpectedException,
+    }
+}

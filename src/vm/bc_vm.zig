@@ -52,6 +52,9 @@ pub const BcVm = struct {
     /// Phase 3b: optional GC heap.
     heap: ?*Heap = null,
     frames: std.ArrayListUnmanaged(BcCallFrame) = .empty,
+    /// Phase 8: high-water mark of the call-frame stack depth across this run.
+    /// Used to verify proper tail calls keep stack growth O(1).
+    frame_high_water: usize = 0,
     result: Value = Value{},
     exception: ?[]const u8 = null,
     /// Phase 4a: the last thrown JS value (for catch binding).
@@ -214,6 +217,9 @@ pub const BcVm = struct {
 
     fn runLoop(self: *BcVm) !RunOutcome {
         while (self.frames.items.len > 0) {
+            if (self.frames.items.len > self.frame_high_water) {
+                self.frame_high_water = self.frames.items.len;
+            }
             const frame = &self.frames.items[self.frames.items.len - 1];
             const code = frame.func.chunk.code;
             const op: Op = @enumFromInt(code[frame.pc]);
@@ -841,6 +847,117 @@ pub const BcVm = struct {
                         }
                     }
                 },
+                .TAIL_CALL => {
+                    const base = code[frame.pc];
+                    frame.pc += 1;
+                    const nargs = code[frame.pc];
+                    frame.pc += 1;
+                    const ret_dst = code[frame.pc];
+                    frame.pc += 1;
+
+                    const callee_val = frame.registers[base];
+                    const this_val = try val_mod.makeUndefined(self.arena); // TAIL_CALL: this = undefined
+
+                    // Proper tail call (ES2015 14.6): when the callee is a plain
+                    // bytecode function, reuse the current frame in place instead
+                    // of pushing a new one. Stack depth stays O(1) for tail
+                    // recursion. Args are read from the current registers BEFORE
+                    // the frame is overwritten.
+                    if (callee_val.bits != 0 and callee_val.toPtr().* == .bc_function) {
+                        const closure = callee_val.toPtr().bc_function;
+                        const fn_ptr = closure.func;
+                        const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                        const call_env = try Environment.init(self.arena, def_env);
+
+                        for (fn_ptr.param_names, 0..) |pname, i| {
+                            const av: Value = if (i < nargs)
+                                frame.registers[base + 1 + @as(u8, @intCast(i))]
+                            else
+                                try val_mod.makeUndefined(self.arena);
+                            try call_env.define(pname, av);
+                        }
+                        if (fn_ptr.name) |fname| {
+                            var is_param = false;
+                            for (fn_ptr.param_names) |p| {
+                                if (std.mem.eql(u8, p, fname)) {
+                                    is_param = true;
+                                    break;
+                                }
+                            }
+                            if (!is_param) call_env.define(fname, callee_val) catch {};
+                        }
+
+                        const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
+                        const new_regs = try self.arena.alloc(Value, num_regs);
+                        for (new_regs) |*r| r.* = Value{};
+                        for (fn_ptr.param_names, 0..) |_, i| {
+                            if (i < num_regs) {
+                                new_regs[i] = if (i < nargs)
+                                    frame.registers[base + 1 + @as(u8, @intCast(i))]
+                                else
+                                    try val_mod.makeUndefined(self.arena);
+                            }
+                        }
+                        if (fn_ptr.name) |fname| {
+                            var is_param = false;
+                            for (fn_ptr.param_names) |p| {
+                                if (std.mem.eql(u8, p, fname)) {
+                                    is_param = true;
+                                    break;
+                                }
+                            }
+                            if (!is_param) {
+                                const nfe_slot = fn_ptr.param_names.len;
+                                if (nfe_slot < num_regs) new_regs[nfe_slot] = callee_val;
+                            }
+                        }
+
+                        // Inherit the replaced frame's caller linkage: the callee
+                        // returns directly to *our* caller — that is the tail call.
+                        const inherited_caller = frame.caller_idx;
+                        const inherited_ret = frame.return_dst;
+                        frame.func = fn_ptr;
+                        frame.pc = 0;
+                        frame.registers = new_regs;
+                        frame.env = call_env;
+                        frame.return_dst = inherited_ret;
+                        frame.caller_idx = inherited_caller;
+                        frame.this_val = this_val;
+                        frame.try_stack = .empty;
+                    } else {
+                        // Fallback: native/bound/object callee. Do a normal call,
+                        // then return its result to our caller (no frame reuse).
+                        const outcome = try self.doCall(callee_val, this_val, base, nargs, ret_dst);
+                        if (outcome) |msg| {
+                            if (std.mem.eql(u8, msg, "__js_exception__")) {
+                                const exc_val = self.last_exception_value;
+                                const found = try self.throwException(exc_val);
+                                const exc_msg = try formatExceptionMessage(self.arena, exc_val);
+                                if (!found) return RunOutcome{ .exception_value = .{ .msg = exc_msg, .value = exc_val } };
+                            } else {
+                                const exc_val = try self.makeErrorObjectBc("TypeError", msg);
+                                self.last_exception_value = exc_val;
+                                const found = try self.throwException(exc_val);
+                                if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+                            }
+                        } else {
+                            const cur = &self.frames.items[self.frames.items.len - 1];
+                            const result = cur.registers[ret_dst];
+                            const caller_idx = cur.caller_idx;
+                            const rd = cur.return_dst;
+                            _ = self.frames.pop();
+                            if (caller_idx == null or self.frames.items.len == 0) {
+                                self.result = result;
+                                return RunOutcome{ .ok = result };
+                            }
+                            if (rd == 0xFF) {
+                                self.result = result;
+                                return RunOutcome{ .ok = result };
+                            }
+                            self.frames.items[self.frames.items.len - 1].registers[rd] = result;
+                        }
+                    }
+                },
                 .METHOD_CALL => {
                     const base = code[frame.pc];
                     frame.pc += 1;
@@ -907,6 +1024,24 @@ pub const BcVm = struct {
                 },
                 .HALT => {
                     return RunOutcome{ .ok = self.result };
+                },
+                .DEBUGGER => {
+                    // Phase 8: fire the installed debug hook (no-op if none).
+                    const debugger_mod = @import("../runtime/debugger.zig");
+                    if (debugger_mod.active_hook) |hook| {
+                        const dbg_pc = frame.pc - 1; // pc of the DEBUGGER op byte
+                        const off: u32 = if (dbg_pc < frame.func.chunk.lines.len)
+                            frame.func.chunk.lines[dbg_pc]
+                        else
+                            0;
+                        hook(debugger_mod.active_hook_ctx, .{
+                            .reason = .debugger_statement,
+                            .source_name = frame.func.chunk.source_name,
+                            .source_offset = off,
+                            .function_name = frame.func.name orelse "<anonymous>",
+                            .pc = dbg_pc,
+                        });
+                    }
                 },
                 // -------------------------------------------------------- Phase 3a/3b ---
                 .NEW_OBJECT => {

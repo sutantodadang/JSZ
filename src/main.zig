@@ -6,7 +6,7 @@ const jsz = @import("jsz");
 // Arg parsing
 // ---------------------------------------------------------------------------
 
-const Mode = enum { help, version, eval, interactive, script };
+const Mode = enum { help, version, eval, interactive, script, run_bytecode };
 
 const Args = struct {
     mode: Mode,
@@ -14,6 +14,10 @@ const Args = struct {
     script_path: []const u8 = "",
     interp: jsz.InterpMode = .tree,
     dump_bytecode: bool = false,
+    source_map: bool = false,
+    debug: bool = false,
+    emit_bc_path: []const u8 = "",
+    run_bc_path: []const u8 = "",
     gc_stats: bool = false,
     gc_after_eval: bool = false,
 };
@@ -55,6 +59,28 @@ fn parseArgs(argv: []const []const u8) Args {
             args.dump_bytecode = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--source-map")) {
+            args.source_map = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--debug")) {
+            args.debug = true;
+            args.interp = .bc; // DEBUGGER opcode only fires in the bytecode VM
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--emit-bytecode")) {
+            i += 1;
+            if (i >= argv.len) return .{ .mode = .help };
+            args.emit_bc_path = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--run-bytecode")) {
+            i += 1;
+            if (i >= argv.len) return .{ .mode = .help };
+            args.run_bc_path = argv[i];
+            args.mode = .run_bytecode;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--gc-stats")) {
             args.gc_stats = true;
             continue;
@@ -87,6 +113,10 @@ fn printHelp(writer: anytype) !void {
         \\  -i, --interactive      Start interactive REPL
         \\  --interp=tree|bc       Choose interpreter: tree-walker (default) or bytecode VM
         \\  --dump-bytecode        Compile and disassemble to stdout, then exit
+        \\  --source-map           Print a bytecode->source JSON source map, then exit
+        \\  --debug                Attach a stub debugger (prints on `debugger;`); implies --interp=bc
+        \\  --emit-bytecode <path> Compile source to a bytecode snapshot file, then exit
+        \\  --run-bytecode <path>  Load and run a bytecode snapshot file (bytecode VM)
         \\  --gc-stats             Print GC stats after eval
         \\  --gc-after-eval        Trigger a GC cycle before printing stats
         \\
@@ -99,18 +129,61 @@ fn printHelp(writer: anytype) !void {
     , .{jsz.version});
 }
 
-fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, show_gc_stats: bool, gc_after: bool) !void {
-    if (dump_bc) {
-        // Compile and disassemble: delegate to jsz public API for dump.
+/// Source text for the active --debug session, used by debugHook to map offsets.
+var dbg_source: []const u8 = "";
+
+/// Phase 8: stub debug hook installed by --debug. Prints the pause location when
+/// a `debugger;` statement executes in the bytecode VM.
+fn debugHook(_: ?*anyopaque, stop: jsz.debug.DebugStop) void {
+    const pos = jsz.debug.offsetToLineCol(dbg_source, stop.source_offset);
+    var ebuf: [256]u8 = undefined;
+    var ew = std.fs.File.stderr().writer(&ebuf);
+    const e = &ew.interface;
+    e.print("[debugger] paused at {s}:{d}:{d} in {s} (pc={d})\n", .{
+        stop.source_name, pos.line, pos.column, stop.function_name, stop.pc,
+    }) catch {};
+    e.flush() catch {};
+}
+
+fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool) !void {
+    if (dump_bc or source_map) {
+        // Compile-only modes: delegate to the jsz public API and exit.
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         var buf: [8192]u8 = undefined;
         var w = std.fs.File.stdout().writer(&buf);
         const out = &w.interface;
-        try jsz.dumpBytecode(arena.allocator(), source, source_name, out);
+        if (dump_bc) {
+            try jsz.dumpBytecode(arena.allocator(), source, source_name, out);
+        } else {
+            try jsz.sourceMap(arena.allocator(), source, source_name, out);
+        }
         try out.flush();
         return;
     }
+
+    if (emit_bc_path.len > 0) {
+        // Compile to a bytecode snapshot and write it to disk, then exit.
+        var iso = try jsz.Isolate.init(allocator);
+        defer iso.deinit();
+        var ctx = try iso.newContext();
+        defer ctx.deinit();
+        const image = try ctx.compileSnapshot(allocator, source);
+        defer allocator.free(image);
+        try std.fs.cwd().writeFile(.{ .sub_path = emit_bc_path, .data = image });
+        var ebuf: [256]u8 = undefined;
+        var ew = std.fs.File.stderr().writer(&ebuf);
+        const e = &ew.interface;
+        try e.print("wrote {d} bytes to {s}\n", .{ image.len, emit_bc_path });
+        try e.flush();
+        return;
+    }
+
+    if (debug) {
+        dbg_source = source;
+        jsz.debug.installHook(debugHook, null);
+    }
+    defer if (debug) jsz.debug.clearHook();
 
     var iso = try jsz.Isolate.init(allocator);
     defer iso.deinit();
@@ -154,6 +227,48 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
         try out.print("objects_alive: {d}\n", .{stats.objects_alive});
     }
 
+    try out.flush();
+    if (uncaught) std.process.exit(1);
+}
+
+/// Phase 8: load a bytecode snapshot file and run it (restore).
+fn runSnapshot(allocator: std.mem.Allocator, path: []const u8) !void {
+    const image = std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024 * 1024) catch |err| {
+        var errbuf: [256]u8 = undefined;
+        var ew = std.fs.File.stderr().writer(&errbuf);
+        const e = &ew.interface;
+        try e.print("jsz: cannot read snapshot '{s}': {s}\n", .{ path, @errorName(err) });
+        try e.flush();
+        std.process.exit(1);
+    };
+    defer allocator.free(image);
+
+    var iso = try jsz.Isolate.init(allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    const out = &w.interface;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var uncaught = false;
+    switch (ctx.evalSnapshot(image)) {
+        .ok => |v| {
+            const s = jsz.valueToDisplayString(arena.allocator(), v) catch "?";
+            try out.print("{s}\n", .{s});
+        },
+        .exception => |e| {
+            try out.print("Uncaught {s}\n", .{e.message});
+            uncaught = true;
+        },
+        .parse_error => |e| {
+            try out.print("SyntaxError: {s} (line {d}:{d})\n", .{ e.message, e.line, e.column });
+            uncaught = true;
+        },
+    }
     try out.flush();
     if (uncaught) std.process.exit(1);
 }
@@ -232,10 +347,13 @@ pub fn main() !void {
             }
         },
         .eval => {
-            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.gc_stats, args.gc_after_eval);
+            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval);
         },
         .interactive => {
             try runRepl(allocator, args.interp);
+        },
+        .run_bytecode => {
+            try runSnapshot(allocator, args.run_bc_path);
         },
         .script => {
             const file_source = std.fs.cwd().readFileAlloc(allocator, args.script_path, 10 * 1024 * 1024) catch |err| {
@@ -244,19 +362,128 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer allocator.free(file_source);
-            const cjs_wrapped = std.fmt.allocPrint(
-                allocator,
-                "var module = {{ exports: {{}} }}; var exports = module.exports; {s}\nmodule.exports;",
-                .{file_source},
-            ) catch {
+            const cjs_wrapped = buildWrappedScript(allocator, args.script_path, file_source) catch {
                 try stderr.print("jsz: out of memory wrapping script\n", .{});
                 try stderr.flush();
                 std.process.exit(1);
             };
             defer allocator.free(cjs_wrapped);
-            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.gc_stats, args.gc_after_eval);
+            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval);
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8: filesystem ES-module loader (relative specifiers, nested dirs).
+// Each reachable module is registered as a CommonJS-style factory keyed by its
+// canonical path (relative to the entry dir, '/'-separated, `.`/`..` resolved),
+// matching what the runtime require() resolver computes. The import/export
+// desugaring runs inside each factory body; a per-factory `__module_id__` makes
+// nested relative imports resolve against the module's own directory.
+// ---------------------------------------------------------------------------
+
+const entry_id = "__entry__";
+
+fn dirnameSlash(id: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, id, '/')) |idx| return id[0..idx];
+    return "";
+}
+
+/// Normalize a '/'-or-'\\'-separated path: drop "."/empty segments, resolve "..".
+fn normalizeRel(allocator: std.mem.Allocator, p: []const u8) ![]const u8 {
+    var parts = std.ArrayList([]const u8){};
+    defer parts.deinit(allocator);
+    var it = std.mem.splitAny(u8, p, "/\\");
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            if (parts.items.len > 0) _ = parts.pop();
+            continue;
+        }
+        try parts.append(allocator, seg);
+    }
+    return std.mem.join(allocator, "/", parts.items);
+}
+
+/// Resolve a relative specifier against the importer's canonical id.
+fn resolveSpec(allocator: std.mem.Allocator, importer_id: []const u8, spec: []const u8) ![]const u8 {
+    const base = dirnameSlash(importer_id);
+    const joined = if (base.len == 0)
+        try allocator.dupe(u8, spec)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, spec });
+    return normalizeRel(allocator, joined);
+}
+
+/// Append canonical ids of relative module specifiers found in `src` (resolved
+/// against `importer_id`) to `out`.
+fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (c == '"' or c == '\'') {
+            const start = i + 1;
+            var j = start;
+            while (j < src.len and src[j] != c) : (j += 1) {}
+            if (j < src.len) {
+                const lit = src[start..j];
+                if (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../")) {
+                    const id = resolveSpec(allocator, importer_id, lit) catch "";
+                    if (id.len > 0) out.append(allocator, id) catch {};
+                }
+            }
+            i = j;
+        }
+    }
+}
+
+fn readModuleFile(allocator: std.mem.Allocator, base_dir: []const u8, id: []const u8) ?[]const u8 {
+    const max = 10 * 1024 * 1024;
+    const p1 = std.fs.path.join(allocator, &.{ base_dir, id }) catch return null;
+    if (std.fs.cwd().readFileAlloc(allocator, p1, max)) |s| return s else |_| {}
+    const p2 = std.fmt.allocPrint(allocator, "{s}.js", .{p1}) catch return null;
+    if (std.fs.cwd().readFileAlloc(allocator, p2, max)) |s| return s else |_| {}
+    return null;
+}
+
+/// Build the entry source wrapped with a `__modules__` registry of all transitively
+/// reachable relative modules. Modules absent on disk are skipped (resolved at runtime).
+fn buildWrappedScript(gpa: std.mem.Allocator, script_path: []const u8, entry_src: []const u8) ![]const u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base_dir = std.fs.path.dirname(script_path) orelse ".";
+    var registry = std.StringArrayHashMap([]const u8).init(arena);
+    var queue = std.ArrayList([]const u8){};
+    scanSpecifiers(entry_src, entry_id, &queue, arena);
+    var qi: usize = 0;
+    while (qi < queue.items.len) : (qi += 1) {
+        const id = queue.items[qi];
+        if (registry.contains(id)) continue;
+        const src = readModuleFile(arena, base_dir, id) orelse continue;
+        try registry.put(id, src);
+        scanSpecifiers(src, id, &queue, arena);
+    }
+
+    var sb = std.ArrayList(u8){};
+    try sb.appendSlice(gpa, "var __modules__ = {};\n");
+    var it = registry.iterator();
+    while (it.next()) |e| {
+        try sb.appendSlice(gpa, "__modules__[\"");
+        try sb.appendSlice(gpa, e.key_ptr.*);
+        try sb.appendSlice(gpa, "\"] = function(require, module, exports){\nvar __module_id__ = \"");
+        try sb.appendSlice(gpa, e.key_ptr.*);
+        try sb.appendSlice(gpa, "\";\n");
+        try sb.appendSlice(gpa, e.value_ptr.*);
+        try sb.appendSlice(gpa, "\n};\n");
+    }
+    try sb.appendSlice(gpa, "var module = { exports: {} }; var exports = module.exports;\nvar __module_id__ = \"");
+    try sb.appendSlice(gpa, entry_id);
+    try sb.appendSlice(gpa, "\";\n");
+    try sb.appendSlice(gpa, entry_src);
+    try sb.appendSlice(gpa, "\nmodule.exports;");
+    return sb.toOwnedSlice(gpa);
 }
 
 test "parseArgs --version" {
@@ -281,4 +508,30 @@ test "parseArgs --interp=bc" {
     const argv = [_][]const u8{ "-e", "1+1", "--interp=bc" };
     const a = parseArgs(&argv);
     try std.testing.expectEqual(jsz.InterpMode.bc, a.interp);
+}
+
+test "parseArgs --source-map" {
+    const argv = [_][]const u8{ "-e", "1+1", "--source-map" };
+    const a = parseArgs(&argv);
+    try std.testing.expect(a.source_map);
+}
+
+test "parseArgs --debug implies bc" {
+    const argv = [_][]const u8{ "-e", "1+1", "--debug" };
+    const a = parseArgs(&argv);
+    try std.testing.expect(a.debug);
+    try std.testing.expectEqual(jsz.InterpMode.bc, a.interp);
+}
+
+test "parseArgs --emit-bytecode" {
+    const argv = [_][]const u8{ "-e", "1+1", "--emit-bytecode", "out.jbc" };
+    const a = parseArgs(&argv);
+    try std.testing.expectEqualStrings("out.jbc", a.emit_bc_path);
+}
+
+test "parseArgs --run-bytecode" {
+    const argv = [_][]const u8{ "--run-bytecode", "out.jbc" };
+    const a = parseArgs(&argv);
+    try std.testing.expectEqual(Mode.run_bytecode, a.mode);
+    try std.testing.expectEqualStrings("out.jbc", a.run_bc_path);
 }

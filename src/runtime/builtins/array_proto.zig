@@ -117,6 +117,97 @@ pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Va
     return val_mod.makeNumber(arena, -1.0);
 }
 
+/// ES2016 Array.prototype.includes — SameValueZero (NaN matches NaN), scans holes as undefined.
+pub fn nativeIncludes(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const arr = getArray(this_val) orelse return val_mod.makeBool(arena, false);
+    const search = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const len = arr.array_length;
+    const from: usize = if (args.len > 1 and args[1].bits != 0)
+        switch (args[1].toPtr().*) {
+            .number => |n| blk: {
+                if (n < 0.0) {
+                    const r = @as(i64, @intCast(len)) + @as(i64, @intFromFloat(@trunc(n)));
+                    break :blk if (r < 0) 0 else @intCast(r);
+                }
+                break :blk @intFromFloat(@trunc(n));
+            },
+            else => 0,
+        }
+    else
+        0;
+    const undef = try val_mod.makeUndefined(arena);
+    var i: usize = from;
+    while (i < len) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const elem = arr.props.get(key) orelse undef;
+        if (sameValueZero(elem, search)) return val_mod.makeBool(arena, true);
+    }
+    return val_mod.makeBool(arena, false);
+}
+
+/// Recursively append src's elements into dst, flattening nested arrays up to `depth`.
+fn flattenInto(arena: std.mem.Allocator, dst: *JsObject, src: *JsObject, depth: i64, ni: *u32) anyerror!void {
+    var i: usize = 0;
+    while (i < src.array_length) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const elem = src.props.get(key) orelse continue;
+        if (depth > 0 and elem.bits != 0 and elem.toPtr().* == .object and elem.toPtr().object.is_array) {
+            try flattenInto(arena, dst, elem.toPtr().object, depth - 1, ni);
+        } else {
+            const dk = try std.fmt.allocPrint(arena, "{d}", .{ni.*});
+            try dst.set(dk, elem);
+            ni.* += 1;
+        }
+    }
+}
+
+/// ES2019 Array.prototype.flat — default depth 1.
+pub fn nativeFlat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const arr = getArray(this_val) orelse return val_mod.makeUndefined(arena);
+    const realm_mod = @import("../realm.zig");
+    const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
+    const depth: i64 = if (args.len > 0 and args[0].bits != 0)
+        switch (args[0].toPtr().*) {
+            .number => |n| if (std.math.isNan(n)) 0 else @intFromFloat(@trunc(n)),
+            else => 1,
+        }
+    else
+        1;
+    const new_arr = try JsObject.createArray(arena, arr_proto);
+    var ni: u32 = 0;
+    try flattenInto(arena, new_arr, arr, depth, &ni);
+    new_arr.array_length = ni;
+    return val_mod.makeObject(arena, new_arr);
+}
+
+/// ES2019 Array.prototype.flatMap — map then flatten one level.
+pub fn nativeFlatMap(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const arr = getArray(this_val) orelse return val_mod.makeUndefined(arena);
+    if (args.len == 0) return val_mod.makeUndefined(arena);
+    const cb = args[0];
+    const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const realm_mod = @import("../realm.zig");
+    const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
+    const len = arr.array_length;
+    const new_arr = try JsObject.createArray(arena, arr_proto);
+    var ni: u32 = 0;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const mapped = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        if (mapped.bits != 0 and mapped.toPtr().* == .object and mapped.toPtr().object.is_array) {
+            try flattenInto(arena, new_arr, mapped.toPtr().object, 1, &ni);
+        } else {
+            const dk = try std.fmt.allocPrint(arena, "{d}", .{ni});
+            try new_arr.set(dk, mapped);
+            ni += 1;
+        }
+    }
+    new_arr.array_length = ni;
+    return val_mod.makeObject(arena, new_arr);
+}
+
 pub fn nativeJoin(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const arr = getArray(this_val) orelse return val_mod.makeString(arena, "");
     const len = arr.array_length;
@@ -488,6 +579,16 @@ fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
         return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
     }
     return std.fmt.allocPrint(arena, "{d}", .{n});
+}
+
+fn sameValueZero(x: Value, y: Value) bool {
+    if (x.bits != 0 and y.bits != 0 and x.toPtr().* == .number and y.toPtr().* == .number) {
+        const a = x.toPtr().number;
+        const b = y.toPtr().number;
+        if (std.math.isNan(a) and std.math.isNan(b)) return true;
+        return a == b;
+    }
+    return jsStrictEqual(x, y);
 }
 
 fn jsStrictEqual(x: Value, y: Value) bool {

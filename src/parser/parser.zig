@@ -27,6 +27,9 @@ pub const ParseResult = union(enum) {
     err: ParseError,
 };
 
+/// Phase 8: an ES-module named/default import binding to make live via use-site rewrite.
+const LiveImport = struct { name: []const u8, ns: []const u8, prop: []const u8 };
+
 pub const Parser = struct {
     lexer: Lexer,
     arena: std.mem.Allocator,
@@ -36,6 +39,15 @@ pub const Parser = struct {
     had_error: bool,
     error_info: ?ParseError,
     in_generator_function: bool,
+    /// Phase 8: statements produced by desugaring ES-module import/export that must be
+    /// spliced into the program body after the primary statement (kept at module scope).
+    extra_stmts: std.ArrayList(*Node),
+    /// Phase 8: named/default import bindings collected per module unit, used to rewrite
+    /// use-sites to live namespace member access (`local` -> `ns.prop`).
+    live_imports: std.ArrayList(LiveImport),
+    /// Phase 8: `export let`/`export var` names collected per module unit, used to rewrite
+    /// their use-sites to `exports.name` so reassignments are observed live by importers.
+    live_exports: std.ArrayList([]const u8),
 
     pub fn init(source: []const u8, arena: std.mem.Allocator) Parser {
         var p = Parser{
@@ -45,6 +57,9 @@ pub const Parser = struct {
             .had_error = false,
             .error_info = null,
             .in_generator_function = false,
+            .extra_stmts = .{},
+            .live_imports = .{},
+            .live_exports = .{},
         };
         // Prime the lookahead.
         p.current = p.lexNext();
@@ -152,13 +167,17 @@ pub const Parser = struct {
     /// Parse a complete script. Returns list of top-level statements or an error.
     pub fn parseScript(self: *Parser) ParseResult {
         var stmts = std.ArrayList(*Node){};
+        const li_start = self.live_imports.items.len;
+        const le_start = self.live_exports.items.len;
         while (!self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
             stmts.append(self.arena, s) catch {
                 self.had_error = true;
                 break;
             };
+            self.drainExtraStmts(&stmts);
         }
+        self.applyLiveBindings(stmts.items, li_start, le_start);
         if (self.had_error) {
             return ParseResult{ .err = self.error_info orelse ParseError{
                 .message = "parse error",
@@ -169,8 +188,498 @@ pub const Parser = struct {
         return ParseResult{ .ok = stmts.items };
     }
 
+    // ---------------------------------------------------- Phase 8: ES modules ---
+    // Desugar import/export onto the existing CommonJS require/exports model.
+
+    fn fail(self: *Parser, msg: []const u8) ?*Node {
+        if (!self.had_error) {
+            self.had_error = true;
+            self.error_info = ParseError{ .message = msg, .line = self.current.line, .column = self.current.column };
+        }
+        return null;
+    }
+
+    fn drainExtraStmts(self: *Parser, stmts: *std.ArrayList(*Node)) void {
+        for (self.extra_stmts.items) |e| {
+            stmts.append(self.arena, e) catch {
+                self.had_error = true;
+                return;
+            };
+        }
+        self.extra_stmts.clearRetainingCapacity();
+    }
+
+    fn matchContextual(self: *Parser, word: []const u8) bool {
+        if (self.current.kind == .identifier and std.mem.eql(u8, self.current.value_str, word)) {
+            _ = self.advance();
+            return true;
+        }
+        return false;
+    }
+
+    fn mkIdent(self: *Parser, name: []const u8) ?*Node {
+        return self.makeNode(.identifier, self.current.start, self.current.start, .{ .identifier = name });
+    }
+    fn mkMember(self: *Parser, obj: *Node, prop: []const u8) ?*Node {
+        const p = self.mkIdent(prop) orelse return null;
+        return self.makeNode(.member_expr, obj.start, self.current.start, .{ .member_expr = .{ .object = obj, .property = p, .computed = false } });
+    }
+    fn mkRequire(self: *Parser, modname: []const u8) ?*Node {
+        const callee = self.mkIdent("require") orelse return null;
+        const arg = self.makeNode(.string_literal, self.current.start, self.current.start, .{ .string_literal = modname }) orelse return null;
+        var args = std.ArrayList(*Node){};
+        args.append(self.arena, arg) catch return null;
+        return self.makeNode(.call_expr, self.current.start, self.current.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+    }
+    fn mkVar(self: *Parser, name: []const u8, init_node: *Node) ?*Node {
+        return self.makeNode(.var_decl, self.current.start, self.current.start, .{ .var_decl = .{ .kind = .var_, .name = name, .init = init_node } });
+    }
+    fn mkExportAssign(self: *Parser, exported: []const u8, value: *Node) ?*Node {
+        const exports_id = self.mkIdent("exports") orelse return null;
+        const target = self.mkMember(exports_id, exported) orelse return null;
+        const assign = self.makeNode(.assignment_expr, self.current.start, self.current.start, .{ .assignment_expr = .{ .op = .assign, .target = target, .value = value } }) orelse return null;
+        return self.makeNode(.expr_stmt, self.current.start, self.current.start, .{ .expr_stmt = assign });
+    }
+
+    /// Push items[1..] into extra_stmts; return items[0] (the primary statement).
+    fn finishMulti(self: *Parser, items: []*Node) ?*Node {
+        if (items.len == 0) return self.makeNode(.empty_stmt, self.current.start, self.current.start, .{ .empty_stmt = {} });
+        for (items[1..]) |it| self.extra_stmts.append(self.arena, it) catch {
+            self.had_error = true;
+            return null;
+        };
+        return items[0];
+    }
+
+    fn collectDeclNames(self: *Parser, node: *Node, list: *std.ArrayList([]const u8)) void {
+        switch (node.kind) {
+            .var_decl => list.append(self.arena, node.data.var_decl.name) catch {},
+            .function_decl => list.append(self.arena, node.data.function_decl.name) catch {},
+            .block_stmt => for (node.data.block_stmt.body) |c| self.collectDeclNames(c, list),
+            else => {},
+        }
+    }
+
+    // Live bindings: rewrite each named/default import use-site to `ns.prop`, and each
+    // `export let/var` use-site to `exports.name`, when the local name has no declaration
+    // other than its own binding (count <= 1) — sound (no shadowing possible). Shadowed
+    // names keep CJS-snapshot semantics.
+    fn applyLiveBindings(self: *Parser, stmts: []*Node, li_start: usize, le_start: usize) void {
+        if (self.had_error) {
+            self.live_imports.shrinkRetainingCapacity(li_start);
+            self.live_exports.shrinkRetainingCapacity(le_start);
+            return;
+        }
+        const n = self.live_imports.items.len;
+        const ne = self.live_exports.items.len;
+        if (n <= li_start and ne <= le_start) return;
+        var counts = std.StringHashMap(u32).init(self.arena);
+        for (stmts) |s| self.countDecls(s, &counts);
+        var i = li_start;
+        while (i < n) : (i += 1) {
+            const imp = self.live_imports.items[i];
+            if ((counts.get(imp.name) orelse 0) <= 1) {
+                for (stmts) |s| self.rewriteName(s, imp.name, imp.ns, imp.prop);
+            }
+        }
+        var j = le_start;
+        while (j < ne) : (j += 1) {
+            const name = self.live_exports.items[j];
+            if ((counts.get(name) orelse 0) <= 1) self.makeExportLive(stmts, name);
+        }
+        self.live_imports.shrinkRetainingCapacity(li_start);
+        self.live_exports.shrinkRetainingCapacity(le_start);
+    }
+
+    /// Is `s` the generated snapshot `exports.name = name;`?
+    fn isSnapshotAssign(s: *Node, name: []const u8) bool {
+        if (s.kind != .expr_stmt) return false;
+        const e = s.data.expr_stmt;
+        if (e.kind != .assignment_expr) return false;
+        const a = e.data.assignment_expr;
+        if (a.value.kind != .identifier or !std.mem.eql(u8, a.value.data.identifier, name)) return false;
+        const t = a.target;
+        if (t.kind != .member_expr or t.data.member_expr.computed) return false;
+        const obj = t.data.member_expr.object;
+        const prop = t.data.member_expr.property;
+        return obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "exports") and
+            prop.kind == .identifier and std.mem.eql(u8, prop.data.identifier, name);
+    }
+
+    /// Turn a `export let/var name = E` into the live form: seed `exports.name = E`,
+    /// drop the snapshot assignment, and rewrite all `name` use-sites to `exports.name`.
+    fn makeExportLive(self: *Parser, stmts: []*Node, name: []const u8) void {
+        for (stmts) |s| {
+            if (isSnapshotAssign(s, name)) {
+                s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
+            } else if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, name)) {
+                if (s.data.var_decl.init) |init_node| {
+                    const obj = self.makeNode(.identifier, s.start, s.start, .{ .identifier = "exports" }) orelse continue;
+                    const p = self.makeNode(.identifier, s.start, s.start, .{ .identifier = name }) orelse continue;
+                    const tgt = self.makeNode(.member_expr, s.start, s.start, .{ .member_expr = .{ .object = obj, .property = p, .computed = false } }) orelse continue;
+                    const asn = self.makeNode(.assignment_expr, s.start, s.start, .{ .assignment_expr = .{ .op = .assign, .target = tgt, .value = init_node } }) orelse continue;
+                    s.* = Node{ .kind = .expr_stmt, .start = s.start, .end = s.end, .data = .{ .expr_stmt = asn } };
+                } else {
+                    s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
+                }
+            }
+        }
+        for (stmts) |s| self.rewriteName(s, name, "exports", name);
+    }
+
+    fn incCount(self: *Parser, counts: *std.StringHashMap(u32), name: []const u8) void {
+        _ = self;
+        const gop = counts.getOrPut(name) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+
+    fn countDecls(self: *Parser, n: *Node, counts: *std.StringHashMap(u32)) void {
+        switch (n.kind) {
+            .var_decl => {
+                self.incCount(counts, n.data.var_decl.name);
+                if (n.data.var_decl.init) |x| self.countDecls(x, counts);
+            },
+            .function_decl => {
+                const f = n.data.function_decl;
+                self.incCount(counts, f.name);
+                for (f.params) |p| self.incCount(counts, p);
+                if (f.rest_param) |r| self.incCount(counts, r);
+                for (f.body) |s| self.countDecls(s, counts);
+            },
+            .function_expr => {
+                const f = n.data.function_expr;
+                if (f.name) |nm| self.incCount(counts, nm);
+                for (f.params) |p| self.incCount(counts, p);
+                if (f.rest_param) |r| self.incCount(counts, r);
+                for (f.body) |s| self.countDecls(s, counts);
+            },
+            .program => for (n.data.program.body) |s| self.countDecls(s, counts),
+            .block_stmt => for (n.data.block_stmt.body) |s| self.countDecls(s, counts),
+            .expr_stmt => self.countDecls(n.data.expr_stmt, counts),
+            .if_stmt => {
+                self.countDecls(n.data.if_stmt.test_, counts);
+                self.countDecls(n.data.if_stmt.consequent, counts);
+                if (n.data.if_stmt.alternate) |a| self.countDecls(a, counts);
+            },
+            .while_stmt => {
+                self.countDecls(n.data.while_stmt.test_, counts);
+                self.countDecls(n.data.while_stmt.body, counts);
+            },
+            .do_while_stmt => {
+                self.countDecls(n.data.do_while_stmt.body, counts);
+                self.countDecls(n.data.do_while_stmt.test_, counts);
+            },
+            .for_stmt => {
+                const f = n.data.for_stmt;
+                if (f.init) |x| self.countDecls(x, counts);
+                if (f.test_) |x| self.countDecls(x, counts);
+                if (f.update) |x| self.countDecls(x, counts);
+                self.countDecls(f.body, counts);
+            },
+            .for_in_stmt => {
+                const f = n.data.for_in_stmt;
+                self.countDecls(f.left, counts);
+                self.countDecls(f.right, counts);
+                self.countDecls(f.body, counts);
+            },
+            .return_stmt => if (n.data.return_stmt) |e| self.countDecls(e, counts),
+            .throw_stmt => self.countDecls(n.data.throw_stmt, counts),
+            .try_stmt => {
+                const t = n.data.try_stmt;
+                self.countDecls(t.block, counts);
+                if (t.handler) |h| {
+                    self.incCount(counts, h.param_name);
+                    self.countDecls(h.body, counts);
+                }
+                if (t.finalizer) |fz| self.countDecls(fz, counts);
+            },
+            .switch_stmt => {
+                const s = n.data.switch_stmt;
+                self.countDecls(s.discriminant, counts);
+                for (s.cases) |c| {
+                    if (c.test_) |t| self.countDecls(t, counts);
+                    for (c.body) |st| self.countDecls(st, counts);
+                }
+            },
+            .labeled_stmt => self.countDecls(n.data.labeled_stmt.body, counts),
+            .unary_expr => self.countDecls(n.data.unary_expr.operand, counts),
+            .binary_expr => {
+                self.countDecls(n.data.binary_expr.left, counts);
+                self.countDecls(n.data.binary_expr.right, counts);
+            },
+            .logical_expr => {
+                self.countDecls(n.data.logical_expr.left, counts);
+                self.countDecls(n.data.logical_expr.right, counts);
+            },
+            .assignment_expr => {
+                self.countDecls(n.data.assignment_expr.target, counts);
+                self.countDecls(n.data.assignment_expr.value, counts);
+            },
+            .update_expr => self.countDecls(n.data.update_expr.operand, counts),
+            .conditional_expr => {
+                const c = n.data.conditional_expr;
+                self.countDecls(c.test_, counts);
+                self.countDecls(c.consequent, counts);
+                self.countDecls(c.alternate, counts);
+            },
+            .sequence_expr => for (n.data.sequence_expr.exprs) |e| self.countDecls(e, counts),
+            .spread_expr => self.countDecls(n.data.spread_expr, counts),
+            .yield_expr => if (n.data.yield_expr) |e| self.countDecls(e, counts),
+            .call_expr => {
+                self.countDecls(n.data.call_expr.callee, counts);
+                for (n.data.call_expr.args) |a| self.countDecls(a, counts);
+            },
+            .new_expr => {
+                self.countDecls(n.data.new_expr.callee, counts);
+                for (n.data.new_expr.args) |a| self.countDecls(a, counts);
+            },
+            .member_expr => {
+                self.countDecls(n.data.member_expr.object, counts);
+                if (n.data.member_expr.computed) self.countDecls(n.data.member_expr.property, counts);
+            },
+            .object_literal => for (n.data.object_literal.properties) |p| self.countDecls(p.value, counts),
+            .array_literal => for (n.data.array_literal.elements) |e| self.countDecls(e, counts),
+            else => {},
+        }
+    }
+
+    fn rewriteName(self: *Parser, n: *Node, name: []const u8, ns: []const u8, prop: []const u8) void {
+        switch (n.kind) {
+            .identifier => {
+                if (std.mem.eql(u8, n.data.identifier, name)) {
+                    const obj = self.makeNode(.identifier, n.start, n.end, .{ .identifier = ns }) orelse return;
+                    const p = self.makeNode(.identifier, n.start, n.end, .{ .identifier = prop }) orelse return;
+                    n.* = Node{ .kind = .member_expr, .start = n.start, .end = n.end, .data = .{ .member_expr = .{ .object = obj, .property = p, .computed = false } } };
+                }
+            },
+            .function_decl => for (n.data.function_decl.body) |s| self.rewriteName(s, name, ns, prop),
+            .function_expr => for (n.data.function_expr.body) |s| self.rewriteName(s, name, ns, prop),
+            .program => for (n.data.program.body) |s| self.rewriteName(s, name, ns, prop),
+            .block_stmt => for (n.data.block_stmt.body) |s| self.rewriteName(s, name, ns, prop),
+            .var_decl => if (n.data.var_decl.init) |x| self.rewriteName(x, name, ns, prop),
+            .expr_stmt => self.rewriteName(n.data.expr_stmt, name, ns, prop),
+            .if_stmt => {
+                self.rewriteName(n.data.if_stmt.test_, name, ns, prop);
+                self.rewriteName(n.data.if_stmt.consequent, name, ns, prop);
+                if (n.data.if_stmt.alternate) |a| self.rewriteName(a, name, ns, prop);
+            },
+            .while_stmt => {
+                self.rewriteName(n.data.while_stmt.test_, name, ns, prop);
+                self.rewriteName(n.data.while_stmt.body, name, ns, prop);
+            },
+            .do_while_stmt => {
+                self.rewriteName(n.data.do_while_stmt.body, name, ns, prop);
+                self.rewriteName(n.data.do_while_stmt.test_, name, ns, prop);
+            },
+            .for_stmt => {
+                const f = n.data.for_stmt;
+                if (f.init) |x| self.rewriteName(x, name, ns, prop);
+                if (f.test_) |x| self.rewriteName(x, name, ns, prop);
+                if (f.update) |x| self.rewriteName(x, name, ns, prop);
+                self.rewriteName(f.body, name, ns, prop);
+            },
+            .for_in_stmt => {
+                const f = n.data.for_in_stmt;
+                self.rewriteName(f.left, name, ns, prop);
+                self.rewriteName(f.right, name, ns, prop);
+                self.rewriteName(f.body, name, ns, prop);
+            },
+            .return_stmt => if (n.data.return_stmt) |e| self.rewriteName(e, name, ns, prop),
+            .throw_stmt => self.rewriteName(n.data.throw_stmt, name, ns, prop),
+            .try_stmt => {
+                const t = n.data.try_stmt;
+                self.rewriteName(t.block, name, ns, prop);
+                if (t.handler) |h| self.rewriteName(h.body, name, ns, prop);
+                if (t.finalizer) |fz| self.rewriteName(fz, name, ns, prop);
+            },
+            .switch_stmt => {
+                const s = n.data.switch_stmt;
+                self.rewriteName(s.discriminant, name, ns, prop);
+                for (s.cases) |c| {
+                    if (c.test_) |t| self.rewriteName(t, name, ns, prop);
+                    for (c.body) |st| self.rewriteName(st, name, ns, prop);
+                }
+            },
+            .labeled_stmt => self.rewriteName(n.data.labeled_stmt.body, name, ns, prop),
+            .unary_expr => self.rewriteName(n.data.unary_expr.operand, name, ns, prop),
+            .binary_expr => {
+                self.rewriteName(n.data.binary_expr.left, name, ns, prop);
+                self.rewriteName(n.data.binary_expr.right, name, ns, prop);
+            },
+            .logical_expr => {
+                self.rewriteName(n.data.logical_expr.left, name, ns, prop);
+                self.rewriteName(n.data.logical_expr.right, name, ns, prop);
+            },
+            .assignment_expr => {
+                self.rewriteName(n.data.assignment_expr.target, name, ns, prop);
+                self.rewriteName(n.data.assignment_expr.value, name, ns, prop);
+            },
+            .update_expr => self.rewriteName(n.data.update_expr.operand, name, ns, prop),
+            .conditional_expr => {
+                const c = n.data.conditional_expr;
+                self.rewriteName(c.test_, name, ns, prop);
+                self.rewriteName(c.consequent, name, ns, prop);
+                self.rewriteName(c.alternate, name, ns, prop);
+            },
+            .sequence_expr => for (n.data.sequence_expr.exprs) |e| self.rewriteName(e, name, ns, prop),
+            .spread_expr => self.rewriteName(n.data.spread_expr, name, ns, prop),
+            .yield_expr => if (n.data.yield_expr) |e| self.rewriteName(e, name, ns, prop),
+            .call_expr => {
+                self.rewriteName(n.data.call_expr.callee, name, ns, prop);
+                for (n.data.call_expr.args) |a| self.rewriteName(a, name, ns, prop);
+            },
+            .new_expr => {
+                self.rewriteName(n.data.new_expr.callee, name, ns, prop);
+                for (n.data.new_expr.args) |a| self.rewriteName(a, name, ns, prop);
+            },
+            .member_expr => {
+                self.rewriteName(n.data.member_expr.object, name, ns, prop);
+                if (n.data.member_expr.computed) self.rewriteName(n.data.member_expr.property, name, ns, prop);
+            },
+            .object_literal => for (n.data.object_literal.properties) |p| self.rewriteName(p.value, name, ns, prop),
+            .array_literal => for (n.data.array_literal.elements) |e| self.rewriteName(e, name, ns, prop),
+            else => {},
+        }
+    }
+
+    fn parseImportDecl(self: *Parser) ?*Node {
+        const start = self.current.start;
+        _ = self.advance(); // import
+
+        // import "mod";  (side-effect only)
+        if (self.current.kind == .string) {
+            const modname = self.current.value_str;
+            _ = self.advance();
+            self.consumeSemicolon();
+            const req = self.mkRequire(modname) orelse return null;
+            return self.makeNode(.expr_stmt, start, self.current.start, .{ .expr_stmt = req });
+        }
+
+        var default_name: ?[]const u8 = null;
+        var ns_name: ?[]const u8 = null;
+        const Named = struct { imp: []const u8, local: []const u8 };
+        var named = std.ArrayList(Named){};
+
+        if (self.current.kind == .identifier) {
+            default_name = self.current.value_str;
+            _ = self.advance();
+            _ = self.match(.comma);
+        }
+        if (self.match(.star)) {
+            if (!self.matchContextual("as")) return self.fail("expected 'as' after import *");
+            const t = self.expect(.identifier) orelse return null;
+            ns_name = t.value_str;
+        } else if (self.match(.left_brace)) {
+            while (!self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
+                const imp = self.expect(.identifier) orelse return null;
+                var local = imp.value_str;
+                if (self.matchContextual("as")) {
+                    const lt = self.expect(.identifier) orelse return null;
+                    local = lt.value_str;
+                }
+                named.append(self.arena, .{ .imp = imp.value_str, .local = local }) catch return null;
+                if (!self.match(.comma)) break;
+            }
+            _ = self.expect(.right_brace) orelse return null;
+        }
+        if (!self.matchContextual("from")) return self.fail("expected 'from' in import declaration");
+        const modtok = self.expect(.string) orelse return null;
+        const modname = modtok.value_str;
+        self.consumeSemicolon();
+
+        const tmp = std.fmt.allocPrint(self.arena, "__esm_{d}", .{start}) catch return null;
+        var out = std.ArrayList(*Node){};
+        const req = self.mkRequire(modname) orelse return null;
+        out.append(self.arena, self.mkVar(tmp, req) orelse return null) catch return null;
+        if (default_name) |d| {
+            const m = self.mkMember(self.mkIdent(tmp) orelse return null, "default") orelse return null;
+            out.append(self.arena, self.mkVar(d, m) orelse return null) catch return null;
+            self.live_imports.append(self.arena, .{ .name = d, .ns = tmp, .prop = "default" }) catch return null;
+        }
+        if (ns_name) |n| {
+            out.append(self.arena, self.mkVar(n, self.mkIdent(tmp) orelse return null) orelse return null) catch return null;
+        }
+        for (named.items) |nb| {
+            const m = self.mkMember(self.mkIdent(tmp) orelse return null, nb.imp) orelse return null;
+            out.append(self.arena, self.mkVar(nb.local, m) orelse return null) catch return null;
+            self.live_imports.append(self.arena, .{ .name = nb.local, .ns = tmp, .prop = nb.imp }) catch return null;
+        }
+        return self.finishMulti(out.items);
+    }
+
+    fn parseExportDecl(self: *Parser) ?*Node {
+        const start = self.current.start;
+        _ = self.advance(); // export
+
+        // export default <assignmentExpr>;
+        if (self.match(.kw_default)) {
+            const expr = self.parseAssignmentExpr() orelse return null;
+            self.consumeSemicolon();
+            return self.mkExportAssign("default", expr);
+        }
+
+        // export { a, b as c } [from "mod"];
+        if (self.match(.left_brace)) {
+            const Spec = struct { local: []const u8, exported: []const u8 };
+            var specs = std.ArrayList(Spec){};
+            while (!self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
+                const l = self.expect(.identifier) orelse return null;
+                var exported = l.value_str;
+                if (self.matchContextual("as")) {
+                    const e = self.expect(.identifier) orelse return null;
+                    exported = e.value_str;
+                }
+                specs.append(self.arena, .{ .local = l.value_str, .exported = exported }) catch return null;
+                if (!self.match(.comma)) break;
+            }
+            _ = self.expect(.right_brace) orelse return null;
+
+            var tmp: ?[]const u8 = null;
+            var out = std.ArrayList(*Node){};
+            if (self.matchContextual("from")) {
+                const modtok = self.expect(.string) orelse return null;
+                tmp = std.fmt.allocPrint(self.arena, "__esm_{d}", .{start}) catch return null;
+                const req = self.mkRequire(modtok.value_str) orelse return null;
+                out.append(self.arena, self.mkVar(tmp.?, req) orelse return null) catch return null;
+            }
+            self.consumeSemicolon();
+            for (specs.items) |sp| {
+                const value = if (tmp) |t|
+                    (self.mkMember(self.mkIdent(t) orelse return null, sp.local) orelse return null)
+                else
+                    (self.mkIdent(sp.local) orelse return null);
+                out.append(self.arena, self.mkExportAssign(sp.exported, value) orelse return null) catch return null;
+            }
+            return self.finishMulti(out.items);
+        }
+
+        // export <declaration>: var/let/const/function/class
+        const decl = self.parseStatement() orelse return null;
+        var names = std.ArrayList([]const u8){};
+        self.collectDeclNames(decl, &names);
+        for (names.items) |nm| {
+            const a = self.mkExportAssign(nm, self.mkIdent(nm) orelse return null) orelse return null;
+            self.extra_stmts.append(self.arena, a) catch {
+                self.had_error = true;
+                return null;
+            };
+        }
+        // A single reassignable declarator (`export let`/`export var x = E`) is made live:
+        // its use-sites are rewritten to `exports.x` so reassignments are seen by importers.
+        if (decl.kind == .var_decl and (decl.data.var_decl.kind == .let or decl.data.var_decl.kind == .var_)) {
+            self.live_exports.append(self.arena, decl.data.var_decl.name) catch {};
+        }
+        return decl;
+    }
+
     fn parseStatement(self: *Parser) ?*Node {
         if (self.had_error) return null;
+        // Phase 8: a statement starting with `await` is an await-expression statement,
+        // not a label/identifier — route to expression parsing (which desugars await).
+        if (self.current.kind == .identifier and std.mem.eql(u8, self.current.value_str, "await")) {
+            return self.parseExprStmt();
+        }
         // Phase 4d: labeled statement — identifier followed by colon.
         if (self.current.kind == .identifier) {
             // Peek ahead: if next non-whitespace token is ':', this is a labeled stmt.
@@ -208,6 +717,8 @@ pub const Parser = struct {
             .kw_let => self.parseLexicalDeclStmt(.let),
             .kw_const => self.parseLexicalDeclStmt(.const_),
             .kw_class => self.parseClassDeclStmt(),
+            .kw_import => self.parseImportDecl(),
+            .kw_export => self.parseExportDecl(),
             .kw_function => self.parseFunctionDecl(),
             .kw_if => self.parseIfStmt(),
             .kw_while => self.parseWhileStmt(),
@@ -753,13 +1264,17 @@ pub const Parser = struct {
     fn parseFunctionBody(self: *Parser) ?[]*Node {
         _ = self.expect(.left_brace) orelse return null;
         var body = std.ArrayList(*Node){};
+        const li_start = self.live_imports.items.len;
+        const le_start = self.live_exports.items.len;
         while (!self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
             body.append(self.arena, s) catch {
                 self.had_error = true;
                 break;
             };
+            self.drainExtraStmts(&body);
         }
+        self.applyLiveBindings(body.items, li_start, le_start);
         _ = self.expect(.right_brace) orelse return null;
         return body.items;
     }
@@ -1271,6 +1786,18 @@ pub const Parser = struct {
                 break;
             }
             const op_kind = self.current.kind;
+            // ES2016: a UnaryExpression may not be the left operand of `**` (e.g. `-2 ** 2`).
+            if (op_kind == .star_star and left.kind == .unary_expr and !left.paren) {
+                if (!self.had_error) {
+                    self.had_error = true;
+                    self.error_info = ParseError{
+                        .message = "unary operator not allowed as left operand of **",
+                        .line = self.current.line,
+                        .column = self.current.column,
+                    };
+                }
+                return null;
+            }
             _ = self.advance();
             // Exponentiation is right-associative: recurse at p-1 so same-prec ** binds rightward.
             const right = self.parseBinaryExpr(if (op_kind == .star_star) p - 1 else p) orelse return null;
@@ -1297,6 +1824,18 @@ pub const Parser = struct {
 
     fn parseUnaryExpr(self: *Parser) ?*Node {
         const start = self.current.start;
+        // Phase 8: `await X` desugars to a call __await__(X) (synchronous-drain await).
+        // Works at module top level and inside any function; no VM changes needed.
+        if (self.current.kind == .identifier and std.mem.eql(u8, self.current.value_str, "await")) {
+            _ = self.advance();
+            const operand = self.parseUnaryExpr() orelse return null;
+            const callee = self.makeNode(.identifier, start, start, .{ .identifier = "__await__" }) orelse return null;
+            var args = std.ArrayList(*Node){};
+            args.append(self.arena, operand) catch return null;
+            return self.makeNode(.call_expr, start, self.current.start, .{
+                .call_expr = .{ .callee = callee, .args = args.items },
+            });
+        }
         // Prefix unary
         switch (self.current.kind) {
             .bang, .tilde, .minus, .plus, .kw_typeof, .kw_void, .kw_delete => {
@@ -1587,6 +2126,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 const expr = self.parseExpression() orelse return null;
                 _ = self.expect(.right_paren) orelse return null;
+                expr.paren = true;
                 return expr;
             },
             .kw_function => {
@@ -1755,13 +2295,17 @@ pub const Parser = struct {
     /// Parse a complete script with strict mode detection.
     pub fn parseScriptWithStrict(self: *Parser) struct { stmts: []*Node, is_strict: bool } {
         var stmts = std.ArrayList(*Node){};
+        const li_start = self.live_imports.items.len;
+        const le_start = self.live_exports.items.len;
         while (!self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
             stmts.append(self.arena, s) catch {
                 self.had_error = true;
                 break;
             };
+            self.drainExtraStmts(&stmts);
         }
+        self.applyLiveBindings(stmts.items, li_start, le_start);
         const is_strict = hasUseStrict(stmts.items);
         return .{ .stmts = stmts.items, .is_strict = is_strict };
     }

@@ -44,6 +44,13 @@ const FnCompiler = struct {
     nfe_name: ?[]const u8 = null,
     /// Phase 4d: label stack for labeled break/continue.
     label_stack: std.ArrayListUnmanaged(LabelEntry) = .empty,
+    /// Phase 8: is this function compiled in strict mode? PTC only applies in
+    /// strict mode (ES2015 14.6).
+    is_strict: bool = false,
+    /// Phase 8: nesting depth of try/catch/finally regions. A call in the
+    /// operand of `return` is only in tail position when try_depth == 0
+    /// (a pending finally would run after the call returns, so it is not tail).
+    try_depth: u32 = 0,
 
     const Self = @This();
 
@@ -215,7 +222,7 @@ const FnCompiler = struct {
             .spread_expr => {
                 return self.compileExpr(node.data.spread_expr);
             },
-            .call_expr => return self.compileCall(node.data.call_expr, line),
+            .call_expr => return self.compileCall(node.data.call_expr, line, false),
             .function_expr => return self.compileFuncExpr(node.data.function_expr, line),
             .member_expr => {
                 return self.compileMemberRead(node.data.member_expr, line);
@@ -755,7 +762,7 @@ const FnCompiler = struct {
         }
     }
 
-    fn compileCall(self: *Self, c: ast.CallExpr, line: u32) error{OutOfMemory}!u8 {
+    fn compileCall(self: *Self, c: ast.CallExpr, line: u32, tail: bool) error{OutOfMemory}!u8 {
         const is_method = c.callee.kind == .member_expr;
 
         if (is_method) {
@@ -828,9 +835,9 @@ const FnCompiler = struct {
             _ = try self.compileExpr(arg);
         }
 
-        // Emit CALL.
+        // Emit CALL (or TAIL_CALL when this call is in tail position).
         const ret_dst = base; // result goes back into base register.
-        try self.emitOp(.CALL, line);
+        try self.emitOp(if (tail) .TAIL_CALL else .CALL, line);
         try self.emitU8(base);
         try self.emitU8(nargs);
         try self.emitU8(ret_dst);
@@ -1046,10 +1053,22 @@ const FnCompiler = struct {
             },
             .return_stmt => {
                 if (node.data.return_stmt) |rv_node| {
-                    const r = try self.compileExpr(rv_node);
-                    try self.emitOp(.RETURN, line);
-                    try self.emitU8(r);
-                    self.freeReg();
+                    // Phase 8: proper tail call. `return f(args);` is a tail call
+                    // when in strict mode and not inside a try/finally region.
+                    // Direct (non-member) callees only — `return obj.m()` falls
+                    // back to a normal METHOD_CALL + RETURN. The TAIL_CALL opcode
+                    // performs the return itself, so no RETURN is emitted.
+                    if (self.is_strict and self.try_depth == 0 and
+                        rv_node.kind == .call_expr and
+                        rv_node.data.call_expr.callee.kind != .member_expr)
+                    {
+                        _ = try self.compileCall(rv_node.data.call_expr, rv_node.start, true);
+                    } else {
+                        const r = try self.compileExpr(rv_node);
+                        try self.emitOp(.RETURN, line);
+                        try self.emitU8(r);
+                        self.freeReg();
+                    }
                 } else {
                     try self.emitOp(.RETURN_UNDEF, line);
                 }
@@ -1063,6 +1082,10 @@ const FnCompiler = struct {
             .try_stmt => {
                 const ts = node.data.try_stmt;
                 const saved_sp = self.sp;
+                // Phase 8: returns anywhere inside try/catch/finally are not in
+                // tail position (a pending finally must run after the callee).
+                self.try_depth += 1;
+                defer self.try_depth -= 1;
 
                 // Allocate a register to receive the caught exception value.
                 const rexc: u8 = if (ts.handler != null) blk: {
@@ -1358,7 +1381,12 @@ const FnCompiler = struct {
                 entry.break_patches.deinit(self.arena);
                 entry.continue_patches.deinit(self.arena);
             },
-            .empty_stmt, .debugger_stmt => {},
+            .empty_stmt => {},
+            .debugger_stmt => {
+                // Phase 8: emit a DEBUGGER opcode so the VM can fire a debug
+                // hook (breakpoint-style pause). No-op when no hook installed.
+                try self.emitOp(.DEBUGGER, line);
+            },
             else => {},
         }
     }
@@ -1420,6 +1448,7 @@ fn compileFunctionStrict(
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
+    fc.is_strict = is_strict;
 
     // Phase 2: all variable access is env-based (GET_GLOBAL/SET_GLOBAL).
     // Params are passed via env on CALL setup (see bc_vm.zig CALL handler).
