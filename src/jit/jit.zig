@@ -62,9 +62,15 @@ pub const JitCompiler = struct {
     counters: std.AutoHashMapUnmanaged(HotKey, u32) = .{},
     /// Set of sites that have crossed hot_threshold.
     hot: std.AutoHashMapUnmanaged(HotKey, void) = .{},
+    /// After this many failed fast-forward attempts, a site is blacklisted.
+    deopt_threshold: u32 = 8,
+    /// Per-site failed-attempt counts.
+    deopt_counts: std.AutoHashMapUnmanaged(HotKey, u32) = .{},
+    /// Sites abandoned after repeated fast-forward failures (stop retrying).
+    blacklist: std.AutoHashMapUnmanaged(HotKey, void) = .{},
     /// Number of functions successfully compiled to native code (always 0 today).
     compiled: usize = 0,
-    /// Number of deoptimizations triggered (always 0 today).
+    /// Number of deoptimizations triggered (failed fast-forward attempts).
     deopts: usize = 0,
 
     /// Create a JitCompiler in .off mode.
@@ -81,6 +87,8 @@ pub const JitCompiler = struct {
     pub fn deinit(self: *JitCompiler) void {
         self.counters.deinit(self.allocator);
         self.hot.deinit(self.allocator);
+        self.deopt_counts.deinit(self.allocator);
+        self.blacklist.deinit(self.allocator);
     }
 
     /// Record one execution of bytecode site (func_id, pc).
@@ -106,6 +114,28 @@ pub const JitCompiler = struct {
     /// Returns true if the given site is in the hot set.
     pub fn isHot(self: *const JitCompiler, func_id: u64, pc: u32) bool {
         return self.hot.contains(HotKey{ .func_id = func_id, .pc = pc });
+    }
+
+    /// True if a site has been abandoned after repeated fast-forward failures.
+    pub fn isBlacklisted(self: *const JitCompiler, func_id: u64, pc: u32) bool {
+        return self.blacklist.contains(HotKey{ .func_id = func_id, .pc = pc });
+    }
+
+    /// Record a failed fast-forward (deopt) at a site: bump the global + per-site
+    /// counters and blacklist the site once it reaches `deopt_threshold`. Returns
+    /// true if the site is now blacklisted.
+    pub fn noteDeopt(self: *JitCompiler, func_id: u64, pc: u32) JitError!bool {
+        self.deopts += 1;
+        const key = HotKey{ .func_id = func_id, .pc = pc };
+        if (self.blacklist.contains(key)) return true;
+        const gop = self.deopt_counts.getOrPut(self.allocator, key) catch return JitError.OutOfMemory;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        if (gop.value_ptr.* >= self.deopt_threshold) {
+            self.blacklist.put(self.allocator, key, {}) catch return JitError.OutOfMemory;
+            return true;
+        }
+        return false;
     }
 
     /// Number of sites currently in the hot set.
@@ -186,4 +216,17 @@ test "DeoptFrame shape" {
     try testing.expectEqual(@as(u32, 42), df.pc);
     try testing.expectEqual(@as(u64, 0xDEAD), df.func_id);
     try testing.expectEqual(@as(u16, 8), df.num_regs);
+}
+
+test "noteDeopt counts failures and blacklists a site after the threshold" {
+    var jc = JitCompiler.initMode(testing.allocator, .experimental);
+    defer jc.deinit();
+    jc.deopt_threshold = 3;
+    try testing.expect(!jc.isBlacklisted(1, 5));
+    try testing.expectEqual(false, try jc.noteDeopt(1, 5));
+    try testing.expectEqual(false, try jc.noteDeopt(1, 5));
+    try testing.expectEqual(true, try jc.noteDeopt(1, 5)); // hits threshold
+    try testing.expect(jc.isBlacklisted(1, 5));
+    try testing.expectEqual(@as(usize, 3), jc.deopts);
+    try testing.expect(!jc.isBlacklisted(2, 9)); // distinct site unaffected
 }

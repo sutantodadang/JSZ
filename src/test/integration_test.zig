@@ -1883,3 +1883,13 @@ test "Phase 9: experimental JIT fast-forwards a hot accumulator loop (s = s + i)
 }
 
 
+
+test "Phase 9: experimental JIT fast-forwards a hot loop with two accumulators" {
+    const a = std.testing.allocator;
+    const src = "var i = 0, s = 0, t = 0; while (i < 6000) { s = s + i; t = t + i; i = i + 1; } s + t;";
+    const expected: f64 = 2.0 * (6000.0 * 5999.0 / 2.0); // s == t == sum 0..5999
+    try std.testing.expectEqual(expected, try evalToF64Mode(a, src, .bc));
+    var compiled: usize = 0;
+    try std.testing.expectEqual(expected, try evalExperimental(a, src, &compiled));
+    try std.testing.expect(compiled >= 1);
+}

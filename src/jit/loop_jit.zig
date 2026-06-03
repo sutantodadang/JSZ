@@ -165,6 +165,18 @@ fn zigAccumulateLoop(start: i64, limit: i64, step: i64, cmp: Cmp, s_init: f64, o
     return .{ .i = i, .s = s };
 }
 
+/// Multiple accumulators folding the induction var: each `s[k] = s[k] op[k] i`
+/// per iteration (f64, interpreter order). Mutates `s` in place; returns final i.
+fn zigMultiAccLoop(start: i64, limit: i64, step: i64, cmp: Cmp, ops: []const u8, s: []f64) i64 {
+    var i = start;
+    while (cmpTrue(i, limit, cmp)) {
+        const fi: f64 = @floatFromInt(i);
+        for (ops, 0..) |op, k| s[k] = accApply(s[k], fi, op);
+        i += step;
+    }
+    return i;
+}
+
 inline fn runAccumulateLoop(start: i64, limit: i64, step: i64, cmp: Cmp, s_init: f64, op: u8) AccResult {
     if (cmp == .lt and op == '+') {
         if (native_accumulate_loop) |f| {
@@ -260,31 +272,33 @@ pub fn tryFastForwardLoop(
     const exit_pc: usize = @intCast(exit_i);
     if (exit_pc > code.len) return null;
     pc += 4;
-    // [acc] Optional accumulator block, present iff the first body instruction
-    // loads a var DIFFERENT from the induction var. Shape (acc updated before
-    // the induction step, reading the current induction value):
+    // [acc] Zero or more accumulator blocks before the induction step. Each is
+    // present iff the next body load targets a var DIFFERENT from the induction
+    // var. Shape (acc folds the current induction value, then i steps):
     //   GET acc;  GET ind;  ADD|SUB|MUL Racc2, Racc, Rind;  SET acc, Racc2
     const Acc = struct { ind: IndVar, op: u8 };
-    var acc: ?Acc = null;
-    if (parseLoad(code, pc)) |first| {
-        if (!indEql(first.ind, ind)) {
-            const accvar = first.ind;
-            const il = parseLoad(code, first.next) orelse return null;
-            if (!indEql(il.ind, ind)) return null; // accumulator must fold the induction var
-            var p = il.next;
-            if (p + 4 > code.len) return null;
-            const aop: u8 = switch (@as(Op, @enumFromInt(code[p]))) {
-                .ADD => '+',
-                .SUB => '-',
-                .MUL => '*',
-                else => return null,
-            };
-            const racc2 = code[p + 1];
-            if (code[p + 2] != first.reg or code[p + 3] != il.reg) return null;
-            p += 4;
-            pc = parseStore(code, p, accvar, racc2) orelse return null;
-            acc = .{ .ind = accvar, .op = aop };
-        }
+    var accs: [4]Acc = undefined;
+    var n_acc: usize = 0;
+    while (parseLoad(code, pc)) |first| {
+        if (indEql(first.ind, ind)) break; // induction block begins here
+        if (n_acc >= accs.len) return null; // too many accumulators to fast-forward
+        const accvar = first.ind;
+        const il = parseLoad(code, first.next) orelse return null;
+        if (!indEql(il.ind, ind)) return null; // accumulator must fold the induction var
+        var p = il.next;
+        if (p + 4 > code.len) return null;
+        const aop: u8 = switch (@as(Op, @enumFromInt(code[p]))) {
+            .ADD => '+',
+            .SUB => '-',
+            .MUL => '*',
+            else => return null,
+        };
+        const racc2 = code[p + 1];
+        if (code[p + 2] != first.reg or code[p + 3] != il.reg) return null;
+        p += 4;
+        pc = parseStore(code, p, accvar, racc2) orelse return null;
+        accs[n_acc] = .{ .ind = accvar, .op = aop };
+        n_acc += 1;
     }
     // [E] body load of the same induction var.
     var re: u8 = undefined;
@@ -369,16 +383,32 @@ pub fn tryFastForwardLoop(
 
     // Accumulator loop: carry `s = s op i` in f64 (matches the interpreter), then
     // write back both the induction var and the accumulator; box once each.
-    if (acc) |ac| {
-        const s0_v = readVar(ac.ind, constants, env, registers) orelse return null;
-        if (s0_v.bits == 0) return null;
-        const sj = s0_v.unbox();
-        if (sj != .number) return null;
-        const r = runAccumulateLoop(start, limit, step, cmp, sj.number, ac.op);
-        const iv = val_mod.makeNumber(arena, @floatFromInt(r.i)) catch return null;
-        const sv = val_mod.makeNumber(arena, r.s) catch return null;
-        writeVar(ind, constants, env, registers, iv);
-        writeVar(ac.ind, constants, env, registers, sv);
+    // Accumulator loop(s): carry each `s_k = s_k op_k i` in f64 (matching the
+    // interpreter's arithmetic + iteration order), then write back the induction
+    // var and every accumulator; box once each.
+    if (n_acc > 0) {
+        var ops: [4]u8 = undefined;
+        var s: [4]f64 = undefined;
+        for (0..n_acc) |k| {
+            const s0_v = readVar(accs[k].ind, constants, env, registers) orelse return null;
+            if (s0_v.bits == 0) return null;
+            const sj = s0_v.unbox();
+            if (sj != .number) return null;
+            s[k] = sj.number;
+            ops[k] = accs[k].op;
+        }
+        // Native fast path only for the single `s = s + i`, `<` shape.
+        if (n_acc == 1 and ops[0] == '+' and cmp == .lt and native_accumulate_loop != null) {
+            const r = runAccumulateLoop(start, limit, step, cmp, s[0], '+');
+            writeVar(ind, constants, env, registers, val_mod.makeNumber(arena, @floatFromInt(r.i)) catch return null);
+            writeVar(accs[0].ind, constants, env, registers, val_mod.makeNumber(arena, r.s) catch return null);
+            return exit_pc;
+        }
+        const final_i = zigMultiAccLoop(start, limit, step, cmp, ops[0..n_acc], s[0..n_acc]);
+        writeVar(ind, constants, env, registers, val_mod.makeNumber(arena, @floatFromInt(final_i)) catch return null);
+        for (0..n_acc) |k| {
+            writeVar(accs[k].ind, constants, env, registers, val_mod.makeNumber(arena, s[k]) catch return null);
+        }
         return exit_pc;
     }
 

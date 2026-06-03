@@ -199,7 +199,11 @@ pub const BcVm = struct {
     inline fn noteBackedge(self: *BcVm, func: *const BcFunction, op_pc: usize) bool {
         if (self.jit) |jc| {
             const ev = jc.notePcHit(@intFromPtr(func), @intCast(op_pc)) catch return false;
-            return ev == .became_hot and jc.mode == .experimental;
+            if (jc.mode != .experimental) return false;
+            // Retry hot sites on every back-edge (catches loop re-entry and late
+            // type stabilization) until the site is blacklisted by noteDeopt.
+            if (ev == .not_hot) return false;
+            return !jc.isBlacklisted(@intFromPtr(func), @intCast(op_pc));
         }
         return false;
     }
@@ -787,6 +791,8 @@ pub const BcVm = struct {
                         )) |exit_pc| {
                             frame.pc = exit_pc;
                             if (self.jit) |jc| jc.compiled += 1;
+                        } else if (self.jit) |jc| {
+                            _ = jc.noteDeopt(@intFromPtr(frame.func), @intCast(op_site)) catch {};
                         }
                     }
                 },
