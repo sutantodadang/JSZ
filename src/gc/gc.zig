@@ -18,6 +18,12 @@ pub fn traceValue(v: Value, mark_fn: *const fn (*JsObject) void) void {
     const inner = v.toPtr();
     switch (inner.*) {
         .object => |obj| mark_fn(obj),
+        // W2 unification: a bc function may carry a backing object (own props +
+        // lazily-created `prototype`). Keep it (and transitively its methods)
+        // alive while the function is reachable.
+        .bc_function => |c| {
+            if (c.obj) |o| mark_fn(@ptrCast(@alignCast(o)));
+        },
         else => {},
     }
 }

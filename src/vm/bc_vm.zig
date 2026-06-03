@@ -40,6 +40,48 @@ pub const BcCallFrame = struct {
     this_val: Value = Value{},
     /// Phase 4a: try stack (pushed by PUSH_TRY, popped by POP_TRY/THROW).
     try_stack: std.ArrayListUnmanaged(TryEntry) = .empty,
+    /// W2: when this frame belongs to a generator, links back to its state so
+    /// YIELD can save the suspended frame. Null for ordinary frames.
+    gen: ?*BcGeneratorState = null,
+};
+
+/// W2: suspended-frame state for a bytecode generator. `frame` holds the saved
+/// call frame (registers persist across resumes); the generator object stores a
+/// pointer to this in its internal_slot.
+pub const BcGeneratorState = struct {
+    frame: BcCallFrame,
+    vm: *BcVm,
+    done: bool = false,
+    started: bool = false,
+    /// Register that receives the value passed to .next(v) on resume.
+    resume_reg: u8 = 0,
+};
+
+/// W2-async: how to resume a suspended coroutine.
+pub const ResumeKind = union(enum) {
+    /// Resume normally, writing `next` into the await/yield result register.
+    next: Value,
+    /// Resume by throwing `throw_` at the suspended await point (rejected await).
+    throw_: Value,
+};
+
+/// W2-async: result of running a coroutine until its next suspend or completion.
+pub const SuspendResult = union(enum) {
+    /// Hit a YIELD (an `await` point); carries the awaited value.
+    yielded: Value,
+    /// Completed normally; carries the return value.
+    returned: Value,
+    /// An exception escaped the coroutine frame; carries the thrown value.
+    threw: Value,
+};
+
+/// W2-async: state for one in-flight async function invocation. Drives a
+/// suspended coroutine and settles `result` when it completes or throws.
+pub const AsyncCtx = struct {
+    vm: *BcVm,
+    state: *BcGeneratorState,
+    /// The pending result promise returned to the caller.
+    result: Value,
 };
 
 pub const RunOutcome = union(enum) {
@@ -65,6 +107,20 @@ pub const BcVm = struct {
     context: @import("../runtime/realm.zig").Context = undefined,
     /// Phase 9: optional JIT profiler. Null = no profiling (zero hot-path cost).
     jit: ?*jit_mod.JitCompiler = null,
+    /// W3: resource limits. 0 = unlimited. Enforced in the dispatch loop and
+    /// surfaced as an uncatchable interrupt (returns past any JS try/catch).
+    gas_limit: u64 = 0,
+    gas_used: u64 = 0,
+    deadline_ns: i128 = 0,
+    /// W2: set by the YIELD handler so the generator driver distinguishes a
+    /// suspension from a normal return.
+    gen_yielded: bool = false,
+    /// W2: all generator states created in this run (kept live for GC scanning
+    /// of their suspended frames; freed with the eval arena).
+    generators: std.ArrayListUnmanaged(*BcGeneratorState) = .empty,
+    /// W2-async: all async invocation contexts (kept live for GC scanning of
+    /// their result promises; suspended frames are scanned via `generators`).
+    async_ctxs: std.ArrayListUnmanaged(*AsyncCtx) = .empty,
 
     pub fn init(arena: std.mem.Allocator, realm: *Realm) BcVm {
         return BcVm{
@@ -108,6 +164,8 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, this_val, args);
+                if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, this_val, args);
                 const call_env = try Environment.init(self.arena, def_env);
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
@@ -236,6 +294,16 @@ pub const BcVm = struct {
 
     fn runLoop(self: *BcVm) !RunOutcome {
         while (self.frames.items.len > 0) {
+            // W3: resource limits. Gas is checked per instruction; the wall-clock
+            // deadline every 16K instructions (nanoTimestamp is too costly per-op).
+            // Returns directly (past any JS try/catch) so scripts can't trap it.
+            if (self.gas_limit != 0 or self.deadline_ns != 0) {
+                self.gas_used += 1;
+                if (self.gas_limit != 0 and self.gas_used > self.gas_limit)
+                    return RunOutcome{ .exception = "interrupted: gas limit exceeded" };
+                if (self.deadline_ns != 0 and (self.gas_used & 0x3FFF) == 0 and std.time.nanoTimestamp() >= self.deadline_ns)
+                    return RunOutcome{ .exception = "interrupted: time limit exceeded" };
+            }
             if (self.frames.items.len > self.frame_high_water) {
                 self.frame_high_water = self.frames.items.len;
             }
@@ -949,7 +1017,7 @@ pub const BcVm = struct {
                     // of pushing a new one. Stack depth stays O(1) for tail
                     // recursion. Args are read from the current registers BEFORE
                     // the frame is overwritten.
-                    if (callee_val.bits != 0 and callee_val.unbox() == .bc_function) {
+                    if (callee_val.bits != 0 and callee_val.unbox() == .bc_function and !callee_val.toPtr().bc_function.func.is_generator) {
                         const closure = callee_val.toPtr().bc_function;
                         const fn_ptr = closure.func;
                         const def_env: *Environment = @ptrCast(@alignCast(closure.env));
@@ -1110,6 +1178,20 @@ pub const BcVm = struct {
                 },
                 .HALT => {
                     return RunOutcome{ .ok = self.result };
+                },
+                .YIELD => {
+                    const rsrc = code[frame.pc];
+                    frame.pc += 1;
+                    const yielded = frame.registers[rsrc];
+                    // The frame must belong to a generator (compiler only emits
+                    // YIELD inside generator bodies). Save the suspended frame.
+                    const state = frame.gen.?;
+                    state.resume_reg = rsrc;
+                    state.frame = frame.*; // pc already advanced past YIELD
+                    _ = self.frames.pop();
+                    self.result = yielded;
+                    self.gen_yielded = true;
+                    return RunOutcome{ .ok = yielded };
                 },
                 .DEBUGGER => {
                     // Phase 8: fire the installed debug hook (no-op if none).
@@ -1388,6 +1470,18 @@ pub const BcVm = struct {
                             cache.target_proto = if (target_proto) |tp| @ptrCast(tp) else null;
                         }
                         result = jsInstanceofWithTarget(lhs, target_proto);
+                    } else if (rhs.bits != 0 and rhs.unbox() == .bc_function) {
+                        // W2 unification: rhs is a bc constructor; its prototype
+                        // lives on the backing object (materialized once any
+                        // instance exists). Not cached (closure-keyed).
+                        var target_proto: ?*JsObject = null;
+                        if (rhs.toPtr().bc_function.obj) |fobj| {
+                            const o: *JsObject = @ptrCast(@alignCast(fobj));
+                            if (o.get("prototype")) |pv| {
+                                if (pv.bits != 0 and pv.unbox() == .object) target_proto = pv.toPtr().object;
+                            }
+                        }
+                        result = jsInstanceofWithTarget(lhs, target_proto);
                     } else {
                         result = false;
                     }
@@ -1456,26 +1550,54 @@ pub const BcVm = struct {
             return "undefined is not a constructor";
         }
         switch (callee_val.unbox()) {
-            .bc_function, .function => {
-                // User-defined constructor.
+            .bc_function => {
+                // W2 unification: real [[Construct]] for bc functions. The new
+                // object's prototype is the constructor's `.prototype`; the ctor
+                // runs synchronously with `this` bound to it; the result is the
+                // ctor's return value if it is an object, else the new object.
                 var args = try self.arena.alloc(Value, nargs);
                 for (0..nargs) |i| {
                     args[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
                 }
-                const proto = self.realm.object_prototype;
+                const proto_v = try self.getProp(callee_val, "prototype");
+                const proto: ?*JsObject = if (proto_v.bits != 0 and proto_v.unbox() == .object)
+                    proto_v.toPtr().object
+                else
+                    self.realm.object_prototype;
                 const new_obj = if (self.heap) |heap|
                     try JsObject.createOnHeap(heap, proto)
                 else
                     try JsObject.create(self.arena, proto);
                 const this_val = try val_mod.makeObject(self.arena, new_obj);
-                // Dispatch as a call, expect result.
+                const result = bcInvokeJs(self, self.arena, this_val, callee_val, args) catch |e| {
+                    if (e == error.JsException) {
+                        const realm_m = @import("../runtime/realm.zig");
+                        if (realm_m.pending_exception.bits != 0) {
+                            self.last_exception_value = realm_m.pending_exception;
+                            realm_m.pending_exception = Value{};
+                        }
+                        return "__js_exception__";
+                    }
+                    return "constructor threw";
+                };
+                const final = if (result.bits != 0 and result.unbox() == .object) result else this_val;
+                self.frames.items[self.frames.items.len - 1].registers[rdst] = final;
+                return null;
+            },
+            .function => {
+                // Tree-mode FuncVal (not produced by the bc compiler). Best-effort:
+                // run with a fresh `this`; caller gets the ctor's return value.
+                var args = try self.arena.alloc(Value, nargs);
+                for (0..nargs) |i| {
+                    args[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                }
+                const new_obj = if (self.heap) |heap|
+                    try JsObject.createOnHeap(heap, self.realm.object_prototype)
+                else
+                    try JsObject.create(self.arena, self.realm.object_prototype);
+                const this_val = try val_mod.makeObject(self.arena, new_obj);
                 const err = try self.doCallWithThis(callee_val, this_val, base, nargs, rdst);
                 if (err != null) return err;
-                // The called function will push a new frame. When that frame RETURNs,
-                // its result goes to rdst. If result is not an object, we should return this_val.
-                // This is complex to handle perfectly without extra plumbing; for now
-                // the caller gets whatever the constructor function returned (or undefined).
-                // The native Error ctors above are handled separately.
                 return null;
             },
             .native_function => |fn_ptr| {
@@ -1543,6 +1665,20 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                if (fn_ptr.is_async) {
+                    var aargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val, aargs);
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
+                    return null;
+                }
+                if (fn_ptr.is_generator) {
+                    var gargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| gargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                    const g = try self.buildGenerator(fn_ptr, def_env, this_val, gargs);
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
+                    return null;
+                }
                 const call_env = try Environment.init(self.arena, def_env);
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < nargs)
@@ -1619,7 +1755,24 @@ pub const BcVm = struct {
                 }
                 return val_mod.makeUndefined(self.arena);
             },
-            .function, .bc_function, .native_function => {
+            .bc_function => |closure| {
+                // W2 unification: bc functions are objects. `prototype` is
+                // materialized lazily; other own props live on the backing
+                // object; everything else delegates to Function.prototype.
+                if (std.mem.eql(u8, key, "prototype")) {
+                    return try self.closurePrototype(obj_val, closure);
+                }
+                if (closure.obj) |op| {
+                    const o: *JsObject = @ptrCast(@alignCast(op));
+                    if (o.get(key)) |v| return v;
+                }
+                const realm_mod = @import("../runtime/realm.zig");
+                if (realm_mod.active_function_proto) |proto| {
+                    if (proto.get(key)) |v| return v;
+                }
+                return val_mod.makeUndefined(self.arena);
+            },
+            .function, .native_function => {
                 // Phase 4d: delegate to Function.prototype (call, apply, bind).
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
@@ -1629,6 +1782,34 @@ pub const BcVm = struct {
             },
             else => return val_mod.makeUndefined(self.arena),
         }
+    }
+
+    /// W2 unification: the lazily-created backing object for a bc function's own
+    /// properties. Proto is Function.prototype so call/apply/bind resolve too.
+    fn closureBackingObj(self: *BcVm, closure: *BcClosure) !*JsObject {
+        if (closure.obj) |op| return @ptrCast(@alignCast(op));
+        const o = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.function_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.function_prototype);
+        closure.obj = o;
+        return o;
+    }
+
+    /// W2 unification: a bc function's `.prototype` value, lazily creating a plain
+    /// object with a `constructor` back-reference on first access (matches the
+    /// implicit prototype every JS function carries).
+    fn closurePrototype(self: *BcVm, fn_val: Value, closure: *BcClosure) !Value {
+        const o = try self.closureBackingObj(closure);
+        if (o.get("prototype")) |p| return p;
+        const proto_obj = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        const pv = try val_mod.makeObject(self.arena, proto_obj);
+        try proto_obj.set("constructor", fn_val);
+        try o.set("prototype", pv);
+        return pv;
     }
 
     fn setProp(self: *BcVm, obj_val: Value, key: []const u8, value: Value) !void {
@@ -1643,9 +1824,14 @@ pub const BcVm = struct {
                 }
                 try obj.set(key, value);
             },
+            // W2 unification: bc functions store own properties (incl.
+            // `C.prototype = ...`) on their backing object.
+            .bc_function => |closure| {
+                const o = try self.closureBackingObj(closure);
+                try o.set(key, value);
+            },
             else => {},
         }
-        _ = self;
     }
 
     /// Execute a regular CALL: reads callee from R[base], args from R[base+1..base+1+nargs].
@@ -1659,6 +1845,24 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+
+                // W2-async: an async function call runs as a coroutine and
+                // returns a pending Promise.
+                if (fn_ptr.is_async) {
+                    var aargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val, aargs);
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
+                    return null;
+                }
+                // W2: a generator function call produces a generator object.
+                if (fn_ptr.is_generator) {
+                    var gargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| gargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                    const g = try self.buildGenerator(fn_ptr, def_env, this_val, gargs);
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
+                    return null;
+                }
 
                 // Create call environment.
                 const call_env = try Environment.init(self.arena, def_env);
@@ -1846,6 +2050,21 @@ pub const BcVm = struct {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
 
+                if (fn_ptr.is_async) {
+                    var aargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| aargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val, aargs);
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
+                    return null;
+                }
+                if (fn_ptr.is_generator) {
+                    var gargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| gargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
+                    const g = try self.buildGenerator(fn_ptr, def_env, this_val, gargs);
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
+                    return null;
+                }
+
                 const call_env = try Environment.init(self.arena, def_env);
 
                 // Bind parameters. Args are at R[base+2..base+1+nargs].
@@ -1972,6 +2191,179 @@ pub const BcVm = struct {
         }
     }
 
+    // ---------------------------------------------------------- W2 generators ---
+
+    fn makeGenIterResult(self: *BcVm, value: Value, done: bool) !Value {
+        const obj = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        try obj.set("value", value);
+        try obj.set("done", try val_mod.makeBool(self.arena, done));
+        return val_mod.makeObject(self.arena, obj);
+    }
+
+    /// Build the suspended-frame state shared by generators and async functions:
+    /// a fresh call env with params bound, register file with params seeded, and
+    /// a BcGeneratorState registered for GC scanning. The frame starts at pc 0.
+    fn buildGenState(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value) !*BcGeneratorState {
+        const call_env = try Environment.init(self.arena, def_env);
+        for (fn_ptr.param_names, 0..) |pname, i| {
+            const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
+            try call_env.define(pname, av);
+        }
+        const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
+        const regs = try self.arena.alloc(Value, num_regs);
+        for (regs) |*r| r.* = Value{};
+        for (fn_ptr.param_names, 0..) |_, i| {
+            if (i < num_regs) regs[i] = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
+        }
+        const state = try self.arena.create(BcGeneratorState);
+        state.* = .{
+            .vm = self,
+            .frame = .{
+                .func = fn_ptr,
+                .pc = 0,
+                .registers = regs,
+                .env = call_env,
+                .return_dst = 0xFF,
+                .caller_idx = 0,
+                .this_val = this_val,
+            },
+        };
+        try self.generators.append(self.arena, state);
+        return state;
+    }
+
+    /// Create a generator object for a `function*` call instead of running it.
+    fn buildGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value) !Value {
+        const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
+
+        const obj = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        obj.internal_kind = .generator;
+        obj.internal_slot = state;
+        try obj.set("next", try val_mod.makeNativeFunction(self.arena, nativeGenNext));
+        try obj.set("return", try val_mod.makeNativeFunction(self.arena, nativeGenReturn));
+        try obj.set("throw", try val_mod.makeNativeFunction(self.arena, nativeGenThrow));
+        try obj.set("@@iterator", try val_mod.makeNativeFunction(self.arena, nativeGenSelfIter));
+        return val_mod.makeObject(self.arena, obj);
+    }
+
+    /// Resume a suspended coroutine (generator or async fn) until its next YIELD
+    /// (await/yield point) or completion. Uses the scoped-runLoop pattern of
+    /// native re-entry (return_dst == 0xFF). `kind` selects normal resume vs.
+    /// throwing at the suspended point (rejected await / generator.throw).
+    fn runSuspendable(self: *BcVm, state: *BcGeneratorState, kind: ResumeKind) !SuspendResult {
+        if (state.done) {
+            return switch (kind) {
+                .next => SuspendResult{ .returned = try val_mod.makeUndefined(self.arena) },
+                .throw_ => |e| SuspendResult{ .threw = e },
+            };
+        }
+        const base = self.frames.items.len;
+        var frame_copy = state.frame;
+        frame_copy.gen = state;
+        frame_copy.return_dst = 0xFF;
+        frame_copy.caller_idx = if (base > 0) base - 1 else null;
+        try self.frames.append(self.arena, frame_copy);
+        const top = &self.frames.items[self.frames.items.len - 1];
+
+        switch (kind) {
+            .next => |sent| {
+                if (state.started) top.registers[state.resume_reg] = sent;
+            },
+            .throw_ => |err| {
+                // Inject the exception at the suspended point: walk this frame's
+                // try stack for a handler (the YIELD was inside the async fn's
+                // own frame). If none, the exception escapes the coroutine.
+                self.last_exception_value = err;
+                if (top.try_stack.items.len > 0) {
+                    const entry = top.try_stack.pop().?;
+                    top.pc = entry.handler_pc;
+                    if (entry.rexc != 0xFF) top.registers[entry.rexc] = err;
+                } else {
+                    _ = self.frames.pop();
+                    state.done = true;
+                    return SuspendResult{ .threw = err };
+                }
+            },
+        }
+        state.started = true;
+        self.gen_yielded = false;
+        while (self.frames.items.len > base) {
+            const outcome = try self.runLoop();
+            switch (outcome) {
+                .ok => break,
+                .exception => {
+                    while (self.frames.items.len > base) _ = self.frames.pop();
+                    state.done = true;
+                    return SuspendResult{ .threw = self.last_exception_value };
+                },
+                .exception_value => |ev| {
+                    while (self.frames.items.len > base) _ = self.frames.pop();
+                    state.done = true;
+                    return SuspendResult{ .threw = ev.value };
+                },
+            }
+        }
+        if (self.gen_yielded) {
+            self.gen_yielded = false;
+            return SuspendResult{ .yielded = self.result };
+        }
+        state.done = true;
+        return SuspendResult{ .returned = self.result };
+    }
+
+    /// Resume a generator and wrap the outcome as an iterator result object.
+    /// Exceptions propagate to the `.next()`/`.throw()` caller as before.
+    fn resumeGenerator(self: *BcVm, state: *BcGeneratorState, sent: Value) !Value {
+        const res = try self.runSuspendable(state, .{ .next = sent });
+        return switch (res) {
+            .yielded => |v| self.makeGenIterResult(v, false),
+            .returned => |v| self.makeGenIterResult(v, true),
+            .threw => |e| blk: {
+                @import("../runtime/realm.zig").pending_exception = e;
+                break :blk error.JsException;
+            },
+        };
+    }
+
+    // ---------------------------------------------------------- W2-async driver ---
+
+    /// Start an `async function` call: build the coroutine, create its pending
+    /// result promise, and drive it synchronously up to the first `await`.
+    /// Returns the result promise immediately.
+    fn buildAsyncFunction(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value) !Value {
+        const promise_mod = @import("../runtime/builtins/promise.zig");
+        const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
+        const result = try promise_mod.newPendingPromise(self.arena);
+        const actx = try self.arena.create(AsyncCtx);
+        actx.* = .{ .vm = self, .state = state, .result = result };
+        try self.async_ctxs.append(self.arena, actx);
+        try self.driveAsync(actx, .{ .next = try val_mod.makeUndefined(self.arena) });
+        return result;
+    }
+
+    /// Run one step of an async coroutine: resume it, then either settle the
+    /// result promise (completion/throw) or subscribe to the awaited value so a
+    /// microtask resumes the coroutine when it settles.
+    fn driveAsync(self: *BcVm, actx: *AsyncCtx, kind: ResumeKind) anyerror!void {
+        const promise_mod = @import("../runtime/builtins/promise.zig");
+        const res = try self.runSuspendable(actx.state, kind);
+        switch (res) {
+            .returned => |v| promise_mod.settleResult(self.arena, actx.result, v, true),
+            .threw => |e| promise_mod.settleResult(self.arena, actx.result, e, false),
+            .yielded => |awaited| {
+                const on_f = try val_mod.makeNativeFunctionData(self.arena, asyncOnFulfill, actx);
+                const on_r = try val_mod.makeNativeFunctionData(self.arena, asyncOnReject, actx);
+                try promise_mod.subscribeAwait(self.arena, awaited, on_f, on_r);
+            },
+        }
+    }
+
     fn jsAdd(self: *BcVm, left: Value, right: Value) !Value {
         const ls = isStringOrObject(left);
         const rs = isStringOrObject(right);
@@ -1984,6 +2376,66 @@ pub const BcVm = struct {
         return val_mod.makeNumber(self.arena, toNumber(left) + toNumber(right));
     }
 };
+
+// ---------------------------------------------------------------- W2 generator natives ---
+
+fn genStateFrom(this_val: Value) ?*BcGeneratorState {
+    if (this_val.bits == 0 or this_val.unbox() != .object) return null;
+    const obj = this_val.toPtr().object;
+    if (obj.internal_kind != .generator) return null;
+    if (obj.internal_slot) |slot| return @ptrCast(@alignCast(slot));
+    return null;
+}
+
+fn nativeGenNext(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const state = genStateFrom(this_val) orelse return error.JsException;
+    const sent = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    return state.vm.resumeGenerator(state, sent);
+}
+
+fn nativeGenReturn(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const state = genStateFrom(this_val) orelse return error.JsException;
+    state.done = true;
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    return state.vm.makeGenIterResult(v, true);
+}
+
+fn nativeGenThrow(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const state = genStateFrom(this_val) orelse return error.JsException;
+    state.done = true;
+    @import("../runtime/realm.zig").pending_exception = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    return error.JsException;
+}
+
+fn nativeGenSelfIter(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return this_val;
+}
+
+// ---------------------------------------------------------------- W2-async natives ---
+// Promise-reaction continuations bound (via makeNativeFunctionData) to an
+// AsyncCtx pointer. Recovered through the active-native-data slot, which the
+// native dispatcher sets immediately before the call.
+
+fn asyncCtxFromActive() ?*AsyncCtx {
+    const slot = val_mod.g_active_native_data orelse return null;
+    return @ptrCast(@alignCast(slot));
+}
+
+/// Awaited promise fulfilled: resume the coroutine with the resolved value.
+fn asyncOnFulfill(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const actx = asyncCtxFromActive() orelse return val_mod.makeUndefined(arena);
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    try actx.vm.driveAsync(actx, .{ .next = v });
+    return val_mod.makeUndefined(arena);
+}
+
+/// Awaited promise rejected: throw the reason at the suspended await point.
+fn asyncOnReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const actx = asyncCtxFromActive() orelse return val_mod.makeUndefined(arena);
+    const e = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    try actx.vm.driveAsync(actx, .{ .throw_ = e });
+    return val_mod.makeUndefined(arena);
+}
 
 // ---------------------------------------------------------------- GC scan callback ---
 
@@ -2000,6 +2452,18 @@ fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
         gc_mod.traceValue(frame.this_val, mark_fn);
         // Environment chain
         gc_mod.traceEnvironment(frame.env, mark_fn);
+    }
+    // W2: suspended generator frames are off the active stack but still live.
+    for (vm.generators.items) |state| {
+        if (state.done) continue;
+        for (state.frame.registers) |reg| gc_mod.traceValue(reg, mark_fn);
+        gc_mod.traceValue(state.frame.this_val, mark_fn);
+        gc_mod.traceEnvironment(state.frame.env, mark_fn);
+    }
+    // W2-async: keep each in-flight async function's result promise alive while
+    // it is pending (its suspended frame is scanned via `generators` above).
+    for (vm.async_ctxs.items) |actx| {
+        gc_mod.traceValue(actx.result, mark_fn);
     }
 }
 

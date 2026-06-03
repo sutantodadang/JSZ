@@ -411,36 +411,48 @@ pub fn nativePromiseCatch(arena: std.mem.Allocator, this_val: Value, args: []con
 }
 
 fn runReactionJob(arena: std.mem.Allocator, job: Job) void {
-    if (job.input_state == .fulfilled) {
-        if (job.reaction.on_fulfilled.bits != 0 and isCallable(job.reaction.on_fulfilled)) {
-            const r = fn_proto.invokeCallback(arena, val_mod.makeUndefined(arena) catch Value{}, job.reaction.on_fulfilled, &[_]Value{job.input_value}) catch {
-                settlePromise(job.reaction.next_data, .rejected, realm_mod.pending_exception);
-                flushReactions(arena, job.reaction.next_data);
+    // Snapshot every field into stack locals BEFORE any callback. A reaction can
+    // enqueue more jobs (e.g. an async coroutine awaiting another promise), which
+    // reallocates `microtasks`; since `job` may be passed by reference to an
+    // element of that buffer, touching `job.*` afterward would read freed memory.
+    const next_data = job.reaction.next_data;
+    const on_fulfilled = job.reaction.on_fulfilled;
+    const on_rejected = job.reaction.on_rejected;
+    const input_state = job.input_state;
+    const input_value = job.input_value;
+    if (input_state == .fulfilled) {
+        if (on_fulfilled.bits != 0 and isCallable(on_fulfilled)) {
+            const r = fn_proto.invokeCallback(arena, val_mod.makeUndefined(arena) catch Value{}, on_fulfilled, &[_]Value{input_value}) catch {
+                settlePromise(next_data, .rejected, realm_mod.pending_exception);
+                flushReactions(arena, next_data);
                 realm_mod.pending_exception = Value{};
                 return;
             };
-            adoptOrFulfill(arena, job.reaction.next_data, r) catch {};
+            adoptOrFulfill(arena, next_data, r) catch {};
         } else {
-            settlePromise(job.reaction.next_data, .fulfilled, job.input_value);
-            flushReactions(arena, job.reaction.next_data);
+            settlePromise(next_data, .fulfilled, input_value);
+            flushReactions(arena, next_data);
         }
     } else {
-        if (job.reaction.on_rejected.bits != 0 and isCallable(job.reaction.on_rejected)) {
-            const r = fn_proto.invokeCallback(arena, val_mod.makeUndefined(arena) catch Value{}, job.reaction.on_rejected, &[_]Value{job.input_value}) catch {
-                settlePromise(job.reaction.next_data, .rejected, realm_mod.pending_exception);
-                flushReactions(arena, job.reaction.next_data);
+        if (on_rejected.bits != 0 and isCallable(on_rejected)) {
+            const r = fn_proto.invokeCallback(arena, val_mod.makeUndefined(arena) catch Value{}, on_rejected, &[_]Value{input_value}) catch {
+                settlePromise(next_data, .rejected, realm_mod.pending_exception);
+                flushReactions(arena, next_data);
                 realm_mod.pending_exception = Value{};
                 return;
             };
-            adoptOrFulfill(arena, job.reaction.next_data, r) catch {};
+            adoptOrFulfill(arena, next_data, r) catch {};
         } else {
-            settlePromise(job.reaction.next_data, .rejected, job.input_value);
-            flushReactions(arena, job.reaction.next_data);
+            settlePromise(next_data, .rejected, input_value);
+            flushReactions(arena, next_data);
         }
     }
 }
 
 pub fn runMicrotasks(arena: std.mem.Allocator) void {
+    // Index by position: reactions may enqueue more jobs (growing the list). A
+    // job's fields are snapshotted inside runReactionJob, so a reallocation here
+    // can't dangle a reference (see runReactionJob).
     var idx: usize = 0;
     while (idx < microtasks.items.len) : (idx += 1) {
         runReactionJob(arena, microtasks.items[idx]);
@@ -477,4 +489,34 @@ pub fn nativeAwait(arena: std.mem.Allocator, _: Value, args: []const Value) anye
 pub fn nativeRunMicrotasks(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
     runMicrotasks(arena);
     return val_mod.makeUndefined(arena);
+}
+
+// -------------------------------------------------------- W2-async driver hooks ---
+// These let the bytecode VM build a real async function as a reaction-driven
+// coroutine: a pending result promise, plus per-await subscriptions that resume
+// the suspended coroutine via the microtask queue.
+
+/// Create a fresh pending promise (the async function's result promise).
+pub fn newPendingPromise(arena: std.mem.Allocator) !Value {
+    return makePendingPromise(arena);
+}
+
+/// Settle an async function's result promise. `fulfill` true resolves with `v`
+/// (adopting it if it is a thenable/promise — this is `return await`/`return p`
+/// semantics); false rejects with `v`.
+pub fn settleResult(arena: std.mem.Allocator, promise: Value, v: Value, fulfill: bool) void {
+    const d = getData(promise) orelse return;
+    if (fulfill) {
+        promiseResolveData(arena, d, v);
+    } else {
+        promiseRejectData(arena, d, v);
+    }
+}
+
+/// `Promise.resolve(awaited).then(on_fulfilled, on_rejected)` — used by the async
+/// driver to resume the coroutine when the awaited value settles. The throwaway
+/// chained promise is ignored.
+pub fn subscribeAwait(arena: std.mem.Allocator, awaited: Value, on_fulfilled: Value, on_rejected: Value) !void {
+    const p = try nativePromiseResolve(arena, try val_mod.makeUndefined(arena), &[_]Value{awaited});
+    _ = try nativePromiseThen(arena, p, &[_]Value{ on_fulfilled, on_rejected });
 }

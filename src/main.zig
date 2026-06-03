@@ -24,7 +24,7 @@ const Args = struct {
     mode: Mode,
     expr: []const u8 = "",
     script_path: []const u8 = "",
-    interp: jsz.InterpMode = .tree,
+    interp: jsz.InterpMode = .bc,
     dump_bytecode: bool = false,
     source_map: bool = false,
     debug: bool = false,
@@ -33,6 +33,7 @@ const Args = struct {
     gc_stats: bool = false,
     gc_after_eval: bool = false,
     jit_mode: jsz.JitMode = .off,
+    limits: jsz.Limits = .{},
 };
 
 fn parseArgs(argv: []const []const u8) Args {
@@ -116,6 +117,20 @@ fn parseArgs(argv: []const []const u8) Args {
             args.interp = .bc; // profiler only runs in bc VM
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--mem-limit=")) {
+            args.limits.mem_bytes = std.fmt.parseInt(usize, arg["--mem-limit=".len..], 10) catch 0;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--gas-limit=")) {
+            args.limits.gas = std.fmt.parseInt(u64, arg["--gas-limit=".len..], 10) catch 0;
+            args.interp = .bc; // gas is enforced in the bytecode VM
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--time-limit=")) {
+            args.limits.time_ms = std.fmt.parseInt(u64, arg["--time-limit=".len..], 10) catch 0;
+            args.interp = .bc; // wall-clock deadline is enforced in the bytecode VM
+            continue;
+        }
         // Positional: treat as script path.
         if (!std.mem.startsWith(u8, arg, "-")) {
             args.mode = .script;
@@ -138,7 +153,7 @@ fn printHelp(writer: anytype) !void {
         \\  -h, --help             Print this help and exit
         \\  -e <expr>              Evaluate an expression and print result
         \\  -i, --interactive      Start interactive REPL
-        \\  --interp=tree|bc       Choose interpreter: tree-walker (default) or bytecode VM
+        \\  --interp=tree|bc       Choose interpreter: bytecode VM (default) or the legacy tree-walker
         \\  --dump-bytecode        Compile and disassemble to stdout, then exit
         \\  --source-map           Print a bytecode->source JSON source map, then exit
         \\  --debug                Attach a stub debugger (prints on `debugger;`); implies --interp=bc
@@ -147,6 +162,9 @@ fn printHelp(writer: anytype) !void {
         \\  --gc-stats             Print GC stats after eval
         \\  --gc-after-eval        Trigger a GC cycle before printing stats
         \\  --jit=off|count|experimental  Profile hot bytecode sites (count) or attempt native compile (experimental); implies --interp=bc
+        \\  --mem-limit=<bytes>    Cap live memory; over-budget eval throws instead of crashing
+        \\  --gas-limit=<n>        Cap executed bytecode instructions (implies --interp=bc)
+        \\  --time-limit=<ms>      Cap wall-clock execution time (implies --interp=bc)
         \\
         \\Examples:
         \\  jsz --version
@@ -173,7 +191,7 @@ fn debugHook(_: ?*anyopaque, stop: jsz.debug.DebugStop) void {
     e.flush() catch {};
 }
 
-fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode) !void {
+fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode, limits: jsz.Limits) !void {
     if (dump_bc or source_map) {
         // Compile-only modes: delegate to the jsz public API and exit.
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -219,6 +237,7 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
     defer ctx.deinit();
     ctx.setInterpMode(interp);
     ctx.setJitMode(jit_mode);
+    ctx.setLimits(limits);
 
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
@@ -387,7 +406,7 @@ pub fn main() !void {
             }
         },
         .eval => {
-            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode);
+            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits);
         },
         .interactive => {
             try runRepl(allocator, args.interp);
@@ -408,7 +427,7 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer allocator.free(cjs_wrapped);
-            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode);
+            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits);
         },
     }
 }

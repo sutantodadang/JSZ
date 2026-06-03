@@ -14,6 +14,60 @@ const jit_mod = @import("../jit/jit.zig");
 
 pub const InterpMode = enum { tree, bc };
 
+/// W3: an allocator wrapper enforcing a live-bytes budget. When `limit` is
+/// non-zero, allocations that would push live bytes past it fail with OOM,
+/// which propagates up as a catchable host error (never a crash).
+pub const LimitAllocator = struct {
+    child: std.mem.Allocator,
+    limit: usize = 0,
+    used: usize = 0,
+
+    pub fn init(child: std.mem.Allocator, limit: usize) LimitAllocator {
+        return .{ .child = child, .limit = limit };
+    }
+
+    pub fn allocator(self: *LimitAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *LimitAllocator = @ptrCast(@alignCast(ctx));
+        if (self.limit != 0 and self.used + len > self.limit) return null;
+        const p = self.child.rawAlloc(len, a, ra) orelse return null;
+        self.used += len;
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *LimitAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > buf.len and self.limit != 0 and self.used + (new_len - buf.len) > self.limit) return false;
+        if (!self.child.rawResize(buf, a, new_len, ra)) return false;
+        self.used = self.used - buf.len + new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *LimitAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > buf.len and self.limit != 0 and self.used + (new_len - buf.len) > self.limit) return null;
+        const p = self.child.rawRemap(buf, a, new_len, ra) orelse return null;
+        self.used = self.used - buf.len + new_len;
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *LimitAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(buf, a, ra);
+        self.used -= buf.len;
+    }
+};
+
 /// Phase 9: snapshot of JIT profiling data from the most recent bc-mode eval.
 pub const JitProfile = struct {
     hot_sites: usize = 0,
@@ -25,6 +79,9 @@ pub const JitProfile = struct {
 pub const IsolateImpl = struct {
     /// Base allocator (owns the eval arena and the GC heap).
     backing: std.mem.Allocator,
+    /// W3: memory-budget wrapper around `backing`. The arena + heap allocate
+    /// through this, so the limit covers parser, compiler, VM, and GC alike.
+    limiter: LimitAllocator,
     /// Arena for a single eval call. Reset after each eval().
     eval_arena: std.heap.ArenaAllocator,
     /// Phase 3b: GC heap. Owned by the IsolateImpl.
@@ -36,15 +93,31 @@ pub const IsolateImpl = struct {
     jit_mode: jit_mod.JitMode = .off,
     /// Phase 9: profile snapshot from the most recent bc-mode eval.
     last_jit_profile: JitProfile = .{},
+    /// W3: gas (instruction) budget and wall-clock budget (ms) for the next
+    /// bc-mode eval. 0 = unlimited.
+    gas_limit: u64 = 0,
+    time_limit_ms: u64 = 0,
 
     pub fn init(backing: std.mem.Allocator) !*IsolateImpl {
         const impl = try backing.create(IsolateImpl);
         impl.* = IsolateImpl{
             .backing = backing,
-            .eval_arena = std.heap.ArenaAllocator.init(backing),
-            .heap = Heap.init(backing),
+            .limiter = LimitAllocator.init(backing, 0),
+            .eval_arena = undefined,
+            .heap = undefined,
         };
+        const lim = impl.limiter.allocator();
+        impl.eval_arena = std.heap.ArenaAllocator.init(lim);
+        impl.heap = Heap.init(lim);
         return impl;
+    }
+
+    /// W3: set resource limits. 0 = unlimited. Memory applies isolate-wide
+    /// immediately; gas/time apply to subsequent bc-mode evals.
+    pub fn setLimits(self: *IsolateImpl, mem_bytes: usize, gas: u64, time_ms: u64) void {
+        self.limiter.limit = mem_bytes;
+        self.gas_limit = gas;
+        self.time_limit_ms = time_ms;
     }
 
     pub fn deinit(self: *IsolateImpl) void {
@@ -78,9 +151,10 @@ pub const IsolateImpl = struct {
         self.jit_mode = m;
     }
 
-    /// Run one eval call in tree mode (Phase 1 default). Resets the eval arena on entry.
+    /// Run one eval call in the bytecode VM (W2: bc is the default engine).
+    /// Resets the eval arena on entry.
     pub fn eval(self: *IsolateImpl, source: []const u8) !EvalOutcome {
-        return self.evalWithMode(source, .tree, &[_]val_mod.NativeBinding{});
+        return self.evalWithMode(source, .bc, &[_]val_mod.NativeBinding{});
     }
 
     pub fn evalWithMode(self: *IsolateImpl, source: []const u8, mode: InterpMode, native_bindings: []const val_mod.NativeBinding) !EvalOutcome {
@@ -157,8 +231,16 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__runMicrotasks__", microtask_fn);
         const await_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeAwait);
         try realm.global_env.define("__await__", await_fn);
+        // W2: generic iteration helpers used by the bc for-of loop.
+        const es2015 = @import("../runtime/builtins/es2015_collections.zig");
+        try realm.global_env.define("__getIterator__", try val_mod.makeNativeFunction(arena, es2015.nativeGetIterator));
+        try realm.global_env.define("__iterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeIterStep));
 
         var bc_vm = BcVm.initWithHeap(arena, &realm, &self.heap);
+        // W3: apply resource limits to this run.
+        bc_vm.gas_limit = self.gas_limit;
+        if (self.time_limit_ms != 0)
+            bc_vm.deadline_ns = std.time.nanoTimestamp() + @as(i128, self.time_limit_ms) * std.time.ns_per_ms;
         // Phase 9: attach JIT profiler when a mode other than .off is requested.
         var jc: jit_mod.JitCompiler = undefined;
         if (self.jit_mode != .off) {
@@ -371,4 +453,32 @@ test "IsolateImpl: gc() returns stats" {
     defer impl.deinit();
     const stats = impl.gc();
     try std.testing.expectEqual(@as(usize, 0), stats.freed_objects);
+}
+
+test "W3: gas limit interrupts an infinite loop (bc)" {
+    const impl = try IsolateImpl.init(std.testing.allocator);
+    defer impl.deinit();
+    impl.setLimits(0, 100_000, 0);
+    const r = try impl.evalWithMode("while(true){}", .bc, &[_]val_mod.NativeBinding{});
+    try std.testing.expect(r == .exception);
+    try std.testing.expectEqualStrings("interrupted: gas limit exceeded", r.exception);
+}
+
+test "W3: time limit interrupts an infinite loop (bc)" {
+    const impl = try IsolateImpl.init(std.testing.allocator);
+    defer impl.deinit();
+    impl.setLimits(0, 0, 10);
+    const r = try impl.evalWithMode("while(true){}", .bc, &[_]val_mod.NativeBinding{});
+    try std.testing.expect(r == .exception);
+    try std.testing.expectEqualStrings("interrupted: time limit exceeded", r.exception);
+}
+
+test "W3: LimitAllocator enforces a live-byte budget" {
+    var lim = LimitAllocator.init(std.testing.allocator, 128);
+    const a = lim.allocator();
+    const p = try a.alloc(u8, 100);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 100));
+    a.free(p);
+    const q = try a.alloc(u8, 100); // budget freed up
+    a.free(q);
 }

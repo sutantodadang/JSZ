@@ -135,9 +135,12 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
     var new_pc = pc + 1;
     switch (op) {
         .LOAD_K => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
@@ -156,18 +159,29 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             }
         },
         .LOAD_TRUE, .LOAD_FALSE, .LOAD_NULL, .LOAD_UNDEF => {
-            const rdst = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d}", .{rdst});
         },
         .MOVE => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const rsrc = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const rsrc = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} R{d}", .{ rdst, rsrc });
         },
+        .YIELD => {
+            const r = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d}", .{r});
+        },
         .GET_GLOBAL => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
@@ -185,10 +199,13 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             }
         },
         .SET_GLOBAL => {
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
-            const rsrc = code[new_pc]; new_pc += 1;
+            const rsrc = code[new_pc];
+            new_pc += 1;
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
@@ -205,77 +222,103 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             }
         },
         .GET_LOCAL => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const slot = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const slot = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} slot{d}", .{ rdst, slot });
         },
         .SET_LOCAL => {
-            const slot = code[new_pc]; new_pc += 1;
-            const rsrc = code[new_pc]; new_pc += 1;
+            const slot = code[new_pc];
+            new_pc += 1;
+            const rsrc = code[new_pc];
+            new_pc += 1;
             try writer.print(" slot{d} R{d}", .{ slot, rsrc });
         },
-        .ADD, .SUB, .MUL, .DIV, .MOD, .EXP,
-        .BIT_AND, .BIT_OR, .BIT_XOR, .SHL, .SHR, .USHR,
-        .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const rlhs = code[new_pc]; new_pc += 1;
-            const rrhs = code[new_pc]; new_pc += 1;
+        .ADD, .SUB, .MUL, .DIV, .MOD, .EXP, .BIT_AND, .BIT_OR, .BIT_XOR, .SHL, .SHR, .USHR, .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE => {
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const rlhs = code[new_pc];
+            new_pc += 1;
+            const rrhs = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} R{d} R{d}", .{ rdst, rlhs, rrhs });
         },
         .NEG, .BIT_NOT, .NOT, .TYPEOF => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const rsrc = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const rsrc = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} R{d}", .{ rdst, rsrc });
         },
         .JMP => {
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
             const target: i64 = @intCast(new_pc);
             try writer.print(" -> {d}", .{target + offset});
         },
         .JMP_IF_TRUE, .JMP_IF_FALSE => {
-            const rcond = code[new_pc]; new_pc += 1;
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const rcond = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
             const target: i64 = @intCast(new_pc);
             try writer.print(" R{d} -> {d}", .{ rcond, target + offset });
         },
         .NEW_CLOSURE => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const fidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
             try writer.print(" R{d} func[{d}]", .{ rdst, fidx });
         },
         .CALL, .TAIL_CALL => {
-            const base = code[new_pc]; new_pc += 1;
-            const nargs = code[new_pc]; new_pc += 1;
-            const ret_dst = code[new_pc]; new_pc += 1;
+            const base = code[new_pc];
+            new_pc += 1;
+            const nargs = code[new_pc];
+            new_pc += 1;
+            const ret_dst = code[new_pc];
+            new_pc += 1;
             try writer.print(" base=R{d} nargs={d} ret=R{d}", .{ base, nargs, ret_dst });
         },
         .RETURN => {
-            const rsrc = code[new_pc]; new_pc += 1;
+            const rsrc = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d}", .{rsrc});
         },
         .RETURN_UNDEF, .HALT, .DEBUGGER => {},
         // Phase 3a
         .NEW_OBJECT => {
-            const rdst = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d}", .{rdst});
         },
         .NEW_ARRAY => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const len = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const len = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} len={d}", .{ rdst, len });
         },
         .SET_PROP => {
-            const robj = code[new_pc]; new_pc += 1;
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const robj = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
-            const rval = code[new_pc]; new_pc += 1;
+            const rval = code[new_pc];
+            new_pc += 1;
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
@@ -291,10 +334,14 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             }
         },
         .GET_PROP => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const robj = code[new_pc]; new_pc += 1;
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const robj = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
@@ -311,77 +358,108 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             }
         },
         .SET_PROP_DYN => {
-            const robj = code[new_pc]; new_pc += 1;
-            const rkey = code[new_pc]; new_pc += 1;
-            const rval = code[new_pc]; new_pc += 1;
+            const robj = code[new_pc];
+            new_pc += 1;
+            const rkey = code[new_pc];
+            new_pc += 1;
+            const rval = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d}[R{d}] = R{d}", .{ robj, rkey, rval });
         },
         .GET_PROP_DYN => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const robj = code[new_pc]; new_pc += 1;
-            const rkey = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const robj = code[new_pc];
+            new_pc += 1;
+            const rkey = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} = R{d}[R{d}]", .{ rdst, robj, rkey });
         },
         .GET_THIS => {
-            const rdst = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d}", .{rdst});
         },
         .METHOD_CALL => {
-            const base = code[new_pc]; new_pc += 1;
-            const nargs = code[new_pc]; new_pc += 1;
-            const ret_dst = code[new_pc]; new_pc += 1;
+            const base = code[new_pc];
+            new_pc += 1;
+            const nargs = code[new_pc];
+            new_pc += 1;
+            const ret_dst = code[new_pc];
+            new_pc += 1;
             try writer.print(" this=R{d} fn=R{d} nargs={d} ret=R{d}", .{ base, base + 1, nargs, ret_dst });
         },
         // Phase 4a opcodes
         .THROW => {
-            const rsrc = code[new_pc]; new_pc += 1;
+            const rsrc = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d}", .{rsrc});
         },
         .PUSH_TRY => {
-            const rexc = code[new_pc]; new_pc += 1;
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const rexc = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
             try writer.print(" exc=R{d} handler_off={d}", .{ rexc, offset });
         },
         .POP_TRY => {},
         .NEW_INSTANCE => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const base = code[new_pc]; new_pc += 1;
-            const nargs = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const base = code[new_pc];
+            new_pc += 1;
+            const nargs = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} ctor=R{d} nargs={d}", .{ rdst, base, nargs });
         },
         .INSTANCEOF => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const rlhs = code[new_pc]; new_pc += 1;
-            const rrhs = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const rlhs = code[new_pc];
+            new_pc += 1;
+            const rrhs = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} = R{d} instanceof R{d}", .{ rdst, rlhs, rrhs });
         },
         // Phase 4d
         .GET_KEYS => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const robj = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const robj = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} = keys(R{d})", .{ rdst, robj });
         },
         .INC, .DEC => {
-            const rdst = code[new_pc]; new_pc += 1;
-            const rsrc = code[new_pc]; new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const rsrc = code[new_pc];
+            new_pc += 1;
             try writer.print(" R{d} R{d}", .{ rdst, rsrc });
         },
         .JSEQ, .JGE => {
-            const rlhs = code[new_pc]; new_pc += 1;
-            const rrhs = code[new_pc]; new_pc += 1;
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const rlhs = code[new_pc];
+            new_pc += 1;
+            const rrhs = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
             const target: i64 = @intCast(new_pc);
             try writer.print(" R{d} R{d} -> {d}", .{ rlhs, rrhs, target + offset });
         },
         .DEFINE_GLOBAL => {
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
-            const rsrc = code[new_pc]; new_pc += 1;
+            const rsrc = code[new_pc];
+            new_pc += 1;
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
@@ -398,9 +476,12 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             }
         },
         .JMP_IF_NULLISH, .JMP_IF_NOT_NULLISH => {
-            const rcond = code[new_pc]; new_pc += 1;
-            const lo = code[new_pc]; new_pc += 1;
-            const hi = code[new_pc]; new_pc += 1;
+            const rcond = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
             const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
             const target: i64 = @intCast(new_pc);
             try writer.print(" R{d} -> {d}", .{ rcond, target + offset });

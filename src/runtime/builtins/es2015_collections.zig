@@ -331,3 +331,92 @@ pub fn nativeSetIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
     iter.index += 1;
     return makeIteratorResult(arena, value, false);
 }
+
+// ---------------------------------------------------------- W2: generic iteration ---
+// Used by the bytecode for-of loop. __getIterator__(x) returns an iterator object
+// (one exposing next()); __iterStep__(it) calls it.next() and returns the result.
+
+const function_proto = @import("function_proto.zig");
+
+fn isCallable(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .native_function, .bc_function, .function => true,
+        .object => |o| o.get("__call__") != null or o.internal_kind == .bound_function,
+        else => false,
+    };
+}
+
+/// Per-instance state for the array/string fallback iterator.
+const SeqIterData = struct { seq: Value, index: usize = 0, is_string: bool };
+
+fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    obj.internal_slot = d;
+    try obj.set("next", try val_mod.makeNativeFunction(arena, nativeSeqIterNext));
+    return val_mod.makeObject(arena, obj);
+}
+
+fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const obj = this_val.toPtr().object;
+    const d: *SeqIterData = @ptrCast(@alignCast(obj.internal_slot.?));
+    if (d.is_string) {
+        const s = d.seq.unbox().string;
+        if (d.index >= s.len) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+        const ch = try arena.dupe(u8, s[d.index .. d.index + 1]);
+        d.index += 1;
+        return makeIteratorResult(arena, try val_mod.makeString(arena, ch), false);
+    }
+    const arr = d.seq.toPtr().object;
+    if (d.index >= arr.getArrayLength()) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const idx_str = try std.fmt.allocPrint(arena, "{d}", .{d.index});
+    const v = arr.get(idx_str) orelse try val_mod.makeUndefined(arena);
+    d.index += 1;
+    return makeIteratorResult(arena, v, false);
+}
+
+/// __getIterator__(x): obtain an iterator (object with next()) for `x`.
+pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const x = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (x.bits != 0 and x.unbox() == .object) {
+        const obj = x.toPtr().object;
+        // Already an iterator (e.g. a generator) — it exposes next().
+        if (obj.get("next")) |nx| {
+            if (isCallable(nx)) return x;
+        }
+        // Iterable — call its @@iterator method.
+        if (obj.get("@@iterator")) |itf| {
+            if (isCallable(itf)) return function_proto.invokeCallback(arena, x, itf, &[_]Value{});
+        }
+        // Array fallback: synthesize an index iterator.
+        if (obj.is_array) {
+            const d = try arena.create(SeqIterData);
+            d.* = .{ .seq = x, .index = 0, .is_string = false };
+            return makeSeqIterator(arena, d);
+        }
+    }
+    if (x.bits != 0 and x.unbox() == .string) {
+        const d = try arena.create(SeqIterData);
+        d.* = .{ .seq = x, .index = 0, .is_string = true };
+        return makeSeqIterator(arena, d);
+    }
+    realm_mod.pending_exception = try makeTypeErrorVal(arena, "value is not iterable");
+    return error.JsException;
+}
+
+/// __iterStep__(it): call it.next() and return the {value,done} result.
+pub fn nativeIterStep(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const it = if (args.len > 0) args[0] else return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    if (it.bits == 0 or it.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const nx = it.toPtr().object.get("next") orelse return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    return function_proto.invokeCallback(arena, it, nx, &[_]Value{});
+}
+
+fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
+    const proto: ?*JsObject = if (realm_mod.active_context) |_| null else null;
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
+    try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    return val_mod.makeObject(arena, obj);
+}

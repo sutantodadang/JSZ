@@ -162,6 +162,10 @@ pub const Op = enum(u8) {
     /// Fires the installed debug hook (runtime/debugger.zig active_hook); a
     /// no-op when no debugger is attached.
     DEBUGGER,
+    /// W2: YIELD — op, Rval u8 (2 bytes). Suspends the current generator frame,
+    /// surfacing R[Rval] as the yielded value. On resume the value passed to
+    /// .next(v) is written back into R[Rval] (so `x = yield e` works).
+    YIELD,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -236,6 +240,7 @@ pub fn instrSize(op: Op) usize {
         // Phase 8
         .TAIL_CALL => 4,
         .DEBUGGER => 1,
+        .YIELD => 2,
     };
 }
 

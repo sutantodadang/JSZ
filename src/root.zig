@@ -11,7 +11,7 @@ const val_mod = @import("./value/value.zig");
 
 pub const version = "0.0.0-phase9-scaffold";
 
-/// Interpreter mode: tree-walker (default) or bytecode VM.
+/// Interpreter mode: bytecode VM (default, W2) or the legacy tree-walker.
 pub const InterpMode = isolate_mod.InterpMode;
 
 /// Phase 9: JIT profiling mode.
@@ -92,6 +92,17 @@ pub const EvalResult = union(enum) {
     ok: Value,
     exception: Exception,
     parse_error: ParseError,
+};
+
+/// W3: resource limits for untrusted execution. 0 = unlimited.
+/// `mem_bytes` caps live heap+arena bytes (all interp modes); `gas` caps
+/// executed bytecode instructions and `time_ms` caps wall-clock — both enforced
+/// in the bytecode VM, so set `interp_mode = .bc` when relying on them. Limit
+/// breaches surface as `EvalResult.exception`, never a crash.
+pub const Limits = struct {
+    mem_bytes: usize = 0,
+    gas: u64 = 0,
+    time_ms: u64 = 0,
 };
 
 /// Stats returned by Context.gc() and available via Context.gcStats().
@@ -194,6 +205,9 @@ pub fn dumpBytecode(arena: std.mem.Allocator, source: []const u8, source_name: [
 /// Phase 8: debugger + source-map surface.
 pub const debug = @import("./runtime/debugger.zig");
 
+/// W5: internal regex engine, exposed for the fuzz harness. Not a stable API.
+pub const _regex = @import("./runtime/builtins/regexp.zig");
+
 /// Phase 8: bytecode snapshot (cache) serializer/deserializer. Advanced
 /// embedding surface; most users go through `Context.compileSnapshot`/`evalSnapshot`.
 pub const snapshot = @import("./bytecode/snapshot.zig");
@@ -254,11 +268,19 @@ pub const Isolate = struct {
 /// A JS execution context: owns the global object and intrinsics.
 pub const Context = struct {
     _isolate: *Isolate,
-    interp_mode: InterpMode = .tree,
+    // W2: the bytecode VM is the default engine; the tree-walker remains
+    // reachable via setInterpMode(.tree) but is being retired.
+    interp_mode: InterpMode = .bc,
     jit_mode: JitMode = .off,
+    limits: Limits = .{},
 
     pub fn setInterpMode(self: *Context, m: InterpMode) void {
         self.interp_mode = m;
+    }
+
+    /// W3: set resource limits for subsequent evals (see `Limits`).
+    pub fn setLimits(self: *Context, l: Limits) void {
+        self.limits = l;
     }
 
     /// Phase 9: set the JIT profiling mode. .count and .experimental imply bc interp.
@@ -274,6 +296,7 @@ pub const Context = struct {
         _ = source_name;
         const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
         impl.setJitMode(self.jit_mode);
+        impl.setLimits(self.limits.mem_bytes, self.limits.gas, self.limits.time_ms);
         const outcome = impl.evalWithMode(source, self.interp_mode, &[_]val_mod.NativeBinding{}) catch {
             return EvalResult{ .exception = Exception{
                 .value = Value{},

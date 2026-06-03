@@ -6,8 +6,15 @@ const std = @import("std");
 const jsz = @import("jsz");
 
 const TEST262_PATH = "external/test262/test";
+const HARNESS_PATH = "external/test262/harness";
 const WHITELIST_PATH = "tests/test262_whitelist.txt";
 const KNOWN_FAILING_PATH = "tests/test262_known_failing.txt";
+const KNOWN_FAILING_FULL_PATH = "tests/test262_known_failing_full.txt";
+
+/// Per-test outcome. `skip` = the test needs a feature the harness can't
+/// provide (module/raw/async flags, or an unreadable harness include) so it is
+/// excluded from the pass/fail denominator rather than counted as a failure.
+const Outcome = enum { pass, fail, skip };
 
 const Category = enum(u8) {
     builtins = 0,
@@ -200,57 +207,143 @@ fn expandWhitelist(arena: std.mem.Allocator, raw: []const []const u8) ![]const [
     return out.items;
 }
 
-fn runOneTest(allocator: std.mem.Allocator, path: []const u8, source: []const u8) !bool {
-    const meta = try parseMeta(allocator, source);
-    _ = path;
+/// Minimal Test262 harness prelude (sta.js + assert.js subset). Used for the
+/// curated whitelist run and as the fallback when the real harness dir is absent.
+const HARDCODED_PRELUDE =
+    \\function Test262Error(message) { this.message = message || ""; }
+    \\Test262Error.prototype.toString = function () { return "Test262Error: " + this.message; };
+    \\function $DONOTEVALUATE() { throw "Test262: This statement should not be evaluated."; }
+    \\var assert = function (mustBeTrue, message) {
+    \\  if (mustBeTrue === true) return;
+    \\  throw new Test262Error(message || "Expected true but got " + String(mustBeTrue));
+    \\};
+    \\assert._isSameValue = function (a, b) {
+    \\  if (a === b) return a !== 0 || 1 / a === 1 / b;
+    \\  return a !== a && b !== b;
+    \\};
+    \\assert.sameValue = function (actual, expected, message) {
+    \\  if (assert._isSameValue(actual, expected)) return;
+    \\  throw new Test262Error((message || "") + " Expected SameValue(" + String(actual) + ", " + String(expected) + ") to be true");
+    \\};
+    \\assert.notSameValue = function (actual, unexpected, message) {
+    \\  if (!assert._isSameValue(actual, unexpected)) return;
+    \\  throw new Test262Error((message || "") + " Expected SameValue to be false");
+    \\};
+    \\assert.throws = function (expectedErrorConstructor, func, message) {
+    \\  try { func(); } catch (thrown) { return; }
+    \\  throw new Test262Error((message || "") + " Expected a thrown error");
+    \\};
+    \\
+;
 
-    var iso = jsz.Isolate.init(allocator) catch return false;
+/// Return the value region of the `includes:` frontmatter key, covering both the
+/// inline `[a.js, b.js]` form and the indented block-list form.
+fn includesRegion(yaml: []const u8) []const u8 {
+    const key = "includes:";
+    const ii = std.mem.indexOf(u8, yaml, key) orelse return "";
+    const start = ii + key.len;
+    var end = std.mem.indexOfScalarPos(u8, yaml, ii, '\n') orelse return yaml[start..];
+    var p = end + 1;
+    while (p < yaml.len) {
+        if (yaml[p] == ' ' or yaml[p] == '\t') {
+            const nl = std.mem.indexOfScalarPos(u8, yaml, p, '\n') orelse yaml.len;
+            end = nl;
+            p = nl + 1;
+        } else break;
+    }
+    return yaml[start..end];
+}
+
+/// Looser eligibility for the full corpus: attempt anything except tests whose
+/// flags need features the single-file harness can't satisfy.
+fn isRunnableFull(source: []const u8) bool {
+    const yaml = frontmatter(source);
+    if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
+        const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
+        const flags = yaml[fi..line_end];
+        if (std.mem.indexOf(u8, flags, "module") != null) return false;
+        if (std.mem.indexOf(u8, flags, "raw") != null) return false;
+        if (std.mem.indexOf(u8, flags, "async") != null) return false;
+        if (std.mem.indexOf(u8, flags, "CanBlockIsFalse") != null) return false;
+    }
+    return true;
+}
+
+/// Collect every non-fixture `.js` test under TEST262_PATH (paths relative to it,
+/// forward-slash normalized). Runnability is decided per-test at run time.
+fn collectFullCorpus(arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {
+    var dir = std.fs.cwd().openDir(TEST262_PATH, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".js")) continue;
+        if (std.mem.indexOf(u8, entry.path, "_FIXTURE") != null) continue;
+        const norm = try arena.dupe(u8, entry.path);
+        for (norm) |*c| {
+            if (c.* == '\\') c.* = '/';
+        }
+        try out.append(arena, norm);
+    }
+}
+
+fn loadHarness(allocator: std.mem.Allocator, name: []const u8, out: *std.ArrayList(u8)) !void {
+    var pbuf: [512]u8 = undefined;
+    const p = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ HARNESS_PATH, name });
+    const src = try std.fs.cwd().readFileAlloc(allocator, p, 256 * 1024);
+    defer allocator.free(src);
+    try out.appendSlice(allocator, src);
+    try out.append(allocator, '\n');
+}
+
+/// Build the prelude from the real Test262 harness: sta.js + assert.js plus every
+/// file named in the test's `includes:`. Errors (missing include) propagate so the
+/// caller can mark the test skipped rather than failed.
+fn buildHarnessPrelude(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try loadHarness(allocator, "sta.js", &buf);
+    try loadHarness(allocator, "assert.js", &buf);
+    var it = std.mem.tokenizeAny(u8, includesRegion(frontmatter(source)), " \t\r\n[],");
+    while (it.next()) |tok| {
+        if (!std.mem.endsWith(u8, tok, ".js")) continue;
+        if (std.mem.eql(u8, tok, "sta.js") or std.mem.eql(u8, tok, "assert.js")) continue;
+        try loadHarness(allocator, tok, &buf);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool, harness_present: bool) !Outcome {
+    if (full_mode and !isRunnableFull(source)) return .skip;
+    const meta = try parseMeta(allocator, source);
+
+    var iso = jsz.Isolate.init(allocator) catch return .fail;
     defer iso.deinit();
-    var ctx = iso.newContext() catch return false;
+    var ctx = iso.newContext() catch return .fail;
     defer ctx.deinit();
 
-    // Minimal Test262 harness prelude (sta.js + assert.js subset).
-    const prelude =
-        \\function Test262Error(message) { this.message = message || ""; }
-        \\Test262Error.prototype.toString = function () { return "Test262Error: " + this.message; };
-        \\function $DONOTEVALUATE() { throw "Test262: This statement should not be evaluated."; }
-        \\var assert = function (mustBeTrue, message) {
-        \\  if (mustBeTrue === true) return;
-        \\  throw new Test262Error(message || "Expected true but got " + String(mustBeTrue));
-        \\};
-        \\assert._isSameValue = function (a, b) {
-        \\  if (a === b) return a !== 0 || 1 / a === 1 / b;
-        \\  return a !== a && b !== b;
-        \\};
-        \\assert.sameValue = function (actual, expected, message) {
-        \\  if (assert._isSameValue(actual, expected)) return;
-        \\  throw new Test262Error((message || "") + " Expected SameValue(" + String(actual) + ", " + String(expected) + ") to be true");
-        \\};
-        \\assert.notSameValue = function (actual, unexpected, message) {
-        \\  if (!assert._isSameValue(actual, unexpected)) return;
-        \\  throw new Test262Error((message || "") + " Expected SameValue to be false");
-        \\};
-        \\assert.throws = function (expectedErrorConstructor, func, message) {
-        \\  try { func(); } catch (thrown) { return; }
-        \\  throw new Test262Error((message || "") + " Expected a thrown error");
-        \\};
-        \\
-    ;
-    const full_source = std.fmt.allocPrint(allocator, "{s}{s}", .{ prelude, source }) catch return false;
+    const prelude_owned: ?[]u8 = if (full_mode and harness_present)
+        (buildHarnessPrelude(allocator, source) catch return .skip)
+    else
+        null;
+    defer if (prelude_owned) |p| allocator.free(p);
+    const prelude: []const u8 = prelude_owned orelse HARDCODED_PRELUDE;
+
+    const full_source = std.fmt.allocPrint(allocator, "{s}{s}", .{ prelude, source }) catch return .fail;
     defer allocator.free(full_source);
 
     const result = ctx.eval(full_source, "<test262>");
     if (meta.negative) {
         // Negative test: expect exception or parse error.
         return switch (result) {
-            .exception, .parse_error => true,
-            .ok => false,
+            .exception, .parse_error => .pass,
+            .ok => .fail,
         };
     }
     return switch (result) {
-        .ok => true,
-        .exception => false,
-        .parse_error => false,
+        .ok => .pass,
+        .exception, .parse_error => .fail,
     };
 }
 
@@ -431,15 +524,23 @@ pub fn main() !void {
 
     var list_mode = false;
     var summary_mode = false;
+    var full_mode = false;
     var fail_on_flips = true;
     var strict_failures = false;
     var dashboard_path: ?[]const u8 = null;
+    var write_failing_path: ?[]const u8 = null;
     var arg_idx: usize = 1;
     while (arg_idx < argv.len) : (arg_idx += 1) {
         const arg = argv[arg_idx];
         if (std.mem.eql(u8, arg, "--list")) {
             list_mode = true;
         } else if (std.mem.eql(u8, arg, "--summary")) {
+            summary_mode = true;
+            fail_on_flips = false;
+        } else if (std.mem.eql(u8, arg, "--full")) {
+            // Run the entire corpus instead of the curated whitelist. Defaults to
+            // baseline-reporting (no flip gate); pass --fail-on-flips to re-enable.
+            full_mode = true;
             summary_mode = true;
             fail_on_flips = false;
         } else if (std.mem.eql(u8, arg, "--fail-on-flips")) {
@@ -451,6 +552,11 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--dashboard") and arg_idx + 1 < argv.len) {
             arg_idx += 1;
             dashboard_path = argv[arg_idx];
+        } else if (std.mem.startsWith(u8, arg, "--write-known-failing=")) {
+            write_failing_path = arg["--write-known-failing=".len..];
+        } else if (std.mem.eql(u8, arg, "--write-known-failing") and arg_idx + 1 < argv.len) {
+            arg_idx += 1;
+            write_failing_path = argv[arg_idx];
         }
     }
 
@@ -464,22 +570,30 @@ pub fn main() !void {
     defer wl_arena.deinit();
     const whitelist = try expandWhitelist(wl_arena.allocator(), whitelist_data.entries.items);
 
-    // Load known failing list.
-    var known_data = try loadList(allocator, KNOWN_FAILING_PATH, 1 * 1024 * 1024);
+    // In full mode the test set is the entire corpus; otherwise the curated whitelist.
+    const tests: []const []const u8 = if (full_mode) blk: {
+        var corpus: std.ArrayList([]const u8) = .empty;
+        try collectFullCorpus(wl_arena.allocator(), &corpus);
+        break :blk corpus.items;
+    } else whitelist;
+
+    // Load known failing list (a separate, larger list backs full-corpus runs).
+    const known_path = if (full_mode) KNOWN_FAILING_FULL_PATH else KNOWN_FAILING_PATH;
+    var known_data = try loadList(allocator, known_path, 8 * 1024 * 1024);
     defer known_data.entries.deinit(allocator);
     defer if (known_data.source) |src| allocator.free(src);
 
     if (list_mode) {
-        try out.print("Test262 whitelist ({d} tests):\n", .{whitelist.len});
-        for (whitelist) |entry| {
+        try out.print("Test262 tests ({d}):\n", .{tests.len});
+        for (tests) |entry| {
             try out.print("  {s}\n", .{entry});
         }
         try out.flush();
         return;
     }
 
-    var categories = countWhitelistCategories(whitelist);
-    const total_count: u32 = @intCast(whitelist.len);
+    var categories = countWhitelistCategories(tests);
+    const total_count: u32 = @intCast(tests.len);
     const known_failing_count: u32 = @intCast(known_data.entries.items.len);
 
     // Check if test262 corpus exists after loading metadata so dashboard
@@ -520,13 +634,27 @@ pub fn main() !void {
     var seen_known = std.StringHashMap(void).init(allocator);
     defer seen_known.deinit();
 
-    // Run whitelisted tests.
+    // The real harness dir lets full mode load per-test `includes:` files.
+    const harness_present = blk: {
+        std.fs.cwd().access(HARNESS_PATH, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    // Run the selected tests.
+    // `quiet` = a full baseline run (no flip gate): suppress the per-test
+    // UNEXPECTED_/KNOWN_/STALE lines that would otherwise be thousands long. The
+    // delta gate (full + --fail-on-flips) keeps them so regressions are visible.
+    const quiet = full_mode and !fail_on_flips;
+    var failing_list: std.ArrayList([]const u8) = .empty;
+    defer failing_list.deinit(allocator);
+
     var pass: u32 = 0;
     var fail: u32 = 0;
+    var skipped: u32 = 0;
     var unexpected_fail: u32 = 0;
     var unexpected_pass: u32 = 0;
 
-    for (whitelist) |rel_path| {
+    for (tests) |rel_path| {
         const category = classifyCategory(rel_path);
         const cat_idx = @intFromEnum(category);
         const expected_fail = known_failing.contains(rel_path);
@@ -540,7 +668,7 @@ pub fn main() !void {
             fail += 1;
             categories[cat_idx].fail += 1;
             unexpected_fail += 1;
-            try out.print("UNEXPECTED_FAIL: {s} (path too long)\n", .{rel_path});
+            if (!quiet) try out.print("UNEXPECTED_FAIL: {s} (path too long)\n", .{rel_path});
             continue;
         };
         const source = std.fs.cwd().readFileAlloc(allocator, full, 512 * 1024) catch |err| {
@@ -548,42 +676,68 @@ pub fn main() !void {
             categories[cat_idx].fail += 1;
             if (!expected_fail) {
                 unexpected_fail += 1;
-                try out.print("UNEXPECTED_FAIL: {s} (read error: {s})\n", .{ rel_path, @errorName(err) });
+                if (!quiet) try out.print("UNEXPECTED_FAIL: {s} (read error: {s})\n", .{ rel_path, @errorName(err) });
             } else if (!summary_mode) {
                 try out.print("KNOWN_FAIL: {s} (read error: {s})\n", .{ rel_path, @errorName(err) });
             }
             continue;
         };
         defer allocator.free(source);
-        const is_pass = try runOneTest(allocator, rel_path, source);
+        const outcome = try runOneTest(allocator, source, full_mode, harness_present);
 
-        if (is_pass) {
-            pass += 1;
-            categories[cat_idx].pass += 1;
-            if (expected_fail) {
-                unexpected_pass += 1;
-                try out.print("UNEXPECTED_PASS: {s}\n", .{rel_path});
-            }
-        } else {
-            fail += 1;
-            categories[cat_idx].fail += 1;
-            if (!expected_fail) {
+        switch (outcome) {
+            .skip => skipped += 1,
+            .pass => {
+                pass += 1;
+                categories[cat_idx].pass += 1;
+                if (expected_fail) {
+                    unexpected_pass += 1;
+                    if (!quiet) try out.print("UNEXPECTED_PASS: {s}\n", .{rel_path});
+                }
+            },
+            .fail => {
+                fail += 1;
+                categories[cat_idx].fail += 1;
+                if (write_failing_path != null) try failing_list.append(allocator, rel_path);
+                if (!expected_fail) {
+                    unexpected_fail += 1;
+                    if (!quiet) try out.print("UNEXPECTED_FAIL: {s}\n", .{rel_path});
+                } else if (!summary_mode and !quiet) {
+                    try out.print("KNOWN_FAIL: {s}\n", .{rel_path});
+                }
+            },
+        }
+    }
+
+    // Stale known-failing entries are noise during a quiet baseline run.
+    if (!quiet) {
+        for (known_data.entries.items) |entry| {
+            if (!seen_known.contains(entry)) {
+                try out.print("STALE_KNOWN_FAILING_ENTRY: {s}\n", .{entry});
                 unexpected_fail += 1;
-                try out.print("UNEXPECTED_FAIL: {s}\n", .{rel_path});
-            } else if (!summary_mode) {
-                try out.print("KNOWN_FAIL: {s}\n", .{rel_path});
             }
         }
     }
 
-    for (known_data.entries.items) |entry| {
-        if (!seen_known.contains(entry)) {
-            try out.print("STALE_KNOWN_FAILING_ENTRY: {s}\n", .{entry});
-            unexpected_fail += 1;
-        }
+    if (write_failing_path) |path| {
+        std.mem.sort([]const u8, failing_list.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+        var fbuf: [4096]u8 = undefined;
+        var fw = file.writer(&fbuf);
+        const fout = &fw.interface;
+        try fout.print("# Auto-generated by --write-known-failing. {d} failing tests.\n", .{failing_list.items.len});
+        for (failing_list.items) |entry| try fout.print("{s}\n", .{entry});
+        try fout.flush();
+        try out.print("Wrote known-failing list ({d} entries): {s}\n", .{ failing_list.items.len, path });
     }
 
-    try printCategorySummary(out, categories, pass, fail, total_count);
+    try printCategorySummary(out, categories, pass, fail, pass + fail);
+    if (full_mode) try out.print("Skipped (unsupported flags/includes): {d}\n", .{skipped});
     try out.print("Known-failing flips: {d} unexpected fail, {d} unexpected pass\n", .{
         unexpected_fail,
         unexpected_pass,
@@ -615,6 +769,26 @@ pub fn main() !void {
         .unexpected_pass = unexpected_pass,
     });
     if (exit_code != 0) std.process.exit(exit_code);
+}
+
+test "includesRegion extracts inline and block forms" {
+    const inline_form = "esid: sec-x\nincludes: [compareArray.js, sta.js]\nflags: [onlyStrict]\n";
+    const r1 = includesRegion(inline_form);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "compareArray.js") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "flags") == null);
+
+    const block_form = "includes:\n  - propertyHelper.js\n  - compareArray.js\nfeatures: [Proxy]\n";
+    const r2 = includesRegion(block_form);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "propertyHelper.js") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "compareArray.js") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "features") == null);
+}
+
+test "isRunnableFull rejects module/raw/async flags" {
+    try std.testing.expect(isRunnableFull("/*---\nes5id: 1\n---*/\nvar x=1;"));
+    try std.testing.expect(!isRunnableFull("/*---\nflags: [module]\n---*/\n"));
+    try std.testing.expect(!isRunnableFull("/*---\nflags: [async]\n---*/\n"));
+    try std.testing.expect(!isRunnableFull("/*---\nflags: [raw]\n---*/\n"));
 }
 
 test "test262_runner compiles" {

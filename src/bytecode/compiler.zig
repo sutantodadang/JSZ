@@ -47,6 +47,9 @@ const FnCompiler = struct {
     /// Phase 8: is this function compiled in strict mode? PTC only applies in
     /// strict mode (ES2015 14.6).
     is_strict: bool = false,
+    /// W2-async: is this an async function body? When true, `__await__(x)`
+    /// compiles to a YIELD suspend instead of a synchronous native call.
+    is_async: bool = false,
     /// Phase 8: nesting depth of try/catch/finally regions. A call in the
     /// operand of `return` is only in tail position when try_depth == 0
     /// (a pending finally would run after the call returns, so it is not tail).
@@ -214,6 +217,19 @@ const FnCompiler = struct {
                 // Phase 3a: emit GET_THIS to retrieve current frame's this slot.
                 const r = self.allocReg();
                 try self.emitOp(.GET_THIS, line);
+                try self.emitU8(r);
+                return r;
+            },
+            .yield_expr => {
+                // W2: `yield e` — evaluate e into r, suspend; on resume the VM
+                // writes the sent value back into r (the expression's result).
+                const r = if (node.data.yield_expr) |yn| try self.compileExpr(yn) else blk: {
+                    const rr = self.allocReg();
+                    try self.emitOp(.LOAD_UNDEF, line);
+                    try self.emitU8(rr);
+                    break :blk rr;
+                };
+                try self.emitOp(.YIELD, line);
                 try self.emitU8(r);
                 return r;
             },
@@ -860,6 +876,91 @@ const FnCompiler = struct {
     }
 
     fn compileCall(self: *Self, c: ast.CallExpr, line: u32, tail: bool) error{OutOfMemory}!u8 {
+        // W2-async: inside an async function `await x` is parsed as __await__(x).
+        // Compile it as a YIELD suspend: evaluate x into r, suspend; the async
+        // driver resumes with the resolved value written back into r. Outside an
+        // async function `__await__` stays a synchronous-drain native call.
+        if (self.is_async and c.callee.kind == .identifier and
+            std.mem.eql(u8, c.callee.data.identifier, "__await__") and c.args.len == 1)
+        {
+            const r = try self.compileExpr(c.args[0]);
+            try self.emitOp(.YIELD, line);
+            try self.emitU8(r);
+            return r;
+        }
+        // W2: `yield* x` is parsed as __yield_star__(x). In a bytecode generator
+        // compile it inline as a delegation loop so the YIELD suspends the
+        // enclosing generator. Result = the inner iterator's return value.
+        if (c.callee.kind == .identifier and std.mem.eql(u8, c.callee.data.identifier, "__yield_star__") and c.args.len == 1) {
+            const base_sp = self.sp;
+            const riter = self.allocReg();
+            {
+                const b = self.allocReg();
+                self.sp = b;
+                const gi = try self.builder.addConstant(try val_mod.makeString(self.arena, "__getIterator__"));
+                try self.emitOp(.GET_GLOBAL, line);
+                try self.emitU8(b);
+                try self.emitU16(@intCast(gi));
+                self.sp = b + 1;
+                _ = try self.compileExpr(c.args[0]);
+                try self.emitOp(.CALL, line);
+                try self.emitU8(b);
+                try self.emitU8(1);
+                try self.emitU8(riter);
+                self.sp = riter + 1;
+            }
+            const rstep = self.allocReg();
+            const rresult = self.allocReg();
+            const loop_start = self.currentOffset();
+            {
+                const b = self.allocReg();
+                const si = try self.builder.addConstant(try val_mod.makeString(self.arena, "__iterStep__"));
+                try self.emitOp(.GET_GLOBAL, line);
+                try self.emitU8(b);
+                try self.emitU16(@intCast(si));
+                const barg = self.allocReg();
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(barg);
+                try self.emitU8(riter);
+                try self.emitOp(.CALL, line);
+                try self.emitU8(b);
+                try self.emitU8(1);
+                try self.emitU8(rstep);
+                self.sp = rresult + 1;
+            }
+            // rresult = step.value (on the done step this is the inner return value)
+            const vi = try self.builder.addConstant(try val_mod.makeString(self.arena, "value"));
+            try self.emitOp(.GET_PROP, line);
+            try self.emitU8(rresult);
+            try self.emitU8(rstep);
+            try self.emitU16(@intCast(vi));
+            // if (step.done) exit
+            const rdone = self.allocReg();
+            const di = try self.builder.addConstant(try val_mod.makeString(self.arena, "done"));
+            try self.emitOp(.GET_PROP, line);
+            try self.emitU8(rdone);
+            try self.emitU8(rstep);
+            try self.emitU16(@intCast(di));
+            try self.emitOp(.JMP_IF_TRUE, line);
+            try self.emitU8(rdone);
+            const patch_exit = self.currentOffset();
+            try self.emitI16(0);
+            self.sp = rresult + 1;
+            // yield the current value, then loop
+            try self.emitOp(.YIELD, line);
+            try self.emitU8(rresult);
+            try self.emitOp(.JMP, line);
+            const back = self.currentOffset();
+            try self.emitI16(0);
+            self.patchJump(back, loop_start);
+            self.patchJump(patch_exit, self.currentOffset());
+            // Move the result down to base_sp and return it.
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(base_sp);
+            try self.emitU8(rresult);
+            self.sp = base_sp + 1;
+            return base_sp;
+        }
         const is_method = c.callee.kind == .member_expr;
 
         if (is_method) {
@@ -962,6 +1063,8 @@ const FnCompiler = struct {
             fe.body,
             fe.name, // nfe_name: if named, bind inside
             fe.is_strict,
+            fe.is_generator,
+            fe.is_async,
         );
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
@@ -1019,6 +1122,8 @@ const FnCompiler = struct {
                     fd.body,
                     null,
                     fd.is_strict,
+                    fd.is_generator,
+                    fd.is_async,
                 );
                 const child_idx: u16 = @intCast(self.child_functions.items.len);
                 try self.child_functions.append(self.arena, child_fn);
@@ -1269,6 +1374,86 @@ const FnCompiler = struct {
                 try self.emitI16(0);
             },
             .for_in_stmt => {
+                // W2: for-of (iterate_values) uses the iterator protocol via the
+                // __getIterator__/__iterStep__ runtime helpers (generators, arrays,
+                // strings, Map/Set). for-in (below) keeps key-enumeration.
+                if (node.data.for_in_stmt.iterate_values) {
+                    const fo = node.data.for_in_stmt;
+                    const base_sp = self.sp;
+                    const riter = self.allocReg();
+                    {
+                        const b = self.allocReg();
+                        self.sp = b;
+                        const gi = try self.builder.addConstant(try val_mod.makeString(self.arena, "__getIterator__"));
+                        try self.emitOp(.GET_GLOBAL, line);
+                        try self.emitU8(b);
+                        try self.emitU16(@intCast(gi));
+                        self.sp = b + 1;
+                        _ = try self.compileExpr(fo.right); // arg lands at b+1
+                        try self.emitOp(.CALL, line);
+                        try self.emitU8(b);
+                        try self.emitU8(1);
+                        try self.emitU8(riter);
+                        self.sp = riter + 1;
+                    }
+                    const rstep = self.allocReg();
+                    const loop_start = self.currentOffset();
+                    {
+                        const b = self.allocReg();
+                        const si = try self.builder.addConstant(try val_mod.makeString(self.arena, "__iterStep__"));
+                        try self.emitOp(.GET_GLOBAL, line);
+                        try self.emitU8(b);
+                        try self.emitU16(@intCast(si));
+                        const barg = self.allocReg();
+                        try self.emitOp(.MOVE, line);
+                        try self.emitU8(barg);
+                        try self.emitU8(riter);
+                        try self.emitOp(.CALL, line);
+                        try self.emitU8(b);
+                        try self.emitU8(1);
+                        try self.emitU8(rstep);
+                        self.sp = rstep + 1;
+                    }
+                    // if (rstep.done) exit
+                    const rdone = self.allocReg();
+                    const di = try self.builder.addConstant(try val_mod.makeString(self.arena, "done"));
+                    try self.emitOp(.GET_PROP, line);
+                    try self.emitU8(rdone);
+                    try self.emitU8(rstep);
+                    try self.emitU16(@intCast(di));
+                    try self.emitOp(.JMP_IF_TRUE, line);
+                    try self.emitU8(rdone);
+                    const patch_exit = self.currentOffset();
+                    try self.emitI16(0);
+                    self.sp = rstep + 1;
+                    // loopvar = rstep.value
+                    const rval = self.allocReg();
+                    const vi = try self.builder.addConstant(try val_mod.makeString(self.arena, "value"));
+                    try self.emitOp(.GET_PROP, line);
+                    try self.emitU8(rval);
+                    try self.emitU8(rstep);
+                    try self.emitU16(@intCast(vi));
+                    const loop_name: ?[]const u8 = switch (fo.left.kind) {
+                        .var_decl => if (fo.left.data.var_decl.name.len > 0) fo.left.data.var_decl.name else null,
+                        .identifier => fo.left.data.identifier,
+                        else => null,
+                    };
+                    if (loop_name) |nm| {
+                        const ni = try self.builder.addConstant(try val_mod.makeString(self.arena, nm));
+                        try self.emitOp(.SET_GLOBAL, line);
+                        try self.emitU16(@intCast(ni));
+                        try self.emitU8(rval);
+                    }
+                    self.sp = rstep + 1;
+                    try self.compileStmt(fo.body, last_expr_reg);
+                    try self.emitOp(.JMP, line);
+                    const back = self.currentOffset();
+                    try self.emitI16(0);
+                    self.patchJump(back, loop_start);
+                    self.patchJump(patch_exit, self.currentOffset());
+                    self.sp = base_sp;
+                    return;
+                }
                 // Phase 4d: for (var k in obj) { body }
                 // Strategy:
                 //   rkeys = GET_KEYS(robj)
@@ -1541,7 +1726,7 @@ fn compileFunction(
     body: []*Node,
     nfe_name: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    return compileFunctionStrict(arena, name, params, body, nfe_name, false);
+    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false);
 }
 
 fn compileFunctionStrict(
@@ -1551,10 +1736,13 @@ fn compileFunctionStrict(
     body: []*Node,
     nfe_name: ?[]const u8,
     is_strict: bool,
+    is_generator: bool,
+    is_async: bool,
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
     fc.is_strict = is_strict;
+    fc.is_async = is_async;
 
     // Phase 2: all variable access is env-based (GET_GLOBAL/SET_GLOBAL).
     // Params are passed via env on CALL setup (see bc_vm.zig CALL handler).
@@ -1587,6 +1775,8 @@ fn compileFunctionStrict(
         .child_functions = child_fns,
         .param_names = params,
         .is_strict = is_strict,
+        .is_generator = is_generator,
+        .is_async = is_async,
         .ic_table = ic_table,
         .arith_ic_table = arith_ic_table,
         .typeof_ic_table = typeof_ic_table,
@@ -1617,6 +1807,8 @@ pub fn compileProgram(
         program.body,
         null,
         program.is_strict,
+        false,
+        false,
     );
     return f;
 }

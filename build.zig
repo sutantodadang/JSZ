@@ -115,9 +115,30 @@ pub fn build(b: *std.Build) void {
     const vm_fuzz = b.addTest(.{ .root_module = vm_fuzz_mod });
     const run_vm_fuzz = b.addRunArtifact(vm_fuzz);
 
+    // Regex fuzzer drives the matcher directly via jsz._regex (the internal engine).
+    const regex_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/test/fuzz/regex_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "jsz", .module = mod }},
+    });
+    const regex_fuzz = b.addTest(.{ .root_module = regex_fuzz_mod });
+    const run_regex_fuzz = b.addRunArtifact(regex_fuzz);
+
+    const json_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/test/fuzz/json_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "jsz", .module = mod }},
+    });
+    const json_fuzz = b.addTest(.{ .root_module = json_fuzz_mod });
+    const run_json_fuzz = b.addRunArtifact(json_fuzz);
+
     const fuzz_step = b.step("fuzz", "Run fuzz harnesses (add --fuzz for fuzzing mode)");
     fuzz_step.dependOn(&run_parser_fuzz.step);
     fuzz_step.dependOn(&run_vm_fuzz.step);
+    fuzz_step.dependOn(&run_regex_fuzz.step);
+    fuzz_step.dependOn(&run_json_fuzz.step);
 
     // ---------------------------------------------------------------------------
     // Conformance: zig build conformance
@@ -152,6 +173,30 @@ pub fn build(b: *std.Build) void {
     run_conformance_dashboard.addArg("docs/CONFORMANCE_DASHBOARD.md");
     const conformance_dashboard_step = b.step("conformance-dashboard", "Generate docs/CONFORMANCE_DASHBOARD.md from Test262 results");
     conformance_dashboard_step.dependOn(&run_conformance_dashboard.step);
+
+    // Full corpus: walk all of external/test262/test, load real harness includes,
+    // report the true (un-whitelisted) per-category baseline + dashboard.
+    const run_conformance_full = b.addRunArtifact(conformance_exe);
+    run_conformance_full.addArg("--full");
+    run_conformance_full.addArg("--dashboard");
+    run_conformance_full.addArg("docs/CONFORMANCE_FULL.md");
+    const conformance_full_step = b.step("conformance-full", "Run the entire Test262 corpus and report the true baseline");
+    conformance_full_step.dependOn(&run_conformance_full.step);
+
+    // Full-corpus CI gate: fail on any flip vs tests/test262_known_failing_full.txt.
+    const run_conformance_full_delta = b.addRunArtifact(conformance_exe);
+    run_conformance_full_delta.addArg("--full");
+    run_conformance_full_delta.addArg("--fail-on-flips");
+    const conformance_full_delta_step = b.step("conformance-full-delta", "Fail on full-corpus pass/fail flips vs the full known-failing list");
+    conformance_full_delta_step.dependOn(&run_conformance_full_delta.step);
+
+    // Seed/refresh the full known-failing list from the current baseline.
+    const run_conformance_full_seed = b.addRunArtifact(conformance_exe);
+    run_conformance_full_seed.addArg("--full");
+    run_conformance_full_seed.addArg("--write-known-failing");
+    run_conformance_full_seed.addArg("tests/test262_known_failing_full.txt");
+    const conformance_full_seed_step = b.step("conformance-full-seed", "Write tests/test262_known_failing_full.txt from the current full-corpus results");
+    conformance_full_seed_step.dependOn(&run_conformance_full_seed.step);
 
     // ---------------------------------------------------------------------------
     // Differential: zig build differential

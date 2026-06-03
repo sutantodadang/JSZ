@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Node.js differential testing harness.
-//! Phase 2: for each corpus file, runs jsz under tree mode AND bc mode,
-//! compares both against Node.js output. Exits non-zero on any mismatch.
+//! W2: the bytecode VM is the engine of record. For each corpus file, runs jsz
+//! under bc mode (the gate) and the legacy tree mode (informational), comparing
+//! both against Node.js. Exits non-zero only on a bc-vs-Node mismatch.
 const std = @import("std");
 const jsz = @import("jsz");
 
@@ -123,27 +124,23 @@ pub fn main() !void {
 
         const tree_ok = std.mem.eql(u8, tree_out, node_out);
         const bc_ok = std.mem.eql(u8, bc_out, node_out);
-        const modes_agree = std.mem.eql(u8, tree_out, bc_out);
 
-        if (tree_ok and bc_ok and modes_agree) {
+        // W2 engine unification: the bytecode VM is the engine of record, so
+        // bc-vs-Node is the hard gate. Tree-walker mismatches are reported as
+        // informational only (the tree engine is being retired and carries
+        // known latent bugs); they no longer fail the build.
+        if (bc_ok) {
             pass += 1;
-        } else {
-            fail += 1;
             if (!tree_ok) {
-                try out.print("MISMATCH tree: {s}\n  tree: {s}\n  node: {s}\n", .{
+                try out.print("INFO tree lags: {s}\n  tree: {s}\n  node: {s}\n", .{
                     entry.name, tree_out, node_out,
                 });
             }
-            if (!bc_ok) {
-                try out.print("MISMATCH bc:   {s}\n  bc:   {s}\n  node: {s}\n", .{
-                    entry.name, bc_out, node_out,
-                });
-            }
-            if (!modes_agree) {
-                try out.print("DIVERGE:       {s}\n  tree: {s}\n  bc:   {s}\n", .{
-                    entry.name, tree_out, bc_out,
-                });
-            }
+        } else {
+            fail += 1;
+            try out.print("MISMATCH bc:   {s}\n  bc:   {s}\n  node: {s}\n", .{
+                entry.name, bc_out, node_out,
+            });
         }
     }
 

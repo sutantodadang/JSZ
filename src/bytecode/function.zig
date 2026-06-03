@@ -16,6 +16,13 @@ pub const BcFunction = struct {
     param_names: [][]const u8,
     /// Phase 4d: whether this function was compiled in strict mode.
     is_strict: bool = false,
+    /// W2: whether this is a generator function (`function*`). When called it
+    /// produces a generator object instead of running the body.
+    is_generator: bool = false,
+    /// W2-async: whether this is an async function (`async function`). When
+    /// called it runs as a reaction-driven coroutine and returns a Promise;
+    /// each `await` suspends via a YIELD opcode.
+    is_async: bool = false,
     /// Phase 6: per-bytecode-site IC table, indexed by instruction PC.
     ic_table: []ic_mod.InlineCache,
     /// Phase 6: arithmetic fast-path feedback per instruction PC.
@@ -31,6 +38,12 @@ pub const BcClosure = struct {
     func: *const BcFunction,
     /// *Environment at definition site. Opaque to avoid circular import.
     env: *anyopaque,
+    /// W2 unification: lazily-created backing object holding the function's own
+    /// properties (incl. its `prototype` object, materialized on first access).
+    /// Makes bc functions first-class objects so `C.prototype.m = ...`, `new C()`,
+    /// and class desugaring work. `?*JsObject` stored opaque to avoid an import
+    /// cycle (function.zig must not depend on object.zig).
+    obj: ?*anyopaque = null,
 };
 
 test "BcFunction fields exist" {

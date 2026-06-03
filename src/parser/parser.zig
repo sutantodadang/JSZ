@@ -98,6 +98,19 @@ pub const Parser = struct {
         return self.current.kind == kind;
     }
 
+    /// Peek the token immediately after `current` without consuming it. The
+    /// lexer is positioned just past `current`, so copying it and pulling one
+    /// token gives the next lookahead. Used for contextual `async` detection.
+    fn peekNext(self: *Parser) Token {
+        var lx = self.lexer;
+        return lx.next() catch Token.initSimple(.eof, 0, 0, 1, 1, false);
+    }
+
+    /// True if `current` is the contextual keyword `async` (a plain identifier).
+    fn currentIsAsyncKw(self: *const Parser) bool {
+        return self.current.kind == .identifier and std.mem.eql(u8, self.current.value_str, "async");
+    }
+
     fn match(self: *Parser, kind: TokenKind) bool {
         if (self.check(kind)) {
             _ = self.advance();
@@ -682,6 +695,13 @@ pub const Parser = struct {
         if (self.current.kind == .identifier and std.mem.eql(u8, self.current.value_str, "await")) {
             return self.parseExprStmt();
         }
+        // W2-async: `async function foo() {}` declaration. `async` is contextual
+        // (a plain identifier); only treat it as a keyword when `function`
+        // immediately follows on the same line.
+        if (self.currentIsAsyncKw() and self.peekNext().kind == .kw_function and !self.peekNext().line_terminator_before) {
+            _ = self.advance(); // consume `async`
+            return self.parseFunctionDecl(true);
+        }
         // Phase 4d: labeled statement — identifier followed by colon.
         if (self.current.kind == .identifier) {
             // Peek ahead: if next non-whitespace token is ':', this is a labeled stmt.
@@ -721,7 +741,7 @@ pub const Parser = struct {
             .kw_class => self.parseClassDeclStmt(),
             .kw_import => self.parseImportDecl(),
             .kw_export => self.parseExportDecl(),
-            .kw_function => self.parseFunctionDecl(),
+            .kw_function => self.parseFunctionDecl(false),
             .kw_if => self.parseIfStmt(),
             .kw_while => self.parseWhileStmt(),
             .kw_do => self.parseDoWhileStmt(),
@@ -1033,7 +1053,7 @@ pub const Parser = struct {
         });
     }
 
-    fn parseFunctionDecl(self: *Parser) ?*Node {
+    fn parseFunctionDecl(self: *Parser, is_async: bool) ?*Node {
         const start = self.current.start;
         _ = self.advance(); // consume 'function'
         const is_generator = self.match(.star);
@@ -1056,6 +1076,7 @@ pub const Parser = struct {
                 .rest_param = parsed_params.rest_param,
                 .body = body,
                 .is_generator = is_generator,
+                .is_async = is_async,
                 .is_strict = is_strict,
             },
         });
@@ -1719,6 +1740,29 @@ pub const Parser = struct {
     }
 
     fn parseAssignmentExpr(self: *Parser) ?*Node {
+        // W2-async: speculative async-arrow detection. `async` is contextual, so
+        // only treat it as an async-arrow marker when an arrow form looks likely
+        // (`async (` or `async ident`, same line). If the speculative parse is
+        // not an arrow, backtrack and parse `async` as an ordinary identifier.
+        if (self.currentIsAsyncKw() and !self.peekNext().line_terminator_before and
+            (self.peekNext().kind == .left_paren or self.peekNext().kind == .identifier))
+        {
+            const save_lexer = self.lexer;
+            const save_cur = self.current;
+            _ = self.advance(); // consume `async`
+            const candidate = self.parseAssignmentExprCore(true);
+            if (candidate) |c| {
+                if (c.kind == .function_expr and c.data.function_expr.is_arrow) return c;
+            }
+            if (self.had_error) return candidate;
+            // Not an arrow — rewind so `async` parses as a normal identifier.
+            self.lexer = save_lexer;
+            self.current = save_cur;
+        }
+        return self.parseAssignmentExprCore(false);
+    }
+
+    fn parseAssignmentExprCore(self: *Parser, is_async_arrow: bool) ?*Node {
         const start = self.current.start;
         // Conditional has higher precedence than assignment.
         const left = self.parseConditionalExpr() orelse return null;
@@ -1750,6 +1794,7 @@ pub const Parser = struct {
                     .rest_param = null,
                     .body = body_nodes,
                     .is_arrow = true,
+                    .is_async = is_async_arrow,
                     .is_strict = is_strict,
                 },
             });
@@ -2233,6 +2278,13 @@ pub const Parser = struct {
                 return self.makeNode(.yield_expr, start, self.current.start, .{ .yield_expr = yielded });
             },
             .identifier => {
+                // W2-async: `async function(){}` / `async function name(){}`
+                // expression. Contextual: only when `function` follows on the
+                // same line.
+                if (self.currentIsAsyncKw() and self.peekNext().kind == .kw_function and !self.peekNext().line_terminator_before) {
+                    _ = self.advance(); // consume `async`
+                    return self.parseFunctionExpr(true);
+                }
                 const name = self.current.value_str;
                 _ = self.advance();
                 // Special: 'undefined' identifier -> undefined literal
@@ -2249,7 +2301,7 @@ pub const Parser = struct {
                 return expr;
             },
             .kw_function => {
-                return self.parseFunctionExpr();
+                return self.parseFunctionExpr(false);
             },
             .left_brace => {
                 return self.parseObjectLiteral();
@@ -2379,7 +2431,7 @@ pub const Parser = struct {
         });
     }
 
-    fn parseFunctionExpr(self: *Parser) ?*Node {
+    fn parseFunctionExpr(self: *Parser, is_async: bool) ?*Node {
         const start = self.current.start;
         _ = self.advance(); // consume 'function'
         const is_generator = self.match(.star);
@@ -2406,6 +2458,7 @@ pub const Parser = struct {
                 .body = body,
                 .is_arrow = false,
                 .is_generator = is_generator,
+                .is_async = is_async,
                 .is_strict = is_strict,
             },
         });

@@ -252,6 +252,7 @@ pub const FuncExpr = struct {
     body: []*Node,
     is_arrow: bool = false,
     is_generator: bool = false,
+    is_async: bool = false,
     is_strict: bool = false,
     requires_super: bool = false,
 };
@@ -308,6 +309,7 @@ pub const FuncDecl = struct {
     rest_param: ?[]const u8 = null,
     body: []*Node,
     is_generator: bool = false,
+    is_async: bool = false,
     is_strict: bool = false,
 };
 
