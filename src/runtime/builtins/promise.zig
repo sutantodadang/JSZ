@@ -35,7 +35,7 @@ const ResolverData = struct {
 var microtasks: std.ArrayListUnmanaged(Job) = .empty;
 
 fn getThenMethod(v: Value) ?Value {
-    if (v.bits == 0 or v.toPtr().* != .object) return null;
+    if (v.bits == 0 or v.unbox() != .object) return null;
     const then_v = v.toPtr().object.get("then") orelse return null;
     if (!isCallable(then_v)) return null;
     return then_v;
@@ -89,7 +89,7 @@ fn settlePromise(data: *PromiseData, state: PromiseState, value: Value) void {
 
 fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
         .object => |o| o.internal_kind == .bound_function or o.get("__call__") != null,
         else => false,
@@ -97,7 +97,7 @@ fn isCallable(v: Value) bool {
 }
 
 fn getData(this_val: Value) ?*PromiseData {
-    if (this_val.bits == 0 or this_val.toPtr().* != .object) return null;
+    if (this_val.bits == 0 or this_val.unbox() != .object) return null;
     const o = this_val.toPtr().object;
     if (o.internal_kind != .promise) return null;
     if (o.internal_slot) |slot| return @ptrCast(@alignCast(slot));
@@ -185,7 +185,7 @@ fn promiseRejectData(arena: std.mem.Allocator, data: *PromiseData, v: Value) voi
 }
 
 fn nativePromiseResolver(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const d = if (this_val.bits != 0 and this_val.toPtr().* == .object and this_val.toPtr().object.internal_slot != null)
+    const d = if (this_val.bits != 0 and this_val.unbox() == .object and this_val.toPtr().object.internal_slot != null)
         @as(*ResolverData, @ptrCast(@alignCast(this_val.toPtr().object.internal_slot.?)))
     else
         return val_mod.makeUndefined(arena);
@@ -199,7 +199,7 @@ fn nativePromiseResolver(arena: std.mem.Allocator, this_val: Value, args: []cons
 }
 
 pub fn nativePromiseCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits != 0 and this_val.toPtr().* == .object) {
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
         const o = this_val.toPtr().object;
         const d = try arena.create(PromiseData);
         d.* = .{};

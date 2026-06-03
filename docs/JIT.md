@@ -94,8 +94,35 @@ runs everything; only the profiling tier (`--jit=count`) is wired into the CLI.
 1. ✅ Wire `JitCompiler.notePcHit` into `bc_vm` (counter table keyed by function + PC; loop back-edges instrumented for JMP/JMP_IF_TRUE/JMP_IF_FALSE/JSEQ/JGE).
 2. ✅ Add `--jit=off|count|experimental` CLI flag (default off); `=== JIT profile ===` printout after eval.
 3. ✅ Integrate Cranelift; emit native `add(i64,i64)` + `const()->i64` and call from Zig (`jit-native/` cdylib, `src/jit/native.zig`, `zig build jit-native`).
-4. Translate a real hot `BcFunction`'s arithmetic (`ADD`/`SUB`/`MUL`) to Cranelift IR with NaN-box unwrap + int/double type guards (next).
-5. Implement one deopt path: guard fail → reconstruct bc registers from a `DeoptFrame` → jump to fallback PC in the bc VM.
-6. Link the native backend into the main binary behind `--jit=experimental`; benchmark vs bc-only on `bench/fib20.zig` and Phase 6 IC benches; track regression in CI.
+4. ✅ **IR for a monomorphic-int hot loop + type-guard/deopt shape** (isolated, in `jit-native/`):
+   - `jsz_clif_compile_count_loop()` emits real loop IR — entry → header (`i < limit` guard `brif`) → body (`iadd step`, jump back = the **back-edge**) → exit — over **unboxed `i64`**. Verified `loop(0,5000,1)==5000` (matches JS `while(i<5000)i=i+1`).
+   - `jsz_clif_compile_guarded_iadd()` emits the speculative-add shape: a guard `brif` splitting into an `ok` block (`a+b`) and a `deopt` block (write `*deopt=1`, return 0). Models guard-fail → deopt without computing.
+5. ✅ **Native execution wired into the live VM** (`src/jit/loop_jit.zig`): at a hot loop back-edge under `--jit=experimental`, the bc VM recognizes the canonical counter-loop opcode template, type-guards the live induction var + limit as integral numbers, and runs the remaining iterations in the count-loop kernel — then boxes the result once, writes the global, and jumps to the loop exit. Recognition/guard failure → keep interpreting (the interpreter is the correct baseline, so this is the "deopt" path; no register reconstruction needed because the back-edge is a clean bytecode boundary).
+6. ✅ **Linked into the main binary** behind `-Djit=true` (build option) + `--jit=experimental` (runtime). `-Djit=true` builds the `jit-native/` cdylib and installs the Cranelift `count_loop` kernel via `root.installNativeCountLoop`; without it a **pure-Zig kernel** is used so the feature + its tests work cargo-free. Default builds/tests/CI link no Rust.
+
+### Benchmark (first native execution of real JS)
+`var i=0; while (i < 50_000_000) { i = i + 1; } i` (hot threshold 1000):
+
+| Mode | Time | Result |
+|------|------|--------|
+| `--interp=bc` | ~32.6 s | 50000000 |
+| `--jit=experimental` (`-Djit=true`, Cranelift) | ~0.11 s | 50000000 |
+
+~**300×** on this loop — the interpreter pays an env-hashmap lookup per `GET_GLOBAL`/`SET_GLOBAL` each iteration; the JIT elides all of it after the loop goes hot. Correctness verified against the interpreter across large / already-past-limit / non-matching / sub-threshold loops, plus integration tests and the 94/94 differential.
+
+### Remaining (broader JIT)
+- ✅ Generalized recognition: step ≠ 1, `<=`/`>`/`>=`/descending, **register-local induction vars** (`GET_LOCAL`/`SET_LOCAL`), and a **single accumulator** carried as `s = s +|-|* i` (`loop_jit.zig` `IndVar = global|local`, optional accumulator block + `zigAccumulateLoop` kernel computing the fold in f64 in interpreter order). The summation shape (`s = s + i`, `<`) is now **compiled to native Cranelift IR** (`jsz_clif_compile_accumulate_loop`: `fcvt_from_sint` + `fadd` accumulator carried beside the induction var, final `i` stored through an out-pointer) — the loop *body* is translated, not just elided; `runAccumulateLoop` uses it when `-Djit=true`, else the Zig kernel. Still TODO: multiple accumulators, accumulator-`const` folds, `-`/`*`/non-`<` native variants, and translating an **arbitrary** body to IR.
+- **DeoptFrame** register-reconstruction for *mid-region* speculation. NOTE: the current recognize-and-elide tier does **not** need this — the loop back-edge is a clean bytecode boundary, so guard/recognition failure simply returns null and the interpreter resumes (the "deopt"). A real `DeoptFrame` is only required once the JIT compiles arbitrary bodies (not just elides recognized counter/accumulator loops).
+- ✅ **Prerequisite shipped:** SMI + full WebKit NaN-box `Value` representation (see below) — numbers (int32 + doubles) and null/bool are now inline/unboxed, so native arithmetic no longer forces a heap allocation per result.
+
+### Value representation: SMI + NaN-box (shipped)
+`src/value/value.zig` now supports inline values behind comptime flags
+(`enable_smi`, `enable_nanbox`, both ON):
+- **SMI / int32** and **inline doubles** (WebKit offset NaN-box: `NumberTag=0xfffe…`,
+  `DoubleEncodeOffset=1<<49`), plus **immediate** null/true/false — no allocation.
+- `bits==0` is kept as undefined (WebKit `ValueEmpty`), so existing guards are
+  unchanged; all reads decode through `unbox()`, and `isHeapPtr()`/`NotCellMask`
+  gate the GC. Type guards are now bit tests, not union-tag checks.
+- Verified green: `zig build test`, differential 94/94, conformance 70.71% (0 flips).
 
 Run profiling-tier tests: `zig build jit`. Run native-backend tests: `zig build jit-native`.

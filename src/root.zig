@@ -17,6 +17,27 @@ pub const InterpMode = isolate_mod.InterpMode;
 /// Phase 9: JIT profiling mode.
 pub const JitMode = @import("./jit/jit.zig").JitMode;
 
+const loop_jit = @import("./jit/loop_jit.zig");
+
+/// Phase 9: native count-loop kernel type (`fn(start,limit,step)->final`).
+pub const NativeCountLoopFn = loop_jit.CountLoopFn;
+
+/// Phase 9: install a native (Cranelift-compiled) count-loop kernel for the
+/// experimental hot-loop JIT. Without it the pure-Zig fallback is used. The CLI
+/// calls this at startup when built with `-Djit=true`.
+pub fn installNativeCountLoop(f: NativeCountLoopFn) void {
+    loop_jit.native_count_loop = f;
+}
+
+/// Phase 9: native summation accumulator-loop kernel type + installer.
+pub const NativeAccumulateLoopFn = loop_jit.AccumulateLoopFn;
+
+/// Install a native (Cranelift-compiled) accumulator-loop kernel for the
+/// experimental hot-loop JIT. Without it the pure-Zig fallback is used.
+pub fn installNativeAccumulateLoop(f: NativeAccumulateLoopFn) void {
+    loop_jit.native_accumulate_loop = f;
+}
+
 /// Phase 9: JIT profile snapshot (hot sites / compiled / deopts) from the most recent bc eval.
 pub const JitProfile = isolate_mod.JitProfile;
 
@@ -99,7 +120,7 @@ pub const NativeResult = union(enum) {
 pub fn valueToDisplayString(arena: std.mem.Allocator, v: Value) ![]const u8 {
     const inner = val_mod.Value{ .bits = v.bits };
     if (inner.bits == 0) return "undefined";
-    return switch (inner.toPtr().*) {
+    return switch (inner.unbox()) {
         .undefined_ => "undefined",
         .null_ => "null",
         .boolean => |b| if (b) "true" else "false",
@@ -123,7 +144,7 @@ pub fn valueToDisplayString(arena: std.mem.Allocator, v: Value) ![]const u8 {
                         _ = vm_mod2;
                         const elem_inner = val_mod.Value{ .bits = elem.bits };
                         if (elem_inner.bits != 0) {
-                            switch (elem_inner.toPtr().*) {
+                            switch (elem_inner.unbox()) {
                                 .number => |n| {
                                     const vm_mod3 = @import("./vm/vm.zig");
                                     const s2 = try vm_mod3.formatNumber(arena, n);

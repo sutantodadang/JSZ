@@ -14,7 +14,7 @@ pub const HandleScope = @import("./handle.zig").HandleScope;
 
 /// Trace a Value: if it holds a JsObject, call mark_fn on it.
 pub fn traceValue(v: Value, mark_fn: *const fn (*JsObject) void) void {
-    if (v.bits == 0) return;
+    if (!v.isHeapPtr()) return;
     const inner = v.toPtr();
     switch (inner.*) {
         .object => |obj| mark_fn(obj),

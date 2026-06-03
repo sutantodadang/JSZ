@@ -19,6 +19,7 @@ const Heap = @import("../gc/heap.zig").Heap;
 const gc_mod = @import("../gc/gc.zig");
 const ic_mod = @import("./ic.zig");
 const jit_mod = @import("../jit/jit.zig");
+const loop_jit = @import("../jit/loop_jit.zig");
 
 /// Phase 4a: a try entry pushed by PUSH_TRY.
 pub const TryEntry = struct {
@@ -102,7 +103,7 @@ pub const BcVm = struct {
         const self: *BcVm = @ptrCast(@alignCast(ptr));
         const function_proto_mod = @import("../runtime/builtins/function_proto.zig");
         if (fn_val.bits == 0) return error.JsException;
-        const inner = fn_val.toPtr().*;
+        const inner = fn_val.unbox();
         switch (inner) {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
@@ -192,15 +193,15 @@ pub const BcVm = struct {
         @import("../runtime/realm.zig").active_context = null;
     }
 
-    /// Phase 9: record a loop back-edge as a hot-site signal. No-op when JIT off.
-    inline fn noteBackedge(self: *BcVm, func: *const BcFunction, op_pc: usize) void {
+    /// Phase 9: record a loop back-edge as a hot-site signal. Returns true when
+    /// this site just crossed the hot threshold AND the JIT is in experimental
+    /// mode — the caller may then attempt a native fast-forward. No-op when off.
+    inline fn noteBackedge(self: *BcVm, func: *const BcFunction, op_pc: usize) bool {
         if (self.jit) |jc| {
-            const ev = jc.notePcHit(@intFromPtr(func), @intCast(op_pc)) catch return;
-            if (ev == .became_hot and jc.mode == .experimental) {
-                // Native compile slot — returns NotImplemented today; swallow.
-                jc.compile(func.chunk.code) catch {};
-            }
+            const ev = jc.notePcHit(@intFromPtr(func), @intCast(op_pc)) catch return false;
+            return ev == .became_hot and jc.mode == .experimental;
         }
+        return false;
     }
 
     pub fn run(
@@ -373,8 +374,11 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv)) {
-                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, lv.toPtr().number + rv.toPtr().number);
+                    if (val_mod.smiArith(lv, rv, '+')) |s| {
+                        frame.registers[rdst] = s;
+                        ac.mode = .number_pair;
+                    } else if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv)) {
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, lv.unbox().number + rv.unbox().number);
                     } else {
                         frame.registers[rdst] = try self.jsAdd(lv, rv);
                         ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
@@ -391,12 +395,17 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        lv.toPtr().number - rv.toPtr().number
-                    else
-                        toNumber(lv) - toNumber(rv);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                    if (val_mod.smiArith(lv, rv, '-')) |s| {
+                        frame.registers[rdst] = s;
+                        ac.mode = .number_pair;
+                    } else {
+                        const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            lv.unbox().number - rv.unbox().number
+                        else
+                            toNumber(lv) - toNumber(rv);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                    }
                 },
                 .MUL => {
                     const site_pc = frame.pc - 1;
@@ -409,12 +418,17 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        lv.toPtr().number * rv.toPtr().number
-                    else
-                        toNumber(lv) * toNumber(rv);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                    if (val_mod.smiArith(lv, rv, '*')) |s| {
+                        frame.registers[rdst] = s;
+                        ac.mode = .number_pair;
+                    } else {
+                        const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            lv.unbox().number * rv.unbox().number
+                        else
+                            toNumber(lv) * toNumber(rv);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                    }
                 },
                 .DIV => {
                     const site_pc = frame.pc - 1;
@@ -428,7 +442,7 @@ pub const BcVm = struct {
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
                     const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        lv.toPtr().number / rv.toPtr().number
+                        lv.unbox().number / rv.unbox().number
                     else
                         toNumber(lv) / toNumber(rv);
                     ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
@@ -446,11 +460,11 @@ pub const BcVm = struct {
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
                     const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        lv.toPtr().number
+                        lv.unbox().number
                     else
                         toNumber(lv);
                     const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        rv.toPtr().number
+                        rv.unbox().number
                     else
                         toNumber(rv);
                     ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
@@ -487,11 +501,11 @@ pub const BcVm = struct {
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
                     const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
                     else
                         toInt32(lv);
                     const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(rv.toPtr().number)))
+                        @as(i32, @intFromFloat(@trunc(rv.unbox().number)))
                     else
                         toInt32(rv);
                     ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
@@ -510,11 +524,11 @@ pub const BcVm = struct {
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
                     const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
                     else
                         toInt32(lv);
                     const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(rv.toPtr().number)))
+                        @as(i32, @intFromFloat(@trunc(rv.unbox().number)))
                     else
                         toInt32(rv);
                     ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
@@ -533,11 +547,11 @@ pub const BcVm = struct {
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
                     const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
                     else
                         toInt32(lv);
                     const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(rv.toPtr().number)))
+                        @as(i32, @intFromFloat(@trunc(rv.unbox().number)))
                     else
                         toInt32(rv);
                     ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
@@ -556,11 +570,11 @@ pub const BcVm = struct {
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
                     const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
                     else
                         toInt32(lv);
                     const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(u32, @intFromFloat(@trunc(rv.toPtr().number)))
+                        @as(u32, @intFromFloat(@trunc(rv.unbox().number)))
                     else
                         toUint32(rv)) & 0x1F);
                     ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
@@ -579,11 +593,11 @@ pub const BcVm = struct {
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
                     const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
                     else
                         toInt32(lv);
                     const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(u32, @intFromFloat(@trunc(rv.toPtr().number)))
+                        @as(u32, @intFromFloat(@trunc(rv.unbox().number)))
                     else
                         toUint32(rv)) & 0x1F);
                     ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
@@ -602,12 +616,12 @@ pub const BcVm = struct {
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
                     const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.toPtr().number)))
+                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
                     else
                         toInt32(lv);
                     const u: u32 = @bitCast(l);
                     const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(u32, @intFromFloat(@trunc(rv.toPtr().number)))
+                        @as(u32, @intFromFloat(@trunc(rv.unbox().number)))
                     else
                         toUint32(rv)) & 0x1F);
                     ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
@@ -758,7 +772,23 @@ pub const BcVm = struct {
                     const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
                     const new_pc: i64 = @intCast(frame.pc);
                     frame.pc = @intCast(new_pc + offset);
-                    if (offset < 0) self.noteBackedge(frame.func, op_site);
+                    if (offset < 0 and self.noteBackedge(frame.func, op_site)) {
+                        // Hot loop back-edge in experimental mode: try to run the
+                        // remaining iterations natively (count-loop kernel). On
+                        // success, jump straight to the loop exit; otherwise keep
+                        // interpreting (graceful deopt).
+                        if (loop_jit.tryFastForwardLoop(
+                            self.arena,
+                            code,
+                            frame.func.chunk.constants,
+                            frame.env,
+                            frame.registers,
+                            op_site,
+                        )) |exit_pc| {
+                            frame.pc = exit_pc;
+                            if (self.jit) |jc| jc.compiled += 1;
+                        }
+                    }
                 },
                 .JMP_IF_TRUE => {
                     const op_site = frame.pc - 1;
@@ -772,7 +802,7 @@ pub const BcVm = struct {
                     if (isTruthy(frame.registers[rcond])) {
                         const new_pc: i64 = @intCast(frame.pc);
                         frame.pc = @intCast(new_pc + offset);
-                        if (offset < 0) self.noteBackedge(frame.func, op_site);
+                        if (offset < 0) _ = self.noteBackedge(frame.func, op_site);
                     }
                 },
                 .JMP_IF_FALSE => {
@@ -787,7 +817,7 @@ pub const BcVm = struct {
                     if (!isTruthy(frame.registers[rcond])) {
                         const new_pc: i64 = @intCast(frame.pc);
                         frame.pc = @intCast(new_pc + offset);
-                        if (offset < 0) self.noteBackedge(frame.func, op_site);
+                        if (offset < 0) _ = self.noteBackedge(frame.func, op_site);
                     }
                 },
                 .JMP_IF_NULLISH => {
@@ -830,7 +860,7 @@ pub const BcVm = struct {
                     if (jsStrictEqual(frame.registers[rlhs], frame.registers[rrhs])) {
                         const new_pc: i64 = @intCast(frame.pc);
                         frame.pc = @intCast(new_pc + offset);
-                        if (offset < 0) self.noteBackedge(frame.func, op_site);
+                        if (offset < 0) _ = self.noteBackedge(frame.func, op_site);
                     }
                 },
                 .JGE => {
@@ -849,7 +879,7 @@ pub const BcVm = struct {
                     if (ge) {
                         const new_pc: i64 = @intCast(frame.pc);
                         frame.pc = @intCast(new_pc + offset);
-                        if (offset < 0) self.noteBackedge(frame.func, op_site);
+                        if (offset < 0) _ = self.noteBackedge(frame.func, op_site);
                     }
                 },
                 .NEW_CLOSURE => {
@@ -913,7 +943,7 @@ pub const BcVm = struct {
                     // of pushing a new one. Stack depth stays O(1) for tail
                     // recursion. Args are read from the current registers BEFORE
                     // the frame is overwritten.
-                    if (callee_val.bits != 0 and callee_val.toPtr().* == .bc_function) {
+                    if (callee_val.bits != 0 and callee_val.unbox() == .bc_function) {
                         const closure = callee_val.toPtr().bc_function;
                         const fn_ptr = closure.func;
                         const def_env: *Environment = @ptrCast(@alignCast(closure.env));
@@ -1129,7 +1159,7 @@ pub const BcVm = struct {
                     const key = key_val.toPtr().string;
                     const obj_val = frame.registers[robj];
                     const site_cache = &@constCast(frame.func.ic_table)[site_pc];
-                    if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                    if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                         const obj = obj_val.toPtr().object;
                         if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                             if (site_cache.lookup(key, obj.shapePtr())) |slot| {
@@ -1143,7 +1173,7 @@ pub const BcVm = struct {
 
                     const result = try self.getProp(obj_val, key);
                     frame.registers[rdst] = result;
-                    if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                    if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                         const obj = obj_val.toPtr().object;
                         if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                             if (obj.resolveOwnSlot(key)) |slot| {
@@ -1162,10 +1192,10 @@ pub const BcVm = struct {
                     frame.pc += 1;
                     const obj_val = frame.registers[robj];
                     const key_val = frame.registers[rkey];
-                    if (key_val.bits != 0 and key_val.toPtr().* == .string) {
+                    if (key_val.bits != 0 and key_val.unbox() == .string) {
                         const key = key_val.toPtr().string;
                         const site_cache = &@constCast(frame.func.ic_table)[site_pc];
-                        if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                        if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                             const obj = obj_val.toPtr().object;
                             if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                                 if (site_cache.lookup(key, obj.shapePtr())) |slot| {
@@ -1178,7 +1208,7 @@ pub const BcVm = struct {
                         }
                         const result = try self.getProp(obj_val, key);
                         frame.registers[rdst] = result;
-                        if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                        if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                             const obj = obj_val.toPtr().object;
                             if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                                 if (obj.resolveOwnSlot(key)) |slot| {
@@ -1208,7 +1238,7 @@ pub const BcVm = struct {
                     const val = frame.registers[rval];
                     try self.setProp(obj_val, key, val);
                     const site_cache = &@constCast(frame.func.ic_table)[site_pc];
-                    if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                    if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                         const obj = obj_val.toPtr().object;
                         if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                             if (obj.resolveOwnSlot(key)) |slot| {
@@ -1228,11 +1258,11 @@ pub const BcVm = struct {
                     const obj_val = frame.registers[robj];
                     const key_val = frame.registers[rkey];
                     const val = frame.registers[rval];
-                    if (key_val.bits != 0 and key_val.toPtr().* == .string) {
+                    if (key_val.bits != 0 and key_val.unbox() == .string) {
                         const key = key_val.toPtr().string;
                         try self.setProp(obj_val, key, val);
                         const site_cache = &@constCast(frame.func.ic_table)[site_pc];
-                        if (obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                        if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                             const obj = obj_val.toPtr().object;
                             if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                                 if (obj.resolveOwnSlot(key)) |slot| {
@@ -1338,14 +1368,14 @@ pub const BcVm = struct {
                     const rhs = frame.registers[rrhs];
                     var result = false;
                     const cache = &@constCast(frame.func.instanceof_ic_table)[site_pc];
-                    if (rhs.bits != 0 and rhs.toPtr().* == .object) {
+                    if (rhs.bits != 0 and rhs.unbox() == .object) {
                         const rhs_obj = rhs.toPtr().object;
                         var target_proto: ?*JsObject = null;
                         if (cache.initialized and cache.rhs_obj != null and cache.rhs_obj.? == @as(*anyopaque, @ptrCast(rhs_obj))) {
                             if (cache.target_proto) |tp| target_proto = @ptrCast(@alignCast(tp));
                         } else {
                             if (rhs_obj.get("prototype")) |pv| {
-                                if (pv.bits != 0 and pv.toPtr().* == .object) target_proto = pv.toPtr().object;
+                                if (pv.bits != 0 and pv.unbox() == .object) target_proto = pv.toPtr().object;
                             }
                             cache.initialized = true;
                             cache.rhs_obj = @ptrCast(rhs_obj);
@@ -1371,7 +1401,7 @@ pub const BcVm = struct {
                     arr_obj.is_array = true;
                     var count: u32 = 0;
                     if (obj_val.bits != 0) {
-                        const iv = obj_val.toPtr().*;
+                        const iv = obj_val.unbox();
                         if (iv == .object) {
                             var it = iv.object.props.iterator();
                             while (it.next()) |entry| {
@@ -1419,7 +1449,7 @@ pub const BcVm = struct {
         if (callee_val.bits == 0) {
             return "undefined is not a constructor";
         }
-        switch (callee_val.toPtr().*) {
+        switch (callee_val.unbox()) {
             .bc_function, .function => {
                 // User-defined constructor.
                 var args = try self.arena.alloc(Value, nargs);
@@ -1456,17 +1486,17 @@ pub const BcVm = struct {
                 const result = fn_ptr.invoke(self.arena, this_val, args) catch {
                     return "native constructor threw";
                 };
-                frame.registers[rdst] = if (result.bits != 0 and result.toPtr().* == .object) result else this_val;
+                frame.registers[rdst] = if (result.bits != 0 and result.unbox() == .object) result else this_val;
                 return null;
             },
             .object => |obj| {
                 // Error constructor object: has __call__ and prototype.
                 if (obj.get("__call__")) |call_val| {
-                    if (call_val.bits != 0 and call_val.toPtr().* == .native_function) {
+                    if (call_val.bits != 0 and call_val.unbox() == .native_function) {
                         const fn_ptr = call_val.toPtr().native_function;
                         var proto: ?*JsObject = self.realm.object_prototype;
                         if (obj.get("prototype")) |pv| {
-                            if (pv.bits != 0 and pv.toPtr().* == .object) {
+                            if (pv.bits != 0 and pv.unbox() == .object) {
                                 proto = pv.toPtr().object;
                             }
                         }
@@ -1490,7 +1520,7 @@ pub const BcVm = struct {
                             }
                             return "native constructor threw";
                         };
-                        const final_r = if (result.bits != 0 and result.toPtr().* == .object) result else this_val;
+                        const final_r = if (result.bits != 0 and result.unbox() == .object) result else this_val;
                         self.frames.items[self.frames.items.len - 1].registers[rdst] = final_r;
                         return null;
                     }
@@ -1503,7 +1533,7 @@ pub const BcVm = struct {
 
     fn doCallWithThis(self: *BcVm, callee_val: Value, this_val: Value, base: u8, nargs: u8, ret_dst: u8) !?[]const u8 {
         const frame = &self.frames.items[self.frames.items.len - 1];
-        switch (callee_val.toPtr().*) {
+        switch (callee_val.unbox()) {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
@@ -1538,7 +1568,7 @@ pub const BcVm = struct {
         const proto_name = try std.fmt.allocPrint(self.arena, "__{s}Proto__", .{name});
         var proto: ?*JsObject = self.realm.object_prototype;
         if (self.realm.global_env.lookup(proto_name)) |pv| {
-            if (pv.bits != 0 and pv.toPtr().* == .object) proto = pv.toPtr().object;
+            if (pv.bits != 0 and pv.unbox() == .object) proto = pv.toPtr().object;
         } else |_| {}
         const obj = if (self.heap) |heap|
             try JsObject.createOnHeap(heap, proto)
@@ -1553,7 +1583,7 @@ pub const BcVm = struct {
 
     fn getProp(self: *BcVm, obj_val: Value, key: []const u8) !Value {
         if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);
-        switch (obj_val.toPtr().*) {
+        switch (obj_val.unbox()) {
             .object => |obj| {
                 // Special case: "length" on arrays.
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
@@ -1597,7 +1627,7 @@ pub const BcVm = struct {
 
     fn setProp(self: *BcVm, obj_val: Value, key: []const u8, value: Value) !void {
         if (obj_val.bits == 0) return;
-        switch (obj_val.toPtr().*) {
+        switch (obj_val.unbox()) {
             .object => |obj| {
                 if (obj.resolveOwnSlot(key)) |slot| {
                     if (obj.setOwnBySlot(obj.shapePtr(), slot, value)) {
@@ -1618,7 +1648,7 @@ pub const BcVm = struct {
         if (callee_val.bits == 0) {
             return try std.fmt.allocPrint(self.arena, "TypeError: undefined is not a function", .{});
         }
-        const inner = callee_val.toPtr().*;
+        const inner = callee_val.unbox();
         switch (inner) {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
@@ -1750,7 +1780,7 @@ pub const BcVm = struct {
                     }
                 }
                 if (obj.get("__call__")) |call_val| {
-                    if (call_val.bits != 0 and call_val.toPtr().* == .native_function) {
+                    if (call_val.bits != 0 and call_val.unbox() == .native_function) {
                         const fn_ptr = call_val.toPtr().native_function;
                         // Collect args.
                         var args = try self.arena.alloc(Value, nargs);
@@ -1761,7 +1791,7 @@ pub const BcVm = struct {
                             // Preserve legacy behavior for Error-like constructor objects.
                             var proto: ?*JsObject = self.realm.object_prototype;
                             if (obj.get("prototype")) |pv| {
-                                if (pv.bits != 0 and pv.toPtr().* == .object) proto = pv.toPtr().object;
+                                if (pv.bits != 0 and pv.unbox() == .object) proto = pv.toPtr().object;
                             }
                             const new_obj = if (self.heap) |heap|
                                 try JsObject.createOnHeap(heap, proto)
@@ -1771,7 +1801,7 @@ pub const BcVm = struct {
                             const result = fn_ptr.invoke(self.arena, this_val_call, args) catch {
                                 return "TypeError: Error constructor threw";
                             };
-                            const final_result = if (result.bits != 0 and result.toPtr().* == .object) result else this_val_call;
+                            const final_result = if (result.bits != 0 and result.unbox() == .object) result else this_val_call;
                             self.frames.items[self.frames.items.len - 1].registers[ret_dst] = final_result;
                             return null;
                         }
@@ -1804,7 +1834,7 @@ pub const BcVm = struct {
         if (callee_val.bits == 0) {
             return try std.fmt.allocPrint(self.arena, "TypeError: undefined is not a function", .{});
         }
-        const inner = callee_val.toPtr().*;
+        const inner = callee_val.unbox();
         switch (inner) {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
@@ -1971,7 +2001,7 @@ fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
 // Mirror vm.zig exactly. These MUST stay in sync.
 
 fn isNumberValue(v: Value) bool {
-    return v.bits != 0 and v.toPtr().* == .number;
+    return v.bits != 0 and v.unbox() == .number;
 }
 
 fn classifyTypeof(v: Value) struct {
@@ -1980,7 +2010,7 @@ fn classifyTypeof(v: Value) struct {
     result: []const u8,
 } {
     if (v.bits == 0) return .{ .tag = .undefined_, .shape = null, .result = "undefined" };
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => .{ .tag = .undefined_, .shape = null, .result = "undefined" },
         .null_ => .{ .tag = .null_, .shape = null, .result = "object" },
         .boolean => .{ .tag = .boolean, .shape = null, .result = "boolean" },
@@ -2000,7 +2030,7 @@ fn classifyTypeof(v: Value) struct {
 
 fn jsInstanceofWithTarget(lhs: Value, target_proto: ?*JsObject) bool {
     if (lhs.bits == 0 or target_proto == null) return false;
-    if (lhs.toPtr().* != .object) return false;
+    if (lhs.unbox() != .object) return false;
     var cur: ?*JsObject = lhs.toPtr().object;
     while (cur) |obj| {
         if (obj == target_proto.?) return true;
@@ -2011,7 +2041,7 @@ fn jsInstanceofWithTarget(lhs: Value, target_proto: ?*JsObject) bool {
 
 pub fn isTruthy(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => false,
         .null_ => false,
         .boolean => |b| b,
@@ -2026,12 +2056,12 @@ pub fn isTruthy(v: Value) bool {
 
 fn isString(v: Value) bool {
     if (v.bits == 0) return false;
-    return v.toPtr().* == .string;
+    return v.unbox() == .string;
 }
 
 fn isStringOrObject(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .string => true,
         .object => true,
         else => false,
@@ -2040,7 +2070,7 @@ fn isStringOrObject(v: Value) bool {
 
 pub fn typeofValue(v: Value) []const u8 {
     if (v.bits == 0) return "undefined";
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => "undefined",
         .null_ => "object",
         .boolean => "boolean",
@@ -2067,7 +2097,7 @@ pub fn toUint32(v: Value) u32 {
 
 pub fn toNumber(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => std.math.nan(f64),
         .null_ => 0.0,
         .boolean => |b| if (b) 1.0 else 0.0,
@@ -2082,7 +2112,7 @@ pub fn toNumber(v: Value) f64 {
 
 fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
     if (v.bits == 0) return "undefined";
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => "undefined",
         .null_ => "null",
         .boolean => |b| if (b) "true" else "false",
@@ -2119,7 +2149,7 @@ fn valueToStringArena(arena: std.mem.Allocator, v: Value) ![]const u8 {
 /// "Name: message" instead of the default "[object Object]" coercion.
 pub fn formatExceptionMessage(arena: std.mem.Allocator, v: Value) ![]const u8 {
     if (v.bits != 0) {
-        if (v.toPtr().* == .object) {
+        if (v.unbox() == .object) {
             const obj = v.toPtr().object;
             const name_v = obj.get("name");
             const msg_v = obj.get("message");
@@ -2143,8 +2173,8 @@ pub fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
 }
 
 fn jsLessThan(left: Value, right: Value) ?bool {
-    const lstr = if (left.bits != 0) left.toPtr().* == .string else false;
-    const rstr = if (right.bits != 0) right.toPtr().* == .string else false;
+    const lstr = if (left.bits != 0) left.unbox() == .string else false;
+    const rstr = if (right.bits != 0) right.unbox() == .string else false;
     if (lstr and rstr) {
         return std.mem.lessThan(u8, left.toPtr().string, right.toPtr().string);
     }
@@ -2162,12 +2192,12 @@ fn jsAbstractEqual(x: Value, y: Value) bool {
     if (tx == .number and ty == .string) return toNumber(x) == toNumber(y);
     if (tx == .string and ty == .number) return toNumber(x) == toNumber(y);
     if (tx == .boolean) {
-        const bv = x.toPtr().boolean;
+        const bv = x.unbox().boolean;
         const n: f64 = if (bv) 1.0 else 0.0;
         return n == toNumber(y);
     }
     if (ty == .boolean) {
-        const bv = y.toPtr().boolean;
+        const bv = y.unbox().boolean;
         const n: f64 = if (bv) 1.0 else 0.0;
         return toNumber(x) == n;
     }
@@ -2191,7 +2221,7 @@ fn jsStrictEqual(x: Value, y: Value) bool {
             return std.mem.eql(u8, x.toPtr().string, y.toPtr().string);
         },
         .boolean => {
-            return x.toPtr().boolean == y.toPtr().boolean;
+            return x.unbox().boolean == y.unbox().boolean;
         },
         .function => return x.bits == y.bits,
         .bc_function => return x.bits == y.bits,
@@ -2204,7 +2234,7 @@ const TypeTag = enum { undefined_, null_, boolean, number, string, function, bc_
 
 fn typeTag(v: Value) TypeTag {
     if (v.bits == 0) return .undefined_;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => .undefined_,
         .null_ => .null_,
         .boolean => .boolean,
@@ -2221,16 +2251,16 @@ fn typeTag(v: Value) TypeTag {
 fn jsInstanceof(lhs: Value, rhs: Value) bool {
     // lhs must be an object.
     if (lhs.bits == 0) return false;
-    if (lhs.toPtr().* != .object) return false;
+    if (lhs.unbox() != .object) return false;
 
     // rhs must be an object (or object-with-__call__) with a .prototype property.
     if (rhs.bits == 0) return false;
-    const rhs_inner = rhs.toPtr().*;
+    const rhs_inner = rhs.unbox();
     const target_proto: *JsObject = switch (rhs_inner) {
         .object => |obj| blk: {
             const pv = obj.get("prototype") orelse return false;
             if (pv.bits == 0) return false;
-            if (pv.toPtr().* != .object) return false;
+            if (pv.unbox() != .object) return false;
             break :blk pv.toPtr().object;
         },
         else => return false,

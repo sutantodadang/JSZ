@@ -58,7 +58,7 @@ fn nativeObjectCreate(arena: std.mem.Allocator, _: Value, args: []const Value) a
     if (args.len > 0) {
         const a = args[0];
         if (a.bits != 0) {
-            switch (a.toPtr().*) {
+            switch (a.unbox()) {
                 .object => |obj| proto = obj,
                 .null_ => proto = null,
                 else => {},
@@ -79,7 +79,7 @@ fn nativeObjectCreate(arena: std.mem.Allocator, _: Value, args: []const Value) a
 /// Minimal CommonJS-style host shim:
 /// require(name) reads from global __modules__[name] when present.
 fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0 or args[0].toPtr().* != .string) {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
         return val_mod.makeUndefined(arena);
     }
     const name = args[0].toPtr().string;
@@ -89,19 +89,19 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
     }
     if (std.mem.eql(u8, name, "exports")) {
         if (env.lookup("module")) |m| {
-            if (m.bits != 0 and m.toPtr().* == .object) {
+            if (m.bits != 0 and m.unbox() == .object) {
                 if (m.toPtr().object.get("exports")) |e| return e;
             }
         } else |_| {}
         return val_mod.makeUndefined(arena);
     }
     const registry = env.lookup("__modules__") catch return throwModuleNotFound(arena, name);
-    if (registry.bits == 0 or registry.toPtr().* != .object) return throwModuleNotFound(arena, name);
+    if (registry.bits == 0 or registry.unbox() != .object) return throwModuleNotFound(arena, name);
     const modules_obj = registry.toPtr().object;
     const resolved_name = resolveModuleName(arena, env, name) catch name;
     const lookup_name = if (modules_obj.get(resolved_name) != null) resolved_name else name;
     if (modules_obj.get(lookup_name)) |entry| {
-        if (entry.bits != 0 and entry.toPtr().* == .object) {
+        if (entry.bits != 0 and entry.unbox() == .object) {
             const mod_obj = entry.toPtr().object;
             if (mod_obj.get("exports")) |exports_val| {
                 try syncRequireCache(env, lookup_name, entry);
@@ -154,19 +154,19 @@ fn throwModuleNotFound(arena: std.mem.Allocator, name: []const u8) !Value {
 
 fn syncRequireCache(env: *Environment, id: []const u8, module_val: Value) !void {
     const cache_val = env.lookup("__require_cache__") catch return;
-    if (cache_val.bits == 0 or cache_val.toPtr().* != .object) return;
+    if (cache_val.bits == 0 or cache_val.unbox() != .object) return;
     try cache_val.toPtr().object.set(id, module_val);
 }
 
 fn nativeRequireResolve(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0 or args[0].toPtr().* != .string) {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
         return val_mod.makeUndefined(arena);
     }
     const name = args[0].toPtr().string;
     const env = active_global_env orelse return val_mod.makeUndefined(arena);
     const resolved = resolveModuleName(arena, env, name) catch name;
     const registry = env.lookup("__modules__") catch return throwModuleNotFound(arena, name);
-    if (registry.bits == 0 or registry.toPtr().* != .object) return throwModuleNotFound(arena, name);
+    if (registry.bits == 0 or registry.unbox() != .object) return throwModuleNotFound(arena, name);
     const modules_obj = registry.toPtr().object;
     if (modules_obj.get(resolved) != null) return val_mod.makeString(arena, resolved);
     if (modules_obj.get(name) != null) return val_mod.makeString(arena, name);
@@ -175,7 +175,7 @@ fn nativeRequireResolve(arena: std.mem.Allocator, _: Value, args: []const Value)
 
 fn isCallableValue(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
         .object => |o| o.get("__call__") != null,
         else => false,
@@ -185,7 +185,7 @@ fn isCallableValue(v: Value) bool {
 fn resolveModuleName(arena: std.mem.Allocator, env: *Environment, name: []const u8) ![]const u8 {
     if (!(std.mem.startsWith(u8, name, "./") or std.mem.startsWith(u8, name, "../"))) return name;
     const cur_id = env.lookup("__module_id__") catch return name;
-    if (cur_id.bits == 0 or cur_id.toPtr().* != .string) return name;
+    if (cur_id.bits == 0 or cur_id.unbox() != .string) return name;
     const base = std.fs.path.dirname(cur_id.toPtr().string) orelse "";
     const joined = try std.fs.path.join(arena, &[_][]const u8{ base, name });
     return normalizePath(arena, joined);
@@ -253,7 +253,7 @@ pub var error_proto_ReferenceError: ?*JsObject = null;
 
 fn extractMessage(args: []const Value) []const u8 {
     if (args.len > 0 and args[0].bits != 0) {
-        return switch (args[0].toPtr().*) {
+        return switch (args[0].unbox()) {
             .string => |s| s,
             .undefined_ => "",
             else => "error",
@@ -265,7 +265,7 @@ fn extractMessage(args: []const Value) []const u8 {
 fn populateErrorThis(arena: std.mem.Allocator, this_val: Value, name: []const u8, message: []const u8) !Value {
     // If this_val is an object, populate it and return it.
     // Otherwise create a new object.
-    if (this_val.bits != 0 and this_val.toPtr().* == .object) {
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
         const obj = this_val.toPtr().object;
         const msg_val = try val_mod.makeString(arena, message);
         const name_val = try val_mod.makeString(arena, name);
@@ -302,10 +302,10 @@ fn nativeReferenceErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []c
 
 fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     // new Object() / Object(): if arg is an object return it, else create new.
-    if (args.len > 0 and args[0].bits != 0 and args[0].toPtr().* == .object) {
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
         return args[0];
     }
-    if (this_val.bits != 0 and this_val.toPtr().* == .object) return this_val;
+    if (this_val.bits != 0 and this_val.unbox() == .object) return this_val;
     const obj = if (active_heap) |heap|
         try JsObject.createOnHeap(heap, active_object_proto)
     else
@@ -314,15 +314,15 @@ fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
 }
 
 fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const obj = if (this_val.bits != 0 and this_val.toPtr().* == .object)
+    const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
         this_val.toPtr().object
     else if (active_heap) |heap|
         try JsObject.createOnHeap(heap, active_array_proto)
     else
         try JsObject.create(arena, active_array_proto);
     obj.is_array = true;
-    if (args.len == 1 and args[0].bits != 0 and args[0].toPtr().* == .number) {
-        const len = args[0].toPtr().number;
+    if (args.len == 1 and args[0].bits != 0 and args[0].unbox() == .number) {
+        const len = args[0].unbox().number;
         if (len >= 0 and len == @floor(len) and len < 4294967296) {
             obj.array_length = @intFromFloat(len);
         }
@@ -337,7 +337,7 @@ fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 }
 
 fn nativeArrayIsArray(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len > 0 and args[0].bits != 0 and args[0].toPtr().* == .object) {
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
         return val_mod.makeBool(arena, args[0].toPtr().object.is_array);
     }
     return val_mod.makeBool(arena, false);
@@ -347,7 +347,7 @@ fn nativeStringCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
     if (args.len == 0) return val_mod.makeString(arena, "");
     const arg = args[0];
     if (arg.bits == 0) return val_mod.makeString(arena, "undefined");
-    return switch (arg.toPtr().*) {
+    return switch (arg.unbox()) {
         .string => |s| val_mod.makeString(arena, s),
         .number => |n| blk: {
             const vm_mod = @import("../vm/vm.zig");
@@ -365,8 +365,8 @@ fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Va
     var buf: [256]u8 = undefined;
     var len: usize = 0;
     for (args) |arg| {
-        if (arg.bits != 0 and arg.toPtr().* == .number) {
-            const code: u32 = @intFromFloat(@mod(arg.toPtr().number, 65536));
+        if (arg.bits != 0 and arg.unbox() == .number) {
+            const code: u32 = @intFromFloat(@mod(arg.unbox().number, 65536));
             if (code < 128 and len < buf.len) {
                 buf[len] = @intCast(code);
                 len += 1;
@@ -378,7 +378,7 @@ fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Va
 
 fn toNumberCoerce(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .number => |n| n,
         .boolean => |b| if (b) 1 else 0,
         .null_ => 0,
@@ -402,7 +402,7 @@ fn nativeIsFinite(arena: std.mem.Allocator, _: Value, args: []const Value) anyer
 }
 
 fn nativeParseFloat(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0 or args[0].toPtr().* != .string) {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
         return val_mod.makeNumber(arena, std.math.nan(f64));
     }
     const s = std.mem.trimLeft(u8, args[0].toPtr().string, &std.ascii.whitespace);
@@ -430,13 +430,13 @@ fn nativeParseFloat(arena: std.mem.Allocator, _: Value, args: []const Value) any
 }
 
 fn nativeParseInt(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0 or args[0].toPtr().* != .string) {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
         return val_mod.makeNumber(arena, std.math.nan(f64));
     }
     var s = std.mem.trimLeft(u8, args[0].toPtr().string, &std.ascii.whitespace);
     var radix: u8 = 10;
-    if (args.len > 1 and args[1].bits != 0 and args[1].toPtr().* == .number) {
-        const r = args[1].toPtr().number;
+    if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .number) {
+        const r = args[1].unbox().number;
         if (r >= 2 and r <= 36) radix = @intFromFloat(r);
     }
     var neg = false;
@@ -467,7 +467,7 @@ pub var eval_hook: ?*const fn (ctx_ptr: *anyopaque, arena: std.mem.Allocator, so
 fn nativeEval(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0) return val_mod.makeUndefined(arena);
     // eval of a non-string returns the argument unchanged (ES5 step 1).
-    if (args[0].bits == 0 or args[0].toPtr().* != .string) return args[0];
+    if (args[0].bits == 0 or args[0].unbox() != .string) return args[0];
     const src = args[0].toPtr().string;
     const hook = eval_hook orelse return val_mod.makeUndefined(arena);
     const ctx = active_context orelse return val_mod.makeUndefined(arena);
@@ -476,7 +476,7 @@ fn nativeEval(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!
 
 fn toBooleanCoerce(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .boolean => |b| b,
         .number => |n| n != 0 and !std.math.isNan(n),
         .string => |s| s.len > 0,
@@ -488,7 +488,7 @@ fn toBooleanCoerce(v: Value) bool {
 fn nativeBooleanCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const b = if (args.len > 0) toBooleanCoerce(args[0]) else false;
     // Called as `new Boolean(x)`: this_val is a fresh object — store primitive, return it.
-    if (this_val.bits != 0 and this_val.toPtr().* == .object) {
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
         try this_val.toPtr().object.set("[[PrimitiveValue]]", try val_mod.makeBool(arena, b));
         return this_val;
     }
@@ -499,7 +499,7 @@ fn nativeNumberCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
     if (args.len == 0) return val_mod.makeNumber(arena, 0);
     const arg = args[0];
     if (arg.bits == 0) return val_mod.makeNumber(arena, std.math.nan(f64));
-    return switch (arg.toPtr().*) {
+    return switch (arg.unbox()) {
         .number => |n| val_mod.makeNumber(arena, n),
         .boolean => |b| val_mod.makeNumber(arena, if (b) 1 else 0),
         .string => |s| blk: {
@@ -774,7 +774,7 @@ pub const Realm = struct {
         // Add keys/values to the existing Object constructor.
         if (env.bindings.getPtr("Object")) |obj_binding| {
             const obj_val_ptr = &obj_binding.value;
-            if (obj_val_ptr.bits != 0 and obj_val_ptr.toPtr().* == .object) {
+            if (obj_val_ptr.bits != 0 and obj_val_ptr.unbox() == .object) {
                 const ctor_obj = obj_val_ptr.toPtr().object;
                 const keys_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectKeys);
                 const values_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectValues);
@@ -1102,7 +1102,7 @@ pub const Realm = struct {
         if (self.global_env.bindings.getPtr("Object")) |obj_binding| {
             const obj_val_ptr = &obj_binding.value;
             if (obj_val_ptr.bits != 0) {
-                switch (obj_val_ptr.toPtr().*) {
+                switch (obj_val_ptr.unbox()) {
                     .object => |ctor_obj| {
                         const new_proto_val = try val_mod.makeObject(self.arena, hp_proto);
                         try ctor_obj.set("prototype", new_proto_val);
@@ -1170,7 +1170,7 @@ test "Realm: Object.create in env" {
     defer realm.deinit();
     const obj_val = try realm.global_env.lookup("Object");
     try std.testing.expect(obj_val.bits != 0);
-    try std.testing.expect(obj_val.toPtr().* == .object);
+    try std.testing.expect(obj_val.unbox() == .object);
 }
 
 test "Realm: activateHeap migrates protos to heap" {

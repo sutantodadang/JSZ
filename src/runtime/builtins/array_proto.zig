@@ -46,7 +46,7 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
 
     const start_raw: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .number => |n| n,
             else => 0.0,
         }
@@ -54,7 +54,7 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
         0.0;
 
     const end_raw: f64 = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].toPtr().*) {
+        switch (args[1].unbox()) {
             .number => |n| n,
             .undefined_ => @floatFromInt(len),
             else => @floatFromInt(len),
@@ -92,7 +92,7 @@ pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Va
     const len = arr.array_length;
 
     const from: usize = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].toPtr().*) {
+        switch (args[1].unbox()) {
             .number => |n| blk: {
                 if (n < 0.0) {
                     const r = @as(i64, @intCast(len)) + @as(i64, @intFromFloat(@trunc(n)));
@@ -123,7 +123,7 @@ pub fn nativeIncludes(arena: std.mem.Allocator, this_val: Value, args: []const V
     const search = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     const len = arr.array_length;
     const from: usize = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].toPtr().*) {
+        switch (args[1].unbox()) {
             .number => |n| blk: {
                 if (n < 0.0) {
                     const r = @as(i64, @intCast(len)) + @as(i64, @intFromFloat(@trunc(n)));
@@ -151,7 +151,7 @@ fn flattenInto(arena: std.mem.Allocator, dst: *JsObject, src: *JsObject, depth: 
     while (i < src.array_length) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
         const elem = src.props.get(key) orelse continue;
-        if (depth > 0 and elem.bits != 0 and elem.toPtr().* == .object and elem.toPtr().object.is_array) {
+        if (depth > 0 and elem.bits != 0 and elem.unbox() == .object and elem.toPtr().object.is_array) {
             try flattenInto(arena, dst, elem.toPtr().object, depth - 1, ni);
         } else {
             const dk = try std.fmt.allocPrint(arena, "{d}", .{ni.*});
@@ -167,7 +167,7 @@ pub fn nativeFlat(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const realm_mod = @import("../realm.zig");
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const depth: i64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .number => |n| if (std.math.isNan(n)) 0 else @intFromFloat(@trunc(n)),
             else => 1,
         }
@@ -196,7 +196,7 @@ pub fn nativeFlatMap(arena: std.mem.Allocator, this_val: Value, args: []const Va
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
         const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
         const mapped = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
-        if (mapped.bits != 0 and mapped.toPtr().* == .object and mapped.toPtr().object.is_array) {
+        if (mapped.bits != 0 and mapped.unbox() == .object and mapped.toPtr().object.is_array) {
             try flattenInto(arena, new_arr, mapped.toPtr().object, 1, &ni);
         } else {
             const dk = try std.fmt.allocPrint(arena, "{d}", .{ni});
@@ -213,7 +213,7 @@ pub fn nativeJoin(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const len = arr.array_length;
 
     const sep: []const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .string => |s| s,
             .undefined_ => ",",
             .null_ => ",",
@@ -261,7 +261,7 @@ pub fn nativeConcat(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
     // Append each arg
     for (args) |a| {
-        if (a.bits != 0 and a.toPtr().* == .object and a.toPtr().object.is_array) {
+        if (a.bits != 0 and a.unbox() == .object and a.toPtr().object.is_array) {
             // Spread one level
             const arg_arr = a.toPtr().object;
             var i: usize = 0;
@@ -296,7 +296,7 @@ fn callCb(arena: std.mem.Allocator, cb: Value, this_arg: Value, elem: Value, idx
 
 fn isTruthy(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => false,
         .null_ => false,
         .boolean => |b| b,
@@ -492,7 +492,7 @@ pub fn nativeAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) 
     const len = arr.array_length;
     if (len == 0) return val_mod.makeUndefined(arena);
     const idx_raw: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .number => |n| n,
             else => 0.0,
         }
@@ -558,7 +558,7 @@ pub fn nativeSort(arena: std.mem.Allocator, this_val: Value, args: []const Value
     // Comparator.
     const cmp_fn: ?Value = if (args.len > 0 and args[0].bits != 0) blk: {
         const v = args[0];
-        if (v.toPtr().* == .undefined_) break :blk null;
+        if (v.unbox() == .undefined_) break :blk null;
         break :blk v;
     } else null;
 
@@ -575,7 +575,7 @@ pub fn nativeSort(arena: std.mem.Allocator, this_val: Value, args: []const Value
                     const fpm = @import("../builtins/function_proto.zig");
                     const cmp_args = [_]Value{ prev, cur };
                     const cmp_res = fpm.invokeCallback(arena, undef, cfn, &cmp_args) catch break :blk false;
-                    const n = switch (cmp_res.toPtr().*) {
+                    const n = switch (cmp_res.unbox()) {
                         .number => |x| x,
                         else => 0.0,
                     };
@@ -630,7 +630,7 @@ fn relativeIndex(idx: f64, len: usize) usize {
 
 fn elemToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
     if (v.bits == 0) return "";
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => "",
         .null_ => "",
         .boolean => |b| if (b) "true" else "false",
@@ -650,9 +650,9 @@ fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
 }
 
 fn sameValueZero(x: Value, y: Value) bool {
-    if (x.bits != 0 and y.bits != 0 and x.toPtr().* == .number and y.toPtr().* == .number) {
-        const a = x.toPtr().number;
-        const b = y.toPtr().number;
+    if (x.bits != 0 and y.bits != 0 and x.unbox() == .number and y.unbox() == .number) {
+        const a = x.unbox().number;
+        const b = y.unbox().number;
         if (std.math.isNan(a) and std.math.isNan(b)) return true;
         return a == b;
     }
@@ -662,8 +662,8 @@ fn sameValueZero(x: Value, y: Value) bool {
 fn jsStrictEqual(x: Value, y: Value) bool {
     if (x.bits == 0 and y.bits == 0) return true;
     if (x.bits == 0 or y.bits == 0) return false;
-    const xi = x.toPtr().*;
-    const yi = y.toPtr().*;
+    const xi = x.unbox();
+    const yi = y.unbox();
     const xt = std.meta.Tag(val_mod.JsValue);
     if (@as(xt, xi) != @as(xt, yi)) return false;
     return switch (xi) {

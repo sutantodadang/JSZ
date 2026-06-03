@@ -225,7 +225,7 @@ pub const Heap = struct {
     }
 
     fn markValue(self: *Heap, v: Value) void {
-        if (v.bits == 0) return;
+        if (!v.isHeapPtr()) return;
         const inner = v.toPtr();
         switch (inner.*) {
             .object => |obj| self.markObject(obj),

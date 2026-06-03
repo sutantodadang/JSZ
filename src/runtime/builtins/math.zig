@@ -7,7 +7,7 @@ const Value = val_mod.Value;
 
 fn getNum(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .number => |n| n,
         .boolean => |b| if (b) 1.0 else 0.0,
         .null_ => 0.0,

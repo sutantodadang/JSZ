@@ -19,8 +19,8 @@ const SetData = struct {
 fn strictEq(a: Value, b: Value) bool {
     if (a.bits == 0 and b.bits == 0) return true;
     if (a.bits == 0 or b.bits == 0) return false;
-    const av = a.toPtr().*;
-    const bv = b.toPtr().*;
+    const av = a.unbox();
+    const bv = b.unbox();
     if (std.meta.activeTag(av) != std.meta.activeTag(bv)) return false;
     return switch (av) {
         .undefined_, .null_ => true,
@@ -38,7 +38,7 @@ fn makeObj(arena: std.mem.Allocator, proto: ?*JsObject, kind: InternalKind) !Val
 }
 
 fn getMapData(this_val: Value, expected: InternalKind) ?*MapData {
-    if (this_val.bits == 0 or this_val.toPtr().* != .object) return null;
+    if (this_val.bits == 0 or this_val.unbox() != .object) return null;
     const obj = this_val.toPtr().object;
     if (obj.internal_kind != expected) return null;
     if (obj.internal_slot) |s| return @ptrCast(@alignCast(s));
@@ -46,7 +46,7 @@ fn getMapData(this_val: Value, expected: InternalKind) ?*MapData {
 }
 
 fn getSetData(this_val: Value, expected: InternalKind) ?*SetData {
-    if (this_val.bits == 0 or this_val.toPtr().* != .object) return null;
+    if (this_val.bits == 0 or this_val.unbox() != .object) return null;
     const obj = this_val.toPtr().object;
     if (obj.internal_kind != expected) return null;
     if (obj.internal_slot) |s| return @ptrCast(@alignCast(s));
@@ -65,7 +65,7 @@ pub fn collectionSize(obj: *JsObject) ?usize {
 
 pub fn nativeMapCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     var out = this_val;
-    if (out.bits == 0 or out.toPtr().* != .object) {
+    if (out.bits == 0 or out.unbox() != .object) {
         out = try makeObj(arena, null, .map);
     }
     const obj = out.toPtr().object;
@@ -73,14 +73,14 @@ pub fn nativeMapCtor(arena: std.mem.Allocator, this_val: Value, args: []const Va
     d.* = .{};
     obj.internal_kind = .map;
     obj.internal_slot = d;
-    if (args.len > 0 and args[0].bits != 0 and args[0].toPtr().* == .object and args[0].toPtr().object.is_array) {
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object and args[0].toPtr().object.is_array) {
         const src = args[0].toPtr().object;
         var i: u32 = 0;
         while (i < src.getArrayLength()) : (i += 1) {
             var kbuf: [16]u8 = undefined;
             const ks = std.fmt.bufPrint(&kbuf, "{d}", .{i}) catch continue;
             const pair_val = src.get(ks) orelse continue;
-            if (pair_val.bits == 0 or pair_val.toPtr().* != .object) continue;
+            if (pair_val.bits == 0 or pair_val.unbox() != .object) continue;
             const pair = pair_val.toPtr().object;
             const k = pair.get("0") orelse continue;
             const v = pair.get("1") orelse try val_mod.makeUndefined(arena);
@@ -92,7 +92,7 @@ pub fn nativeMapCtor(arena: std.mem.Allocator, this_val: Value, args: []const Va
 
 pub fn nativeWeakMapCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     var out = this_val;
-    if (out.bits == 0 or out.toPtr().* != .object) out = try makeObj(arena, null, .weakmap);
+    if (out.bits == 0 or out.unbox() != .object) out = try makeObj(arena, null, .weakmap);
     const obj = out.toPtr().object;
     const d = try arena.create(MapData);
     d.* = .{};
@@ -103,13 +103,13 @@ pub fn nativeWeakMapCtor(arena: std.mem.Allocator, this_val: Value, _: []const V
 
 pub fn nativeSetCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     var out = this_val;
-    if (out.bits == 0 or out.toPtr().* != .object) out = try makeObj(arena, null, .set);
+    if (out.bits == 0 or out.unbox() != .object) out = try makeObj(arena, null, .set);
     const obj = out.toPtr().object;
     const d = try arena.create(SetData);
     d.* = .{};
     obj.internal_kind = .set;
     obj.internal_slot = d;
-    if (args.len > 0 and args[0].bits != 0 and args[0].toPtr().* == .object and args[0].toPtr().object.is_array) {
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object and args[0].toPtr().object.is_array) {
         const src = args[0].toPtr().object;
         var i: u32 = 0;
         while (i < src.getArrayLength()) : (i += 1) {
@@ -124,7 +124,7 @@ pub fn nativeSetCtor(arena: std.mem.Allocator, this_val: Value, args: []const Va
 
 pub fn nativeWeakSetCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     var out = this_val;
-    if (out.bits == 0 or out.toPtr().* != .object) out = try makeObj(arena, null, .weakset);
+    if (out.bits == 0 or out.unbox() != .object) out = try makeObj(arena, null, .weakset);
     const obj = out.toPtr().object;
     const d = try arena.create(SetData);
     d.* = .{};
@@ -137,7 +137,7 @@ pub fn nativeMapSet(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const data = getMapData(this_val, .map) orelse getMapData(this_val, .weakmap) orelse return this_val;
     if (args.len < 2) return this_val;
     const weak = this_val.toPtr().object.internal_kind == .weakmap;
-    if (weak and (args[0].bits == 0 or args[0].toPtr().* != .object)) return this_val;
+    if (weak and (args[0].bits == 0 or args[0].unbox() != .object)) return this_val;
     for (data.keys.items, 0..) |k, i| {
         if (strictEq(k, args[0])) {
             data.values.items[i] = args[1];
@@ -196,7 +196,7 @@ pub fn nativeSetAdd(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const data = getSetData(this_val, .set) orelse getSetData(this_val, .weakset) orelse return this_val;
     if (args.len == 0) return this_val;
     const weak = this_val.toPtr().object.internal_kind == .weakset;
-    if (weak and (args[0].bits == 0 or args[0].toPtr().* != .object)) return this_val;
+    if (weak and (args[0].bits == 0 or args[0].unbox() != .object)) return this_val;
     for (data.values.items) |v| if (strictEq(v, args[0])) return this_val;
     try data.values.append(arena, args[0]);
     return this_val;
@@ -293,7 +293,7 @@ pub fn nativeSetValues(arena: std.mem.Allocator, this_val: Value, _: []const Val
 }
 
 pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.toPtr().* != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    if (this_val.bits == 0 or this_val.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const obj = this_val.toPtr().object;
     if (obj.internal_slot == null) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const iter: *MapIterData = @ptrCast(@alignCast(obj.internal_slot.?));
@@ -320,7 +320,7 @@ pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
 }
 
 pub fn nativeSetIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.toPtr().* != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    if (this_val.bits == 0 or this_val.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const obj = this_val.toPtr().object;
     if (obj.internal_slot == null) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const iter: *SetIterData = @ptrCast(@alignCast(obj.internal_slot.?));

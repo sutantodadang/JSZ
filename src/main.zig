@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: MIT
 const std = @import("std");
 const jsz = @import("jsz");
+const build_options = @import("build_options");
+
+/// Phase 9: when built with `-Djit=true`, compile the Cranelift native count-loop
+/// kernel and install it so the experimental hot-loop JIT runs native code.
+/// Compiled out entirely otherwise (no cargo/DLL dependency).
+fn installNativeJit() void {
+    if (comptime build_options.jit_enabled) {
+        const native = @import("jit/native.zig");
+        if (native.compileCountLoop()) |f| jsz.installNativeCountLoop(f);
+        if (native.compileAccumulateLoop()) |f| jsz.installNativeAccumulateLoop(f);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -343,6 +355,8 @@ fn runRepl(allocator: std.mem.Allocator, interp: jsz.InterpMode) !void {
 }
 
 pub fn main() !void {
+    installNativeJit();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

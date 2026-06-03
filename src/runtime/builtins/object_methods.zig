@@ -96,11 +96,11 @@ pub fn nativeObjectFromEntries(arena: std.mem.Allocator, _: Value, args: []const
     while (i < list.array_length) : (i += 1) {
         const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
         const entry = list.props.get(ek) orelse continue;
-        if (entry.bits == 0 or entry.toPtr().* != .object) continue;
+        if (entry.bits == 0 or entry.unbox() != .object) continue;
         const pair = entry.toPtr().object;
         const kv = pair.props.get("0") orelse continue;
         const vv = pair.props.get("1") orelse try val_mod.makeUndefined(arena);
-        const key: []const u8 = switch (kv.toPtr().*) {
+        const key: []const u8 = switch (kv.unbox()) {
             .string => |s| s,
             .number => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
             else => continue,
@@ -142,11 +142,11 @@ pub fn nativeObjectGetOwnPropertyDescriptors(arena: std.mem.Allocator, _: Value,
 
 /// hasOwnProperty(key): checks if own prop exists (not in proto chain).
 pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.toPtr().* != .object) {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
         return val_mod.makeBool(arena, false);
     }
     if (args.len == 0) return val_mod.makeBool(arena, false);
-    const key: []const u8 = if (args[0].bits != 0 and args[0].toPtr().* == .string)
+    const key: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
         args[0].toPtr().string
     else
         return val_mod.makeBool(arena, false);

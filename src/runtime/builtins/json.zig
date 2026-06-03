@@ -14,7 +14,7 @@ pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Val
     }
 
     const indent: usize = if (args.len > 2 and args[2].bits != 0)
-        switch (args[2].toPtr().*) {
+        switch (args[2].unbox()) {
             .number => |n| blk: {
                 if (n < 0.0) break :blk 0;
                 const u: usize = @intFromFloat(@trunc(n));
@@ -43,7 +43,7 @@ fn stringifyValue(
         try buf.appendSlice(arena, "undefined");
         return;
     }
-    switch (v.toPtr().*) {
+    switch (v.unbox()) {
         .undefined_ => {
             try buf.appendSlice(arena, "undefined");
         },
@@ -84,7 +84,7 @@ fn stringifyObject(
         const val = entry.value_ptr.*;
         // Skip functions and undefined values (per JSON spec)
         if (val.bits != 0) {
-            const tag = val.toPtr().*;
+            const tag = val.unbox();
             if (tag == .function or tag == .bc_function or tag == .native_function or tag == .undefined_) continue;
         } else {
             continue; // zero = undefined
@@ -132,7 +132,7 @@ fn stringifyArray(
         if (arr.props.get(key)) |elem| {
             // Functions/undefined in arrays become "null"
             if (elem.bits != 0) {
-                const tag = elem.toPtr().*;
+                const tag = elem.unbox();
                 if (tag == .function or tag == .bc_function or tag == .native_function or tag == .undefined_) {
                     try buf.appendSlice(arena, "null");
                     continue;
@@ -189,7 +189,7 @@ pub fn nativeJsonParse(arena: std.mem.Allocator, _: Value, args: []const Value) 
     if (args.len == 0) {
         return throwSyntaxError(arena, "JSON.parse: missing argument");
     }
-    const src: []const u8 = if (args[0].bits != 0 and args[0].toPtr().* == .string)
+    const src: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
         args[0].toPtr().string
     else
         return throwSyntaxError(arena, "JSON.parse: argument is not a string");
@@ -375,7 +375,7 @@ const JsonParser = struct {
             self.skipWs();
             if (self.peek() != '"') return throwSyntaxError(self.arena, "JSON.parse: expected string key");
             const key_val = try self.parseString();
-            const key_str = if (key_val.bits != 0 and key_val.toPtr().* == .string)
+            const key_str = if (key_val.bits != 0 and key_val.unbox() == .string)
                 key_val.toPtr().string
             else
                 return throwSyntaxError(self.arena, "JSON.parse: expected string key");

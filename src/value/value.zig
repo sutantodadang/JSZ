@@ -52,6 +52,72 @@ pub const JsValue = union(enum) {
     pub const Tag = std.meta.Tag(JsValue);
 };
 
+/// Phase 9 (staged): SMI inline-integer value representation, the foundation for
+/// a NaN-boxed `Value`. Built OFF — when false, `unbox()` is exactly `toPtr().*`,
+/// no SMI handle is ever produced, GC is untouched, and the engine is bit-for-bit
+/// the boxed-pointer model (green). The dedicated follow-up migrates the read
+/// dispatch sites to `unbox()`, then flips this to true. Pointers from the arena
+/// are ≥8-byte aligned, so low bit 0 ⇒ pointer/undefined, low bit 1 ⇒ SMI.
+pub const enable_smi = true;
+
+/// Phase 9 (staged): full WebKit-style inline-double NaN-boxing, layered on top
+/// of the SMI/immediate scheme. Built OFF — when false the engine uses the
+/// low-bit SMI + {2,4,6} immediate scheme (green). When ON, numbers are encoded
+/// inline as int32 (`NumberTag|u32`) or offset-doubles, and singletons use the
+/// WebKit immediate constants; `unbox()` decodes all of it. `bits==0` stays
+/// undefined (WebKit ValueEmpty), so existing `bits==0` guards are unchanged.
+pub const enable_nanbox = true;
+
+// WebKit JSVALUE64 constants (Source/JavaScriptCore/runtime/JSCJSValue.h).
+const NumberTag: u64 = 0xfffe000000000000;
+const DoubleEncodeOffset: u64 = 1 << 49; // 0x0002000000000000
+const NotCellMask: u64 = NumberTag | 0x2; // 0xfffe000000000002
+const nb_null: u64 = 0x2; //  OtherTag
+const nb_false: u64 = 0x6; // OtherTag|BoolTag
+const nb_true: u64 = 0x7; //  OtherTag|BoolTag|1
+
+/// Inclusive SMI integer bounds: i32 under NaN-boxing (WebKit int32 tag), else
+/// the i53 exactly-representable band for the low-bit SMI scheme.
+const smi_min: i64 = if (enable_nanbox) -2147483648 else -9007199254740992;
+const smi_max: i64 = if (enable_nanbox) 2147483647 else 9007199254740992;
+
+/// SMI range guard: integral, finite, within the i53 exactly-representable band.
+inline fn smiFits(n: f64) bool {
+    if (!std.math.isFinite(n) or @floor(n) != n) return false;
+    if (n == 0.0 and std.math.signbit(n)) return false; // preserve -0.0 distinctly
+    return n >= @as(f64, @floatFromInt(smi_min)) and n <= @as(f64, @floatFromInt(smi_max));
+}
+
+/// Immediate singleton encodings (gated by `enable_smi`). Heap pointers are
+/// ≥8-byte aligned (low 3 bits 000, nonzero); SMI has bit0==1; undefined is
+/// bits==0. That leaves low-3-bit patterns {010,100,110} free for inline
+/// singletons, so null/true/false need no allocation and gain canonical bits.
+const imm_null: u64 = 0b010; // 2
+const imm_true: u64 = 0b100; // 4
+const imm_false: u64 = 0b110; // 6
+
+/// Integer arithmetic fast-path: when both operands are SMIs and the exact
+/// integer result stays in SMI range, return it as an SMI (no f64 round-trip,
+/// no allocation); else null so the caller falls back to f64 semantics. `op` is
+/// '+','-','*'. Multiply returning 0 defers to f64 to preserve JS -0.
+pub inline fn smiArith(a: Value, b: Value, op: u8) ?Value {
+    if (!a.isSmi() or !b.isSmi()) return null;
+    const x = a.smiValue();
+    const y = b.smiValue();
+    const r: i64 = switch (op) {
+        '+' => std.math.add(i64, x, y) catch return null,
+        '-' => std.math.sub(i64, x, y) catch return null,
+        '*' => blk: {
+            const m = std.math.mul(i64, x, y) catch return null;
+            if (m == 0) return null; // could be -0 in JS; let f64 decide
+            break :blk m;
+        },
+        else => return null,
+    };
+    if (r < smi_min or r > smi_max) return null; // SMI range
+    return Value.fromSmi(r);
+}
+
 /// A JS function value: captures its AST + closure environment.
 pub const FuncVal = struct {
     name: ?[]const u8,
@@ -88,32 +154,88 @@ pub const Value = extern struct {
         return Value{ .bits = @intFromPtr(ptr) };
     }
 
-    /// Unwrap the *JsValue pointer. Only safe when bits != 0.
+    /// Unwrap the *JsValue pointer. Only safe when bits != 0 and not an SMI.
     pub fn toPtr(self: Value) *JsValue {
         return @ptrFromInt(self.bits);
     }
 
+    /// True if this handle carries an inline small integer. Always false while
+    /// `enable_smi` is off, so the pointer model is unaffected.
+    pub inline fn isSmi(self: Value) bool {
+        if (enable_nanbox) return (self.bits & NumberTag) == NumberTag; // int32 tag
+        return enable_smi and (self.bits & 1) == 1;
+    }
+
+    /// Decode an SMI payload. Caller must check `isSmi`.
+    pub inline fn smiValue(self: Value) i64 {
+        if (enable_nanbox) return @as(i32, @bitCast(@as(u32, @truncate(self.bits)))); // i32 in low 32
+        return @as(i64, @bitCast(self.bits)) >> 1;
+    }
+
+    /// Encode an integer as an inline SMI handle (no allocation). Under nanbox
+    /// the value must be in i32 range (callers guarantee via `smiFits`).
+    pub inline fn fromSmi(n: i64) Value {
+        if (enable_nanbox) return Value{ .bits = NumberTag | @as(u64, @as(u32, @bitCast(@as(i32, @intCast(n))))) };
+        return Value{ .bits = @bitCast((n << 1) | 1) };
+    }
+
+    /// True when these bits denote a real heap JsValue pointer (a "cell").
+    /// nanbox: `(bits & NotCellMask)==0 && bits!=0`. Low-bit scheme: 8-aligned,
+    /// nonzero. With all inline schemes off this is just `bits != 0`.
+    pub inline fn isHeapPtr(self: Value) bool {
+        if (enable_nanbox) return self.bits != 0 and (self.bits & NotCellMask) == 0;
+        return self.bits != 0 and (self.bits & 0b111) == 0;
+    }
+
+    /// Read-dispatch superset accessor: the JsValue this handle denotes. Decodes
+    /// inline SMI/double/immediate forms; otherwise it is exactly `toPtr().*`.
+    /// READ sites only — write sites (`toPtr().* = …`) must keep `toPtr()`.
+    pub inline fn unbox(self: Value) JsValue {
+        if (enable_nanbox) {
+            if (self.bits == 0) return .undefined_;
+            if ((self.bits & NumberTag) != 0) { // number
+                if ((self.bits & NumberTag) == NumberTag) return .{ .number = @floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(self.bits))))) };
+                return .{ .number = @bitCast(self.bits -% DoubleEncodeOffset) };
+            }
+            switch (self.bits) {
+                nb_null => return .null_,
+                nb_true => return .{ .boolean = true },
+                nb_false => return .{ .boolean = false },
+                else => {},
+            }
+            return self.toPtr().*;
+        }
+        if (self.isSmi()) return JsValue{ .number = @floatFromInt(self.smiValue()) };
+        if (enable_smi) switch (self.bits) {
+            imm_null => return .null_,
+            imm_true => return .{ .boolean = true },
+            imm_false => return .{ .boolean = false },
+            else => {},
+        };
+        return self.toPtr().*;
+    }
+
     pub fn isNull(self: Value) bool {
         if (self.bits == 0) return false;
-        return self.toPtr().* == .null_;
+        return self.unbox() == .null_;
     }
 
     pub fn isUndefined(self: Value) bool {
         if (self.bits == 0) return true; // zero = uninitialized = undefined
-        return self.toPtr().* == .undefined_;
+        return self.unbox() == .undefined_;
     }
 
     /// True if the value is `null` or `undefined` (ES nullish).
     pub fn isNullish(self: Value) bool {
         if (self.bits == 0) return true; // uninitialized = undefined
-        const tag = self.toPtr().*;
+        const tag = self.unbox();
         return tag == .null_ or tag == .undefined_;
     }
 
     /// Phase 0 compat: return i32 approximation.
     pub fn toI32(self: Value) i32 {
         if (self.bits == 0) return 0;
-        return switch (self.toPtr().*) {
+        return switch (self.unbox()) {
             .number => |n| @intFromFloat(n),
             .boolean => |b| if (b) 1 else 0,
             else => 0,
@@ -122,7 +244,7 @@ pub const Value = extern struct {
 
     pub fn toF64(self: Value) f64 {
         if (self.bits == 0) return std.math.nan(f64);
-        return switch (self.toPtr().*) {
+        return switch (self.unbox()) {
             .number => |n| n,
             .boolean => |b| if (b) 1.0 else 0.0,
             .null_ => 0.0,
@@ -137,7 +259,7 @@ pub const Value = extern struct {
 
     pub fn toString(self: Value) []const u8 {
         if (self.bits == 0) return "undefined";
-        return switch (self.toPtr().*) {
+        return switch (self.unbox()) {
             .undefined_ => "undefined",
             .null_ => "null",
             .boolean => |b| if (b) "true" else "false",
@@ -162,18 +284,28 @@ pub fn makeUndefined(arena: std.mem.Allocator) !Value {
 }
 
 pub fn makeNull(arena: std.mem.Allocator) !Value {
+    if (enable_nanbox) return Value{ .bits = nb_null };
+    if (enable_smi) return Value{ .bits = imm_null };
     const v = try arena.create(JsValue);
     v.* = .null_;
     return Value.fromPtr(v);
 }
 
 pub fn makeBool(arena: std.mem.Allocator, b: bool) !Value {
+    if (enable_nanbox) return Value{ .bits = if (b) nb_true else nb_false };
+    if (enable_smi) return Value{ .bits = if (b) imm_true else imm_false };
     const v = try arena.create(JsValue);
     v.* = .{ .boolean = b };
     return Value.fromPtr(v);
 }
 
 pub fn makeNumber(arena: std.mem.Allocator, n: f64) !Value {
+    if (enable_nanbox) {
+        if (smiFits(n)) return Value.fromSmi(@intFromFloat(n));
+        const d = if (std.math.isNan(n)) std.math.nan(f64) else n; // purify NaN
+        return Value{ .bits = @as(u64, @bitCast(d)) +% DoubleEncodeOffset };
+    }
+    if (enable_smi and smiFits(n)) return Value.fromSmi(@intFromFloat(n));
     const v = try arena.create(JsValue);
     v.* = .{ .number = n };
     return Value.fromPtr(v);
@@ -250,4 +382,82 @@ test "Value object arm" {
     const v = try makeObject(arena.allocator(), obj);
     try std.testing.expect(v.bits != 0);
     try std.testing.expect(v.toPtr().* == .object);
+}
+
+test "SMI codec round-trips and is tagged distinctly from pointers" {
+    if (enable_nanbox) return; // low-bit SMI scheme only; nanbox int32 covered separately
+    // Independent of `enable_smi`: validate the encode/decode + range guard so
+    // the staged flip rests on a verified codec.
+    inline for (.{ @as(i64, 0), 1, -1, 42, -9007199254740992, 9007199254740992 }) |n| {
+        const v = Value.fromSmi(n);
+        try std.testing.expect((v.bits & 1) == 1); // low-bit tag set
+        try std.testing.expectEqual(n, v.smiValue());
+    }
+    try std.testing.expect(smiFits(42.0));
+    try std.testing.expect(!smiFits(1.5));
+    try std.testing.expect(!smiFits(std.math.inf(f64)));
+}
+
+test "immediate singletons decode and never look like heap pointers" {
+    if (!enable_smi) return;
+    const a = std.testing.allocator;
+    const nul = try makeNull(a);
+    const t = try makeBool(a, true);
+    const f = try makeBool(a, false);
+    try std.testing.expect(!nul.isHeapPtr() and !t.isHeapPtr() and !f.isHeapPtr());
+    try std.testing.expect(nul.unbox() == .null_ and nul.isNull());
+    try std.testing.expect(t.unbox().boolean == true);
+    try std.testing.expect(f.unbox().boolean == false);
+    // distinct from undefined(0), SMI(bit0), and each other.
+    try std.testing.expect(nul.bits != 0 and (nul.bits & 1) == 0);
+}
+
+test "smiArith integer fast-path: exact, range/overflow/-0 aware" {
+    const a = Value.fromSmi(3);
+    const b = Value.fromSmi(4);
+    try std.testing.expectEqual(@as(i64, 7), smiArith(a, b, '+').?.smiValue());
+    try std.testing.expectEqual(@as(i64, -1), smiArith(a, b, '-').?.smiValue());
+    try std.testing.expectEqual(@as(i64, 12), smiArith(a, b, '*').?.smiValue());
+    // multiply to 0 defers to f64 (JS -0 hazard).
+    try std.testing.expect(smiArith(Value.fromSmi(-1), Value.fromSmi(0), '*') == null);
+    // overflow past the SMI range defers.
+    const big = Value.fromSmi(smi_max);
+    try std.testing.expect(smiArith(big, big, '+') == null);
+    // non-SMI operands defer.
+    try std.testing.expect(smiArith(Value{}, a, '+') == null);
+}
+
+test "nanbox codec: double round-trip + disjoint classification (flag-independent)" {
+    const isNum = struct {
+        fn f(b: u64) bool {
+            return (b & NumberTag) != 0;
+        }
+    }.f;
+    const isInt = struct {
+        fn f(b: u64) bool {
+            return (b & NumberTag) == NumberTag;
+        }
+    }.f;
+    // Doubles: encode→ number, not int32, bit-exact decode.
+    const ds = [_]f64{ 0.5, -0.5, 1.5, -1.5, 3.14159, 1e300, -1e300, 1e-300, std.math.floatMax(f64), -std.math.floatMax(f64), std.math.inf(f64), -std.math.inf(f64) };
+    for (ds) |d| {
+        const enc = @as(u64, @bitCast(d)) +% DoubleEncodeOffset;
+        try std.testing.expect(isNum(enc) and !isInt(enc));
+        try std.testing.expectEqual(d, @as(f64, @bitCast(enc -% DoubleEncodeOffset)));
+    }
+    // Canonical NaN: still a (non-int) number, decodes to NaN.
+    const nan_enc = @as(u64, @bitCast(std.math.nan(f64))) +% DoubleEncodeOffset;
+    try std.testing.expect(isNum(nan_enc) and !isInt(nan_enc));
+    try std.testing.expect(std.math.isNan(@as(f64, @bitCast(nan_enc -% DoubleEncodeOffset))));
+    // Int32: tagged, classified as int, decodes exactly.
+    for ([_]i32{ 0, 1, -1, 2147483647, -2147483648, 42 }) |i| {
+        const enc = NumberTag | @as(u64, @as(u32, @bitCast(i)));
+        try std.testing.expect(isNum(enc) and isInt(enc));
+        try std.testing.expectEqual(i, @as(i32, @bitCast(@as(u32, @truncate(enc)))));
+    }
+    // Immediates + a fake cell pointer: not numbers, cell-mask disjoint.
+    try std.testing.expect(!isNum(nb_null) and !isNum(nb_true) and !isNum(nb_false));
+    try std.testing.expect((nb_null & NotCellMask) != 0); // immediates are not cells
+    const fake_cell: u64 = 0x1000; // 8-aligned, low memory
+    try std.testing.expect(!isNum(fake_cell) and (fake_cell & NotCellMask) == 0);
 }

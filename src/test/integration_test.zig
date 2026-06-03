@@ -62,7 +62,7 @@ fn evalToBoolMode(allocator: std.mem.Allocator, source: []const u8, mode: Interp
         .ok => |v| {
             const inner = val_mod.Value{ .bits = v.bits };
             if (inner.bits == 0) return false;
-            return switch (inner.toPtr().*) {
+            return switch (inner.unbox()) {
                 .boolean => |b| b,
                 .number => |n| n != 0.0 and !std.math.isNan(n),
                 else => false,
@@ -1811,3 +1811,75 @@ test "es2020: Promise.allSettled preserves order" {
     defer std.testing.allocator.free(s);
     try std.testing.expectEqualStrings("fulfilledfulfilledrejected", s);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 9: experimental JIT hot-loop fast-forward. The native count-loop kernel
+// is null under `zig build test`, so these exercise the pure-Zig kernel path;
+// `zig build -Djit=true` swaps in the Cranelift kernel (same results).
+// ---------------------------------------------------------------------------
+
+fn evalExperimental(allocator: std.mem.Allocator, source: []const u8, out_compiled: *usize) !f64 {
+    var iso = try Isolate.init(allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setInterpMode(.bc);
+    ctx.setJitMode(.experimental);
+    const result = ctx.eval(source, "<test>");
+    out_compiled.* = ctx.lastJitProfile().compiled;
+    return switch (result) {
+        .ok => |v| v.toF64(),
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+}
+
+test "Phase 9: experimental JIT fast-forwards a hot counter loop and matches the interpreter" {
+    const a = std.testing.allocator;
+    const src = "var i = 0; while (i < 6000) { i = i + 1; } i;";
+    // Interpreter baseline.
+    try std.testing.expectEqual(@as(f64, 6000), try evalToF64Mode(a, src, .bc));
+    // Experimental JIT: same answer, and the loop was actually fast-forwarded.
+    var compiled: usize = 0;
+    try std.testing.expectEqual(@as(f64, 6000), try evalExperimental(a, src, &compiled));
+    try std.testing.expect(compiled >= 1);
+}
+
+test "Phase 9: experimental JIT leaves non-matching loops to the interpreter (correct, no fast-forward)" {
+    const a = std.testing.allocator;
+    // Body has an extra statement (s = s + i), so the template does not match.
+    const src = "var i = 0, s = 0; while (i < 3000) { i = i + 1; s = s + i; } s;";
+    const baseline = try evalToF64Mode(a, src, .bc);
+    var compiled: usize = 0;
+    const jit = try evalExperimental(a, src, &compiled);
+    try std.testing.expectEqual(baseline, jit);
+    try std.testing.expectEqual(@as(usize, 0), compiled); // no loop fast-forwarded
+}
+
+test "Phase 9: experimental JIT fast-forwards a hot loop over a function-local induction var" {
+    const a = std.testing.allocator;
+    // `i` is a function local (GET_LOCAL/SET_LOCAL), not a global.
+    const src = "function f(){ var i = 0; while (i < 6000) { i = i + 1; } return i; } f();";
+    try std.testing.expectEqual(@as(f64, 6000), try evalToF64Mode(a, src, .bc));
+    var compiled: usize = 0;
+    try std.testing.expectEqual(@as(f64, 6000), try evalExperimental(a, src, &compiled));
+    try std.testing.expect(compiled >= 1);
+}
+
+test "Phase 9: experimental JIT fast-forwards a hot accumulator loop (s = s + i)" {
+    const a = std.testing.allocator;
+    const src = "var i = 0, s = 0; while (i < 6000) { s = s + i; i = i + 1; } s;";
+    const expected: f64 = 6000.0 * 5999.0 / 2.0; // sum 0..5999
+    try std.testing.expectEqual(expected, try evalToF64Mode(a, src, .bc));
+    var compiled: usize = 0;
+    try std.testing.expectEqual(expected, try evalExperimental(a, src, &compiled));
+    try std.testing.expect(compiled >= 1);
+}
+
+

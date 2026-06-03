@@ -140,7 +140,7 @@ fn fieldsToMs(year: i32, month: i32, day: i32, hour: i32, min_: i32, sec_: i32, 
 
 fn getDateData(this_val: Value) ?*DateData {
     if (this_val.bits == 0) return null;
-    const inner = this_val.toPtr().*;
+    const inner = this_val.unbox();
     if (inner != .object) return null;
     const obj = inner.object;
     if (obj.internal_kind != .date) return null;
@@ -163,7 +163,7 @@ fn createDateObject(arena: std.mem.Allocator, ms: i64) !Value {
 
 fn argToI32(args: []const Value, idx: usize, default: i32) i32 {
     if (idx >= args.len or args[idx].bits == 0) return default;
-    return switch (args[idx].toPtr().*) {
+    return switch (args[idx].unbox()) {
         .number => |n| @intFromFloat(n),
         else => default,
     };
@@ -186,7 +186,7 @@ pub fn nativeDateCtor(arena: std.mem.Allocator, this_val: Value, args: []const V
             // new Date(ms) or new Date(string) — we only support ms.
             const v = args[0];
             if (v.bits != 0) {
-                switch (v.toPtr().*) {
+                switch (v.unbox()) {
                     .number => |n| break :blk @intFromFloat(n),
                     else => break :blk std.time.milliTimestamp(),
                 }
@@ -206,7 +206,7 @@ pub fn nativeDateCtor(arena: std.mem.Allocator, this_val: Value, args: []const V
     };
 
     // Populate `this` object (called with new).
-    if (this_val.bits != 0 and this_val.toPtr().* == .object) {
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
         const dd = try arena.create(DateData);
         dd.* = DateData{ .ms = ms };
         this_val.toPtr().object.internal_kind = .date;

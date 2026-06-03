@@ -12,7 +12,7 @@ const realm_mod = @import("../realm.zig");
 /// Extract the string from a this_val. Returns "" on non-string.
 fn getThis(this_val: Value) []const u8 {
     if (this_val.bits == 0) return "";
-    return switch (this_val.toPtr().*) {
+    return switch (this_val.unbox()) {
         .string => |s| s,
         else => "",
     };
@@ -35,7 +35,7 @@ fn normalizeIndex(idx: f64, len: usize) usize {
 pub fn nativeCharAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = getThis(this_val);
     const idx: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .number => |n| n,
             else => 0.0,
         }
@@ -50,7 +50,7 @@ pub fn nativeCharAt(arena: std.mem.Allocator, this_val: Value, args: []const Val
 pub fn nativeCharCodeAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = getThis(this_val);
     const idx: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .number => |n| n,
             else => 0.0,
         }
@@ -64,13 +64,13 @@ pub fn nativeCharCodeAt(arena: std.mem.Allocator, this_val: Value, args: []const
 pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = getThis(this_val);
     if (args.len == 0) return val_mod.makeNumber(arena, -1.0);
-    const search: []const u8 = if (args[0].bits != 0 and args[0].toPtr().* == .string)
+    const search: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
         args[0].toPtr().string
     else
         return val_mod.makeNumber(arena, -1.0);
 
     const from: usize = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].toPtr().*) {
+        switch (args[1].unbox()) {
             .number => |n| blk: {
                 if (n < 0.0) break :blk 0;
                 if (std.math.isNan(n)) break :blk 0;
@@ -94,14 +94,14 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const len = s.len;
 
     const start_raw: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .number => |n| n,
             else => 0.0,
         }
     else
         0.0;
     const end_raw: f64 = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].toPtr().*) {
+        switch (args[1].unbox()) {
             .number => |n| n,
             .undefined_ => @floatFromInt(len),
             else => @floatFromInt(len),
@@ -146,7 +146,7 @@ pub fn nativeSplit(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
     // Separator
     const sep: ?[]const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .string => |sep_s| sep_s,
             .undefined_ => null,
             else => null,
@@ -252,7 +252,7 @@ pub fn nativeMatch(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const cr_opt: ?*regexp_mod.CompiledRegex = regexp_mod.getCompiledRegex(arg);
     if (cr_opt == null) {
         // String argument: treat as pattern
-        const pat: []const u8 = if (arg.bits != 0 and arg.toPtr().* == .string) arg.toPtr().string else "";
+        const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
         const cr_arena = try arena.create(regexp_mod.CompiledRegex);
         cr_arena.* = regexp_mod.compileRegex(arena, pat, "") catch return val_mod.makeNull(arena);
         return doExec(arena, s, cr_arena);
@@ -328,7 +328,7 @@ pub fn nativeSearch(arena: std.mem.Allocator, this_val: Value, args: []const Val
         if (regexp_mod.getCompiledRegex(arg)) |cr_ptr| {
             break :blk cr_ptr.*;
         }
-        const pat: []const u8 = if (arg.bits != 0 and arg.toPtr().* == .string) arg.toPtr().string else "";
+        const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
         break :blk regexp_mod.compileRegex(arena, pat, "") catch return val_mod.makeNumber(arena, -1.0);
     };
 
@@ -341,7 +341,7 @@ pub fn nativeSearch(arena: std.mem.Allocator, this_val: Value, args: []const Val
 /// Return true if a Value is callable (function, bc_function, native_function, bound_function).
 fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .function, .bc_function, .native_function => true,
         .object => |obj| obj.internal_kind == .bound_function,
         else => false,
@@ -362,7 +362,7 @@ pub fn nativeReplace(arena: std.mem.Allocator, this_val: Value, args: []const Va
             return doReplaceWithFn(arena, s, cr, repl_arg);
         }
         // String pattern with callback: replace first occurrence only.
-        const pat: []const u8 = if (arg.bits != 0 and arg.toPtr().* == .string) arg.toPtr().string else "";
+        const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
         if (std.mem.indexOf(u8, s, pat)) |idx| {
             const match_str = s[idx .. idx + pat.len];
             const undefined_val = try val_mod.makeUndefined(arena);
@@ -374,7 +374,7 @@ pub fn nativeReplace(arena: std.mem.Allocator, this_val: Value, args: []const Va
                 if (e == error.JsException) return error.JsException;
                 return error.OutOfMemory;
             };
-            const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.toPtr().* == .string)
+            const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.unbox() == .string)
                 repl_val.toPtr().string
             else
                 "undefined";
@@ -384,7 +384,7 @@ pub fn nativeReplace(arena: std.mem.Allocator, this_val: Value, args: []const Va
         return val_mod.makeString(arena, try arena.dupe(u8, s));
     }
 
-    const repl_str: []const u8 = if (repl_arg.bits != 0 and repl_arg.toPtr().* == .string)
+    const repl_str: []const u8 = if (repl_arg.bits != 0 and repl_arg.unbox() == .string)
         repl_arg.toPtr().string
     else
         "undefined";
@@ -395,7 +395,7 @@ pub fn nativeReplace(arena: std.mem.Allocator, this_val: Value, args: []const Va
     }
 
     // String pattern: replace first occurrence
-    const pat: []const u8 = if (arg.bits != 0 and arg.toPtr().* == .string) arg.toPtr().string else "";
+    const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
     if (std.mem.indexOf(u8, s, pat)) |idx| {
         const before = s[0..idx];
         const after = s[idx + pat.len..];
@@ -422,11 +422,11 @@ pub fn nativeReplaceAll(arena: std.mem.Allocator, this_val: Value, args: []const
             }
             return doReplaceWithFn(arena, s, cr, repl_arg);
         }
-        const pat: []const u8 = if (arg.bits != 0 and arg.toPtr().* == .string) arg.toPtr().string else "";
+        const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
         return replaceAllStringWithFn(arena, s, pat, repl_arg);
     }
 
-    const repl_str: []const u8 = if (repl_arg.bits != 0 and repl_arg.toPtr().* == .string)
+    const repl_str: []const u8 = if (repl_arg.bits != 0 and repl_arg.unbox() == .string)
         repl_arg.toPtr().string
     else
         "undefined";
@@ -439,7 +439,7 @@ pub fn nativeReplaceAll(arena: std.mem.Allocator, this_val: Value, args: []const
         return doReplace(arena, s, cr, repl_str);
     }
 
-    const pat: []const u8 = if (arg.bits != 0 and arg.toPtr().* == .string) arg.toPtr().string else "";
+    const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
     return replaceAllString(arena, s, pat, repl_str);
 }
 
@@ -481,7 +481,7 @@ fn replaceAllStringWithFn(arena: std.mem.Allocator, s: []const u8, pat: []const 
                 if (e == error.JsException) return error.JsException;
                 return error.OutOfMemory;
             };
-            const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.toPtr().* == .string)
+            const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.unbox() == .string)
                 repl_val.toPtr().string
             else
                 "undefined";
@@ -505,7 +505,7 @@ fn replaceAllStringWithFn(arena: std.mem.Allocator, s: []const u8, pat: []const 
             if (e == error.JsException) return error.JsException;
             return error.OutOfMemory;
         };
-        const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.toPtr().* == .string)
+        const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.unbox() == .string)
             repl_val.toPtr().string
         else
             "undefined";
@@ -550,7 +550,7 @@ fn doReplaceWithFn(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mo
             if (e == error.JsException) return error.JsException;
             return error.OutOfMemory;
         };
-        const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.toPtr().* == .string)
+        const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.unbox() == .string)
             repl_val.toPtr().string
         else
             "undefined";
@@ -679,7 +679,7 @@ pub fn nativeConcat(arena: std.mem.Allocator, this_val: Value, args: []const Val
     try buf.appendSlice(arena, s);
     for (args) |a| {
         if (a.bits != 0) {
-            switch (a.toPtr().*) {
+            switch (a.unbox()) {
                 .string => |ss| try buf.appendSlice(arena, ss),
                 .number => |n| {
                     const ns = try formatNumber(arena, n);
@@ -737,14 +737,14 @@ fn buildFiller(arena: std.mem.Allocator, pad: []const u8, count: usize) ![]const
 fn padImpl(arena: std.mem.Allocator, this_val: Value, args: []const Value, at_start: bool) anyerror!Value {
     const s = getThis(this_val);
     const target: usize = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .number => |n| if (n <= 0 or std.math.isNan(n)) 0 else @intFromFloat(@trunc(n)),
             else => 0,
         }
     else
         0;
     if (target <= s.len) return val_mod.makeString(arena, s);
-    const pad: []const u8 = if (args.len > 1 and args[1].bits != 0 and args[1].toPtr().* == .string)
+    const pad: []const u8 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .string)
         args[1].toPtr().string
     else
         " ";

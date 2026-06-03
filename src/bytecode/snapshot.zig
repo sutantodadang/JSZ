@@ -84,7 +84,7 @@ const Writer = struct {
             try self.u8v(@intFromEnum(ValueTag.undefined_));
             return;
         }
-        switch (v.toPtr().*) {
+        switch (v.unbox()) {
             .undefined_ => try self.u8v(@intFromEnum(ValueTag.undefined_)),
             .null_ => try self.u8v(@intFromEnum(ValueTag.null_)),
             .boolean => |b| try self.u8v(@intFromEnum(if (b) ValueTag.true_ else ValueTag.false_)),
@@ -306,7 +306,7 @@ test "snapshot: round-trip preserves code, constants, children" {
     // String constant survives.
     var found_hi = false;
     for (g.chunk.constants) |c| {
-        if (c.bits != 0 and c.toPtr().* == .string and std.mem.eql(u8, c.toPtr().string, "hi")) found_hi = true;
+        if (c.bits != 0 and c.unbox() == .string and std.mem.eql(u8, c.toPtr().string, "hi")) found_hi = true;
     }
     try std.testing.expect(found_hi);
 }

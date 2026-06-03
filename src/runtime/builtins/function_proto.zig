@@ -35,7 +35,7 @@ pub fn invokeCallback(arena: std.mem.Allocator, this_val: Value, fn_val: Value, 
         return error.JsException;
     }
 
-    const inner = fn_val.toPtr().*;
+    const inner = fn_val.unbox();
     switch (inner) {
         .native_function => |fn_ptr| {
             return fn_ptr.invoke(arena, this_val, args) catch |e| {
@@ -126,7 +126,7 @@ pub fn nativeFunctionApply(arena: std.mem.Allocator, this_val: Value, args: []co
     var call_args: []Value = &[_]Value{};
     if (args.len > 1 and args[1].bits != 0) {
         const arr_val = args[1];
-        if (arr_val.toPtr().* == .object) {
+        if (arr_val.unbox() == .object) {
             const arr = arr_val.toPtr().object;
             if (arr.is_array) {
                 const len = arr.getArrayLength();

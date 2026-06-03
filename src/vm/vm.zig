@@ -312,7 +312,7 @@ pub const Vm = struct {
     fn vmInvokeJs(ptr: *anyopaque, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         const self: *Vm = @ptrCast(@alignCast(ptr));
         _ = arena; // use self.arena
-        const inner = fn_val.toPtr().*;
+        const inner = fn_val.unbox();
         switch (inner) {
             .function => |fv| {
                 return self.callFunction(fv, @constCast(args), this_val) catch |e| {
@@ -343,7 +343,7 @@ pub const Vm = struct {
                     }
                 }
                 if (obj.get("__call__")) |call_val| {
-                    if (call_val.bits != 0 and call_val.toPtr().* == .native_function) {
+                    if (call_val.bits != 0 and call_val.unbox() == .native_function) {
                         const nf2 = call_val.toPtr().native_function;
                         return nf2.invoke(self.arena, this_val, args) catch |e| {
                             if (e == error.JsException) return error.JsException;
@@ -652,7 +652,7 @@ pub const Vm = struct {
                 var seen = std.StringHashMapUnmanaged(void){};
                 defer seen.deinit(self.arena);
                 if (obj_val.bits != 0) {
-                    switch (obj_val.toPtr().*) {
+                    switch (obj_val.unbox()) {
                         .object => |obj| {
                             // Enumerate own properties only (prototype-chain properties
                             // from built-in prototypes are not user-visible as enumerable).
@@ -692,7 +692,7 @@ pub const Vm = struct {
                 }
                 var iter_values = std.ArrayList(Value){};
                 var use_iter_values = false;
-                if (fi.iterate_values and obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                if (fi.iterate_values and obj_val.bits != 0 and obj_val.unbox() == .object) {
                     use_iter_values = self.collectIteratorValues(&iter_values, obj_val) catch |e| switch (e) {
                         error.JsException => return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } },
                         else => return error.OutOfMemory,
@@ -704,7 +704,7 @@ pub const Vm = struct {
                         self.last_exception_value = self.makeTypeErrorObject("value is not iterable") catch Value{};
                         return StmtResult{ .exception = .{ .message = self.last_exception_msg, .value = self.last_exception_value } };
                     }
-                    switch (obj_val.toPtr().*) {
+                    switch (obj_val.unbox()) {
                         .string => {},
                         .object => |obj| {
                             if (!obj.is_array) {
@@ -727,7 +727,7 @@ pub const Vm = struct {
                         iter_values.items[iter_idx]
                     else blk: {
                         const key = keys.items[iter_idx];
-                        if (fi.iterate_values and obj_val.bits != 0 and obj_val.toPtr().* == .string) {
+                        if (fi.iterate_values and obj_val.bits != 0 and obj_val.unbox() == .string) {
                             const idx = std.fmt.parseInt(usize, key, 10) catch 0;
                             const s = obj_val.toPtr().string;
                             if (idx < s.len) {
@@ -736,7 +736,7 @@ pub const Vm = struct {
                             }
                             break :blk try self.makeUndefined();
                         }
-                        if (fi.iterate_values and obj_val.bits != 0 and obj_val.toPtr().* == .object) {
+                        if (fi.iterate_values and obj_val.bits != 0 and obj_val.unbox() == .object) {
                             break :blk obj_val.toPtr().object.get(key) orelse try self.makeUndefined();
                         }
                         break :blk try val_mod.makeString(self.arena, key);
@@ -1129,7 +1129,7 @@ pub const Vm = struct {
 
     fn collectSpreadValues(self: *Vm, out: *std.ArrayList(Value), source: Value) EvalError!void {
         if (source.bits == 0) return;
-        switch (source.toPtr().*) {
+        switch (source.unbox()) {
             .object => |obj| {
                 if (try self.collectIteratorValues(out, source)) return;
                 if (obj.is_array) {
@@ -1155,7 +1155,7 @@ pub const Vm = struct {
     }
 
     fn collectIteratorValues(self: *Vm, out: *std.ArrayList(Value), source: Value) EvalError!bool {
-        if (source.bits == 0 or source.toPtr().* != .object) return false;
+        if (source.bits == 0 or source.unbox() != .object) return false;
         const src_obj = source.toPtr().object;
 
         var iter_obj: ?*JsObject = null;
@@ -1168,7 +1168,7 @@ pub const Vm = struct {
                 return EvalError.JsException;
             }
             const iter_val = try self.invokeCallable(source, iter_fn, &[_]Value{});
-            if (iter_val.bits == 0 or iter_val.toPtr().* != .object) {
+            if (iter_val.bits == 0 or iter_val.unbox() != .object) {
                 self.last_exception_msg = "TypeError: iterator() must return object";
                 self.last_exception_value = self.makeTypeErrorObject("iterator() must return object") catch Value{};
                 return EvalError.JsException;
@@ -1182,7 +1182,7 @@ pub const Vm = struct {
                 return EvalError.JsException;
             }
             const iter_val = try self.invokeCallable(source, iter_fn, &[_]Value{});
-            if (iter_val.bits == 0 or iter_val.toPtr().* != .object) {
+            if (iter_val.bits == 0 or iter_val.unbox() != .object) {
                 self.last_exception_msg = "TypeError: iterator() must return object";
                 self.last_exception_value = self.makeTypeErrorObject("iterator() must return object") catch Value{};
                 return EvalError.JsException;
@@ -1219,7 +1219,7 @@ pub const Vm = struct {
                 self.closeIteratorIfPresent(it) catch {};
                 return e;
             };
-            if (step_val.bits == 0 or step_val.toPtr().* != .object) {
+            if (step_val.bits == 0 or step_val.unbox() != .object) {
                 self.closeIteratorIfPresent(it) catch {};
                 self.last_exception_msg = "TypeError: iterator result is not an object";
                 self.last_exception_value = self.makeTypeErrorObject("iterator result is not an object") catch Value{};
@@ -1249,7 +1249,7 @@ pub const Vm = struct {
 
     fn invokeCallable(self: *Vm, this_val: Value, fn_val: Value, args: []const Value) EvalError!Value {
         if (fn_val.bits == 0) return EvalError.JsException;
-        switch (fn_val.toPtr().*) {
+        switch (fn_val.unbox()) {
             .function => |fv| return self.callFunction(fv, @constCast(args), this_val),
             .native_function => |nf| {
                 return nf.invoke(self.arena, this_val, args) catch |e| {
@@ -1289,7 +1289,7 @@ pub const Vm = struct {
             self.last_exception_value = self.makeTypeErrorObject(msg) catch Value{};
             return EvalError.JsException;
         }
-        switch (obj_val.toPtr().*) {
+        switch (obj_val.unbox()) {
             .object => |obj| {
                 // Special case: "length" on arrays.
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
@@ -1365,11 +1365,11 @@ pub const Vm = struct {
             self.last_exception_msg = msg;
             return EvalError.JsException;
         }
-        switch (obj_val.toPtr().*) {
+        switch (obj_val.unbox()) {
             .object => |obj| {
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
-                    if (value.bits != 0 and value.toPtr().* == .number) {
-                        const n = value.toPtr().number;
+                    if (value.bits != 0 and value.unbox() == .number) {
+                        const n = value.unbox().number;
                         if (n >= 0 and n == @floor(n) and n < 4294967296) {
                             const new_len: u32 = @intFromFloat(n);
                             // Clear indexed slots at or above new length.
@@ -1393,7 +1393,7 @@ pub const Vm = struct {
             },
             .function => |fv| {
                 if (std.mem.eql(u8, key, "prototype")) {
-                    if (value.bits != 0 and value.toPtr().* == .object) {
+                    if (value.bits != 0 and value.unbox() == .object) {
                         fv.prototype_obj = value.toPtr().object;
                     }
                     return;
@@ -1513,7 +1513,7 @@ pub const Vm = struct {
             },
             .in => {
                 // Phase 3a: check if property exists in object.
-                if (right.bits != 0 and right.toPtr().* == .object) {
+                if (right.bits != 0 and right.unbox() == .object) {
                     const obj = right.toPtr().object;
                     const key = valueToStringArena(self.arena, left) catch return EvalError.OutOfMemory;
                     return self.makeBool(obj.get(key) != null);
@@ -1762,7 +1762,7 @@ pub const Vm = struct {
                         var combined = try self.arena.alloc(Value, bd.prefix.len + arg_vals.items.len);
                         for (bd.prefix, 0..) |v, i| combined[i] = v;
                         for (arg_vals.items, 0..) |v, i| combined[bd.prefix.len + i] = v;
-                        const bound_inner = bd.target.toPtr().*;
+                        const bound_inner = bd.target.unbox();
                         switch (bound_inner) {
                             .function => |fv| return self.callFunction(fv, combined, bd.this_val),
                             .native_function => |fn_ptr| {
@@ -1785,7 +1785,7 @@ pub const Vm = struct {
                     }
                 }
                 if (obj.get("__call__")) |call_val| {
-                    if (call_val.bits != 0 and call_val.toPtr().* == .native_function) {
+                    if (call_val.bits != 0 and call_val.unbox() == .native_function) {
                         const fn_ptr2 = call_val.toPtr().native_function;
                         if (obj.get("prototype") != null) {
                             // Preserve legacy behavior for Error-like constructor objects.
@@ -1826,7 +1826,7 @@ pub const Vm = struct {
     fn evalYieldStar(self: *Vm, capture: *GeneratorCapture, delegated: Value) EvalError!Value {
         const state = capture.state orelse return self.makeUndefined();
         if (capture.yield_star_iter == null and capture.yield_star_array == null) {
-            if (delegated.bits != 0 and delegated.toPtr().* == .object) {
+            if (delegated.bits != 0 and delegated.unbox() == .object) {
                 const src_obj = delegated.toPtr().object;
                 if (src_obj.is_array) {
                     capture.yield_star_array = src_obj;
@@ -1835,10 +1835,10 @@ pub const Vm = struct {
                     var iter_obj: ?*JsObject = null;
                     if (src_obj.get("@@iterator")) |iter_fn| {
                         const iter_val = try self.invokeCallable(delegated, iter_fn, &[_]Value{});
-                        if (iter_val.bits != 0 and iter_val.toPtr().* == .object) iter_obj = iter_val.toPtr().object;
+                        if (iter_val.bits != 0 and iter_val.unbox() == .object) iter_obj = iter_val.toPtr().object;
                     } else if (src_obj.get("iterator")) |iter_fn| {
                         const iter_val = try self.invokeCallable(delegated, iter_fn, &[_]Value{});
-                        if (iter_val.bits != 0 and iter_val.toPtr().* == .object) iter_obj = iter_val.toPtr().object;
+                        if (iter_val.bits != 0 and iter_val.unbox() == .object) iter_obj = iter_val.toPtr().object;
                     } else if (src_obj.get("next")) |_| {
                         iter_obj = src_obj;
                     }
@@ -1877,7 +1877,7 @@ pub const Vm = struct {
                 if (e == error.JsException) return EvalError.JsException;
                 return EvalError.OutOfMemory;
             };
-            if (step_val.bits == 0 or step_val.toPtr().* != .object) {
+            if (step_val.bits == 0 or step_val.unbox() != .object) {
                 capture.yield_star_iter = null;
                 self.last_exception_msg = "TypeError: iterator result is not an object";
                 self.last_exception_value = self.makeTypeErrorObject("iterator result is not an object") catch Value{};
@@ -1888,7 +1888,7 @@ pub const Vm = struct {
             const value_val = step_obj.get("value") orelse try self.makeUndefined();
             if (isTruthy(done_val)) {
                 capture.yield_star_iter = null;
-                const is_undef = value_val.bits == 0 or (value_val.bits != 0 and value_val.toPtr().* == .undefined_);
+                const is_undef = value_val.bits == 0 or (value_val.bits != 0 and value_val.unbox() == .undefined_);
                 if (!is_undef) {
                     state.return_value = value_val;
                     capture.delegate_return = true;
@@ -1916,7 +1916,7 @@ pub const Vm = struct {
             self.closeIteratorIfPresent(it) catch {};
             return e;
         };
-        if (step_val.bits == 0 or step_val.toPtr().* != .object) {
+        if (step_val.bits == 0 or step_val.unbox() != .object) {
             capture.yield_star_iter = null;
             self.closeIteratorIfPresent(it) catch {};
             self.last_exception_msg = "TypeError: iterator result is not an object";
@@ -1928,7 +1928,7 @@ pub const Vm = struct {
         if (isTruthy(done_val)) {
             capture.yield_star_iter = null;
             const return_val = step_obj.get("value") orelse try self.makeUndefined();
-            const is_undef = return_val.bits == 0 or (return_val.bits != 0 and return_val.toPtr().* == .undefined_);
+            const is_undef = return_val.bits == 0 or (return_val.bits != 0 and return_val.unbox() == .undefined_);
             if (!is_undef) {
                 state.return_value = return_val;
                 capture.delegate_return = true;
@@ -1973,7 +1973,7 @@ pub const Vm = struct {
         for (fv.params, 0..) |param, i| {
             var av = if (i < args.len) args[i] else try self.makeUndefined();
             if (i < param_defaults.len and param_defaults[i] != null) {
-                const is_undef = av.bits == 0 or (av.bits != 0 and av.toPtr().* == .undefined_);
+                const is_undef = av.bits == 0 or (av.bits != 0 and av.unbox() == .undefined_);
                 if (is_undef) {
                     av = try self.evalExpression(param_defaults[i].?, call_env);
                 }
@@ -2142,7 +2142,7 @@ pub const Vm = struct {
             for (state.func.params, 0..) |param, i| {
                 var av = if (i < state.args.len) state.args[i] else try self.makeUndefined();
                 if (i < param_defaults.len and param_defaults[i] != null) {
-                    const is_undef = av.bits == 0 or (av.bits != 0 and av.toPtr().* == .undefined_);
+                    const is_undef = av.bits == 0 or (av.bits != 0 and av.unbox() == .undefined_);
                     if (is_undef) av = try self.evalExpression(param_defaults[i].?, call_env);
                 }
                 call_env.define(param, av) catch return EvalError.OutOfMemory;
@@ -2289,7 +2289,7 @@ pub const Vm = struct {
                     JsObject.create(self.arena, proto) catch return EvalError.OutOfMemory;
                 const this_val = val_mod.makeObject(self.arena, new_obj) catch return EvalError.OutOfMemory;
                 const result = fn_ptr.invoke(self.arena, this_val, args) catch return EvalError.OutOfMemory;
-                if (result.bits != 0 and result.toPtr().* == .object) {
+                if (result.bits != 0 and result.unbox() == .object) {
                     return result;
                 }
                 return this_val;
@@ -2302,7 +2302,7 @@ pub const Vm = struct {
                     JsObject.create(self.arena, proto) catch return EvalError.OutOfMemory;
                 const this_val = val_mod.makeObject(self.arena, new_obj) catch return EvalError.OutOfMemory;
                 const result = self.callFunction(fv, args, this_val) catch |e| return e;
-                if (result.bits != 0 and result.toPtr().* == .object) {
+                if (result.bits != 0 and result.unbox() == .object) {
                     return result;
                 }
                 return this_val;
@@ -2316,12 +2316,12 @@ pub const Vm = struct {
             .object => |obj| {
                 // An Error constructor object: has a "__call__" native fn and a "prototype" property.
                 if (obj.get("__call__")) |call_val| {
-                    if (call_val.bits != 0 and call_val.toPtr().* == .native_function) {
+                    if (call_val.bits != 0 and call_val.unbox() == .native_function) {
                         const fn_ptr = call_val.toPtr().native_function;
                         // Get prototype for the new object.
                         var proto: ?*JsObject = self.realm.object_prototype;
                         if (obj.get("prototype")) |pv| {
-                            if (pv.bits != 0 and pv.toPtr().* == .object) {
+                            if (pv.bits != 0 and pv.unbox() == .object) {
                                 proto = pv.toPtr().object;
                             }
                         }
@@ -2343,7 +2343,7 @@ pub const Vm = struct {
                             }
                             return EvalError.OutOfMemory;
                         };
-                        if (result.bits != 0 and result.toPtr().* == .object) {
+                        if (result.bits != 0 and result.unbox() == .object) {
                             return result;
                         }
                         return this_val;
@@ -2396,7 +2396,7 @@ pub const Vm = struct {
     fn getErrorProto(self: *Vm, name: []const u8) ?*JsObject {
         const proto_name = std.fmt.allocPrint(self.arena, "__{s}Proto__", .{name}) catch return self.realm.object_prototype;
         const val = self.realm.global_env.lookup(proto_name) catch return self.realm.object_prototype;
-        if (val.bits != 0 and val.toPtr().* == .object) return val.toPtr().object;
+        if (val.bits != 0 and val.unbox() == .object) return val.toPtr().object;
         return self.realm.object_prototype;
     }
 
@@ -2500,7 +2500,7 @@ fn nativeGeneratorSelfIterator(_: std.mem.Allocator, this_val: Value, _: []const
 }
 
 fn nativeGeneratorNext(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.toPtr().* != .object) return val_mod.makeUndefined(arena);
+    if (this_val.bits == 0 or this_val.unbox() != .object) return val_mod.makeUndefined(arena);
     const obj = this_val.toPtr().object;
     if (obj.internal_slot == null) return val_mod.makeUndefined(arena);
     const state: *GeneratorState = @ptrCast(@alignCast(obj.internal_slot.?));
@@ -2544,7 +2544,7 @@ fn nativeGeneratorNext(arena: std.mem.Allocator, this_val: Value, args: []const 
 }
 
 fn nativeGeneratorReturn(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.toPtr().* != .object) return val_mod.makeUndefined(arena);
+    if (this_val.bits == 0 or this_val.unbox() != .object) return val_mod.makeUndefined(arena);
     const obj = this_val.toPtr().object;
     if (obj.internal_slot == null) return val_mod.makeUndefined(arena);
     const state: *GeneratorState = @ptrCast(@alignCast(obj.internal_slot.?));
@@ -2557,7 +2557,7 @@ fn nativeGeneratorReturn(arena: std.mem.Allocator, this_val: Value, args: []cons
 }
 
 fn nativeGeneratorThrow(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.toPtr().* != .object) return val_mod.makeUndefined(arena);
+    if (this_val.bits == 0 or this_val.unbox() != .object) return val_mod.makeUndefined(arena);
     const obj = this_val.toPtr().object;
     if (obj.internal_slot == null) return val_mod.makeUndefined(arena);
     const state: *GeneratorState = @ptrCast(@alignCast(obj.internal_slot.?));
@@ -2604,7 +2604,7 @@ fn nativeGcCollect(arena: std.mem.Allocator, _: Value, _: []const Value) anyerro
 
 fn isTruthy(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => false,
         .null_ => false,
         .boolean => |b| b,
@@ -2619,12 +2619,12 @@ fn isTruthy(v: Value) bool {
 
 fn isString(v: Value) bool {
     if (v.bits == 0) return false;
-    return v.toPtr().* == .string;
+    return v.unbox() == .string;
 }
 
 fn isStringOrObject(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .string => true,
         .object => true,
         else => false,
@@ -2633,7 +2633,7 @@ fn isStringOrObject(v: Value) bool {
 
 fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
         .object => |obj| obj.get("__call__") != null,
         else => false,
@@ -2642,7 +2642,7 @@ fn isCallable(v: Value) bool {
 
 fn typeofValue(v: Value) []const u8 {
     if (v.bits == 0) return "undefined";
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => "undefined",
         .null_ => "object", // the famous bug — it's in the spec
         .boolean => "boolean",
@@ -2657,7 +2657,7 @@ fn typeofValue(v: Value) []const u8 {
 
 fn toNumber(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => std.math.nan(f64),
         .null_ => 0.0,
         .boolean => |b| if (b) 1.0 else 0.0,
@@ -2685,7 +2685,7 @@ fn toUint32(v: Value) u32 {
 
 fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
     if (v.bits == 0) return "undefined";
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => "undefined",
         .null_ => "null",
         .boolean => |b| if (b) "true" else "false",
@@ -2720,7 +2720,7 @@ fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
 /// "Name: message" instead of the default "[object Object]" coercion.
 pub fn formatExceptionMessage(arena: std.mem.Allocator, v: Value) ![]const u8 {
     if (v.bits != 0) {
-        if (v.toPtr().* == .object) {
+        if (v.unbox() == .object) {
             const obj = v.toPtr().object;
             const name_v = obj.get("name");
             const msg_v = obj.get("message");
@@ -2754,15 +2754,15 @@ fn jsInstanceof(lhs: Value, rhs: Value) bool {
     if (lhs.bits == 0) return false;
     if (rhs.bits == 0) return false;
     // lhs must be an object.
-    if (lhs.toPtr().* != .object) return false;
+    if (lhs.unbox() != .object) return false;
     // rhs must be callable. Get rhs.prototype.
-    const rhs_proto: ?*JsObject = switch (rhs.toPtr().*) {
+    const rhs_proto: ?*JsObject = switch (rhs.unbox()) {
         .native_function => null, // bare fn ptr — can't get prototype
         .function => null, // tree-walker function — no attached prototype object
         .object => |obj| blk: {
             // Constructor object wrapping a native function with a .prototype property.
             if (obj.get("prototype")) |pv| {
-                if (pv.bits != 0 and pv.toPtr().* == .object) break :blk pv.toPtr().object;
+                if (pv.bits != 0 and pv.unbox() == .object) break :blk pv.toPtr().object;
             }
             break :blk null;
         },
@@ -2786,8 +2786,8 @@ fn jsInstanceof(lhs: Value, rhs: Value) bool {
 /// but return result for original order.
 fn jsLessThan(left: Value, right: Value, _: bool) ?bool {
     // Numeric comparison
-    const lstr = if (left.bits != 0) left.toPtr().* == .string else false;
-    const rstr = if (right.bits != 0) right.toPtr().* == .string else false;
+    const lstr = if (left.bits != 0) left.unbox() == .string else false;
+    const rstr = if (right.bits != 0) right.unbox() == .string else false;
     if (lstr and rstr) {
         // Lex compare
         const ls = left.toPtr().string;
@@ -2816,12 +2816,12 @@ fn jsAbstractEqual(x: Value, y: Value) bool {
     }
     // boolean: convert to number then recurse
     if (tx == .boolean) {
-        const bv = x.toPtr().boolean;
+        const bv = x.unbox().boolean;
         const n = if (bv) @as(f64, 1.0) else @as(f64, 0.0);
         return n == toNumber(y);
     }
     if (ty == .boolean) {
-        const bv = y.toPtr().boolean;
+        const bv = y.unbox().boolean;
         const n = if (bv) @as(f64, 1.0) else @as(f64, 0.0);
         return toNumber(x) == n;
     }
@@ -2830,8 +2830,8 @@ fn jsAbstractEqual(x: Value, y: Value) bool {
 
 /// LessThan used by bc_vm.zig (re-exported so both share the same logic surface).
 pub fn jsLessThanPub(left: Value, right: Value) ?bool {
-    const lstr = if (left.bits != 0) left.toPtr().* == .string else false;
-    const rstr = if (right.bits != 0) right.toPtr().* == .string else false;
+    const lstr = if (left.bits != 0) left.unbox() == .string else false;
+    const rstr = if (right.bits != 0) right.unbox() == .string else false;
     if (lstr and rstr) {
         return std.mem.lessThan(u8, left.toPtr().string, right.toPtr().string);
     }
@@ -2862,7 +2862,7 @@ fn jsStrictEqual(x: Value, y: Value) bool {
             return std.mem.eql(u8, xs, ys);
         },
         .boolean => {
-            return x.toPtr().boolean == y.toPtr().boolean;
+            return x.unbox().boolean == y.unbox().boolean;
         },
         .function => {
             return x.bits == y.bits; // same pointer = same function
@@ -2883,7 +2883,7 @@ const TypeTag = enum { undefined_, null_, boolean, number, string, function, bc_
 
 fn typeTag(v: Value) TypeTag {
     if (v.bits == 0) return .undefined_;
-    return switch (v.toPtr().*) {
+    return switch (v.unbox()) {
         .undefined_ => .undefined_,
         .null_ => .null_,
         .boolean => .boolean,

@@ -58,10 +58,10 @@ pub const ChunkBuilder = struct {
     pub fn addConstant(self: *Self, v: Value) !u16 {
         // Deduplicate: scan existing constants.
         if (v.bits != 0) {
-            const inner = v.toPtr().*;
+            const inner = v.unbox();
             for (self.constants.items, 0..) |c, i| {
                 if (c.bits == 0) continue;
-                const ci = c.toPtr().*;
+                const ci = c.unbox();
                 switch (inner) {
                     .number => |n| switch (ci) {
                         .number => |cn| {
@@ -142,7 +142,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
-                    const inner = cv.toPtr().*;
+                    const inner = cv.unbox();
                     switch (inner) {
                         .number => |n| try writer.print(" R{d} K{d}  ; const={d}", .{ rdst, kidx, n }),
                         .string => |s| try writer.print(" R{d} K{d}  ; const=\"{s}\"", .{ rdst, kidx, s }),
@@ -172,7 +172,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
-                    const inner = cv.toPtr().*;
+                    const inner = cv.unbox();
                     switch (inner) {
                         .string => |s| try writer.print(" R{d} \"{s}\"", .{ rdst, s }),
                         else => try writer.print(" R{d} K{d}", .{ rdst, kidx }),
@@ -192,7 +192,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
-                    const inner = cv.toPtr().*;
+                    const inner = cv.unbox();
                     switch (inner) {
                         .string => |s| try writer.print(" \"{s}\" R{d}", .{ s, rsrc }),
                         else => try writer.print(" K{d} R{d}", .{ kidx, rsrc }),
@@ -279,7 +279,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
-                    switch (cv.toPtr().*) {
+                    switch (cv.unbox()) {
                         .string => |s| try writer.print(" R{d}[\"{s}\"] = R{d}", .{ robj, s, rval }),
                         else => try writer.print(" R{d}[K{d}] = R{d}", .{ robj, kidx, rval }),
                     }
@@ -299,7 +299,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
-                    switch (cv.toPtr().*) {
+                    switch (cv.unbox()) {
                         .string => |s| try writer.print(" R{d} = R{d}[\"{s}\"]", .{ rdst, robj, s }),
                         else => try writer.print(" R{d} = R{d}[K{d}]", .{ rdst, robj, kidx }),
                     }
@@ -385,7 +385,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
-                    const inner = cv.toPtr().*;
+                    const inner = cv.unbox();
                     switch (inner) {
                         .string => |s| try writer.print(" \"{s}\" R{d}", .{ s, rsrc }),
                         else => try writer.print(" K{d} R{d}", .{ kidx, rsrc }),

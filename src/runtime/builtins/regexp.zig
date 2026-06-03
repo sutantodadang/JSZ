@@ -854,11 +854,11 @@ pub fn getCompiledRegex(v: Value) ?*CompiledRegex {
 /// Get the lastIndex from a regex object.
 pub fn getLastIndex(v: Value) usize {
     if (v.bits == 0) return 0;
-    if (v.toPtr().* != .object) return 0;
+    if (v.unbox() != .object) return 0;
     const obj = v.toPtr().object;
     if (obj.get("lastIndex")) |li| {
-        if (li.bits != 0 and li.toPtr().* == .number) {
-            const n = li.toPtr().number;
+        if (li.bits != 0 and li.unbox() == .number) {
+            const n = li.unbox().number;
             if (n < 0 or std.math.isNan(n)) return 0;
             return @intFromFloat(@trunc(n));
         }
@@ -869,7 +869,7 @@ pub fn getLastIndex(v: Value) usize {
 /// Set lastIndex on a regex object.
 pub fn setLastIndex(arena: std.mem.Allocator, v: Value, idx: usize) !void {
     if (v.bits == 0) return;
-    if (v.toPtr().* != .object) return;
+    if (v.unbox() != .object) return;
     const obj = v.toPtr().object;
     const li_val = try val_mod.makeNumber(arena, @floatFromInt(idx));
     try obj.set("lastIndex", li_val);
@@ -879,13 +879,13 @@ pub fn setLastIndex(arena: std.mem.Allocator, v: Value, idx: usize) !void {
 pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     // Extract source string
     const pattern_str: []const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .string => |s| s,
             .object => |obj| blk: {
                 // If it's already a RegExp, return its source
                 if (obj.internal_kind == .regexp) {
                     if (obj.get("source")) |sv| {
-                        if (sv.bits != 0 and sv.toPtr().* == .string) break :blk sv.toPtr().string;
+                        if (sv.bits != 0 and sv.unbox() == .string) break :blk sv.toPtr().string;
                     }
                 }
                 break :blk "";
@@ -896,7 +896,7 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         "";
 
     const flags_str: []const u8 = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].toPtr().*) {
+        switch (args[1].unbox()) {
             .string => |s| s,
             .undefined_ => "",
             else => "",
@@ -925,7 +925,7 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     };
 
     // Populate `this` if it's a fresh object (from `new`), else create new.
-    if (this_val.bits != 0 and this_val.toPtr().* == .object) {
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
         const this_obj = this_val.toPtr().object;
         const source_val = try val_mod.makeString(arena, pattern_str);
         const flags_val = try val_mod.makeString(arena, flags_str);
@@ -951,7 +951,7 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
 pub fn nativeRegExpTest(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const cr = getCompiledRegex(this_val) orelse return val_mod.makeBool(arena, false);
     const s: []const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .string => |st| st,
             else => "",
         }
@@ -971,7 +971,7 @@ pub fn nativeRegExpTest(arena: std.mem.Allocator, this_val: Value, args: []const
 pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const cr = getCompiledRegex(this_val) orelse return val_mod.makeNull(arena);
     const s: []const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].toPtr().*) {
+        switch (args[0].unbox()) {
             .string => |st| st,
             else => "",
         }
