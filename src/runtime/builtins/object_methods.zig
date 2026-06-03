@@ -110,6 +110,36 @@ pub fn nativeObjectFromEntries(arena: std.mem.Allocator, _: Value, args: []const
     return val_mod.makeObject(arena, out);
 }
 
+fn makeDataDescriptor(arena: std.mem.Allocator, value: Value) !Value {
+    const realm_mod = @import("../realm.zig");
+    const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+    const desc = try JsObject.create(arena, obj_proto);
+    try desc.set("value", value);
+    try desc.set("writable", try val_mod.makeBool(arena, true));
+    try desc.set("enumerable", try val_mod.makeBool(arena, true));
+    try desc.set("configurable", try val_mod.makeBool(arena, true));
+    return val_mod.makeObject(arena, desc);
+}
+
+/// ES2017 Object.getOwnPropertyDescriptors(o): own keys → data descriptor objects.
+pub fn nativeObjectGetOwnPropertyDescriptors(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+    const out = try JsObject.create(arena, obj_proto);
+
+    if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, out);
+    const inner = args[0].toPtr();
+    if (inner.* != .object) return val_mod.makeObject(arena, out);
+    const obj = inner.object;
+
+    var it = obj.props.iterator();
+    while (it.next()) |entry| {
+        const desc_val = try makeDataDescriptor(arena, entry.value_ptr.*);
+        try out.set(entry.key_ptr.*, desc_val);
+    }
+    return val_mod.makeObject(arena, out);
+}
+
 /// hasOwnProperty(key): checks if own prop exists (not in proto chain).
 pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.toPtr().* != .object) {

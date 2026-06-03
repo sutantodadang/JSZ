@@ -43,6 +43,10 @@ pub const AssignOp = enum {
     lshift,
     rshift,
     urshift,
+    // ES2021 logical assignment (short-circuiting).
+    logical_and,
+    logical_or,
+    logical_nullish,
 };
 
 pub const UnaryOp = enum {
@@ -57,7 +61,7 @@ pub const UnaryOp = enum {
     pre_dec,
 };
 
-pub const LogicalOp = enum { and_, or_ };
+pub const LogicalOp = enum { and_, or_, nullish };
 
 pub const UpdateOp = enum { inc, dec };
 
@@ -84,6 +88,11 @@ pub const NodeKind = enum {
     call_expr,
     new_expr,
     member_expr,
+    /// ES2020 optional chain root — wraps the outermost member/call of a chain
+    /// that contains at least one `?.` link. Establishes the short-circuit
+    /// boundary: if any optional link sees a nullish base the whole chain
+    /// evaluates to `undefined`.
+    optional_chain,
     function_expr,
     // Phase 3a: object and array literals
     object_literal,
@@ -145,6 +154,7 @@ pub const Data = union(NodeKind) {
     call_expr: CallExpr,
     new_expr: NewExpr,
     member_expr: MemberExpr,
+    optional_chain: *Node,
     function_expr: FuncExpr,
     object_literal: ObjectLiteral,
     array_literal: ArrayLiteral,
@@ -217,6 +227,8 @@ pub const SeqExpr = struct {
 pub const CallExpr = struct {
     callee: *Node,
     args: []*Node,
+    /// ES2020 optional call `f?.(args)`.
+    optional: bool = false,
 };
 
 pub const NewExpr = struct {
@@ -228,6 +240,8 @@ pub const MemberExpr = struct {
     object: *Node,
     property: *Node,
     computed: bool,
+    /// ES2020 optional member `obj?.prop` / `obj?.[expr]`.
+    optional: bool = false,
 };
 
 pub const FuncExpr = struct {

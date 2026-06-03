@@ -91,7 +91,7 @@ fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.toPtr().*) {
         .function, .native_function, .bc_function => true,
-        .object => |o| o.get("__call__") != null,
+        .object => |o| o.internal_kind == .bound_function or o.get("__call__") != null,
         else => false,
     };
 }
@@ -241,6 +241,145 @@ pub fn nativePromiseResolve(arena: std.mem.Allocator, _: Value, args: []const Va
 pub fn nativePromiseReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     return makePromise(arena, .rejected, v);
+}
+
+const AllSettledCtx = struct {
+    result_promise: *PromiseData,
+    results: []Value,
+    remaining: usize,
+    result_arr: *JsObject,
+};
+
+threadlocal var active_all_settled_ctx: ?*AllSettledCtx = null;
+
+fn allSettledRecord(arena: std.mem.Allocator, ctx: *AllSettledCtx, idx: usize, status: []const u8, payload: Value) void {
+    const obj_proto = realm_mod.active_object_proto;
+    const entry = if (realm_mod.active_heap) |h|
+        JsObject.createOnHeap(h, obj_proto) catch return
+    else
+        JsObject.create(arena, obj_proto) catch return;
+    const status_val = val_mod.makeString(arena, status) catch return;
+    entry.set("status", status_val) catch return;
+    if (std.mem.eql(u8, status, "fulfilled")) {
+        entry.set("value", payload) catch return;
+    } else {
+        entry.set("reason", payload) catch return;
+    }
+    const idx_key = std.fmt.allocPrint(arena, "{d}", .{idx}) catch return;
+    const entry_val = val_mod.makeObject(arena, entry) catch return;
+    ctx.result_arr.set(idx_key, entry_val) catch return;
+    ctx.results[idx] = entry_val;
+
+    if (ctx.remaining > 0) {
+        ctx.remaining -= 1;
+    }
+    if (ctx.remaining == 0) {
+        ctx.result_arr.array_length = @intCast(ctx.results.len);
+        const arr_val = val_mod.makeObject(arena, ctx.result_arr) catch return;
+        promiseResolveData(arena, ctx.result_promise, arr_val);
+        flushReactions(arena, ctx.result_promise);
+        active_all_settled_ctx = null;
+    }
+}
+
+fn nativeAllSettledFulfill(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = active_all_settled_ctx orelse return val_mod.makeUndefined(arena);
+    if (args.len < 2) return val_mod.makeUndefined(arena);
+    const idx: usize = @intFromFloat(@trunc(args[0].toF64()));
+    allSettledRecord(arena, ctx, idx, "fulfilled", args[1]);
+    return val_mod.makeUndefined(arena);
+}
+
+fn nativeAllSettledReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = active_all_settled_ctx orelse return val_mod.makeUndefined(arena);
+    if (args.len < 2) return val_mod.makeUndefined(arena);
+    const idx: usize = @intFromFloat(@trunc(args[0].toF64()));
+    allSettledRecord(arena, ctx, idx, "rejected", args[1]);
+    return val_mod.makeUndefined(arena);
+}
+
+fn bindNativeWithIndex(arena: std.mem.Allocator, target: Value, idx: usize) !Value {
+    const idx_val = try val_mod.makeNumber(arena, @floatFromInt(idx));
+    const prefix = try arena.alloc(Value, 1);
+    prefix[0] = idx_val;
+    const bd = try arena.create(fn_proto.BoundData);
+    bd.* = .{
+        .target = target,
+        .this_val = try val_mod.makeUndefined(arena),
+        .prefix = prefix,
+    };
+    const bound_obj = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    bound_obj.internal_kind = .bound_function;
+    bound_obj.internal_slot = bd;
+    return val_mod.makeObject(arena, bound_obj);
+}
+
+fn subscribeAllSettledAsync(arena: std.mem.Allocator, _: *AllSettledCtx, idx: usize, wrapped: Value) !void {
+    const fulfill_base = try val_mod.makeNativeFunction(arena, nativeAllSettledFulfill);
+    const reject_base = try val_mod.makeNativeFunction(arena, nativeAllSettledReject);
+    const on_fulfill = try bindNativeWithIndex(arena, fulfill_base, idx);
+    const on_reject = try bindNativeWithIndex(arena, reject_base, idx);
+    _ = try nativePromiseThen(arena, wrapped, &[_]Value{ on_fulfill, on_reject });
+}
+
+/// ES2020 Promise.allSettled(iterable) — never rejects; each input → {status,value|reason}.
+pub fn nativePromiseAllSettled(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const result_p = try makePendingPromise(arena);
+    const result_data = getData(result_p) orelse return result_p;
+
+    const arr_proto = realm_mod.active_array_proto;
+    const result_arr = try JsObject.createArray(arena, arr_proto);
+
+    if (args.len == 0 or args[0].bits == 0) {
+        result_arr.array_length = 0;
+        promiseResolveData(arena, result_data, try val_mod.makeObject(arena, result_arr));
+        flushReactions(arena, result_data);
+        return result_p;
+    }
+
+    const inner = args[0].toPtr();
+    if (inner.* != .object or !inner.object.is_array) {
+        result_arr.array_length = 0;
+        promiseResolveData(arena, result_data, try val_mod.makeObject(arena, result_arr));
+        flushReactions(arena, result_data);
+        return result_p;
+    }
+    const list = inner.object;
+    const count = list.array_length;
+    if (count == 0) {
+        result_arr.array_length = 0;
+        promiseResolveData(arena, result_data, try val_mod.makeObject(arena, result_arr));
+        flushReactions(arena, result_data);
+        return result_p;
+    }
+
+    const ctx = try arena.create(AllSettledCtx);
+    const results = try arena.alloc(Value, count);
+    @memset(results, Value{});
+    ctx.* = .{
+        .result_promise = result_data,
+        .results = results,
+        .remaining = count,
+        .result_arr = result_arr,
+    };
+    active_all_settled_ctx = ctx;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const item = list.props.get(ek) orelse try val_mod.makeUndefined(arena);
+        const wrapped = try nativePromiseResolve(arena, Value{}, &[_]Value{item});
+        const wd = getData(wrapped) orelse continue;
+        switch (wd.state) {
+            .fulfilled => allSettledRecord(arena, ctx, i, "fulfilled", wd.value),
+            .rejected => allSettledRecord(arena, ctx, i, "rejected", wd.value),
+            .pending => try subscribeAllSettledAsync(arena, ctx, i, wrapped),
+        }
+    }
+    return result_p;
 }
 
 pub fn nativePromiseThen(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {

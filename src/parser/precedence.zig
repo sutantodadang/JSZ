@@ -8,20 +8,23 @@ pub const Prec = struct {
     pub const comma: u8 = 1;
     pub const assignment: u8 = 2;
     pub const conditional: u8 = 3;
-    pub const logical_or: u8 = 4;
-    pub const logical_and: u8 = 5;
-    pub const bitwise_or: u8 = 6;
-    pub const bitwise_xor: u8 = 7;
-    pub const bitwise_and: u8 = 8;
-    pub const equality: u8 = 9;
-    pub const relational: u8 = 10;
-    pub const shift: u8 = 11;
-    pub const additive: u8 = 12;
-    pub const multiplicative: u8 = 13;
-    pub const exponentiation: u8 = 14;
-    pub const unary: u8 = 15;
-    pub const postfix: u8 = 16;
-    pub const call_member: u8 = 17;
+    // ES2020 nullish coalescing: same tier as `||`/`&&` but cannot be mixed
+    // with them without parentheses (enforced in the parser).
+    pub const nullish_coalescing: u8 = 4;
+    pub const logical_or: u8 = 5;
+    pub const logical_and: u8 = 6;
+    pub const bitwise_or: u8 = 7;
+    pub const bitwise_xor: u8 = 8;
+    pub const bitwise_and: u8 = 9;
+    pub const equality: u8 = 10;
+    pub const relational: u8 = 11;
+    pub const shift: u8 = 12;
+    pub const additive: u8 = 13;
+    pub const multiplicative: u8 = 14;
+    pub const exponentiation: u8 = 15;
+    pub const unary: u8 = 16;
+    pub const postfix: u8 = 17;
+    pub const call_member: u8 = 18;
 };
 
 /// Return the infix precedence for binary/logical/relational operators.
@@ -30,6 +33,7 @@ pub fn infixPrec(kind: TokenKind) u8 {
     return switch (kind) {
         .comma => Prec.comma,
         // Assignment operators are handled separately (right-assoc), not via infixPrec
+        .question_question => Prec.nullish_coalescing,
         .pipe_pipe => Prec.logical_or,
         .amp_amp => Prec.logical_and,
         .pipe => Prec.bitwise_or,
@@ -50,7 +54,8 @@ pub fn infixPrec(kind: TokenKind) u8 {
 pub fn isAssignOp(kind: TokenKind) bool {
     return switch (kind) {
         .eq, .plus_eq, .minus_eq, .star_eq, .star_star_eq, .slash_eq, .percent_eq,
-        .amp_eq, .pipe_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq, .gt_gt_gt_eq => true,
+        .amp_eq, .pipe_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq, .gt_gt_gt_eq,
+        .amp_amp_eq, .pipe_pipe_eq, .question_question_eq => true,
         else => false,
     };
 }

@@ -1,0 +1,23 @@
+[package]
+name = "jit-native"
+version = "0.1.0"
+edition = "2024"
+
+# SPDX-License-Identifier: MIT
+# Phase 9 baseline JIT native backend: a thin C-ABI wrapper over cranelift-jit.
+# Built as a staticlib and linked into the isolated `zig build jit-native` step
+# (NOT the main jsz binary yet). See docs/JIT.md.
+[lib]
+# cdylib so the Rust toolchain links all crate deps (incl. windows import libs)
+# into a self-contained DLL; Zig links only the small import lib + ships the DLL.
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+cranelift-codegen = "0.131.2"
+cranelift-frontend = "0.131.2"
+cranelift-jit = "0.131.2"
+cranelift-module = "0.131.2"
+cranelift-native = "0.131.2"

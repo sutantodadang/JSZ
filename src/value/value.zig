@@ -103,6 +103,13 @@ pub const Value = extern struct {
         return self.toPtr().* == .undefined_;
     }
 
+    /// True if the value is `null` or `undefined` (ES nullish).
+    pub fn isNullish(self: Value) bool {
+        if (self.bits == 0) return true; // uninitialized = undefined
+        const tag = self.toPtr().*;
+        return tag == .null_ or tag == .undefined_;
+    }
+
     /// Phase 0 compat: return i32 approximation.
     pub fn toI32(self: Value) i32 {
         if (self.bits == 0) return 0;

@@ -534,6 +534,7 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         // Phase 4c: regex-aware string methods
         .{ "match", string_proto_mod.nativeMatch },
         .{ "replace", string_proto_mod.nativeReplace },
+        .{ "replaceAll", string_proto_mod.nativeReplaceAll },
         .{ "search", string_proto_mod.nativeSearch },
     };
     inline for (fns) |pair| {
@@ -563,6 +564,9 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "every", array_proto_mod.nativeEvery },
         .{ "find", array_proto_mod.nativeFind },
         .{ "findIndex", array_proto_mod.nativeFindIndex },
+        .{ "findLast", array_proto_mod.nativeFindLast },
+        .{ "findLastIndex", array_proto_mod.nativeFindLastIndex },
+        .{ "at", array_proto_mod.nativeAt },
         .{ "sort", array_proto_mod.nativeSort },
     };
     inline for (fns) |pair| {
@@ -612,6 +616,20 @@ fn registerMath(arena: std.mem.Allocator, obj: *JsObject) !void {
         const fn_val = try val_mod.makeNativeFunction(arena, pair[1]);
         try obj.set(pair[0], fn_val);
     }
+}
+
+/// Build a plain object mirroring global env bindings and expose as globalThis/global.
+fn installGlobalThis(arena: std.mem.Allocator, env: *Environment, object_proto: *JsObject) !void {
+    const global_obj = try JsObject.create(arena, object_proto);
+    var it = env.bindings.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (name.len >= 2 and name[0] == '_' and name[1] == '_') continue;
+        try global_obj.set(name, entry.value_ptr.value);
+    }
+    const global_val = try val_mod.makeObject(arena, global_obj);
+    try env.define("globalThis", global_val);
+    try env.define("global", global_val);
 }
 
 pub const Realm = struct {
@@ -766,6 +784,8 @@ pub const Realm = struct {
                 try ctor_obj.set("entries", entries_fn);
                 const from_entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFromEntries);
                 try ctor_obj.set("fromEntries", from_entries_fn);
+                const gopd_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptors);
+                try ctor_obj.set("getOwnPropertyDescriptors", gopd_fn);
             }
         }
         // hasOwnProperty on Object.prototype
@@ -934,6 +954,7 @@ pub const Realm = struct {
         try promise_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseCtor));
         try promise_ctor_obj.set("resolve", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseResolve));
         try promise_ctor_obj.set("reject", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseReject));
+        try promise_ctor_obj.set("allSettled", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseAllSettled));
         try env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
         const require_cache_obj = try JsObject.create(arena, object_proto);
         try env.define("__require_cache__", try val_mod.makeObject(arena, require_cache_obj));
@@ -982,6 +1003,9 @@ pub const Realm = struct {
         try env.define("parseFloat", try val_mod.makeNativeFunction(arena, nativeParseFloat));
         try env.define("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)));
         try env.define("Infinity", try val_mod.makeNumber(arena, std.math.inf(f64)));
+
+        // ---- ES2020 globalThis (+ Node-compatible `global`) ----
+        try installGlobalThis(arena, env, object_proto);
 
         // Set thread-locals for builtins that need them.
         active_array_proto = array_proto;

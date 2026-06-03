@@ -201,6 +201,10 @@ pub const Lexer = struct {
             .bang_eq_eq,
             .amp_amp,
             .pipe_pipe,
+            .question_question,
+            .amp_amp_eq,
+            .pipe_pipe_eq,
+            .question_question_eq,
             .question,
             .colon,
             .semicolon,
@@ -523,7 +527,32 @@ pub const Lexer = struct {
             ':' => .colon,
             ',' => .comma,
             '~' => .tilde,
-            '?' => .question,
+            '?' => blk: {
+                if (self.pos < self.source.len) {
+                    const n = self.source[self.pos];
+                    if (n == '?') {
+                        self.pos += 1;
+                        self.column += 1;
+                        if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                            self.pos += 1;
+                            self.column += 1;
+                            break :blk .question_question_eq;
+                        }
+                        break :blk .question_question;
+                    }
+                    // `?.` is optional chaining, but NOT when followed by a digit
+                    // (e.g. `x?.3:y` is the ternary `x ? .3 : y`).
+                    if (n == '.') {
+                        const after: u8 = if (self.pos + 1 < self.source.len) self.source[self.pos + 1] else 0;
+                        if (!(after >= '0' and after <= '9')) {
+                            self.pos += 1;
+                            self.column += 1;
+                            break :blk .question_dot;
+                        }
+                    }
+                }
+                break :blk .question;
+            },
             '.' => blk: {
                 if (self.pos + 1 < self.source.len and self.source[self.pos] == '.' and self.source[self.pos + 1] == '.') {
                     self.pos += 2;
@@ -593,6 +622,11 @@ pub const Lexer = struct {
                     if (self.source[self.pos] == '&') {
                         self.pos += 1;
                         self.column += 1;
+                        if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                            self.pos += 1;
+                            self.column += 1;
+                            break :blk .amp_amp_eq;
+                        }
                         break :blk .amp_amp;
                     }
                     if (self.source[self.pos] == '=') {
@@ -608,6 +642,11 @@ pub const Lexer = struct {
                     if (self.source[self.pos] == '|') {
                         self.pos += 1;
                         self.column += 1;
+                        if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                            self.pos += 1;
+                            self.column += 1;
+                            break :blk .pipe_pipe_eq;
+                        }
                         break :blk .pipe_pipe;
                     }
                     if (self.source[self.pos] == '=') {
@@ -832,6 +871,30 @@ test "Lexer: compound operators" {
     try std.testing.expectEqual(TokenKind.amp_amp, t3.kind);
     const t4 = try lex.next();
     try std.testing.expectEqual(TokenKind.pipe_pipe, t4.kind);
+}
+
+test "Lexer: ES2020/2021 operators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lex = Lexer.init("?? ?. &&= ||= ??=", arena.allocator());
+    try std.testing.expectEqual(TokenKind.question_question, (try lex.next()).kind);
+    try std.testing.expectEqual(TokenKind.question_dot, (try lex.next()).kind);
+    try std.testing.expectEqual(TokenKind.amp_amp_eq, (try lex.next()).kind);
+    try std.testing.expectEqual(TokenKind.pipe_pipe_eq, (try lex.next()).kind);
+    try std.testing.expectEqual(TokenKind.question_question_eq, (try lex.next()).kind);
+}
+
+test "Lexer: ?. before digit is ternary, not optional chaining" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lex = Lexer.init("x?.3:y", arena.allocator());
+    try std.testing.expectEqual(TokenKind.identifier, (try lex.next()).kind);
+    try std.testing.expectEqual(TokenKind.question, (try lex.next()).kind);
+    const num = try lex.next();
+    try std.testing.expectEqual(TokenKind.number, num.kind);
+    try std.testing.expectEqual(@as(f64, 0.3), num.value_num);
+    try std.testing.expectEqual(TokenKind.colon, (try lex.next()).kind);
+    try std.testing.expectEqual(TokenKind.identifier, (try lex.next()).kind);
 }
 
 test "Lexer: line comment skipped" {

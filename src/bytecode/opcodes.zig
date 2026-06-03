@@ -44,6 +44,8 @@
 //!  JMP             |   3   | op, offset i16-LE (relative to next instr)
 //!  JMP_IF_TRUE     |   4   | op, Rcond u8, offset i16-LE
 //!  JMP_IF_FALSE    |   4   | op, Rcond u8, offset i16-LE
+//!  JMP_IF_NULLISH  |   4   | op, Rcond u8, offset i16-LE
+//!  JMP_IF_NOT_NULLISH | 4  | op, Rcond u8, offset i16-LE
 //!  JSEQ            |   5   | op, Rlhs u8, Rrhs u8, offset i16-LE
 //!  JGE             |   5   | op, Rlhs u8, Rrhs u8, offset i16-LE
 //!  NEW_CLOSURE     |   4   | op, Rdst u8, funcIdx u16-LE
@@ -116,6 +118,9 @@ pub const Op = enum(u8) {
     JMP,
     JMP_IF_TRUE,
     JMP_IF_FALSE,
+    // ES2020: nullish-coalescing / optional-chaining short-circuit jumps.
+    JMP_IF_NULLISH,
+    JMP_IF_NOT_NULLISH,
     JSEQ,
     JGE,
     NEW_CLOSURE,
@@ -201,6 +206,8 @@ pub fn instrSize(op: Op) usize {
         .JMP => 3,
         .JMP_IF_TRUE => 4,
         .JMP_IF_FALSE => 4,
+        .JMP_IF_NULLISH => 4,
+        .JMP_IF_NOT_NULLISH => 4,
         .JSEQ => 5,
         .JGE => 5,
         .NEW_CLOSURE => 4,

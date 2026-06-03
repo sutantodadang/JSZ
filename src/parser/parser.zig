@@ -438,6 +438,7 @@ pub const Parser = struct {
                 self.countDecls(n.data.member_expr.object, counts);
                 if (n.data.member_expr.computed) self.countDecls(n.data.member_expr.property, counts);
             },
+            .optional_chain => self.countDecls(n.data.optional_chain, counts),
             .object_literal => for (n.data.object_literal.properties) |p| self.countDecls(p.value, counts),
             .array_literal => for (n.data.array_literal.elements) |e| self.countDecls(e, counts),
             else => {},
@@ -537,6 +538,7 @@ pub const Parser = struct {
                 self.rewriteName(n.data.member_expr.object, name, ns, prop);
                 if (n.data.member_expr.computed) self.rewriteName(n.data.member_expr.property, name, ns, prop);
             },
+            .optional_chain => self.rewriteName(n.data.optional_chain, name, ns, prop),
             .object_literal => for (n.data.object_literal.properties) |p| self.rewriteName(p.value, name, ns, prop),
             .array_literal => for (n.data.array_literal.elements) |e| self.rewriteName(e, name, ns, prop),
             else => {},
@@ -749,9 +751,33 @@ pub const Parser = struct {
     fn parseExprFromIdent(self: *Parser, ident: *Node) ?*Node {
         // We have the identifier node. Check for assignment or other binary/postfix ops.
         var base: *Node = ident;
+        var saw_optional = false;
         // Handle postfix member access / calls.
         while (true) {
-            if (self.check(.left_paren)) {
+            if (self.match(.question_dot)) {
+                // ES2020 optional chaining: `obj?.prop`, `obj?.[expr]`, `obj?.(args)`.
+                saw_optional = true;
+                if (self.check(.left_paren)) {
+                    const args = self.parseArgs() orelse return null;
+                    base = self.makeNode(.call_expr, base.start, self.current.start, .{
+                        .call_expr = .{ .callee = base, .args = args, .optional = true },
+                    }) orelse return null;
+                } else if (self.match(.left_bracket)) {
+                    const prop = self.parseExpression() orelse return null;
+                    _ = self.expect(.right_bracket) orelse return null;
+                    base = self.makeNode(.member_expr, base.start, self.current.start, .{
+                        .member_expr = .{ .object = base, .property = prop, .computed = true, .optional = true },
+                    }) orelse return null;
+                } else {
+                    const prop_tok = self.expect(.identifier) orelse return null;
+                    const prop = self.makeNode(.identifier, prop_tok.start, prop_tok.end, .{
+                        .identifier = prop_tok.value_str,
+                    }) orelse return null;
+                    base = self.makeNode(.member_expr, base.start, self.current.start, .{
+                        .member_expr = .{ .object = base, .property = prop, .computed = false, .optional = true },
+                    }) orelse return null;
+                }
+            } else if (self.check(.left_paren)) {
                 const args = self.parseArgs() orelse return null;
                 base = self.makeNode(.call_expr, base.start, self.current.start, .{
                     .call_expr = .{ .callee = base, .args = args },
@@ -786,6 +812,11 @@ pub const Parser = struct {
                 break;
             }
         }
+        if (saw_optional) {
+            base = self.makeNode(.optional_chain, base.start, base.end, .{
+                .optional_chain = base,
+            }) orelse return null;
+        }
         // Now parse binary ops.
         while (true) {
             const p = infixPrec(self.current.kind);
@@ -793,12 +824,29 @@ pub const Parser = struct {
             if (self.current.kind == .left_paren or self.current.kind == .left_bracket or self.current.kind == .dot) break;
             const op_kind = self.current.kind;
             _ = self.advance();
+            // ES2020: `??` may not be mixed with `&&`/`||` without parentheses.
+            if (op_kind == .question_question and isUnparenthesizedAndOr(base)) {
+                self.coalesceMixError();
+                return null;
+            }
             const right = self.parseBinaryExpr(if (op_kind == .star_star) p - 1 else p) orelse return null;
+            if (op_kind == .question_question and isUnparenthesizedAndOr(right)) {
+                self.coalesceMixError();
+                return null;
+            }
+            if ((op_kind == .amp_amp or op_kind == .pipe_pipe) and isUnparenthesizedNullish(right)) {
+                self.coalesceMixError();
+                return null;
+            }
             const start = base.start;
             base = switch (op_kind) {
-                .amp_amp, .pipe_pipe => self.makeNode(.logical_expr, start, self.current.start, .{
+                .amp_amp, .pipe_pipe, .question_question => self.makeNode(.logical_expr, start, self.current.start, .{
                     .logical_expr = .{
-                        .op = if (op_kind == .amp_amp) .and_ else .or_,
+                        .op = switch (op_kind) {
+                            .amp_amp => .and_,
+                            .pipe_pipe => .or_,
+                            else => .nullish,
+                        },
                         .left = base,
                         .right = right,
                     },
@@ -1775,6 +1823,18 @@ pub const Parser = struct {
         return test_;
     }
 
+    /// Emit the "cannot mix ?? with && or ||" SyntaxError.
+    fn coalesceMixError(self: *Parser) void {
+        if (!self.had_error) {
+            self.had_error = true;
+            self.error_info = ParseError{
+                .message = "cannot mix '??' with '||' or '&&' without parentheses",
+                .line = self.current.line,
+                .column = self.current.column,
+            };
+        }
+    }
+
     /// Pratt-style binary expression parser.
     fn parseBinaryExpr(self: *Parser, min_prec: u8) ?*Node {
         var left = self.parseUnaryExpr() orelse return null;
@@ -1798,14 +1858,42 @@ pub const Parser = struct {
                 }
                 return null;
             }
+            // ES2020: `??` may not be mixed with `&&`/`||` without parentheses.
+            if (op_kind == .question_question) {
+                if (isUnparenthesizedAndOr(left)) {
+                    self.coalesceMixError();
+                    return null;
+                }
+            } else if (op_kind == .amp_amp or op_kind == .pipe_pipe) {
+                if (isUnparenthesizedNullish(left)) {
+                    self.coalesceMixError();
+                    return null;
+                }
+            }
             _ = self.advance();
             // Exponentiation is right-associative: recurse at p-1 so same-prec ** binds rightward.
             const right = self.parseBinaryExpr(if (op_kind == .star_star) p - 1 else p) orelse return null;
+            // Reject the right-operand mixing direction too (e.g. `a ?? b || c`).
+            if (op_kind == .question_question) {
+                if (isUnparenthesizedAndOr(right)) {
+                    self.coalesceMixError();
+                    return null;
+                }
+            } else if (op_kind == .amp_amp or op_kind == .pipe_pipe) {
+                if (isUnparenthesizedNullish(right)) {
+                    self.coalesceMixError();
+                    return null;
+                }
+            }
             const start = left.start;
             left = switch (op_kind) {
-                .amp_amp, .pipe_pipe => self.makeNode(.logical_expr, start, self.current.start, .{
+                .amp_amp, .pipe_pipe, .question_question => self.makeNode(.logical_expr, start, self.current.start, .{
                     .logical_expr = .{
-                        .op = if (op_kind == .amp_amp) .and_ else .or_,
+                        .op = switch (op_kind) {
+                            .amp_amp => .and_,
+                            .pipe_pipe => .or_,
+                            else => .nullish,
+                        },
                         .left = left,
                         .right = right,
                     },
@@ -1920,11 +2008,37 @@ pub const Parser = struct {
         return expr;
     }
 
-    /// Parse call, member access, subscript.
+    /// Parse call, member access, subscript. Handles ES2020 optional chaining
+    /// (`?.`); if any link in the chain is optional, the whole chain is wrapped
+    /// in an `optional_chain` node which establishes the short-circuit boundary.
     fn parseCallMemberExpr(self: *Parser) ?*Node {
         var base = self.parsePrimaryExpr() orelse return null;
+        var saw_optional = false;
         while (true) {
-            if (self.check(.left_paren)) {
+            if (self.match(.question_dot)) {
+                // `obj?.[expr]`, `obj?.(args)`, or `obj?.prop`
+                saw_optional = true;
+                if (self.check(.left_paren)) {
+                    const args = self.parseArgs() orelse return null;
+                    base = self.makeNode(.call_expr, base.start, self.current.start, .{
+                        .call_expr = .{ .callee = base, .args = args, .optional = true },
+                    }) orelse return null;
+                } else if (self.match(.left_bracket)) {
+                    const prop = self.parseExpression() orelse return null;
+                    _ = self.expect(.right_bracket) orelse return null;
+                    base = self.makeNode(.member_expr, base.start, self.current.start, .{
+                        .member_expr = .{ .object = base, .property = prop, .computed = true, .optional = true },
+                    }) orelse return null;
+                } else {
+                    const prop_tok = self.expect(.identifier) orelse return null;
+                    const prop = self.makeNode(.identifier, prop_tok.start, prop_tok.end, .{
+                        .identifier = prop_tok.value_str,
+                    }) orelse return null;
+                    base = self.makeNode(.member_expr, base.start, self.current.start, .{
+                        .member_expr = .{ .object = base, .property = prop, .computed = false, .optional = true },
+                    }) orelse return null;
+                }
+            } else if (self.check(.left_paren)) {
                 const args = self.parseArgs() orelse return null;
                 const raw_call = self.makeNode(.call_expr, base.start, self.current.start, .{
                     .call_expr = .{ .callee = base, .args = args },
@@ -1947,6 +2061,11 @@ pub const Parser = struct {
             } else {
                 break;
             }
+        }
+        if (saw_optional) {
+            base = self.makeNode(.optional_chain, base.start, base.end, .{
+                .optional_chain = base,
+            }) orelse return null;
         }
         return base;
     }
@@ -2313,6 +2432,17 @@ pub const Parser = struct {
 
 // ---------------------------------------------------------------- helpers ---
 
+/// True if `n` is a non-parenthesized `&&` / `||` logical expression.
+fn isUnparenthesizedAndOr(n: *Node) bool {
+    return n.kind == .logical_expr and !n.paren and
+        (n.data.logical_expr.op == .and_ or n.data.logical_expr.op == .or_);
+}
+
+/// True if `n` is a non-parenthesized `??` logical expression.
+fn isUnparenthesizedNullish(n: *Node) bool {
+    return n.kind == .logical_expr and !n.paren and n.data.logical_expr.op == .nullish;
+}
+
 fn tokenToBinaryOp(kind: TokenKind) ast.BinaryOp {
     return switch (kind) {
         .plus => .add,
@@ -2407,6 +2537,9 @@ fn tokenToAssignOp(kind: TokenKind) ast.AssignOp {
         .lt_lt_eq => .lshift,
         .gt_gt_eq => .rshift,
         .gt_gt_gt_eq => .urshift,
+        .amp_amp_eq => .logical_and,
+        .pipe_pipe_eq => .logical_or,
+        .question_question_eq => .logical_nullish,
         else => .assign,
     };
 }

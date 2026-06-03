@@ -7,9 +7,13 @@ Versioning: 0.x — anything may break. 1.0 = strict semver.
 
 ---
 
-## [Unreleased] — Phase 8: bytecode caching + snapshot/restore
+## [Unreleased] — Phase 9: JIT profiling tier + Cranelift native backend + Phase 8: bytecode caching + snapshot/restore
 
 ### Added
+- **Phase 9 JIT profiling tier.** `JitCompiler` (`src/jit/jit.zig`) now has real counter infrastructure: `AutoHashMapUnmanaged` per-site hit counters keyed by `(func_id, pc)`, a hot set, `notePcHit`/`isHot`/`hotCount`, plus `JitMode` enum (`.off`/`.count`/`.experimental`), `HotEvent`, and `DeoptFrame` type scaffold. `compile()` always returns `NotImplemented` — Cranelift backend deferred. PC hit counters wired into bc VM loop back-edges (JMP, JMP_IF_TRUE, JMP_IF_FALSE, JSEQ, JGE); `BcVm.jit: ?*JitCompiler` field is null by default (zero hot-path cost when off). `--jit=off|count|experimental` CLI flag added (implies `--interp=bc`); `=== JIT profile ===` block printed after eval when mode != off. `JitMode`/`JitProfile` exported in `src/root.zig`; `Context.setJitMode`/`lastJitProfile` added. 5 unit tests in `jit.zig` + hot-loop integration test in `bc_vm.zig`. `zig build jit` + `zig build test` + `zig build differential` (94/94) all green.
+- **Phase 9 Cranelift native backend (isolated proof).** `jit-native/` — a Rust crate wrapping `cranelift-jit` 0.131, built as a **`cdylib`** so the Rust toolchain links all transitive deps (incl. version-pinned `windows.*.lib`) into a self-contained DLL; Zig links only the small import lib. C ABI (`jsz_clif_compile_add`, `jsz_clif_compile_const`, `jsz_clif_available`) returns raw code pointers from a leaked `JITModule` (W^X mapping kept alive). `src/jit/native.zig` wraps them as `callconv(.c)` fn pointers and verifies Cranelift-emitted `add(2,3)==5`, `const(42)()==42`, etc. New `zig build jit-native` step runs `cargo build --release`, links the import lib, and runs 3 FFI tests (green). **Not linked into the main `jsz` binary yet.** `jit-native/target/` gitignored.
+
+
 - **Bytecode caching.** `bytecode/snapshot.zig` serializes a compiled
   `BcFunction` tree to a flat, sourceless binary image (`"JSZB"` magic + version,
   then recursively: name, source name, arity, register/local counts, strict

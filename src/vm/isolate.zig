@@ -10,8 +10,16 @@ const Value = val_mod.Value;
 const Heap = @import("../gc/heap.zig").Heap;
 const CollectStats = @import("../gc/heap.zig").CollectStats;
 const promise_mod = @import("../runtime/builtins/promise.zig");
+const jit_mod = @import("../jit/jit.zig");
 
 pub const InterpMode = enum { tree, bc };
+
+/// Phase 9: snapshot of JIT profiling data from the most recent bc-mode eval.
+pub const JitProfile = struct {
+    hot_sites: usize = 0,
+    compiled: usize = 0,
+    deopts: usize = 0,
+};
 
 /// Internal implementation of the public Isolate.
 pub const IsolateImpl = struct {
@@ -24,6 +32,10 @@ pub const IsolateImpl = struct {
     /// Phase 8: call-frame depth high-water mark of the most recent bc-mode
     /// eval. Exposed for tail-call tests (stays small when PTC engages).
     last_frame_high_water: usize = 0,
+    /// Phase 9: JIT mode for the next eval call.
+    jit_mode: jit_mod.JitMode = .off,
+    /// Phase 9: profile snapshot from the most recent bc-mode eval.
+    last_jit_profile: JitProfile = .{},
 
     pub fn init(backing: std.mem.Allocator) !*IsolateImpl {
         const impl = try backing.create(IsolateImpl);
@@ -59,6 +71,11 @@ pub const IsolateImpl = struct {
             .bytes_freed = self.heap.bytes_freed,
             .objects_alive = self.heap.objects_alive,
         };
+    }
+
+    /// Phase 9: set the JIT mode for the next eval call.
+    pub fn setJitMode(self: *IsolateImpl, m: jit_mod.JitMode) void {
+        self.jit_mode = m;
     }
 
     /// Run one eval call in tree mode (Phase 1 default). Resets the eval arena on entry.
@@ -142,12 +159,28 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__await__", await_fn);
 
         var bc_vm = BcVm.initWithHeap(arena, &realm, &self.heap);
+        // Phase 9: attach JIT profiler when a mode other than .off is requested.
+        var jc: jit_mod.JitCompiler = undefined;
+        if (self.jit_mode != .off) {
+            jc = jit_mod.JitCompiler.initMode(arena, self.jit_mode);
+            bc_vm.jit = &jc;
+        }
         // Register roots AFTER bc_vm/realm are in final stack location.
         try realm.registerRoots();
         try bc_vm.registerHeapCallback(&self.heap);
         defer bc_vm.unregisterHeapCallback(&self.heap);
         const outcome = try bc_vm.run(main_func, @ptrCast(realm.global_env));
         self.last_frame_high_water = bc_vm.frame_high_water;
+        // Phase 9: capture JIT profile snapshot.
+        if (self.jit_mode != .off) {
+            self.last_jit_profile = .{
+                .hot_sites = jc.hotCount(),
+                .compiled = jc.compiled,
+                .deopts = jc.deopts,
+            };
+        } else {
+            self.last_jit_profile = .{};
+        }
         promise_mod.runMicrotasks(arena);
         return switch (outcome) {
             .ok => |v| EvalOutcome{ .ok = v },

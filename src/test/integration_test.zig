@@ -1640,3 +1640,174 @@ test "snapshot: corrupt image yields an exception, not a crash" {
         else => return error.ExpectedException,
     }
 }
+
+// --------------------------------------------------------------------------
+// ES2020/2021: nullish coalescing `??`, optional chaining `?.`,
+// logical assignment `&&=` / `||=` / `??=`. Run in BOTH tree and bc modes.
+// --------------------------------------------------------------------------
+
+/// Both modes must report a parse error (e.g. `??` mixed with `&&`/`||`).
+fn expectDualParseError(source: []const u8) !void {
+    inline for (.{ .tree, .bc }) |mode| {
+        var iso = try Isolate.init(std.testing.allocator);
+        defer iso.deinit();
+        var ctx = try iso.newContext();
+        defer ctx.deinit();
+        ctx.setInterpMode(mode);
+        switch (ctx.eval(source, "<test>")) {
+            .parse_error => {},
+            else => return error.ExpectedParseError,
+        }
+    }
+}
+
+test "es2020: nullish coalescing basic" {
+    try std.testing.expectEqual(@as(f64, 5), try dualF64(std.testing.allocator, "null ?? 5"));
+    try std.testing.expectEqual(@as(f64, 7), try dualF64(std.testing.allocator, "undefined ?? 7"));
+    // 0 and "" are NOT nullish — left operand is kept.
+    try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, "0 ?? 5"));
+    try std.testing.expectEqual(@as(f64, 1), try dualF64(std.testing.allocator, "(false ?? 9) ? 2 : 1"));
+}
+
+test "es2020: nullish coalescing short-circuits RHS" {
+    // f() must not run when the left operand is non-nullish.
+    const src = "var c=0; function f(){c=1; return 9;} var x = 3 ?? f(); x*10+c";
+    try std.testing.expectEqual(@as(f64, 30), try dualF64(std.testing.allocator, src));
+    // ...but it does run when the left operand is nullish.
+    const src2 = "var c=0; function f(){c=1; return 9;} var x = null ?? f(); x*10+c";
+    try std.testing.expectEqual(@as(f64, 91), try dualF64(std.testing.allocator, src2));
+}
+
+test "es2020: nullish lower precedence than parenthesized or" {
+    // (a || b) ?? c  -> a||b is 1, not nullish, result 1.
+    try std.testing.expectEqual(@as(f64, 1), try dualF64(std.testing.allocator, "(0 || 1) ?? 5"));
+}
+
+test "es2020: mixing ?? with || or && is a SyntaxError" {
+    try expectDualParseError("1 || 2 ?? 3");
+    try expectDualParseError("1 ?? 2 || 3");
+    try expectDualParseError("1 && 2 ?? 3");
+    try expectDualParseError("1 ?? 2 && 3");
+    // Statement-starting-with-identifier path (parseExprFromIdent).
+    try expectDualParseError("var a=1,b=2,c=3; a || b ?? c");
+    try expectDualParseError("var a=1,b=2,c=3; a ?? b && c");
+}
+
+test "es2020: nullish coalescing on identifier target" {
+    // Exercises the parseExprFromIdent `??` path.
+    try std.testing.expectEqual(@as(f64, 9), try dualF64(std.testing.allocator, "var a; a ?? 9"));
+    try std.testing.expectEqual(@as(f64, 4), try dualF64(std.testing.allocator, "var a=4; a ?? 9"));
+    try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, "var a=0; a ?? 9"));
+}
+
+test "es2020: optional chaining member access" {
+    try std.testing.expectEqual(@as(f64, 5), try dualF64(std.testing.allocator, "var o={a:{b:5}}; o?.a?.b"));
+    // nullish base short-circuits the whole chain to undefined.
+    try std.testing.expect(try dualBool(std.testing.allocator, "var o=null; (o?.a?.b) === undefined"));
+    // optional link on a null intermediate short-circuits (no TypeError).
+    try std.testing.expect(try dualBool(std.testing.allocator, "var o={a:null}; (o?.a?.b) === undefined"));
+}
+
+test "es2020: optional computed index" {
+    try std.testing.expectEqual(@as(f64, 20), try dualF64(std.testing.allocator, "var o={arr:[10,20]}; o?.arr?.[1]"));
+    try std.testing.expect(try dualBool(std.testing.allocator, "var o=null; (o?.arr?.[0]) === undefined"));
+}
+
+test "es2020: optional call forms" {
+    // method call present.
+    try std.testing.expectEqual(@as(f64, 42), try dualF64(std.testing.allocator, "var o={f:function(){return 42;}}; o.f?.()"));
+    // optional method call on missing method short-circuits.
+    try std.testing.expect(try dualBool(std.testing.allocator, "var o={}; (o.g?.()) === undefined"));
+    // optional call on nullish callee short-circuits.
+    try std.testing.expect(try dualBool(std.testing.allocator, "var f=null; (f?.(1,2)) === undefined"));
+}
+
+test "es2020: optional chaining short-circuits rest of chain" {
+    // o is null: `?.a` short-circuits so the `[c=5]` index is never evaluated.
+    const src = "var c=0; var o=null; var r = o?.a[(c=5)]; c";
+    try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, src));
+    // o is null: optional method args are not evaluated either.
+    const src2 = "var c=0; function f(){c=1; return 0;} var o=null; o?.m(f()); c";
+    try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, src2));
+}
+
+test "es2020: ?. before a digit is the ternary operator" {
+    // `x?.5:9` parses as `x ? .5 : 9`.
+    try std.testing.expectEqual(@as(f64, 0.5), try dualF64(std.testing.allocator, "var x=1; x?.5:9"));
+    try std.testing.expectEqual(@as(f64, 9), try dualF64(std.testing.allocator, "var x=0; x?.5:9"));
+}
+
+test "es2021: logical-and assignment" {
+    try std.testing.expectEqual(@as(f64, 2), try dualF64(std.testing.allocator, "var x=1; x &&= 2; x"));
+    try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, "var x=0; x &&= 2; x"));
+}
+
+test "es2021: logical-or assignment" {
+    try std.testing.expectEqual(@as(f64, 5), try dualF64(std.testing.allocator, "var x=0; x ||= 5; x"));
+    try std.testing.expectEqual(@as(f64, 3), try dualF64(std.testing.allocator, "var x=3; x ||= 5; x"));
+}
+
+test "es2021: nullish assignment" {
+    try std.testing.expectEqual(@as(f64, 8), try dualF64(std.testing.allocator, "var x=null; x ??= 8; x"));
+    try std.testing.expectEqual(@as(f64, 4), try dualF64(std.testing.allocator, "var x=4; x ??= 8; x"));
+    try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, "var x=0; x ??= 8; x"));
+}
+
+test "es2021: logical assignment short-circuits RHS" {
+    // x truthy -> ||= does NOT evaluate f().
+    try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, "var c=0; function f(){c=1;return 1;} var x=5; x ||= f(); c"));
+    // x non-nullish -> ??= does NOT evaluate f().
+    try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, "var c=0; function f(){c=1;return 1;} var x=5; x ??= f(); c"));
+    // x falsy -> &&= does NOT evaluate f().
+    try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, "var c=0; function f(){c=1;return 1;} var x=0; x &&= f(); c"));
+}
+
+test "es2021: logical assignment on member targets" {
+    try std.testing.expectEqual(@as(f64, 7), try dualF64(std.testing.allocator, "var o={x:0}; o.x ||= 7; o.x"));
+    try std.testing.expectEqual(@as(f64, 3), try dualF64(std.testing.allocator, "var o={}; o.y ??= 3; o.y"));
+    try std.testing.expectEqual(@as(f64, 9), try dualF64(std.testing.allocator, "var o={}; var k='z'; o[k] ||= 9; o.z"));
+    // member ??= keeps existing non-nullish value.
+    try std.testing.expectEqual(@as(f64, 2), try dualF64(std.testing.allocator, "var o={x:2}; o.x ??= 9; o.x"));
+}
+
+// ---- Phase 8 catch-up: ES2017–2022 builtins (dual tree+bc) ----
+
+test "es2020: globalThis is self-referential and exposes Math" {
+    try std.testing.expect(try evalToBool(std.testing.allocator, "globalThis === globalThis"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "globalThis === global"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "globalThis.Math === Math"));
+}
+
+test "es2017: Object.getOwnPropertyDescriptors" {
+    const s = try evalToString(std.testing.allocator, "JSON.stringify(Object.getOwnPropertyDescriptors({a:1,b:2}).a)");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("{\"value\":1,\"writable\":true,\"enumerable\":true,\"configurable\":true}", s);
+}
+
+test "es2021: String.prototype.replaceAll string pattern" {
+    const s = try evalToString(std.testing.allocator, "'a-b-a'.replaceAll('a','x')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("x-b-x", s);
+}
+
+test "es2022: Array.prototype.at positive and negative" {
+    try std.testing.expectEqual(@as(f64, 2), try dualF64(std.testing.allocator, "[1,2,3].at(1)"));
+    try std.testing.expectEqual(@as(f64, 1), try dualF64(std.testing.allocator, "[1,2,3].at(-3)"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "[1,2,3].at(99) === undefined"));
+}
+
+test "es2022: Array.prototype.findLast and findLastIndex" {
+    try std.testing.expectEqual(@as(f64, 3), try dualF64(std.testing.allocator, "[1,2,3,4,3].findLast(function(x){ return x > 2; })"));
+    try std.testing.expectEqual(@as(f64, 4), try dualF64(std.testing.allocator, "[1,2,3,4,3].findLastIndex(function(x){ return x > 2; })"));
+}
+
+test "es2020: Promise.allSettled mixed outcomes" {
+    const v = try evalToF64(std.testing.allocator, "var a=0,b=0; Promise.allSettled([Promise.resolve(5), Promise.reject(7)]).then(function(rs){ a=rs[0].value; b=rs[1].reason; }); __runMicrotasks__(); a+b");
+    try std.testing.expectEqual(@as(f64, 12), v);
+}
+
+test "es2020: Promise.allSettled preserves order" {
+    const s = try evalToString(std.testing.allocator, "var s=''; Promise.allSettled([Promise.resolve(1), 2, Promise.reject(3)]).then(function(rs){ s=rs[0].status+rs[1].status+rs[2].status; }); __runMicrotasks__(); s");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("fulfilledfulfilledrejected", s);
+}

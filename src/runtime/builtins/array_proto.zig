@@ -486,6 +486,62 @@ pub fn nativeFindIndex(arena: std.mem.Allocator, this_val: Value, args: []const 
     return val_mod.makeNumber(arena, -1.0);
 }
 
+/// ES2022 Array.prototype.at — negative indices count from the end.
+pub fn nativeAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const arr = getArray(this_val) orelse return val_mod.makeUndefined(arena);
+    const len = arr.array_length;
+    if (len == 0) return val_mod.makeUndefined(arena);
+    const idx_raw: f64 = if (args.len > 0 and args[0].bits != 0)
+        switch (args[0].toPtr().*) {
+            .number => |n| n,
+            else => 0.0,
+        }
+    else
+        0.0;
+    const k = relativeIndex(idx_raw, len);
+    if (k >= len) return val_mod.makeUndefined(arena);
+    const key = try std.fmt.allocPrint(arena, "{d}", .{k});
+    return arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+}
+
+/// ES2022 Array.prototype.findLast — like find, scans from the end.
+pub fn nativeFindLast(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const arr = getArray(this_val) orelse return val_mod.makeUndefined(arena);
+    if (args.len == 0) return val_mod.makeUndefined(arena);
+    const cb = args[0];
+    const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const len = arr.array_length;
+    if (len == 0) return val_mod.makeUndefined(arena);
+    var i: usize = len;
+    while (i > 0) {
+        i -= 1;
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        if (isTruthy(result)) return elem;
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+/// ES2022 Array.prototype.findLastIndex — like findIndex, scans from the end.
+pub fn nativeFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const arr = getArray(this_val) orelse return val_mod.makeNumber(arena, -1.0);
+    if (args.len == 0) return val_mod.makeNumber(arena, -1.0);
+    const cb = args[0];
+    const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const len = arr.array_length;
+    if (len == 0) return val_mod.makeNumber(arena, -1.0);
+    var i: usize = len;
+    while (i > 0) {
+        i -= 1;
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        if (isTruthy(result)) return val_mod.makeNumber(arena, @floatFromInt(i));
+    }
+    return val_mod.makeNumber(arena, -1.0);
+}
+
 pub fn nativeSort(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const arr = getArray(this_val) orelse return this_val;
     const len = arr.array_length;
@@ -557,6 +613,18 @@ fn normalizeIndex(idx: f64, len: usize) usize {
         return if (r < 0) 0 else @intCast(r);
     }
     if (i > @as(i64, @intCast(len))) return len;
+    return @intCast(i);
+}
+
+/// Relative index for `.at()` — out-of-range indices stay out of range (caller returns undefined).
+fn relativeIndex(idx: f64, len: usize) usize {
+    if (std.math.isNan(idx)) return std.math.maxInt(usize);
+    const i: i64 = @intFromFloat(@trunc(idx));
+    if (i < 0) {
+        const pos: i64 = @intCast(len);
+        const r = pos + i;
+        return if (r < 0) std.math.maxInt(usize) else @intCast(r);
+    }
     return @intCast(i);
 }
 

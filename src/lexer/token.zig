@@ -21,6 +21,8 @@ pub const TokenKind = enum {
     dot,
     ellipsis,
     question,
+    // ES2020 optional chaining `?.` (only when not immediately followed by a digit).
+    question_dot,
     // Operators
     plus,
     minus,
@@ -64,6 +66,11 @@ pub const TokenKind = enum {
     // Logical
     amp_amp,
     pipe_pipe,
+    // ES2020 nullish coalescing + ES2021 logical assignment
+    question_question,
+    amp_amp_eq,
+    pipe_pipe_eq,
+    question_question_eq,
     // Arrow (Phase 7, lex but reject)
     arrow,
     // Keywords

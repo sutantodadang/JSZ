@@ -68,6 +68,10 @@ pub const Vm = struct {
     /// Phase 7: derived constructor must call super before touching `this`.
     derived_super_pending: bool = false,
     derived_super_called: bool = false,
+    /// ES2020 optional chaining: set true when an optional link (`?.`) sees a
+    /// nullish base; propagated up the chain so the enclosing `optional_chain`
+    /// node yields `undefined` and skips remaining links.
+    optional_short_circuit: bool = false,
 
     fn checkThisBeforeSuper(self: *Vm) EvalError!void {
         if (self.derived_super_pending and !self.derived_super_called) {
@@ -1035,6 +1039,17 @@ pub const Vm = struct {
             .member_expr => {
                 return self.evalMemberExpr(node.data.member_expr, env);
             },
+            .optional_chain => {
+                // Short-circuit boundary: evaluate the wrapped chain with a fresh
+                // flag; if any optional link tripped it, the whole chain is undefined.
+                const saved = self.optional_short_circuit;
+                self.optional_short_circuit = false;
+                const result = try self.evalExpression(node.data.optional_chain, env);
+                const tripped = self.optional_short_circuit;
+                self.optional_short_circuit = saved;
+                if (tripped) return self.makeUndefined();
+                return result;
+            },
             .object_literal => {
                 return self.evalObjectLiteral(node.data.object_literal, env);
             },
@@ -1249,6 +1264,13 @@ pub const Vm = struct {
     fn evalMemberExpr(self: *Vm, me: ast.MemberExpr, env: *Environment) EvalError!Value {
         if (me.object.kind == .this_expr) try self.checkThisBeforeSuper();
         const obj_val = try self.evalExpression(me.object, env);
+        // Optional chaining: a prior link already short-circuited.
+        if (self.optional_short_circuit) return self.makeUndefined();
+        // `obj?.prop` / `obj?.[expr]` on a nullish base short-circuits the chain.
+        if (me.optional and obj_val.isNullish()) {
+            self.optional_short_circuit = true;
+            return self.makeUndefined();
+        }
         // Resolve property key.
         const key = if (me.computed) blk: {
             const key_val = try self.evalExpression(me.property, env);
@@ -1529,6 +1551,10 @@ pub const Vm = struct {
                 if (isTruthy(left)) return left;
                 return self.evalExpression(l.right, env);
             },
+            .nullish => {
+                if (!left.isNullish()) return left;
+                return self.evalExpression(l.right, env);
+            },
         }
     }
 
@@ -1537,6 +1563,24 @@ pub const Vm = struct {
             const v = try self.evalExpression(a.value, env);
             try self.assignLvalue(a.target, env, v);
             return v;
+        }
+        // ES2021 logical assignment: short-circuit — only evaluate RHS and assign
+        // when the LHS condition holds. Returns the current LHS otherwise.
+        switch (a.op) {
+            .logical_and, .logical_or, .logical_nullish => {
+                const cur = try self.evalExpression(a.target, env);
+                const do_assign = switch (a.op) {
+                    .logical_and => isTruthy(cur),
+                    .logical_or => !isTruthy(cur),
+                    .logical_nullish => cur.isNullish(),
+                    else => unreachable,
+                };
+                if (!do_assign) return cur;
+                const v = try self.evalExpression(a.value, env);
+                try self.assignLvalue(a.target, env, v);
+                return v;
+            },
+            else => {},
         }
         // Compound assignment: read, apply op, write back.
         const cur_val = try self.evalExpression(a.target, env);
@@ -1558,7 +1602,7 @@ pub const Vm = struct {
                 const shift: u5 = @intCast(toUint32(rhs) & 0x1F);
                 break :blk try self.makeNumber(@floatFromInt(u >> shift));
             },
-            .assign => unreachable,
+            .assign, .logical_and, .logical_or, .logical_nullish => unreachable,
         };
         try self.assignLvalue(a.target, env, result);
         return result;
@@ -1643,6 +1687,11 @@ pub const Vm = struct {
         if (is_method) {
             const me = c.callee.data.member_expr;
             const obj_val = try self.evalExpression(me.object, env);
+            if (self.optional_short_circuit) return self.makeUndefined();
+            if (me.optional and obj_val.isNullish()) {
+                self.optional_short_circuit = true;
+                return self.makeUndefined();
+            }
             this_val = obj_val;
             const key = if (me.computed) blk: {
                 const key_val = try self.evalExpression(me.property, env);
@@ -1653,6 +1702,14 @@ pub const Vm = struct {
             callee_val = try self.getProperty(obj_val, key);
         } else {
             callee_val = try self.evalExpression(c.callee, env);
+        }
+
+        // Optional chaining: callee evaluation short-circuited upstream.
+        if (self.optional_short_circuit) return self.makeUndefined();
+        // `f?.(args)` on a nullish callee short-circuits the chain (args not evaluated).
+        if (c.optional and callee_val.isNullish()) {
+            self.optional_short_circuit = true;
+            return self.makeUndefined();
         }
 
         if (isSuperCall(c)) self.derived_super_called = true;

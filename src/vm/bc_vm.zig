@@ -18,6 +18,7 @@ const Realm = @import("../runtime/realm.zig").Realm;
 const Heap = @import("../gc/heap.zig").Heap;
 const gc_mod = @import("../gc/gc.zig");
 const ic_mod = @import("./ic.zig");
+const jit_mod = @import("../jit/jit.zig");
 
 /// Phase 4a: a try entry pushed by PUSH_TRY.
 pub const TryEntry = struct {
@@ -61,6 +62,8 @@ pub const BcVm = struct {
     last_exception_value: Value = Value{},
     /// Phase 4d: context for re-entry from native callbacks.
     context: @import("../runtime/realm.zig").Context = undefined,
+    /// Phase 9: optional JIT profiler. Null = no profiling (zero hot-path cost).
+    jit: ?*jit_mod.JitCompiler = null,
 
     pub fn init(arena: std.mem.Allocator, realm: *Realm) BcVm {
         return BcVm{
@@ -187,6 +190,17 @@ pub const BcVm = struct {
 
     fn deactivateContext(_: *BcVm) void {
         @import("../runtime/realm.zig").active_context = null;
+    }
+
+    /// Phase 9: record a loop back-edge as a hot-site signal. No-op when JIT off.
+    inline fn noteBackedge(self: *BcVm, func: *const BcFunction, op_pc: usize) void {
+        if (self.jit) |jc| {
+            const ev = jc.notePcHit(@intFromPtr(func), @intCast(op_pc)) catch return;
+            if (ev == .became_hot and jc.mode == .experimental) {
+                // Native compile slot — returns NotImplemented today; swallow.
+                jc.compile(func.chunk.code) catch {};
+            }
+        }
     }
 
     pub fn run(
@@ -736,6 +750,7 @@ pub const BcVm = struct {
                     frame.registers[rdst] = try val_mod.makeString(self.arena, ts);
                 },
                 .JMP => {
+                    const op_site = frame.pc - 1;
                     const lo = code[frame.pc];
                     frame.pc += 1;
                     const hi = code[frame.pc];
@@ -743,8 +758,10 @@ pub const BcVm = struct {
                     const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
                     const new_pc: i64 = @intCast(frame.pc);
                     frame.pc = @intCast(new_pc + offset);
+                    if (offset < 0) self.noteBackedge(frame.func, op_site);
                 },
                 .JMP_IF_TRUE => {
+                    const op_site = frame.pc - 1;
                     const rcond = code[frame.pc];
                     frame.pc += 1;
                     const lo = code[frame.pc];
@@ -755,9 +772,11 @@ pub const BcVm = struct {
                     if (isTruthy(frame.registers[rcond])) {
                         const new_pc: i64 = @intCast(frame.pc);
                         frame.pc = @intCast(new_pc + offset);
+                        if (offset < 0) self.noteBackedge(frame.func, op_site);
                     }
                 },
                 .JMP_IF_FALSE => {
+                    const op_site = frame.pc - 1;
                     const rcond = code[frame.pc];
                     frame.pc += 1;
                     const lo = code[frame.pc];
@@ -768,9 +787,37 @@ pub const BcVm = struct {
                     if (!isTruthy(frame.registers[rcond])) {
                         const new_pc: i64 = @intCast(frame.pc);
                         frame.pc = @intCast(new_pc + offset);
+                        if (offset < 0) self.noteBackedge(frame.func, op_site);
+                    }
+                },
+                .JMP_IF_NULLISH => {
+                    const rcond = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
+                    const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
+                    if (frame.registers[rcond].isNullish()) {
+                        const new_pc: i64 = @intCast(frame.pc);
+                        frame.pc = @intCast(new_pc + offset);
+                    }
+                },
+                .JMP_IF_NOT_NULLISH => {
+                    const rcond = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
+                    const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
+                    if (!frame.registers[rcond].isNullish()) {
+                        const new_pc: i64 = @intCast(frame.pc);
+                        frame.pc = @intCast(new_pc + offset);
                     }
                 },
                 .JSEQ => {
+                    const op_site = frame.pc - 1;
                     const rlhs = code[frame.pc];
                     frame.pc += 1;
                     const rrhs = code[frame.pc];
@@ -783,9 +830,11 @@ pub const BcVm = struct {
                     if (jsStrictEqual(frame.registers[rlhs], frame.registers[rrhs])) {
                         const new_pc: i64 = @intCast(frame.pc);
                         frame.pc = @intCast(new_pc + offset);
+                        if (offset < 0) self.noteBackedge(frame.func, op_site);
                     }
                 },
                 .JGE => {
+                    const op_site = frame.pc - 1;
                     const rlhs = code[frame.pc];
                     frame.pc += 1;
                     const rrhs = code[frame.pc];
@@ -800,6 +849,7 @@ pub const BcVm = struct {
                     if (ge) {
                         const new_pc: i64 = @intCast(frame.pc);
                         frame.pc = @intCast(new_pc + offset);
+                        if (offset < 0) self.noteBackedge(frame.func, op_site);
                     }
                 },
                 .NEW_CLOSURE => {
@@ -2207,4 +2257,36 @@ test "BcVm: isTruthy" {
     try std.testing.expect(!isTruthy(f));
     const undef = try val_mod.makeUndefined(alloc);
     try std.testing.expect(!isTruthy(undef));
+}
+
+test "Phase 9: hot loop registers a hot back-edge" {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src = "var i = 0; while (i < 5000) { i = i + 1; } i;";
+    var p = parser_mod.Parser.init(src, arena);
+    const pr = p.parseScript();
+    const stmts = switch (pr) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast_mod.Program{ .body = stmts };
+    const main_func = try compiler_mod.compileProgram(arena, &prog, "<test>");
+
+    var realm = try Realm.init(arena);
+    defer realm.deinit();
+
+    var jc = jit_mod.JitCompiler.initMode(std.testing.allocator, .count);
+    defer jc.deinit();
+    jc.hot_threshold = 100;
+
+    var vm = BcVm.init(arena, &realm);
+    vm.jit = &jc;
+    _ = try vm.run(main_func, @ptrCast(realm.global_env));
+    try std.testing.expect(jc.hotCount() > 0);
 }

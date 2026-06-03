@@ -20,6 +20,7 @@ const Args = struct {
     run_bc_path: []const u8 = "",
     gc_stats: bool = false,
     gc_after_eval: bool = false,
+    jit_mode: jsz.JitMode = .off,
 };
 
 fn parseArgs(argv: []const []const u8) Args {
@@ -89,6 +90,20 @@ fn parseArgs(argv: []const []const u8) Args {
             args.gc_after_eval = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--jit=off")) {
+            args.jit_mode = .off;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--jit=count")) {
+            args.jit_mode = .count;
+            args.interp = .bc; // profiler only runs in bc VM
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--jit=experimental")) {
+            args.jit_mode = .experimental;
+            args.interp = .bc; // profiler only runs in bc VM
+            continue;
+        }
         // Positional: treat as script path.
         if (!std.mem.startsWith(u8, arg, "-")) {
             args.mode = .script;
@@ -119,6 +134,7 @@ fn printHelp(writer: anytype) !void {
         \\  --run-bytecode <path>  Load and run a bytecode snapshot file (bytecode VM)
         \\  --gc-stats             Print GC stats after eval
         \\  --gc-after-eval        Trigger a GC cycle before printing stats
+        \\  --jit=off|count|experimental  Profile hot bytecode sites (count) or attempt native compile (experimental); implies --interp=bc
         \\
         \\Examples:
         \\  jsz --version
@@ -145,7 +161,7 @@ fn debugHook(_: ?*anyopaque, stop: jsz.debug.DebugStop) void {
     e.flush() catch {};
 }
 
-fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool) !void {
+fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode) !void {
     if (dump_bc or source_map) {
         // Compile-only modes: delegate to the jsz public API and exit.
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -190,6 +206,7 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
     var ctx = try iso.newContext();
     defer ctx.deinit();
     ctx.setInterpMode(interp);
+    ctx.setJitMode(jit_mode);
 
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
@@ -225,6 +242,15 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
         try out.print("bytes_allocated: {d}\n", .{stats.bytes_allocated});
         try out.print("bytes_freed: {d}\n", .{stats.bytes_freed});
         try out.print("objects_alive: {d}\n", .{stats.objects_alive});
+    }
+
+    if (jit_mode != .off) {
+        const prof = ctx.lastJitProfile();
+        try out.print("=== JIT profile ===\n", .{});
+        try out.print("mode: {s}\n", .{@tagName(jit_mode)});
+        try out.print("hot_sites: {d}\n", .{prof.hot_sites});
+        try out.print("compiled: {d}\n", .{prof.compiled});
+        try out.print("deopts: {d}\n", .{prof.deopts});
     }
 
     try out.flush();
@@ -347,7 +373,7 @@ pub fn main() !void {
             }
         },
         .eval => {
-            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval);
+            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode);
         },
         .interactive => {
             try runRepl(allocator, args.interp);
@@ -368,7 +394,7 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer allocator.free(cjs_wrapped);
-            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval);
+            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode);
         },
     }
 }
@@ -534,4 +560,11 @@ test "parseArgs --run-bytecode" {
     const a = parseArgs(&argv);
     try std.testing.expectEqual(Mode.run_bytecode, a.mode);
     try std.testing.expectEqualStrings("out.jbc", a.run_bc_path);
+}
+
+test "parseArgs --jit=count implies bc" {
+    const argv = [_][]const u8{ "-e", "1+1", "--jit=count" };
+    const a = parseArgs(&argv);
+    try std.testing.expectEqual(jsz.JitMode.count, a.jit_mode);
+    try std.testing.expectEqual(jsz.InterpMode.bc, a.interp);
 }

@@ -397,6 +397,14 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
                 try writer.print(" K{d} R{d}", .{ kidx, rsrc });
             }
         },
+        .JMP_IF_NULLISH, .JMP_IF_NOT_NULLISH => {
+            const rcond = code[new_pc]; new_pc += 1;
+            const lo = code[new_pc]; new_pc += 1;
+            const hi = code[new_pc]; new_pc += 1;
+            const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
+            const target: i64 = @intCast(new_pc);
+            try writer.print(" R{d} -> {d}", .{ rcond, target + offset });
+        },
     }
     try writer.print("\n", .{});
     return new_pc;

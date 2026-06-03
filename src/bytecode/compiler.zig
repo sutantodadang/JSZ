@@ -51,6 +51,11 @@ const FnCompiler = struct {
     /// operand of `return` is only in tail position when try_depth == 0
     /// (a pending finally would run after the call returns, so it is not tail).
     try_depth: u32 = 0,
+    /// ES2020 optional chaining: while compiling an `optional_chain`, this points
+    /// to the list of JMP_IF_NULLISH patch offsets emitted by optional links.
+    /// They are all patched to the chain's short-circuit landing pad. null when
+    /// not inside an optional chain.
+    optional_jumps: ?*std.ArrayListUnmanaged(usize) = null,
 
     const Self = @This();
 
@@ -102,6 +107,18 @@ const FnCompiler = struct {
 
     fn patchJump(self: *Self, at: usize, target: usize) void {
         self.builder.patchJump(at, target);
+    }
+
+    /// ES2020 optional chaining: if inside an optional chain, emit a
+    /// `JMP_IF_NULLISH rtest` guard whose target is the chain's short-circuit
+    /// landing pad (patched later by compileOptionalChain).
+    fn emitOptionalGuard(self: *Self, rtest: u8, line: u32) error{OutOfMemory}!void {
+        const list = self.optional_jumps orelse return;
+        try self.emitOp(.JMP_IF_NULLISH, line);
+        try self.emitU8(rtest);
+        const patch = self.currentOffset();
+        try self.emitI16(0);
+        try list.append(self.arena, patch);
     }
 
     // --------------------------------------------------------- resolve name ---
@@ -227,6 +244,7 @@ const FnCompiler = struct {
             .member_expr => {
                 return self.compileMemberRead(node.data.member_expr, line);
             },
+            .optional_chain => return self.compileOptionalChain(node.data.optional_chain, line),
             .object_literal => {
                 return self.compileObjectLiteral(node.data.object_literal, line);
             },
@@ -461,7 +479,11 @@ const FnCompiler = struct {
         // The result register is rlhs.
 
         // JMP past rhs evaluation if short-circuit.
-        const jump_op: Op = if (l.op == .and_) .JMP_IF_FALSE else .JMP_IF_TRUE;
+        const jump_op: Op = switch (l.op) {
+            .and_ => .JMP_IF_FALSE,
+            .or_ => .JMP_IF_TRUE,
+            .nullish => .JMP_IF_NOT_NULLISH,
+        };
         try self.emitOp(jump_op, line);
         try self.emitU8(rlhs);
         const patch_offset = self.currentOffset();
@@ -554,6 +576,11 @@ const FnCompiler = struct {
             }
             return rhs;
         }
+        // ES2021 logical assignment: short-circuit RHS + store.
+        switch (a.op) {
+            .logical_and, .logical_or, .logical_nullish => return self.compileLogicalAssign(a, line),
+            else => {},
+        }
         // Compound assignment.
         const rcur = try self.compileExpr(a.target);
         const rrhs = try self.compileExpr(a.value);
@@ -574,7 +601,7 @@ const FnCompiler = struct {
             .lshift => .SHL,
             .rshift => .SHR,
             .urshift => .USHR,
-            .assign => unreachable,
+            .assign, .logical_and, .logical_or, .logical_nullish => unreachable,
         };
         try self.emitOp(op, line);
         try self.emitU8(rdst);
@@ -589,8 +616,47 @@ const FnCompiler = struct {
         return rdst;
     }
 
+    /// ES2021 logical assignment (`&&=`, `||=`, `??=`). Short-circuits: reads the
+    /// target, and only evaluates+stores the RHS when the condition holds. The
+    /// result register always ends up holding either the original or new value.
+    fn compileLogicalAssign(self: *Self, a: ast.AssignExpr, line: u32) error{OutOfMemory}!u8 {
+        const rcur = try self.compileExpr(a.target);
+        // Skip RHS+store when the condition is NOT met (result stays = current value).
+        const skip_op: Op = switch (a.op) {
+            .logical_and => .JMP_IF_FALSE, // &&=: only assign if truthy
+            .logical_or => .JMP_IF_TRUE, // ||=: only assign if falsy
+            .logical_nullish => .JMP_IF_NOT_NULLISH, // ??=: only assign if nullish
+            else => unreachable,
+        };
+        try self.emitOp(skip_op, line);
+        try self.emitU8(rcur);
+        const patch_end = self.currentOffset();
+        try self.emitI16(0);
+
+        // Assign branch: evaluate RHS into rcur's slot, store, keep result in rcur.
+        self.freeReg(); // free rcur slot so RHS can reuse it
+        const rrhs = try self.compileExpr(a.value);
+        if (a.target.kind == .identifier) {
+            try self.emitStore(a.target.data.identifier, rrhs, line);
+        } else if (a.target.kind == .member_expr) {
+            try self.compileMemberWrite(a.target.data.member_expr, rrhs, line);
+        }
+        if (rrhs != rcur) {
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(rcur);
+            try self.emitU8(rrhs);
+            self.sp = rcur + 1;
+        }
+
+        const end = self.currentOffset();
+        self.patchJump(patch_end, end);
+        return rcur;
+    }
+
     fn compileMemberRead(self: *Self, me: ast.MemberExpr, line: u32) error{OutOfMemory}!u8 {
         const robj = try self.compileExpr(me.object);
+        // ES2020 `obj?.prop`: short-circuit the whole chain if obj is nullish.
+        if (me.optional) try self.emitOptionalGuard(robj, line);
         if (!me.computed) {
             // Static member access: GET_PROP Rdst Robj K"name"
             const prop_name = me.property.data.identifier;
@@ -645,6 +711,37 @@ const FnCompiler = struct {
             try self.emitU8(rkey);
             return rdst;
         }
+    }
+
+    /// Compile an ES2020 optional chain. Establishes the short-circuit boundary:
+    /// every optional link emits a JMP_IF_NULLISH guard (via emitOptionalGuard)
+    /// recorded in a fresh jump list; on short-circuit they all land on a pad that
+    /// loads `undefined` into the chain's result register. The chain result always
+    /// lives in the base register where the chain started, so a single
+    /// LOAD_UNDEF restores a consistent result.
+    fn compileOptionalChain(self: *Self, inner: *Node, line: u32) error{OutOfMemory}!u8 {
+        var jumps: std.ArrayListUnmanaged(usize) = .empty;
+        const saved = self.optional_jumps;
+        self.optional_jumps = &jumps;
+
+        const rres = try self.compileExpr(inner);
+
+        // Skip the short-circuit pad on the normal (non-nullish) path.
+        try self.emitOp(.JMP, line);
+        const patch_end = self.currentOffset();
+        try self.emitI16(0);
+
+        // Short-circuit landing pad: every optional guard jumps here.
+        const pad = self.currentOffset();
+        for (jumps.items) |patch| self.patchJump(patch, pad);
+        try self.emitOp(.LOAD_UNDEF, line);
+        try self.emitU8(rres);
+
+        const end = self.currentOffset();
+        self.patchJump(patch_end, end);
+
+        self.optional_jumps = saved;
+        return rres;
     }
 
     fn compileMemberWrite(self: *Self, me: ast.MemberExpr, rval: u8, line: u32) error{OutOfMemory}!void {
@@ -780,6 +877,9 @@ const FnCompiler = struct {
             _ = robj;
             self.sp = base + 1;
 
+            // ES2020 `a?.b()`: short-circuit if the object is nullish.
+            if (me.optional) try self.emitOptionalGuard(base, line);
+
             // Compile the property read into R[base+1].
             _ = self.allocReg(); // reserve base+1
             self.sp = base + 1;
@@ -801,6 +901,9 @@ const FnCompiler = struct {
                 self.freeReg(); // free rkey
                 self.sp = base + 2;
             }
+
+            // ES2020 `a.b?.()`: short-circuit if the resolved callee is nullish.
+            if (c.optional) try self.emitOptionalGuard(base + 1, line);
 
             // Compile args into R[base+2..].
             const nargs: u8 = @intCast(c.args.len);
@@ -828,6 +931,9 @@ const FnCompiler = struct {
         const rcallee = try self.compileExpr(c.callee);
         _ = rcallee;
         self.sp = saved_sp; // restore
+
+        // ES2020 `f?.(args)`: short-circuit if callee is nullish (args not evaluated).
+        if (c.optional) try self.emitOptionalGuard(base, line);
 
         // Compile each argument into consecutive registers.
         const nargs: u8 = @intCast(c.args.len);

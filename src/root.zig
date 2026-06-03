@@ -9,10 +9,16 @@ const isolate_mod = @import("./vm/isolate.zig");
 const IsolateImpl = isolate_mod.IsolateImpl;
 const val_mod = @import("./value/value.zig");
 
-pub const version = "0.0.0-phase4d";
+pub const version = "0.0.0-phase9-scaffold";
 
 /// Interpreter mode: tree-walker (default) or bytecode VM.
 pub const InterpMode = isolate_mod.InterpMode;
+
+/// Phase 9: JIT profiling mode.
+pub const JitMode = @import("./jit/jit.zig").JitMode;
+
+/// Phase 9: JIT profile snapshot (hot sites / compiled / deopts) from the most recent bc eval.
+pub const JitProfile = isolate_mod.JitProfile;
 
 /// Error set for all jsz operations.
 pub const JszError = error{ NotImplemented, OutOfMemory };
@@ -228,9 +234,15 @@ pub const Isolate = struct {
 pub const Context = struct {
     _isolate: *Isolate,
     interp_mode: InterpMode = .tree,
+    jit_mode: JitMode = .off,
 
     pub fn setInterpMode(self: *Context, m: InterpMode) void {
         self.interp_mode = m;
+    }
+
+    /// Phase 9: set the JIT profiling mode. .count and .experimental imply bc interp.
+    pub fn setJitMode(self: *Context, m: JitMode) void {
+        self.jit_mode = m;
     }
 
     pub fn deinit(self: *Context) void {
@@ -240,6 +252,7 @@ pub const Context = struct {
     pub fn eval(self: *Context, source: []const u8, source_name: []const u8) EvalResult {
         _ = source_name;
         const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        impl.setJitMode(self.jit_mode);
         const outcome = impl.evalWithMode(source, self.interp_mode, &[_]val_mod.NativeBinding{}) catch {
             return EvalResult{ .exception = Exception{
                 .value = Value{},
@@ -288,6 +301,13 @@ pub const Context = struct {
     pub fn lastFrameHighWater(self: *Context) usize {
         const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
         return impl.last_frame_high_water;
+    }
+
+    /// Phase 9: JIT profile (hot sites / compiled / deopts) from the most recent
+    /// bc-mode eval. All zero unless a JIT mode other than .off was set.
+    pub fn lastJitProfile(self: *Context) JitProfile {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        return impl.last_jit_profile;
     }
 
     /// Phase 8: compile `source` to a sourceless bytecode image (snapshot).

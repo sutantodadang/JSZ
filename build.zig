@@ -208,4 +208,42 @@ pub fn build(b: *std.Build) void {
     const run_gc_stress = b.addRunArtifact(gc_stress_exe);
     const gc_stress_step = b.step("gc-stress", "Run Phase 3b GC stress test");
     gc_stress_step.dependOn(&run_gc_stress.step);
+
+    // ---------------------------------------------------------------------------
+    // Phase 9 JIT scaffold: zig build jit  (not linked to main binary yet)
+    // ---------------------------------------------------------------------------
+    const jit_mod = b.createModule(.{
+        .root_source_file = b.path("src/jit/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const jit_tests = b.addTest(.{ .root_module = jit_mod });
+    const run_jit_tests = b.addRunArtifact(jit_tests);
+    const jit_step = b.step("jit", "Run Phase 9 JIT module tests (scaffold; not linked to jsz CLI)");
+    jit_step.dependOn(&run_jit_tests.step);
+
+    // ---------------------------------------------------------------------------
+    // Phase 9 native JIT backend (Cranelift via Rust cdylib): zig build jit-native
+    //   Builds jit-native/ (cargo), links its import lib, runs the FFI tests.
+    //   Not linked into the main jsz CLI yet.
+    // ---------------------------------------------------------------------------
+    const cargo_build = b.addSystemCommand(&.{
+        "cargo", "build", "--release", "--manifest-path", "jit-native/Cargo.toml",
+    });
+    const native_mod = b.createModule(.{
+        .root_source_file = b.path("src/jit/native.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const native_tests = b.addTest(.{ .root_module = native_mod });
+    native_tests.step.dependOn(&cargo_build.step);
+    native_tests.addLibraryPath(b.path("jit-native/target/release"));
+    // Import lib is `jit_native.dll.lib`; the MSVC linker appends `.lib` to the name.
+    native_tests.linkSystemLibrary("jit_native.dll");
+    native_tests.linkLibC();
+    const run_native_tests = b.addRunArtifact(native_tests);
+    // Make jit_native.dll resolvable at test runtime.
+    run_native_tests.addPathDir(b.pathFromRoot("jit-native/target/release"));
+    const jit_native_step = b.step("jit-native", "Build the Cranelift native backend (Rust cdylib) and run its FFI tests");
+    jit_native_step.dependOn(&run_native_tests.step);
 }

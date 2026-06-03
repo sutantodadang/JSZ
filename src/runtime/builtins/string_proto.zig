@@ -7,6 +7,7 @@ const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const regexp_mod = @import("./regexp.zig");
 const function_proto_mod = @import("./function_proto.zig");
+const realm_mod = @import("../realm.zig");
 
 /// Extract the string from a this_val. Returns "" on non-string.
 fn getThis(this_val: Value) []const u8 {
@@ -133,7 +134,6 @@ pub fn nativeToLowerCase(arena: std.mem.Allocator, this_val: Value, _: []const V
 pub fn nativeSplit(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = getThis(this_val);
     const JsObject = @import("../../object/object.zig").JsObject;
-    const realm_mod = @import("../realm.zig");
 
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
 
@@ -266,7 +266,6 @@ pub fn nativeMatch(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
     // Global: return array of all match strings
     const JsObject = @import("../../object/object.zig").JsObject;
-    const realm_mod = @import("../realm.zig");
     const arr_proto = realm_mod.active_array_proto;
     const arr = try JsObject.createArray(arena, arr_proto);
     var idx: u32 = 0;
@@ -292,7 +291,6 @@ pub fn nativeMatch(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 fn doExec(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mod.CompiledRegex) !Value {
     const result = regexp_mod.matchAnywhere(cr, s, 0) orelse return val_mod.makeNull(arena);
     const JsObject = @import("../../object/object.zig").JsObject;
-    const realm_mod = @import("../realm.zig");
     const arr_proto = realm_mod.active_array_proto;
     const arr = try JsObject.createArray(arena, arr_proto);
 
@@ -406,6 +404,116 @@ pub fn nativeReplace(arena: std.mem.Allocator, this_val: Value, args: []const Va
         return val_mod.makeString(arena, result);
     }
     return val_mod.makeString(arena, try arena.dupe(u8, s));
+}
+
+/// ES2021 String.prototype.replaceAll — all occurrences (string or global RegExp).
+pub fn nativeReplaceAll(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    if (args.len < 2) return val_mod.makeString(arena, s);
+
+    const repl_arg = args[1];
+    const arg = args[0];
+
+    if (isCallable(repl_arg)) {
+        if (regexp_mod.getCompiledRegex(arg)) |cr| {
+            if (!cr.flags.global) {
+                realm_mod.pending_exception = try val_mod.makeString(arena, "TypeError: replaceAll must be called with a global RegExp");
+                return error.JsException;
+            }
+            return doReplaceWithFn(arena, s, cr, repl_arg);
+        }
+        const pat: []const u8 = if (arg.bits != 0 and arg.toPtr().* == .string) arg.toPtr().string else "";
+        return replaceAllStringWithFn(arena, s, pat, repl_arg);
+    }
+
+    const repl_str: []const u8 = if (repl_arg.bits != 0 and repl_arg.toPtr().* == .string)
+        repl_arg.toPtr().string
+    else
+        "undefined";
+
+    if (regexp_mod.getCompiledRegex(arg)) |cr| {
+        if (!cr.flags.global) {
+            realm_mod.pending_exception = try val_mod.makeString(arena, "TypeError: replaceAll must be called with a global RegExp");
+            return error.JsException;
+        }
+        return doReplace(arena, s, cr, repl_str);
+    }
+
+    const pat: []const u8 = if (arg.bits != 0 and arg.toPtr().* == .string) arg.toPtr().string else "";
+    return replaceAllString(arena, s, pat, repl_str);
+}
+
+fn replaceAllString(arena: std.mem.Allocator, s: []const u8, pat: []const u8, repl: []const u8) !Value {
+    if (pat.len == 0) {
+        var result = std.ArrayList(u8){};
+        var i: usize = 0;
+        while (i <= s.len) : (i += 1) {
+            if (i > 0) try result.appendSlice(arena, s[i - 1 .. i]);
+            try result.appendSlice(arena, repl);
+        }
+        return val_mod.makeString(arena, try arena.dupe(u8, result.items));
+    }
+    var result = std.ArrayList(u8){};
+    var pos: usize = 0;
+    while (pos <= s.len) {
+        const idx = std.mem.indexOf(u8, s[pos..], pat) orelse break;
+        const abs = pos + idx;
+        try result.appendSlice(arena, s[pos..abs]);
+        try result.appendSlice(arena, repl);
+        pos = abs + pat.len;
+    }
+    try result.appendSlice(arena, s[pos..]);
+    return val_mod.makeString(arena, try arena.dupe(u8, result.items));
+}
+
+fn replaceAllStringWithFn(arena: std.mem.Allocator, s: []const u8, pat: []const u8, fn_val: Value) !Value {
+    const undefined_val = try val_mod.makeUndefined(arena);
+    if (pat.len == 0) {
+        var result = std.ArrayList(u8){};
+        var pos: usize = 0;
+        while (pos <= s.len) {
+            const match_str = if (pos < s.len) s[pos .. pos + 1] else "";
+            const match_val = try val_mod.makeString(arena, match_str);
+            const offset_val = try val_mod.makeNumber(arena, @floatFromInt(pos));
+            const source_val = try val_mod.makeString(arena, s);
+            const cb_args = [_]Value{ match_val, offset_val, source_val };
+            const repl_val = function_proto_mod.invokeCallback(arena, undefined_val, fn_val, &cb_args) catch |e| {
+                if (e == error.JsException) return error.JsException;
+                return error.OutOfMemory;
+            };
+            const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.toPtr().* == .string)
+                repl_val.toPtr().string
+            else
+                "undefined";
+            try result.appendSlice(arena, repl_s);
+            if (pos < s.len) pos += 1 else break;
+        }
+        return val_mod.makeString(arena, try arena.dupe(u8, result.items));
+    }
+    var result = std.ArrayList(u8){};
+    var pos: usize = 0;
+    while (pos <= s.len) {
+        const idx = std.mem.indexOf(u8, s[pos..], pat) orelse break;
+        const abs = pos + idx;
+        try result.appendSlice(arena, s[pos..abs]);
+        const match_str = s[abs .. abs + pat.len];
+        const match_val = try val_mod.makeString(arena, match_str);
+        const offset_val = try val_mod.makeNumber(arena, @floatFromInt(abs));
+        const source_val = try val_mod.makeString(arena, s);
+        const cb_args = [_]Value{ match_val, offset_val, source_val };
+        const repl_val = function_proto_mod.invokeCallback(arena, undefined_val, fn_val, &cb_args) catch |e| {
+            if (e == error.JsException) return error.JsException;
+            return error.OutOfMemory;
+        };
+        const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.toPtr().* == .string)
+            repl_val.toPtr().string
+        else
+            "undefined";
+        try result.appendSlice(arena, repl_s);
+        pos = abs + pat.len;
+    }
+    try result.appendSlice(arena, s[pos..]);
+    return val_mod.makeString(arena, try arena.dupe(u8, result.items));
 }
 
 /// Replace with function callback for regex pattern.
