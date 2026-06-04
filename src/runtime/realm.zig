@@ -1082,15 +1082,13 @@ pub const Realm = struct {
         // will be visited during mark. Register them as roots so they survive collect.
         const hp_proto = try heap.allocateObject(null);
         // Copy properties from arena object to heap object.
-        var it = self.object_prototype.props.iterator();
-        while (it.next()) |entry| {
-            try hp_proto.set(entry.key_ptr.*, entry.value_ptr.*);
+        for (self.object_prototype.ownKeys()) |k| {
+            try hp_proto.set(k, self.object_prototype.getOwn(k).?);
         }
 
         const hp_array_proto = try heap.allocateObject(hp_proto);
-        var it2 = self.array_prototype.props.iterator();
-        while (it2.next()) |entry| {
-            try hp_array_proto.set(entry.key_ptr.*, entry.value_ptr.*);
+        for (self.array_prototype.ownKeys()) |k| {
+            try hp_array_proto.set(k, self.array_prototype.getOwn(k).?);
         }
 
         self.object_prototype = hp_proto;

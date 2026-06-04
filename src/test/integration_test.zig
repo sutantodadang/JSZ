@@ -726,6 +726,11 @@ test "esm: export named list with rename" {
     try std.testing.expectEqual(@as(f64, 12), v);
 }
 
+test "esm: export {a} list is a live binding" {
+    const v = try evalToF64(std.testing.allocator, "var exports={}; var a=1; export {a}; a=7; exports.a");
+    try std.testing.expectEqual(@as(f64, 7), v);
+}
+
 test "esm: export default" {
     const v = try evalToF64(std.testing.allocator, "var exports={}; export default 42; exports['default']");
     try std.testing.expectEqual(@as(f64, 42), v);
@@ -873,6 +878,14 @@ test "tco: mutual tail recursion (strict) terminates" {
         "isEven(50000) ? 1 : 0";
     const r = try evalBcWithFrames(std.testing.allocator, src);
     try std.testing.expectEqual(@as(f64, 1), r.value);
+    try std.testing.expect(r.frames <= 4);
+}
+
+test "tco: member-position tail recursion keeps stack O(1) in bc mode" {
+    // `return o.sum(...)` is a member-position tail call (TAIL_METHOD_CALL).
+    const src = "var o = { sum: function(n, acc){ 'use strict'; if (n === 0) return acc; return o.sum(n - 1, acc + n); } }; o.sum(20000, 0)";
+    const r = try evalBcWithFrames(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(f64, 200010000), r.value);
     try std.testing.expect(r.frames <= 4);
 }
 

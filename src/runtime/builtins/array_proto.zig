@@ -32,8 +32,8 @@ pub fn nativePop(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     if (arr.array_length == 0) return val_mod.makeUndefined(arena);
     const idx = arr.array_length - 1;
     const key = try std.fmt.allocPrint(arena, "{d}", .{idx});
-    const val = arr.props.get(key) orelse return val_mod.makeUndefined(arena);
-    _ = arr.props.swapRemove(key);
+    const val = arr.getOwn(key) orelse return val_mod.makeUndefined(arena);
+    _ = try arr.deleteOwn(key);
     arr.array_length = idx;
     return val;
 }
@@ -72,7 +72,7 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
         while (i < end_) : (i += 1) {
             const src_key = try std.fmt.allocPrint(arena, "{d}", .{i});
             const dst_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
-            if (arr.props.get(src_key)) |elem| {
+            if (arr.getOwn(src_key)) |elem| {
                 try new_arr.set(dst_key, elem);
             } else {
                 const undef = try val_mod.makeUndefined(arena);
@@ -108,7 +108,7 @@ pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Va
     var i: usize = from;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        if (arr.props.get(key)) |elem| {
+        if (arr.getOwn(key)) |elem| {
             if (jsStrictEqual(elem, search)) {
                 return val_mod.makeNumber(arena, @floatFromInt(i));
             }
@@ -139,7 +139,7 @@ pub fn nativeIncludes(arena: std.mem.Allocator, this_val: Value, args: []const V
     var i: usize = from;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse undef;
+        const elem = arr.getOwn(key) orelse undef;
         if (sameValueZero(elem, search)) return val_mod.makeBool(arena, true);
     }
     return val_mod.makeBool(arena, false);
@@ -150,7 +150,7 @@ fn flattenInto(arena: std.mem.Allocator, dst: *JsObject, src: *JsObject, depth: 
     var i: usize = 0;
     while (i < src.array_length) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = src.props.get(key) orelse continue;
+        const elem = src.getOwn(key) orelse continue;
         if (depth > 0 and elem.bits != 0 and elem.unbox() == .object and elem.toPtr().object.is_array) {
             try flattenInto(arena, dst, elem.toPtr().object, depth - 1, ni);
         } else {
@@ -194,7 +194,7 @@ pub fn nativeFlatMap(arena: std.mem.Allocator, this_val: Value, args: []const Va
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         const mapped = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         if (mapped.bits != 0 and mapped.unbox() == .object and mapped.toPtr().object.is_array) {
             try flattenInto(arena, new_arr, mapped.toPtr().object, 1, &ni);
@@ -227,7 +227,7 @@ pub fn nativeJoin(arena: std.mem.Allocator, this_val: Value, args: []const Value
     while (i < len) : (i += 1) {
         if (i > 0) try buf.appendSlice(arena, sep);
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        if (arr.props.get(key)) |elem| {
+        if (arr.getOwn(key)) |elem| {
             const s = try elemToString(arena, elem);
             try buf.appendSlice(arena, s);
         }
@@ -247,7 +247,7 @@ pub fn nativeConcat(arena: std.mem.Allocator, this_val: Value, args: []const Val
         while (i < base.array_length) : (i += 1) {
             const src_key = try std.fmt.allocPrint(arena, "{d}", .{i});
             const dst_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
-            if (base.props.get(src_key)) |elem| {
+            if (base.getOwn(src_key)) |elem| {
                 try new_arr.set(dst_key, elem);
             }
             ni += 1;
@@ -268,7 +268,7 @@ pub fn nativeConcat(arena: std.mem.Allocator, this_val: Value, args: []const Val
             while (i < arg_arr.array_length) : (i += 1) {
                 const src_key = try std.fmt.allocPrint(arena, "{d}", .{i});
                 const dst_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
-                if (arg_arr.props.get(src_key)) |elem| {
+                if (arg_arr.getOwn(src_key)) |elem| {
                     try new_arr.set(dst_key, elem);
                 }
                 ni += 1;
@@ -315,7 +315,7 @@ pub fn nativeForEach(arena: std.mem.Allocator, this_val: Value, args: []const Va
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         _ = callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val) catch |e| {
             return e;
         };
@@ -335,7 +335,7 @@ pub fn nativeMap(arena: std.mem.Allocator, this_val: Value, args: []const Value)
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         try new_arr.set(key, result);
     }
@@ -355,7 +355,7 @@ pub fn nativeFilter(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         if (isTruthy(result)) {
             const dst_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
@@ -378,14 +378,14 @@ pub fn nativeReduce(arena: std.mem.Allocator, this_val: Value, args: []const Val
     } else {
         if (len == 0) return error.JsException; // TypeError
         const key0 = try std.fmt.allocPrint(arena, "0", .{});
-        acc = arr.props.get(key0) orelse try val_mod.makeUndefined(arena);
+        acc = arr.getOwn(key0) orelse try val_mod.makeUndefined(arena);
         start_i = 1;
     }
     var i: usize = start_i;
     const undef = try val_mod.makeUndefined(arena);
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse undef;
+        const elem = arr.getOwn(key) orelse undef;
         const fpm = @import("../builtins/function_proto.zig");
         const cb_args = [_]Value{ acc, elem, try val_mod.makeNumber(arena, @floatFromInt(i)), this_val };
         acc = try fpm.invokeCallback(arena, undef, cb, &cb_args);
@@ -407,7 +407,7 @@ pub fn nativeReduceRight(arena: std.mem.Allocator, this_val: Value, args: []cons
         if (len == 0) return error.JsException;
         start_i = @intCast(len - 1);
         const key_last = try std.fmt.allocPrint(arena, "{d}", .{len - 1});
-        acc = arr.props.get(key_last) orelse try val_mod.makeUndefined(arena);
+        acc = arr.getOwn(key_last) orelse try val_mod.makeUndefined(arena);
         start_i -= 1;
     }
     const undef = try val_mod.makeUndefined(arena);
@@ -415,7 +415,7 @@ pub fn nativeReduceRight(arena: std.mem.Allocator, this_val: Value, args: []cons
     var i: i64 = start_i - 1;
     while (i >= 0) : (i -= 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse undef;
+        const elem = arr.getOwn(key) orelse undef;
         const cb_args = [_]Value{ acc, elem, try val_mod.makeNumber(arena, @floatFromInt(i)), this_val };
         acc = try fpm.invokeCallback(arena, undef, cb, &cb_args);
     }
@@ -431,7 +431,7 @@ pub fn nativeSome(arena: std.mem.Allocator, this_val: Value, args: []const Value
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         if (isTruthy(result)) return val_mod.makeBool(arena, true);
     }
@@ -447,7 +447,7 @@ pub fn nativeEvery(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         if (!isTruthy(result)) return val_mod.makeBool(arena, false);
     }
@@ -463,7 +463,7 @@ pub fn nativeFind(arena: std.mem.Allocator, this_val: Value, args: []const Value
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         if (isTruthy(result)) return elem;
     }
@@ -479,7 +479,7 @@ pub fn nativeFindIndex(arena: std.mem.Allocator, this_val: Value, args: []const 
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         if (isTruthy(result)) return val_mod.makeNumber(arena, @floatFromInt(i));
     }
@@ -501,7 +501,7 @@ pub fn nativeAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) 
     const k = relativeIndex(idx_raw, len);
     if (k >= len) return val_mod.makeUndefined(arena);
     const key = try std.fmt.allocPrint(arena, "{d}", .{k});
-    return arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+    return arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
 }
 
 /// ES2022 Array.prototype.findLast — like find, scans from the end.
@@ -516,7 +516,7 @@ pub fn nativeFindLast(arena: std.mem.Allocator, this_val: Value, args: []const V
     while (i > 0) {
         i -= 1;
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         if (isTruthy(result)) return elem;
     }
@@ -535,7 +535,7 @@ pub fn nativeFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []co
     while (i > 0) {
         i -= 1;
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.props.get(key) orelse try val_mod.makeUndefined(arena);
+        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         if (isTruthy(result)) return val_mod.makeNumber(arena, @floatFromInt(i));
     }
@@ -552,7 +552,7 @@ pub fn nativeSort(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const undef = try val_mod.makeUndefined(arena);
     for (0..len) |i| {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        elems[i] = arr.props.get(key) orelse undef;
+        elems[i] = arr.getOwn(key) orelse undef;
     }
 
     // Comparator.

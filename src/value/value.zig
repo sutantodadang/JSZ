@@ -62,23 +62,11 @@ pub fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
     return std.fmt.allocPrint(arena, "{d}", .{n});
 }
 
-/// Phase 9 (staged): SMI inline-integer value representation, the foundation for
-/// a NaN-boxed `Value`. Built OFF — when false, `unbox()` is exactly `toPtr().*`,
-/// no SMI handle is ever produced, GC is untouched, and the engine is bit-for-bit
-/// the boxed-pointer model (green). The dedicated follow-up migrates the read
-/// dispatch sites to `unbox()`, then flips this to true. Pointers from the arena
-/// are ≥8-byte aligned, so low bit 0 ⇒ pointer/undefined, low bit 1 ⇒ SMI.
-pub const enable_smi = true;
-
-/// Phase 9 (staged): full WebKit-style inline-double NaN-boxing, layered on top
-/// of the SMI/immediate scheme. Built OFF — when false the engine uses the
-/// low-bit SMI + {2,4,6} immediate scheme (green). When ON, numbers are encoded
-/// inline as int32 (`NumberTag|u32`) or offset-doubles, and singletons use the
-/// WebKit immediate constants; `unbox()` decodes all of it. `bits==0` stays
-/// undefined (WebKit ValueEmpty), so existing `bits==0` guards are unchanged.
-pub const enable_nanbox = true;
-
-// WebKit JSVALUE64 constants (Source/JavaScriptCore/runtime/JSCJSValue.h).
+// WebKit-style JSVALUE64 NaN-boxed Value representation (committed). Numbers are
+// encoded inline as int32 (`NumberTag|u32`) or offset-doubles; null/true/false
+// use the WebKit immediate constants; `bits==0` is undefined (WebKit ValueEmpty),
+// so all `bits==0` guards remain valid. Constants from
+// Source/JavaScriptCore/runtime/JSCJSValue.h.
 const NumberTag: u64 = 0xfffe000000000000;
 const DoubleEncodeOffset: u64 = 1 << 49; // 0x0002000000000000
 const NotCellMask: u64 = NumberTag | 0x2; // 0xfffe000000000002
@@ -86,25 +74,16 @@ const nb_null: u64 = 0x2; //  OtherTag
 const nb_false: u64 = 0x6; // OtherTag|BoolTag
 const nb_true: u64 = 0x7; //  OtherTag|BoolTag|1
 
-/// Inclusive SMI integer bounds: i32 under NaN-boxing (WebKit int32 tag), else
-/// the i53 exactly-representable band for the low-bit SMI scheme.
-const smi_min: i64 = if (enable_nanbox) -2147483648 else -9007199254740992;
-const smi_max: i64 = if (enable_nanbox) 2147483647 else 9007199254740992;
+/// Inclusive SMI integer bounds: i32 (WebKit int32 tag).
+const smi_min: i64 = -2147483648;
+const smi_max: i64 = 2147483647;
 
-/// SMI range guard: integral, finite, within the i53 exactly-representable band.
+/// SMI range guard: integral, finite, within i32 range.
 inline fn smiFits(n: f64) bool {
     if (!std.math.isFinite(n) or @floor(n) != n) return false;
     if (n == 0.0 and std.math.signbit(n)) return false; // preserve -0.0 distinctly
     return n >= @as(f64, @floatFromInt(smi_min)) and n <= @as(f64, @floatFromInt(smi_max));
 }
-
-/// Immediate singleton encodings (gated by `enable_smi`). Heap pointers are
-/// ≥8-byte aligned (low 3 bits 000, nonzero); SMI has bit0==1; undefined is
-/// bits==0. That leaves low-3-bit patterns {010,100,110} free for inline
-/// singletons, so null/true/false need no allocation and gain canonical bits.
-const imm_null: u64 = 0b010; // 2
-const imm_true: u64 = 0b100; // 4
-const imm_false: u64 = 0b110; // 6
 
 /// Integer arithmetic fast-path: when both operands are SMIs and the exact
 /// integer result stays in SMI range, return it as an SMI (no f64 round-trip,
@@ -169,59 +148,43 @@ pub const Value = extern struct {
         return @ptrFromInt(self.bits);
     }
 
-    /// True if this handle carries an inline small integer. Always false while
-    /// `enable_smi` is off, so the pointer model is unaffected.
+    /// True if this handle carries an inline small integer (WebKit int32 tag).
     pub inline fn isSmi(self: Value) bool {
-        if (enable_nanbox) return (self.bits & NumberTag) == NumberTag; // int32 tag
-        return enable_smi and (self.bits & 1) == 1;
+        return (self.bits & NumberTag) == NumberTag;
     }
 
     /// Decode an SMI payload. Caller must check `isSmi`.
     pub inline fn smiValue(self: Value) i64 {
-        if (enable_nanbox) return @as(i32, @bitCast(@as(u32, @truncate(self.bits)))); // i32 in low 32
-        return @as(i64, @bitCast(self.bits)) >> 1;
+        return @as(i32, @bitCast(@as(u32, @truncate(self.bits)))); // i32 in low 32
     }
 
-    /// Encode an integer as an inline SMI handle (no allocation). Under nanbox
-    /// the value must be in i32 range (callers guarantee via `smiFits`).
+    /// Encode an integer as an inline SMI handle (no allocation). The value must
+    /// be in i32 range (callers guarantee via `smiFits`).
     pub inline fn fromSmi(n: i64) Value {
-        if (enable_nanbox) return Value{ .bits = NumberTag | @as(u64, @as(u32, @bitCast(@as(i32, @intCast(n))))) };
-        return Value{ .bits = @bitCast((n << 1) | 1) };
+        return Value{ .bits = NumberTag | @as(u64, @as(u32, @bitCast(@as(i32, @intCast(n))))) };
     }
 
-    /// True when these bits denote a real heap JsValue pointer (a "cell").
-    /// nanbox: `(bits & NotCellMask)==0 && bits!=0`. Low-bit scheme: 8-aligned,
-    /// nonzero. With all inline schemes off this is just `bits != 0`.
+    /// True when these bits denote a real heap JsValue pointer (a "cell"):
+    /// `(bits & NotCellMask)==0 && bits!=0`.
     pub inline fn isHeapPtr(self: Value) bool {
-        if (enable_nanbox) return self.bits != 0 and (self.bits & NotCellMask) == 0;
-        return self.bits != 0 and (self.bits & 0b111) == 0;
+        return self.bits != 0 and (self.bits & NotCellMask) == 0;
     }
 
     /// Read-dispatch superset accessor: the JsValue this handle denotes. Decodes
-    /// inline SMI/double/immediate forms; otherwise it is exactly `toPtr().*`.
+    /// inline int32/double/immediate forms; otherwise it is exactly `toPtr().*`.
     /// READ sites only — write sites (`toPtr().* = …`) must keep `toPtr()`.
     pub inline fn unbox(self: Value) JsValue {
-        if (enable_nanbox) {
-            if (self.bits == 0) return .undefined_;
-            if ((self.bits & NumberTag) != 0) { // number
-                if ((self.bits & NumberTag) == NumberTag) return .{ .number = @floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(self.bits))))) };
-                return .{ .number = @bitCast(self.bits -% DoubleEncodeOffset) };
-            }
-            switch (self.bits) {
-                nb_null => return .null_,
-                nb_true => return .{ .boolean = true },
-                nb_false => return .{ .boolean = false },
-                else => {},
-            }
-            return self.toPtr().*;
+        if (self.bits == 0) return .undefined_;
+        if ((self.bits & NumberTag) != 0) { // number
+            if ((self.bits & NumberTag) == NumberTag) return .{ .number = @floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(self.bits))))) };
+            return .{ .number = @bitCast(self.bits -% DoubleEncodeOffset) };
         }
-        if (self.isSmi()) return JsValue{ .number = @floatFromInt(self.smiValue()) };
-        if (enable_smi) switch (self.bits) {
-            imm_null => return .null_,
-            imm_true => return .{ .boolean = true },
-            imm_false => return .{ .boolean = false },
+        switch (self.bits) {
+            nb_null => return .null_,
+            nb_true => return .{ .boolean = true },
+            nb_false => return .{ .boolean = false },
             else => {},
-        };
+        }
         return self.toPtr().*;
     }
 
@@ -294,31 +257,20 @@ pub fn makeUndefined(arena: std.mem.Allocator) !Value {
 }
 
 pub fn makeNull(arena: std.mem.Allocator) !Value {
-    if (enable_nanbox) return Value{ .bits = nb_null };
-    if (enable_smi) return Value{ .bits = imm_null };
-    const v = try arena.create(JsValue);
-    v.* = .null_;
-    return Value.fromPtr(v);
+    _ = arena;
+    return Value{ .bits = nb_null };
 }
 
 pub fn makeBool(arena: std.mem.Allocator, b: bool) !Value {
-    if (enable_nanbox) return Value{ .bits = if (b) nb_true else nb_false };
-    if (enable_smi) return Value{ .bits = if (b) imm_true else imm_false };
-    const v = try arena.create(JsValue);
-    v.* = .{ .boolean = b };
-    return Value.fromPtr(v);
+    _ = arena;
+    return Value{ .bits = if (b) nb_true else nb_false };
 }
 
 pub fn makeNumber(arena: std.mem.Allocator, n: f64) !Value {
-    if (enable_nanbox) {
-        if (smiFits(n)) return Value.fromSmi(@intFromFloat(n));
-        const d = if (std.math.isNan(n)) std.math.nan(f64) else n; // purify NaN
-        return Value{ .bits = @as(u64, @bitCast(d)) +% DoubleEncodeOffset };
-    }
-    if (enable_smi and smiFits(n)) return Value.fromSmi(@intFromFloat(n));
-    const v = try arena.create(JsValue);
-    v.* = .{ .number = n };
-    return Value.fromPtr(v);
+    _ = arena;
+    if (smiFits(n)) return Value.fromSmi(@intFromFloat(n));
+    const d = if (std.math.isNan(n)) std.math.nan(f64) else n; // purify NaN
+    return Value{ .bits = @as(u64, @bitCast(d)) +% DoubleEncodeOffset };
 }
 
 pub fn makeString(arena: std.mem.Allocator, s: []const u8) !Value {
@@ -394,22 +346,7 @@ test "Value object arm" {
     try std.testing.expect(v.toPtr().* == .object);
 }
 
-test "SMI codec round-trips and is tagged distinctly from pointers" {
-    if (enable_nanbox) return; // low-bit SMI scheme only; nanbox int32 covered separately
-    // Independent of `enable_smi`: validate the encode/decode + range guard so
-    // the staged flip rests on a verified codec.
-    inline for (.{ @as(i64, 0), 1, -1, 42, -9007199254740992, 9007199254740992 }) |n| {
-        const v = Value.fromSmi(n);
-        try std.testing.expect((v.bits & 1) == 1); // low-bit tag set
-        try std.testing.expectEqual(n, v.smiValue());
-    }
-    try std.testing.expect(smiFits(42.0));
-    try std.testing.expect(!smiFits(1.5));
-    try std.testing.expect(!smiFits(std.math.inf(f64)));
-}
-
 test "immediate singletons decode and never look like heap pointers" {
-    if (!enable_smi) return;
     const a = std.testing.allocator;
     const nul = try makeNull(a);
     const t = try makeBool(a, true);

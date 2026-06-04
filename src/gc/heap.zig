@@ -87,7 +87,6 @@ pub const Heap = struct {
             const next = hdr.next;
             if (hdr.kind == .js_object) {
                 const slot: *GcJsObjectSlot = @fieldParentPtr("header", hdr);
-                slot.object.props.deinit(self.backing_allocator);
                 slot.object.slots.deinit(self.backing_allocator);
                 self.backing_allocator.destroy(slot);
             }
@@ -198,10 +197,7 @@ pub const Heap = struct {
         if (!obj.is_gc_managed) {
             // Still walk into their property values: those values may reference
             // heap-managed objects that need to be marked.
-            var it = obj.props.iterator();
-            while (it.next()) |entry| {
-                self.markValue(entry.value_ptr.*);
-            }
+            for (obj.slots.items) |v| self.markValue(v);
             // And the proto chain (may transition back into GC-managed objects).
             if (obj.proto) |proto| {
                 self.markObject(proto);
@@ -218,10 +214,7 @@ pub const Heap = struct {
         }
 
         // Mark all own property values.
-        var it = obj.props.iterator();
-        while (it.next()) |entry| {
-            self.markValue(entry.value_ptr.*);
-        }
+        for (obj.slots.items) |v| self.markValue(v);
     }
 
     fn markValue(self: *Heap, v: Value) void {
@@ -296,7 +289,6 @@ pub const Heap = struct {
                 const slot_size = hdr.size;
                 if (hdr.kind == .js_object) {
                     const slot: *GcJsObjectSlot = @fieldParentPtr("header", hdr);
-                    slot.object.props.deinit(self.backing_allocator);
                     slot.object.slots.deinit(self.backing_allocator);
                     self.backing_allocator.destroy(slot);
                 }

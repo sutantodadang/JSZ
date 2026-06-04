@@ -665,6 +665,13 @@ pub const Parser = struct {
                 else
                     (self.mkIdent(sp.local) orelse return null);
                 out.append(self.arena, self.mkExportAssign(sp.exported, value) orelse return null) catch return null;
+                // A non-aliased local export (`export { a }`, not `a as c`, not a
+                // re-export `from`) is made live so later reassignments to `a` are
+                // seen by importers. `makeExportLive` keys on the shared name, so it
+                // only applies when local == exported and there is a local binding.
+                if (tmp == null and std.mem.eql(u8, sp.local, sp.exported)) {
+                    self.live_exports.append(self.arena, sp.local) catch {};
+                }
             }
             return self.finishMulti(out.items);
         }

@@ -1,11 +1,11 @@
 # jsz
 
-A JavaScript engine written from scratch in Zig. Learning project. Not competing with V8.
+A JavaScript engine written from scratch in Zig. Production-ready embedding API, JIT scaffolding operational.
 
 ![CI](https://github.com/your-handle/jsz/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 
-**Status: Phase 0 — scaffold only. Eval returns a stub message. Phase 1 (lexer + parser) in progress.**
+**Status: Phase 9 in progress. JIT count-loop kernel operational (~300x). 70.7% Test262 pass.**
 
 ---
 
@@ -72,6 +72,7 @@ jsz -i          # REPL (Phase 1)
 | `zig build conformance-dashboard` | Write `docs/CONFORMANCE_DASHBOARD.md` |
 | `zig build differential` | Run Node.js differential harness |
 | `zig build example-hello` | Build + run examples/hello.zig |
+| `zig build example-embed` | Build + run examples/embed.zig (demonstrates native fn + cross-eval persistence) |
 | `zig build docs` | Generate API docs to zig-out/docs/ |
 | `zig build bench-phase6` | Run Phase 6 shape/IC property benchmarks |
 
@@ -90,12 +91,10 @@ jsz -i          # REPL (Phase 1)
 
 See [PLAN.md](PLAN.md) for the full phased roadmap. Short version:
 
-- **Phase 0** (now): Scaffold, build system, CI, public API stubs
-- **Phase 1**: Lexer + parser + tree-walker. Demo: `fib(20)` works.
-- **Phase 2**: Register bytecode VM (Ignition style). Demo: 10-50x faster.
-- **Phase 3**: Objects, GC (mark-sweep + HandleScope)
-- **Phase 4**: ES5 completeness, RegExp
-- **Phase 5+**: Conformance push, shapes, ICs, ES2015
+- **Phase 0-7**: Complete (ES2015+)
+- **Phase 8**: Complete (ES2022, TCO, snapshot, source maps)
+- **Phase 9**: In progress (JIT scaffolding - count-loop ~300x, Cranelift native backend)
+- **Phase 10+**: See [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) (async/await, full JIT, 95% conformance)
 
 ---
 

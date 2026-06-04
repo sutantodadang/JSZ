@@ -231,6 +231,23 @@ pub fn build(b: *std.Build) void {
     hello_step.dependOn(&run_hello.step);
 
     // ---------------------------------------------------------------------------
+    // Example: zig build example-embed  (W6 embedding API demo)
+    // ---------------------------------------------------------------------------
+    const embed_exe = b.addExecutable(.{
+        .name = "embed",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/embed.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "jsz", .module = mod }},
+        }),
+    });
+    b.installArtifact(embed_exe);
+    const run_embed = b.addRunArtifact(embed_exe);
+    const embed_step = b.step("example-embed", "Build and run examples/embed.zig (W6 embedding API demo)");
+    embed_step.dependOn(&run_embed.step);
+
+    // ---------------------------------------------------------------------------
     // Docs: zig build docs  (autodoc via -femit-docs on the module test artifact)
     // ---------------------------------------------------------------------------
     const docs_mod_test = b.addTest(.{ .root_module = mod });

@@ -3,25 +3,49 @@
 //! Memory model: Values are handles valid until the owning Context is destroyed.
 //! Strings passed into jsz are copied. Strings returned from jsz are borrowed
 //! (valid until the next eval call). Use toOwnedSlice() to detach.
+//!
+//! ## API stability (1.0 target)
+//! STABLE (frozen for 1.0 — semver-governed): `version`, `Isolate`
+//! (`init`/`deinit`/`newContext`), `Context` (`deinit`, `eval`, `registerNativeFn`,
+//! `globalObject`, `getProperty`, `makeNumber`/`makeString`/`makeBool`/`makeUndefined`/
+//! `makeNull`, `gc`, `gcStats`, `setLimits`), `Value` (`toI32`/`toF64`/`toString`),
+//! and the result/option types (`EvalResult`, `Exception`, `ParseError`, `StackFrame`,
+//! `GcStats`, `Limits`, `NativeFn`, `NativeResult`), plus `valueToDisplayString`.
+//! EXPERIMENTAL (may change before 1.0; not semver-governed): bytecode snapshot
+//! (`compileSnapshot`/`evalSnapshot`/`snapshot`), `dumpBytecode`, `sourceMap`,
+//! `debug`, the JIT surface (`JitMode`, `JitProfile`, `setJitMode`, `lastJitProfile`,
+//! `lastFrameHighWater`, `installNativeCountLoop`/`installNativeAccumulateLoop` and
+//! their fn types), and `_regex`.
+//!
+//! ## Memory ownership
+//! `Value` handles are valid until the owning `Context`/`Isolate` is destroyed.
+//! Strings passed in are copied; strings returned (e.g. `Value.toString`,
+//! `valueToDisplayString`) are borrowed and valid until the next `eval` on that
+//! Context — copy them (e.g. `allocator.dupe`) to retain. Host registrations
+//! (`registerNativeFn`) live for the Isolate's lifetime.
 
 const std = @import("std");
 const isolate_mod = @import("./vm/isolate.zig");
 const IsolateImpl = isolate_mod.IsolateImpl;
 const val_mod = @import("./value/value.zig");
+const realm_mod = @import("./runtime/realm.zig");
 
 pub const version = "0.0.0-phase9-scaffold";
 
 /// Interpreter mode: bytecode VM (only remaining engine).
 pub const InterpMode = isolate_mod.InterpMode;
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 9: JIT profiling mode.
 pub const JitMode = @import("./jit/jit.zig").JitMode;
 
 const loop_jit = @import("./jit/loop_jit.zig");
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 9: native count-loop kernel type (`fn(start,limit,step)->final`).
 pub const NativeCountLoopFn = loop_jit.CountLoopFn;
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 9: install a native (Cranelift-compiled) count-loop kernel for the
 /// experimental hot-loop JIT. Without it the pure-Zig fallback is used. The CLI
 /// calls this at startup when built with `-Djit=true`.
@@ -29,15 +53,18 @@ pub fn installNativeCountLoop(f: NativeCountLoopFn) void {
     loop_jit.native_count_loop = f;
 }
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 9: native summation accumulator-loop kernel type + installer.
 pub const NativeAccumulateLoopFn = loop_jit.AccumulateLoopFn;
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Install a native (Cranelift-compiled) accumulator-loop kernel for the
 /// experimental hot-loop JIT. Without it the pure-Zig fallback is used.
 pub fn installNativeAccumulateLoop(f: NativeAccumulateLoopFn) void {
     loop_jit.native_accumulate_loop = f;
 }
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 9: JIT profile snapshot (hot sites / compiled / deopts) from the most recent bc eval.
 pub const JitProfile = isolate_mod.JitProfile;
 
@@ -126,6 +153,26 @@ pub const NativeResult = union(enum) {
     throw: Value,
 };
 
+/// W6: binds a host `NativeFn` + its owning Context to the internal native ABI.
+const HostNativeReg = struct { func: NativeFn, ctx: *Context };
+
+/// Internal-ABI trampoline: recovers the HostNativeReg from the active-native
+/// side channel, calls the host fn, and maps NativeResult back (throw → JS exception).
+fn hostNativeTrampoline(arena: std.mem.Allocator, this_val: val_mod.Value, args: []const val_mod.Value) anyerror!val_mod.Value {
+    _ = this_val;
+    const data = val_mod.g_active_native_data orelse return error.JsException;
+    const reg: *HostNativeReg = @ptrCast(@alignCast(data));
+    const rargs = try arena.alloc(Value, args.len);
+    for (args, 0..) |a, i| rargs[i] = Value{ .bits = a.bits };
+    return switch (reg.func(reg.ctx, rargs)) {
+        .ok => |v| val_mod.Value{ .bits = v.bits },
+        .throw => |v| {
+            realm_mod.pending_exception = val_mod.Value{ .bits = v.bits };
+            return error.JsException;
+        },
+    };
+}
+
 /// Convert a Value to a display string (ECMAScript ToString for printing).
 /// The returned slice is allocated from `arena` and valid until arena is freed.
 pub fn valueToDisplayString(arena: std.mem.Allocator, v: Value) ![]const u8 {
@@ -174,6 +221,7 @@ pub fn valueToDisplayString(arena: std.mem.Allocator, v: Value) ![]const u8 {
     };
 }
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Compile source to bytecode and disassemble to writer.
 /// Used by --dump-bytecode CLI flag.
 pub fn dumpBytecode(arena: std.mem.Allocator, source: []const u8, source_name: []const u8, writer: anytype) !void {
@@ -198,16 +246,20 @@ pub fn dumpBytecode(arena: std.mem.Allocator, source: []const u8, source_name: [
     try chunk_mod.disassemble(&f.chunk, writer);
 }
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 8: debugger + source-map surface.
 pub const debug = @import("./runtime/debugger.zig");
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// W5: internal regex engine, exposed for the fuzz harness. Not a stable API.
 pub const _regex = @import("./runtime/builtins/regexp.zig");
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 8: bytecode snapshot (cache) serializer/deserializer. Advanced
 /// embedding surface; most users go through `Context.compileSnapshot`/`evalSnapshot`.
 pub const snapshot = @import("./bytecode/snapshot.zig");
 
+/// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 8: compile `source` and write a bytecode→source JSON source map to
 /// `writer`. Maps each opcode (and nested function literals) back to a
 /// line/column in the original source. See `runtime/debugger.zig`.
@@ -273,11 +325,13 @@ pub const Context = struct {
         self.interp_mode = m;
     }
 
+    /// STABLE (1.0).
     /// W3: set resource limits for subsequent evals (see `Limits`).
     pub fn setLimits(self: *Context, l: Limits) void {
         self.limits = l;
     }
 
+    /// EXPERIMENTAL (unstable, may change before 1.0).
     /// Phase 9: set the JIT profiling mode. .count and .experimental imply bc interp.
     pub fn setJitMode(self: *Context, m: JitMode) void {
         self.jit_mode = m;
@@ -287,6 +341,7 @@ pub const Context = struct {
         self._isolate.allocator.destroy(self);
     }
 
+    /// STABLE (1.0).
     pub fn eval(self: *Context, source: []const u8, source_name: []const u8) EvalResult {
         _ = source_name;
         const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
@@ -314,6 +369,7 @@ pub const Context = struct {
         };
     }
 
+    /// STABLE (1.0).
     /// Trigger a manual mark-sweep GC cycle.
     /// Returns cumulative heap stats after the cycle.
     pub fn gc(self: *Context) GcStats {
@@ -322,6 +378,7 @@ pub const Context = struct {
         return self.gcStats();
     }
 
+    /// STABLE (1.0).
     /// Return current GC stats without triggering a collection.
     pub fn gcStats(self: *Context) GcStats {
         const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
@@ -334,6 +391,7 @@ pub const Context = struct {
         };
     }
 
+    /// EXPERIMENTAL (unstable, may change before 1.0).
     /// Phase 8: call-frame depth high-water mark of the most recent bc-mode
     /// eval. Mainly a test/inspection hook for proper tail calls: a strict
     /// tail-recursive function keeps this O(1) regardless of recursion depth.
@@ -342,6 +400,7 @@ pub const Context = struct {
         return impl.last_frame_high_water;
     }
 
+    /// EXPERIMENTAL (unstable, may change before 1.0).
     /// Phase 9: JIT profile (hot sites / compiled / deopts) from the most recent
     /// bc-mode eval. All zero unless a JIT mode other than .off was set.
     pub fn lastJitProfile(self: *Context) JitProfile {
@@ -349,6 +408,7 @@ pub const Context = struct {
         return impl.last_jit_profile;
     }
 
+    /// EXPERIMENTAL (unstable, may change before 1.0).
     /// Phase 8: compile `source` to a sourceless bytecode image (snapshot).
     /// The returned bytes are allocated with `out_allocator` and owned by the
     /// caller — they outlive the Context and can be persisted to disk.
@@ -357,6 +417,7 @@ pub const Context = struct {
         return impl.compileSnapshot(out_allocator, source);
     }
 
+    /// EXPERIMENTAL (unstable, may change before 1.0).
     /// Phase 8: restore a bytecode image (from `compileSnapshot`) and run it in
     /// the bytecode VM against a fresh realm.
     pub fn evalSnapshot(self: *Context, image: []const u8) EvalResult {
@@ -383,16 +444,66 @@ pub const Context = struct {
         };
     }
 
+    /// STABLE (1.0).
     pub fn registerNativeFn(self: *Context, name: []const u8, func: NativeFn) JszError!void {
-        _ = self;
-        _ = name;
-        _ = func;
-        return JszError.NotImplemented;
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        const reg = impl.persistentAllocator().create(HostNativeReg) catch return JszError.OutOfMemory;
+        reg.* = .{ .func = func, .ctx = self };
+        impl.registerNative(name, hostNativeTrampoline, reg) catch return JszError.OutOfMemory;
     }
 
+    /// STABLE (1.0).
     pub fn globalObject(self: *Context) Value {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        const v = impl.globalSnapshot() catch return Value{};
+        return Value{ .bits = v.bits };
+    }
+
+    /// STABLE (1.0).
+    pub fn makeNumber(self: *Context, n: f64) Value {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        const v = val_mod.makeNumber(impl.persistentAllocator(), n) catch return Value{};
+        return Value{ .bits = v.bits };
+    }
+
+    /// STABLE (1.0).
+    pub fn makeString(self: *Context, s: []const u8) Value {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        const v = val_mod.makeString(impl.persistentAllocator(), s) catch return Value{};
+        return Value{ .bits = v.bits };
+    }
+
+    /// STABLE (1.0).
+    pub fn makeBool(self: *Context, b: bool) Value {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        const v = val_mod.makeBool(impl.persistentAllocator(), b) catch return Value{};
+        return Value{ .bits = v.bits };
+    }
+
+    /// STABLE (1.0).
+    pub fn makeUndefined(self: *Context) Value {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        const v = val_mod.makeUndefined(impl.persistentAllocator()) catch return Value{};
+        return Value{ .bits = v.bits };
+    }
+
+    /// STABLE (1.0).
+    pub fn makeNull(self: *Context) Value {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        const v = val_mod.makeNull(impl.persistentAllocator()) catch return Value{};
+        return Value{ .bits = v.bits };
+    }
+
+    /// STABLE (1.0).
+    /// Read an own/inherited property from an object Value (undefined-Value if absent/non-object).
+    pub fn getProperty(self: *Context, obj: Value, name: []const u8) Value {
         _ = self;
-        return Value{};
+        const inner = val_mod.Value{ .bits = obj.bits };
+        if (inner.bits == 0) return Value{};
+        return switch (inner.unbox()) {
+            .object => |o| if (o.get(name)) |v| Value{ .bits = v.bits } else Value{},
+            else => Value{},
+        };
     }
 };
 
@@ -483,4 +594,35 @@ test "Context eval typeof null = object" {
         },
         else => return error.UnexpectedResult,
     }
+}
+
+test "W6: registerNativeFn callable from JS" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    const H = struct {
+        fn addOne(c: *Context, args: []const Value) NativeResult {
+            const n = if (args.len > 0) args[0].toF64() else 0;
+            return .{ .ok = c.makeNumber(n + 1) };
+        }
+    };
+    try ctx.registerNativeFn("addOne", H.addOne);
+    const r = ctx.eval("addOne(41)", "<test>");
+    switch (r) {
+        .ok => |v| try std.testing.expectEqual(@as(f64, 42), v.toF64()),
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "W6: globalObject reflects JS-defined globals" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    _ = ctx.eval("var answer = 42;", "<test>");
+    const g = ctx.globalObject();
+    try std.testing.expect(g.bits != 0);
+    const a = ctx.getProperty(g, "answer");
+    try std.testing.expectEqual(@as(f64, 42), a.toF64());
 }

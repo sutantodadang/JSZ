@@ -370,7 +370,7 @@ pub fn nativePromiseAllSettled(arena: std.mem.Allocator, _: Value, args: []const
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const item = list.props.get(ek) orelse try val_mod.makeUndefined(arena);
+        const item = list.getOwn(ek) orelse try val_mod.makeUndefined(arena);
         const wrapped = try nativePromiseResolve(arena, Value{}, &[_]Value{item});
         const wd = getData(wrapped) orelse continue;
         switch (wd.state) {

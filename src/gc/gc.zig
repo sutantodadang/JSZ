@@ -30,13 +30,8 @@ pub fn traceValue(v: Value, mark_fn: *const fn (*JsObject) void) void {
 
 /// Trace all values in a JsObject's own properties and proto chain.
 pub fn traceJsObject(obj: *JsObject, mark_fn: *const fn (*JsObject) void) void {
-    // proto
     if (obj.proto) |proto| mark_fn(proto);
-    // own props
-    var it = obj.props.iterator();
-    while (it.next()) |entry| {
-        traceValue(entry.value_ptr.*, mark_fn);
-    }
+    for (obj.slots.items) |v| traceValue(v, mark_fn);
 }
 
 /// Trace all values bound in an Environment frame chain.

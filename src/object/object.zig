@@ -19,8 +19,6 @@ const ShapeManager = shape_mod.ShapeManager;
 const MAX_PROTO_DEPTH: usize = 64;
 
 pub const JsObject = struct {
-    /// Insertion-ordered property map (ES5: own properties keep insertion order).
-    props: std.StringArrayHashMapUnmanaged(Value) = .empty,
     /// Prototype link (null = Object.prototype or bare object).
     proto: ?*JsObject = null,
     /// True if this object is the backing store for an array.
@@ -90,14 +88,11 @@ pub const JsObject = struct {
 
     /// Get own property (no proto walk).
     pub fn getOwn(self: *JsObject, key: []const u8) ?Value {
-        if (self.is_array and std.mem.eql(u8, key, "length")) {
-            // length is virtual for arrays.
-            return null; // will be handled by getLength
-        }
+        if (self.is_array and std.mem.eql(u8, key, "length")) return null;
         if (self.shape.key_to_slot.get(key)) |slot| {
             if (slot < self.slots.items.len) return self.slots.items[slot];
         }
-        return self.props.get(key);
+        return null;
     }
 
     /// Get property with prototype chain walk. Returns null if not found.
@@ -135,7 +130,6 @@ pub const JsObject = struct {
                 self.slots.items[new_slot] = value;
             }
         }
-        try self.props.put(self.arena, key, value);
         if (self.is_array) {
             // If key parses as a non-negative integer, bump array_length.
             const idx = std.fmt.parseUnsigned(u32, key, 10) catch return;
@@ -147,13 +141,13 @@ pub const JsObject = struct {
 
     /// Has own property check.
     pub fn hasOwn(self: *JsObject, key: []const u8) bool {
-        return self.shape.key_to_slot.contains(key) or self.props.contains(key);
+        return self.shape.key_to_slot.contains(key);
     }
 
     /// Get length: for arrays returns cached length as a Value.
     /// Returns null for non-arrays (caller may fall back to own prop "length").
     pub fn getLength(self: *JsObject) ?Value {
-        if (!self.is_array) return self.props.get("length");
+        if (!self.is_array) return self.getOwn("length");
         // Return a Value wrapping the length number.
         // We can't allocate here without error propagation, so we store a sentinel.
         // Caller uses getArrayLength() for the raw u32.
@@ -188,16 +182,21 @@ pub const JsObject = struct {
     /// Delete own property and transition shape if key exists.
     pub fn deleteOwn(self: *JsObject, key: []const u8) !bool {
         if (self.shape.key_to_slot.get(key) == null) return false;
-        _ = self.props.swapRemove(key);
-        self.shape = try self.shape_manager.transitionDelete(self.shape, key);
-
+        const old_shape = self.shape;
+        self.shape = try self.shape_manager.transitionDelete(old_shape, key);
         var new_slots: std.ArrayListUnmanaged(Value) = .empty;
         for (self.shape.key_order.items) |k| {
-            const v = self.props.get(k) orelse Value{};
+            const old_slot = old_shape.key_to_slot.get(k);
+            const v = if (old_slot) |s| (if (s < self.slots.items.len) self.slots.items[s] else Value{}) else Value{};
             try new_slots.append(self.arena, v);
         }
         self.slots = new_slots;
         return true;
+    }
+
+    /// Ordered own-property keys (insertion order). Backed by the shape.
+    pub fn ownKeys(self: *JsObject) []const []const u8 {
+        return self.shape.key_order.items;
     }
 };
 

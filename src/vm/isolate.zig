@@ -96,6 +96,9 @@ pub const IsolateImpl = struct {
     /// bc-mode eval. 0 = unlimited.
     gas_limit: u64 = 0,
     time_limit_ms: u64 = 0,
+    /// W6: the persistent Realm (global scope + intrinsics), built once on the
+    /// first eval and reused across evals so top-level declarations persist.
+    realm: ?*@import("../runtime/realm.zig").Realm = null,
 
     pub fn init(backing: std.mem.Allocator) !*IsolateImpl {
         const impl = try backing.create(IsolateImpl);
@@ -120,6 +123,7 @@ pub const IsolateImpl = struct {
     }
 
     pub fn deinit(self: *IsolateImpl) void {
+        if (self.realm) |r| r.deinit();
         self.heap.deinit();
         self.eval_arena.deinit();
         self.backing.destroy(self);
@@ -151,14 +155,13 @@ pub const IsolateImpl = struct {
     }
 
     /// Run one eval call in the bytecode VM (W2: bc is the default engine).
-    /// Resets the eval arena on entry.
+    /// Does NOT reset the eval arena so top-level declarations persist (W6).
     pub fn eval(self: *IsolateImpl, source: []const u8) !EvalOutcome {
         return self.evalWithMode(source, .bc, &[_]val_mod.NativeBinding{});
     }
 
     pub fn evalWithMode(self: *IsolateImpl, source: []const u8, mode: InterpMode, native_bindings: []const val_mod.NativeBinding) !EvalOutcome {
         _ = native_bindings;
-        _ = self.eval_arena.reset(.free_all);
         promise_mod.clearMicrotasks();
         const arena = self.eval_arena.allocator();
         const transformed_source = try rewriteTemplateLiterals(arena, source);
@@ -190,14 +193,15 @@ pub const IsolateImpl = struct {
         }
     }
 
-    /// Run a compiled `main_func` in the bytecode VM against a fresh realm.
-    /// Shared by `evalWithMode(.bc)` and snapshot restore.
-    fn runMainBc(self: *IsolateImpl, arena: std.mem.Allocator, main_func: *const @import("../bytecode/function.zig").BcFunction) !EvalOutcome {
-        // Set up realm with ES5 globals + Phase 3a/3b intrinsics.
+    /// W6: build the persistent Realm on first use; reuse it thereafter so
+    /// global declarations survive across eval calls. Realm + globals live in
+    /// the (now non-reset) eval arena.
+    fn ensureRealm(self: *IsolateImpl, arena: std.mem.Allocator) !*@import("../runtime/realm.zig").Realm {
+        if (self.realm) |r| return r;
         const Realm = @import("../runtime/realm.zig").Realm;
-        var realm = try Realm.init(arena);
+        const realm = try arena.create(Realm);
+        realm.* = try Realm.init(arena);
         try realm.activateHeap(&self.heap);
-        defer realm.deinit();
 
         const nan_val = try val_mod.makeNumber(arena, std.math.nan(f64));
         const inf_val = try val_mod.makeNumber(arena, std.math.inf(f64));
@@ -205,20 +209,24 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("NaN", nan_val);
         try realm.global_env.define("Infinity", inf_val);
         try realm.global_env.define("undefined", undef_val);
-
-        // Expose __gc__ native function for JS-side collection trigger.
-        const gc_fn = try val_mod.makeNativeFunction(arena, nativeGcCollect);
-        try realm.global_env.define("__gc__", gc_fn);
-        const microtask_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeRunMicrotasks);
-        try realm.global_env.define("__runMicrotasks__", microtask_fn);
-        const await_fn = try val_mod.makeNativeFunction(arena, promise_mod.nativeAwait);
-        try realm.global_env.define("__await__", await_fn);
-        // W2: generic iteration helpers used by the bc for-of loop.
+        try realm.global_env.define("__gc__", try val_mod.makeNativeFunction(arena, nativeGcCollect));
+        try realm.global_env.define("__runMicrotasks__", try val_mod.makeNativeFunction(arena, promise_mod.nativeRunMicrotasks));
+        try realm.global_env.define("__await__", try val_mod.makeNativeFunction(arena, promise_mod.nativeAwait));
         const es2015 = @import("../runtime/builtins/es2015_collections.zig");
         try realm.global_env.define("__getIterator__", try val_mod.makeNativeFunction(arena, es2015.nativeGetIterator));
         try realm.global_env.define("__iterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeIterStep));
 
-        var bc_vm = BcVm.initWithHeap(arena, &realm, &self.heap);
+        try realm.registerRoots();
+        self.realm = realm;
+        return realm;
+    }
+
+    /// Run a compiled `main_func` in the bytecode VM against the persistent realm.
+    /// Shared by `evalWithMode(.bc)` and snapshot restore.
+    fn runMainBc(self: *IsolateImpl, arena: std.mem.Allocator, main_func: *const @import("../bytecode/function.zig").BcFunction) !EvalOutcome {
+        const realm = try self.ensureRealm(arena);
+
+        var bc_vm = BcVm.initWithHeap(arena, realm, &self.heap);
         // W3: apply resource limits to this run.
         bc_vm.gas_limit = self.gas_limit;
         if (self.time_limit_ms != 0)
@@ -230,7 +238,6 @@ pub const IsolateImpl = struct {
             bc_vm.jit = &jc;
         }
         // Register roots AFTER bc_vm/realm are in final stack location.
-        try realm.registerRoots();
         try bc_vm.registerHeapCallback(&self.heap);
         defer bc_vm.unregisterHeapCallback(&self.heap);
         const outcome = try bc_vm.run(main_func, @ptrCast(realm.global_env));
@@ -256,8 +263,9 @@ pub const IsolateImpl = struct {
     /// Phase 8: compile `source` to a sourceless bytecode image (snapshot).
     /// Caller owns the returned bytes (allocated with `out_allocator`).
     pub fn compileSnapshot(self: *IsolateImpl, out_allocator: std.mem.Allocator, source: []const u8) ![]u8 {
-        _ = self.eval_arena.reset(.free_all);
-        const arena = self.eval_arena.allocator();
+        var tmp = std.heap.ArenaAllocator.init(self.backing);
+        defer tmp.deinit();
+        const arena = tmp.allocator();
         const transformed = try rewriteTemplateLiterals(arena, source);
         const parser_mod = @import("../parser/parser.zig");
         var p = parser_mod.Parser.init(transformed, arena);
@@ -272,9 +280,38 @@ pub const IsolateImpl = struct {
         return snapshot_mod.serialize(out_allocator, main_func);
     }
 
+    /// W6: persistent allocator for host-owned registrations (freed on deinit).
+    pub fn persistentAllocator(self: *IsolateImpl) std.mem.Allocator {
+        return self.eval_arena.allocator();
+    }
+
+    /// W6: define a native function in the persistent global scope.
+    pub fn registerNative(self: *IsolateImpl, name: []const u8, fn_ptr: val_mod.NativeFnPtr, data: ?*anyopaque) !void {
+        const arena = self.eval_arena.allocator();
+        const realm = try self.ensureRealm(arena);
+        const name_dup = try arena.dupe(u8, name);
+        const fnv = try val_mod.makeNativeFunctionData(arena, fn_ptr, data);
+        try realm.global_env.define(name_dup, fnv);
+    }
+
+    /// W6: snapshot the current global scope as a plain JS object (reflects
+    /// JS-defined globals at call time; `__`-prefixed internals are hidden).
+    pub fn globalSnapshot(self: *IsolateImpl) !val_mod.Value {
+        const arena = self.eval_arena.allocator();
+        const realm = try self.ensureRealm(arena);
+        const JsObject = @import("../object/object.zig").JsObject;
+        const obj = try JsObject.create(arena, realm.object_prototype);
+        var it = realm.global_env.bindings.iterator();
+        while (it.next()) |entry| {
+            const nm = entry.key_ptr.*;
+            if (nm.len >= 2 and nm[0] == '_' and nm[1] == '_') continue;
+            try obj.set(nm, entry.value_ptr.value);
+        }
+        return val_mod.makeObject(arena, obj);
+    }
+
     /// Phase 8: restore a bytecode image and run it (bytecode VM).
     pub fn evalSnapshot(self: *IsolateImpl, image: []const u8) !EvalOutcome {
-        _ = self.eval_arena.reset(.free_all);
         promise_mod.clearMicrotasks();
         const arena = self.eval_arena.allocator();
         const snapshot_mod = @import("../bytecode/snapshot.zig");
@@ -463,4 +500,15 @@ test "W3: LimitAllocator enforces a live-byte budget" {
     a.free(p);
     const q = try a.alloc(u8, 100); // budget freed up
     a.free(q);
+}
+
+test "W6: globals persist across evals on one isolate" {
+    const impl = try IsolateImpl.init(std.testing.allocator);
+    defer impl.deinit();
+    _ = try impl.eval("var x = 41;");
+    const r = try impl.eval("x + 1");
+    switch (r) {
+        .ok => |v| try std.testing.expectEqual(@as(f64, 42), v.toF64()),
+        else => return error.UnexpectedResult,
+    }
 }

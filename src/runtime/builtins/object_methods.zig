@@ -19,9 +19,8 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
     const obj = inner.object;
 
     var i: u32 = 0;
-    var it = obj.props.iterator();
-    while (it.next()) |entry| {
-        const key_val = try val_mod.makeString(arena, entry.key_ptr.*);
+    for (obj.ownKeys()) |k| {
+        const key_val = try val_mod.makeString(arena, k);
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
         try arr.set(idx_key, key_val);
         i += 1;
@@ -44,10 +43,10 @@ pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Valu
     const obj = inner.object;
 
     var i: u32 = 0;
-    var it = obj.props.iterator();
-    while (it.next()) |entry| {
+    for (obj.ownKeys()) |k| {
+        const v = obj.getOwn(k) orelse continue;
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        try arr.set(idx_key, entry.value_ptr.*);
+        try arr.set(idx_key, v);
         i += 1;
     }
     arr.array_length = i;
@@ -66,12 +65,12 @@ pub fn nativeObjectEntries(arena: std.mem.Allocator, _: Value, args: []const Val
     const obj = inner.object;
 
     var i: u32 = 0;
-    var it = obj.props.iterator();
-    while (it.next()) |entry| {
+    for (obj.ownKeys()) |k| {
+        const v = obj.getOwn(k) orelse continue;
         const pair = try JsObject.createArray(arena, arr_proto);
-        const key_val = try val_mod.makeString(arena, entry.key_ptr.*);
+        const key_val = try val_mod.makeString(arena, k);
         try pair.set("0", key_val);
-        try pair.set("1", entry.value_ptr.*);
+        try pair.set("1", v);
         pair.array_length = 2;
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
         try arr.set(idx_key, try val_mod.makeObject(arena, pair));
@@ -95,11 +94,11 @@ pub fn nativeObjectFromEntries(arena: std.mem.Allocator, _: Value, args: []const
     var i: usize = 0;
     while (i < list.array_length) : (i += 1) {
         const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const entry = list.props.get(ek) orelse continue;
+        const entry = list.getOwn(ek) orelse continue;
         if (entry.bits == 0 or entry.unbox() != .object) continue;
         const pair = entry.toPtr().object;
-        const kv = pair.props.get("0") orelse continue;
-        const vv = pair.props.get("1") orelse try val_mod.makeUndefined(arena);
+        const kv = pair.getOwn("0") orelse continue;
+        const vv = pair.getOwn("1") orelse try val_mod.makeUndefined(arena);
         const key: []const u8 = switch (kv.unbox()) {
             .string => |s| s,
             .number => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
@@ -132,10 +131,10 @@ pub fn nativeObjectGetOwnPropertyDescriptors(arena: std.mem.Allocator, _: Value,
     if (inner.* != .object) return val_mod.makeObject(arena, out);
     const obj = inner.object;
 
-    var it = obj.props.iterator();
-    while (it.next()) |entry| {
-        const desc_val = try makeDataDescriptor(arena, entry.value_ptr.*);
-        try out.set(entry.key_ptr.*, desc_val);
+    for (obj.ownKeys()) |k| {
+        const v = obj.getOwn(k) orelse continue;
+        const desc_val = try makeDataDescriptor(arena, v);
+        try out.set(k, desc_val);
     }
     return val_mod.makeObject(arena, out);
 }

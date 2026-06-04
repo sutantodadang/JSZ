@@ -1139,6 +1139,118 @@ pub const BcVm = struct {
                         }
                     }
                 },
+                .TAIL_METHOD_CALL => {
+                    const base = code[frame.pc];
+                    frame.pc += 1;
+                    const nargs = code[frame.pc];
+                    frame.pc += 1;
+                    const ret_dst = code[frame.pc];
+                    frame.pc += 1;
+
+                    // R[base] = this object, R[base+1] = callee, args at base+2..
+                    const this_val = frame.registers[base];
+                    const callee_val = frame.registers[base + 1];
+
+                    // Proper tail call in member position: when the callee is a
+                    // plain (non-generator, non-async) bytecode function, reuse the
+                    // current frame in place. Args are read BEFORE the frame is
+                    // overwritten. `this` is the receiver object (not undefined).
+                    if (callee_val.bits != 0 and callee_val.unbox() == .bc_function and
+                        !callee_val.toPtr().bc_function.func.is_generator and
+                        !callee_val.toPtr().bc_function.func.is_async)
+                    {
+                        const closure = callee_val.toPtr().bc_function;
+                        const fn_ptr = closure.func;
+                        const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                        const call_env = try Environment.init(self.arena, def_env);
+
+                        for (fn_ptr.param_names, 0..) |pname, i| {
+                            const av: Value = if (i < nargs)
+                                frame.registers[base + 2 + @as(u8, @intCast(i))]
+                            else
+                                try val_mod.makeUndefined(self.arena);
+                            try call_env.define(pname, av);
+                        }
+                        if (fn_ptr.name) |fname| {
+                            var is_param = false;
+                            for (fn_ptr.param_names) |p| {
+                                if (std.mem.eql(u8, p, fname)) {
+                                    is_param = true;
+                                    break;
+                                }
+                            }
+                            if (!is_param) call_env.define(fname, callee_val) catch {};
+                        }
+
+                        const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
+                        const new_regs = try self.arena.alloc(Value, num_regs);
+                        for (new_regs) |*r| r.* = Value{};
+                        for (fn_ptr.param_names, 0..) |_, i| {
+                            if (i < num_regs) {
+                                new_regs[i] = if (i < nargs)
+                                    frame.registers[base + 2 + @as(u8, @intCast(i))]
+                                else
+                                    try val_mod.makeUndefined(self.arena);
+                            }
+                        }
+                        if (fn_ptr.name) |fname| {
+                            var is_param = false;
+                            for (fn_ptr.param_names) |p| {
+                                if (std.mem.eql(u8, p, fname)) {
+                                    is_param = true;
+                                    break;
+                                }
+                            }
+                            if (!is_param) {
+                                const nfe_slot = fn_ptr.param_names.len;
+                                if (nfe_slot < num_regs) new_regs[nfe_slot] = callee_val;
+                            }
+                        }
+
+                        const inherited_caller = frame.caller_idx;
+                        const inherited_ret = frame.return_dst;
+                        frame.func = fn_ptr;
+                        frame.pc = 0;
+                        frame.registers = new_regs;
+                        frame.env = call_env;
+                        frame.return_dst = inherited_ret;
+                        frame.caller_idx = inherited_caller;
+                        frame.this_val = this_val;
+                        frame.try_stack = .empty;
+                    } else {
+                        // Fallback: native/bound/getter/generator/async callee. Do a
+                        // normal method call, then return its result to our caller.
+                        const outcome = try self.doMethodCall(callee_val, this_val, base, nargs, ret_dst);
+                        if (outcome) |msg| {
+                            if (std.mem.eql(u8, msg, "__js_exception__")) {
+                                const exc_val = self.last_exception_value;
+                                const found = try self.throwException(exc_val);
+                                const exc_msg = try formatExceptionMessage(self.arena, exc_val);
+                                if (!found) return RunOutcome{ .exception_value = .{ .msg = exc_msg, .value = exc_val } };
+                            } else {
+                                const exc_val = try self.makeErrorObjectBc("TypeError", msg);
+                                self.last_exception_value = exc_val;
+                                const found = try self.throwException(exc_val);
+                                if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+                            }
+                        } else {
+                            const cur = &self.frames.items[self.frames.items.len - 1];
+                            const result = cur.registers[ret_dst];
+                            const caller_idx = cur.caller_idx;
+                            const rd = cur.return_dst;
+                            _ = self.frames.pop();
+                            if (caller_idx == null or self.frames.items.len == 0) {
+                                self.result = result;
+                                return RunOutcome{ .ok = result };
+                            }
+                            if (rd == 0xFF) {
+                                self.result = result;
+                                return RunOutcome{ .ok = result };
+                            }
+                            self.frames.items[self.frames.items.len - 1].registers[rd] = result;
+                        }
+                    }
+                },
                 .RETURN => {
                     const rsrc = code[frame.pc];
                     frame.pc += 1;
@@ -1503,11 +1615,9 @@ pub const BcVm = struct {
                     if (obj_val.bits != 0) {
                         const iv = obj_val.unbox();
                         if (iv == .object) {
-                            var it = iv.object.props.iterator();
-                            while (it.next()) |entry| {
-                                const key_str = entry.key_ptr.*;
+                            for (iv.object.ownKeys()) |k| {
                                 const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
-                                const key_val = try val_mod.makeString(self.arena, key_str);
+                                const key_val = try val_mod.makeString(self.arena, k);
                                 arr_obj.set(idx_str, key_val) catch {};
                                 count += 1;
                             }
@@ -1818,7 +1928,6 @@ pub const BcVm = struct {
             .object => |obj| {
                 if (obj.resolveOwnSlot(key)) |slot| {
                     if (obj.setOwnBySlot(obj.shapePtr(), slot, value)) {
-                        try obj.props.put(obj.arena, key, value);
                         return;
                     }
                 }

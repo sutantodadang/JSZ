@@ -79,9 +79,8 @@ fn stringifyObject(
 ) anyerror!void {
     try buf.append(arena, '{');
     var first = true;
-    var it = obj.props.iterator();
-    while (it.next()) |entry| {
-        const val = entry.value_ptr.*;
+    for (obj.ownKeys()) |k| {
+        const val = obj.getOwn(k) orelse continue;
         // Skip functions and undefined values (per JSON spec)
         if (val.bits != 0) {
             const tag = val.unbox();
@@ -98,7 +97,7 @@ fn stringifyObject(
             try appendIndent(arena, buf, indent, depth + 1);
         }
         try buf.append(arena, '"');
-        try appendJsonString(arena, buf, entry.key_ptr.*);
+        try appendJsonString(arena, buf, k);
         try buf.append(arena, '"');
         try buf.append(arena, ':');
         if (indent > 0) try buf.append(arena, ' ');
@@ -129,7 +128,7 @@ fn stringifyArray(
             try appendIndent(arena, buf, indent, depth + 1);
         }
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        if (arr.props.get(key)) |elem| {
+        if (arr.getOwn(key)) |elem| {
             // Functions/undefined in arrays become "null"
             if (elem.bits != 0) {
                 const tag = elem.unbox();

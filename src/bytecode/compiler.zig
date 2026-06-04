@@ -1013,7 +1013,7 @@ const FnCompiler = struct {
             }
 
             const ret_dst = base;
-            try self.emitOp(.METHOD_CALL, line);
+            try self.emitOp(if (tail) .TAIL_METHOD_CALL else .METHOD_CALL, line);
             try self.emitU8(base);
             try self.emitU8(nargs);
             try self.emitU8(ret_dst);
@@ -1264,14 +1264,13 @@ const FnCompiler = struct {
             },
             .return_stmt => {
                 if (node.data.return_stmt) |rv_node| {
-                    // Phase 8: proper tail call. `return f(args);` is a tail call
-                    // when in strict mode and not inside a try/finally region.
-                    // Direct (non-member) callees only — `return obj.m()` falls
-                    // back to a normal METHOD_CALL + RETURN. The TAIL_CALL opcode
-                    // performs the return itself, so no RETURN is emitted.
+                    // Phase 8 / W7: proper tail call. `return f(args);` and
+                    // `return obj.m(args);` are tail calls when in strict mode and
+                    // not inside a try/finally region. compileCall emits TAIL_CALL
+                    // (direct) or TAIL_METHOD_CALL (member); the opcode performs the
+                    // return itself, so no RETURN is emitted here.
                     if (self.is_strict and self.try_depth == 0 and
-                        rv_node.kind == .call_expr and
-                        rv_node.data.call_expr.callee.kind != .member_expr)
+                        rv_node.kind == .call_expr)
                     {
                         _ = try self.compileCall(rv_node.data.call_expr, rv_node.start, true);
                     } else {

@@ -380,7 +380,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d}", .{rdst});
         },
-        .METHOD_CALL => {
+        .METHOD_CALL, .TAIL_METHOD_CALL => {
             const base = code[new_pc];
             new_pc += 1;
             const nargs = code[new_pc];

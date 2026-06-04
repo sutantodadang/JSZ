@@ -32,6 +32,16 @@ jobs:
       - name: Test
         run: zig build test -Doptimize=${{ matrix.optimize }}
 
+      - name: GC stress (W4 hard gate — bounded heap under sustained allocation)
+        run: zig build gc-stress -Doptimize=${{ matrix.optimize }}
+
+      - name: Differential vs Node.js (bc engine of record)
+        if: matrix.os == 'ubuntu-latest'
+        run: zig build differential -Doptimize=${{ matrix.optimize }}
+
+      - name: Embedding example compiles + runs
+        run: zig build example-embed -Doptimize=${{ matrix.optimize }}
+
       - name: Conformance delta (known-failing flip gate)
         if: matrix.os == 'ubuntu-latest' && matrix.optimize == 'Debug'
         run: zig build conformance-delta -Doptimize=${{ matrix.optimize }}
