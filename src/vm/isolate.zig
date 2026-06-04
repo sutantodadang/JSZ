@@ -2,7 +2,6 @@
 //! IsolateImpl: holds arenas, realm, GC heap, and the parser for one Isolate.
 //! The public Isolate (root.zig) stores a *IsolateImpl via _impl: ?*anyopaque.
 const std = @import("std");
-const Vm = @import("./vm.zig").Vm;
 const compiler_mod = @import("../bytecode/compiler.zig");
 const BcVm = @import("./bc_vm.zig").BcVm;
 const val_mod = @import("../value/value.zig");
@@ -12,7 +11,7 @@ const CollectStats = @import("../gc/heap.zig").CollectStats;
 const promise_mod = @import("../runtime/builtins/promise.zig");
 const jit_mod = @import("../jit/jit.zig");
 
-pub const InterpMode = enum { tree, bc };
+pub const InterpMode = enum { bc };
 
 /// W3: an allocator wrapper enforcing a live-bytes budget. When `limit` is
 /// non-zero, allocations that would push live bytes past it fail with OOM,
@@ -177,23 +176,6 @@ pub const IsolateImpl = struct {
         };
 
         switch (mode) {
-            .tree => {
-                var vm = try Vm.initWithHeap(arena, &self.heap);
-                // Register roots AFTER vm is in final stack location.
-                try vm.realm.registerRoots();
-                try vm.registerHeapCallback(&self.heap);
-                defer vm.unregisterHeapCallback(&self.heap);
-                const r = try vm.runScript(stmts);
-                promise_mod.runMicrotasks(arena);
-                return switch (r) {
-                    .value => |v| EvalOutcome{ .ok = v },
-                    .exception => |ex| EvalOutcome{ .exception = ex.message },
-                    .return_ => |v| EvalOutcome{ .ok = v },
-                    .break_ => EvalOutcome{ .ok = try val_mod.makeUndefined(arena) },
-                    .continue_ => EvalOutcome{ .ok = try val_mod.makeUndefined(arena) },
-                    .yield_suspend => EvalOutcome{ .ok = try val_mod.makeUndefined(arena) },
-                };
-            },
             .bc => {
                 // Compile to bytecode.
                 const ast_mod = @import("../parser/ast.zig");

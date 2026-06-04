@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Phase 6 benchmark: object/shape heavy property access.
-//! Measures tree vs bytecode VM and prints speedup.
+//! Measures bytecode VM property-access throughput.
 const std = @import("std");
 const jsz = @import("jsz");
 
@@ -116,15 +116,8 @@ pub fn main() !void {
     const out = &w.interface;
 
     for (cases) |c| {
-        const tree_ms = try benchCase(allocator, .tree, c.source);
         const bc_ms = try benchCase(allocator, .bc, c.source);
-        const speedup = if (bc_ms > 0) tree_ms / bc_ms else 0;
-        try out.print("{s}: tree={d:.3}ms bc={d:.3}ms speedup={d:.2}x\n", .{
-            c.name,
-            tree_ms,
-            bc_ms,
-            speedup,
-        });
+        try out.print("{s}: bc={d:.3}ms\n", .{ c.name, bc_ms });
     }
     try out.flush();
 }

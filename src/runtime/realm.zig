@@ -350,8 +350,7 @@ fn nativeStringCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
     return switch (arg.unbox()) {
         .string => |s| val_mod.makeString(arena, s),
         .number => |n| blk: {
-            const vm_mod = @import("../vm/vm.zig");
-            break :blk val_mod.makeString(arena, try vm_mod.formatNumber(arena, n));
+            break :blk val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
         },
         .boolean => |b| val_mod.makeString(arena, if (b) "true" else "false"),
         .null_ => val_mod.makeString(arena, "null"),

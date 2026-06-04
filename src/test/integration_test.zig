@@ -1,10 +1,9 @@
-// SPDX-License-Identifier: MIT
+﻿// SPDX-License-Identifier: MIT
 //! Integration tests: lex -> parse -> eval end-to-end.
 //! Phase 2: each test runs under BOTH tree and bc modes and asserts identical results.
 const std = @import("std");
 const root = @import("../root.zig");
 const val_mod = @import("../value/value.zig");
-const vm_mod = @import("../vm/vm.zig");
 
 const Isolate = root.Isolate;
 const Value = root.Value;
@@ -79,13 +78,7 @@ fn evalToBoolMode(allocator: std.mem.Allocator, source: []const u8, mode: Interp
     };
 }
 
-// W2 engine unification: the bytecode VM is now the engine of record. These
-// helpers run bc only; correctness is validated against Node.js by the
-// differential harness (src/test/differential.zig). The historical tree-vs-bc
-// cross-check is retired — bc has surpassed the tree-walker (which carries
-// latent bugs, e.g. instanceof across `extends`). The tree-walker remains
-// reachable via `--interp=tree` / `evalToF64Mode(...,.tree)` and is exercised
-// by the explicit `.tree` tests below until it is removed.
+// The bytecode VM is the only engine; correctness is validated against Node.js by src/test/differential.zig.
 fn dualF64(allocator: std.mem.Allocator, source: []const u8) !f64 {
     return evalToF64Mode(allocator, source, .bc);
 }
@@ -98,7 +91,7 @@ fn dualBool(allocator: std.mem.Allocator, source: []const u8) !bool {
     return evalToBoolMode(allocator, source, .bc);
 }
 
-// Legacy single-mode helper names (used by many tests) — now bc-only.
+// Legacy single-mode helper names (used by many tests) â€” now bc-only.
 fn evalToF64(allocator: std.mem.Allocator, source: []const u8) !f64 {
     return evalToF64Mode(allocator, source, .bc);
 }
@@ -228,712 +221,6 @@ test "integration: NaN !== NaN" {
     try std.testing.expect(!v);
 }
 
-test "phase7: let block scoping in tree mode" {
-    const v = try evalToF64Mode(std.testing.allocator, "var x = 1; { let x = 2; } x", .tree);
-    try std.testing.expectEqual(@as(f64, 1), v);
-}
-
-test "phase7: TDZ throws in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("{ x; let x = 1; }", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "ReferenceError") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: const assignment throws in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("const x = 1; x = 2;", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "TypeError") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: arrow function basic in tree mode" {
-    const v = try evalToF64Mode(std.testing.allocator, "var f = (x) => x + 1; f(41)", .tree);
-    try std.testing.expectEqual(@as(f64, 42), v);
-}
-
-test "phase7: arrow captures lexical this in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var o = ({x: 7, m: function(){ var f = (q) => this.x; return f(0); }}); o.m()",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 7), v);
-}
-
-test "phase7: for-of array with let in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "let sum = 0; for (let x of [1,2,3]) { sum = sum + x; } sum",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 6), v);
-}
-
-test "phase7: for-of array with const in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var sum = 0; for (const x of [1,2,3]) { sum = sum + x; } sum",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 6), v);
-}
-
-test "phase7: simple class desugars and runs in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "class A { constructor(x){ this.x = x; } get(){ return this.x; } } var a = new A(9); a.get()",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 9), v);
-}
-
-test "phase7: class extends prototype chain in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "class A { get(){ return 5; } } class B extends A { more(){ return this.get() + 1; } } var b = new B(); b.more()",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 6), v);
-}
-
-test "phase7: template literal plain in tree mode" {
-    const s = try evalToStringMode(std.testing.allocator, "`hello template`", .tree);
-    defer std.testing.allocator.free(s);
-    try std.testing.expectEqualStrings("hello template", s);
-}
-
-test "phase7: template literal interpolation in tree mode" {
-    const s = try evalToStringMode(std.testing.allocator, "var x = 7; `v=${x + 1}`", .tree);
-    defer std.testing.allocator.free(s);
-    try std.testing.expectEqualStrings("v=8", s);
-}
-
-test "phase7: default parameter applies on undefined in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function f(a = 3){ return a; } f(undefined)",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 3), v);
-}
-
-test "phase7: rest parameter collects trailing args in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function f(a, ...rest){ return a + rest.length; } f(5, 10, 20)",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 7), v);
-}
-
-test "phase7: spread call expands array args in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function add(a,b,c){ return a+b+c; } var xs=[1,2,3]; add(...xs)",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 6), v);
-}
-
-test "phase7: spread array literal expands values in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var xs=[2,3]; var ys=[1,...xs,4]; ys.length + ys[1]",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 6), v);
-}
-
-test "phase7: map builtin in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var m = new Map(); m.set(\"k\", 42); m.get(\"k\")",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 42), v);
-}
-
-test "phase7: set builtin in tree mode" {
-    const v = try evalToBoolMode(
-        std.testing.allocator,
-        "var s = new Set(); s.add(7); s.has(7)",
-        .tree,
-    );
-    try std.testing.expect(v);
-}
-
-test "phase7: promise resolve then baseline in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r = 0; Promise.resolve(5).then(function(x){ r = x + 1; }); r",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 0), v);
-}
-
-test "phase7: super method call in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "class A { get(){ return 9; } } class B extends A { get(){ return super.get() + 1; } } (new B()).get()",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 10), v);
-}
-
-test "phase7: super constructor chaining via call in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "class A { constructor(x){ this.x = x; } } class B extends A { constructor(){ super.call(this, 4); } } (new B()).x",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 4), v);
-}
-
-test "phase7: direct super constructor call in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "class A { constructor(x){ this.x = x; } } class B extends A { constructor(){ super(6); } } (new B()).x",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 6), v);
-}
-
-test "phase7: super method dispatch uses derived this in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "class A { get(){ return this.x; } } class B extends A { constructor(){ super(); this.x = 9; } get(){ return super.get() + 1; } } (new B()).get()",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 10), v);
-}
-
-test "phase7: derived class default constructor chains super in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "class A { constructor(){ this.ok = 1; } } class B extends A {} (new B()).ok",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 1), v);
-}
-
-test "phase7: class prototype constructor points at class in tree mode" {
-    const v = try evalToBoolMode(
-        std.testing.allocator,
-        "class A {} class B extends A {} (new B()).constructor === B",
-        .tree,
-    );
-    try std.testing.expect(v);
-}
-
-test "phase7: super call without extends throws in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("class A { constructor(){ super(); } } new A()", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "ReferenceError") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: for-of over string in tree mode" {
-    const s = try evalToStringMode(
-        std.testing.allocator,
-        "var out = \"\"; for (let ch of \"ab\") { out = out + ch; } out",
-        .tree,
-    );
-    defer std.testing.allocator.free(s);
-    try std.testing.expectEqualStrings("ab", s);
-}
-
-test "phase7: for-of uses iterator protocol object in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var it={i:0,next:function(){ this.i=this.i+1; return ({value:this.i,done:this.i>3}); }}; var seq={next:it.next,i:it.i}; var sum=0; for (let x of seq) { sum = sum + x; } sum",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 6), v);
-}
-
-test "phase7: spread uses iterator protocol object in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var seq={ i:0, next:function(){ this.i=this.i+1; return ({value:this.i,done:this.i>2}); } }; var a=[0,...seq,9]; a[1]+a[2]",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 3), v);
-}
-
-test "phase7: spread non-iterable object throws in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("var a=[...({a:1})]; a.length", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "TypeError") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: generator next yields values and done in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* g(){ yield 1; yield 2; return 7; } var it = g(); var a = it.next(); var b = it.next(); var c = it.next(); a.value + b.value + c.value + (a.done?1000:0) + (b.done?100:0) + (c.done?10:0)",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 20), v);
-}
-
-test "phase7: for-of consumes generator in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* g(){ yield 4; yield 5; } var sum = 0; for (let x of g()) { sum = sum + x; } sum",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 9), v);
-}
-
-test "phase7: spread consumes generator in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* g(){ yield 2; yield 3; } var xs = [1, ...g(), 4]; xs[1] + xs[2]",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 5), v);
-}
-
-test "phase7: yield outside generator reports explicit parse error" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("yield 1", "<test>");
-    switch (result) {
-        .parse_error => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "yield is only valid inside generator functions") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: yield star delegates values in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* g(){ yield 1; yield* [2,3]; return 4; } var it=g(); it.next().value + it.next().value + it.next().value + it.next().value",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 10), v);
-}
-
-test "phase7: generator next resume value in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* g(){ var x = yield 1; yield x + 1; } var it = g(); it.next(); it.next(4).value",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 5), v);
-}
-
-test "phase7: first generator next argument ignored in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* g(){ var x = yield 1; return x === undefined ? 9 : 0; } var it = g(); it.next(77); it.next().value",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 9), v);
-}
-
-test "phase7: generator return closes iterator in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* g(){ yield 1; yield 2; } var it=g(); var a=it[\"return\"](9); var b=it.next(); a.value + (a.done?100:0) + (b.done?10:0)",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 119), v);
-}
-
-test "phase7: generator throw throws and closes in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* g(){ yield 1; } var it=g(); var c=0; try { it[\"throw\"](7); } catch(e) { c=e; } c + (it.next().done ? 10 : 0)",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 17), v);
-}
-
-test "phase7: for-of invalid iterator result throws in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("var seq={next:function(){ return 1; }}; for (let x of seq) {} 0", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "TypeError") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: for-of non-iterable object throws in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("for (let x of ({a:1})) {} 0", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "TypeError") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: for-of iterator method must return object in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("var seq={iterator:function(){ return 1; }}; for (let x of seq) {} 0", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "TypeError") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: for-of ignores value when done true in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var seq={i:0,next:function(){ this.i=this.i+1; return ({value:99,done:this.i>1}); }}; var sum=0; for (let x of seq){ sum=sum+x; } sum",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 99), v);
-}
-
-test "phase7: Promise.resolve returns same promise in tree mode" {
-    const v = try evalToBoolMode(
-        std.testing.allocator,
-        "var p = Promise.resolve(3); Promise.resolve(p) === p",
-        .tree,
-    );
-    try std.testing.expect(v);
-}
-
-test "phase7: Promise constructor executor and chain parse/run in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r=0; var p = new Promise(function(resolve){ resolve(5); }); p.then(function(x){ return x+2; }).then(function(y){ r=y; }); r",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 0), v);
-}
-
-test "phase7: Promise pending then queue registration in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r=0; var resolveRef; var p = new Promise(function(resolve){ resolveRef = resolve; }); p.then(function(x){ r = x + 1; }); resolveRef(9); r",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 0), v);
-}
-
-test "phase7: Promise catch converts rejection to fulfillment in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r=0; Promise.reject(2)[\"catch\"](function(x){ return x+5; }).then(function(v){ r=v; }); r",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 0), v);
-}
-
-test "phase7: Promise.then receiver must be Promise in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("Promise.prototype.then.call({}, function(x){ return x; })", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "TypeError") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: Promise microtasks flush side effects in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r=0; Promise.resolve(5).then(function(x){ r = x + 1; }); __runMicrotasks__(); r",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 6), v);
-}
-
-test "phase7: Promise chain propagates rejection in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r=0; Promise.resolve(1).then(function(){ throw 7; })[\"catch\"](function(e){ r = e + 1; }); __runMicrotasks__(); r",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 8), v);
-}
-
-test "phase7: Promise thenable assimilation in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r=0; Promise.resolve({ then: function(resolve){ resolve(9); } }).then(function(x){ r = x; }); __runMicrotasks__(); r",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 9), v);
-}
-
-test "phase7: Promise.resolve chains thenable return in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r=0; Promise.resolve(1).then(function(){ return { then: function(resolve){ resolve(4); } }; }).then(function(v){ r=v; }); __runMicrotasks__(); r",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 4), v);
-}
-
-test "phase7: Promise microtask queue runs all jobs in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r=0; Promise.resolve(1).then(function(){ r=r+1; }); Promise.resolve(1).then(function(){ r=r+2; }); __runMicrotasks__(); r===3 ? 1 : 0",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 1), v);
-}
-
-test "phase7: Promise thenable throw rejects chain in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var r=0; Promise.resolve({ then: function(){ throw 6; } })[\"catch\"](function(e){ r=e+1; }); __runMicrotasks__(); r",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 7), v);
-}
-
-test "phase7: require host shim reads __modules__ in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var __modules__ = ({math: ({answer: 41})}); require(\"math\").answer + 1",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 42), v);
-}
-
-test "phase7: require returns module.exports when present in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var __modules__ = ({m: ({exports: ({answer: 42})})}); require(\"m\").answer",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 42), v);
-}
-
-test "phase7: require executes factory and caches exports in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var __modules__ = ({m: function(require,module,exports){ exports.answer = 42; }}); require(\"m\").answer + require(\"m\").answer",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 84), v);
-}
-
-test "phase7: require resolves relative module ids in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var __module_id__ = \"pkg/main\"; var __modules__ = ({\"pkg/util\": ({answer: 41})}); require(\"./util\").answer + 1",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 42), v);
-}
-
-test "phase7: require module pseudo-id returns global module in tree mode" {
-    const v = try evalToBoolMode(
-        std.testing.allocator,
-        "require(\"module\").exports === module.exports",
-        .tree,
-    );
-    try std.testing.expect(v);
-}
-
-test "phase7: exports global aliases module.exports in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "exports.answer = 41; module.exports.answer + 1",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 42), v);
-}
-
-test "phase7: require factory this binds exports in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var __modules__ = ({m: function(require,module,exports){ this.answer = 41; }}); require(\"m\").answer + 1",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 42), v);
-}
-
-test "phase7: require caches relative and absolute module ids in tree mode" {
-    const v = try evalToBoolMode(
-        std.testing.allocator,
-        "var __module_id__ = \"pkg/main\"; var __modules__ = ({\"pkg/util\": function(require,module,exports){ exports.n = 1; }}); require(\"./util\") === require(\"pkg/util\")",
-        .tree,
-    );
-    try std.testing.expect(v);
-}
-
-test "phase7: iterator return called on abrupt spread completion in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var closed=0; var it={next:function(){return 1;}, \"return\":function(){closed=1; return ({done:true});}}; var seq={iterator:function(){return it;}}; try { var a=[...seq]; } catch(e) {} closed",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 1), v);
-}
-
-test "phase7: iterator return called when next throws in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var closed=0; var it={next:function(){throw 1;}, \"return\":function(){closed=1; return ({done:true});}}; var seq={iterator:function(){return it;}}; try { var a=[...seq]; } catch(e) {} closed",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 1), v);
-}
-
-test "phase7: map delete updates has in tree mode" {
-    const v = try evalToBoolMode(
-        std.testing.allocator,
-        "var m = new Map(); m.set(\"k\", 1); m[\"delete\"](\"k\"); m.has(\"k\")",
-        .tree,
-    );
-    try std.testing.expect(!v);
-}
-
-test "phase7: array destructuring declaration baseline in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var arr = [2, 5]; var [a, b] = arr; a + b",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 7), v);
-}
-
-test "phase7: object destructuring declaration baseline in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var obj = {x: 3, y: 4}; var {x, y} = obj; x * y",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 12), v);
-}
-
-test "phase7: generator side effects run once per step in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var c = 0; function side(){ c = c + 1; } function* g(){ side(); yield 1; side(); yield 2; } var it = g(); it.next(); it.next(); c",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 2), v);
-}
-
-test "phase7: yield star delegate return propagates in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* inner(){ yield 2; return 9; } function* outer(){ yield 1; yield* inner(); yield 3; } var it=outer(); it.next(); it.next(); var d=it.next(); d.value + (d.done?10:0)",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 19), v);
-}
-
-test "phase7: require resolve returns normalized id in tree mode" {
-    const s = try evalToStringMode(
-        std.testing.allocator,
-        "var __module_id__ = \"pkg/main\"; var __modules__ = ({\"pkg/util\": ({answer: 1})}); require.resolve(\"./util\")",
-        .tree,
-    );
-    defer std.testing.allocator.free(s);
-    try std.testing.expectEqualStrings("pkg/util", s);
-}
-
-test "phase7: require missing module throws in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("require(\"missing-module\")", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "Cannot find module") != null),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "phase7: require cache stores loaded module in tree mode" {
-    const v = try evalToBoolMode(
-        std.testing.allocator,
-        "var __modules__ = ({m: function(require,module,exports){ exports.n = 1; }}); require(\"m\"); require.cache[\"m\"].exports === require(\"m\")",
-        .tree,
-    );
-    try std.testing.expect(v);
-}
-
-test "phase7: generator yield in for loop resumes in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "function* g(){ for (var i = 0; i < 3; i++) { yield i; } } var it = g(); it.next().value + it.next().value + it.next().value",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 3), v);
-}
-
-test "phase7: map keys iterator and for-of in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); var s = 0; for (var x of m.keys()) { s = s + x.length; } s",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 2), v);
-}
-
-test "phase7: map entries for-of in tree mode" {
-    const v = try evalToF64Mode(
-        std.testing.allocator,
-        "var m = new Map(); m.set(1, 10); var t = 0; for (var p of m.entries()) { t = t + p[0] + p[1]; } t",
-        .tree,
-    );
-    try std.testing.expectEqual(@as(f64, 11), v);
-}
-
-test "phase7: derived constructor this before super throws in tree mode" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-    const result = ctx.eval("class A { constructor(x){ this.x = x; } } class B extends A { constructor(){ this.y = 1; super(2); } } new B()", "<test>");
-    switch (result) {
-        .exception => |e| try std.testing.expect(std.mem.indexOf(u8, e.message, "Must call super") != null),
-        else => return error.UnexpectedResult,
-    }
-}
 
 test "phase7: Map and Promise builtins present in bc mode" {
     const v = try evalToF64Mode(
@@ -980,7 +267,7 @@ test "W2 unification: class methods + extends + super (both modes)" {
 }
 
 test "W2 unification: instanceof across class hierarchy (bc; Node=11)" {
-    // bc only: the tree-walker has a latent bug here (returns 0 — instanceof
+    // bc only: the tree-walker has a latent bug here (returns 0 â€” instanceof
     // across a default-constructor `extends` chain), but bc matches Node (11).
     // The tree engine is being retired, so this is asserted against bc directly.
     const v = try evalToF64Mode(
@@ -1247,20 +534,6 @@ test "gc: object survives if referenced (bc)" {
     }
 }
 
-test "gc: object survives if referenced (tree)" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-
-    const result = ctx.eval("var o = {x: 42}; __gc__(); o.x", "<test>");
-    switch (result) {
-        .ok => |v| try std.testing.expectEqual(@as(f64, 42), v.toF64()),
-        else => return error.UnexpectedResult,
-    }
-}
-
 test "gc: object freed if unreferenced - stats show freed (bc)" {
     var iso = try Isolate.init(std.testing.allocator);
     defer iso.deinit();
@@ -1350,25 +623,6 @@ test "gc: 1000 iterations terminates with bounded heap (bc)" {
     try std.testing.expect(stats.objects_alive < 200);
 }
 
-test "gc: local var of in-progress call is rooted (tree)" {
-    // Regression: GC fired mid-call must root the call's local env,
-    // not just the global env. Previously segfaulted in tree mode.
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-
-    const result = ctx.eval(
-        "var c=null; (function(){var inner={secret:42}; __gc__(); c=inner;})(); c.secret",
-        "<test>",
-    );
-    switch (result) {
-        .ok => |v| try std.testing.expectEqual(@as(f64, 42), v.toF64()),
-        else => return error.UnexpectedResult,
-    }
-}
-
 test "gc: local var of in-progress call is rooted (bc)" {
     var iso = try Isolate.init(std.testing.allocator);
     defer iso.deinit();
@@ -1382,30 +636,6 @@ test "gc: local var of in-progress call is rooted (bc)" {
     );
     switch (result) {
         .ok => |v| try std.testing.expectEqual(@as(f64, 42), v.toF64()),
-        else => return error.UnexpectedResult,
-    }
-}
-
-test "gc: 1000 iterations terminates with bounded heap (tree)" {
-    var iso = try Isolate.init(std.testing.allocator);
-    defer iso.deinit();
-    var ctx = try iso.newContext();
-    defer ctx.deinit();
-    ctx.setInterpMode(.tree);
-
-    // In tree mode, __gc__ is a noop (no heap), but loop should still work correctly.
-    const result = ctx.eval(
-        \\var i = 0;
-        \\while (i < 1000) {
-        \\  var o = { x: i };
-        \\  i = i + 1;
-        \\}
-        \\i
-    ,
-        "<test>",
-    );
-    switch (result) {
-        .ok => |v| try std.testing.expectEqual(@as(f64, 1000), v.toF64()),
         else => return error.UnexpectedResult,
     }
 }
@@ -1609,12 +839,12 @@ fn evalBcWithFrames(allocator: std.mem.Allocator, source: []const u8) !struct { 
 }
 
 // NOTE: strictness is per-function (the directive must be in the function's own
-// body — this engine does not inherit strictness from the enclosing scope), so
+// body â€” this engine does not inherit strictness from the enclosing scope), so
 // the `'use strict'` prologue lives inside each tail-recursive function.
 
 test "tco: strict tail recursion returns correct result (tree+bc)" {
     // Accumulator-style tail recursion: sum(1..n). Small n so the tree-walker
-    // (no TCO, native recursion) does not overflow — correctness parity check.
+    // (no TCO, native recursion) does not overflow â€” correctness parity check.
     const src = "function sum(n, acc){ 'use strict'; if (n === 0) return acc; return sum(n - 1, acc + n); } sum(100, 0)";
     const v = try dualF64(std.testing.allocator, src);
     try std.testing.expectEqual(@as(f64, 5050), v);
@@ -1769,12 +999,12 @@ test "snapshot: corrupt image yields an exception, not a crash" {
 
 // --------------------------------------------------------------------------
 // ES2020/2021: nullish coalescing `??`, optional chaining `?.`,
-// logical assignment `&&=` / `||=` / `??=`. Run in BOTH tree and bc modes.
+// logical assignment `&&=` / `||=` / `??=`.
 // --------------------------------------------------------------------------
 
-/// Both modes must report a parse error (e.g. `??` mixed with `&&`/`||`).
+/// Must report a parse error (e.g. `??` mixed with `&&`/`||`).
 fn expectDualParseError(source: []const u8) !void {
-    inline for (.{ .tree, .bc }) |mode| {
+    inline for (.{.bc}) |mode| {
         var iso = try Isolate.init(std.testing.allocator);
         defer iso.deinit();
         var ctx = try iso.newContext();
@@ -1790,7 +1020,7 @@ fn expectDualParseError(source: []const u8) !void {
 test "es2020: nullish coalescing basic" {
     try std.testing.expectEqual(@as(f64, 5), try dualF64(std.testing.allocator, "null ?? 5"));
     try std.testing.expectEqual(@as(f64, 7), try dualF64(std.testing.allocator, "undefined ?? 7"));
-    // 0 and "" are NOT nullish — left operand is kept.
+    // 0 and "" are NOT nullish â€” left operand is kept.
     try std.testing.expectEqual(@as(f64, 0), try dualF64(std.testing.allocator, "0 ?? 5"));
     try std.testing.expectEqual(@as(f64, 1), try dualF64(std.testing.allocator, "(false ?? 9) ? 2 : 1"));
 }
@@ -1896,7 +1126,7 @@ test "es2021: logical assignment on member targets" {
     try std.testing.expectEqual(@as(f64, 2), try dualF64(std.testing.allocator, "var o={x:2}; o.x ??= 9; o.x"));
 }
 
-// ---- Phase 8 catch-up: ES2017–2022 builtins (dual tree+bc) ----
+// ---- Phase 8 catch-up: ES2017â€“2022 builtins (dual tree+bc) ----
 
 test "es2020: globalThis is self-referential and exposes Math" {
     try std.testing.expect(try evalToBool(std.testing.allocator, "globalThis === globalThis"));

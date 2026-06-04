@@ -61,10 +61,6 @@ fn parseArgs(argv: []const []const u8) Args {
             args.mode = .interactive;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--interp=tree")) {
-            args.interp = .tree;
-            continue;
-        }
         if (std.mem.eql(u8, arg, "--interp=bc")) {
             args.interp = .bc;
             continue;
@@ -153,7 +149,7 @@ fn printHelp(writer: anytype) !void {
         \\  -h, --help             Print this help and exit
         \\  -e <expr>              Evaluate an expression and print result
         \\  -i, --interactive      Start interactive REPL
-        \\  --interp=tree|bc       Choose interpreter: bytecode VM (default) or the legacy tree-walker
+        \\  --interp=bc            Select the bytecode VM (default and only engine)
         \\  --dump-bytecode        Compile and disassemble to stdout, then exit
         \\  --source-map           Print a bytecode->source JSON source map, then exit
         \\  --debug                Attach a stub debugger (prints on `debugger;`); implies --interp=bc

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Node.js differential testing harness.
-//! W2: the bytecode VM is the engine of record. For each corpus file, runs jsz
-//! under bc mode (the gate) and the legacy tree mode (informational), comparing
-//! both against Node.js. Exits non-zero only on a bc-vs-Node mismatch.
+//! For each corpus file, runs jsz under bc mode and compares against Node.js.
 const std = @import("std");
 const jsz = @import("jsz");
 
@@ -103,10 +101,6 @@ pub fn main() !void {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const tree_out = runJszMode(arena.allocator(), source, .tree) catch {
-            skip += 1;
-            continue;
-        };
         const bc_out = runJszMode(arena.allocator(), source, .bc) catch {
             skip += 1;
             continue;
@@ -122,20 +116,10 @@ pub fn main() !void {
         }
         const node_out = node_out_opt.?;
 
-        const tree_ok = std.mem.eql(u8, tree_out, node_out);
         const bc_ok = std.mem.eql(u8, bc_out, node_out);
 
-        // W2 engine unification: the bytecode VM is the engine of record, so
-        // bc-vs-Node is the hard gate. Tree-walker mismatches are reported as
-        // informational only (the tree engine is being retired and carries
-        // known latent bugs); they no longer fail the build.
         if (bc_ok) {
             pass += 1;
-            if (!tree_ok) {
-                try out.print("INFO tree lags: {s}\n  tree: {s}\n  node: {s}\n", .{
-                    entry.name, tree_out, node_out,
-                });
-            }
         } else {
             fail += 1;
             try out.print("MISMATCH bc:   {s}\n  bc:   {s}\n  node: {s}\n", .{

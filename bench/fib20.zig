@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Benchmark: fib(20) under tree-walker vs bytecode VM.
-//! Runs 10 iterations each, reports average ms and speedup.
+//! Benchmark: fib(20) under the bytecode VM.
 const std = @import("std");
 const jsz = @import("jsz");
 
@@ -49,16 +48,7 @@ pub fn main() !void {
     var w = std.fs.File.stdout().writer(&buf);
     const out = &w.interface;
 
-    const tree_ms = try benchMode(allocator, .tree);
     const bc_ms = try benchMode(allocator, .bc);
-
-    const speedup = if (bc_ms > 0) tree_ms / bc_ms else 0;
-
-    try out.print("tree: {d:.3}ms  bc: {d:.3}ms  speedup: {d:.2}x\n", .{ tree_ms, bc_ms, speedup });
-
-    if (speedup < 3.0) {
-        try out.print("WARNING: speedup below target 3x\n", .{});
-    }
-
+    try out.print("bc: {d:.3}ms\n", .{bc_ms});
     try out.flush();
 }

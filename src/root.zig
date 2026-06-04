@@ -11,7 +11,7 @@ const val_mod = @import("./value/value.zig");
 
 pub const version = "0.0.0-phase9-scaffold";
 
-/// Interpreter mode: bytecode VM (default, W2) or the legacy tree-walker.
+/// Interpreter mode: bytecode VM (only remaining engine).
 pub const InterpMode = isolate_mod.InterpMode;
 
 /// Phase 9: JIT profiling mode.
@@ -136,8 +136,7 @@ pub fn valueToDisplayString(arena: std.mem.Allocator, v: Value) ![]const u8 {
         .null_ => "null",
         .boolean => |b| if (b) "true" else "false",
         .number => |n| blk: {
-            const vm_mod = @import("./vm/vm.zig");
-            break :blk vm_mod.formatNumber(arena, n);
+            break :blk val_mod.formatNumber(arena, n);
         },
         .string => |s| try arena.dupe(u8, s),
         .function => |f| std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{f.name orelse ""}),
@@ -151,14 +150,11 @@ pub fn valueToDisplayString(arena: std.mem.Allocator, v: Value) ![]const u8 {
                     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
                     if (i > 0) try buf.append(arena, ',');
                     if (obj.get(key)) |elem| {
-                        const vm_mod2 = @import("./vm/vm.zig");
-                        _ = vm_mod2;
                         const elem_inner = val_mod.Value{ .bits = elem.bits };
                         if (elem_inner.bits != 0) {
                             switch (elem_inner.unbox()) {
                                 .number => |n| {
-                                    const vm_mod3 = @import("./vm/vm.zig");
-                                    const s2 = try vm_mod3.formatNumber(arena, n);
+                                    const s2 = try val_mod.formatNumber(arena, n);
                                     try buf.appendSlice(arena, s2);
                                 },
                                 .string => |s2| try buf.appendSlice(arena, s2),
@@ -268,8 +264,7 @@ pub const Isolate = struct {
 /// A JS execution context: owns the global object and intrinsics.
 pub const Context = struct {
     _isolate: *Isolate,
-    // W2: the bytecode VM is the default engine; the tree-walker remains
-    // reachable via setInterpMode(.tree) but is being retired.
+    // The bytecode VM is the only engine.
     interp_mode: InterpMode = .bc,
     jit_mode: JitMode = .off,
     limits: Limits = .{},
@@ -415,7 +410,6 @@ comptime {
     _ = @import("./runtime/realm.zig");
     _ = @import("./runtime/error.zig");
     _ = @import("./vm/frame.zig");
-    _ = @import("./vm/vm.zig");
     _ = @import("./vm/isolate.zig");
     _ = @import("./vm/bc_vm.zig");
     _ = @import("./bytecode/opcodes.zig");

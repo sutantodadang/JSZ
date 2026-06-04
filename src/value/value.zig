@@ -52,6 +52,16 @@ pub const JsValue = union(enum) {
     pub const Tag = std.meta.Tag(JsValue);
 };
 
+/// ECMAScript number → string for display (shared by VM + public API).
+pub fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
+    if (std.math.isNan(n)) return "NaN";
+    if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
+    if (n == @trunc(n) and @abs(n) < 1e15) {
+        return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
+    }
+    return std.fmt.allocPrint(arena, "{d}", .{n});
+}
+
 /// Phase 9 (staged): SMI inline-integer value representation, the foundation for
 /// a NaN-boxed `Value`. Built OFF — when false, `unbox()` is exactly `toPtr().*`,
 /// no SMI handle is ever produced, GC is untouched, and the engine is bit-for-bit
