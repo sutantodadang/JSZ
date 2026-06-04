@@ -22,6 +22,7 @@ const function_proto_mod = @import("./builtins/function_proto.zig");
 const date_mod = @import("./builtins/date.zig");
 const es2015_collections_mod = @import("./builtins/es2015_collections.zig");
 const promise_mod = @import("./builtins/promise.zig");
+const console_mod = @import("./builtins/console.zig");
 
 // ---------------------------------------------------------------- Context interface ---
 
@@ -250,6 +251,7 @@ pub var error_proto_TypeError: ?*JsObject = null;
 pub var error_proto_SyntaxError: ?*JsObject = null;
 pub var error_proto_RangeError: ?*JsObject = null;
 pub var error_proto_ReferenceError: ?*JsObject = null;
+pub var error_proto_AggregateError: ?*JsObject = null;
 
 fn extractMessage(args: []const Value) []const u8 {
     if (args.len > 0 and args[0].bits != 0) {
@@ -296,6 +298,29 @@ fn nativeRangeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const
 
 fn nativeReferenceErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     return populateErrorThis(arena, this_val, "ReferenceError", extractMessage(args));
+}
+
+fn nativeAggregateErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // args[0] = errors iterable/array, args[1] = message string
+    const message = if (args.len > 1) extractMessage(args[1..]) else "";
+    const result = try populateErrorThis(arena, this_val, "AggregateError", message);
+    // Attach the errors array (args[0]) if it is an array/object, else empty array.
+    const errors_val: Value = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object)
+        args[0]
+    else blk: {
+        const arr_proto = active_array_proto;
+        const empty_arr = if (active_heap) |h|
+            try JsObject.createOnHeap(h, arr_proto)
+        else
+            try JsObject.create(arena, arr_proto);
+        empty_arr.is_array = true;
+        empty_arr.array_length = 0;
+        break :blk try val_mod.makeObject(arena, empty_arr);
+    };
+    if (result.bits != 0 and result.unbox() == .object) {
+        try result.toPtr().object.set("errors", errors_val);
+    }
+    return result;
 }
 
 // ---- Phase 4: Array/String/Number constructors ----
@@ -644,6 +669,7 @@ pub const Realm = struct {
     syntax_error_prototype: *JsObject = undefined,
     range_error_prototype: *JsObject = undefined,
     reference_error_prototype: *JsObject = undefined,
+    aggregate_error_prototype: *JsObject = undefined,
     /// Phase 4b: String.prototype.
     string_prototype: *JsObject = undefined,
     /// Phase 4c: RegExp.prototype.
@@ -661,6 +687,7 @@ pub const Realm = struct {
     _syntax_error_proto_root: Value = Value{},
     _range_error_proto_root: Value = Value{},
     _reference_error_proto_root: Value = Value{},
+    _aggregate_error_proto_root: Value = Value{},
 
     pub fn init(arena: std.mem.Allocator) !Realm {
         const env = try Environment.init(arena, null);
@@ -717,12 +744,19 @@ pub const Realm = struct {
         try reference_error_proto.set("name", refp_name);
         try reference_error_proto.set("message", ep_msg);
 
+        // AggregateError.prototype: proto = Error.prototype.
+        const aggregate_error_proto = try JsObject.create(arena, error_proto);
+        const aep_name = try val_mod.makeString(arena, "AggregateError");
+        try aggregate_error_proto.set("name", aep_name);
+        try aggregate_error_proto.set("message", ep_msg);
+
         // Set thread-local proto pointers so native ctors can find them.
         error_proto_Error = error_proto;
         error_proto_TypeError = type_error_proto;
         error_proto_SyntaxError = syntax_error_proto;
         error_proto_RangeError = range_error_proto;
         error_proto_ReferenceError = reference_error_proto;
+        error_proto_AggregateError = aggregate_error_proto;
 
         // Create Error constructor objects. Each has a .prototype property
         // and a hidden __proto__ marker so `instanceof` can find the prototype.
@@ -743,12 +777,14 @@ pub const Realm = struct {
         const syntax_error_ctor_val = try makeErrorCtor(arena, nativeSyntaxErrorCtor, syntax_error_proto);
         const range_error_ctor_val = try makeErrorCtor(arena, nativeRangeErrorCtor, range_error_proto);
         const reference_error_ctor_val = try makeErrorCtor(arena, nativeReferenceErrorCtor, reference_error_proto);
+        const aggregate_error_ctor_val = try makeErrorCtor(arena, nativeAggregateErrorCtor, aggregate_error_proto);
 
         try env.define("Error", error_ctor_val);
         try env.define("TypeError", type_error_ctor_val);
         try env.define("SyntaxError", syntax_error_ctor_val);
         try env.define("RangeError", range_error_ctor_val);
         try env.define("ReferenceError", reference_error_ctor_val);
+        try env.define("AggregateError", aggregate_error_ctor_val);
 
         // Also store prototypes under hidden names so vm.zig's getErrorProto can find them.
         const error_proto_val = try val_mod.makeObject(arena, error_proto);
@@ -756,11 +792,13 @@ pub const Realm = struct {
         const syntax_error_proto_val = try val_mod.makeObject(arena, syntax_error_proto);
         const range_error_proto_val = try val_mod.makeObject(arena, range_error_proto);
         const reference_error_proto_val = try val_mod.makeObject(arena, reference_error_proto);
+        const aggregate_error_proto_val = try val_mod.makeObject(arena, aggregate_error_proto);
         try env.define("__ErrorProto__", error_proto_val);
         try env.define("__TypeErrorProto__", type_error_proto_val);
         try env.define("__SyntaxErrorProto__", syntax_error_proto_val);
         try env.define("__RangeErrorProto__", range_error_proto_val);
         try env.define("__ReferenceErrorProto__", reference_error_proto_val);
+        try env.define("__AggregateErrorProto__", aggregate_error_proto_val);
 
         // ---- Phase 4b: String.prototype ----
         const string_proto = try JsObject.create(arena, object_proto);
@@ -954,6 +992,10 @@ pub const Realm = struct {
         try promise_ctor_obj.set("resolve", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseResolve));
         try promise_ctor_obj.set("reject", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseReject));
         try promise_ctor_obj.set("allSettled", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseAllSettled));
+        try promise_ctor_obj.set("all", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseAll));
+        try promise_ctor_obj.set("race", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseRace));
+        try promise_ctor_obj.set("any", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseAny));
+        try promise_proto.set("finally", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseFinally));
         try env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
         const require_cache_obj = try JsObject.create(arena, object_proto);
         try env.define("__require_cache__", try val_mod.makeObject(arena, require_cache_obj));
@@ -1003,6 +1045,21 @@ pub const Realm = struct {
         try env.define("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)));
         try env.define("Infinity", try val_mod.makeNumber(arena, std.math.inf(f64)));
 
+        // ---- console global ----
+        const console_obj = try JsObject.create(arena, null);
+        const console_fns = .{
+            .{ "log", console_mod.nativeConsoleLog },
+            .{ "info", console_mod.nativeConsoleInfo },
+            .{ "debug", console_mod.nativeConsoleDebug },
+            .{ "error", console_mod.nativeConsoleError },
+            .{ "warn", console_mod.nativeConsoleWarn },
+        };
+        inline for (console_fns) |pair| {
+            const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
+            try console_obj.set(pair[0], fn_v);
+        }
+        try env.define("console", try val_mod.makeObject(arena, console_obj));
+
         // ---- ES2020 globalThis (+ Node-compatible `global`) ----
         try installGlobalThis(arena, env, object_proto);
 
@@ -1022,6 +1079,7 @@ pub const Realm = struct {
             .syntax_error_prototype = syntax_error_proto,
             .range_error_prototype = range_error_proto,
             .reference_error_prototype = reference_error_proto,
+            .aggregate_error_prototype = aggregate_error_proto,
             .string_prototype = string_proto,
             .regexp_prototype = regexp_proto,
             .function_prototype = function_proto,

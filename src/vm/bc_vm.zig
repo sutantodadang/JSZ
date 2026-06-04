@@ -196,12 +196,19 @@ pub const BcVm = struct {
                     switch (outcome) {
                         .ok => |v| return v,
                         .exception => |msg| {
+                            // Unwind this invocation's frames. runLoop returns an
+                            // uncaught throw without popping the throwing frame; since
+                            // re-entrant callbacks (e.g. microtask reaction handlers)
+                            // share this VM's frame stack, a leaked dead frame would
+                            // poison the next re-entrant call. Restore to frames_before.
+                            while (self.frames.items.len > frames_before) _ = self.frames.pop();
                             const realm_mod = @import("../runtime/realm.zig");
                             realm_mod.pending_exception = self.last_exception_value;
                             _ = msg;
                             return error.JsException;
                         },
                         .exception_value => |ev| {
+                            while (self.frames.items.len > frames_before) _ = self.frames.pop();
                             const realm_mod = @import("../runtime/realm.zig");
                             realm_mod.pending_exception = ev.value;
                             return error.JsException;
@@ -1487,6 +1494,14 @@ pub const BcVm = struct {
                     const thrown_val = frame.registers[rsrc];
                     self.last_exception_value = thrown_val;
 
+                    // Attach a synchronous stack trace to Error-like throwables
+                    // that lack one (e.g. user `throw new Error(...)`, which is
+                    // constructed via the realm ctor without frame access).
+                    if (thrown_val.bits != 0 and thrown_val.unbox() == .object) {
+                        const eo = thrown_val.toPtr().object;
+                        if (eo.getOwn("message") != null) self.captureStackBc(eo);
+                    }
+
                     // Walk frame stack looking for a PUSH_TRY entry.
                     var found_handler = false;
                     var fi: usize = self.frames.items.len;
@@ -1508,6 +1523,14 @@ pub const BcVm = struct {
                             found_handler = true;
                             break;
                         }
+                        // Re-entrancy boundary (native callback or coroutine frame,
+                        // marked return_dst == 0xFF). The exception must not escape
+                        // into the caller's frames — those belong to a different
+                        // invocation (async driver, microtask reaction, native call).
+                        // Stop so this invocation's runLoop reports it uncaught; the
+                        // boundary owner converts it (e.g. rejects the async result
+                        // promise, which then resumes the awaiter with a throw).
+                        if (f.return_dst == 0xFF) break;
                     }
                     if (!found_handler) {
                         // Uncaught exception. Format Error-like objects nicely.
@@ -1816,6 +1839,42 @@ pub const BcVm = struct {
         }
     }
 
+    /// Read an own string property, or a fallback. Used by stack capture.
+    fn ownStr(obj: *JsObject, key: []const u8, fallback: []const u8) []const u8 {
+        if (obj.getOwn(key)) |v| {
+            if (v.bits != 0 and v.unbox() == .string) return v.unbox().string;
+        }
+        return fallback;
+    }
+
+    /// Best-effort synchronous stack trace for an Error-like object: builds a
+    /// V8-style "Name: message\n    at fn\n    at async fn" string from the live
+    /// call frames (innermost first) and stores it as the object's own `stack`.
+    /// Frames belonging to a generator/async coroutine are marked `at async`.
+    /// No-op if a `stack` is already present. Async-boundary detail is coarse
+    /// (per-frame marker only); cross-await caller chains are not yet linked.
+    fn captureStackBc(self: *BcVm, err_obj: *JsObject) void {
+        if (err_obj.getOwn("stack") != null) return;
+        const name = ownStr(err_obj, "name", "Error");
+        const msg = ownStr(err_obj, "message", "");
+        var buf = std.ArrayListUnmanaged(u8){};
+        const hdr = if (msg.len > 0)
+            std.fmt.allocPrint(self.arena, "{s}: {s}", .{ name, msg }) catch return
+        else
+            self.arena.dupe(u8, name) catch return;
+        buf.appendSlice(self.arena, hdr) catch return;
+        var i: usize = self.frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            const f = self.frames.items[i];
+            const fname = f.func.name orelse "<anonymous>";
+            buf.appendSlice(self.arena, if (f.gen != null) "\n    at async " else "\n    at ") catch return;
+            buf.appendSlice(self.arena, fname) catch return;
+        }
+        const stack_str = val_mod.makeString(self.arena, buf.items) catch return;
+        err_obj.set("stack", stack_str) catch {};
+    }
+
     fn makeErrorObjectBc(self: *BcVm, name: []const u8, message: []const u8) !Value {
         const proto_name = try std.fmt.allocPrint(self.arena, "__{s}Proto__", .{name});
         var proto: ?*JsObject = self.realm.object_prototype;
@@ -1830,6 +1889,7 @@ pub const BcVm = struct {
         const name_val = try val_mod.makeString(self.arena, name);
         try obj.set("message", msg_val);
         try obj.set("name", name_val);
+        self.captureStackBc(obj);
         return val_mod.makeObject(self.arena, obj);
     }
 

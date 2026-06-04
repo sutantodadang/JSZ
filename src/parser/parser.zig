@@ -119,6 +119,19 @@ pub const Parser = struct {
         return false;
     }
 
+    /// Accept an IdentifierName at the current position: plain identifier OR any
+    /// keyword token (ES spec §12.1 — reserved words are valid after `.` / `?.`).
+    fn expectIdentifierName(self: *Parser) ?Token {
+        const k = self.current.kind;
+        if (k == .identifier) return self.advance();
+        const i = @intFromEnum(k);
+        if (i >= @intFromEnum(TokenKind.kw_break) and i <= @intFromEnum(TokenKind.kw_null)) {
+            return self.advance();
+        }
+        // Fall through to normal error reporting via expect(.identifier).
+        return self.expect(.identifier);
+    }
+
     fn expect(self: *Parser, kind: TokenKind) ?Token {
         if (self.check(kind)) return self.advance();
         if (!self.had_error) {
@@ -2082,7 +2095,7 @@ pub const Parser = struct {
                         .member_expr = .{ .object = base, .property = prop, .computed = true, .optional = true },
                     }) orelse return null;
                 } else {
-                    const prop_tok = self.expect(.identifier) orelse return null;
+                    const prop_tok = self.expectIdentifierName() orelse return null;
                     const prop = self.makeNode(.identifier, prop_tok.start, prop_tok.end, .{
                         .identifier = prop_tok.value_str,
                     }) orelse return null;
@@ -2097,7 +2110,7 @@ pub const Parser = struct {
                 }) orelse return null;
                 base = self.rewriteSuperCall(raw_call) orelse return null;
             } else if (self.match(.dot)) {
-                const prop_tok = self.expect(.identifier) orelse return null;
+                const prop_tok = self.expectIdentifierName() orelse return null;
                 const prop = self.makeNode(.identifier, prop_tok.start, prop_tok.end, .{
                     .identifier = prop_tok.value_str,
                 }) orelse return null;

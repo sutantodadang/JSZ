@@ -1,0 +1,1 @@
+typeof Promise.race
