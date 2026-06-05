@@ -89,6 +89,7 @@ pub const Heap = struct {
                 const slot: *GcJsObjectSlot = @fieldParentPtr("header", hdr);
                 slot.object.slots.deinit(self.backing_allocator);
                 slot.object.attrs.deinit(self.backing_allocator);
+                slot.object.sym_props.deinit(self.backing_allocator);
                 self.backing_allocator.destroy(slot);
             }
             cur = next;
@@ -199,6 +200,10 @@ pub const Heap = struct {
             // Still walk into their property values: those values may reference
             // heap-managed objects that need to be marked.
             for (obj.slots.items) |v| self.markValue(v);
+            for (obj.sym_props.items) |sp| {
+                self.markValue(sp.key);
+                self.markValue(sp.value);
+            }
             // And the proto chain (may transition back into GC-managed objects).
             if (obj.proto) |proto| {
                 self.markObject(proto);
@@ -216,6 +221,10 @@ pub const Heap = struct {
 
         // Mark all own property values.
         for (obj.slots.items) |v| self.markValue(v);
+        for (obj.sym_props.items) |sp| {
+            self.markValue(sp.key);
+            self.markValue(sp.value);
+        }
     }
 
     fn markValue(self: *Heap, v: Value) void {
@@ -292,6 +301,7 @@ pub const Heap = struct {
                     const slot: *GcJsObjectSlot = @fieldParentPtr("header", hdr);
                     slot.object.slots.deinit(self.backing_allocator);
                     slot.object.attrs.deinit(self.backing_allocator);
+                    slot.object.sym_props.deinit(self.backing_allocator);
                     self.backing_allocator.destroy(slot);
                 }
 

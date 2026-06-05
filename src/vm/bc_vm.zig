@@ -1520,6 +1520,8 @@ pub const BcVm = struct {
                                 }
                             }
                         }
+                    } else if (key_val.bits != 0 and key_val.unbox() == .symbol) {
+                        frame.registers[rdst] = try self.getPropSym(obj_val, key_val);
                     } else {
                         const frame_idx_dyn2 = self.frames.items.len - 1;
                         const key = try valueToStringArena(self.arena, key_val);
@@ -1580,6 +1582,8 @@ pub const BcVm = struct {
                                 }
                             }
                         }
+                    } else if (key_val.bits != 0 and key_val.unbox() == .symbol) {
+                        try self.setPropSym(obj_val, key_val, val);
                     } else {
                         const key = try valueToStringArena(self.arena, key_val);
                         try self.setProp(obj_val, key, val);
@@ -2049,6 +2053,27 @@ pub const BcVm = struct {
     fn callAccessor(self: *BcVm, fn_val: Value, this_val: Value, args: []const Value) !Value {
         const fp = @import("../runtime/builtins/function_proto.zig");
         return fp.invokeCallback(self.arena, this_val, fn_val, args);
+    }
+
+    /// Read a symbol-keyed property, walking the prototype chain (own first).
+    fn getPropSym(self: *BcVm, obj_val: Value, sym_key: Value) !Value {
+        if (obj_val.bits == 0 or obj_val.unbox() != .object) return val_mod.makeUndefined(self.arena);
+        var cur: ?*JsObject = obj_val.toPtr().object;
+        var depth: usize = 0;
+        while (cur) |o| {
+            if (depth >= 64) break;
+            depth += 1;
+            if (o.getOwnSym(sym_key)) |v| return v;
+            cur = o.proto;
+        }
+        return val_mod.makeUndefined(self.arena);
+    }
+
+    /// Set a symbol-keyed own property.
+    fn setPropSym(self: *BcVm, obj_val: Value, sym_key: Value, value: Value) !void {
+        _ = self;
+        if (obj_val.bits == 0 or obj_val.unbox() != .object) return;
+        try obj_val.toPtr().object.setSym(sym_key, value);
     }
 
     fn getProp(self: *BcVm, obj_val: Value, key: []const u8) !Value {

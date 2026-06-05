@@ -1,0 +1,375 @@
+// SPDX-License-Identifier: MIT
+//! ES2015 Reflect namespace — thin wrappers over the object meta-protocol.
+const std = @import("std");
+const val_mod = @import("../../value/value.zig");
+const Value = val_mod.Value;
+const JsValue = val_mod.JsValue;
+const obj_mod = @import("../../object/object.zig");
+const JsObject = obj_mod.JsObject;
+const PropAttr = obj_mod.PropAttr;
+const fp = @import("function_proto.zig");
+
+// ---------------------------------------------------------------- helpers ---
+
+fn isObj(v: Value) bool {
+    if (v.bits == 0) return false;
+    // Must be a real heap pointer; SMIs and immediates are not objects.
+    if (!v.isHeapPtr()) return false;
+    return v.toPtr().* == .object;
+}
+
+fn isSym(v: Value) bool {
+    if (v.bits == 0) return false;
+    if (!v.isHeapPtr()) return false;
+    return v.toPtr().* == .symbol;
+}
+
+fn keyStr(arena: std.mem.Allocator, v: Value) !?[]const u8 {
+    if (v.bits == 0) return "undefined";
+    return switch (v.unbox()) {
+        .string => |s| s,
+        .number => |n| try val_mod.formatNumber(arena, n),
+        .boolean => |b| if (b) "true" else "false",
+        .symbol => null, // caller handles symbol keys separately
+        .undefined_ => "undefined",
+        .null_ => "null",
+        else => "[object Object]",
+    };
+}
+
+fn descTruthy(v: ?Value) bool {
+    const val = v orelse return false;
+    if (val.bits == 0) return false;
+    return switch (val.unbox()) {
+        .boolean => |b| b,
+        .number => |n| n != 0 and !std.math.isNan(n),
+        .string => |s| s.len != 0,
+        .object, .symbol => true,
+        else => false,
+    };
+}
+
+fn isCallable(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .function, .bc_function, .native_function => true,
+        .object => |o| o.internal_kind == .bound_function,
+        else => false,
+    };
+}
+
+fn makeAccessorHolder(arena: std.mem.Allocator, getter: ?Value, setter: ?Value) !Value {
+    const realm_mod = @import("../realm.zig");
+    const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+    const holder = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, obj_proto)
+    else
+        try JsObject.create(arena, obj_proto);
+    try holder.set("get", getter orelse try val_mod.makeUndefined(arena));
+    try holder.set("set", setter orelse try val_mod.makeUndefined(arena));
+    return val_mod.makeObject(arena, holder);
+}
+
+// ---------------------------------------------------------------- Reflect.get ---
+
+pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or !isObj(args[0])) return val_mod.makeUndefined(arena);
+    const target = args[0];
+    const key = if (args.len > 1) args[1] else Value{};
+    const receiver = if (args.len > 2) args[2] else target;
+
+    const target_obj = target.toPtr().object;
+
+    if (isSym(key)) {
+        // Proto-chain walk for symbol-keyed property.
+        var depth: usize = 0;
+        var cur: ?*JsObject = target_obj;
+        while (cur) |o| {
+            if (depth >= 64) break;
+            depth += 1;
+            if (o.getOwnSym(key)) |v| return v;
+            cur = o.proto;
+        }
+        return val_mod.makeUndefined(arena);
+    }
+
+    const k = (try keyStr(arena, key)) orelse return val_mod.makeUndefined(arena);
+
+    if (target_obj.findProperty(k)) |found| {
+        const attr = found.holder.attrAt(found.slot);
+        if (attr.is_accessor) {
+            // Get the accessor holder value stored in the slot.
+            if (found.slot < found.holder.slots.items.len) {
+                const holder_val = found.holder.slots.items[found.slot];
+                if (holder_val.bits != 0 and holder_val.isHeapPtr() and holder_val.toPtr().* == .object) {
+                    const hobj = holder_val.toPtr().object;
+                    const getter = hobj.getOwn("get") orelse return val_mod.makeUndefined(arena);
+                    if (isCallable(getter)) {
+                        return fp.invokeCallback(arena, receiver, getter, &[_]Value{});
+                    }
+                }
+            }
+            return val_mod.makeUndefined(arena);
+        }
+        // Data property.
+        if (found.slot < found.holder.slots.items.len) {
+            return found.holder.slots.items[found.slot];
+        }
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+// ---------------------------------------------------------------- Reflect.set ---
+
+pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
+    const target = args[0];
+    const key = if (args.len > 1) args[1] else Value{};
+    const value = if (args.len > 2) args[2] else Value{};
+
+    const target_obj = target.toPtr().object;
+
+    if (isSym(key)) {
+        try target_obj.setSym(key, value);
+        return val_mod.makeBool(arena, true);
+    }
+
+    const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
+
+    // Check for accessor in proto chain.
+    if (target_obj.findProperty(k)) |found| {
+        const attr = found.holder.attrAt(found.slot);
+        if (attr.is_accessor) {
+            if (found.slot < found.holder.slots.items.len) {
+                const holder_val = found.holder.slots.items[found.slot];
+                if (holder_val.bits != 0 and holder_val.isHeapPtr() and holder_val.toPtr().* == .object) {
+                    const hobj = holder_val.toPtr().object;
+                    const setter = hobj.getOwn("set") orelse return val_mod.makeBool(arena, false);
+                    if (isCallable(setter)) {
+                        _ = try fp.invokeCallback(arena, target, setter, &[_]Value{value});
+                        return val_mod.makeBool(arena, true);
+                    }
+                }
+            }
+            return val_mod.makeBool(arena, false);
+        }
+    }
+
+    try target_obj.set(k, value);
+    return val_mod.makeBool(arena, true);
+}
+
+// ---------------------------------------------------------------- Reflect.has ---
+
+pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
+    const target_obj = args[0].toPtr().object;
+    const key = if (args.len > 1) args[1] else Value{};
+
+    if (isSym(key)) {
+        var depth: usize = 0;
+        var cur: ?*JsObject = target_obj;
+        while (cur) |o| {
+            if (depth >= 64) break;
+            depth += 1;
+            if (o.getOwnSym(key) != null) return val_mod.makeBool(arena, true);
+            cur = o.proto;
+        }
+        return val_mod.makeBool(arena, false);
+    }
+
+    const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
+    var depth: usize = 0;
+    var cur: ?*JsObject = target_obj;
+    while (cur) |o| {
+        if (depth >= 64) break;
+        depth += 1;
+        if (o.resolveOwnSlot(k) != null) return val_mod.makeBool(arena, true);
+        cur = o.proto;
+    }
+    return val_mod.makeBool(arena, false);
+}
+
+// ---------------------------------------------------------------- Reflect.deleteProperty ---
+
+pub fn nativeReflectDeleteProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
+    const target_obj = args[0].toPtr().object;
+    const key = if (args.len > 1) args[1] else Value{};
+
+    if (isSym(key)) {
+        return val_mod.makeBool(arena, target_obj.deleteOwnSym(key));
+    }
+
+    const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, try target_obj.deleteOwn(k));
+}
+
+// ---------------------------------------------------------------- Reflect.ownKeys ---
+
+pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
+    const arr = try JsObject.createArray(arena, arr_proto);
+
+    if (args.len == 0 or !isObj(args[0])) {
+        return val_mod.makeObject(arena, arr);
+    }
+    const obj = args[0].toPtr().object;
+
+    var i: u32 = 0;
+    for (obj.ownKeys()) |k| {
+        const key_val = try val_mod.makeString(arena, k);
+        const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        try arr.set(idx_key, key_val);
+        i += 1;
+    }
+    for (obj.symKeys()) |sp| {
+        const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        try arr.set(idx_key, sp.key);
+        i += 1;
+    }
+    arr.array_length = i;
+    return val_mod.makeObject(arena, arr);
+}
+
+// ---------------------------------------------------------------- Reflect.getPrototypeOf ---
+
+pub fn nativeReflectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or !isObj(args[0])) return val_mod.makeNull(arena);
+    const obj = args[0].toPtr().object;
+    if (obj.proto) |p| return val_mod.makeObject(arena, p);
+    return val_mod.makeNull(arena);
+}
+
+// ---------------------------------------------------------------- Reflect.defineProperty ---
+
+pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len < 1 or !isObj(args[0])) return val_mod.makeBool(arena, false);
+    if (args.len < 3 or !isObj(args[2])) return val_mod.makeBool(arena, false);
+
+    const target_obj = args[0].toPtr().object;
+    const key_arg = if (args.len > 1) args[1] else Value{};
+
+    // Symbol keys not supported for defineProperty.
+    if (isSym(key_arg)) return val_mod.makeBool(arena, false);
+
+    const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeBool(arena, false);
+    const desc = args[2].toPtr().object;
+
+    if (desc.hasOwn("get") or desc.hasOwn("set")) {
+        const getter: ?Value = if (desc.hasOwn("get")) desc.getOwn("get") else null;
+        const setter: ?Value = if (desc.hasOwn("set")) desc.getOwn("set") else null;
+        const holder = try makeAccessorHolder(arena, getter, setter);
+        const attr = PropAttr{
+            .is_accessor = true,
+            .enumerable = descTruthy(desc.getOwn("enumerable")),
+            .configurable = descTruthy(desc.getOwn("configurable")),
+        };
+        const ok = try target_obj.defineOwnAccessor(k, holder, attr);
+        return val_mod.makeBool(arena, ok);
+    }
+
+    const value = desc.getOwn("value") orelse Value{};
+    const attr = PropAttr{
+        .writable = descTruthy(desc.getOwn("writable")),
+        .enumerable = descTruthy(desc.getOwn("enumerable")),
+        .configurable = descTruthy(desc.getOwn("configurable")),
+    };
+    const ok = try target_obj.defineOwnData(k, value, attr);
+    return val_mod.makeBool(arena, ok);
+}
+
+// ---------------------------------------------------------------- Reflect.getOwnPropertyDescriptor ---
+
+pub fn nativeReflectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or !isObj(args[0])) return val_mod.makeUndefined(arena);
+    const obj = args[0].toPtr().object;
+
+    if (args.len < 2) return val_mod.makeUndefined(arena);
+    const key_arg = args[1];
+
+    // Symbol keys: return undefined (not supported).
+    if (isSym(key_arg)) return val_mod.makeUndefined(arena);
+
+    const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeUndefined(arena);
+
+    const a = obj.ownAttr(k) orelse return val_mod.makeUndefined(arena);
+
+    const realm_mod = @import("../realm.zig");
+    const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+
+    if (obj.ownAccessorHolder(k)) |holder_val| {
+        const desc = try JsObject.create(arena, obj_proto);
+        const hobj = holder_val.toPtr().object;
+        try desc.set("get", hobj.getOwn("get") orelse try val_mod.makeUndefined(arena));
+        try desc.set("set", hobj.getOwn("set") orelse try val_mod.makeUndefined(arena));
+        try desc.set("enumerable", try val_mod.makeBool(arena, a.enumerable));
+        try desc.set("configurable", try val_mod.makeBool(arena, a.configurable));
+        return val_mod.makeObject(arena, desc);
+    }
+
+    const v = obj.getOwn(k) orelse try val_mod.makeUndefined(arena);
+    const desc = try JsObject.create(arena, obj_proto);
+    try desc.set("value", v);
+    try desc.set("writable", try val_mod.makeBool(arena, a.writable));
+    try desc.set("enumerable", try val_mod.makeBool(arena, a.enumerable));
+    try desc.set("configurable", try val_mod.makeBool(arena, a.configurable));
+    return val_mod.makeObject(arena, desc);
+}
+
+// ---------------------------------------------------------------- Reflect.isExtensible ---
+
+pub fn nativeReflectIsExtensible(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, args[0].toPtr().object.extensible);
+}
+
+// ---------------------------------------------------------------- Reflect.preventExtensions ---
+
+pub fn nativeReflectPreventExtensions(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len > 0 and isObj(args[0])) {
+        args[0].toPtr().object.preventExtensionsSelf();
+    }
+    return val_mod.makeBool(arena, true);
+}
+
+// ---------------------------------------------------------------- Reflect.apply ---
+
+pub fn nativeReflectApply(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const target = if (args.len > 0) args[0] else Value{};
+    const this_arg = if (args.len > 1) args[1] else Value{};
+    const args_list = if (args.len > 2) args[2] else Value{};
+
+    // Unpack argsList if it is an array object.
+    var call_args: []Value = &[_]Value{};
+    if (args_list.bits != 0 and isObj(args_list)) {
+        const arr = args_list.toPtr().object;
+        if (arr.is_array) {
+            const len = arr.getArrayLength();
+            call_args = try arena.alloc(Value, len);
+            for (0..len) |i| {
+                const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+                call_args[i] = arr.get(idx_key) orelse Value{};
+            }
+        } else {
+            // Non-array object with numeric length or just treat as empty.
+            // If it has a "length" property, treat as array-like.
+            if (arr.getOwn("length")) |len_val| {
+                if (len_val.bits != 0) {
+                    const len_f = len_val.toF64();
+                    if (!std.math.isNan(len_f) and len_f >= 0) {
+                        const len: u32 = @intFromFloat(len_f);
+                        call_args = try arena.alloc(Value, len);
+                        for (0..len) |i| {
+                            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+                            call_args[i] = arr.getOwn(idx_key) orelse Value{};
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return fp.invokeCallback(arena, this_arg, target, call_args);
+}

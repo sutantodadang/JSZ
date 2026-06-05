@@ -28,6 +28,10 @@ pub const PropAttr = packed struct(u8) {
     _pad: u4 = 0,
 };
 
+/// A symbol-keyed own property (stored separately from string-keyed slots so
+/// string enumeration never sees it). `key` is a Value boxing a *SymbolData.
+pub const SymProp = struct { key: Value, value: Value, attr: PropAttr = .{} };
+
 pub const JsObject = struct {
     /// Prototype link (null = Object.prototype or bare object).
     proto: ?*JsObject = null,
@@ -58,6 +62,8 @@ pub const JsObject = struct {
     /// Per-slot attribute bits, parallel to `slots` (same index). Kept in
     /// lockstep with `slots` everywhere slots grow/shrink. Default all-true.
     attrs: std.ArrayListUnmanaged(PropAttr) = .empty,
+    /// Symbol-keyed own properties (ES2015). Looked up by symbol pointer identity.
+    sym_props: std.ArrayListUnmanaged(SymProp) = .empty,
 
     /// Allocate a plain object with an optional prototype.
     pub fn create(arena: std.mem.Allocator, proto: ?*JsObject) !*JsObject {
@@ -288,6 +294,7 @@ pub const JsObject = struct {
     pub fn sealSelf(self: *JsObject) void {
         self.extensible = false;
         for (self.attrs.items) |*a| a.configurable = false;
+        for (self.sym_props.items) |*sp| sp.attr.configurable = false;
     }
 
     /// Object.freeze: seal + mark all own data props non-writable.
@@ -297,6 +304,10 @@ pub const JsObject = struct {
             a.configurable = false;
             a.writable = false;
         }
+        for (self.sym_props.items) |*sp| {
+            sp.attr.configurable = false;
+            sp.attr.writable = false;
+        }
     }
 
     /// Object.isSealed: non-extensible and every own prop non-configurable.
@@ -304,6 +315,9 @@ pub const JsObject = struct {
         if (self.extensible) return false;
         for (self.attrs.items) |a| {
             if (a.configurable) return false;
+        }
+        for (self.sym_props.items) |sp| {
+            if (sp.attr.configurable) return false;
         }
         return true;
     }
@@ -313,6 +327,9 @@ pub const JsObject = struct {
         if (self.extensible) return false;
         for (self.attrs.items) |a| {
             if (a.configurable or a.writable) return false;
+        }
+        for (self.sym_props.items) |sp| {
+            if (sp.attr.configurable or sp.attr.writable) return false;
         }
         return true;
     }
@@ -365,6 +382,54 @@ pub const JsObject = struct {
             cur = o.proto;
         }
         return null;
+    }
+
+    /// Own symbol-keyed property by symbol identity (no proto walk).
+    pub fn getOwnSym(self: *JsObject, sym_key: Value) ?Value {
+        if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return null;
+        const target = sym_key.toPtr().symbol;
+        for (self.sym_props.items) |sp| {
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) return sp.value;
+        }
+        return null;
+    }
+
+    pub fn hasOwnSym(self: *JsObject, sym_key: Value) bool {
+        return self.getOwnSym(sym_key) != null;
+    }
+
+    /// Set/upsert an own symbol-keyed property. Honors writable / extensible.
+    pub fn setSym(self: *JsObject, sym_key: Value, value: Value) !void {
+        if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return;
+        const target = sym_key.toPtr().symbol;
+        for (self.sym_props.items) |*sp| {
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
+                if (!sp.attr.writable) return;
+                sp.value = value;
+                return;
+            }
+        }
+        if (!self.extensible) return;
+        try self.sym_props.append(self.arena, .{ .key = sym_key, .value = value });
+    }
+
+    /// Delete own symbol-keyed property; honors configurable. Returns true if removed.
+    pub fn deleteOwnSym(self: *JsObject, sym_key: Value) bool {
+        if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return false;
+        const target = sym_key.toPtr().symbol;
+        for (self.sym_props.items, 0..) |sp, i| {
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
+                if (!sp.attr.configurable) return false;
+                _ = self.sym_props.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// All own symbol-keyed properties (for Object.getOwnPropertySymbols).
+    pub fn symKeys(self: *JsObject) []const SymProp {
+        return self.sym_props.items;
     }
 };
 

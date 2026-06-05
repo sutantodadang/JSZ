@@ -403,3 +403,22 @@ pub fn nativeObjectIsExtensible(arena: std.mem.Allocator, _: Value, args: []cons
     if (args[0].unbox() != .object) return val_mod.makeBool(arena, false);
     return val_mod.makeBool(arena, args[0].toPtr().object.extensible);
 }
+
+/// Object.getOwnPropertySymbols(o): array of own symbol keys.
+pub fn nativeObjectGetOwnPropertySymbols(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
+    const arr = try JsObject.createArray(arena, arr_proto);
+    if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, arr);
+    const inner = args[0].toPtr();
+    if (inner.* != .object) return val_mod.makeObject(arena, arr);
+    const obj = inner.object;
+    var i: u32 = 0;
+    for (obj.symKeys()) |sp| {
+        const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        try arr.set(idx_key, sp.key);
+        i += 1;
+    }
+    arr.array_length = i;
+    return val_mod.makeObject(arena, arr);
+}

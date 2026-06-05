@@ -25,6 +25,8 @@ const promise_mod = @import("./builtins/promise.zig");
 const console_mod = @import("./builtins/console.zig");
 // ES2015 Symbol
 const symbol_mod = @import("./builtins/symbol.zig");
+// ES2015 Reflect
+const reflect_mod = @import("./builtins/reflect.zig");
 
 // ---------------------------------------------------------------- Context interface ---
 
@@ -838,6 +840,7 @@ pub const Realm = struct {
                 try ctor_obj.set("isFrozen", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsFrozen));
                 try ctor_obj.set("isSealed", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsSealed));
                 try ctor_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsExtensible));
+                try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols));
             }
         }
         // hasOwnProperty on Object.prototype
@@ -1091,6 +1094,21 @@ pub const Realm = struct {
             try symbol_ctor.set(name, try val_mod.makeSymbol(arena, desc));
         }
         try env.define("Symbol", try val_mod.makeObject(arena, symbol_ctor));
+
+        // ---- ES2015 Reflect ----
+        const reflect_obj = try JsObject.create(arena, object_proto);
+        try reflect_obj.set("get", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectGet));
+        try reflect_obj.set("set", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectSet));
+        try reflect_obj.set("has", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectHas));
+        try reflect_obj.set("deleteProperty", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectDeleteProperty));
+        try reflect_obj.set("ownKeys", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectOwnKeys));
+        try reflect_obj.set("getPrototypeOf", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectGetPrototypeOf));
+        try reflect_obj.set("defineProperty", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectDefineProperty));
+        try reflect_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectGetOwnPropertyDescriptor));
+        try reflect_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectIsExtensible));
+        try reflect_obj.set("preventExtensions", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectPreventExtensions));
+        try reflect_obj.set("apply", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectApply));
+        try env.define("Reflect", try val_mod.makeObject(arena, reflect_obj));
 
         // ---- ES2020 globalThis (+ Node-compatible `global`) ----
         try installGlobalThis(arena, env, object_proto);
