@@ -1411,13 +1411,17 @@ pub const BcVm = struct {
                     }
 
                     if (self.ic_stats_enabled and obj_val.bits != 0 and obj_val.unbox() == .object) self.ic_misses += 1;
+                    const frame_idx = self.frames.items.len - 1;
                     const result = try self.getProp(obj_val, key);
-                    frame.registers[rdst] = result;
+                    // Re-fetch frame: getProp may invoke a getter via bcInvokeJs which
+                    // appends to self.frames and potentially reallocates the backing slice.
+                    const frame2 = &self.frames.items[frame_idx];
+                    frame2.registers[rdst] = result;
                     if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                         const obj = obj_val.toPtr().object;
                         if (!obj.is_array and !std.mem.eql(u8, key, "length") and !std.mem.eql(u8, key, "size")) {
                             if (obj.resolveOwnSlot(key)) |slot| {
-                                site_cache.record(self.arena, key, obj.shapePtr(), slot);
+                                if (!obj.attrAt(slot).is_accessor) site_cache.record(self.arena, key, obj.shapePtr(), slot);
                             } else {
                                 // Walk proto chain; cache a hit within PROTO_IC_DEPTH links.
                                 var guards: [ic_mod.PROTO_IC_DEPTH]ic_mod.ProtoGuard = undefined;
@@ -1427,7 +1431,7 @@ pub const BcVm = struct {
                                     if (n >= ic_mod.PROTO_IC_DEPTH) break;
                                     guards[n] = .{ .obj = @ptrCast(c), .shape = c.shapePtr() };
                                     if (c.resolveOwnSlot(key)) |pslot| {
-                                        site_cache.protoRecord(key, obj.shapePtr(), guards[0 .. n + 1], pslot);
+                                        if (!c.attrAt(pslot).is_accessor) site_cache.protoRecord(key, obj.shapePtr(), guards[0 .. n + 1], pslot);
                                         break;
                                     }
                                     cur = c.proto;
@@ -1488,13 +1492,17 @@ pub const BcVm = struct {
                             }
                         }
                         if (self.ic_stats_enabled and obj_val.bits != 0 and obj_val.unbox() == .object) self.ic_misses += 1;
+                        const frame_idx_dyn = self.frames.items.len - 1;
                         const result = try self.getProp(obj_val, key);
-                        frame.registers[rdst] = result;
+                        // Re-fetch frame after getProp: accessor getter dispatch via
+                        // bcInvokeJs may have appended frames and reallocated the slice.
+                        const frame2_dyn = &self.frames.items[frame_idx_dyn];
+                        frame2_dyn.registers[rdst] = result;
                         if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                             const obj = obj_val.toPtr().object;
                             if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                                 if (obj.resolveOwnSlot(key)) |slot| {
-                                    site_cache.record(self.arena, key, obj.shapePtr(), slot);
+                                    if (!obj.attrAt(slot).is_accessor) site_cache.record(self.arena, key, obj.shapePtr(), slot);
                                 } else {
                                     var guards: [ic_mod.PROTO_IC_DEPTH]ic_mod.ProtoGuard = undefined;
                                     var cur = obj.proto;
@@ -1503,7 +1511,7 @@ pub const BcVm = struct {
                                         if (n >= ic_mod.PROTO_IC_DEPTH) break;
                                         guards[n] = .{ .obj = @ptrCast(c), .shape = c.shapePtr() };
                                         if (c.resolveOwnSlot(key)) |pslot| {
-                                            site_cache.protoRecord(key, obj.shapePtr(), guards[0 .. n + 1], pslot);
+                                            if (!c.attrAt(pslot).is_accessor) site_cache.protoRecord(key, obj.shapePtr(), guards[0 .. n + 1], pslot);
                                             break;
                                         }
                                         cur = c.proto;
@@ -1513,8 +1521,10 @@ pub const BcVm = struct {
                             }
                         }
                     } else {
+                        const frame_idx_dyn2 = self.frames.items.len - 1;
                         const key = try valueToStringArena(self.arena, key_val);
-                        frame.registers[rdst] = try self.getProp(obj_val, key);
+                        const result_dyn2 = try self.getProp(obj_val, key);
+                        self.frames.items[frame_idx_dyn2].registers[rdst] = result_dyn2;
                     }
                 },
                 .SET_PROP => {
@@ -1532,8 +1542,11 @@ pub const BcVm = struct {
                     const key = key_val.toPtr().string;
                     const obj_val = frame.registers[robj];
                     const val = frame.registers[rval];
+                    // Save func pointer before setProp: a setter dispatch via bcInvokeJs
+                    // may reallocate self.frames, invalidating the `frame` pointer.
+                    const set_func = frame.func;
                     try self.setProp(obj_val, key, val);
-                    const site_cache = &@constCast(frame.func.ic_table)[site_pc];
+                    const site_cache = &@constCast(set_func.ic_table)[site_pc];
                     if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                         const obj = obj_val.toPtr().object;
                         if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
@@ -1556,8 +1569,9 @@ pub const BcVm = struct {
                     const val = frame.registers[rval];
                     if (key_val.bits != 0 and key_val.unbox() == .string) {
                         const key = key_val.toPtr().string;
+                        const set_dyn_func = frame.func;
                         try self.setProp(obj_val, key, val);
-                        const site_cache = &@constCast(frame.func.ic_table)[site_pc];
+                        const site_cache = &@constCast(set_dyn_func.ic_table)[site_pc];
                         if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                             const obj = obj_val.toPtr().object;
                             if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
@@ -1569,6 +1583,38 @@ pub const BcVm = struct {
                     } else {
                         const key = try valueToStringArena(self.arena, key_val);
                         try self.setProp(obj_val, key, val);
+                    }
+                },
+                .DEFINE_ACCESSOR => {
+                    const robj = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
+                    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+                    const kind = code[frame.pc];
+                    frame.pc += 1;
+                    const rfn = code[frame.pc];
+                    frame.pc += 1;
+                    const key = frame.func.chunk.constants[kidx].toPtr().string;
+                    const obj_val = frame.registers[robj];
+                    const fn_val = frame.registers[rfn];
+                    if (obj_val.bits != 0 and obj_val.unbox() == .object) {
+                        const obj = obj_val.toPtr().object;
+                        const member: []const u8 = if (kind == 0) "get" else "set";
+                        if (obj.ownAccessorHolder(key)) |hv| {
+                            // Merge into the existing accessor holder for this key.
+                            try hv.toPtr().object.set(member, fn_val);
+                        } else {
+                            const holder_obj = if (self.heap) |heap|
+                                try JsObject.createOnHeap(heap, self.realm.object_prototype)
+                            else
+                                try JsObject.create(self.arena, self.realm.object_prototype);
+                            try holder_obj.set(member, fn_val);
+                            const holder_val = try val_mod.makeObject(self.arena, holder_obj);
+                            _ = try obj.defineOwnAccessor(key, holder_val, .{ .enumerable = true, .configurable = true });
+                        }
                     }
                 },
                 .GET_THIS => {
@@ -1983,24 +2029,52 @@ pub const BcVm = struct {
         return val_mod.makeObject(self.arena, obj);
     }
 
+    /// Read a member ("get"/"set") off an accessor holder Value.
+    fn accessorMember(holder_val: Value, name: []const u8) Value {
+        if (holder_val.bits == 0 or holder_val.unbox() != .object) return Value{};
+        return holder_val.toPtr().object.getOwn(name) orelse Value{};
+    }
+
+    /// True if `v` is a callable value (function, native, bc_function, bound).
+    fn isCallable(v: Value) bool {
+        if (v.bits == 0) return false;
+        return switch (v.unbox()) {
+            .function, .native_function, .bc_function => true,
+            .object => |obj| obj.internal_kind == .bound_function,
+            else => false,
+        };
+    }
+
+    /// Invoke a getter/setter callable with the given receiver.
+    fn callAccessor(self: *BcVm, fn_val: Value, this_val: Value, args: []const Value) !Value {
+        const fp = @import("../runtime/builtins/function_proto.zig");
+        return fp.invokeCallback(self.arena, this_val, fn_val, args);
+    }
+
     fn getProp(self: *BcVm, obj_val: Value, key: []const u8) !Value {
         if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);
         switch (obj_val.unbox()) {
             .object => |obj| {
-                // Special case: "length" on arrays.
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength()));
                 }
-                // ES2015 virtual "size" accessor on Map/Set.
                 if (std.mem.eql(u8, key, "size")) {
                     if (@import("../runtime/builtins/es2015_collections.zig").collectionSize(obj)) |n| {
                         return val_mod.makeNumber(self.arena, @floatFromInt(n));
                     }
                 }
-                if (obj.resolveOwnSlot(key)) |slot| {
-                    if (obj.getOwnBySlot(obj.shapePtr(), slot)) |v| return v;
+                if (obj.findProperty(key)) |loc| {
+                    const a = loc.holder.attrAt(loc.slot);
+                    const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+                    if (a.is_accessor) {
+                        const getter = accessorMember(raw, "get");
+                        // Only invoke if getter is an actual callable (not undefined/null).
+                        if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                        return try self.callAccessor(getter, obj_val, &[_]Value{});
+                    }
+                    if (raw.bits != 0) return raw;
+                    return val_mod.makeUndefined(self.arena);
                 }
-                if (obj.get(key)) |v| return v;
                 return val_mod.makeUndefined(self.arena);
             },
             .string => |s| {
@@ -2036,6 +2110,13 @@ pub const BcVm = struct {
                 // Phase 4d: delegate to Function.prototype (call, apply, bind).
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
+                    if (proto.get(key)) |v| return v;
+                }
+                return val_mod.makeUndefined(self.arena);
+            },
+            .symbol => {
+                const realm_mod = @import("../runtime/realm.zig");
+                if (realm_mod.active_symbol_proto) |proto| {
                     if (proto.get(key)) |v| return v;
                 }
                 return val_mod.makeUndefined(self.arena);
@@ -2076,14 +2157,21 @@ pub const BcVm = struct {
         if (obj_val.bits == 0) return;
         switch (obj_val.unbox()) {
             .object => |obj| {
-                if (obj.resolveOwnSlot(key)) |slot| {
-                    // Respect non-writable attrs: skip fast-path if not writable.
-                    const attr_ok = if (slot < obj.attrs.items.len) obj.attrs.items[slot].writable else true;
-                    if (attr_ok and obj.setOwnBySlot(obj.shapePtr(), slot, value)) {
-                        return;
-                    } else if (!attr_ok) {
-                        return; // sloppy: silent no-op for non-writable
+                if (obj.findProperty(key)) |loc| {
+                    const a = loc.holder.attrAt(loc.slot);
+                    if (a.is_accessor) {
+                        const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+                        const setter = accessorMember(raw, "set");
+                        // Only invoke if setter is an actual callable (not undefined/null).
+                        if (isCallable(setter)) _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
+                        return; // accessor with no setter: sloppy no-op
                     }
+                    if (loc.holder == obj) {
+                        if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return;
+                        _ = obj.setOwnBySlot(obj.shapePtr(), loc.slot, value);
+                        return;
+                    }
+                    // inherited data property: fall through to create an own (shadow).
                 }
                 try obj.set(key, value);
             },
@@ -2274,7 +2362,14 @@ pub const BcVm = struct {
                             const result = fn_ptr.invoke(self.arena, this_val_call, args) catch {
                                 return "TypeError: Error constructor threw";
                             };
-                            const final_result = if (result.bits != 0 and result.unbox() == .object) result else this_val_call;
+                            // If the factory returned a primitive non-null/undefined value
+                            // (e.g. a Symbol), honour that return value directly (factory pattern).
+                            const final_result = if (result.bits != 0 and result.unbox() != .undefined_ and result.unbox() != .null_ and result.unbox() != .object)
+                                result
+                            else if (result.bits != 0 and result.unbox() == .object)
+                                result
+                            else
+                                this_val_call;
                             self.frames.items[self.frames.items.len - 1].registers[ret_dst] = final_result;
                             return null;
                         }
@@ -2749,6 +2844,7 @@ fn classifyTypeof(v: Value) struct {
         .boolean => .{ .tag = .boolean, .shape = null, .result = "boolean" },
         .number => .{ .tag = .number, .shape = null, .result = "number" },
         .string => .{ .tag = .string, .shape = null, .result = "string" },
+        .symbol => .{ .tag = .symbol, .shape = null, .result = "symbol" },
         .function, .bc_function, .native_function => .{ .tag = .function_like, .shape = null, .result = "function" },
         .object => |obj| blk: {
             const callable = obj.get("__call__") != null;
@@ -2784,6 +2880,7 @@ pub fn isTruthy(v: Value) bool {
         .bc_function => true,
         .object => true,
         .native_function => true,
+        .symbol => true,
     };
 }
 
@@ -2809,6 +2906,7 @@ pub fn typeofValue(v: Value) []const u8 {
         .boolean => "boolean",
         .number => "number",
         .string => "string",
+        .symbol => "symbol",
         .function => "function",
         .bc_function => "function",
         .object => |obj| if (obj.get("__call__") != null) "function" else "object",
@@ -2840,6 +2938,7 @@ pub fn toNumber(v: Value) f64 {
         .bc_function => std.math.nan(f64),
         .object => std.math.nan(f64),
         .native_function => std.math.nan(f64),
+        .symbol => std.math.nan(f64),
     };
 }
 
@@ -2870,6 +2969,7 @@ fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
             break :blk "[object Object]";
         },
         .native_function => "function () { [native code] }",
+        .symbol => |sd| try std.fmt.allocPrint(arena, "Symbol({s})", .{sd.description orelse ""}),
     };
 }
 
@@ -2960,10 +3060,11 @@ fn jsStrictEqual(x: Value, y: Value) bool {
         .bc_function => return x.bits == y.bits,
         .object => return x.toPtr().object == y.toPtr().object,
         .native_function => return x.bits == y.bits,
+        .symbol => return x.toPtr().symbol == y.toPtr().symbol,
     }
 }
 
-const TypeTag = enum { undefined_, null_, boolean, number, string, function, bc_function, object, native_function };
+const TypeTag = enum { undefined_, null_, boolean, number, string, symbol, function, bc_function, object, native_function };
 
 fn typeTag(v: Value) TypeTag {
     if (v.bits == 0) return .undefined_;
@@ -2973,6 +3074,7 @@ fn typeTag(v: Value) TypeTag {
         .boolean => .boolean,
         .number => .number,
         .string => .string,
+        .symbol => .symbol,
         .function => .function,
         .bc_function => .bc_function,
         .object => .object,

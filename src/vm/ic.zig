@@ -155,6 +155,7 @@ pub const TypeofTag = enum(u8) {
     boolean,
     number,
     string,
+    symbol,
     function_like,
     object_like,
 };

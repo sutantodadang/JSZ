@@ -258,10 +258,13 @@ pub const FuncExpr = struct {
 };
 
 /// Phase 3a: a single property in an object literal.
+pub const PropKind = enum { init, get, set };
+
 pub const ObjectProp = struct {
     /// Property key (always stored as a string, even for numeric keys).
     key: []const u8,
     value: *Node,
+    kind: PropKind = .init,
 };
 
 /// Phase 3a: object literal { key: value, ... }

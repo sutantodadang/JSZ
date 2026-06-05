@@ -2365,6 +2365,7 @@ pub const Parser = struct {
         _ = self.expect(.left_brace) orelse return null;
         var props = std.ArrayList(ast.ObjectProp){};
         while (!self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
+            const prop_start = self.current.start;
             // Key: identifier, string literal, or number literal.
             var key: []const u8 = undefined;
             if (self.check(.identifier)) {
@@ -2402,9 +2403,55 @@ pub const Parser = struct {
                 }
                 return null;
             }
+            // Accessor: `get name(...) { ... }` / `set name(v) { ... }`.
+            // `key` holds "get"/"set"; an accessor only if a property name follows
+            // (not ':' for a data prop named get/set, not '(' for a method, not end).
+            if ((std.mem.eql(u8, key, "get") or std.mem.eql(u8, key, "set")) and
+                !self.check(.colon) and !self.check(.comma) and
+                !self.check(.right_brace) and !self.check(.left_paren))
+            {
+                const acc_kind: ast.PropKind = if (key[0] == 'g') .get else .set;
+                var aname: []const u8 = undefined;
+                if (self.check(.identifier) or self.check(.string)) {
+                    aname = self.current.value_str;
+                    _ = self.advance();
+                } else if (self.check(.number)) {
+                    const n = self.current.value_num;
+                    _ = self.advance();
+                    aname = if (n == @trunc(n) and n >= 0 and n < 1e15)
+                        std.fmt.allocPrint(self.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch { self.had_error = true; return null; }
+                    else
+                        std.fmt.allocPrint(self.arena, "{d}", .{n}) catch { self.had_error = true; return null; };
+                } else {
+                    self.had_error = true;
+                    self.error_info = ParseError{ .message = "expected accessor name", .line = self.current.line, .column = self.current.column };
+                    return null;
+                }
+                const acc_params = self.parseFunctionParams() orelse return null;
+                const acc_body = self.parseFunctionBody() orelse return null;
+                const acc_fn = self.makeNode(.function_expr, prop_start, self.current.start, .{
+                    .function_expr = .{
+                        .name = null,
+                        .params = acc_params.params,
+                        .param_defaults = acc_params.param_defaults,
+                        .rest_param = acc_params.rest_param,
+                        .body = acc_body,
+                        .is_arrow = false,
+                        .is_generator = false,
+                        .is_async = false,
+                        .is_strict = hasUseStrict(acc_body),
+                    },
+                }) orelse return null;
+                props.append(self.arena, ast.ObjectProp{ .key = aname, .value = acc_fn, .kind = acc_kind }) catch {
+                    self.had_error = true;
+                    return null;
+                };
+                if (!self.match(.comma)) break;
+                continue;
+            }
             _ = self.expect(.colon) orelse return null;
             const val_node = self.parseAssignmentExpr() orelse return null;
-            props.append(self.arena, ast.ObjectProp{ .key = key, .value = val_node }) catch {
+            props.append(self.arena, ast.ObjectProp{ .key = key, .value = val_node, .kind = .init }) catch {
                 self.had_error = true;
                 return null;
             };

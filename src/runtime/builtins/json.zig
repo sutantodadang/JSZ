@@ -65,8 +65,8 @@ fn stringifyValue(
                 try stringifyObject(arena, buf, obj, indent, depth);
             }
         },
-        // functions and native_function: produce nothing (caller uses "null" for arrays)
-        .function, .bc_function, .native_function => {},
+        // functions, native_function, symbol: produce nothing (caller uses "null" for arrays)
+        .function, .bc_function, .native_function, .symbol => {},
     }
 }
 

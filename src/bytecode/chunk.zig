@@ -333,6 +333,28 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
                 try writer.print(" R{d}[K{d}] = R{d}", .{ robj, kidx, rval });
             }
         },
+        .DEFINE_ACCESSOR => {
+            const robj = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
+            const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+            const kind = code[new_pc];
+            new_pc += 1;
+            const rfn = code[new_pc];
+            new_pc += 1;
+            const knd: []const u8 = if (kind == 0) "get" else "set";
+            if (kidx < chunk.constants.len and chunk.constants[kidx].bits != 0) {
+                switch (chunk.constants[kidx].unbox()) {
+                    .string => |s| try writer.print(" R{d}[\"{s}\"] {s}= R{d}", .{ robj, s, knd, rfn }),
+                    else => try writer.print(" R{d}[K{d}] {s}= R{d}", .{ robj, kidx, knd, rfn }),
+                }
+            } else {
+                try writer.print(" R{d}[K{d}] {s}= R{d}", .{ robj, kidx, knd, rfn });
+            }
+        },
         .GET_PROP => {
             const rdst = code[new_pc];
             new_pc += 1;

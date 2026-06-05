@@ -24,7 +24,8 @@ pub const PropAttr = packed struct(u8) {
     writable: bool = true,
     enumerable: bool = true,
     configurable: bool = true,
-    _pad: u5 = 0,
+    is_accessor: bool = false,
+    _pad: u4 = 0,
 };
 
 pub const JsObject = struct {
@@ -98,10 +99,13 @@ pub const JsObject = struct {
         return heap.allocateArray(proto);
     }
 
-    /// Get own property (no proto walk).
+    /// Get own property (no proto walk). Returns null for accessor slots so
+    /// enumeration and the plain `get` path skip them (accessor dispatch happens
+    /// in the VM via `findProperty`/`ownAccessorHolder`).
     pub fn getOwn(self: *JsObject, key: []const u8) ?Value {
         if (self.is_array and std.mem.eql(u8, key, "length")) return null;
         if (self.shape.key_to_slot.get(key)) |slot| {
+            if (slot < self.attrs.items.len and self.attrs.items[slot].is_accessor) return null;
             if (slot < self.slots.items.len) return self.slots.items[slot];
         }
         return null;
@@ -242,15 +246,25 @@ pub const JsObject = struct {
     pub fn defineOwnData(self: *JsObject, key: []const u8, value: Value, attr: PropAttr) !bool {
         if (self.shape.key_to_slot.get(key)) |slot| {
             const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
-            if (!cur.configurable) {
-                if (attr.configurable) return false;
-                if (attr.enumerable != cur.enumerable) return false;
-                if (!cur.writable) return false;
+            // Converting accessor → data: delete the accessor slot first so a
+            // shape transition happens and stale ICs miss.
+            if (cur.is_accessor) {
+                if (!cur.configurable) return false;
+                _ = try self.deleteOwn(key);
+                // Fall through to the add-new-key path below.
+            } else {
+                if (!cur.configurable) {
+                    if (attr.configurable) return false;
+                    if (attr.enumerable != cur.enumerable) return false;
+                    if (!cur.writable) return false;
+                }
+                if (slot < self.slots.items.len) self.slots.items[slot] = value;
+                if (slot < self.attrs.items.len) self.attrs.items[slot] = attr;
+                return true;
             }
-            if (slot < self.slots.items.len) self.slots.items[slot] = value;
-            if (slot < self.attrs.items.len) self.attrs.items[slot] = attr;
-            return true;
-        } else {
+        }
+        // New key (or just-deleted-accessor) path.
+        {
             if (!self.extensible) return false;
             self.shape = try self.shape_manager.transitionAdd(self.shape, key);
             const new_slot = self.shape.key_to_slot.get(key) orelse unreachable;
@@ -301,6 +315,56 @@ pub const JsObject = struct {
             if (a.configurable or a.writable) return false;
         }
         return true;
+    }
+
+    /// Define/redefine an own ACCESSOR property. `holder` is a Value boxing a
+    /// JsObject with own "get"/"set". Forces a shape transition so any stale
+    /// data inline cache for the previous shape misses. Returns false if
+    /// disallowed (non-configurable redefine, or add when non-extensible).
+    pub fn defineOwnAccessor(self: *JsObject, key: []const u8, holder: Value, attr_in: PropAttr) !bool {
+        var attr = attr_in;
+        attr.is_accessor = true;
+        if (self.shape.key_to_slot.get(key)) |slot| {
+            const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
+            if (!cur.configurable) return false;
+            _ = try self.deleteOwn(key);
+        } else {
+            if (!self.extensible) return false;
+        }
+        self.shape = try self.shape_manager.transitionAdd(self.shape, key);
+        const new_slot = self.shape.key_to_slot.get(key) orelse unreachable;
+        try self.growSlots(new_slot + 1);
+        self.slots.items[new_slot] = holder;
+        self.attrs.items[new_slot] = attr;
+        return true;
+    }
+
+    /// If own `key` is an accessor, return the holder Value (boxing get/set).
+    pub fn ownAccessorHolder(self: *JsObject, key: []const u8) ?Value {
+        const slot = self.shape.key_to_slot.get(key) orelse return null;
+        if (slot >= self.attrs.items.len or !self.attrs.items[slot].is_accessor) return null;
+        if (slot >= self.slots.items.len) return null;
+        return self.slots.items[slot];
+    }
+
+    /// Attribute bits at a resolved own slot.
+    pub fn attrAt(self: *JsObject, slot: u32) PropAttr {
+        if (slot >= self.attrs.items.len) return PropAttr{};
+        return self.attrs.items[slot];
+    }
+
+    /// Locate a property along the prototype chain (own first). Returns the
+    /// holder object that owns `key` and the slot index, or null.
+    pub fn findProperty(self: *JsObject, key: []const u8) ?struct { holder: *JsObject, slot: u32 } {
+        var depth: usize = 0;
+        var cur: ?*JsObject = self;
+        while (cur) |o| {
+            if (depth >= MAX_PROTO_DEPTH) break;
+            depth += 1;
+            if (o.shape.key_to_slot.get(key)) |slot| return .{ .holder = o, .slot = slot };
+            cur = o.proto;
+        }
+        return null;
     }
 };
 

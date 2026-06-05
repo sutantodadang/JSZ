@@ -814,10 +814,18 @@ const FnCompiler = struct {
             const rval = try self.compileExpr(prop.value);
             const sv = try val_mod.makeString(self.arena, prop.key);
             const kidx = try self.addConstant(sv);
-            try self.emitOp(.SET_PROP, line);
-            try self.emitU8(robj);
-            try self.emitU16(kidx);
-            try self.emitU8(rval);
+            if (prop.kind == .init) {
+                try self.emitOp(.SET_PROP, line);
+                try self.emitU8(robj);
+                try self.emitU16(kidx);
+                try self.emitU8(rval);
+            } else {
+                try self.emitOp(.DEFINE_ACCESSOR, line);
+                try self.emitU8(robj);
+                try self.emitU16(kidx);
+                try self.emitU8(if (prop.kind == .get) @as(u8, 0) else @as(u8, 1));
+                try self.emitU8(rval);
+            }
             self.freeReg(); // free rval
         }
         return robj;

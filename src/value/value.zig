@@ -33,6 +33,14 @@ pub const NativeFnEntry = struct {
 
 pub const NativeBinding = struct { name: []const u8, entry: NativeFnEntry };
 
+/// Backing data for a Symbol primitive. Identity is by pointer (===).
+pub const SymbolData = struct {
+    id: u64,
+    description: ?[]const u8 = null,
+};
+
+var g_symbol_counter: u64 = 0;
+
 /// Internal tagged JavaScript value. Arena-allocated per eval call.
 pub const JsValue = union(enum) {
     undefined_,
@@ -48,6 +56,8 @@ pub const JsValue = union(enum) {
     object: *JsObject,
     /// Phase 3a: native function (host-provided).
     native_function: NativeFnEntry,
+    /// ES2015 Symbol primitive (identity by pointer).
+    symbol: *SymbolData,
 
     pub const Tag = std.meta.Tag(JsValue);
 };
@@ -227,6 +237,7 @@ pub const Value = extern struct {
             .bc_function => std.math.nan(f64),
             .object => std.math.nan(f64),
             .native_function => std.math.nan(f64),
+            .symbol => std.math.nan(f64),
         };
     }
 
@@ -245,6 +256,7 @@ pub const Value = extern struct {
             .bc_function => |c| c.func.name orelse "function",
             .object => "[object Object]",
             .native_function => "function",
+            .symbol => "Symbol()",
         };
     }
 };
@@ -295,6 +307,15 @@ pub fn makeBcFunction(arena: std.mem.Allocator, closure: *BcClosure) !Value {
 pub fn makeObject(arena: std.mem.Allocator, obj: *JsObject) !Value {
     const v = try arena.create(JsValue);
     v.* = .{ .object = obj };
+    return Value.fromPtr(v);
+}
+
+pub fn makeSymbol(arena: std.mem.Allocator, description: ?[]const u8) !Value {
+    const sd = try arena.create(SymbolData);
+    g_symbol_counter += 1;
+    sd.* = .{ .id = g_symbol_counter, .description = description };
+    const v = try arena.create(JsValue);
+    v.* = .{ .symbol = sd };
     return Value.fromPtr(v);
 }
 

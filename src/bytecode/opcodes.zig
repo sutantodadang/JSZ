@@ -172,6 +172,10 @@ pub const Op = enum(u8) {
     /// when the resolved callee is a plain bytecode function; otherwise degrades
     /// to a normal method call followed by a return.
     TAIL_METHOD_CALL,
+    /// DEFINE_ACCESSOR: op, Robj u8, Kname u16-LE, kind u8 (0=get,1=set), Rfn u8.
+    /// Installs an accessor (getter if kind==0, setter if kind==1) named Kname on
+    /// R[Robj], merging into an existing accessor holder for the same key.
+    DEFINE_ACCESSOR,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -248,6 +252,7 @@ pub fn instrSize(op: Op) usize {
         .DEBUGGER => 1,
         .YIELD => 2,
         .TAIL_METHOD_CALL => 4,
+        .DEFINE_ACCESSOR => 6,
     };
 }
 

@@ -219,6 +219,7 @@ pub fn valueToDisplayString(arena: std.mem.Allocator, v: Value) ![]const u8 {
             break :blk try arena.dupe(u8, "[object Object]");
         },
         .native_function => try arena.dupe(u8, "function () { [native code] }"),
+        .symbol => |sd| try std.fmt.allocPrint(arena, "Symbol({s})", .{sd.description orelse ""}),
     };
 }
 

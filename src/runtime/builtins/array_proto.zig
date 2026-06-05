@@ -679,5 +679,6 @@ fn jsStrictEqual(x: Value, y: Value) bool {
         .function => x.bits == y.bits,
         .bc_function => x.bits == y.bits,
         .native_function => x.bits == y.bits,
+        .symbol => x.toPtr().symbol == y.toPtr().symbol,
     };
 }

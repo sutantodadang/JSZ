@@ -23,6 +23,8 @@ const date_mod = @import("./builtins/date.zig");
 const es2015_collections_mod = @import("./builtins/es2015_collections.zig");
 const promise_mod = @import("./builtins/promise.zig");
 const console_mod = @import("./builtins/console.zig");
+// ES2015 Symbol
+const symbol_mod = @import("./builtins/symbol.zig");
 
 // ---------------------------------------------------------------- Context interface ---
 
@@ -222,6 +224,8 @@ pub var active_regexp_proto: ?*JsObject = null;
 /// Phase 4d: thread-local for Function.prototype.
 pub var active_function_proto: ?*JsObject = null;
 pub var active_promise_proto: ?*JsObject = null;
+/// ES2015 Symbol.prototype (autoboxing lookup for symbol primitives).
+pub var active_symbol_proto: ?*JsObject = null;
 
 /// Phase 4b: pending JS exception Value (set by JSON.parse on error).
 /// VMs check this after catching error.JsException from a native call.
@@ -1071,6 +1075,23 @@ pub const Realm = struct {
         }
         try env.define("console", try val_mod.makeObject(arena, console_obj));
 
+        // ---- ES2015 Symbol ----
+        const symbol_proto = try JsObject.create(arena, object_proto);
+        try symbol_proto.set("toString", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolToString));
+        active_symbol_proto = symbol_proto;
+        const symbol_ctor = try JsObject.create(arena, null);
+        try symbol_ctor.set("__call__", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolCall));
+        try symbol_ctor.set("prototype", try val_mod.makeObject(arena, symbol_proto));
+        try symbol_ctor.set("for", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolFor));
+        try symbol_ctor.set("keyFor", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolKeyFor));
+        // Well-known symbols (identity constants; inert in S1).
+        const wk_names = [_][]const u8{ "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable", "match", "replace", "search", "split", "species", "toPrimitive", "toStringTag", "unscopables" };
+        for (wk_names) |name| {
+            const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
+            try symbol_ctor.set(name, try val_mod.makeSymbol(arena, desc));
+        }
+        try env.define("Symbol", try val_mod.makeObject(arena, symbol_ctor));
+
         // ---- ES2020 globalThis (+ Node-compatible `global`) ----
         try installGlobalThis(arena, env, object_proto);
 
@@ -1214,6 +1235,7 @@ pub const Realm = struct {
         active_regexp_proto = null;
         active_function_proto = null;
         active_promise_proto = null;
+        active_symbol_proto = null;
         active_global_env = null;
         pending_exception = Value{};
     }

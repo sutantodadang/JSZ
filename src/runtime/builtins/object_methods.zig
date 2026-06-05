@@ -202,6 +202,18 @@ fn coerceKey(arena: std.mem.Allocator, v: Value) !?[]const u8 {
     };
 }
 
+fn makeAccessorHolder(arena: std.mem.Allocator, getter: ?Value, setter: ?Value) !Value {
+    const realm_mod = @import("../realm.zig");
+    const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+    const holder = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, obj_proto)
+    else
+        try JsObject.create(arena, obj_proto);
+    try holder.set("get", getter orelse try val_mod.makeUndefined(arena));
+    try holder.set("set", setter orelse try val_mod.makeUndefined(arena));
+    return val_mod.makeObject(arena, holder);
+}
+
 /// Object.getPrototypeOf(o): return proto of o, or null for primitives.
 pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeNull(arena);
@@ -243,9 +255,20 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     const key = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
 
     const a = obj.ownAttr(key) orelse return val_mod.makeUndefined(arena);
-    const v = obj.getOwn(key) orelse try val_mod.makeUndefined(arena);
 
     const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+
+    if (obj.ownAccessorHolder(key)) |holder_val| {
+        const desc = try JsObject.create(arena, obj_proto);
+        const hobj = holder_val.toPtr().object;
+        try desc.set("get", hobj.getOwn("get") orelse try val_mod.makeUndefined(arena));
+        try desc.set("set", hobj.getOwn("set") orelse try val_mod.makeUndefined(arena));
+        try desc.set("enumerable", try val_mod.makeBool(arena, a.enumerable));
+        try desc.set("configurable", try val_mod.makeBool(arena, a.configurable));
+        return val_mod.makeObject(arena, desc);
+    }
+
+    const v = obj.getOwn(key) orelse try val_mod.makeUndefined(arena);
     const desc = try JsObject.create(arena, obj_proto);
     try desc.set("value", v);
     try desc.set("writable", try val_mod.makeBool(arena, a.writable));
@@ -270,7 +293,16 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     const desc = args[2].toPtr().object;
 
     if (desc.hasOwn("get") or desc.hasOwn("set")) {
-        return throwTypeError(arena, "accessor descriptors not supported yet");
+        const getter: ?Value = if (desc.hasOwn("get")) desc.getOwn("get") else null;
+        const setter: ?Value = if (desc.hasOwn("set")) desc.getOwn("set") else null;
+        const holder = try makeAccessorHolder(arena, getter, setter);
+        const attr = PropAttr{
+            .enumerable = descTruthy(desc.getOwn("enumerable")),
+            .configurable = descTruthy(desc.getOwn("configurable")),
+        };
+        const ok = try obj.defineOwnAccessor(key, holder, attr);
+        if (!ok) return throwTypeError(arena, "cannot redefine property");
+        return args[0];
     }
 
     const value = desc.getOwn("value") orelse try val_mod.makeUndefined(arena);
@@ -303,7 +335,16 @@ pub fn nativeObjectDefineProperties(arena: std.mem.Allocator, _: Value, args: []
         const desc = desc_val.toPtr().object;
 
         if (desc.hasOwn("get") or desc.hasOwn("set")) {
-            return throwTypeError(arena, "accessor descriptors not supported yet");
+            const getter: ?Value = if (desc.hasOwn("get")) desc.getOwn("get") else null;
+            const setter: ?Value = if (desc.hasOwn("set")) desc.getOwn("set") else null;
+            const holder = try makeAccessorHolder(arena, getter, setter);
+            const attr = PropAttr{
+                .enumerable = descTruthy(desc.getOwn("enumerable")),
+                .configurable = descTruthy(desc.getOwn("configurable")),
+            };
+            const ok = try obj.defineOwnAccessor(k, holder, attr);
+            if (!ok) return throwTypeError(arena, "cannot redefine property");
+            continue;
         }
 
         const value = desc.getOwn("value") orelse try val_mod.makeUndefined(arena);
