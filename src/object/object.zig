@@ -18,6 +18,15 @@ const ShapeManager = shape_mod.ShapeManager;
 /// Maximum prototype chain depth before we give up (cycle guard, Phase 3a).
 const MAX_PROTO_DEPTH: usize = 64;
 
+/// Per-property attribute bits (ES5.1 property descriptor flags). Default = all
+/// true, matching the behavior of a plain assigned data property.
+pub const PropAttr = packed struct(u8) {
+    writable: bool = true,
+    enumerable: bool = true,
+    configurable: bool = true,
+    _pad: u5 = 0,
+};
+
 pub const JsObject = struct {
     /// Prototype link (null = Object.prototype or bare object).
     proto: ?*JsObject = null,
@@ -45,6 +54,9 @@ pub const JsObject = struct {
     shape: *Shape,
     /// Slot values indexed by shape key_to_slot.
     slots: std.ArrayListUnmanaged(Value) = .empty,
+    /// Per-slot attribute bits, parallel to `slots` (same index). Kept in
+    /// lockstep with `slots` everywhere slots grow/shrink. Default all-true.
+    attrs: std.ArrayListUnmanaged(PropAttr) = .empty,
 
     /// Allocate a plain object with an optional prototype.
     pub fn create(arena: std.mem.Allocator, proto: ?*JsObject) !*JsObject {
@@ -112,31 +124,35 @@ pub const JsObject = struct {
         return null;
     }
 
-    /// Set own property. Updates array_length if key is an array index.
+    /// Set own property. Respects non-writable data props (sloppy: silent no-op)
+    /// and non-extensibility (cannot add new keys). Keeps `attrs` in lockstep.
     pub fn set(self: *JsObject, key: []const u8, value: Value) !void {
         if (self.shape.key_to_slot.get(key)) |slot| {
             if (slot < self.slots.items.len) {
+                if (slot < self.attrs.items.len and !self.attrs.items[slot].writable) return;
                 self.slots.items[slot] = value;
             }
         } else {
+            if (!self.extensible) return;
             self.shape = try self.shape_manager.transitionAdd(self.shape, key);
             const new_slot = self.shape.key_to_slot.get(key) orelse unreachable;
-            if (new_slot == self.slots.items.len) {
-                try self.slots.append(self.arena, value);
-            } else {
-                while (self.slots.items.len <= new_slot) {
-                    try self.slots.append(self.arena, Value{});
-                }
-                self.slots.items[new_slot] = value;
-            }
+            try self.growSlots(new_slot + 1);
+            self.slots.items[new_slot] = value;
+            self.attrs.items[new_slot] = .{};
         }
         if (self.is_array) {
-            // If key parses as a non-negative integer, bump array_length.
             const idx = std.fmt.parseUnsigned(u32, key, 10) catch return;
             if (idx >= self.array_length) {
                 self.array_length = idx + 1;
             }
         }
+    }
+
+    /// Grow `slots` and `attrs` together to at least `n` entries, padding with
+    /// undefined values and default (all-true) attributes.
+    fn growSlots(self: *JsObject, n: usize) !void {
+        while (self.slots.items.len < n) try self.slots.append(self.arena, Value{});
+        while (self.attrs.items.len < n) try self.attrs.append(self.arena, .{});
     }
 
     /// Has own property check.
@@ -179,24 +195,112 @@ pub const JsObject = struct {
         return true;
     }
 
-    /// Delete own property and transition shape if key exists.
+    /// Delete own property and transition shape if key exists. Honors
+    /// non-configurable (returns false without deleting). Rebuilds `attrs`
+    /// parallel to the new slot order.
     pub fn deleteOwn(self: *JsObject, key: []const u8) !bool {
-        if (self.shape.key_to_slot.get(key) == null) return false;
+        const del_slot = self.shape.key_to_slot.get(key) orelse return false;
+        if (del_slot < self.attrs.items.len and !self.attrs.items[del_slot].configurable) return false;
         const old_shape = self.shape;
         self.shape = try self.shape_manager.transitionDelete(old_shape, key);
         var new_slots: std.ArrayListUnmanaged(Value) = .empty;
+        var new_attrs: std.ArrayListUnmanaged(PropAttr) = .empty;
         for (self.shape.key_order.items) |k| {
             const old_slot = old_shape.key_to_slot.get(k);
             const v = if (old_slot) |s| (if (s < self.slots.items.len) self.slots.items[s] else Value{}) else Value{};
+            const a = if (old_slot) |s| (if (s < self.attrs.items.len) self.attrs.items[s] else PropAttr{}) else PropAttr{};
             try new_slots.append(self.arena, v);
+            try new_attrs.append(self.arena, a);
         }
         self.slots = new_slots;
+        self.attrs = new_attrs;
         return true;
     }
 
     /// Ordered own-property keys (insertion order). Backed by the shape.
     pub fn ownKeys(self: *JsObject) []const []const u8 {
         return self.shape.key_order.items;
+    }
+
+    /// True if `key` is an own enumerable property. Missing key → false.
+    pub fn isEnumerable(self: *JsObject, key: []const u8) bool {
+        const slot = self.shape.key_to_slot.get(key) orelse return false;
+        if (slot >= self.attrs.items.len) return true;
+        return self.attrs.items[slot].enumerable;
+    }
+
+    /// Own attribute bits for `key`, or null if not an own property.
+    pub fn ownAttr(self: *JsObject, key: []const u8) ?PropAttr {
+        const slot = self.shape.key_to_slot.get(key) orelse return null;
+        if (slot >= self.attrs.items.len) return PropAttr{};
+        return self.attrs.items[slot];
+    }
+
+    /// Define or redefine an own DATA property with explicit attributes.
+    /// Returns false (caller should throw TypeError) when disallowed by
+    /// non-configurability or non-extensibility. Honors lockstep growth.
+    pub fn defineOwnData(self: *JsObject, key: []const u8, value: Value, attr: PropAttr) !bool {
+        if (self.shape.key_to_slot.get(key)) |slot| {
+            const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
+            if (!cur.configurable) {
+                if (attr.configurable) return false;
+                if (attr.enumerable != cur.enumerable) return false;
+                if (!cur.writable) return false;
+            }
+            if (slot < self.slots.items.len) self.slots.items[slot] = value;
+            if (slot < self.attrs.items.len) self.attrs.items[slot] = attr;
+            return true;
+        } else {
+            if (!self.extensible) return false;
+            self.shape = try self.shape_manager.transitionAdd(self.shape, key);
+            const new_slot = self.shape.key_to_slot.get(key) orelse unreachable;
+            try self.growSlots(new_slot + 1);
+            self.slots.items[new_slot] = value;
+            self.attrs.items[new_slot] = attr;
+            if (self.is_array) {
+                const idx = std.fmt.parseUnsigned(u32, key, 10) catch return true;
+                if (idx >= self.array_length) self.array_length = idx + 1;
+            }
+            return true;
+        }
+    }
+
+    /// Object.preventExtensions: forbid new own properties.
+    pub fn preventExtensionsSelf(self: *JsObject) void {
+        self.extensible = false;
+    }
+
+    /// Object.seal: prevent extensions + mark all own props non-configurable.
+    pub fn sealSelf(self: *JsObject) void {
+        self.extensible = false;
+        for (self.attrs.items) |*a| a.configurable = false;
+    }
+
+    /// Object.freeze: seal + mark all own data props non-writable.
+    pub fn freezeSelf(self: *JsObject) void {
+        self.extensible = false;
+        for (self.attrs.items) |*a| {
+            a.configurable = false;
+            a.writable = false;
+        }
+    }
+
+    /// Object.isSealed: non-extensible and every own prop non-configurable.
+    pub fn isSealedSelf(self: *JsObject) bool {
+        if (self.extensible) return false;
+        for (self.attrs.items) |a| {
+            if (a.configurable) return false;
+        }
+        return true;
+    }
+
+    /// Object.isFrozen: sealed and every own data prop non-writable.
+    pub fn isFrozenSelf(self: *JsObject) bool {
+        if (self.extensible) return false;
+        for (self.attrs.items) |a| {
+            if (a.configurable or a.writable) return false;
+        }
+        return true;
     }
 };
 

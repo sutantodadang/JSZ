@@ -74,6 +74,13 @@ pub const JitProfile = struct {
     deopts: usize = 0,
 };
 
+/// Phase 11: snapshot of IC hit-rate counters from the most recent bc eval.
+pub const IcProfile = struct {
+    own_hits: u64 = 0,
+    proto_hits: u64 = 0,
+    misses: u64 = 0,
+};
+
 /// Internal implementation of the public Isolate.
 pub const IsolateImpl = struct {
     /// Base allocator (owns the eval arena and the GC heap).
@@ -92,6 +99,10 @@ pub const IsolateImpl = struct {
     jit_mode: jit_mod.JitMode = .off,
     /// Phase 9: profile snapshot from the most recent bc-mode eval.
     last_jit_profile: JitProfile = .{},
+    /// Phase 11: enable IC instrumentation for the next bc eval.
+    ic_stats_enabled: bool = false,
+    /// Phase 11: IC profile snapshot from the most recent bc eval.
+    last_ic_profile: IcProfile = .{},
     /// W3: gas (instruction) budget and wall-clock budget (ms) for the next
     /// bc-mode eval. 0 = unlimited.
     gas_limit: u64 = 0,
@@ -152,6 +163,10 @@ pub const IsolateImpl = struct {
     /// Phase 9: set the JIT mode for the next eval call.
     pub fn setJitMode(self: *IsolateImpl, m: jit_mod.JitMode) void {
         self.jit_mode = m;
+    }
+
+    pub fn setIcStats(self: *IsolateImpl, on: bool) void {
+        self.ic_stats_enabled = on;
     }
 
     /// Run one eval call in the bytecode VM (W2: bc is the default engine).
@@ -229,6 +244,7 @@ pub const IsolateImpl = struct {
         var bc_vm = BcVm.initWithHeap(arena, realm, &self.heap);
         // W3: apply resource limits to this run.
         bc_vm.gas_limit = self.gas_limit;
+        bc_vm.ic_stats_enabled = self.ic_stats_enabled;
         if (self.time_limit_ms != 0)
             bc_vm.deadline_ns = std.time.nanoTimestamp() + @as(i128, self.time_limit_ms) * std.time.ns_per_ms;
         // Phase 9: attach JIT profiler when a mode other than .off is requested.
@@ -251,6 +267,15 @@ pub const IsolateImpl = struct {
             };
         } else {
             self.last_jit_profile = .{};
+        }
+        if (self.ic_stats_enabled) {
+            self.last_ic_profile = .{
+                .own_hits = bc_vm.ic_own_hits,
+                .proto_hits = bc_vm.ic_proto_hits,
+                .misses = bc_vm.ic_misses,
+            };
+        } else {
+            self.last_ic_profile = .{};
         }
         promise_mod.runMicrotasks(arena);
         return switch (outcome) {

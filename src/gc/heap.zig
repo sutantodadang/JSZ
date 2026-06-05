@@ -88,6 +88,7 @@ pub const Heap = struct {
             if (hdr.kind == .js_object) {
                 const slot: *GcJsObjectSlot = @fieldParentPtr("header", hdr);
                 slot.object.slots.deinit(self.backing_allocator);
+                slot.object.attrs.deinit(self.backing_allocator);
                 self.backing_allocator.destroy(slot);
             }
             cur = next;
@@ -290,6 +291,7 @@ pub const Heap = struct {
                 if (hdr.kind == .js_object) {
                     const slot: *GcJsObjectSlot = @fieldParentPtr("header", hdr);
                     slot.object.slots.deinit(self.backing_allocator);
+                    slot.object.attrs.deinit(self.backing_allocator);
                     self.backing_allocator.destroy(slot);
                 }
 

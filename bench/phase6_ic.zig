@@ -66,6 +66,52 @@ const INSTANCEOF_HOT =
     \\c;
 ;
 
+// Megamorphic benchmark: a single access site reads .v from objects cycling
+// through 12 distinct shapes, driving the site past the polymorphic cap (8)
+// and exercising the MegaIC HashMap path.
+const MEGA_OBJECT =
+    \\function mk(tag) {
+    \\  var o = { v: tag };
+    \\  if (tag === 0)  { o.a0 = 0; }
+    \\  if (tag === 1)  { o.a1 = 1; }
+    \\  if (tag === 2)  { o.a2 = 2; }
+    \\  if (tag === 3)  { o.a3 = 3; }
+    \\  if (tag === 4)  { o.a4 = 4; }
+    \\  if (tag === 5)  { o.a5 = 5; }
+    \\  if (tag === 6)  { o.a6 = 6; }
+    \\  if (tag === 7)  { o.a7 = 7; }
+    \\  if (tag === 8)  { o.a8 = 8; }
+    \\  if (tag === 9)  { o.a9 = 9; }
+    \\  if (tag === 10) { o.a10 = 10; }
+    \\  if (tag === 11) { o.a11 = 11; }
+    \\  return o;
+    \\}
+    \\var objs = [];
+    \\var n = 0;
+    \\while (n < 12) { objs[n] = mk(n); n = n + 1; }
+    \\var sum = 0;
+    \\for (var i = 0; i < 60000; i = i + 1) {
+    \\  sum = sum + objs[i % 12].v;
+    \\}
+    \\sum;
+;
+
+// Prototype method/data dispatch: a single access site reads `.m` (a data
+// property living on the shared prototype, not own) off instances in a hot loop.
+// Exercises the depth-1 prototype inline cache.
+const PROTO_METHOD =
+    \\function C() { this.v = 1; }
+    \\C.prototype.m = 7;
+    \\var arr = [];
+    \\var n = 0;
+    \\while (n < 4) { arr[n] = new C(); n = n + 1; }
+    \\var sum = 0;
+    \\for (var i = 0; i < 120000; i = i + 1) {
+    \\  sum = sum + arr[i % 4].m;
+    \\}
+    \\sum;
+;
+
 const Case = struct {
     name: []const u8,
     source: []const u8,
@@ -109,6 +155,8 @@ pub fn main() !void {
         .{ .name = "arith-hot", .source = ARITH_HOT },
         .{ .name = "typeof-hot", .source = TYPEOF_HOT },
         .{ .name = "instanceof-hot", .source = INSTANCEOF_HOT },
+        .{ .name = "megamorphic", .source = MEGA_OBJECT },
+        .{ .name = "proto-method", .source = PROTO_METHOD },
     };
 
     var buf: [1024]u8 = undefined;

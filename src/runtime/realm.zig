@@ -823,6 +823,17 @@ pub const Realm = struct {
                 try ctor_obj.set("fromEntries", from_entries_fn);
                 const gopd_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptors);
                 try ctor_obj.set("getOwnPropertyDescriptors", gopd_fn);
+                try ctor_obj.set("getPrototypeOf", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetPrototypeOf));
+                try ctor_obj.set("getOwnPropertyNames", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyNames));
+                try ctor_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptor));
+                try ctor_obj.set("defineProperty", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectDefineProperty));
+                try ctor_obj.set("defineProperties", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectDefineProperties));
+                try ctor_obj.set("freeze", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFreeze));
+                try ctor_obj.set("seal", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectSeal));
+                try ctor_obj.set("preventExtensions", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectPreventExtensions));
+                try ctor_obj.set("isFrozen", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsFrozen));
+                try ctor_obj.set("isSealed", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsSealed));
+                try ctor_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsExtensible));
             }
         }
         // hasOwnProperty on Object.prototype

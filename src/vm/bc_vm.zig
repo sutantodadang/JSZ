@@ -121,6 +121,11 @@ pub const BcVm = struct {
     /// W2-async: all async invocation contexts (kept live for GC scanning of
     /// their result promises; suspended frames are scanned via `generators`).
     async_ctxs: std.ArrayListUnmanaged(*AsyncCtx) = .empty,
+    /// Phase 11: IC hit-rate instrumentation. Counted only when enabled.
+    ic_stats_enabled: bool = false,
+    ic_own_hits: u64 = 0,
+    ic_proto_hits: u64 = 0,
+    ic_misses: u64 = 0,
 
     pub fn init(arena: std.mem.Allocator, realm: *Realm) BcVm {
         return BcVm{
@@ -1368,23 +1373,66 @@ pub const BcVm = struct {
                     const site_cache = &@constCast(frame.func.ic_table)[site_pc];
                     if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                         const obj = obj_val.toPtr().object;
-                        if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
+                        if (!obj.is_array and !std.mem.eql(u8, key, "length") and !std.mem.eql(u8, key, "size")) {
                             if (site_cache.lookup(key, obj.shapePtr())) |slot| {
                                 if (obj.getOwnBySlot(obj.shapePtr(), slot)) |cached| {
+                                    if (self.ic_stats_enabled) self.ic_own_hits += 1;
                                     frame.registers[rdst] = cached;
                                     continue;
+                                }
+                            }
+                            // Proto-chain cache: method dispatch fast path (depth <= PROTO_IC_DEPTH).
+                            if (site_cache.protoKeyMatches(key) and site_cache.proto_recv_shape == obj.shapePtr()) {
+                                var cur: *JsObject = obj;
+                                var ok = true;
+                                var n: u8 = 0;
+                                while (n < site_cache.proto_chain_len) : (n += 1) {
+                                    const nxt = cur.proto orelse {
+                                        ok = false;
+                                        break;
+                                    };
+                                    const g = site_cache.proto_chain[n];
+                                    if (@as(*anyopaque, @ptrCast(nxt)) != g.obj or nxt.shapePtr() != g.shape) {
+                                        ok = false;
+                                        break;
+                                    }
+                                    cur = nxt;
+                                }
+                                if (ok) {
+                                    const hshape = site_cache.proto_chain[site_cache.proto_chain_len - 1].shape;
+                                    if (cur.getOwnBySlot(hshape, site_cache.proto_slot)) |cached| {
+                                        if (self.ic_stats_enabled) self.ic_proto_hits += 1;
+                                        frame.registers[rdst] = cached;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     }
 
+                    if (self.ic_stats_enabled and obj_val.bits != 0 and obj_val.unbox() == .object) self.ic_misses += 1;
                     const result = try self.getProp(obj_val, key);
                     frame.registers[rdst] = result;
                     if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                         const obj = obj_val.toPtr().object;
-                        if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
+                        if (!obj.is_array and !std.mem.eql(u8, key, "length") and !std.mem.eql(u8, key, "size")) {
                             if (obj.resolveOwnSlot(key)) |slot| {
-                                site_cache.record(key, obj.shapePtr(), slot);
+                                site_cache.record(self.arena, key, obj.shapePtr(), slot);
+                            } else {
+                                // Walk proto chain; cache a hit within PROTO_IC_DEPTH links.
+                                var guards: [ic_mod.PROTO_IC_DEPTH]ic_mod.ProtoGuard = undefined;
+                                var cur = obj.proto;
+                                var n: usize = 0;
+                                while (cur) |c| {
+                                    if (n >= ic_mod.PROTO_IC_DEPTH) break;
+                                    guards[n] = .{ .obj = @ptrCast(c), .shape = c.shapePtr() };
+                                    if (c.resolveOwnSlot(key)) |pslot| {
+                                        site_cache.protoRecord(key, obj.shapePtr(), guards[0 .. n + 1], pslot);
+                                        break;
+                                    }
+                                    cur = c.proto;
+                                    n += 1;
+                                }
                             }
                         }
                     }
@@ -1407,19 +1455,60 @@ pub const BcVm = struct {
                             if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                                 if (site_cache.lookup(key, obj.shapePtr())) |slot| {
                                     if (obj.getOwnBySlot(obj.shapePtr(), slot)) |cached| {
+                                        if (self.ic_stats_enabled) self.ic_own_hits += 1;
                                         frame.registers[rdst] = cached;
                                         continue;
                                     }
                                 }
+                                if (site_cache.protoKeyMatches(key) and site_cache.proto_recv_shape == obj.shapePtr()) {
+                                    var cur: *JsObject = obj;
+                                    var ok = true;
+                                    var n: u8 = 0;
+                                    while (n < site_cache.proto_chain_len) : (n += 1) {
+                                        const nxt = cur.proto orelse {
+                                            ok = false;
+                                            break;
+                                        };
+                                        const g = site_cache.proto_chain[n];
+                                        if (@as(*anyopaque, @ptrCast(nxt)) != g.obj or nxt.shapePtr() != g.shape) {
+                                            ok = false;
+                                            break;
+                                        }
+                                        cur = nxt;
+                                    }
+                                    if (ok) {
+                                        const hshape = site_cache.proto_chain[site_cache.proto_chain_len - 1].shape;
+                                        if (cur.getOwnBySlot(hshape, site_cache.proto_slot)) |cached| {
+                                            if (self.ic_stats_enabled) self.ic_proto_hits += 1;
+                                            frame.registers[rdst] = cached;
+                                            continue;
+                                        }
+                                    }
+                                }
                             }
                         }
+                        if (self.ic_stats_enabled and obj_val.bits != 0 and obj_val.unbox() == .object) self.ic_misses += 1;
                         const result = try self.getProp(obj_val, key);
                         frame.registers[rdst] = result;
                         if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                             const obj = obj_val.toPtr().object;
                             if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                                 if (obj.resolveOwnSlot(key)) |slot| {
-                                    site_cache.record(key, obj.shapePtr(), slot);
+                                    site_cache.record(self.arena, key, obj.shapePtr(), slot);
+                                } else {
+                                    var guards: [ic_mod.PROTO_IC_DEPTH]ic_mod.ProtoGuard = undefined;
+                                    var cur = obj.proto;
+                                    var n: usize = 0;
+                                    while (cur) |c| {
+                                        if (n >= ic_mod.PROTO_IC_DEPTH) break;
+                                        guards[n] = .{ .obj = @ptrCast(c), .shape = c.shapePtr() };
+                                        if (c.resolveOwnSlot(key)) |pslot| {
+                                            site_cache.protoRecord(key, obj.shapePtr(), guards[0 .. n + 1], pslot);
+                                            break;
+                                        }
+                                        cur = c.proto;
+                                        n += 1;
+                                    }
                                 }
                             }
                         }
@@ -1449,7 +1538,7 @@ pub const BcVm = struct {
                         const obj = obj_val.toPtr().object;
                         if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                             if (obj.resolveOwnSlot(key)) |slot| {
-                                site_cache.record(key, obj.shapePtr(), slot);
+                                site_cache.record(self.arena, key, obj.shapePtr(), slot);
                             }
                         }
                     }
@@ -1473,7 +1562,7 @@ pub const BcVm = struct {
                             const obj = obj_val.toPtr().object;
                             if (!obj.is_array and !std.mem.eql(u8, key, "length")) {
                                 if (obj.resolveOwnSlot(key)) |slot| {
-                                    site_cache.record(key, obj.shapePtr(), slot);
+                                    site_cache.record(self.arena, key, obj.shapePtr(), slot);
                                 }
                             }
                         }
@@ -1639,6 +1728,7 @@ pub const BcVm = struct {
                         const iv = obj_val.unbox();
                         if (iv == .object) {
                             for (iv.object.ownKeys()) |k| {
+                                if (!iv.object.isEnumerable(k)) continue;
                                 const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
                                 const key_val = try val_mod.makeString(self.arena, k);
                                 arr_obj.set(idx_str, key_val) catch {};
@@ -1987,8 +2077,12 @@ pub const BcVm = struct {
         switch (obj_val.unbox()) {
             .object => |obj| {
                 if (obj.resolveOwnSlot(key)) |slot| {
-                    if (obj.setOwnBySlot(obj.shapePtr(), slot, value)) {
+                    // Respect non-writable attrs: skip fast-path if not writable.
+                    const attr_ok = if (slot < obj.attrs.items.len) obj.attrs.items[slot].writable else true;
+                    if (attr_ok and obj.setOwnBySlot(obj.shapePtr(), slot, value)) {
                         return;
+                    } else if (!attr_ok) {
+                        return; // sloppy: silent no-op for non-writable
                     }
                 }
                 try obj.set(key, value);
@@ -2864,7 +2958,7 @@ fn jsStrictEqual(x: Value, y: Value) bool {
         },
         .function => return x.bits == y.bits,
         .bc_function => return x.bits == y.bits,
-        .object => return x.bits == y.bits,
+        .object => return x.toPtr().object == y.toPtr().object,
         .native_function => return x.bits == y.bits,
     }
 }

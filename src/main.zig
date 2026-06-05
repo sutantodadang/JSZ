@@ -34,6 +34,7 @@ const Args = struct {
     gc_after_eval: bool = false,
     jit_mode: jsz.JitMode = .off,
     limits: jsz.Limits = .{},
+    ic_stats: bool = false,
 };
 
 fn parseArgs(argv: []const []const u8) Args {
@@ -99,6 +100,11 @@ fn parseArgs(argv: []const []const u8) Args {
             args.gc_after_eval = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ic-stats")) {
+            args.ic_stats = true;
+            args.interp = .bc;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--jit=off")) {
             args.jit_mode = .off;
             continue;
@@ -157,6 +163,7 @@ fn printHelp(writer: anytype) !void {
         \\  --run-bytecode <path>  Load and run a bytecode snapshot file (bytecode VM)
         \\  --gc-stats             Print GC stats after eval
         \\  --gc-after-eval        Trigger a GC cycle before printing stats
+        \\  --ic-stats             Print inline-cache hit-rate stats after eval
         \\  --jit=off|count|experimental  Profile hot bytecode sites (count) or attempt native compile (experimental); implies --interp=bc
         \\  --mem-limit=<bytes>    Cap live memory; over-budget eval throws instead of crashing
         \\  --gas-limit=<n>        Cap executed bytecode instructions (implies --interp=bc)
@@ -187,7 +194,7 @@ fn debugHook(_: ?*anyopaque, stop: jsz.debug.DebugStop) void {
     e.flush() catch {};
 }
 
-fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode, limits: jsz.Limits) !void {
+fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode, limits: jsz.Limits, ic_stats: bool) !void {
     if (dump_bc or source_map) {
         // Compile-only modes: delegate to the jsz public API and exit.
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -233,6 +240,7 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
     defer ctx.deinit();
     ctx.setInterpMode(interp);
     ctx.setJitMode(jit_mode);
+    ctx.setIcStats(ic_stats);
     ctx.setLimits(limits);
 
     var buf: [4096]u8 = undefined;
@@ -278,6 +286,19 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
         try out.print("hot_sites: {d}\n", .{prof.hot_sites});
         try out.print("compiled: {d}\n", .{prof.compiled});
         try out.print("deopts: {d}\n", .{prof.deopts});
+    }
+
+    if (ic_stats) {
+        const prof = ctx.lastIcProfile();
+        const total = prof.own_hits + prof.proto_hits + prof.misses;
+        try out.print("=== IC stats ===\n", .{});
+        try out.print("own_hits: {d}\n", .{prof.own_hits});
+        try out.print("proto_hits: {d}\n", .{prof.proto_hits});
+        try out.print("misses: {d}\n", .{prof.misses});
+        if (total > 0) {
+            const pct = @as(f64, @floatFromInt(prof.own_hits + prof.proto_hits)) * 100.0 / @as(f64, @floatFromInt(total));
+            try out.print("hit_rate: {d:.1}%\n", .{pct});
+        }
     }
 
     try out.flush();
@@ -402,7 +423,7 @@ pub fn main() !void {
             }
         },
         .eval => {
-            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits);
+            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats);
         },
         .interactive => {
             try runRepl(allocator, args.interp);
@@ -423,7 +444,7 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer allocator.free(cjs_wrapped);
-            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits);
+            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats);
         },
     }
 }

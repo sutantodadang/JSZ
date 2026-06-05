@@ -67,6 +67,7 @@ pub fn installNativeAccumulateLoop(f: NativeAccumulateLoopFn) void {
 /// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 9: JIT profile snapshot (hot sites / compiled / deopts) from the most recent bc eval.
 pub const JitProfile = isolate_mod.JitProfile;
+pub const IcProfile = isolate_mod.IcProfile;
 
 /// Error set for all jsz operations.
 pub const JszError = error{ NotImplemented, OutOfMemory };
@@ -320,6 +321,7 @@ pub const Context = struct {
     interp_mode: InterpMode = .bc,
     jit_mode: JitMode = .off,
     limits: Limits = .{},
+    ic_stats: bool = false,
 
     pub fn setInterpMode(self: *Context, m: InterpMode) void {
         self.interp_mode = m;
@@ -337,6 +339,11 @@ pub const Context = struct {
         self.jit_mode = m;
     }
 
+    /// EXPERIMENTAL. Phase 11: enable IC hit-rate instrumentation for next eval.
+    pub fn setIcStats(self: *Context, on: bool) void {
+        self.ic_stats = on;
+    }
+
     pub fn deinit(self: *Context) void {
         self._isolate.allocator.destroy(self);
     }
@@ -346,6 +353,7 @@ pub const Context = struct {
         _ = source_name;
         const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
         impl.setJitMode(self.jit_mode);
+        impl.setIcStats(self.ic_stats);
         impl.setLimits(self.limits.mem_bytes, self.limits.gas, self.limits.time_ms);
         const outcome = impl.evalWithMode(source, self.interp_mode, &[_]val_mod.NativeBinding{}) catch {
             return EvalResult{ .exception = Exception{
@@ -406,6 +414,13 @@ pub const Context = struct {
     pub fn lastJitProfile(self: *Context) JitProfile {
         const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
         return impl.last_jit_profile;
+    }
+
+    /// EXPERIMENTAL. Phase 11: IC profile (own/proto hits, misses) from the most
+    /// recent bc eval. All zero unless setIcStats(true) was called.
+    pub fn lastIcProfile(self: *Context) IcProfile {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        return impl.last_ic_profile;
     }
 
     /// EXPERIMENTAL (unstable, may change before 1.0).

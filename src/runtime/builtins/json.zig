@@ -80,6 +80,7 @@ fn stringifyObject(
     try buf.append(arena, '{');
     var first = true;
     for (obj.ownKeys()) |k| {
+        if (!obj.isEnumerable(k)) continue;
         const val = obj.getOwn(k) orelse continue;
         // Skip functions and undefined values (per JSON spec)
         if (val.bits != 0) {
