@@ -250,11 +250,77 @@ pub const BcVm = struct {
         }
     }
 
+    /// Construct `ctor` with `args` (native-friendly: throws JsException on
+    /// failure, setting realm pending_exception). Used by Reflect.construct and
+    /// Proxy. Mirrors doConstruct's per-callee logic.
+    pub fn constructFromArgs(self: *BcVm, ctor: Value, args: []const Value) anyerror!Value {
+        const realm_m = @import("../runtime/realm.zig");
+        if (ctor.bits == 0) {
+            realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+            return error.JsException;
+        }
+        switch (ctor.unbox()) {
+            .bc_function => {
+                const proto_v = try self.getProp(ctor, "prototype");
+                const proto: ?*JsObject = if (proto_v.bits != 0 and proto_v.unbox() == .object)
+                    proto_v.toPtr().object
+                else
+                    self.realm.object_prototype;
+                const new_obj = if (self.heap) |heap|
+                    try JsObject.createOnHeap(heap, proto)
+                else
+                    try JsObject.create(self.arena, proto);
+                const this_val = try val_mod.makeObject(self.arena, new_obj);
+                const result = try bcInvokeJs(self, self.arena, this_val, ctor, args);
+                return if (result.bits != 0 and result.unbox() == .object) result else this_val;
+            },
+            .native_function => |fn_ptr| {
+                const new_obj = if (self.heap) |heap|
+                    try JsObject.createOnHeap(heap, self.realm.object_prototype)
+                else
+                    try JsObject.create(self.arena, self.realm.object_prototype);
+                const this_val = try val_mod.makeObject(self.arena, new_obj);
+                const result = try fn_ptr.invoke(self.arena, this_val, args);
+                return if (result.bits != 0 and result.unbox() == .object) result else this_val;
+            },
+            .object => |o| {
+                if (o.get("__call__")) |cv| {
+                    if (cv.bits != 0 and cv.unbox() == .native_function) {
+                        var proto: ?*JsObject = self.realm.object_prototype;
+                        if (o.get("prototype")) |pv| {
+                            if (pv.bits != 0 and pv.unbox() == .object) proto = pv.toPtr().object;
+                        }
+                        const new_obj = if (self.heap) |heap|
+                            try JsObject.createOnHeap(heap, proto)
+                        else
+                            try JsObject.create(self.arena, proto);
+                        const this_val = try val_mod.makeObject(self.arena, new_obj);
+                        const result = try cv.toPtr().native_function.invoke(self.arena, this_val, args);
+                        return if (result.bits != 0 and result.unbox() == .object) result else this_val;
+                    }
+                }
+                realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                return error.JsException;
+            },
+            else => {
+                realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                return error.JsException;
+            },
+        }
+    }
+
+    fn bcConstruct(ptr: *anyopaque, arena: std.mem.Allocator, ctor_val: Value, args: []const Value) anyerror!Value {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        return self.constructFromArgs(ctor_val, args);
+    }
+
     fn activateContext(self: *BcVm) void {
         const realm_mod = @import("../runtime/realm.zig");
         self.context = realm_mod.Context{
             .ptr = self,
             .invoke_fn = bcInvokeJs,
+            .construct_fn = bcConstruct,
         };
         realm_mod.active_context = &self.context;
     }

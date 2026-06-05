@@ -1073,6 +1073,7 @@ const FnCompiler = struct {
             fe.is_strict,
             fe.is_generator,
             fe.is_async,
+            false, // function body: no implicit last-expr return
         );
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
@@ -1132,6 +1133,7 @@ const FnCompiler = struct {
                     fd.is_strict,
                     fd.is_generator,
                     fd.is_async,
+                    false, // function body: no implicit last-expr return
                 );
                 const child_idx: u16 = @intCast(self.child_functions.items.len);
                 try self.child_functions.append(self.arena, child_fn);
@@ -1689,8 +1691,10 @@ const FnCompiler = struct {
         }
     }
 
-    /// Compile a function body.
-    fn compileBody(self: *Self, body: []*Node) error{OutOfMemory}!void {
+    /// Compile a function body. `implicit_return` is true only for the top-level
+    /// program (so eval/REPL yields the last expression-statement value); function
+    /// bodies pass false and return undefined on fall-through.
+    fn compileBody(self: *Self, body: []*Node, implicit_return: bool) error{OutOfMemory}!void {
         var last_expr_stmt_reg: ?u8 = null;
         var last_other_reg: ?u8 = null;
 
@@ -1713,8 +1717,10 @@ const FnCompiler = struct {
             }
         }
 
-        // Emit final return using last expression statement result.
-        const ret_reg = last_expr_stmt_reg orelse last_other_reg;
+        // Top-level program returns its last expression-statement value (eval /
+        // REPL result). Function bodies fall through to undefined unless an
+        // explicit `return` executed.
+        const ret_reg = if (implicit_return) (last_expr_stmt_reg orelse last_other_reg) else null;
         if (ret_reg) |r| {
             try self.emitOp(.RETURN, 0);
             try self.emitU8(r);
@@ -1733,7 +1739,7 @@ fn compileFunction(
     body: []*Node,
     nfe_name: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false);
+    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false);
 }
 
 fn compileFunctionStrict(
@@ -1745,6 +1751,7 @@ fn compileFunctionStrict(
     is_strict: bool,
     is_generator: bool,
     is_async: bool,
+    implicit_return: bool,
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
@@ -1756,7 +1763,7 @@ fn compileFunctionStrict(
     // Register slots are used only for compiler temporaries.
     // sp starts at 0; max_regs tracks highest allocated temporary register.
 
-    try fc.compileBody(body);
+    try fc.compileBody(body, implicit_return);
 
     const chunk = try fc.builder.finalize(name orelse "<anonymous>", 0);
 
@@ -1816,6 +1823,7 @@ pub fn compileProgram(
         program.is_strict,
         false,
         false,
+        true, // top-level program: yield last expression-statement value (eval result)
     );
     return f;
 }

@@ -347,8 +347,32 @@ fn isCallable(v: Value) bool {
     };
 }
 
+/// Walk the prototype chain for the object's Symbol.iterator method, if any.
+fn iteratorMethod(obj: *JsObject) ?Value {
+    const sym = realm_mod.active_sym_iterator orelse return null;
+    var cur: ?*JsObject = obj;
+    var depth: usize = 0;
+    while (cur) |o| {
+        if (depth >= 64) break;
+        depth += 1;
+        if (o.getOwnSym(sym)) |v| return v;
+        cur = o.proto;
+    }
+    return null;
+}
+
 /// Per-instance state for the array/string fallback iterator.
 const SeqIterData = struct { seq: Value, index: usize = 0, is_string: bool };
+
+/// Array.prototype[Symbol.iterator] (and values()): index iterator over `this`.
+pub fn nativeArrayValues(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
+        const d = try arena.create(SeqIterData);
+        d.* = .{ .seq = this_val, .index = 0, .is_string = false };
+        return makeSeqIterator(arena, d);
+    }
+    return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+}
 
 fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
@@ -384,6 +408,10 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
         // Already an iterator (e.g. a generator) — it exposes next().
         if (obj.get("next")) |nx| {
             if (isCallable(nx)) return x;
+        }
+        // ES2015: obtain the iterator via the object's Symbol.iterator method.
+        if (iteratorMethod(obj)) |itf| {
+            if (isCallable(itf)) return function_proto.invokeCallback(arena, x, itf, &[_]Value{});
         }
         // Iterable — call its @@iterator method.
         if (obj.get("@@iterator")) |itf| {

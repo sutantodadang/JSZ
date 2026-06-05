@@ -38,9 +38,16 @@ pub const Context = struct {
     /// Invoke a JS function value with given this/args. Returns Value or sets
     /// pending_exception + returns error.JsException.
     invoke_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value,
+    /// Construct a value with given args. Returns Value or sets pending_exception
+    /// and returns error.JsException.
+    construct_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, ctor_val: Value, args: []const Value) anyerror!Value,
 
     pub fn invokeJs(self: *Context, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         return self.invoke_fn(self.ptr, arena, this_val, fn_val, args);
+    }
+
+    pub fn construct(self: *Context, arena: std.mem.Allocator, ctor_val: Value, args: []const Value) anyerror!Value {
+        return self.construct_fn(self.ptr, arena, ctor_val, args);
     }
 };
 
@@ -228,6 +235,8 @@ pub var active_function_proto: ?*JsObject = null;
 pub var active_promise_proto: ?*JsObject = null;
 /// ES2015 Symbol.prototype (autoboxing lookup for symbol primitives).
 pub var active_symbol_proto: ?*JsObject = null;
+/// ES2015 Symbol.iterator well-known symbol value.
+pub var active_sym_iterator: ?Value = null;
 
 /// Phase 4b: pending JS exception Value (set by JSON.parse on error).
 /// VMs check this after catching error.JsException from a native call.
@@ -1094,6 +1103,11 @@ pub const Realm = struct {
             try symbol_ctor.set(name, try val_mod.makeSymbol(arena, desc));
         }
         try env.define("Symbol", try val_mod.makeObject(arena, symbol_ctor));
+        // Capture Symbol.iterator and register Array.prototype[Symbol.iterator].
+        active_sym_iterator = symbol_ctor.getOwn("iterator");
+        if (active_sym_iterator) |symv| {
+            try array_proto.setSym(symv, try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeArrayValues));
+        }
 
         // ---- ES2015 Reflect ----
         const reflect_obj = try JsObject.create(arena, object_proto);
@@ -1108,6 +1122,7 @@ pub const Realm = struct {
         try reflect_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectIsExtensible));
         try reflect_obj.set("preventExtensions", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectPreventExtensions));
         try reflect_obj.set("apply", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectApply));
+        try reflect_obj.set("construct", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectConstruct));
         try env.define("Reflect", try val_mod.makeObject(arena, reflect_obj));
 
         // ---- ES2020 globalThis (+ Node-compatible `global`) ----
@@ -1193,10 +1208,16 @@ pub const Realm = struct {
         for (self.object_prototype.ownKeys()) |k| {
             try hp_proto.set(k, self.object_prototype.getOwn(k).?);
         }
+        for (self.object_prototype.sym_props.items) |sp| {
+            try hp_proto.setSym(sp.key, sp.value);
+        }
 
         const hp_array_proto = try heap.allocateObject(hp_proto);
         for (self.array_prototype.ownKeys()) |k| {
             try hp_array_proto.set(k, self.array_prototype.getOwn(k).?);
+        }
+        for (self.array_prototype.sym_props.items) |sp| {
+            try hp_array_proto.setSym(sp.key, sp.value);
         }
 
         self.object_prototype = hp_proto;
@@ -1254,6 +1275,7 @@ pub const Realm = struct {
         active_function_proto = null;
         active_promise_proto = null;
         active_symbol_proto = null;
+        active_sym_iterator = null;
         active_global_env = null;
         pending_exception = Value{};
     }

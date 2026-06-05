@@ -373,3 +373,50 @@ pub fn nativeReflectApply(arena: std.mem.Allocator, _: Value, args: []const Valu
 
     return fp.invokeCallback(arena, this_arg, target, call_args);
 }
+
+// ---------------------------------------------------------------- Reflect.construct ---
+
+pub fn nativeReflectConstruct(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    if (args.len < 1) return val_mod.makeUndefined(arena);
+    const target = args[0];
+
+    // Unpack argsList (second argument, array-like).
+    var arg_list: []Value = &[_]Value{};
+    if (args.len >= 2 and args[1].bits != 0 and isObj(args[1])) {
+        const arr = args[1].toPtr().object;
+        if (arr.is_array) {
+            const n = arr.getArrayLength();
+            if (n > 0) {
+                arg_list = try arena.alloc(Value, n);
+                for (0..n) |i| {
+                    const idx = try std.fmt.allocPrint(arena, "{d}", .{i});
+                    arg_list[i] = arr.get(idx) orelse try val_mod.makeUndefined(arena);
+                }
+            }
+        } else {
+            // Array-like with length property.
+            if (arr.getOwn("length")) |len_val| {
+                if (len_val.bits != 0) {
+                    const len_f = len_val.toF64();
+                    if (!std.math.isNan(len_f) and len_f >= 0) {
+                        const n: u32 = @intFromFloat(len_f);
+                        if (n > 0) {
+                            arg_list = try arena.alloc(Value, n);
+                            for (0..n) |i| {
+                                const idx = try std.fmt.allocPrint(arena, "{d}", .{i});
+                                arg_list[i] = arr.getOwn(idx) orelse try val_mod.makeUndefined(arena);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const ctx = realm_mod.active_context orelse {
+        realm_mod.pending_exception = try val_mod.makeString(arena, "no active context");
+        return error.JsException;
+    };
+    return ctx.construct(arena, target, arg_list);
+}
