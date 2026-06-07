@@ -2315,6 +2315,27 @@ pub const Parser = struct {
             },
             .left_paren => {
                 _ = self.advance();
+                // Empty parens `()` are only valid as an arrow's parameter list.
+                // Emit an empty sequence_expr marker so the enclosing
+                // parseAssignmentExprCore sees `=>` and extractArrowParams yields
+                // zero parameters.
+                if (self.check(.right_paren)) {
+                    _ = self.advance(); // consume ')'
+                    if (!self.check(.arrow)) {
+                        if (!self.had_error) {
+                            self.had_error = true;
+                            self.error_info = ParseError{
+                                .message = "unexpected empty parentheses",
+                                .line = self.current.line,
+                                .column = self.current.column,
+                            };
+                        }
+                        return null;
+                    }
+                    return self.makeNode(.sequence_expr, start, self.current.start, .{
+                        .sequence_expr = .{ .exprs = &[_]*Node{} },
+                    });
+                }
                 const expr = self.parseExpression() orelse return null;
                 _ = self.expect(.right_paren) orelse return null;
                 expr.paren = true;

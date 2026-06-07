@@ -353,7 +353,7 @@ pub const IsolateImpl = struct {
     }
 };
 
-fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]const u8 {
+pub fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]const u8 {
     var out = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < source.len) {

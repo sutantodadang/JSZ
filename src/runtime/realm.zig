@@ -47,6 +47,10 @@ pub const Context = struct {
     /// Construct a value with given args. Returns Value or sets pending_exception
     /// and returns error.JsException.
     construct_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, ctor_val: Value, args: []const Value) anyerror!Value,
+    /// Compile + run `source` in the global scope and return its completion value
+    /// (the value of the last expression). Sets pending_exception + returns
+    /// error.JsException on a parse error or an uncaught throw.
+    eval_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8) anyerror!Value,
 
     pub fn invokeJs(self: *Context, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         return self.invoke_fn(self.ptr, arena, this_val, fn_val, args);
@@ -54,6 +58,10 @@ pub const Context = struct {
 
     pub fn construct(self: *Context, arena: std.mem.Allocator, ctor_val: Value, args: []const Value) anyerror!Value {
         return self.construct_fn(self.ptr, arena, ctor_val, args);
+    }
+
+    pub fn evalSource(self: *Context, arena: std.mem.Allocator, source: []const u8) anyerror!Value {
+        return self.eval_fn(self.ptr, arena, source);
     }
 };
 
@@ -234,6 +242,15 @@ pub var active_array_proto: ?*JsObject = null;
 pub var active_object_proto: ?*JsObject = null;
 /// Phase 4b: thread-local for String.prototype (autoboxing lookup).
 pub var active_string_proto: ?*JsObject = null;
+/// Phase 13: thread-locals for Number/Boolean.prototype (autoboxing lookup).
+pub var active_number_proto: ?*JsObject = null;
+pub var active_boolean_proto: ?*JsObject = null;
+/// Phase 13: set true by the VM immediately before invoking a native constructor
+/// via `new` (or Reflect.construct); reset false at every plain-call entry. Lets
+/// the Boolean/Number/String factories return a wrapper object under `new` but a
+/// primitive under a plain call — the synthesized `this` is identical in both
+/// paths, so prototype identity cannot distinguish them.
+pub var active_constructing: bool = false;
 /// Phase 4c: thread-local for RegExp.prototype.
 pub var active_regexp_proto: ?*JsObject = null;
 /// Phase 4d: thread-local for Function.prototype.
@@ -395,27 +412,34 @@ fn nativeArrayIsArray(arena: std.mem.Allocator, _: Value, args: []const Value) a
     return val_mod.makeBool(arena, false);
 }
 
-fn nativeStringCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0) return val_mod.makeString(arena, "");
-    const arg = args[0];
-    if (arg.bits == 0) return val_mod.makeString(arena, "undefined");
+fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8 {
+    if (arg.bits == 0) return "undefined";
     return switch (arg.unbox()) {
-        .string => |s| val_mod.makeString(arena, s),
-        .number => |n| blk: {
-            break :blk val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
-        },
-        .boolean => |b| val_mod.makeString(arena, if (b) "true" else "false"),
-        .null_ => val_mod.makeString(arena, "null"),
-        .undefined_ => val_mod.makeString(arena, "undefined"),
+        .string => |s| s,
+        .number => |n| try val_mod.formatNumber(arena, n),
+        .boolean => |b| if (b) "true" else "false",
+        .null_ => "null",
+        .undefined_ => "undefined",
         .object => blk: {
             // ToString(ToPrimitive(arg, "string")) when a user hook applies.
-            if (try coercion_mod.toPrimitive(arena, arg, .string)) |prim| {
-                break :blk nativeStringCtor(arena, arg, &[_]Value{prim});
-            }
-            break :blk val_mod.makeString(arena, "[object Object]");
+            if (try coercion_mod.toPrimitive(arena, arg, .string)) |prim|
+                break :blk try stringPrimitive(arena, prim);
+            break :blk "[object Object]";
         },
-        else => val_mod.makeString(arena, "[object Object]"),
+        else => "[object Object]",
     };
+}
+
+fn nativeStringCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const constructing = active_constructing;
+    active_constructing = false;
+    const s: []const u8 = if (args.len == 0) "" else try stringPrimitive(arena, args[0]);
+    // `new String(x)`: wrap on the synthesized object; plain call returns primitive.
+    if (constructing and this_val.bits != 0 and this_val.unbox() == .object) {
+        try this_val.toPtr().object.set("[[PrimitiveValue]]", try val_mod.makeString(arena, s));
+        return this_val;
+    }
+    return val_mod.makeString(arena, s);
 }
 
 fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
@@ -527,9 +551,8 @@ fn nativeEval(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!
     // eval of a non-string returns the argument unchanged (ES5 step 1).
     if (args[0].bits == 0 or args[0].unbox() != .string) return args[0];
     const src = args[0].toPtr().string;
-    const hook = eval_hook orelse return val_mod.makeUndefined(arena);
     const ctx = active_context orelse return val_mod.makeUndefined(arena);
-    return hook(ctx.ptr, arena, src);
+    return ctx.evalSource(arena, src);
 }
 
 fn toBooleanCoerce(v: Value) bool {
@@ -544,39 +567,125 @@ fn toBooleanCoerce(v: Value) bool {
 }
 
 fn nativeBooleanCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const constructing = active_constructing;
+    active_constructing = false;
     const b = if (args.len > 0) toBooleanCoerce(args[0]) else false;
-    // Called as `new Boolean(x)`: this_val is a fresh object — store primitive, return it.
-    if (this_val.bits != 0 and this_val.unbox() == .object) {
+    // `new Boolean(x)`: store the primitive on the synthesized wrapper and return
+    // it. Plain `Boolean(x)` returns the primitive.
+    if (constructing and this_val.bits != 0 and this_val.unbox() == .object) {
         try this_val.toPtr().object.set("[[PrimitiveValue]]", try val_mod.makeBool(arena, b));
         return this_val;
     }
     return val_mod.makeBool(arena, b);
 }
 
-fn nativeNumberCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0) return val_mod.makeNumber(arena, 0);
-    const arg = args[0];
-    if (arg.bits == 0) return val_mod.makeNumber(arena, std.math.nan(f64));
+fn numberPrimitive(arena: std.mem.Allocator, arg: Value) anyerror!f64 {
+    if (arg.bits == 0) return std.math.nan(f64);
     return switch (arg.unbox()) {
-        .number => |n| val_mod.makeNumber(arena, n),
-        .boolean => |b| val_mod.makeNumber(arena, if (b) 1 else 0),
+        .number => |n| n,
+        .boolean => |b| if (b) 1 else 0,
         .string => |s| blk: {
             const trimmed = std.mem.trim(u8, s, &std.ascii.whitespace);
-            if (trimmed.len == 0) break :blk val_mod.makeNumber(arena, 0);
-            const parsed = std.fmt.parseFloat(f64, trimmed) catch std.math.nan(f64);
-            break :blk val_mod.makeNumber(arena, parsed);
+            if (trimmed.len == 0) break :blk 0;
+            break :blk std.fmt.parseFloat(f64, trimmed) catch std.math.nan(f64);
         },
-        .null_ => val_mod.makeNumber(arena, 0),
-        .undefined_ => val_mod.makeNumber(arena, std.math.nan(f64)),
+        .null_ => 0,
+        .undefined_ => std.math.nan(f64),
         .object => blk: {
             // ToNumber(ToPrimitive(arg, "number")) when a user hook applies.
-            if (try coercion_mod.toPrimitive(arena, arg, .number)) |prim| {
-                break :blk nativeNumberCtor(arena, arg, &[_]Value{prim});
-            }
-            break :blk val_mod.makeNumber(arena, std.math.nan(f64));
+            if (try coercion_mod.toPrimitive(arena, arg, .number)) |prim|
+                break :blk try numberPrimitive(arena, prim);
+            break :blk std.math.nan(f64);
         },
-        else => val_mod.makeNumber(arena, std.math.nan(f64)),
+        else => std.math.nan(f64),
     };
+}
+
+fn nativeNumberCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const constructing = active_constructing;
+    active_constructing = false;
+    const n: f64 = if (args.len == 0) 0 else try numberPrimitive(arena, args[0]);
+    // `new Number(x)`: wrap on the synthesized object; plain call returns primitive.
+    if (constructing and this_val.bits != 0 and this_val.unbox() == .object) {
+        try this_val.toPtr().object.set("[[PrimitiveValue]]", try val_mod.makeNumber(arena, n));
+        return this_val;
+    }
+    return val_mod.makeNumber(arena, n);
+}
+
+/// Pull a wrapper object's stored `[[PrimitiveValue]]`, if present.
+fn wrapperPrimitive(this_val: Value) ?Value {
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
+        if (this_val.toPtr().object.get("[[PrimitiveValue]]")) |p| return p;
+    }
+    return null;
+}
+
+/// Raise a `TypeError` from a native: sets `pending_exception` and returns
+/// `error.JsException` for the VM to surface as a catchable throw.
+fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    const err_obj = if (active_heap) |h|
+        try JsObject.createOnHeap(h, error_proto_TypeError)
+    else
+        try JsObject.create(arena, error_proto_TypeError);
+    try err_obj.set("message", try val_mod.makeString(arena, msg));
+    try err_obj.set("name", try val_mod.makeString(arena, "TypeError"));
+    pending_exception = try val_mod.makeObject(arena, err_obj);
+    return error.JsException;
+}
+
+// ---- Boolean.prototype ----
+/// `this` boolean value: the primitive itself, or a Boolean wrapper's
+/// `[[PrimitiveValue]]`. Any other `this` is a TypeError per the spec.
+fn thisBoolean(this_val: Value) ?bool {
+    if (this_val.bits != 0 and this_val.unbox() == .boolean) return this_val.unbox().boolean;
+    if (wrapperPrimitive(this_val)) |p| {
+        if (p.bits != 0 and p.unbox() == .boolean) return p.unbox().boolean;
+    }
+    return null;
+}
+
+fn nativeBooleanValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const b = thisBoolean(this_val) orelse return throwTypeError(arena, "Boolean.prototype.valueOf requires a Boolean");
+    return val_mod.makeBool(arena, b);
+}
+
+fn nativeBooleanToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const b = thisBoolean(this_val) orelse return throwTypeError(arena, "Boolean.prototype.toString requires a Boolean");
+    return val_mod.makeString(arena, if (b) "true" else "false");
+}
+
+// ---- Number.prototype ----
+fn thisNumber(this_val: Value) ?f64 {
+    if (this_val.bits != 0 and this_val.unbox() == .number) return this_val.unbox().number;
+    if (wrapperPrimitive(this_val)) |p| {
+        if (p.bits != 0 and p.unbox() == .number) return p.unbox().number;
+    }
+    return null;
+}
+
+fn nativeNumberValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.valueOf requires a Number");
+    return val_mod.makeNumber(arena, n);
+}
+
+fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toString requires a Number");
+    return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+}
+
+// ---- String.prototype valueOf/toString ----
+fn thisString(this_val: Value) ?[]const u8 {
+    if (this_val.bits != 0 and this_val.unbox() == .string) return this_val.toPtr().string;
+    if (wrapperPrimitive(this_val)) |p| {
+        if (p.bits != 0 and p.unbox() == .string) return p.toPtr().string;
+    }
+    return null;
+}
+
+fn nativeStringValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const s = thisString(this_val) orelse return throwTypeError(arena, "String.prototype.valueOf requires a String");
+    return val_mod.makeString(arena, s);
 }
 
 // ---------------------------------------------------------------- Phase 4b registration helpers ---
@@ -606,6 +715,10 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         const fn_val = try val_mod.makeNativeFunction(arena, pair[1]);
         try proto.set(pair[0], fn_val);
     }
+    // String.prototype is itself a String object with [[StringData]] = "".
+    try proto.set("[[PrimitiveValue]]", try val_mod.makeString(arena, ""));
+    try proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeStringValueOf));
+    try proto.set("toString", try val_mod.makeNativeFunction(arena, nativeStringValueOf));
 }
 
 fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
@@ -676,6 +789,26 @@ fn registerMath(arena: std.mem.Allocator, obj: *JsObject) !void {
         .{ "min", math_mod.nativeMin },
         .{ "max", math_mod.nativeMax },
         .{ "random", math_mod.nativeRandom },
+        .{ "acos", math_mod.nativeAcos },
+        .{ "asin", math_mod.nativeAsin },
+        .{ "atan", math_mod.nativeAtan },
+        .{ "atan2", math_mod.nativeAtan2 },
+        .{ "sign", math_mod.nativeSign },
+        .{ "cbrt", math_mod.nativeCbrt },
+        .{ "log2", math_mod.nativeLog2 },
+        .{ "log10", math_mod.nativeLog10 },
+        .{ "log1p", math_mod.nativeLog1p },
+        .{ "expm1", math_mod.nativeExpm1 },
+        .{ "sinh", math_mod.nativeSinh },
+        .{ "cosh", math_mod.nativeCosh },
+        .{ "tanh", math_mod.nativeTanh },
+        .{ "asinh", math_mod.nativeAsinh },
+        .{ "acosh", math_mod.nativeAcosh },
+        .{ "atanh", math_mod.nativeAtanh },
+        .{ "hypot", math_mod.nativeHypot },
+        .{ "clz32", math_mod.nativeClz32 },
+        .{ "fround", math_mod.nativeFround },
+        .{ "imul", math_mod.nativeImul },
     };
     inline for (func_fns) |pair| {
         const fn_val = try val_mod.makeNativeFunction(arena, pair[1]);
@@ -1077,7 +1210,14 @@ pub const Realm = struct {
         try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunction(arena, nativeStringFromCharCode));
         try env.define("String", try val_mod.makeObject(arena, string_ctor_obj));
 
+        const number_proto = try JsObject.create(arena, object_proto);
+        // Number.prototype is itself a Number object with [[NumberData]] = +0.
+        try number_proto.set("[[PrimitiveValue]]", try val_mod.makeNumber(arena, 0));
+        try number_proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeNumberValueOf));
+        try number_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeNumberToString));
+        active_number_proto = number_proto;
         const number_ctor_obj = try JsObject.create(arena, null);
+        try number_ctor_obj.set("prototype", try val_mod.makeObject(arena, number_proto));
         try number_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeNumberCtor));
         try number_ctor_obj.set("MAX_VALUE", try val_mod.makeNumber(arena, 1.7976931348623157e+308));
         try number_ctor_obj.set("MIN_VALUE", try val_mod.makeNumber(arena, 5e-324));
@@ -1087,7 +1227,14 @@ pub const Realm = struct {
         try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
 
         // ---- Phase 4: global functions + value globals ----
+        const boolean_proto = try JsObject.create(arena, object_proto);
+        // Boolean.prototype is itself a Boolean object with [[BooleanData]] = false.
+        try boolean_proto.set("[[PrimitiveValue]]", try val_mod.makeBool(arena, false));
+        try boolean_proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeBooleanValueOf));
+        try boolean_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeBooleanToString));
+        active_boolean_proto = boolean_proto;
         const boolean_ctor_obj = try JsObject.create(arena, null);
+        try boolean_ctor_obj.set("prototype", try val_mod.makeObject(arena, boolean_proto));
         try boolean_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBooleanCtor));
         try env.define("Boolean", try val_mod.makeObject(arena, boolean_ctor_obj));
         try env.define("isNaN", try val_mod.makeNativeFunction(arena, nativeIsNaN));
@@ -1337,6 +1484,8 @@ pub const Realm = struct {
         active_array_proto = null;
         active_object_proto = null;
         active_string_proto = null;
+        active_number_proto = null;
+        active_boolean_proto = null;
         active_regexp_proto = null;
         active_function_proto = null;
         active_promise_proto = null;

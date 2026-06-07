@@ -163,6 +163,7 @@ pub const BcVm = struct {
     /// Phase 4d: Context re-entry — called by invokeCallback for JS functions.
     fn bcInvokeJs(ptr: *anyopaque, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         _ = arena;
+        @import("../runtime/realm.zig").active_constructing = false;
         const self: *BcVm = @ptrCast(@alignCast(ptr));
         const function_proto_mod = @import("../runtime/builtins/function_proto.zig");
         if (fn_val.bits == 0) return error.JsException;
@@ -282,7 +283,12 @@ pub const BcVm = struct {
                 else
                     try JsObject.create(self.arena, self.realm.object_prototype);
                 const this_val = try val_mod.makeObject(self.arena, new_obj);
-                const result = try fn_ptr.invoke(self.arena, this_val, args);
+                realm_m.active_constructing = true;
+                const result = fn_ptr.invoke(self.arena, this_val, args) catch |e| {
+                    realm_m.active_constructing = false;
+                    return e;
+                };
+                realm_m.active_constructing = false;
                 return if (result.bits != 0 and result.unbox() == .object) result else this_val;
             },
             .object => |o| {
@@ -298,7 +304,12 @@ pub const BcVm = struct {
                         else
                             try JsObject.create(self.arena, proto);
                         const this_val = try val_mod.makeObject(self.arena, new_obj);
-                        const result = try cv.toPtr().native_function.invoke(self.arena, this_val, args);
+                        realm_m.active_constructing = true;
+                        const result = cv.toPtr().native_function.invoke(self.arena, this_val, args) catch |e| {
+                            realm_m.active_constructing = false;
+                            return e;
+                        };
+                        realm_m.active_constructing = false;
                         return if (result.bits != 0 and result.unbox() == .object) result else this_val;
                     }
                 }
@@ -318,12 +329,45 @@ pub const BcVm = struct {
         return self.constructFromArgs(ctor_val, args);
     }
 
+    /// Phase 13: global `eval(source)` — compile + run `source` against the
+    /// global environment, returning its completion value (the value of the last
+    /// expression, which `compileProgram` emits as an implicit return). Reachable
+    /// from `nativeEval` via the Context bridge.
+    fn bcEval(ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8) anyerror!Value {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        const realm_mod = @import("../runtime/realm.zig");
+        const parser_mod = @import("../parser/parser.zig");
+        const compiler_mod = @import("../bytecode/compiler.zig");
+        const ast_mod = @import("../parser/ast.zig");
+        const isolate_mod = @import("./isolate.zig");
+
+        const transformed = isolate_mod.rewriteTemplateLiterals(self.arena, source) catch source;
+        var p = parser_mod.Parser.init(transformed, self.arena);
+        const parse_result = p.parseScript();
+        const stmts = switch (parse_result) {
+            .ok => |s| s,
+            .err => |e| {
+                realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", e.message);
+                return error.JsException;
+            },
+        };
+        const prog = ast_mod.Program{ .body = stmts };
+        const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<eval>");
+        const closure = try self.arena.create(BcClosure);
+        closure.* = .{ .func = main_func, .env = @ptrCast(self.realm.global_env) };
+        const closure_val = try val_mod.makeBcFunction(self.arena, closure);
+        const undef = try val_mod.makeUndefined(self.arena);
+        return bcInvokeJs(self, self.arena, undef, closure_val, &[_]Value{});
+    }
+
     fn activateContext(self: *BcVm) void {
         const realm_mod = @import("../runtime/realm.zig");
         self.context = realm_mod.Context{
             .ptr = self,
             .invoke_fn = bcInvokeJs,
             .construct_fn = bcConstruct,
+            .eval_fn = bcEval,
         };
         realm_mod.active_context = &self.context;
     }
@@ -670,7 +714,7 @@ pub const BcVm = struct {
                         const l = try self.toNumberCoerced(lv);
                         const r = try self.toNumberCoerced(rv);
                         ac.mode = .unknown;
-                        const res = std.math.mod(f64, l, r) catch std.math.nan(f64);
+                        const res = jsRemainder(l, r);
                         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, res);
                     } else {
                         const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
@@ -682,7 +726,7 @@ pub const BcVm = struct {
                         else
                             toNumber(rv);
                         ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                        const res = std.math.mod(f64, l, r) catch std.math.nan(f64);
+                        const res = jsRemainder(l, r);
                         frame.registers[rdst] = try val_mod.makeNumber(self.arena, res);
                     }
                 },
@@ -698,9 +742,9 @@ pub const BcVm = struct {
                     if (isObjectOperand(lv) or isObjectOperand(rv)) {
                         const ln = try self.toNumberCoerced(lv);
                         const rn = try self.toNumberCoerced(rv);
-                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, std.math.pow(f64, ln, rn));
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, jsExp(ln, rn));
                     } else {
-                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, std.math.pow(f64, toNumber(lv), toNumber(rv)));
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, jsExp(toNumber(lv), toNumber(rv)));
                     }
                 },
                 .NEG => {
@@ -2330,9 +2374,12 @@ pub const BcVm = struct {
                 else
                     try JsObject.create(self.arena, proto);
                 const this_val = try val_mod.makeObject(self.arena, new_obj);
+                @import("../runtime/realm.zig").active_constructing = true;
                 const result = fn_ptr.invoke(self.arena, this_val, args) catch {
+                    @import("../runtime/realm.zig").active_constructing = false;
                     return "native constructor threw";
                 };
+                @import("../runtime/realm.zig").active_constructing = false;
                 frame.registers[rdst] = if (result.bits != 0 and result.unbox() == .object) result else this_val;
                 return null;
             },
@@ -2374,7 +2421,10 @@ pub const BcVm = struct {
                         else
                             try JsObject.create(self.arena, proto);
                         const this_val = try val_mod.makeObject(self.arena, new_obj);
+                        const realm_c = @import("../runtime/realm.zig");
+                        realm_c.active_constructing = true;
                         const result = fn_ptr.invoke(self.arena, this_val, args) catch |e| {
+                            realm_c.active_constructing = false;
                             if (e == error.JsException) {
                                 const realm_m = @import("../runtime/realm.zig");
                                 if (realm_m.pending_exception.bits != 0) {
@@ -2385,6 +2435,7 @@ pub const BcVm = struct {
                             }
                             return "native constructor threw";
                         };
+                        realm_c.active_constructing = false;
                         const final_r = if (result.bits != 0 and result.unbox() == .object) result else this_val;
                         self.frames.items[self.frames.items.len - 1].registers[rdst] = final_r;
                         return null;
@@ -2785,6 +2836,22 @@ pub const BcVm = struct {
                 }
                 return val_mod.makeUndefined(self.arena);
             },
+            .number => {
+                // Phase 13: autoboxing for number primitives → Number.prototype.
+                const realm_mod = @import("../runtime/realm.zig");
+                if (realm_mod.active_number_proto) |proto| {
+                    if (proto.get(key)) |v| return v;
+                }
+                return val_mod.makeUndefined(self.arena);
+            },
+            .boolean => {
+                // Phase 13: autoboxing for boolean primitives → Boolean.prototype.
+                const realm_mod = @import("../runtime/realm.zig");
+                if (realm_mod.active_boolean_proto) |proto| {
+                    if (proto.get(key)) |v| return v;
+                }
+                return val_mod.makeUndefined(self.arena);
+            },
             else => return val_mod.makeUndefined(self.arena),
         }
     }
@@ -2856,6 +2923,7 @@ pub const BcVm = struct {
 
     /// Execute a regular CALL: reads callee from R[base], args from R[base+1..base+1+nargs].
     fn doCall(self: *BcVm, callee_val: Value, this_val: Value, base: u8, nargs: u8, ret_dst: u8) !?[]const u8 {
+        @import("../runtime/realm.zig").active_constructing = false;
         const frame = &self.frames.items[self.frames.items.len - 1];
         if (callee_val.bits == 0) {
             return try std.fmt.allocPrint(self.arena, "TypeError: undefined is not a function", .{});
@@ -3085,6 +3153,7 @@ pub const BcVm = struct {
 
     /// Execute a METHOD_CALL: R[base]=this, R[base+1]=fn, args from R[base+2..base+1+nargs].
     fn doMethodCall(self: *BcVm, callee_val: Value, this_val: Value, base: u8, nargs: u8, ret_dst: u8) !?[]const u8 {
+        @import("../runtime/realm.zig").active_constructing = false;
         const frame = &self.frames.items[self.frames.items.len - 1];
         if (callee_val.bits == 0) {
             return try std.fmt.allocPrint(self.arena, "TypeError: undefined is not a function", .{});
@@ -3647,6 +3716,47 @@ pub fn toUint32(v: Value) u32 {
     return @bitCast(toInt32(v));
 }
 
+/// ES `StringNumericValue`: a trimmed empty string is 0, `Infinity` forms and
+/// `0x`/`0o`/`0b` radix prefixes are recognized, everything else falls back to a
+/// decimal float parse (NaN on failure). Diverges from a bare `parseFloat`, which
+/// maps "" to NaN and does not accept radix prefixes.
+pub fn jsStringToNumber(s: []const u8) f64 {
+    const t = std.mem.trim(u8, s, " \t\n\r\x0B\x0C");
+    if (t.len == 0) return 0;
+    if (std.mem.eql(u8, t, "Infinity") or std.mem.eql(u8, t, "+Infinity")) return std.math.inf(f64);
+    if (std.mem.eql(u8, t, "-Infinity")) return -std.math.inf(f64);
+    if (t.len > 2 and t[0] == '0') {
+        const radix: ?u8 = switch (t[1]) {
+            'x', 'X' => @as(u8, 16),
+            'o', 'O' => @as(u8, 8),
+            'b', 'B' => @as(u8, 2),
+            else => null,
+        };
+        if (radix) |r| {
+            const v = std.fmt.parseInt(u64, t[2..], r) catch return std.math.nan(f64);
+            return @floatFromInt(v);
+        }
+    }
+    return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
+}
+
+/// ES `Number::remainder` (the `%` operator): truncated remainder taking the sign
+/// of the dividend (C `fmod`), unlike `std.math.mod` which floors toward the
+/// divisor's sign.
+pub fn jsRemainder(a: f64, b: f64) f64 {
+    if (std.math.isNan(a) or std.math.isNan(b) or std.math.isInf(a) or b == 0) return std.math.nan(f64);
+    if (std.math.isInf(b)) return a; // finite a % ±Inf = a
+    if (a == 0) return a; // ±0 % finite = ±0
+    return @rem(a, b);
+}
+
+/// ES `Number::exponentiate` (the `**` operator): `std.math.pow` plus the JS-only
+/// rule that `(±1) ** ±Infinity` is NaN (C `pow` returns 1).
+pub fn jsExp(base: f64, exp: f64) f64 {
+    if (std.math.isInf(exp) and (base == 1 or base == -1)) return std.math.nan(f64);
+    return std.math.pow(f64, base, exp);
+}
+
 pub fn toNumber(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
     return switch (v.unbox()) {
@@ -3654,7 +3764,7 @@ pub fn toNumber(v: Value) f64 {
         .null_ => 0.0,
         .boolean => |b| if (b) 1.0 else 0.0,
         .number => |n| n,
-        .string => |s| std.fmt.parseFloat(f64, std.mem.trim(u8, s, " \t\n\r")) catch std.math.nan(f64),
+        .string => |s| jsStringToNumber(s),
         .function => std.math.nan(f64),
         .bc_function => std.math.nan(f64),
         .object => std.math.nan(f64),

@@ -27,6 +27,18 @@ const LabelEntry = struct {
     loop_start: usize = 0,
 };
 
+/// Per-loop compilation context for unlabeled (and labeled) `break`/`continue`.
+/// Each `while`/`do-while`/`for` pushes one before compiling its body; `break`
+/// and `continue` register their JMP patch offsets here, resolved when the loop
+/// pops (break → loop exit, continue → the loop's continue target).
+const LoopCtx = struct {
+    break_patches: std.ArrayListUnmanaged(usize) = .empty,
+    continue_patches: std.ArrayListUnmanaged(usize) = .empty,
+    /// Label attached to this loop (from a directly-enclosing labeled statement),
+    /// so `break L`/`continue L` can target it. null when unlabeled.
+    label: ?[]const u8 = null,
+};
+
 const FnCompiler = struct {
     arena: std.mem.Allocator,
     builder: ChunkBuilder,
@@ -44,6 +56,11 @@ const FnCompiler = struct {
     nfe_name: ?[]const u8 = null,
     /// Phase 4d: label stack for labeled break/continue.
     label_stack: std.ArrayListUnmanaged(LabelEntry) = .empty,
+    /// Phase 13: stack of enclosing loops for unlabeled/labeled break+continue.
+    loop_stack: std.ArrayListUnmanaged(LoopCtx) = .empty,
+    /// Phase 13: a pending label from a labeled statement, consumed by the next
+    /// loop so `break L`/`continue L` target that loop. null otherwise.
+    pending_label: ?[]const u8 = null,
     /// Phase 8: is this function compiled in strict mode? PTC only applies in
     /// strict mode (ES2015 14.6).
     is_strict: bool = false,
@@ -110,6 +127,16 @@ const FnCompiler = struct {
 
     fn patchJump(self: *Self, at: usize, target: usize) void {
         self.builder.patchJump(at, target);
+    }
+
+    /// Pop the innermost loop context, patching its `break` jumps to `exit` and
+    /// its `continue` jumps to `continue_target`.
+    fn resolveLoop(self: *Self, continue_target: usize, exit: usize) void {
+        var ctx = self.loop_stack.pop().?;
+        for (ctx.break_patches.items) |bp| self.patchJump(bp, exit);
+        for (ctx.continue_patches.items) |cp| self.patchJump(cp, continue_target);
+        ctx.break_patches.deinit(self.arena);
+        ctx.continue_patches.deinit(self.arena);
     }
 
     /// ES2020 optional chaining: if inside an optional chain, emit a
@@ -1413,6 +1440,8 @@ const FnCompiler = struct {
             },
             .while_stmt => {
                 const ws = node.data.while_stmt;
+                const loop_lbl = self.pending_label;
+                self.pending_label = null;
                 const loop_start = self.currentOffset();
 
                 const rcond = try self.compileExpr(ws.test_);
@@ -1423,9 +1452,10 @@ const FnCompiler = struct {
                 const patch_exit = self.currentOffset();
                 try self.emitI16(0);
 
+                try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl });
                 try self.compileStmt(ws.body, last_expr_reg);
 
-                // Jump back to loop start.
+                // Jump back to loop start (continue lands here too: re-eval cond).
                 try self.emitOp(.JMP, line);
                 const back_offset = self.currentOffset();
                 try self.emitI16(0);
@@ -1433,13 +1463,19 @@ const FnCompiler = struct {
 
                 const exit_offset = self.currentOffset();
                 self.patchJump(patch_exit, exit_offset);
+                self.resolveLoop(loop_start, exit_offset);
             },
             .do_while_stmt => {
                 const dw = node.data.do_while_stmt;
+                const loop_lbl = self.pending_label;
+                self.pending_label = null;
                 const loop_start = self.currentOffset();
 
+                try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl });
                 try self.compileStmt(dw.body, last_expr_reg);
 
+                // continue in a do-while jumps to the condition test.
+                const cond_offset = self.currentOffset();
                 const rcond = try self.compileExpr(dw.test_);
                 self.freeReg();
 
@@ -1448,9 +1484,14 @@ const FnCompiler = struct {
                 const back_offset = self.currentOffset();
                 try self.emitI16(0);
                 self.patchJump(back_offset, loop_start);
+
+                const exit_offset = self.currentOffset();
+                self.resolveLoop(cond_offset, exit_offset);
             },
             .for_stmt => {
                 const fs = node.data.for_stmt;
+                const loop_lbl = self.pending_label;
+                self.pending_label = null;
                 if (fs.init) |init_node| {
                     var dummy: ?u8 = null;
                     try self.compileStmt(init_node, &dummy);
@@ -1468,8 +1509,11 @@ const FnCompiler = struct {
                     try self.emitI16(0);
                 }
 
+                try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl });
                 try self.compileStmt(fs.body, last_expr_reg);
 
+                // continue in a for-loop runs the update expression, then re-tests.
+                const update_offset = self.currentOffset();
                 if (fs.update) |update_node| {
                     const r = try self.compileExpr(update_node);
                     self.freeReg();
@@ -1482,9 +1526,11 @@ const FnCompiler = struct {
                 try self.emitI16(0);
                 self.patchJump(back_offset, loop_start);
 
+                const exit_offset = self.currentOffset();
                 if (patch_exit) |pe| {
-                    self.patchJump(pe, self.currentOffset());
+                    self.patchJump(pe, exit_offset);
                 }
+                self.resolveLoop(update_offset, exit_offset);
             },
             .return_stmt => {
                 if (node.data.return_stmt) |rv_node| {
@@ -1569,32 +1615,55 @@ const FnCompiler = struct {
             },
             .break_stmt => {
                 const label = node.data.break_stmt;
+                try self.emitOp(.JMP, line);
+                const patch = self.currentOffset();
+                try self.emitI16(0);
                 if (label) |lname| {
-                    // Find the matching label entry and add a patch.
+                    // Prefer a labeled loop (so `break L` exits the loop); fall back
+                    // to a labeled non-loop statement block.
+                    var li = self.loop_stack.items.len;
+                    while (li > 0) {
+                        li -= 1;
+                        if (self.loop_stack.items[li].label) |l| {
+                            if (std.mem.eql(u8, l, lname)) {
+                                try self.loop_stack.items[li].break_patches.append(self.arena, patch);
+                                return;
+                            }
+                        }
+                    }
                     var i = self.label_stack.items.len;
                     while (i > 0) {
                         i -= 1;
                         if (std.mem.eql(u8, self.label_stack.items[i].name, lname)) {
-                            try self.emitOp(.JMP, line);
-                            try self.label_stack.items[i].break_patches.append(self.arena, self.currentOffset());
-                            try self.emitI16(0);
-                            break;
+                            try self.label_stack.items[i].break_patches.append(self.arena, patch);
+                            return;
                         }
-                    } else {
-                        // Label not found — emit stub JMP 0.
-                        try self.emitOp(.JMP, line);
-                        try self.emitI16(0);
                     }
-                } else {
-                    // Unlabeled break: emit JMP 0 (patched by loop structure).
-                    try self.emitOp(.JMP, line);
-                    try self.emitI16(0);
+                    // Label not found — leave the stub JMP 0 (no-op fall-through).
+                } else if (self.loop_stack.items.len > 0) {
+                    try self.loop_stack.items[self.loop_stack.items.len - 1].break_patches.append(self.arena, patch);
                 }
             },
             .continue_stmt => {
-                // emit JMP 0 (no label support yet for continue).
+                const label = node.data.continue_stmt;
                 try self.emitOp(.JMP, line);
+                const patch = self.currentOffset();
                 try self.emitI16(0);
+                if (label) |lname| {
+                    var li = self.loop_stack.items.len;
+                    while (li > 0) {
+                        li -= 1;
+                        if (self.loop_stack.items[li].label) |l| {
+                            if (std.mem.eql(u8, l, lname)) {
+                                try self.loop_stack.items[li].continue_patches.append(self.arena, patch);
+                                return;
+                            }
+                        }
+                    }
+                    // Label not found — stub JMP 0.
+                } else if (self.loop_stack.items.len > 0) {
+                    try self.loop_stack.items[self.loop_stack.items.len - 1].continue_patches.append(self.arena, patch);
+                }
             },
             .for_in_stmt => {
                 // W2: for-of (iterate_values) uses the iterator protocol via the
@@ -1880,12 +1949,16 @@ const FnCompiler = struct {
             },
             .labeled_stmt => {
                 // Phase 4d: push label, compile body, patch breaks to exit.
+                // Phase 13: also expose the label to a directly-enclosed loop via
+                // `pending_label` so `break L`/`continue L` target the loop.
                 const ls = node.data.labeled_stmt;
+                self.pending_label = ls.name;
                 try self.label_stack.append(self.arena, LabelEntry{
                     .name = ls.name,
                     .loop_start = self.currentOffset(),
                 });
                 try self.compileStmt(ls.body, last_expr_reg);
+                self.pending_label = null;
                 const exit = self.currentOffset();
                 // Patch all break patches for this label.
                 var entry = self.label_stack.pop().?;

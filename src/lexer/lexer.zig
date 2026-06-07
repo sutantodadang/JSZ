@@ -90,14 +90,42 @@ pub const Lexer = struct {
         return a == 0xE2 and b == 0x80 and (c2 == 0xA8 or c2 == 0xA9);
     }
 
+    /// Byte length of a non-line-terminator Unicode whitespace code point at the
+    /// current position (UTF-8), or 0 if none. Covers the ES `WhiteSpace`
+    /// production beyond the ASCII set: NBSP, the U+2000-block spaces, BOM, etc.
+    /// (U+2028/U+2029 are line terminators, handled separately.)
+    fn unicodeWsLen(self: *const Lexer) usize {
+        const rem = self.source.len - self.pos;
+        if (rem < 2) return 0;
+        const p = self.source[self.pos..];
+        if (p[0] == 0xC2 and p[1] == 0xA0) return 2; // U+00A0 NBSP
+        if (rem < 3) return 0;
+        if (p[0] == 0xE1 and p[1] == 0x9A and p[2] == 0x80) return 3; // U+1680
+        if (p[0] == 0xE2 and p[1] == 0x80) {
+            if (p[2] >= 0x80 and p[2] <= 0x8A) return 3; // U+2000..U+200A
+            if (p[2] == 0xAF) return 3; // U+202F
+        }
+        if (p[0] == 0xE2 and p[1] == 0x81 and p[2] == 0x9F) return 3; // U+205F
+        if (p[0] == 0xE3 and p[1] == 0x80 and p[2] == 0x80) return 3; // U+3000
+        if (p[0] == 0xEF and p[1] == 0xBB and p[2] == 0xBF) return 3; // U+FEFF ZWNBSP/BOM
+        return 0;
+    }
+
     /// Skip whitespace and comments. Returns true if any line terminator was consumed.
     fn skipTrivia(self: *Lexer) bool {
         var lt_before = false;
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
-            // Whitespace
-            if (c == ' ' or c == '\t' or c == '\x0B' or c == '\x0C' or c == 0xA0) {
+            // Whitespace (ASCII)
+            if (c == ' ' or c == '\t' or c == '\x0B' or c == '\x0C') {
                 self.pos += 1;
+                self.column += 1;
+                continue;
+            }
+            // Whitespace (multi-byte Unicode: NBSP, U+2000-block, BOM, …)
+            const uws = self.unicodeWsLen();
+            if (uws > 0) {
+                self.pos += uws;
                 self.column += 1;
                 continue;
             }
