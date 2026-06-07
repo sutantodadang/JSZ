@@ -441,12 +441,46 @@ pub const BcVm = struct {
                     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
                     const name_val = frame.func.chunk.constants[kidx];
                     const name = name_val.toPtr().string;
-                    // Look up in frame env (which chains up to global).
+                    // Look up in frame env (chains to global), then realm global.
+                    // An identifier that resolves nowhere is a ReferenceError
+                    // (env lookups run no user code, so no frame realloc here).
+                    if (frame.env.lookup(name)) |v| {
+                        frame.registers[rdst] = v;
+                    } else |_| if (self.realm.global_env.lookup(name)) |v| {
+                        frame.registers[rdst] = v;
+                    } else |_| {
+                        const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{name});
+                        const exc_val = try self.makeErrorObjectBc("ReferenceError", msg);
+                        self.last_exception_value = exc_val;
+                        const found = try self.throwException(exc_val);
+                        if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+                    }
+                },
+                .GET_GLOBAL_OPT => {
+                    // Tolerant load for `typeof <identifier>`: undeclared => undefined.
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
+                    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+                    const name_val = frame.func.chunk.constants[kidx];
+                    const name = name_val.toPtr().string;
                     frame.registers[rdst] = frame.env.lookup(name) catch blk: {
-                        // Not in env chain: also try realm global directly.
                         break :blk self.realm.global_env.lookup(name) catch
                             try val_mod.makeUndefined(self.arena);
                     };
+                },
+                .HOIST_VAR => {
+                    const lo = code[frame.pc];
+                    frame.pc += 1;
+                    const hi = code[frame.pc];
+                    frame.pc += 1;
+                    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+                    const name = frame.func.chunk.constants[kidx].toPtr().string;
+                    const undef = try val_mod.makeUndefined(self.arena);
+                    frame.env.hoistVar(name, undef) catch return error.OutOfMemory;
                 },
                 .SET_GLOBAL => {
                     const lo = code[frame.pc];

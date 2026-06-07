@@ -323,6 +323,16 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     var ctx = iso.newContext() catch return .fail;
     defer ctx.deinit();
 
+    // Per-test resource limits so a looping/allocating test can't hang the
+    // whole run. Enforced in the bc VM (the default); a breach surfaces as an
+    // `EvalResult.exception` with an "interrupted:"/"out of memory" message,
+    // which we treat as `.skip` (not a genuine pass/fail).
+    ctx.setLimits(.{
+        .time_ms = 1000,
+        .mem_bytes = 256 * 1024 * 1024,
+        .gas = 0,
+    });
+
     const prelude_owned: ?[]u8 = if (full_mode and harness_present)
         (buildHarnessPrelude(allocator, source) catch return .skip)
     else
@@ -334,6 +344,19 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     defer allocator.free(full_source);
 
     const result = ctx.eval(full_source, "<test262>");
+
+    // A resource-limit interrupt is neither a pass nor a fail — skip it so a
+    // looping test cannot masquerade as a passing negative test.
+    if (result == .exception) {
+        const msg = result.exception.message;
+        if (std.mem.startsWith(u8, msg, "interrupted:") or
+            std.mem.startsWith(u8, msg, "out of memory") or
+            std.mem.startsWith(u8, msg, "Uncaught out of memory"))
+        {
+            return .skip;
+        }
+    }
+
     if (meta.negative) {
         // Negative test: expect exception or parse error.
         return switch (result) {

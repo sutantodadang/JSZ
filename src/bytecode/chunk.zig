@@ -175,7 +175,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d}", .{r});
         },
-        .GET_GLOBAL => {
+        .GET_GLOBAL, .GET_GLOBAL_OPT => {
             const rdst = code[new_pc];
             new_pc += 1;
             const lo = code[new_pc];
@@ -516,6 +516,22 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
             const target: i64 = @intCast(new_pc);
             try writer.print(" R{d} R{d} -> {d}", .{ rlhs, rrhs, target + offset });
+        },
+        .HOIST_VAR => {
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
+            const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+            if (kidx < chunk.constants.len and chunk.constants[kidx].bits != 0) {
+                const inner = chunk.constants[kidx].unbox();
+                switch (inner) {
+                    .string => |s| try writer.print(" \"{s}\"", .{s}),
+                    else => try writer.print(" K{d}", .{kidx}),
+                }
+            } else {
+                try writer.print(" K{d}", .{kidx});
+            }
         },
         .DEFINE_GLOBAL => {
             const lo = code[new_pc];

@@ -196,6 +196,14 @@ pub const Op = enum(u8) {
     /// R[Rargs]; result into R[Rdst]. Used for calls containing a spread arg
     /// (`f(...xs)`, `obj.m(a, ...xs)`). Operand registers need not be contiguous.
     CALL_SPREAD,
+    /// Tolerant global read: like GET_GLOBAL but yields `undefined` (never a
+    /// ReferenceError) when the name resolves nowhere. Emitted only for the
+    /// operand of `typeof <identifier>`, where an undeclared name must be safe.
+    GET_GLOBAL_OPT,
+    /// HOIST_VAR | 3 | op, Kname u16-LE. Defines `name` = undefined in the
+    /// current env if it has no own binding yet (var/function-decl hoisting).
+    /// Never clobbers a parameter or an already-defined binding.
+    HOIST_VAR,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -208,6 +216,8 @@ pub fn instrSize(op: Op) usize {
         .LOAD_UNDEF => 2,
         .MOVE => 3,
         .GET_GLOBAL => 4,
+        .GET_GLOBAL_OPT => 4,
+        .HOIST_VAR => 3,
         .SET_GLOBAL => 4,
         .GET_LOCAL => 3,
         .SET_LOCAL => 3,

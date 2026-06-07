@@ -39,6 +39,16 @@ pub const Environment = struct {
         return env;
     }
 
+    /// Hoist a `var`/function-declaration binding into THIS frame: define it as
+    /// `value` (usually undefined) only if this frame has no own binding for the
+    /// name yet. Never walks the parent chain and never clobbers an existing
+    /// binding (e.g. a parameter, or an already-hoisted name). This gives every
+    /// `var` an `undefined` value at scope entry without overwriting params.
+    pub fn hoistVar(self: *Environment, name: []const u8, value: Value) !void {
+        if (self.bindings.contains(name)) return;
+        try self.define(name, value);
+    }
+
     /// Define a var-style binding in THIS frame.
     pub fn define(self: *Environment, name: []const u8, value: Value) !void {
         try self.bindings.put(self.arena, name, .{

@@ -198,6 +198,14 @@ pub fn build(b: *std.Build) void {
     const conformance_full_seed_step = b.step("conformance-full-seed", "Write tests/test262_known_failing_full.txt from the current full-corpus results");
     conformance_full_seed_step.dependOn(&run_conformance_full_seed.step);
 
+    // Seed/refresh the whitelist known-failing list from the current baseline.
+    const run_conformance_seed = b.addRunArtifact(conformance_exe);
+    run_conformance_seed.addArg("--summary");
+    run_conformance_seed.addArg("--write-known-failing");
+    run_conformance_seed.addArg("tests/test262_known_failing.txt");
+    const conformance_seed_step = b.step("conformance-seed", "Write tests/test262_known_failing.txt from the current whitelist results");
+    conformance_seed_step.dependOn(&run_conformance_seed.step);
+
     // ---------------------------------------------------------------------------
     // Differential: zig build differential
     // ---------------------------------------------------------------------------

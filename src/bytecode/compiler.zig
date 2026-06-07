@@ -140,6 +140,77 @@ const FnCompiler = struct {
         try self.emitU16(kidx);
     }
 
+    /// Tolerant identifier load (undeclared => `undefined`, never a
+    /// ReferenceError). Only for the operand of `typeof <identifier>`.
+    fn emitLoadOpt(self: *Self, name: []const u8, rdst: u8, line: u32) !void {
+        const sv = try val_mod.makeString(self.arena, name);
+        const kidx = try self.addConstant(sv);
+        try self.emitOp(.GET_GLOBAL_OPT, line);
+        try self.emitU8(rdst);
+        try self.emitU16(kidx);
+    }
+
+    /// Emit a HOIST_VAR for `name` (binds it to undefined at scope entry if it
+    /// has no own binding yet).
+    fn emitHoist(self: *Self, name: []const u8, line: u32) !void {
+        const sv = try val_mod.makeString(self.arena, name);
+        const kidx = try self.addConstant(sv);
+        try self.emitOp(.HOIST_VAR, line);
+        try self.emitU16(kidx);
+    }
+
+    /// Add `name` to `list` if not already present (dedup hoisted names).
+    fn addHoistName(self: *Self, list: *std.ArrayList([]const u8), name: []const u8) !void {
+        for (list.items) |n| {
+            if (std.mem.eql(u8, n, name)) return;
+        }
+        try list.append(self.arena, name);
+    }
+
+    /// Collect `var` and function-declaration names reachable in the current
+    /// function/script scope (recursing through nested statements but NOT into
+    /// nested function bodies — those are separate scopes). `let`/`const` are
+    /// block-scoped and intentionally excluded.
+    fn collectHoistedNames(self: *Self, node: *ast.Node, list: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        switch (node.kind) {
+            .var_decl => {
+                if (node.data.var_decl.kind == .var_) {
+                    try self.addHoistName(list, node.data.var_decl.name);
+                }
+            },
+            .function_decl => try self.addHoistName(list, node.data.function_decl.name),
+            .block_stmt => {
+                for (node.data.block_stmt.body) |c| try self.collectHoistedNames(c, list);
+            },
+            .if_stmt => {
+                try self.collectHoistedNames(node.data.if_stmt.consequent, list);
+                if (node.data.if_stmt.alternate) |a| try self.collectHoistedNames(a, list);
+            },
+            .while_stmt => try self.collectHoistedNames(node.data.while_stmt.body, list),
+            .do_while_stmt => try self.collectHoistedNames(node.data.do_while_stmt.body, list),
+            .for_stmt => {
+                if (node.data.for_stmt.init) |i| try self.collectHoistedNames(i, list);
+                try self.collectHoistedNames(node.data.for_stmt.body, list);
+            },
+            .for_in_stmt => {
+                try self.collectHoistedNames(node.data.for_in_stmt.left, list);
+                try self.collectHoistedNames(node.data.for_in_stmt.body, list);
+            },
+            .try_stmt => {
+                try self.collectHoistedNames(node.data.try_stmt.block, list);
+                if (node.data.try_stmt.handler) |h| try self.collectHoistedNames(h.body, list);
+                if (node.data.try_stmt.finalizer) |f| try self.collectHoistedNames(f, list);
+            },
+            .switch_stmt => {
+                for (node.data.switch_stmt.cases) |case| {
+                    for (case.body) |c| try self.collectHoistedNames(c, list);
+                }
+            },
+            .labeled_stmt => try self.collectHoistedNames(node.data.labeled_stmt.body, list),
+            else => {},
+        }
+    }
+
     // --------------------------------------------------------- emit name store ---
 
     fn emitStore(self: *Self, name: []const u8, rsrc: u8, line: u32) !void {
@@ -337,7 +408,17 @@ const FnCompiler = struct {
     fn compileUnary(self: *Self, u: ast.UnaryExpr, line: u32) error{OutOfMemory}!u8 {
         switch (u.op) {
             .typeof_ => {
-                // typeof: always use env-based load (won't throw for undeclared).
+                // typeof: a bare identifier uses a tolerant load so an
+                // undeclared name yields "undefined" instead of throwing a
+                // ReferenceError. Other operands use the normal eval path.
+                if (u.operand.kind == .identifier) {
+                    const r = self.allocReg();
+                    try self.emitLoadOpt(u.operand.data.identifier, r, line);
+                    try self.emitOp(.TYPEOF, line);
+                    try self.emitU8(r);
+                    try self.emitU8(r);
+                    return r;
+                }
                 const r_src = try self.compileExpr(u.operand);
                 const r_dst = r_src;
                 self.sp = r_src;
@@ -1828,6 +1909,15 @@ const FnCompiler = struct {
     /// program (so eval/REPL yields the last expression-statement value); function
     /// bodies pass false and return undefined on fall-through.
     fn compileBody(self: *Self, body: []*Node, implicit_return: bool) error{OutOfMemory}!void {
+        // Hoisting pre-pass: bind every `var` and function-declaration name in
+        // this scope to `undefined` at entry, so reads before initialization
+        // yield undefined while genuinely-undeclared names throw ReferenceError.
+        {
+            var hoisted: std.ArrayList([]const u8) = .empty;
+            for (body) |stmt| try self.collectHoistedNames(stmt, &hoisted);
+            for (hoisted.items) |name| try self.emitHoist(name, 0);
+        }
+
         var last_expr_stmt_reg: ?u8 = null;
         var last_other_reg: ?u8 = null;
 
