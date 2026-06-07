@@ -31,6 +31,8 @@ const reflect_mod = @import("./builtins/reflect.zig");
 const coercion_mod = @import("./builtins/coercion.zig");
 // Phase 13 Proxy
 const proxy_mod = @import("./builtins/proxy.zig");
+// Phase 13 Intl
+const intl_mod = @import("./builtins/intl.zig");
 
 // ---------------------------------------------------------------- Context interface ---
 
@@ -1161,6 +1163,33 @@ pub const Realm = struct {
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
         try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
+
+        // ---- Intl (en-US, dependency-free) ----
+        {
+            const intl_obj = try JsObject.create(arena, object_proto);
+            // Intl.NumberFormat
+            const nf_proto = try JsObject.create(arena, object_proto);
+            try nf_proto.set("format", try val_mod.makeNativeFunction(arena, intl_mod.nativeNumberFormatFormat));
+            const nf_ctor = try JsObject.create(arena, null);
+            try nf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeNumberFormatCtor));
+            try nf_ctor.set("prototype", try val_mod.makeObject(arena, nf_proto));
+            try intl_obj.set("NumberFormat", try val_mod.makeObject(arena, nf_ctor));
+            // Intl.DateTimeFormat
+            const dtf_proto = try JsObject.create(arena, object_proto);
+            try dtf_proto.set("format", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatFormat));
+            const dtf_ctor = try JsObject.create(arena, null);
+            try dtf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatCtor));
+            try dtf_ctor.set("prototype", try val_mod.makeObject(arena, dtf_proto));
+            try intl_obj.set("DateTimeFormat", try val_mod.makeObject(arena, dtf_ctor));
+            // Intl.Collator
+            const col_proto = try JsObject.create(arena, object_proto);
+            try col_proto.set("compare", try val_mod.makeNativeFunction(arena, intl_mod.nativeCollatorCompare));
+            const col_ctor = try JsObject.create(arena, null);
+            try col_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeCollatorCtor));
+            try col_ctor.set("prototype", try val_mod.makeObject(arena, col_proto));
+            try intl_obj.set("Collator", try val_mod.makeObject(arena, col_ctor));
+            try env.define("Intl", try val_mod.makeObject(arena, intl_obj));
+        }
 
         // ---- ES2020 globalThis (+ Node-compatible `global`) ----
         try installGlobalThis(arena, env, object_proto);

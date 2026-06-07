@@ -1394,3 +1394,93 @@ test "phase13: spread call preserves method this-binding" {
     const v = try evalToF64(std.testing.allocator, "var o={base:10,add:function(a,b,c){return this.base+a+b+c;}}; o.add(...[1,2,3])");
     try std.testing.expectEqual(@as(f64, 16), v);
 }
+
+test "phase13: Proxy apply trap" {
+    const v = try evalToF64(std.testing.allocator, "var p=new Proxy(function(){},{apply:function(t,th,a){return a[0]+a[1]+a[2];}}); p(1,2,3)");
+    try std.testing.expectEqual(@as(f64, 6), v);
+}
+
+test "phase13: Proxy apply forwards when no trap" {
+    const v = try evalToF64(std.testing.allocator, "function add(a,b){return a+b;} var p=new Proxy(add,{}); p(3,4)");
+    try std.testing.expectEqual(@as(f64, 7), v);
+}
+
+test "phase13: Proxy construct trap" {
+    const v = try evalToF64(std.testing.allocator, "var p=new Proxy(function(){},{construct:function(t,a){return {sum:a[0]+a[1]};}}); (new p(5,6)).sum");
+    try std.testing.expectEqual(@as(f64, 11), v);
+}
+
+test "phase13: Proxy construct forwards when no trap" {
+    const v = try evalToF64(std.testing.allocator, "function C(x){this.x=x;} var p=new Proxy(C,{}); (new p(42)).x");
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+test "phase13: Proxy ownKeys trap drives Object.keys" {
+    const s = try dualString(std.testing.allocator, "var p=new Proxy({},{ownKeys:function(){return ['x','y','z'];},getOwnPropertyDescriptor:function(t,k){return {enumerable:true,configurable:true,value:1};}}); Object.keys(p).join(',')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("x,y,z", s);
+}
+
+test "phase13: Proxy getOwnPropertyDescriptor trap" {
+    const s = try dualString(std.testing.allocator, "var p=new Proxy({},{getOwnPropertyDescriptor:function(t,k){return {value:'V_'+k,enumerable:true,configurable:true};}}); Object.getOwnPropertyDescriptor(p,'foo').value");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("V_foo", s);
+}
+
+test "phase13: regex /s dotAll flag" {
+    const s = try dualString(std.testing.allocator, "[/a.b/.test('a\\nb'), /a.b/s.test('a\\nb')].join(',')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("false,true", s);
+}
+
+test "phase13: regex /y sticky flag anchors at lastIndex" {
+    const s = try dualString(std.testing.allocator, "var r=/\\d/y; r.lastIndex=2; var a=r.test('ab3'); r.lastIndex=0; var b=r.test('ab3'); [a,b].join(',')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("true,false", s);
+}
+
+test "phase13: regex /u flag is accepted" {
+    const b = try dualBool(std.testing.allocator, "/\\d+/u.test('123') && /abc/u.test('xabcx')");
+    try std.testing.expect(b);
+}
+
+test "phase13: regex flag accessor properties" {
+    const s = try dualString(std.testing.allocator, "var r=/x/gsyu; [r.global,r.dotAll,r.sticky,r.unicode,r.flags].join(',')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("true,true,true,true,gsyu", s);
+}
+
+test "phase13: Intl.NumberFormat decimal grouping (en-US)" {
+    const s = try dualString(std.testing.allocator, "new Intl.NumberFormat('en-US').format(1234567.891)");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("1,234,567.891", s);
+}
+
+test "phase13: Intl.NumberFormat currency (en-US)" {
+    const s = try dualString(std.testing.allocator, "new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(-1234.5)");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("-$1,234.50", s);
+}
+
+test "phase13: Intl.NumberFormat percent (en-US)" {
+    const s = try dualString(std.testing.allocator, "new Intl.NumberFormat('en-US',{style:'percent'}).format(0.255)");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("26%", s);
+}
+
+test "phase13: Intl.Collator compares same-case ASCII" {
+    const v = try evalToF64(std.testing.allocator, "new Intl.Collator('en').compare('apple','banana')");
+    try std.testing.expectEqual(@as(f64, -1), v);
+}
+
+test "phase13: regex lookbehind positive + negative" {
+    const s = try dualString(std.testing.allocator, "'1foo2bar'.replace(/(?<=\\d)[a-z]+/g,'-') + '|' + '5'.replace(/(?<!\\d)\\d/g,'#')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("1-2-|#", s);
+}
+
+test "phase13: regex property escapes under /u" {
+    const s = try dualString(std.testing.allocator, "[/\\p{L}+/u.test('abc'), 'a1b2'.replace(/\\p{N}/gu,'#'), /\\P{L}/u.test('5')].join(',')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("true,a#b#,true", s);
+}

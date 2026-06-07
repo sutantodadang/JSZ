@@ -15,6 +15,7 @@ const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
+const function_proto = @import("function_proto.zig");
 
 /// True if `v` is a Proxy exotic object.
 pub fn isProxy(v: Value) bool {
@@ -43,6 +44,44 @@ pub fn trap(handler: Value, name: []const u8) ?Value {
         .object => |o| if (o.internal_kind == .bound_function) t else null,
         else => null,
     };
+}
+
+/// Invoke the proxy's `ownKeys` trap (or forward to the target when absent),
+/// returning the resulting own-key Values (strings + symbols).
+/// Returns null only when the proxy is malformed (missing target/handler).
+pub fn proxyOwnKeys(arena: std.mem.Allocator, proxy_obj: *JsObject) anyerror!?[]Value {
+    const handler = proxyHandler(proxy_obj) orelse return null;
+    const target = proxyTarget(proxy_obj) orelse return null;
+    var list = std.ArrayListUnmanaged(Value){};
+    if (trap(handler, "ownKeys")) |trap_fn| {
+        const res = try function_proto.invokeCallback(arena, handler, trap_fn, &[_]Value{target});
+        if (res.bits != 0 and res.unbox() == .object) {
+            const arr = res.toPtr().object;
+            const n = arr.getArrayLength();
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                const k = try std.fmt.allocPrint(arena, "{d}", .{i});
+                if (arr.get(k)) |ev| try list.append(arena, ev);
+            }
+        }
+        return try list.toOwnedSlice(arena);
+    }
+    // No trap: forward to the target's own keys (string keys).
+    if (target.bits != 0 and target.unbox() == .object) {
+        const t = target.toPtr().object;
+        for (t.ownKeys()) |k| try list.append(arena, try val_mod.makeString(arena, k));
+    }
+    return try list.toOwnedSlice(arena);
+}
+
+/// Invoke the proxy's `getOwnPropertyDescriptor` trap if present. Returns the
+/// trap result (descriptor object or undefined), or null when no trap exists
+/// (caller should forward to the target).
+pub fn proxyGetOwnPropertyDescriptor(arena: std.mem.Allocator, proxy_obj: *JsObject, key: Value) anyerror!?Value {
+    const handler = proxyHandler(proxy_obj) orelse return null;
+    const target = proxyTarget(proxy_obj) orelse return null;
+    const trap_fn = trap(handler, "getOwnPropertyDescriptor") orelse return null;
+    return try function_proto.invokeCallback(arena, handler, trap_fn, &[_]Value{ target, key });
 }
 
 fn isObjectLike(v: Value) bool {

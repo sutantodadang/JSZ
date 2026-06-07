@@ -286,6 +286,7 @@ pub const BcVm = struct {
                 return if (result.bits != 0 and result.unbox() == .object) result else this_val;
             },
             .object => |o| {
+                if (o.internal_kind == .proxy) return try self.proxyConstruct(o, args, ctor);
                 if (o.get("__call__")) |cv| {
                     if (cv.bits != 0 and cv.unbox() == .native_function) {
                         var proto: ?*JsObject = self.realm.object_prototype;
@@ -2157,7 +2158,17 @@ pub const BcVm = struct {
                     var count: u32 = 0;
                     if (obj_val.bits != 0) {
                         const iv = obj_val.unbox();
-                        if (iv == .object) {
+                        if (iv == .object and iv.object.internal_kind == .proxy) {
+                            if (try proxy_mod.proxyOwnKeys(self.arena, iv.object)) |keys| {
+                                for (keys) |kv| {
+                                    if (kv.bits != 0 and kv.unbox() == .string) {
+                                        const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
+                                        arr_obj.set(idx_str, kv) catch {};
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        } else if (iv == .object) {
                             for (iv.object.ownKeys()) |k| {
                                 if (!iv.object.isEnumerable(k)) continue;
                                 const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
@@ -2169,7 +2180,8 @@ pub const BcVm = struct {
                     }
                     const len_val = try val_mod.makeNumber(self.arena, @floatFromInt(count));
                     arr_obj.set("length", len_val) catch {};
-                    frame.registers[rdst] = try val_mod.makeObject(self.arena, arr_obj);
+                    // Re-fetch frame: a proxy ownKeys trap may have run user code.
+                    self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeObject(self.arena, arr_obj);
                 },
             }
         }
@@ -2291,6 +2303,24 @@ pub const BcVm = struct {
                 return null;
             },
             .object => |obj| {
+                // Phase 13: Proxy construct trap (or forward to target).
+                if (obj.internal_kind == .proxy) {
+                    var pargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| pargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                    const res = self.proxyConstruct(obj, pargs, callee_val) catch |e| {
+                        if (e == error.JsException) {
+                            const realm_m = @import("../runtime/realm.zig");
+                            if (realm_m.pending_exception.bits != 0) {
+                                self.last_exception_value = realm_m.pending_exception;
+                                realm_m.pending_exception = Value{};
+                            }
+                            return "__js_exception__";
+                        }
+                        return "TypeError: proxy is not a constructor";
+                    };
+                    self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+                    return null;
+                }
                 // Error constructor object: has __call__ and prototype.
                 if (obj.get("__call__")) |call_val| {
                     if (call_val.bits != 0 and call_val.unbox() == .native_function) {
@@ -2603,6 +2633,50 @@ pub const BcVm = struct {
         return jsAbstractEqual(x, y);
     }
 
+    /// Build a JS array from a slice of values (used to pass an argument list to
+    /// Proxy `apply`/`construct` traps).
+    fn arrayFromSlice(self: *BcVm, items: []const Value) !Value {
+        const arr = if (self.heap) |heap|
+            try JsObject.createArrayOnHeap(heap, self.realm.array_prototype)
+        else
+            try JsObject.createArray(self.arena, self.realm.array_prototype);
+        for (items, 0..) |it, i| {
+            const key = try std.fmt.allocPrint(self.arena, "{d}", .{i});
+            try arr.set(key, it);
+        }
+        return val_mod.makeObject(self.arena, arr);
+    }
+
+    /// Proxy `apply` trap: `handler.apply(target, thisArg, argsArray)`, forwarding
+    /// to a plain call on the target when no trap is defined.
+    fn proxyApply(self: *BcVm, proxy_obj: *JsObject, this_val: Value, args: []const Value) anyerror!Value {
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return error.JsException;
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return error.JsException;
+        if (proxy_mod.trap(handler, "apply")) |trap_fn| {
+            const args_arr = try self.arrayFromSlice(args);
+            return try self.callAccessor(trap_fn, handler, &[_]Value{ target, this_val, args_arr });
+        }
+        const fp = @import("../runtime/builtins/function_proto.zig");
+        return try fp.invokeCallback(self.arena, this_val, target, args);
+    }
+
+    /// Proxy `construct` trap: `handler.construct(target, argsArray, newTarget)`,
+    /// forwarding to a plain construct on the target when no trap is defined.
+    /// A present trap must return an object (else TypeError).
+    fn proxyConstruct(self: *BcVm, proxy_obj: *JsObject, args: []const Value, new_target: Value) anyerror!Value {
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return error.JsException;
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return error.JsException;
+        if (proxy_mod.trap(handler, "construct")) |trap_fn| {
+            const args_arr = try self.arrayFromSlice(args);
+            const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, args_arr, new_target });
+            if (res.bits != 0 and res.unbox() == .object) return res;
+            const realm_m = @import("../runtime/realm.zig");
+            realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "proxy [[Construct]] must return an object");
+            return error.JsException;
+        }
+        return try self.constructFromArgs(target, args);
+    }
+
     fn getProp(self: *BcVm, obj_val: Value, key: []const u8) !Value {
         if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);
         switch (obj_val.unbox()) {
@@ -2876,6 +2950,24 @@ pub const BcVm = struct {
                 return "TypeError: cannot call tree-walker function from bc mode";
             },
             .object => |obj| {
+                // Phase 13: callable Proxy — apply trap (or forward to target).
+                if (obj.internal_kind == .proxy) {
+                    var pargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| pargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                    const res = self.proxyApply(obj, this_val, pargs) catch |e| {
+                        if (e == error.JsException) {
+                            const realm_mod = @import("../runtime/realm.zig");
+                            if (realm_mod.pending_exception.bits != 0) {
+                                self.last_exception_value = realm_mod.pending_exception;
+                                realm_mod.pending_exception = Value{};
+                            }
+                            return "__js_exception__";
+                        }
+                        return "TypeError: proxy is not a function";
+                    };
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = res;
+                    return null;
+                }
                 // Phase 4d: bound function.
                 if (obj.internal_kind == .bound_function) {
                     if (obj.internal_slot) |slot| {

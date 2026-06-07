@@ -66,16 +66,16 @@ pub const CharClass = struct {
 };
 
 pub const RegexNode = union(enum) {
-    literal: u8,           // single ASCII byte (codepoint <= 127 after case fold)
+    literal: u8, // single ASCII byte (codepoint <= 127 after case fold)
     char_class: *CharClass,
-    dot,                   // any char except line terminators
-    anchor_start,          // ^
-    anchor_end,            // $
-    word_boundary,         // \b
-    non_word_boundary,     // \B
-    alt: []RegexNode,      // alternation: try each in order
-    seq: []RegexNode,      // sequence: match all in order
-    group: struct {        // capturing group
+    dot, // any char except line terminators
+    anchor_start, // ^
+    anchor_end, // $
+    word_boundary, // \b
+    non_word_boundary, // \B
+    alt: []RegexNode, // alternation: try each in order
+    seq: []RegexNode, // sequence: match all in order
+    group: struct { // capturing group
         idx: u32,
         inner: *RegexNode,
     },
@@ -83,7 +83,7 @@ pub const RegexNode = union(enum) {
     quant: struct {
         inner: *RegexNode,
         min: u32,
-        max: u32,           // std.math.maxInt(u32) = infinity
+        max: u32, // std.math.maxInt(u32) = infinity
         lazy: bool,
     },
     /// Phase 4d: lookahead assertion (?=...) or (?!...)
@@ -91,8 +91,13 @@ pub const RegexNode = union(enum) {
         inner: *RegexNode,
         negative: bool,
     },
+    /// Phase 13: lookbehind assertion (?<=...) or (?<!...)
+    look_behind: struct {
+        inner: *RegexNode,
+        negative: bool,
+    },
     /// Phase 4d: backreference \1..\9
-    back_ref: u8,  // group index 1-9
+    back_ref: u8, // group index 1-9
 };
 
 /// Compiled regex: pattern IR + flags + capture count.
@@ -107,6 +112,13 @@ pub const CompiledRegex = struct {
         ignore_case: bool = false,
         global: bool = false,
         multiline: bool = false,
+        /// ES2018 `s` (dotAll): `.` also matches line terminators.
+        dotall: bool = false,
+        /// ES2015 `y` (sticky): match anchored at lastIndex (no scanning).
+        sticky: bool = false,
+        /// ES2015 `u` (unicode): accepted; full code-point/property-escape
+        /// semantics are NOT yet implemented (byte-oriented matcher).
+        unicode: bool = false,
     };
 };
 
@@ -119,9 +131,10 @@ const PatternParser = struct {
     pos: usize,
     alloc: std.mem.Allocator,
     next_cap: u32, // next capture group index (1-based)
+    unicode: bool, // `/u` flag: enables `\p{...}` property escapes
 
-    fn init(src: []const u8, alloc: std.mem.Allocator) PatternParser {
-        return .{ .src = src, .pos = 0, .alloc = alloc, .next_cap = 1 };
+    fn init(src: []const u8, alloc: std.mem.Allocator, unicode: bool) PatternParser {
+        return .{ .src = src, .pos = 0, .alloc = alloc, .next_cap = 1, .unicode = unicode };
     }
 
     fn eof(self: *const PatternParser) bool {
@@ -207,9 +220,18 @@ const PatternParser = struct {
         const c = self.cur();
         var q: QuantInfo = undefined;
         switch (c) {
-            '*' => { self.advance(); q = .{ .min = 0, .max = std.math.maxInt(u32), .lazy = false }; },
-            '+' => { self.advance(); q = .{ .min = 1, .max = std.math.maxInt(u32), .lazy = false }; },
-            '?' => { self.advance(); q = .{ .min = 0, .max = 1, .lazy = false }; },
+            '*' => {
+                self.advance();
+                q = .{ .min = 0, .max = std.math.maxInt(u32), .lazy = false };
+            },
+            '+' => {
+                self.advance();
+                q = .{ .min = 1, .max = std.math.maxInt(u32), .lazy = false };
+            },
+            '?' => {
+                self.advance();
+                q = .{ .min = 0, .max = 1, .lazy = false };
+            },
             '{' => {
                 // Try to parse {n}, {n,}, {n,m}
                 const saved_pos = self.pos;
@@ -274,7 +296,8 @@ const PatternParser = struct {
                 self.advance();
                 // Non-capturing group?
                 if (!self.eof() and self.cur() == '?' and self.peek() != null and self.peek().? == ':') {
-                    self.advance(); self.advance(); // consume ?:
+                    self.advance();
+                    self.advance(); // consume ?:
                     const inner = try self.parseAlt();
                     if (self.eof() or self.cur() != ')') return ParseError.InvalidPattern;
                     self.advance();
@@ -284,7 +307,8 @@ const PatternParser = struct {
                 }
                 // Phase 4d: positive lookahead (?=...)
                 if (!self.eof() and self.cur() == '?' and self.peek() != null and self.peek().? == '=') {
-                    self.advance(); self.advance(); // consume ?=
+                    self.advance();
+                    self.advance(); // consume ?=
                     const inner = try self.parseAlt();
                     if (self.eof() or self.cur() != ')') return ParseError.InvalidPattern;
                     self.advance();
@@ -294,13 +318,32 @@ const PatternParser = struct {
                 }
                 // Phase 4d: negative lookahead (?!...)
                 if (!self.eof() and self.cur() == '?' and self.peek() != null and self.peek().? == '!') {
-                    self.advance(); self.advance(); // consume ?!
+                    self.advance();
+                    self.advance(); // consume ?!
                     const inner = try self.parseAlt();
                     if (self.eof() or self.cur() != ')') return ParseError.InvalidPattern;
                     self.advance();
                     const inner_ptr = try self.alloc.create(RegexNode);
                     inner_ptr.* = inner;
                     return RegexNode{ .look_ahead = .{ .inner = inner_ptr, .negative = true } };
+                }
+                // Phase 13: lookbehind (?<=...) / (?<!...)
+                if (!self.eof() and self.cur() == '?' and self.peek() != null and self.peek().? == '<') {
+                    const p2: ?u8 = if (self.pos + 2 < self.src.len) self.src[self.pos + 2] else null;
+                    if (p2 != null and (p2.? == '=' or p2.? == '!')) {
+                        const neg = p2.? == '!';
+                        self.advance(); // ?
+                        self.advance(); // <
+                        self.advance(); // = or !
+                        const inner = try self.parseAlt();
+                        if (self.eof() or self.cur() != ')') return ParseError.InvalidPattern;
+                        self.advance();
+                        const inner_ptr = try self.alloc.create(RegexNode);
+                        inner_ptr.* = inner;
+                        return RegexNode{ .look_behind = .{ .inner = inner_ptr, .negative = neg } };
+                    }
+                    // Named groups (?<name>...) are not supported.
+                    return ParseError.InvalidPattern;
                 }
                 // Capturing group
                 const idx = self.next_cap;
@@ -376,7 +419,7 @@ const PatternParser = struct {
                         while (i <= 255) : (i += 1) {
                             const ci: u8 = @intCast(i);
                             const is_w = (ci >= 'a' and ci <= 'z') or (ci >= 'A' and ci <= 'Z') or
-                                         (ci >= '0' and ci <= '9') or ci == '_';
+                                (ci >= '0' and ci <= '9') or ci == '_';
                             if (!is_w) cc.bitmap[@intCast(i)] = true;
                         }
                     },
@@ -386,7 +429,7 @@ const PatternParser = struct {
                         while (i <= 255) : (i += 1) {
                             const ci: u8 = @intCast(i);
                             const is_s = ci == ' ' or ci == '\t' or ci == '\n' or ci == '\r' or
-                                         ci == 0x0B or ci == 0x0C or ci == 0xA0;
+                                ci == 0x0B or ci == 0x0C or ci == 0xA0;
                             if (!is_s) cc.bitmap[@intCast(i)] = true;
                         }
                     },
@@ -428,8 +471,12 @@ const PatternParser = struct {
                         const e = self.cur();
                         self.advance();
                         break :blk switch (e) {
-                            'n' => '\n', 't' => '\t', 'r' => '\r',
-                            'v' => 0x0B, 'f' => 0x0C, '0' => 0,
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            'v' => 0x0B,
+                            'f' => 0x0C,
+                            '0' => 0,
                             else => e,
                         };
                     } else end_ch_raw;
@@ -470,6 +517,22 @@ const PatternParser = struct {
             },
             'b' => RegexNode{ .word_boundary = {} },
             'B' => RegexNode{ .non_word_boundary = {} },
+            'p', 'P' => {
+                // Unicode property escape (only under /u; otherwise identity).
+                if (!self.unicode) return RegexNode{ .literal = c };
+                if (self.eof() or self.cur() != '{') return ParseError.InvalidPattern;
+                self.advance(); // {
+                const name_start = self.pos;
+                while (!self.eof() and self.cur() != '}') self.advance();
+                if (self.eof()) return ParseError.InvalidPattern;
+                const name = self.src[name_start..self.pos];
+                self.advance(); // }
+                const cc = try self.alloc.create(CharClass);
+                cc.* = CharClass{};
+                if (!fillPropertyClass(cc, name)) return ParseError.InvalidPattern;
+                if (c == 'P') cc.negate = true;
+                return RegexNode{ .char_class = cc };
+            },
             'n' => RegexNode{ .literal = '\n' },
             't' => RegexNode{ .literal = '\t' },
             'r' => RegexNode{ .literal = '\r' },
@@ -510,20 +573,65 @@ fn hexVal(c: u8) ?u8 {
 
 /// Compile a pattern string + flags string into a CompiledRegex.
 /// Returns InvalidPattern on bad pattern.
-pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []const u8) !CompiledRegex {
-    var pp = PatternParser.init(pattern, alloc);
-    const root = pp.parseAlt() catch return error.InvalidPattern;
-    if (!pp.eof()) return error.InvalidPattern; // unconsumed chars
+/// Fill `cc` with the ASCII approximation of a Unicode property name (`\p{...}`).
+/// Returns false for unknown/unsupported names. Non-ASCII code points are not
+/// covered (byte-oriented engine).
+fn fillPropertyClass(cc: *CharClass, name: []const u8) bool {
+    const eq = std.mem.eql;
+    if (eq(u8, name, "L") or eq(u8, name, "Letter") or
+        eq(u8, name, "Alpha") or eq(u8, name, "Alphabetic"))
+    {
+        cc.addRange('a', 'z');
+        cc.addRange('A', 'Z');
+        return true;
+    }
+    if (eq(u8, name, "Lu") or eq(u8, name, "Uppercase_Letter") or eq(u8, name, "Uppercase")) {
+        cc.addRange('A', 'Z');
+        return true;
+    }
+    if (eq(u8, name, "Ll") or eq(u8, name, "Lowercase_Letter") or eq(u8, name, "Lowercase")) {
+        cc.addRange('a', 'z');
+        return true;
+    }
+    if (eq(u8, name, "N") or eq(u8, name, "Nd") or eq(u8, name, "Number") or eq(u8, name, "Decimal_Number")) {
+        cc.addRange('0', '9');
+        return true;
+    }
+    if (eq(u8, name, "Alnum")) {
+        cc.addRange('a', 'z');
+        cc.addRange('A', 'Z');
+        cc.addRange('0', '9');
+        return true;
+    }
+    if (eq(u8, name, "White_Space") or eq(u8, name, "space") or eq(u8, name, "White_space")) {
+        cc.addChar(' ');
+        cc.addChar('\t');
+        cc.addChar('\n');
+        cc.addChar('\r');
+        cc.addChar(0x0B);
+        cc.addChar(0x0C);
+        return true;
+    }
+    return false;
+}
 
+pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []const u8) !CompiledRegex {
     var flags = CompiledRegex.Flags{};
     for (flags_str) |f| {
         switch (f) {
             'i' => flags.ignore_case = true,
             'g' => flags.global = true,
             'm' => flags.multiline = true,
+            's' => flags.dotall = true,
+            'y' => flags.sticky = true,
+            'u' => flags.unicode = true,
             else => return error.InvalidPattern,
         }
     }
+
+    var pp = PatternParser.init(pattern, alloc, flags.unicode);
+    const root = pp.parseAlt() catch return error.InvalidPattern;
+    if (!pp.eof()) return error.InvalidPattern; // unconsumed chars
 
     return CompiledRegex{
         .root = root,
@@ -544,6 +652,9 @@ const MatchState = struct {
     captures: [MAX_CAPTURES]CaptureSpan,
 };
 
+/// A successful match: the start offset and the resulting match state.
+pub const MatchResult = struct { start: usize, state: MatchState };
+
 /// Entry point: try to match starting at `start`. Returns null on no match.
 pub fn matchAt(
     regex: *const CompiledRegex,
@@ -561,7 +672,7 @@ pub fn matchAnywhere(
     regex: *const CompiledRegex,
     input: []const u8,
     from: usize,
-) ?struct { start: usize, state: MatchState } {
+) ?MatchResult {
     var i = from;
     while (i <= input.len) {
         if (matchAt(regex, input, i)) |ms| {
@@ -573,9 +684,24 @@ pub fn matchAnywhere(
     return null;
 }
 
+/// Find a match honoring the sticky (`y`) flag: when sticky, the match must
+/// begin exactly at `from` (no scanning); otherwise scan forward.
+pub fn findMatch(
+    regex: *const CompiledRegex,
+    input: []const u8,
+    from: usize,
+) ?MatchResult {
+    if (regex.flags.sticky) {
+        if (from > input.len) return null;
+        if (matchAt(regex, input, from)) |ms| return .{ .start = from, .state = ms };
+        return null;
+    }
+    return matchAnywhere(regex, input, from);
+}
+
 fn isWordChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-           (c >= '0' and c <= '9') or c == '_';
+        (c >= '0' and c <= '9') or c == '_';
 }
 
 fn isLineTerminator(c: u8) bool {
@@ -622,7 +748,7 @@ fn matchNode(
         .dot => {
             if (pos >= input.len) return null;
             const c = input[pos];
-            if (isLineTerminator(c)) return null;
+            if (!flags.dotall and isLineTerminator(c)) return null;
             return pos + 1;
         },
         .anchor_start => {
@@ -692,6 +818,29 @@ fn matchNode(
             } else {
                 // Positive lookahead: succeed iff inner matched.
                 return if (matched) pos else null;
+            }
+        },
+        .look_behind => |lb| {
+            // Zero-width: succeed iff the inner pattern matches some substring
+            // ending exactly at `pos`. Try each start j in [0, pos]. Captures are
+            // discarded (assertion is non-consuming). Fixed-length inners match
+            // exactly; greedy variable-length inners may be incomplete.
+            var matched_lb = false;
+            var j: usize = pos + 1;
+            while (j > 0) {
+                j -= 1;
+                var tmp_caps = caps.*;
+                if (matchNode(lb.inner, input, j, &tmp_caps, flags)) |end| {
+                    if (end == pos) {
+                        matched_lb = true;
+                        break;
+                    }
+                }
+            }
+            if (lb.negative) {
+                return if (!matched_lb) pos else null;
+            } else {
+                return if (matched_lb) pos else null;
             }
         },
         .back_ref => |idx| {
@@ -829,6 +978,9 @@ pub fn makeRegExpObject(arena: std.mem.Allocator, cr: *CompiledRegex, source: []
     try obj.set("global", global_val);
     try obj.set("ignoreCase", ic_val);
     try obj.set("multiline", ml_val);
+    try obj.set("dotAll", try val_mod.makeBool(arena, cr.flags.dotall));
+    try obj.set("sticky", try val_mod.makeBool(arena, cr.flags.sticky));
+    try obj.set("unicode", try val_mod.makeBool(arena, cr.flags.unicode));
 
     // lastIndex = 0
     const li_val = try val_mod.makeNumber(arena, 0.0);
@@ -937,6 +1089,9 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         try this_obj.set("global", global_val);
         try this_obj.set("ignoreCase", ic_val);
         try this_obj.set("multiline", ml_val);
+        try this_obj.set("dotAll", try val_mod.makeBool(arena, cr.flags.dotall));
+        try this_obj.set("sticky", try val_mod.makeBool(arena, cr.flags.sticky));
+        try this_obj.set("unicode", try val_mod.makeBool(arena, cr.flags.unicode));
         const li_val = try val_mod.makeNumber(arena, 0.0);
         try this_obj.set("lastIndex", li_val);
         this_obj.internal_slot = @ptrCast(cr);
@@ -958,12 +1113,13 @@ pub fn nativeRegExpTest(arena: std.mem.Allocator, this_val: Value, args: []const
     else
         "";
 
-    const from: usize = if (cr.flags.global) getLastIndex(this_val) else 0;
-    if (matchAnywhere(cr, s, from)) |m| {
-        if (cr.flags.global) try setLastIndex(arena, this_val, m.state.pos);
+    const use_li = cr.flags.global or cr.flags.sticky;
+    const from: usize = if (use_li) getLastIndex(this_val) else 0;
+    if (findMatch(cr, s, from)) |m| {
+        if (use_li) try setLastIndex(arena, this_val, m.state.pos);
         return val_mod.makeBool(arena, true);
     }
-    if (cr.flags.global) try setLastIndex(arena, this_val, 0);
+    if (use_li) try setLastIndex(arena, this_val, 0);
     return val_mod.makeBool(arena, false);
 }
 
@@ -978,14 +1134,15 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
     else
         "";
 
-    const from: usize = if (cr.flags.global) getLastIndex(this_val) else 0;
+    const use_li = cr.flags.global or cr.flags.sticky;
+    const from: usize = if (use_li) getLastIndex(this_val) else 0;
 
-    const result = matchAnywhere(cr, s, from) orelse {
-        if (cr.flags.global) try setLastIndex(arena, this_val, 0);
+    const result = findMatch(cr, s, from) orelse {
+        if (use_li) try setLastIndex(arena, this_val, 0);
         return val_mod.makeNull(arena);
     };
 
-    if (cr.flags.global) try setLastIndex(arena, this_val, result.state.pos);
+    if (use_li) try setLastIndex(arena, this_val, result.state.pos);
 
     // Build result array: [fullMatch, cap1, ..., capN]
     const arr_proto = realm_mod.active_array_proto;

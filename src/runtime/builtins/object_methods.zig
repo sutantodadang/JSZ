@@ -6,6 +6,7 @@ const Value = val_mod.Value;
 const obj_mod = @import("../../object/object.zig");
 const JsObject = obj_mod.JsObject;
 const PropAttr = obj_mod.PropAttr;
+const proxy_mod = @import("proxy.zig");
 
 /// Object.keys(o): returns array of own enumerable string property names.
 pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
@@ -19,6 +20,22 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
     const inner = args[0].toPtr();
     if (inner.* != .object) return val_mod.makeObject(arena, arr);
     const obj = inner.object;
+
+    // Proxy: ownKeys trap (string keys only for Object.keys).
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyOwnKeys(arena, obj)) |keys| {
+            var pi: u32 = 0;
+            for (keys) |kv| {
+                if (kv.bits != 0 and kv.unbox() == .string) {
+                    const idx_key = try std.fmt.allocPrint(arena, "{d}", .{pi});
+                    try arr.set(idx_key, kv);
+                    pi += 1;
+                }
+            }
+            arr.array_length = pi;
+        }
+        return val_mod.makeObject(arena, arr);
+    }
 
     var i: u32 = 0;
     for (obj.ownKeys()) |k| {
@@ -233,6 +250,22 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
     if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
     const obj = args[0].toPtr().object;
 
+    // Proxy: ownKeys trap (all string keys for getOwnPropertyNames).
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyOwnKeys(arena, obj)) |keys| {
+            var pi: u32 = 0;
+            for (keys) |kv| {
+                if (kv.bits != 0 and kv.unbox() == .string) {
+                    const idx_key = try std.fmt.allocPrint(arena, "{d}", .{pi});
+                    try arr.set(idx_key, kv);
+                    pi += 1;
+                }
+            }
+            arr.array_length = pi;
+        }
+        return val_mod.makeObject(arena, arr);
+    }
+
     var i: u32 = 0;
     for (obj.ownKeys()) |k| {
         const key_val = try val_mod.makeString(arena, k);
@@ -252,6 +285,18 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     const obj = args[0].toPtr().object;
 
     if (args.len < 2) return val_mod.makeUndefined(arena);
+
+    // Proxy: getOwnPropertyDescriptor trap (or forward to target).
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, obj, args[1])) |desc| {
+            return desc;
+        }
+        if (proxy_mod.proxyTarget(obj)) |target| {
+            return try nativeObjectGetOwnPropertyDescriptor(arena, args[0], &[_]Value{ target, args[1] });
+        }
+        return val_mod.makeUndefined(arena);
+    }
+
     const key = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
 
     const a = obj.ownAttr(key) orelse return val_mod.makeUndefined(arena);

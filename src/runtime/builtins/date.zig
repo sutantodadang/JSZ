@@ -39,7 +39,7 @@ fn isLeapYear(y: i32) bool {
 }
 
 /// Milliseconds since epoch -> { year, month (0-11), day (1-31), weekday (0=Sun), hour, min, sec, ms }
-const DateFields = struct {
+pub const DateFields = struct {
     year: i32,
     month: i32,
     day: i32,
@@ -49,6 +49,17 @@ const DateFields = struct {
     sec: i32,
     ms: i32,
 };
+
+/// Public UTC field decomposition (used by Intl.DateTimeFormat).
+pub fn msToFieldsUtc(ms_epoch: i64) DateFields {
+    return msToFields(ms_epoch);
+}
+
+/// Extract the epoch-millisecond value from a Date object Value, or null.
+pub fn getDateMs(v: Value) ?i64 {
+    const dd = getDateData(v) orelse return null;
+    return dd.ms;
+}
 
 fn msToFields(ms_epoch: i64) DateFields {
     const ms_abs: i64 = @mod(ms_epoch, 1000);
