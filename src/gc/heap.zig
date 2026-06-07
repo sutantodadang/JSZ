@@ -68,6 +68,9 @@ pub const Heap = struct {
     extra_roots: std.ArrayListUnmanaged(*Value) = .empty,
     /// VM root-scan callbacks (tree-walker + bytecode VM register theirs).
     scan_callbacks: std.ArrayListUnmanaged(ScanCallback) = .empty,
+    /// Arena intrinsics visited during the current mark phase (their `gc_seen`
+    /// flag is set). Cleared after each collection. See markObject.
+    arena_seen: std.ArrayListUnmanaged(*JsObject) = .empty,
     /// Cumulative stats.
     bytes_allocated: usize = 0,
     bytes_freed: usize = 0,
@@ -97,6 +100,7 @@ pub const Heap = struct {
         self.all_objects_head = null;
         self.extra_roots.deinit(self.backing_allocator);
         self.scan_callbacks.deinit(self.backing_allocator);
+        self.arena_seen.deinit(self.backing_allocator);
     }
 
     // ------------------------------------------------------------------
@@ -197,6 +201,13 @@ pub const Heap = struct {
         // worse, mark-writes can corrupt arena bookkeeping (BufNode chain).
         // Skip them entirely — their lifetime is the eval arena, not the GC.
         if (!obj.is_gc_managed) {
+            // Arena intrinsics have no GcHeader, so use the transient `gc_seen`
+            // flag as a cycle guard (arena objects can reference each other
+            // cyclically, e.g. a prototype and its `.constructor`). The flag is
+            // cleared after each collection via `arena_seen`.
+            if (obj.gc_seen) return;
+            obj.gc_seen = true;
+            self.arena_seen.append(self.backing_allocator, obj) catch {};
             // Still walk into their property values: those values may reference
             // heap-managed objects that need to be marked.
             for (obj.slots.items) |v| self.markValue(v);
@@ -323,6 +334,9 @@ pub const Heap = struct {
     pub fn collect(self: *Heap) CollectStats {
         const start = std.time.nanoTimestamp();
         self.mark();
+        // Clear the transient arena cycle-guard flags set during marking.
+        for (self.arena_seen.items) |obj| obj.gc_seen = false;
+        self.arena_seen.clearRetainingCapacity();
         var stats = self.sweep();
         const end = std.time.nanoTimestamp();
         stats.duration_ns = @intCast(end - start);

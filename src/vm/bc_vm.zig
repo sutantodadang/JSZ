@@ -3737,6 +3737,12 @@ pub fn jsStringToNumber(s: []const u8) f64 {
             return @floatFromInt(v);
         }
     }
+    // A valid decimal literal starts with a digit, sign, or dot. Reject letter
+    // leads up front so `std.fmt.parseFloat` does not accept "inf"/"infinity"/
+    // "nan" (ES ToNumber maps "INFINITY", "inf", etc. to NaN; only exact
+    // "Infinity"/"+Infinity"/"-Infinity", handled above, are special).
+    const c0 = t[0];
+    if (!(std.ascii.isDigit(c0) or c0 == '.' or c0 == '+' or c0 == '-')) return std.math.nan(f64);
     return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
 }
 
@@ -3852,7 +3858,11 @@ fn jsAbstractEqual(x: Value, y: Value) bool {
     const tx = typeTag(x);
     const ty = typeTag(y);
     if (tx == ty) return jsStrictEqual(x, y);
-    if ((tx == .null_ and ty == .undefined_) or (tx == .undefined_ and ty == .null_)) return true;
+    // `null` and `undefined` are loosely equal only to each other — never to a
+    // boolean, number, or string (e.g. `null == false` is false).
+    const x_nullish = tx == .null_ or tx == .undefined_;
+    const y_nullish = ty == .null_ or ty == .undefined_;
+    if (x_nullish or y_nullish) return x_nullish and y_nullish;
     if (tx == .number and ty == .string) return toNumber(x) == toNumber(y);
     if (tx == .string and ty == .number) return toNumber(x) == toNumber(y);
     if (tx == .boolean) {

@@ -46,6 +46,12 @@ pub const JsObject = struct {
     /// Used by the GC mark phase to avoid dereferencing a fake header on
     /// arena objects reached via proto walks.
     is_gc_managed: bool = false,
+    /// Transient GC cycle guard for arena-allocated (non-GC-managed) intrinsics,
+    /// which have no GcHeader `marked` bit. Set while the mark phase is walking
+    /// this object and cleared after each collection (see Heap.markObject). Guards
+    /// against arena↔arena reference cycles, e.g. `String.prototype.constructor`
+    /// ↔ `String` (whose `.prototype` points back to `String.prototype`).
+    gc_seen: bool = false,
     /// Phase 4c: opaque pointer for internal slots (e.g., CompiledRegex).
     /// Arena-allocated; MUST NOT be traversed by markObject.
     internal_slot: ?*anyopaque = null,

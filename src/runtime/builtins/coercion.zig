@@ -52,10 +52,12 @@ fn getSymMethod(obj: *JsObject, sym: Value) ?Value {
 }
 
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
+    // Proto = TypeError.prototype so `caught instanceof TypeError` holds.
+    const proto = realm_mod.error_proto_TypeError;
     const obj = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, null)
+        try JsObject.createOnHeap(h, proto)
     else
-        try JsObject.create(arena, null);
+        try JsObject.create(arena, proto);
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     try obj.set("message", try val_mod.makeString(arena, msg));
     return val_mod.makeObject(arena, obj);
@@ -99,11 +101,20 @@ pub fn toPrimitive(arena: std.mem.Allocator, v: Value, hint: Hint) anyerror!?Val
         .{ "toString", "valueOf" }
     else
         .{ "valueOf", "toString" };
+    var had_callable = false;
     for (names) |name| {
         const method = obj.get(name) orelse continue;
         if (!isCallable(method)) continue;
+        had_callable = true;
         const res = try function_proto.invokeCallback(arena, v, method, &[_]Value{});
         if (isPrimitive(res)) return res;
+    }
+
+    // When the object had a callable `valueOf`/`toString` but neither produced a
+    // primitive, ToPrimitive throws a TypeError (ES OrdinaryToPrimitive step 5).
+    if (had_callable) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "Cannot convert object to primitive value");
+        return error.JsException;
     }
 
     // 3. No user-defined conversion applies; caller uses its default.

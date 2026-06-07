@@ -2470,6 +2470,42 @@ pub const Parser = struct {
                 if (!self.match(.comma)) break;
                 continue;
             }
+            // ES6 method shorthand: `name(params) { body }` ≡ `name: function(params){body}`.
+            if (self.check(.left_paren)) {
+                const m_params = self.parseFunctionParams() orelse return null;
+                const m_body = self.parseFunctionBody() orelse return null;
+                const m_fn = self.makeNode(.function_expr, prop_start, self.current.start, .{
+                    .function_expr = .{
+                        .name = key,
+                        .params = m_params.params,
+                        .param_defaults = m_params.param_defaults,
+                        .rest_param = m_params.rest_param,
+                        .body = m_body,
+                        .is_arrow = false,
+                        .is_generator = false,
+                        .is_async = false,
+                        .is_strict = hasUseStrict(m_body),
+                    },
+                }) orelse return null;
+                props.append(self.arena, ast.ObjectProp{ .key = key, .value = m_fn, .kind = .init }) catch {
+                    self.had_error = true;
+                    return null;
+                };
+                if (!self.match(.comma)) break;
+                continue;
+            }
+            // ES6 shorthand property: `{ x }` ≡ `{ x: x }`.
+            if (self.check(.comma) or self.check(.right_brace)) {
+                const id_node = self.makeNode(.identifier, prop_start, self.current.start, .{
+                    .identifier = key,
+                }) orelse return null;
+                props.append(self.arena, ast.ObjectProp{ .key = key, .value = id_node, .kind = .init }) catch {
+                    self.had_error = true;
+                    return null;
+                };
+                if (!self.match(.comma)) break;
+                continue;
+            }
             _ = self.expect(.colon) orelse return null;
             const val_node = self.parseAssignmentExpr() orelse return null;
             props.append(self.arena, ast.ObjectProp{ .key = key, .value = val_node, .kind = .init }) catch {

@@ -688,6 +688,19 @@ fn nativeStringValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Val
     return val_mod.makeString(arena, s);
 }
 
+// ---- Function.prototype.toString ----
+fn nativeFunctionToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    var name: []const u8 = "";
+    if (this_val.bits != 0) {
+        switch (this_val.unbox()) {
+            .bc_function => |c| name = c.func.name orelse "",
+            else => {},
+        }
+    }
+    const s = try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{name});
+    return val_mod.makeString(arena, s);
+}
+
 // ---------------------------------------------------------------- Phase 4b registration helpers ---
 
 fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
@@ -1058,6 +1071,7 @@ pub const Realm = struct {
         try function_proto.set("call", fn_call_fn);
         try function_proto.set("apply", fn_apply_fn);
         try function_proto.set("bind", fn_bind_fn);
+        try function_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeFunctionToString));
         active_function_proto = function_proto;
 
         // ---- Phase 4d: Date ----
@@ -1208,6 +1222,7 @@ pub const Realm = struct {
         try string_ctor_obj.set("prototype", try val_mod.makeObject(arena, string_proto));
         try string_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeStringCtor));
         try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunction(arena, nativeStringFromCharCode));
+        try string_proto.set("constructor", try val_mod.makeObject(arena, string_ctor_obj));
         try env.define("String", try val_mod.makeObject(arena, string_ctor_obj));
 
         const number_proto = try JsObject.create(arena, object_proto);
@@ -1224,6 +1239,7 @@ pub const Realm = struct {
         try number_ctor_obj.set("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)));
         try number_ctor_obj.set("POSITIVE_INFINITY", try val_mod.makeNumber(arena, std.math.inf(f64)));
         try number_ctor_obj.set("NEGATIVE_INFINITY", try val_mod.makeNumber(arena, -std.math.inf(f64)));
+        try number_proto.set("constructor", try val_mod.makeObject(arena, number_ctor_obj));
         try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
 
         // ---- Phase 4: global functions + value globals ----
@@ -1236,6 +1252,7 @@ pub const Realm = struct {
         const boolean_ctor_obj = try JsObject.create(arena, null);
         try boolean_ctor_obj.set("prototype", try val_mod.makeObject(arena, boolean_proto));
         try boolean_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBooleanCtor));
+        try boolean_proto.set("constructor", try val_mod.makeObject(arena, boolean_ctor_obj));
         try env.define("Boolean", try val_mod.makeObject(arena, boolean_ctor_obj));
         try env.define("isNaN", try val_mod.makeNativeFunction(arena, nativeIsNaN));
         try env.define("eval", try val_mod.makeNativeFunction(arena, nativeEval));
