@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! JS Object stub — Cell-headed, hashmap-backed slots (Phase 3a).
 const std = @import("std");
 const Cell = @import("./cell.zig").Cell;

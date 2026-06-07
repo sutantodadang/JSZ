@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! VM fuzz harness: arbitrary bytes treated as JS source, no panics allowed.
 //! Run: zig build fuzz --fuzz
 const std = @import("std");

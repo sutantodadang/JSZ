@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Recursive descent / Pratt-style parser for ES5 subset.
 //! All nodes are arena-allocated; caller owns the arena lifetime.
 const std = @import("std");

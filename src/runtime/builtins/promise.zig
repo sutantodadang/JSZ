@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 7 Promise practical subset with reaction queues.
 const std = @import("std");
 const val_mod = @import("../../value/value.zig");

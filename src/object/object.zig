@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 3a/3b: JsObject — ES5 object with prototype chain.
 //!
 //! Allocation strategies:

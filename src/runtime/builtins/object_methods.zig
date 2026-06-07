@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 4b: Object static methods and Object.prototype.hasOwnProperty.
 const std = @import("std");
 const val_mod = @import("../../value/value.zig");

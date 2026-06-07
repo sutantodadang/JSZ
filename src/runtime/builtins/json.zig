@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 4b: JSON.stringify and JSON.parse.
 //! JSON.parse throws a real SyntaxError (Phase 4a path) on invalid input.
 const std = @import("std");

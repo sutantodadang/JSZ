@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 4d: Function.prototype — call, apply, bind.
 //!
 //! BoundFunction is stored as a JsObject with internal_kind = .bound_function.

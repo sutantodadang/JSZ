@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 3b: HandleScope — RAII GC root frames.
 //!
 //! Every native function entry point must open a HandleScope on the Zig stack

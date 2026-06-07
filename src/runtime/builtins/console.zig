@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! console global: log / error / warn / info / debug
 //! Display logic mirrors root.zig:valueToDisplayString (kept local to avoid
 //! circular imports: root imports the runtime).

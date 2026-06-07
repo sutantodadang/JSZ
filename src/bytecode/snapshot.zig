@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 8: bytecode caching + code snapshot/restore.
 //!
 //! Serializes a compiled `BcFunction` tree to a flat, sourceless binary image

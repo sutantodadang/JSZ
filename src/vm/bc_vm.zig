@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Bytecode register VM for Phase 2/3a/3b.
 //! Semantics must match the tree-walker (vm.zig) exactly.
 //! All arithmetic, equality, typeof, etc. delegate to the same

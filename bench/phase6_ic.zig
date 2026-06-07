@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 6 benchmark: object/shape heavy property access.
 //! Measures bytecode VM property-access throughput.
 const std = @import("std");

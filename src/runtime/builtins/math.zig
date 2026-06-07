@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 4b: Math object — constants and functions.
 //! All numeric operations delegate to std.math.
 const std = @import("std");

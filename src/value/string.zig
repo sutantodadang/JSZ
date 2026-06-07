@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! OneByteString (Latin-1) and TwoByteString (UCS-2) stubs.
 const std = @import("std");
 const Cell = @import("./cell.zig").Cell;

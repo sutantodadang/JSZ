@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 3b: Mark-sweep garbage collector for JsObject instances.
 //!
 //! Design:

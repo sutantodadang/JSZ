@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Bytecode chunk: code bytes, constant pool, line info, disassembler.
 const std = @import("std");
 const Value = @import("../value/value.zig").Value;

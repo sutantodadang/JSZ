@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! ParseError accumulator. Collects errors; parser aborts on first in Phase 1.
 const std = @import("std");
 

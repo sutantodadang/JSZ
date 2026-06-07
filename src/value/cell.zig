@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Cell header — foundation for all GC-managed objects.
 //! No imports from other jsz modules; this is the lowest layer.
 const std = @import("std");

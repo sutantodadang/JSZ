@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 3b GC stress test: allocate 10,000 objects in a loop via the JavaScript
 //! engine, calling __gc__() (manual collect) every 100 iterations.
 //! Asserts that live-object count stays bounded (< 200) after each collection.

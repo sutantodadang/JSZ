@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 4c: RegExp — pattern compiler, backtracking matcher, runtime API.
 //!
 //! Supported syntax:

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 6 hidden classes (shapes) with transition caches.
 const std = @import("std");
 

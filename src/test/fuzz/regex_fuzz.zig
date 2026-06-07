@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Regex fuzz harness: arbitrary bytes as a pattern must not panic.
 //! Invalid patterns return error (fine); the matcher must not crash.
 //! Run: zig build fuzz --fuzz

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Integration tests: lex -> parse -> eval end-to-end.
 //! Phase 2: each test runs under BOTH tree and bc modes and asserts identical results.
 const std = @import("std");

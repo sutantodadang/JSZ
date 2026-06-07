@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! IsolateImpl: holds arenas, realm, GC heap, and the parser for one Isolate.
 //! The public Isolate (root.zig) stores a *IsolateImpl via _impl: ?*anyopaque.
 const std = @import("std");

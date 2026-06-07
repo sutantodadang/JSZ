@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 9 baseline JIT — Zig FFI surface over the Cranelift native backend
 //! (`jit-native/` Rust cdylib). This is the first real native-codegen milestone:
 //! drive Cranelift from Zig and call the emitted machine code.

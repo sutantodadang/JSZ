@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! ES5 token enum and Token struct. Borrowed slices into source, zero-copy.
 const std = @import("std");
 

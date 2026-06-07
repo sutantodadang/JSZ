@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 8: source maps + debugger protocol stubs.
 //!
 //! Two things live here:

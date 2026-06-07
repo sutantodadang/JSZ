@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Lexical scope chain (Environment). define/lookup/assign bindings.
 //! Arena-allocated; no deallocation needed per-binding.
 const std = @import("std");

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! AST -> bytecode compiler for Phase 2.
 //! Emits a register-based bytecode (Ignition/Lua-5 style).
 //! Each function compiles to a BcFunction with a Chunk, register count,
@@ -37,6 +37,11 @@ const LoopCtx = struct {
     /// Label attached to this loop (from a directly-enclosing labeled statement),
     /// so `break L`/`continue L` can target it. null when unlabeled.
     label: ?[]const u8 = null,
+    /// Phase 13 completion values: register holding the completion value at the
+    /// start of the current iteration. `continue` reverts the completion register
+    /// to this (its iteration produced an empty completion). null outside the
+    /// program's implicit-return (completion-value) compilation.
+    prev_reg: ?u8 = null,
 };
 
 const FnCompiler = struct {
@@ -61,6 +66,11 @@ const FnCompiler = struct {
     /// Phase 13: a pending label from a labeled statement, consumed by the next
     /// loop so `break L`/`continue L` target that loop. null otherwise.
     pending_label: ?[]const u8 = null,
+    /// Phase 13 completion values: the register accumulating the program's
+    /// completion value (the result of `eval`/REPL). Non-null only while compiling
+    /// the top-level program (implicit-return mode); function bodies leave it null
+    /// so none of the completion bookkeeping is emitted for them.
+    completion_reg: ?u8 = null,
     /// Phase 8: is this function compiled in strict mode? PTC only applies in
     /// strict mode (ES2015 14.6).
     is_strict: bool = false,
@@ -127,6 +137,40 @@ const FnCompiler = struct {
 
     fn patchJump(self: *Self, at: usize, target: usize) void {
         self.builder.patchJump(at, target);
+    }
+
+    /// Completion values (program/eval only): record `r` as the running
+    /// completion value. No-op outside implicit-return compilation.
+    fn writeCompletion(self: *Self, r: u8, line: u32) error{OutOfMemory}!void {
+        if (self.completion_reg) |cr| {
+            if (cr != r) {
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(cr);
+                try self.emitU8(r);
+            }
+        }
+    }
+
+    /// Completion values: reset the completion register to `undefined` (the
+    /// UpdateEmpty base used by `if` and at loop entry). No-op outside
+    /// implicit-return compilation.
+    fn resetCompletion(self: *Self, line: u32) error{OutOfMemory}!void {
+        if (self.completion_reg) |cr| {
+            try self.emitOp(.LOAD_UNDEF, line);
+            try self.emitU8(cr);
+        }
+    }
+
+    /// Completion values: at the start of each loop iteration, snapshot the
+    /// completion register into the loop's `prev_reg` so `continue` can revert.
+    fn saveLoopPrev(self: *Self, prev_reg: ?u8, line: u32) error{OutOfMemory}!void {
+        if (prev_reg) |pr| {
+            if (self.completion_reg) |cr| {
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(pr);
+                try self.emitU8(cr);
+            }
+        }
     }
 
     /// Pop the innermost loop context, patching its `break` jumps to `exit` and
@@ -1337,6 +1381,9 @@ const FnCompiler = struct {
             .expr_stmt => {
                 const r = try self.compileExpr(node.data.expr_stmt);
                 last_expr_reg.* = r;
+                // Completion value (eval/REPL): an expression statement's value
+                // becomes the running completion value.
+                try self.writeCompletion(r, line);
                 // Do NOT free r here; the caller (compileBody) tracks the last one.
             },
             .var_decl => {
@@ -1392,6 +1439,12 @@ const FnCompiler = struct {
                 const rcond = try self.compileExpr(is.test_);
                 self.freeReg();
 
+                // Completion value: an `if` whose taken branch produces no value
+                // (or whose condition is false with no `else`) completes with
+                // `undefined` — the UpdateEmpty base. Reset before dispatch; a
+                // value-producing branch overwrites it.
+                try self.resetCompletion(line);
+
                 // Save sp so both branches start from the same register level.
                 const saved_sp = self.sp;
 
@@ -1442,6 +1495,9 @@ const FnCompiler = struct {
                 const ws = node.data.while_stmt;
                 const loop_lbl = self.pending_label;
                 self.pending_label = null;
+                // Completion value: a loop's value starts fresh at `undefined`.
+                try self.resetCompletion(line);
+                const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
                 const loop_start = self.currentOffset();
 
                 const rcond = try self.compileExpr(ws.test_);
@@ -1452,7 +1508,10 @@ const FnCompiler = struct {
                 const patch_exit = self.currentOffset();
                 try self.emitI16(0);
 
-                try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl });
+                // Save the completion value at the start of this iteration so a
+                // `continue` (an empty completion) can revert to it.
+                try self.saveLoopPrev(prev_reg, line);
+                try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg });
                 try self.compileStmt(ws.body, last_expr_reg);
 
                 // Jump back to loop start (continue lands here too: re-eval cond).
@@ -1469,9 +1528,12 @@ const FnCompiler = struct {
                 const dw = node.data.do_while_stmt;
                 const loop_lbl = self.pending_label;
                 self.pending_label = null;
+                try self.resetCompletion(line);
+                const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
                 const loop_start = self.currentOffset();
 
-                try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl });
+                try self.saveLoopPrev(prev_reg, line);
+                try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg });
                 try self.compileStmt(dw.body, last_expr_reg);
 
                 // continue in a do-while jumps to the condition test.
@@ -1497,6 +1559,8 @@ const FnCompiler = struct {
                     try self.compileStmt(init_node, &dummy);
                 }
 
+                try self.resetCompletion(line);
+                const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
                 const loop_start = self.currentOffset();
                 var patch_exit: ?usize = null;
 
@@ -1509,7 +1573,8 @@ const FnCompiler = struct {
                     try self.emitI16(0);
                 }
 
-                try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl });
+                try self.saveLoopPrev(prev_reg, line);
+                try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg });
                 try self.compileStmt(fs.body, last_expr_reg);
 
                 // continue in a for-loop runs the update expression, then re-tests.
@@ -1646,24 +1711,41 @@ const FnCompiler = struct {
             },
             .continue_stmt => {
                 const label = node.data.continue_stmt;
-                try self.emitOp(.JMP, line);
-                const patch = self.currentOffset();
-                try self.emitI16(0);
+                // Resolve the target loop (labeled or innermost) first so we can
+                // revert the completion register before jumping.
+                var target_idx: ?usize = null;
                 if (label) |lname| {
                     var li = self.loop_stack.items.len;
                     while (li > 0) {
                         li -= 1;
                         if (self.loop_stack.items[li].label) |l| {
                             if (std.mem.eql(u8, l, lname)) {
-                                try self.loop_stack.items[li].continue_patches.append(self.arena, patch);
-                                return;
+                                target_idx = li;
+                                break;
                             }
                         }
                     }
-                    // Label not found — stub JMP 0.
                 } else if (self.loop_stack.items.len > 0) {
-                    try self.loop_stack.items[self.loop_stack.items.len - 1].continue_patches.append(self.arena, patch);
+                    target_idx = self.loop_stack.items.len - 1;
                 }
+                // Completion value: `continue` yields an empty completion, so the
+                // loop's value reverts to its value at this iteration's start.
+                if (target_idx) |ti| {
+                    if (self.loop_stack.items[ti].prev_reg) |pr| {
+                        if (self.completion_reg) |cr| {
+                            try self.emitOp(.MOVE, line);
+                            try self.emitU8(cr);
+                            try self.emitU8(pr);
+                        }
+                    }
+                }
+                try self.emitOp(.JMP, line);
+                const patch = self.currentOffset();
+                try self.emitI16(0);
+                if (target_idx) |ti| {
+                    try self.loop_stack.items[ti].continue_patches.append(self.arena, patch);
+                }
+                // (Label not found — leave the stub JMP 0.)
             },
             .for_in_stmt => {
                 // W2: for-of (iterate_values) uses the iterator protocol via the
@@ -1991,16 +2073,31 @@ const FnCompiler = struct {
             for (hoisted.items) |name| try self.emitHoist(name, 0);
         }
 
+        // Completion values (eval/REPL): the top-level program accumulates its
+        // completion value into a dedicated register, initialized to `undefined`
+        // and updated per the ES statement-completion rules (see writeCompletion/
+        // resetCompletion and the loop handlers). Allocate it first so it stays
+        // below — and untouched by — the per-statement register reclamation.
+        // Function bodies leave `completion_reg` null and behave exactly as before.
+        if (implicit_return) {
+            const cr = self.allocReg();
+            try self.emitOp(.LOAD_UNDEF, 0);
+            try self.emitU8(cr);
+            self.completion_reg = cr;
+        }
+
         var last_expr_stmt_reg: ?u8 = null;
         var last_other_reg: ?u8 = null;
+        const reclaim_floor: u8 = if (self.completion_reg) |cr| cr + 1 else 0;
 
         for (body) |stmt| {
-            // Reclaim register from previous expression statement.
+            // Reclaim register from previous statement (never below the completion
+            // register, which must persist across statements).
             if (last_expr_stmt_reg) |pr| {
-                self.sp = pr;
+                if (pr >= reclaim_floor) self.sp = pr;
                 last_expr_stmt_reg = null;
             } else if (last_other_reg) |pr| {
-                self.sp = pr;
+                if (pr >= reclaim_floor) self.sp = pr;
                 last_other_reg = null;
             }
 
@@ -2013,13 +2110,12 @@ const FnCompiler = struct {
             }
         }
 
-        // Top-level program returns its last expression-statement value (eval /
-        // REPL result). Function bodies fall through to undefined unless an
-        // explicit `return` executed.
-        const ret_reg = if (implicit_return) (last_expr_stmt_reg orelse last_other_reg) else null;
-        if (ret_reg) |r| {
+        // Top-level program returns its accumulated completion value (eval / REPL
+        // result). Function bodies fall through to undefined unless an explicit
+        // `return` executed.
+        if (self.completion_reg) |cr| {
             try self.emitOp(.RETURN, 0);
-            try self.emitU8(r);
+            try self.emitU8(cr);
         } else {
             try self.emitOp(.RETURN_UNDEF, 0);
         }

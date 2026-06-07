@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 9 JIT — profiling tier (PC hit counters + hot-site detection).
 //! See docs/JIT.md for the full tiering plan.
 //!

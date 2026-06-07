@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 4d: Date — constructor + prototype methods.
 //! Storage: internal_kind = .date, internal_slot -> DateData{ ms: i64 }.
 //! All UTC. Uses std.time.timestamp() for Date.now().

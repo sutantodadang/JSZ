@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 9 step 5/6 — native hot-loop fast-forward (OSR-style).
 //!
 //! At a hot loop back-edge the bc VM asks this module to recognize the canonical
@@ -192,6 +192,30 @@ inline fn rdU16(code: []const u8, at: usize) u16 {
     return @as(u16, code[at]) | (@as(u16, code[at + 1]) << 8);
 }
 
+/// Skip completion-value bookkeeping ops (`MOVE`, `LOAD_UNDEF`) that the program
+/// compiler interleaves into the top-level loop body to track the eval/REPL
+/// completion value. They write only the dedicated completion/prev registers —
+/// never the induction or accumulator variables — so eliding them is sound for
+/// the fast-forward. The final `pc == jmp_pc` body-shape check still rejects any
+/// genuinely-extra instruction.
+fn skipBenign(code: []const u8, pc_in: usize) usize {
+    var pc = pc_in;
+    while (pc < code.len) {
+        switch (@as(Op, @enumFromInt(code[pc]))) {
+            .MOVE => {
+                if (pc + 3 > code.len) break;
+                pc += 3;
+            },
+            .LOAD_UNDEF => {
+                if (pc + 2 > code.len) break;
+                pc += 2;
+            },
+            else => break,
+        }
+    }
+    return pc;
+}
+
 /// Type guard: read an integral i64 from a number Value, or null if it is not a
 /// finite integral number within the exactly-representable i64 range (2^53).
 fn intGuard(v: Value) ?i64 {
@@ -272,6 +296,8 @@ pub fn tryFastForwardLoop(
     const exit_pc: usize = @intCast(exit_i);
     if (exit_pc > code.len) return null;
     pc += 4;
+    // Skip the per-iteration completion-value snapshot (`MOVE prev <- completion`).
+    pc = skipBenign(code, pc);
     // [acc] Zero or more accumulator blocks before the induction step. Each is
     // present iff the next body load targets a var DIFFERENT from the induction
     // var. Shape (acc folds the current induction value, then i steps):
@@ -297,6 +323,8 @@ pub fn tryFastForwardLoop(
         if (code[p + 2] != first.reg or code[p + 3] != il.reg) return null;
         p += 4;
         pc = parseStore(code, p, accvar, racc2) orelse return null;
+        // Skip the completion-value write after this accumulator statement.
+        pc = skipBenign(code, pc);
         accs[n_acc] = .{ .ind = accvar, .op = aop };
         n_acc += 1;
     }
@@ -364,6 +392,8 @@ pub fn tryFastForwardLoop(
             pc += 3;
         },
     }
+    // Skip the completion-value write after the induction step.
+    pc = skipBenign(code, pc);
     // [H] the very next instruction must be exactly the back-edge JMP we started
     // from — guarantees the loop body contains nothing else (sound to elide).
     if (pc != jmp_pc) return null;

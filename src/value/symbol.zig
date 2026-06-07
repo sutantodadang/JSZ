@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Symbol stub — ES2015 placeholder, Phase 7.
 const std = @import("std");
 const Cell = @import("./cell.zig").Cell;

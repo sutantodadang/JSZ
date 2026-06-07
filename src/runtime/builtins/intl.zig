@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 13: a pragmatic, dependency-free `Intl` implementation.
 //!
 //! Scope: en-US formatting only (no ICU / CLDR data). Covers the common cases:

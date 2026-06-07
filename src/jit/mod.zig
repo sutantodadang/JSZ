@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 9 JIT scaffold — profiling tier re-exports.
 pub const jit = @import("jit.zig");
 pub const JitCompiler = jit.JitCompiler;

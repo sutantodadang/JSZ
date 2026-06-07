@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Node.js differential testing harness.
 //! For each corpus file, runs jsz under bc mode and compares against Node.js.
 const std = @import("std");

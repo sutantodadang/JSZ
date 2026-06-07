@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! BcFunction and BcClosure: bytecode function representation for Phase 2.
 const std = @import("std");
 const Chunk = @import("./chunk.zig").Chunk;

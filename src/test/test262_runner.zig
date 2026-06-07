@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Test262 conformance runner.
 //! When external/test262/test/ is absent, prints instructions and exits 0.
 //! To activate: git submodule add -f https://github.com/tc39/test262 external/test262

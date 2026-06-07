@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Minimal jsz embedding example. Build + run: `zig build example-embed`.
 const std = @import("std");
 const jsz = @import("jsz");

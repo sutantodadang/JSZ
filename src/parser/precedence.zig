@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Operator precedence table — 16 ES5 levels (lowest = 1, highest = 16).
 const std = @import("std");
 const TokenKind = @import("../lexer/token.zig").TokenKind;

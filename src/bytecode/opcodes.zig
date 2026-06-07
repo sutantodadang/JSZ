@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Register-based bytecode instruction set for jsz Phase 2/3a/4a.
 //! Encoding: byte stream, [op u8][operands packed little-endian].
 //!

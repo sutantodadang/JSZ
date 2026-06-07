@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 3b: GC module re-exports and tracing helpers.
 //! This file serves as the roots/tracing shim described in the spec as roots.zig.
 const std = @import("std");

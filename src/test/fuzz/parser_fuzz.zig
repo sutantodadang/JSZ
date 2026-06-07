@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Parser fuzz harness: arbitrary bytes must not cause panics.
 //! Parse errors and lex errors are OK; panics are not.
 //! Run: zig build fuzz --fuzz

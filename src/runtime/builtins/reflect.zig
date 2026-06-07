@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! ES2015 Reflect namespace — thin wrappers over the object meta-protocol.
 const std = @import("std");
 const val_mod = @import("../../value/value.zig");

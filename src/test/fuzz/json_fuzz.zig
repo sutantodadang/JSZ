@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! JSON fuzz harness: arbitrary bytes fed to JSON.parse must not panic.
 //! The bytes are embedded as a JS string literal so JSON.parse receives them
 //! verbatim as its source. Any result (ok/exception) is fine; panics are not.

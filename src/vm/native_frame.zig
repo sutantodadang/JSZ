@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Native re-entry ABI stub — HandleScope around every native boundary.
 const std = @import("std");
 const Value = @import("../value/value.zig").Value;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! ES2015 Symbol: factory, prototype methods, global registry.
 const std = @import("std");
 const val_mod = @import("../../value/value.zig");

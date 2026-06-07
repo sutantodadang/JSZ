@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 3a/3b/4a/4b Realm: holds global Environment, Object.prototype, Array.prototype,
 //! the Object constructor, Error constructors, Math, JSON, String/Array/Object builtins,
 //! and (Phase 3b) the GC Heap.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 4b/4c/4d: String.prototype native functions.
 //! All operate on the string `this` value (first arg = this_val).
 //! No mutation — all return new strings or numbers.

@@ -73,4 +73,4 @@ See [docs/CONTRIBUTING/adding-a-builtin.md](docs/CONTRIBUTING/adding-a-builtin.m
 
 ## License
 
-By contributing, you agree your contributions are licensed under MIT.
+By contributing, you agree your contributions are licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

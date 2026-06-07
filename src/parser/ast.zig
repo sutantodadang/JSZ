@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! ES5 AST nodes. Arena-allocated tagged unions. Phase 1.
 const std = @import("std");
 

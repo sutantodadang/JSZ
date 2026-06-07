@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Benchmark: fib(20) under the bytecode VM.
 const std = @import("std");
 const jsz = @import("jsz");

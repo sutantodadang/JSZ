@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! ES5 lexer: regex/division disambiguation, ASI tracking, full token set.
 //! Single public method: next() !Token. EOF returns .eof sentinel.
 const std = @import("std");
