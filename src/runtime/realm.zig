@@ -27,6 +27,10 @@ const console_mod = @import("./builtins/console.zig");
 const symbol_mod = @import("./builtins/symbol.zig");
 // ES2015 Reflect
 const reflect_mod = @import("./builtins/reflect.zig");
+// Phase 13 ToPrimitive (Symbol.toPrimitive / valueOf / toString)
+const coercion_mod = @import("./builtins/coercion.zig");
+// Phase 13 Proxy
+const proxy_mod = @import("./builtins/proxy.zig");
 
 // ---------------------------------------------------------------- Context interface ---
 
@@ -237,6 +241,12 @@ pub var active_promise_proto: ?*JsObject = null;
 pub var active_symbol_proto: ?*JsObject = null;
 /// ES2015 Symbol.iterator well-known symbol value.
 pub var active_sym_iterator: ?Value = null;
+/// ES2015 Symbol.toPrimitive well-known symbol value (ToPrimitive hook).
+pub var active_sym_to_primitive: ?Value = null;
+/// Phase 13: private symbols storing a Proxy's [[ProxyTarget]]/[[ProxyHandler]]
+/// as GC-traced symbol-keyed own properties.
+pub var active_sym_proxy_target: ?Value = null;
+pub var active_sym_proxy_handler: ?Value = null;
 
 /// Phase 4b: pending JS exception Value (set by JSON.parse on error).
 /// VMs check this after catching error.JsException from a native call.
@@ -395,6 +405,13 @@ fn nativeStringCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
         .boolean => |b| val_mod.makeString(arena, if (b) "true" else "false"),
         .null_ => val_mod.makeString(arena, "null"),
         .undefined_ => val_mod.makeString(arena, "undefined"),
+        .object => blk: {
+            // ToString(ToPrimitive(arg, "string")) when a user hook applies.
+            if (try coercion_mod.toPrimitive(arena, arg, .string)) |prim| {
+                break :blk nativeStringCtor(arena, arg, &[_]Value{prim});
+            }
+            break :blk val_mod.makeString(arena, "[object Object]");
+        },
         else => val_mod.makeString(arena, "[object Object]"),
     };
 }
@@ -549,6 +566,13 @@ fn nativeNumberCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
         },
         .null_ => val_mod.makeNumber(arena, 0),
         .undefined_ => val_mod.makeNumber(arena, std.math.nan(f64)),
+        .object => blk: {
+            // ToNumber(ToPrimitive(arg, "number")) when a user hook applies.
+            if (try coercion_mod.toPrimitive(arena, arg, .number)) |prim| {
+                break :blk nativeNumberCtor(arena, arg, &[_]Value{prim});
+            }
+            break :blk val_mod.makeNumber(arena, std.math.nan(f64));
+        },
         else => val_mod.makeNumber(arena, std.math.nan(f64)),
     };
 }
@@ -1108,6 +1132,12 @@ pub const Realm = struct {
         if (active_sym_iterator) |symv| {
             try array_proto.setSym(symv, try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeArrayValues));
         }
+        // Capture Symbol.toPrimitive and give Date the spec-correct hook so
+        // `date + x` coerces to a string (default hint) rather than a number.
+        active_sym_to_primitive = symbol_ctor.getOwn("toPrimitive");
+        if (active_sym_to_primitive) |symv| {
+            try date_proto.setSym(symv, try val_mod.makeNativeFunction(arena, date_mod.nativeDateToPrimitive));
+        }
 
         // ---- ES2015 Reflect ----
         const reflect_obj = try JsObject.create(arena, object_proto);
@@ -1124,6 +1154,13 @@ pub const Realm = struct {
         try reflect_obj.set("apply", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectApply));
         try reflect_obj.set("construct", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectConstruct));
         try env.define("Reflect", try val_mod.makeObject(arena, reflect_obj));
+
+        // ---- ES2015 Proxy ----
+        active_sym_proxy_target = try val_mod.makeSymbol(arena, "[[ProxyTarget]]");
+        active_sym_proxy_handler = try val_mod.makeSymbol(arena, "[[ProxyHandler]]");
+        const proxy_ctor = try JsObject.create(arena, null);
+        try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
+        try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
 
         // ---- ES2020 globalThis (+ Node-compatible `global`) ----
         try installGlobalThis(arena, env, object_proto);

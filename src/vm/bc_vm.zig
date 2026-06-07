@@ -20,6 +20,8 @@ const gc_mod = @import("../gc/gc.zig");
 const ic_mod = @import("./ic.zig");
 const jit_mod = @import("../jit/jit.zig");
 const loop_jit = @import("../jit/loop_jit.zig");
+const coercion = @import("../runtime/builtins/coercion.zig");
+const proxy_mod = @import("../runtime/builtins/proxy.zig");
 
 /// Phase 4a: a try entry pushed by PUSH_TRY.
 pub const TryEntry = struct {
@@ -530,7 +532,10 @@ pub const BcVm = struct {
                     } else if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv)) {
                         frame.registers[rdst] = try val_mod.makeNumber(self.arena, lv.unbox().number + rv.unbox().number);
                     } else {
-                        frame.registers[rdst] = try self.jsAdd(lv, rv);
+                        const sum = try self.jsAdd(lv, rv);
+                        // jsAdd may invoke user ToPrimitive hooks, which can
+                        // reallocate self.frames; re-fetch the current frame.
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = sum;
                         ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
                     }
                 },
@@ -545,7 +550,12 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    if (val_mod.smiArith(lv, rv, '-')) |s| {
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const ln = try self.toNumberCoerced(lv);
+                        const rn = try self.toNumberCoerced(rv);
+                        ac.mode = .unknown;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, ln - rn);
+                    } else if (val_mod.smiArith(lv, rv, '-')) |s| {
                         frame.registers[rdst] = s;
                         ac.mode = .number_pair;
                     } else {
@@ -568,7 +578,12 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    if (val_mod.smiArith(lv, rv, '*')) |s| {
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const ln = try self.toNumberCoerced(lv);
+                        const rn = try self.toNumberCoerced(rv);
+                        ac.mode = .unknown;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, ln * rn);
+                    } else if (val_mod.smiArith(lv, rv, '*')) |s| {
                         frame.registers[rdst] = s;
                         ac.mode = .number_pair;
                     } else {
@@ -591,12 +606,19 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        lv.unbox().number / rv.unbox().number
-                    else
-                        toNumber(lv) / toNumber(rv);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const ln = try self.toNumberCoerced(lv);
+                        const rn = try self.toNumberCoerced(rv);
+                        ac.mode = .unknown;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, ln / rn);
+                    } else {
+                        const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            lv.unbox().number / rv.unbox().number
+                        else
+                            toNumber(lv) / toNumber(rv);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                    }
                 },
                 .MOD => {
                     const site_pc = frame.pc - 1;
@@ -609,17 +631,25 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        lv.unbox().number
-                    else
-                        toNumber(lv);
-                    const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        rv.unbox().number
-                    else
-                        toNumber(rv);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    const res = std.math.mod(f64, l, r) catch std.math.nan(f64);
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, res);
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const l = try self.toNumberCoerced(lv);
+                        const r = try self.toNumberCoerced(rv);
+                        ac.mode = .unknown;
+                        const res = std.math.mod(f64, l, r) catch std.math.nan(f64);
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, res);
+                    } else {
+                        const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            lv.unbox().number
+                        else
+                            toNumber(lv);
+                        const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            rv.unbox().number
+                        else
+                            toNumber(rv);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        const res = std.math.mod(f64, l, r) catch std.math.nan(f64);
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, res);
+                    }
                 },
                 .EXP => {
                     const rdst = code[frame.pc];
@@ -630,14 +660,26 @@ pub const BcVm = struct {
                     frame.pc += 1;
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, std.math.pow(f64, toNumber(lv), toNumber(rv)));
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const ln = try self.toNumberCoerced(lv);
+                        const rn = try self.toNumberCoerced(rv);
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, std.math.pow(f64, ln, rn));
+                    } else {
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, std.math.pow(f64, toNumber(lv), toNumber(rv)));
+                    }
                 },
                 .NEG => {
                     const rdst = code[frame.pc];
                     frame.pc += 1;
                     const rsrc = code[frame.pc];
                     frame.pc += 1;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, -toNumber(frame.registers[rsrc]));
+                    const sv = frame.registers[rsrc];
+                    if (isObjectOperand(sv)) {
+                        const n = try self.toNumberCoerced(sv);
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, -n);
+                    } else {
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, -toNumber(sv));
+                    }
                 },
                 .BIT_AND => {
                     const site_pc = frame.pc - 1;
@@ -650,17 +692,25 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
-                    else
-                        toInt32(lv);
-                    const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(rv.unbox().number)))
-                    else
-                        toInt32(rv);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    const r: i32 = l & r0;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const lo = try self.toInt32Coerced(lv);
+                        const ro = try self.toInt32Coerced(rv);
+                        ac.mode = .unknown;
+                        const r: i32 = lo & ro;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    } else {
+                        const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
+                        else
+                            toInt32(lv);
+                        const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(i32, @intFromFloat(@trunc(rv.unbox().number)))
+                        else
+                            toInt32(rv);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        const r: i32 = l & r0;
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    }
                 },
                 .BIT_OR => {
                     const site_pc = frame.pc - 1;
@@ -673,17 +723,25 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
-                    else
-                        toInt32(lv);
-                    const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(rv.unbox().number)))
-                    else
-                        toInt32(rv);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    const r: i32 = l | r0;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const lo = try self.toInt32Coerced(lv);
+                        const ro = try self.toInt32Coerced(rv);
+                        ac.mode = .unknown;
+                        const r: i32 = lo | ro;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    } else {
+                        const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
+                        else
+                            toInt32(lv);
+                        const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(i32, @intFromFloat(@trunc(rv.unbox().number)))
+                        else
+                            toInt32(rv);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        const r: i32 = l | r0;
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    }
                 },
                 .BIT_XOR => {
                     const site_pc = frame.pc - 1;
@@ -696,17 +754,25 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
-                    else
-                        toInt32(lv);
-                    const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(rv.unbox().number)))
-                    else
-                        toInt32(rv);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    const r: i32 = l ^ r0;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const lo = try self.toInt32Coerced(lv);
+                        const ro = try self.toInt32Coerced(rv);
+                        ac.mode = .unknown;
+                        const r: i32 = lo ^ ro;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    } else {
+                        const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
+                        else
+                            toInt32(lv);
+                        const r0 = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(i32, @intFromFloat(@trunc(rv.unbox().number)))
+                        else
+                            toInt32(rv);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        const r: i32 = l ^ r0;
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    }
                 },
                 .SHL => {
                     const site_pc = frame.pc - 1;
@@ -719,17 +785,25 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
-                    else
-                        toInt32(lv);
-                    const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(u32, @intFromFloat(@trunc(rv.unbox().number)))
-                    else
-                        toUint32(rv)) & 0x1F);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    const r: i32 = l << shift;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const l = try self.toInt32Coerced(lv);
+                        const shift: u5 = @intCast((try self.toUint32Coerced(rv)) & 0x1F);
+                        ac.mode = .unknown;
+                        const r: i32 = l << shift;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    } else {
+                        const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
+                        else
+                            toInt32(lv);
+                        const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(u32, @intFromFloat(@trunc(rv.unbox().number)))
+                        else
+                            toUint32(rv)) & 0x1F);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        const r: i32 = l << shift;
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    }
                 },
                 .SHR => {
                     const site_pc = frame.pc - 1;
@@ -742,17 +816,25 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
-                    else
-                        toInt32(lv);
-                    const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(u32, @intFromFloat(@trunc(rv.unbox().number)))
-                    else
-                        toUint32(rv)) & 0x1F);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    const r: i32 = l >> shift;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const l = try self.toInt32Coerced(lv);
+                        const shift: u5 = @intCast((try self.toUint32Coerced(rv)) & 0x1F);
+                        ac.mode = .unknown;
+                        const r: i32 = l >> shift;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    } else {
+                        const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
+                        else
+                            toInt32(lv);
+                        const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(u32, @intFromFloat(@trunc(rv.unbox().number)))
+                        else
+                            toUint32(rv)) & 0x1F);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        const r: i32 = l >> shift;
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    }
                 },
                 .USHR => {
                     const site_pc = frame.pc - 1;
@@ -765,42 +847,67 @@ pub const BcVm = struct {
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-                    const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
-                    else
-                        toInt32(lv);
-                    const u: u32 = @bitCast(l);
-                    const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
-                        @as(u32, @intFromFloat(@trunc(rv.unbox().number)))
-                    else
-                        toUint32(rv)) & 0x1F);
-                    ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
-                    const r: u32 = u >> shift;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const l = try self.toInt32Coerced(lv);
+                        const u: u32 = @bitCast(l);
+                        const shift: u5 = @intCast((try self.toUint32Coerced(rv)) & 0x1F);
+                        ac.mode = .unknown;
+                        const r: u32 = u >> shift;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    } else {
+                        const l = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
+                        else
+                            toInt32(lv);
+                        const u: u32 = @bitCast(l);
+                        const shift: u5 = @intCast((if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
+                            @as(u32, @intFromFloat(@trunc(rv.unbox().number)))
+                        else
+                            toUint32(rv)) & 0x1F);
+                        ac.mode = if (isNumberValue(lv) and isNumberValue(rv)) .number_pair else .unknown;
+                        const r: u32 = u >> shift;
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    }
                 },
                 .BIT_NOT => {
                     const rdst = code[frame.pc];
                     frame.pc += 1;
                     const rsrc = code[frame.pc];
                     frame.pc += 1;
-                    const r: i32 = ~toInt32(frame.registers[rsrc]);
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    const sv = frame.registers[rsrc];
+                    if (isObjectOperand(sv)) {
+                        const r: i32 = ~(try self.toInt32Coerced(sv));
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    } else {
+                        const r: i32 = ~toInt32(sv);
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
+                    }
                 },
                 .INC => {
                     const rdst = code[frame.pc];
                     frame.pc += 1;
                     const rsrc = code[frame.pc];
                     frame.pc += 1;
-                    const r = toNumber(frame.registers[rsrc]) + 1.0;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                    const sv = frame.registers[rsrc];
+                    if (isObjectOperand(sv)) {
+                        const n = try self.toNumberCoerced(sv);
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, n + 1.0);
+                    } else {
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, toNumber(sv) + 1.0);
+                    }
                 },
                 .DEC => {
                     const rdst = code[frame.pc];
                     frame.pc += 1;
                     const rsrc = code[frame.pc];
                     frame.pc += 1;
-                    const r = toNumber(frame.registers[rsrc]) - 1.0;
-                    frame.registers[rdst] = try val_mod.makeNumber(self.arena, r);
+                    const sv = frame.registers[rsrc];
+                    if (isObjectOperand(sv)) {
+                        const n = try self.toNumberCoerced(sv);
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, n - 1.0);
+                    } else {
+                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, toNumber(sv) - 1.0);
+                    }
                 },
                 .EQ => {
                     const rdst = code[frame.pc];
@@ -809,8 +916,18 @@ pub const BcVm = struct {
                     frame.pc += 1;
                     const rrhs = code[frame.pc];
                     frame.pc += 1;
-                    const r = jsAbstractEqual(frame.registers[rlhs], frame.registers[rrhs]);
-                    frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const r = self.abstractEqual(lv, rv) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in ToPrimitive")) |oc| return oc;
+                            continue;
+                        };
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    } else {
+                        frame.registers[rdst] = try val_mod.makeBool(self.arena, jsAbstractEqual(lv, rv));
+                    }
                 },
                 .NEQ => {
                     const rdst = code[frame.pc];
@@ -819,8 +936,18 @@ pub const BcVm = struct {
                     frame.pc += 1;
                     const rrhs = code[frame.pc];
                     frame.pc += 1;
-                    const r = !jsAbstractEqual(frame.registers[rlhs], frame.registers[rrhs]);
-                    frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const r = self.abstractEqual(lv, rv) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in ToPrimitive")) |oc| return oc;
+                            continue;
+                        };
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, !r);
+                    } else {
+                        frame.registers[rdst] = try val_mod.makeBool(self.arena, !jsAbstractEqual(lv, rv));
+                    }
                 },
                 .SEQ => {
                     const rdst = code[frame.pc];
@@ -849,8 +976,17 @@ pub const BcVm = struct {
                     frame.pc += 1;
                     const rrhs = code[frame.pc];
                     frame.pc += 1;
-                    const r = jsLessThan(frame.registers[rlhs], frame.registers[rrhs]) orelse false;
-                    frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const lp = try self.coerceForRelational(lv);
+                        const rp = try self.coerceForRelational(rv);
+                        const r = jsLessThan(lp, rp) orelse false;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    } else {
+                        const r = jsLessThan(lv, rv) orelse false;
+                        frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    }
                 },
                 .LE => {
                     const rdst = code[frame.pc];
@@ -860,9 +996,19 @@ pub const BcVm = struct {
                     const rrhs = code[frame.pc];
                     frame.pc += 1;
                     // a <= b == !(b < a)
-                    const r2 = jsLessThan(frame.registers[rrhs], frame.registers[rlhs]);
-                    const r = if (r2) |v| !v else false;
-                    frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const lp = try self.coerceForRelational(lv);
+                        const rp = try self.coerceForRelational(rv);
+                        const r2 = jsLessThan(rp, lp);
+                        const r = if (r2) |v| !v else false;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    } else {
+                        const r2 = jsLessThan(rv, lv);
+                        const r = if (r2) |v| !v else false;
+                        frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    }
                 },
                 .GT => {
                     const rdst = code[frame.pc];
@@ -871,8 +1017,17 @@ pub const BcVm = struct {
                     frame.pc += 1;
                     const rrhs = code[frame.pc];
                     frame.pc += 1;
-                    const r = jsLessThan(frame.registers[rrhs], frame.registers[rlhs]) orelse false;
-                    frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const lp = try self.coerceForRelational(lv);
+                        const rp = try self.coerceForRelational(rv);
+                        const r = jsLessThan(rp, lp) orelse false;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    } else {
+                        const r = jsLessThan(rv, lv) orelse false;
+                        frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    }
                 },
                 .GE => {
                     const rdst = code[frame.pc];
@@ -882,9 +1037,19 @@ pub const BcVm = struct {
                     const rrhs = code[frame.pc];
                     frame.pc += 1;
                     // a >= b == !(a < b)
-                    const r2 = jsLessThan(frame.registers[rlhs], frame.registers[rrhs]);
-                    const r = if (r2) |v| !v else false;
-                    frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    const lv = frame.registers[rlhs];
+                    const rv = frame.registers[rrhs];
+                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
+                        const lp = try self.coerceForRelational(lv);
+                        const rp = try self.coerceForRelational(rv);
+                        const r2 = jsLessThan(lp, rp);
+                        const r = if (r2) |v| !v else false;
+                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    } else {
+                        const r2 = jsLessThan(lv, rv);
+                        const r = if (r2) |v| !v else false;
+                        frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
+                    }
                 },
                 .NOT => {
                     const rdst = code[frame.pc];
@@ -1422,6 +1587,51 @@ pub const BcVm = struct {
                         try JsObject.createArray(self.arena, self.realm.array_prototype);
                     frame.registers[rdst] = try val_mod.makeObject(self.arena, arr);
                 },
+                .ARRAY_APPEND => {
+                    const rarr = code[frame.pc];
+                    frame.pc += 1;
+                    const rval = code[frame.pc];
+                    frame.pc += 1;
+                    const arr_val = frame.registers[rarr];
+                    const val = frame.registers[rval];
+                    if (arr_val.bits != 0 and arr_val.unbox() == .object) {
+                        const arr = arr_val.toPtr().object;
+                        const idx = arr.getArrayLength();
+                        const key = try std.fmt.allocPrint(self.arena, "{d}", .{idx});
+                        try arr.set(key, val);
+                    }
+                },
+                .ARRAY_SPREAD => {
+                    const rarr = code[frame.pc];
+                    frame.pc += 1;
+                    const riter = code[frame.pc];
+                    frame.pc += 1;
+                    const arr_val = frame.registers[rarr];
+                    const iter_src = frame.registers[riter];
+                    if (arr_val.bits != 0 and arr_val.unbox() == .object) {
+                        const arr = arr_val.toPtr().object;
+                        const iter_mod = @import("../runtime/builtins/es2015_collections.zig");
+                        const it = iter_mod.nativeGetIterator(self.arena, Value{}, &[_]Value{iter_src}) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("is not iterable")) |oc| return oc;
+                            continue;
+                        };
+                        while (true) {
+                            const step = iter_mod.nativeIterStep(self.arena, Value{}, &[_]Value{it}) catch |e| {
+                                if (e != error.JsException) return e;
+                                if (try self.raisePendingException("iterator error")) |oc| return oc;
+                                break;
+                            };
+                            if (step.bits == 0 or step.unbox() != .object) break;
+                            const done_v = step.toPtr().object.get("done") orelse break;
+                            if (isTruthy(done_v)) break;
+                            const v = step.toPtr().object.get("value") orelse try val_mod.makeUndefined(self.arena);
+                            const idx = arr.getArrayLength();
+                            const key = try std.fmt.allocPrint(self.arena, "{d}", .{idx});
+                            try arr.set(key, v);
+                        }
+                    }
+                },
                 .GET_PROP => {
                     const site_pc = frame.pc - 1;
                     const rdst = code[frame.pc];
@@ -1478,7 +1688,11 @@ pub const BcVm = struct {
 
                     if (self.ic_stats_enabled and obj_val.bits != 0 and obj_val.unbox() == .object) self.ic_misses += 1;
                     const frame_idx = self.frames.items.len - 1;
-                    const result = try self.getProp(obj_val, key);
+                    const result = self.getProp(obj_val, key) catch |e| {
+                        if (e != error.JsException) return e;
+                        if (try self.raisePendingException("error in getter")) |oc| return oc;
+                        continue;
+                    };
                     // Re-fetch frame: getProp may invoke a getter via bcInvokeJs which
                     // appends to self.frames and potentially reallocates the backing slice.
                     const frame2 = &self.frames.items[frame_idx];
@@ -1559,7 +1773,11 @@ pub const BcVm = struct {
                         }
                         if (self.ic_stats_enabled and obj_val.bits != 0 and obj_val.unbox() == .object) self.ic_misses += 1;
                         const frame_idx_dyn = self.frames.items.len - 1;
-                        const result = try self.getProp(obj_val, key);
+                        const result = self.getProp(obj_val, key) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in getter")) |oc| return oc;
+                            continue;
+                        };
                         // Re-fetch frame after getProp: accessor getter dispatch via
                         // bcInvokeJs may have appended frames and reallocated the slice.
                         const frame2_dyn = &self.frames.items[frame_idx_dyn];
@@ -1587,11 +1805,21 @@ pub const BcVm = struct {
                             }
                         }
                     } else if (key_val.bits != 0 and key_val.unbox() == .symbol) {
-                        frame.registers[rdst] = try self.getPropSym(obj_val, key_val);
+                        const fidx_sym = self.frames.items.len - 1;
+                        const sym_res = self.getPropSym(obj_val, key_val) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in getter")) |oc| return oc;
+                            continue;
+                        };
+                        self.frames.items[fidx_sym].registers[rdst] = sym_res;
                     } else {
                         const frame_idx_dyn2 = self.frames.items.len - 1;
                         const key = try valueToStringArena(self.arena, key_val);
-                        const result_dyn2 = try self.getProp(obj_val, key);
+                        const result_dyn2 = self.getProp(obj_val, key) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in getter")) |oc| return oc;
+                            continue;
+                        };
                         self.frames.items[frame_idx_dyn2].registers[rdst] = result_dyn2;
                     }
                 },
@@ -1613,7 +1841,11 @@ pub const BcVm = struct {
                     // Save func pointer before setProp: a setter dispatch via bcInvokeJs
                     // may reallocate self.frames, invalidating the `frame` pointer.
                     const set_func = frame.func;
-                    try self.setProp(obj_val, key, val);
+                    self.setProp(obj_val, key, val) catch |e| {
+                        if (e != error.JsException) return e;
+                        if (try self.raisePendingException("error in setter")) |oc| return oc;
+                        continue;
+                    };
                     const site_cache = &@constCast(set_func.ic_table)[site_pc];
                     if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                         const obj = obj_val.toPtr().object;
@@ -1638,7 +1870,11 @@ pub const BcVm = struct {
                     if (key_val.bits != 0 and key_val.unbox() == .string) {
                         const key = key_val.toPtr().string;
                         const set_dyn_func = frame.func;
-                        try self.setProp(obj_val, key, val);
+                        self.setProp(obj_val, key, val) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in setter")) |oc| return oc;
+                            continue;
+                        };
                         const site_cache = &@constCast(set_dyn_func.ic_table)[site_pc];
                         if (obj_val.bits != 0 and obj_val.unbox() == .object) {
                             const obj = obj_val.toPtr().object;
@@ -1649,10 +1885,18 @@ pub const BcVm = struct {
                             }
                         }
                     } else if (key_val.bits != 0 and key_val.unbox() == .symbol) {
-                        try self.setPropSym(obj_val, key_val, val);
+                        self.setPropSym(obj_val, key_val, val) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in setter")) |oc| return oc;
+                            continue;
+                        };
                     } else {
                         const key = try valueToStringArena(self.arena, key_val);
-                        try self.setProp(obj_val, key, val);
+                        self.setProp(obj_val, key, val) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in setter")) |oc| return oc;
+                            continue;
+                        };
                     }
                 },
                 .DEFINE_ACCESSOR => {
@@ -1827,6 +2071,77 @@ pub const BcVm = struct {
                     }
                     frame.registers[rdst] = try val_mod.makeBool(self.arena, result);
                 },
+                .IN => {
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const rkey = code[frame.pc];
+                    frame.pc += 1;
+                    const robj = code[frame.pc];
+                    frame.pc += 1;
+                    const key_v = frame.registers[rkey];
+                    const obj_v = frame.registers[robj];
+                    if (obj_v.bits == 0 or obj_v.unbox() != .object) {
+                        const exc = try self.makeErrorObjectBc("TypeError", "Cannot use 'in' operator to search for key in a non-object");
+                        self.last_exception_value = exc;
+                        const found = try self.throwException(exc);
+                        if (!found) return RunOutcome{ .exception_value = .{ .msg = "Cannot use 'in' operator on a non-object", .value = exc } };
+                        continue;
+                    }
+                    const has = self.hasProperty(obj_v, key_v) catch |e| {
+                        if (e != error.JsException) return e;
+                        if (try self.raisePendingException("error in proxy has trap")) |oc| return oc;
+                        continue;
+                    };
+                    self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, has);
+                },
+                .DELETE_PROP => {
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const robj = code[frame.pc];
+                    frame.pc += 1;
+                    const rkey = code[frame.pc];
+                    frame.pc += 1;
+                    const obj_v = frame.registers[robj];
+                    const key_v = frame.registers[rkey];
+                    const ok = self.deleteProperty(obj_v, key_v) catch |e| {
+                        if (e != error.JsException) return e;
+                        if (try self.raisePendingException("error in proxy deleteProperty trap")) |oc| return oc;
+                        continue;
+                    };
+                    self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, ok);
+                },
+                .CALL_SPREAD => {
+                    const rcallee = code[frame.pc];
+                    frame.pc += 1;
+                    const rthis = code[frame.pc];
+                    frame.pc += 1;
+                    const rargs = code[frame.pc];
+                    frame.pc += 1;
+                    const rdst = code[frame.pc];
+                    frame.pc += 1;
+                    const callee_v = frame.registers[rcallee];
+                    const this_v = frame.registers[rthis];
+                    const args_v = frame.registers[rargs];
+                    // Flatten the args array into a Value slice.
+                    var args_list = std.ArrayListUnmanaged(Value){};
+                    if (args_v.bits != 0 and args_v.unbox() == .object) {
+                        const arr = args_v.toPtr().object;
+                        const n = arr.getArrayLength();
+                        var i: u32 = 0;
+                        while (i < n) : (i += 1) {
+                            const key = try std.fmt.allocPrint(self.arena, "{d}", .{i});
+                            const ev = arr.get(key) orelse try val_mod.makeUndefined(self.arena);
+                            try args_list.append(self.arena, ev);
+                        }
+                    }
+                    const fp = @import("../runtime/builtins/function_proto.zig");
+                    const result = fp.invokeCallback(self.arena, this_v, callee_v, args_list.items) catch |e| {
+                        if (e != error.JsException) return e;
+                        if (try self.raisePendingException("error in spread call")) |oc| return oc;
+                        continue;
+                    };
+                    self.frames.items[self.frames.items.len - 1].registers[rdst] = result;
+                },
                 // Phase 4d
                 .GET_KEYS => {
                     const rdst = code[frame.pc];
@@ -1859,6 +2174,25 @@ pub const BcVm = struct {
             }
         }
         return RunOutcome{ .ok = try val_mod.makeUndefined(self.arena) };
+    }
+
+    /// Route a caught native `error.JsException` into the VM's try/catch
+    /// machinery. Returns a `RunOutcome` the caller must return (no handler
+    /// found), or null when a handler was found (caller continues dispatch).
+    fn raisePendingException(self: *BcVm, fallback_msg: []const u8) !?RunOutcome {
+        const realm_mod = @import("../runtime/realm.zig");
+        const exc_val = if (realm_mod.pending_exception.bits != 0)
+            realm_mod.pending_exception
+        else
+            try self.makeErrorObjectBc("TypeError", fallback_msg);
+        realm_mod.pending_exception = Value{};
+        self.last_exception_value = exc_val;
+        const found = try self.throwException(exc_val);
+        if (!found) {
+            const exc_msg = try formatExceptionMessage(self.arena, exc_val);
+            return RunOutcome{ .exception_value = .{ .msg = exc_msg, .value = exc_val } };
+        }
+        return null;
     }
 
     /// Throw helper: walk frame stack for a try entry and dispatch. Returns true if handled.
@@ -2124,7 +2458,11 @@ pub const BcVm = struct {
     /// Read a symbol-keyed property, walking the prototype chain (own first).
     fn getPropSym(self: *BcVm, obj_val: Value, sym_key: Value) !Value {
         if (obj_val.bits == 0 or obj_val.unbox() != .object) return val_mod.makeUndefined(self.arena);
-        var cur: ?*JsObject = obj_val.toPtr().object;
+        const root_obj = obj_val.toPtr().object;
+        if (root_obj.internal_kind == .proxy) {
+            return try self.proxyGet(obj_val, root_obj, sym_key);
+        }
+        var cur: ?*JsObject = root_obj;
         var depth: usize = 0;
         while (cur) |o| {
             if (depth >= 64) break;
@@ -2137,15 +2475,142 @@ pub const BcVm = struct {
 
     /// Set a symbol-keyed own property.
     fn setPropSym(self: *BcVm, obj_val: Value, sym_key: Value, value: Value) !void {
-        _ = self;
         if (obj_val.bits == 0 or obj_val.unbox() != .object) return;
-        try obj_val.toPtr().object.setSym(sym_key, value);
+        const obj = obj_val.toPtr().object;
+        if (obj.internal_kind == .proxy) {
+            try self.proxySet(obj_val, obj, sym_key, value);
+            return;
+        }
+        try obj.setSym(sym_key, value);
+    }
+
+    /// Proxy `get` trap dispatch: `handler.get(target, key, receiver)`, falling
+    /// back to a plain read on the target when no trap is defined.
+    fn proxyGet(self: *BcVm, proxy_val: Value, proxy_obj: *JsObject, key: Value) anyerror!Value {
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return val_mod.makeUndefined(self.arena);
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return val_mod.makeUndefined(self.arena);
+        if (proxy_mod.trap(handler, "get")) |trap_fn| {
+            return try self.callAccessor(trap_fn, handler, &[_]Value{ target, key, proxy_val });
+        }
+        // No trap: forward to the target.
+        if (key.bits != 0 and key.unbox() == .symbol) return try self.getPropSym(target, key);
+        const key_str = try valueToStringArena(self.arena, key);
+        return try self.getProp(target, key_str);
+    }
+
+    /// Proxy `set` trap dispatch: `handler.set(target, key, value, receiver)`,
+    /// falling back to a plain write on the target when no trap is defined.
+    fn proxySet(self: *BcVm, proxy_val: Value, proxy_obj: *JsObject, key: Value, value: Value) anyerror!void {
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return;
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return;
+        if (proxy_mod.trap(handler, "set")) |trap_fn| {
+            _ = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key, value, proxy_val });
+            return;
+        }
+        // No trap: forward to the target.
+        if (key.bits != 0 and key.unbox() == .symbol) {
+            try self.setPropSym(target, key, value);
+            return;
+        }
+        const key_str = try valueToStringArena(self.arena, key);
+        try self.setProp(target, key_str, value);
+    }
+
+    /// HasProperty(obj, key) for the `in` operator: prototype-chain walk over
+    /// string and symbol keys, with Proxy `has` trap dispatch.
+    fn hasProperty(self: *BcVm, obj_val: Value, key_v: Value) anyerror!bool {
+        if (obj_val.bits == 0 or obj_val.unbox() != .object) return false;
+        const root_obj = obj_val.toPtr().object;
+        if (root_obj.internal_kind == .proxy) {
+            const handler = proxy_mod.proxyHandler(root_obj) orelse return false;
+            const target = proxy_mod.proxyTarget(root_obj) orelse return false;
+            if (proxy_mod.trap(handler, "has")) |trap_fn| {
+                const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v });
+                return isTruthy(res);
+            }
+            return try self.hasProperty(target, key_v);
+        }
+        // Symbol key.
+        if (key_v.bits != 0 and key_v.unbox() == .symbol) {
+            var cur: ?*JsObject = root_obj;
+            var depth: usize = 0;
+            while (cur) |o| {
+                if (depth >= 64) break;
+                depth += 1;
+                if (o.getOwnSym(key_v) != null) return true;
+                cur = o.proto;
+            }
+            return false;
+        }
+        // String key.
+        const key = try valueToStringArena(self.arena, key_v);
+        var cur: ?*JsObject = root_obj;
+        var depth: usize = 0;
+        while (cur) |o| {
+            if (depth >= 64) break;
+            depth += 1;
+            if (o.is_array and std.mem.eql(u8, key, "length")) return true;
+            if (o.hasOwn(key)) return true;
+            cur = o.proto;
+        }
+        return false;
+    }
+
+    /// Delete own property for the `delete` operator, returning the boolean
+    /// result. Dispatches the Proxy `deleteProperty` trap; deleting from a
+    /// non-object is a no-op that yields `true`.
+    fn deleteProperty(self: *BcVm, obj_val: Value, key_v: Value) anyerror!bool {
+        if (obj_val.bits == 0 or obj_val.unbox() != .object) return true;
+        const obj = obj_val.toPtr().object;
+        if (obj.internal_kind == .proxy) {
+            const handler = proxy_mod.proxyHandler(obj) orelse return false;
+            const target = proxy_mod.proxyTarget(obj) orelse return false;
+            if (proxy_mod.trap(handler, "deleteProperty")) |trap_fn| {
+                const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v });
+                return isTruthy(res);
+            }
+            return try self.deleteProperty(target, key_v);
+        }
+        if (key_v.bits != 0 and key_v.unbox() == .symbol) {
+            return obj.deleteOwnSym(key_v);
+        }
+        const key = try valueToStringArena(self.arena, key_v);
+        return obj.deleteOwn(key);
+    }
+
+    /// Abstract equality (`==`) with object↔primitive ToPrimitive coercion.
+    /// When exactly one side is an object (and the other is neither null nor
+    /// undefined), the object is converted via ToPrimitive(default) — honoring
+    /// `Symbol.toPrimitive`/`valueOf`/`toString` — then re-compared. Everything
+    /// else delegates to the pure `jsAbstractEqual`.
+    fn abstractEqual(self: *BcVm, x: Value, y: Value) anyerror!bool {
+        const x_obj = isObjectOperand(x);
+        const y_obj = isObjectOperand(y);
+        if (x_obj and !y_obj) {
+            if (y.bits == 0) return false; // object == undefined
+            if (y.unbox() == .null_ or y.unbox() == .undefined_) return false;
+            const xp = (try coercion.toPrimitive(self.arena, x, .default)) orelse
+                try val_mod.makeString(self.arena, try valueToString(self.arena, x));
+            return try self.abstractEqual(xp, y);
+        }
+        if (y_obj and !x_obj) {
+            if (x.bits == 0) return false;
+            if (x.unbox() == .null_ or x.unbox() == .undefined_) return false;
+            const yp = (try coercion.toPrimitive(self.arena, y, .default)) orelse
+                try val_mod.makeString(self.arena, try valueToString(self.arena, y));
+            return try self.abstractEqual(x, yp);
+        }
+        return jsAbstractEqual(x, y);
     }
 
     fn getProp(self: *BcVm, obj_val: Value, key: []const u8) !Value {
         if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);
         switch (obj_val.unbox()) {
             .object => |obj| {
+                if (obj.internal_kind == .proxy) {
+                    const key_v = try val_mod.makeString(self.arena, key);
+                    return try self.proxyGet(obj_val, obj, key_v);
+                }
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength()));
                 }
@@ -2248,6 +2713,11 @@ pub const BcVm = struct {
         if (obj_val.bits == 0) return;
         switch (obj_val.unbox()) {
             .object => |obj| {
+                if (obj.internal_kind == .proxy) {
+                    const key_v = try val_mod.makeString(self.arena, key);
+                    try self.proxySet(obj_val, obj, key_v, value);
+                    return;
+                }
                 if (obj.findProperty(key)) |loc| {
                     const a = loc.holder.attrAt(loc.slot);
                     if (a.is_accessor) {
@@ -2814,15 +3284,43 @@ pub const BcVm = struct {
     }
 
     fn jsAdd(self: *BcVm, left: Value, right: Value) !Value {
-        const ls = isStringOrObject(left);
-        const rs = isStringOrObject(right);
+        // ES2015 11.6.1: lprim = ToPrimitive(left), rprim = ToPrimitive(right),
+        // both with the "default" hint, before deciding string vs numeric.
+        const lp = (try coercion.toPrimitive(self.arena, left, .default)) orelse left;
+        const rp = (try coercion.toPrimitive(self.arena, right, .default)) orelse right;
+        const ls = isStringOrObject(lp);
+        const rs = isStringOrObject(rp);
         if (ls or rs) {
-            const ls_str = try valueToString(self.arena, left);
-            const rs_str = try valueToString(self.arena, right);
+            const ls_str = try valueToString(self.arena, lp);
+            const rs_str = try valueToString(self.arena, rp);
             const combined = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ ls_str, rs_str });
             return val_mod.makeString(self.arena, combined);
         }
-        return val_mod.makeNumber(self.arena, toNumber(left) + toNumber(right));
+        return val_mod.makeNumber(self.arena, toNumber(lp) + toNumber(rp));
+    }
+
+    /// ToNumber that honors user-defined ToPrimitive(number) on objects.
+    /// For non-objects this is exactly `toNumber`.
+    fn toNumberCoerced(self: *BcVm, v: Value) !f64 {
+        const p = (try coercion.toPrimitive(self.arena, v, .number)) orelse v;
+        return toNumber(p);
+    }
+
+    /// ToPrimitive(number) for relational comparison; returns `v` unchanged
+    /// when no user hook applies.
+    fn coerceForRelational(self: *BcVm, v: Value) !Value {
+        return (try coercion.toPrimitive(self.arena, v, .number)) orelse v;
+    }
+
+    /// ToInt32 honoring user-defined ToPrimitive(number) on objects.
+    fn toInt32Coerced(self: *BcVm, v: Value) !i32 {
+        const p = (try coercion.toPrimitive(self.arena, v, .number)) orelse v;
+        return toInt32(p);
+    }
+
+    /// ToUint32 honoring user-defined ToPrimitive(number) on objects.
+    fn toUint32Coerced(self: *BcVm, v: Value) !u32 {
+        return @bitCast(try self.toInt32Coerced(v));
     }
 };
 
@@ -2921,6 +3419,12 @@ fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
 
 fn isNumberValue(v: Value) bool {
     return v.bits != 0 and v.unbox() == .number;
+}
+
+/// True when `v` is a plain object (the only operand kind that can carry a
+/// user-defined ToPrimitive hook needing a slow, JS-reentrant coercion path).
+fn isObjectOperand(v: Value) bool {
+    return v.bits != 0 and v.unbox() == .object;
 }
 
 fn classifyTypeof(v: Value) struct {

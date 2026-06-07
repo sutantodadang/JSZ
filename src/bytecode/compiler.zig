@@ -357,8 +357,37 @@ const FnCompiler = struct {
                 return rdst;
             },
             .delete_ => {
-                // Phase 2: always true.
-                _ = try self.compileExpr(u.operand);
+                const operand = u.operand;
+                if (operand.kind == .member_expr) {
+                    // `delete obj.prop` / `delete obj[expr]`: delete the own
+                    // property and yield a boolean result.
+                    const me = operand.data.member_expr;
+                    const robj = try self.compileExpr(me.object);
+                    if (me.computed) {
+                        const rkey = try self.compileExpr(me.property);
+                        try self.emitOp(.DELETE_PROP, line);
+                        try self.emitU8(robj);
+                        try self.emitU8(robj);
+                        try self.emitU8(rkey);
+                    } else {
+                        const name = me.property.data.identifier;
+                        const sv = try val_mod.makeString(self.arena, name);
+                        const kidx = try self.addConstant(sv);
+                        const rkey = self.allocReg();
+                        try self.emitOp(.LOAD_K, line);
+                        try self.emitU8(rkey);
+                        try self.emitU16(kidx);
+                        try self.emitOp(.DELETE_PROP, line);
+                        try self.emitU8(robj);
+                        try self.emitU8(robj);
+                        try self.emitU8(rkey);
+                    }
+                    self.sp = robj + 1; // free key (and computed-key reg)
+                    return robj;
+                }
+                // Deleting a non-reference (e.g. `delete x`, `delete 1`): evaluate
+                // for side effects, result is `true`.
+                _ = try self.compileExpr(operand);
                 self.freeReg();
                 const r = self.allocReg();
                 try self.emitOp(.LOAD_TRUE, line);
@@ -477,9 +506,11 @@ const FnCompiler = struct {
                 return rdst;
             },
             .in => {
-                // Not supported yet: always false.
-                try self.emitOp(.LOAD_FALSE, line);
+                // `key in obj`: HasProperty(R[rrhs], R[rlhs]).
+                try self.emitOp(.IN, line);
                 try self.emitU8(rdst);
+                try self.emitU8(rlhs);
+                try self.emitU8(rrhs);
                 return rdst;
             },
         };
@@ -832,23 +863,53 @@ const FnCompiler = struct {
     }
 
     fn compileArrayLiteral(self: *Self, al: ast.ArrayLiteral, line: u32) error{OutOfMemory}!u8 {
+        // Detect spread elements; without any, keep the fast static-index path.
+        var has_spread = false;
+        for (al.elements) |elem| {
+            if (elem.kind == .spread_expr) {
+                has_spread = true;
+                break;
+            }
+        }
+
         const len_hint: u8 = if (al.elements.len <= 255) @intCast(al.elements.len) else 255;
         const robj = self.allocReg();
         try self.emitOp(.NEW_ARRAY, line);
         try self.emitU8(robj);
         try self.emitU8(len_hint);
 
-        for (al.elements, 0..) |elem, i| {
-            const rval = try self.compileExpr(elem);
-            // Use static string key for the index.
-            const key_str = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return error.OutOfMemory;
-            const sv = try val_mod.makeString(self.arena, key_str);
-            const kidx = try self.addConstant(sv);
-            try self.emitOp(.SET_PROP, line);
-            try self.emitU8(robj);
-            try self.emitU16(kidx);
-            try self.emitU8(rval);
-            self.freeReg(); // free rval
+        if (!has_spread) {
+            for (al.elements, 0..) |elem, i| {
+                const rval = try self.compileExpr(elem);
+                // Use static string key for the index.
+                const key_str = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return error.OutOfMemory;
+                const sv = try val_mod.makeString(self.arena, key_str);
+                const kidx = try self.addConstant(sv);
+                try self.emitOp(.SET_PROP, line);
+                try self.emitU8(robj);
+                try self.emitU16(kidx);
+                try self.emitU8(rval);
+                self.freeReg(); // free rval
+            }
+            return robj;
+        }
+
+        // Spread path: indices are dynamic, so append element-by-element.
+        // `[a, ...iter, b]` -> NEW_ARRAY; APPEND a; SPREAD iter; APPEND b.
+        for (al.elements) |elem| {
+            if (elem.kind == .spread_expr) {
+                const riter = try self.compileExpr(elem.data.spread_expr);
+                try self.emitOp(.ARRAY_SPREAD, line);
+                try self.emitU8(robj);
+                try self.emitU8(riter);
+                self.freeReg(); // free riter
+            } else {
+                const rval = try self.compileExpr(elem);
+                try self.emitOp(.ARRAY_APPEND, line);
+                try self.emitU8(robj);
+                try self.emitU8(rval);
+                self.freeReg(); // free rval
+            }
         }
         return robj;
     }
@@ -969,6 +1030,13 @@ const FnCompiler = struct {
             self.sp = base_sp + 1;
             return base_sp;
         }
+        // Call-argument spread: `f(...xs)` / `obj.m(a, ...xs)` build a runtime
+        // args array and dispatch via CALL_SPREAD (the static-nargs CALL ABI
+        // cannot express a variable argument count).
+        for (c.args) |a| {
+            if (a.kind == .spread_expr) return try self.compileCallSpread(c, line);
+        }
+
         const is_method = c.callee.kind == .member_expr;
 
         if (is_method) {
@@ -1060,6 +1128,71 @@ const FnCompiler = struct {
         // Free all arg registers, keep only ret_dst.
         self.sp = base + 1;
         return ret_dst;
+    }
+
+    /// Compile a call whose arguments include a spread (`f(...xs)`,
+    /// `obj.m(a, ...xs)`). Builds a runtime argument array and emits CALL_SPREAD.
+    fn compileCallSpread(self: *Self, c: ast.CallExpr, line: u32) error{OutOfMemory}!u8 {
+        var rthis: u8 = 0;
+        var rcallee: u8 = 0;
+        var rdst: u8 = 0;
+        if (c.callee.kind == .member_expr) {
+            const me = c.callee.data.member_expr;
+            rthis = try self.compileExpr(me.object);
+            rcallee = self.allocReg();
+            if (me.computed) {
+                const rkey = try self.compileExpr(me.property);
+                try self.emitOp(.GET_PROP_DYN, line);
+                try self.emitU8(rcallee);
+                try self.emitU8(rthis);
+                try self.emitU8(rkey);
+                self.sp = rcallee + 1; // free rkey
+            } else {
+                const name = me.property.data.identifier;
+                const sv = try val_mod.makeString(self.arena, name);
+                const kidx = try self.addConstant(sv);
+                try self.emitOp(.GET_PROP, line);
+                try self.emitU8(rcallee);
+                try self.emitU8(rthis);
+                try self.emitU16(kidx);
+            }
+            rdst = rthis; // reuse the (lowest) object slot for the result
+        } else {
+            rcallee = try self.compileExpr(c.callee);
+            rthis = self.allocReg();
+            try self.emitOp(.LOAD_UNDEF, line);
+            try self.emitU8(rthis);
+            rdst = rcallee; // lowest slot
+        }
+
+        // Build the argument array dynamically.
+        const rargs = self.allocReg();
+        try self.emitOp(.NEW_ARRAY, line);
+        try self.emitU8(rargs);
+        try self.emitU8(0);
+        for (c.args) |a| {
+            if (a.kind == .spread_expr) {
+                const riter = try self.compileExpr(a.data.spread_expr);
+                try self.emitOp(.ARRAY_SPREAD, line);
+                try self.emitU8(rargs);
+                try self.emitU8(riter);
+                self.freeReg();
+            } else {
+                const rval = try self.compileExpr(a);
+                try self.emitOp(.ARRAY_APPEND, line);
+                try self.emitU8(rargs);
+                try self.emitU8(rval);
+                self.freeReg();
+            }
+        }
+
+        try self.emitOp(.CALL_SPREAD, line);
+        try self.emitU8(rcallee);
+        try self.emitU8(rthis);
+        try self.emitU8(rargs);
+        try self.emitU8(rdst);
+        self.sp = rdst + 1;
+        return rdst;
     }
 
     fn compileFuncExpr(self: *Self, fe: ast.FuncExpr, line: u32) error{OutOfMemory}!u8 {

@@ -50,7 +50,7 @@ pub const JsObject = struct {
     /// Arena-allocated; MUST NOT be traversed by markObject.
     internal_slot: ?*anyopaque = null,
     /// Phase 4c/4d: discriminator for internal_slot type.
-    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, promise, generator } = .none,
+    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, promise, generator, proxy } = .none,
     /// Allocator for property storage (the eval arena).
     arena: std.mem.Allocator,
     /// Phase 6 hidden class manager (shared globally).
@@ -222,8 +222,14 @@ pub const JsObject = struct {
             try new_slots.append(self.arena, v);
             try new_attrs.append(self.arena, a);
         }
+        // Free the old parallel arrays before replacing them (else the prior
+        // `slots`/`attrs` backing buffers leak for heap-allocated objects).
+        var old_slots = self.slots;
+        var old_attrs = self.attrs;
         self.slots = new_slots;
         self.attrs = new_attrs;
+        old_slots.deinit(self.arena);
+        old_attrs.deinit(self.arena);
         return true;
     }
 

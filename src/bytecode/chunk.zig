@@ -355,6 +355,49 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
                 try writer.print(" R{d}[K{d}] {s}= R{d}", .{ robj, kidx, knd, rfn });
             }
         },
+        .ARRAY_APPEND => {
+            const rarr = code[new_pc];
+            new_pc += 1;
+            const rval = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} += R{d}", .{ rarr, rval });
+        },
+        .ARRAY_SPREAD => {
+            const rarr = code[new_pc];
+            new_pc += 1;
+            const riter = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} += ...R{d}", .{ rarr, riter });
+        },
+        .IN => {
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const rkey = code[new_pc];
+            new_pc += 1;
+            const robj = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} = R{d} in R{d}", .{ rdst, rkey, robj });
+        },
+        .DELETE_PROP => {
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const robj = code[new_pc];
+            new_pc += 1;
+            const rkey = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} = delete R{d}[R{d}]", .{ rdst, robj, rkey });
+        },
+        .CALL_SPREAD => {
+            const rcallee = code[new_pc];
+            new_pc += 1;
+            const rthis = code[new_pc];
+            new_pc += 1;
+            const rargs = code[new_pc];
+            new_pc += 1;
+            const rdst = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} = R{d}.call(R{d}, ...R{d})", .{ rdst, rcallee, rthis, rargs });
+        },
         .GET_PROP => {
             const rdst = code[new_pc];
             new_pc += 1;

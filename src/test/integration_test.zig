@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 //! Integration tests: lex -> parse -> eval end-to-end.
 //! Phase 2: each test runs under BOTH tree and bc modes and asserts identical results.
 const std = @import("std");
@@ -220,7 +220,6 @@ test "integration: NaN !== NaN" {
     const v = try evalToBool(std.testing.allocator, "NaN === NaN");
     try std.testing.expect(!v);
 }
-
 
 test "phase7: Map and Promise builtins present in bc mode" {
     const v = try evalToF64Mode(
@@ -1259,4 +1258,139 @@ test "Phase 9: experimental JIT fast-forwards a hot loop with two accumulators" 
     var compiled: usize = 0;
     try std.testing.expectEqual(expected, try evalExperimental(a, src, &compiled));
     try std.testing.expect(compiled >= 1);
+}
+
+// ---------------------------------------------------------------- Phase 13 ---
+// ToPrimitive (Symbol.toPrimitive / valueOf / toString) + array-literal spread.
+
+test "phase13: valueOf drives + arithmetic" {
+    const v = try evalToF64(std.testing.allocator, "var o={valueOf:function(){return 5}}; o+1");
+    try std.testing.expectEqual(@as(f64, 6), v);
+}
+
+test "phase13: toString drives string concatenation" {
+    const s = try dualString(std.testing.allocator, "var o={toString:function(){return 'x'}}; ''+o");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("x", s);
+}
+
+test "phase13: Symbol.toPrimitive hint dispatch" {
+    const s = try dualString(std.testing.allocator, "var o={}; o[Symbol.toPrimitive]=function(h){return h}; (''+o)+'|'+String(o)");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("default|string", s);
+}
+
+test "phase13: valueOf drives relational comparison" {
+    const b = try dualBool(std.testing.allocator, "var o={valueOf:function(){return 10}}; o<20 && o>=10 && !(o>20)");
+    try std.testing.expect(b);
+}
+
+test "phase13: plain object still coerces to [object Object]" {
+    const s = try dualString(std.testing.allocator, "''+{}");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("[object Object]", s);
+}
+
+test "phase13: array spread over array literal (mixed)" {
+    const s = try dualString(std.testing.allocator, "[0,...[1,2],3,...[4,5]].join(',')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("0,1,2,3,4,5", s);
+}
+
+test "phase13: array spread over string and Set" {
+    const s = try dualString(std.testing.allocator, "var st=new Set([1,2,2]); [...'ab',...st].join('-')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("a-b-1-2", s);
+}
+
+test "phase13: array spread over a generator" {
+    const s = try dualString(std.testing.allocator, "function* g(){yield 1;yield 2;yield 3;} [...g()].join(',')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("1,2,3", s);
+}
+
+test "phase13: spread of a non-iterable throws a catchable TypeError" {
+    const s = try dualString(std.testing.allocator, "try{var x=[...5];'no'}catch(e){e.name}");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("TypeError", s);
+}
+
+test "phase13: Proxy get trap intercepts reads" {
+    const s = try dualString(std.testing.allocator, "var p=new Proxy({a:1},{get:function(t,k){return 'g:'+k;}}); p.anything");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("g:anything", s);
+}
+
+test "phase13: Proxy set trap transforms values" {
+    const v = try evalToF64(std.testing.allocator, "var p=new Proxy({},{set:function(t,k,v){t[k]=v*2;return true;}}); p.a=5; p.a");
+    try std.testing.expectEqual(@as(f64, 10), v);
+}
+
+test "phase13: Proxy with empty handler forwards to target" {
+    const v = try evalToF64(std.testing.allocator, "var p=new Proxy({a:1,b:2},{}); p.c=3; p.a+p.b+p.c");
+    try std.testing.expectEqual(@as(f64, 6), v);
+}
+
+test "phase13: new Proxy with non-object throws TypeError" {
+    const s = try dualString(std.testing.allocator, "try{var p=new Proxy(42,{});'no'}catch(e){e.name}");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("TypeError", s);
+}
+
+test "phase13: throwing getter is catchable in try/catch" {
+    const s = try dualString(std.testing.allocator, "var o={}; Object.defineProperty(o,'x',{get:function(){throw new TypeError('boom');}}); try{o.x}catch(e){e.message}");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("boom", s);
+}
+
+test "phase13: throwing Proxy set trap is catchable" {
+    const s = try dualString(std.testing.allocator, "var p=new Proxy({},{set:function(t,k,v){throw new TypeError('no');}}); try{p.a=1;'unreached'}catch(e){e.message}");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("no", s);
+}
+
+test "phase13: in operator (own/inherited/array)" {
+    const s = try dualString(std.testing.allocator, "[('a' in {a:1}), (0 in [1,2]), (5 in [1,2]), ('length' in [1]), ('push' in [])].join(',')");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("true,true,false,true,true", s);
+}
+
+test "phase13: delete operator removes own property" {
+    const s = try dualString(std.testing.allocator, "var o={a:1,b:2}; var r=delete o.a; r+'|'+('a' in o)+'|'+('b' in o)");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("true|false|true", s);
+}
+
+test "phase13: Proxy has trap drives the in operator" {
+    const s = try dualString(std.testing.allocator, "var p=new Proxy({a:1},{has:function(t,k){return k==='magic';}}); ('magic' in p)+'|'+('a' in p)");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("true|false", s);
+}
+
+test "phase13: Proxy deleteProperty trap drives the delete operator" {
+    const s = try dualString(std.testing.allocator, "var seen=''; var p=new Proxy({a:1},{deleteProperty:function(t,k){seen=k;delete t[k];return true;}}); var r=delete p.a; r+'|'+seen+'|'+('a' in p)");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("true|a|false", s);
+}
+
+test "phase13: == coerces object via valueOf" {
+    const b = try dualBool(std.testing.allocator, "var o={valueOf:function(){return 5}}; o==5 && 5==o && !(o==6)");
+    try std.testing.expect(b);
+}
+
+test "phase13: bitwise operators coerce object via valueOf" {
+    const v = try evalToF64(std.testing.allocator, "var o={valueOf:function(){return 6}}; (o&3)+(o|1)+(~o)");
+    // 6&3=2, 6|1=7, ~6=-7  => 2+7-7 = 2
+    try std.testing.expectEqual(@as(f64, 2), v);
+}
+
+test "phase13: call-argument spread into named params" {
+    const s = try dualString(std.testing.allocator, "function g(a,b,c,d,e){return [a,b,c,d,e].join(',');} g(1,...[2,3],4,...[5])");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("1,2,3,4,5", s);
+}
+
+test "phase13: spread call preserves method this-binding" {
+    const v = try evalToF64(std.testing.allocator, "var o={base:10,add:function(a,b,c){return this.base+a+b+c;}}; o.add(...[1,2,3])");
+    try std.testing.expectEqual(@as(f64, 16), v);
 }

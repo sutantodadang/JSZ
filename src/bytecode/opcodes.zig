@@ -176,6 +176,26 @@ pub const Op = enum(u8) {
     /// Installs an accessor (getter if kind==0, setter if kind==1) named Kname on
     /// R[Robj], merging into an existing accessor holder for the same key.
     DEFINE_ACCESSOR,
+    /// ARRAY_APPEND: op, Rarr u8, Rval u8 (3 bytes). Appends R[Rval] to the array
+    /// R[Rarr] at its current length (used for array-literal elements when the
+    /// literal contains a spread, so indices are dynamic).
+    ARRAY_APPEND,
+    /// ARRAY_SPREAD: op, Rarr u8, Riter u8 (3 bytes). Iterates R[Riter] via the
+    /// iterator protocol and appends every produced value to the array R[Rarr]
+    /// (implements `[...iterable]` in array literals).
+    ARRAY_SPREAD,
+    /// IN: op, Rdst u8, Rkey u8, Robj u8 (4 bytes). Rdst = HasProperty(R[Robj],
+    /// R[Rkey]) — the `key in obj` operator (proto-chain walk; Proxy `has` trap).
+    IN,
+    /// DELETE_PROP: op, Rdst u8, Robj u8, Rkey u8 (4 bytes). Deletes own property
+    /// R[Rkey] from R[Robj]; Rdst = boolean result (the `delete obj[key]`
+    /// operator; Proxy `deleteProperty` trap).
+    DELETE_PROP,
+    /// CALL_SPREAD: op, Rcallee u8, Rthis u8, Rargs u8, Rdst u8 (5 bytes). Calls
+    /// R[Rcallee] with `this` = R[Rthis] and arguments unpacked from the array
+    /// R[Rargs]; result into R[Rdst]. Used for calls containing a spread arg
+    /// (`f(...xs)`, `obj.m(a, ...xs)`). Operand registers need not be contiguous.
+    CALL_SPREAD,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -253,6 +273,11 @@ pub fn instrSize(op: Op) usize {
         .YIELD => 2,
         .TAIL_METHOD_CALL => 4,
         .DEFINE_ACCESSOR => 6,
+        .ARRAY_APPEND => 3,
+        .ARRAY_SPREAD => 3,
+        .IN => 4,
+        .DELETE_PROP => 4,
+        .CALL_SPREAD => 5,
     };
 }
 

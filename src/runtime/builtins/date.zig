@@ -64,7 +64,10 @@ fn msToFields(ms_epoch: i64) DateFields {
     // Derive year/month/day from days since epoch.
     var days: i64 = @divFloor(secs, 86400);
     var rem_secs: i64 = @mod(secs, 86400);
-    if (rem_secs < 0) { rem_secs += 86400; days -= 1; }
+    if (rem_secs < 0) {
+        rem_secs += 86400;
+        days -= 1;
+    }
 
     const hour: i32 = @intCast(@divFloor(rem_secs, 3600));
     const min_: i32 = @intCast(@divFloor(@mod(rem_secs, 3600), 60));
@@ -112,8 +115,14 @@ fn fieldsToMs(year: i32, month: i32, day: i32, hour: i32, min_: i32, sec_: i32, 
     // Normalize month overflow.
     var y = year;
     var m = month;
-    while (m >= 12) { m -= 12; y += 1; }
-    while (m < 0)   { m += 12; y -= 1; }
+    while (m >= 12) {
+        m -= 12;
+        y += 1;
+    }
+    while (m < 0) {
+        m += 12;
+        y -= 1;
+    }
 
     // Days from epoch to Jan 1 of year.
     var days: i64 = 0;
@@ -194,12 +203,12 @@ pub fn nativeDateCtor(arena: std.mem.Allocator, this_val: Value, args: []const V
             break :blk 0;
         } else {
             // new Date(year, month, day?, hour?, min?, sec?, ms?)
-            const y  = argToI32(args, 0, 1970);
+            const y = argToI32(args, 0, 1970);
             const mo = argToI32(args, 1, 0);
-            const d  = argToI32(args, 2, 1);
-            const h  = argToI32(args, 3, 0);
+            const d = argToI32(args, 2, 1);
+            const h = argToI32(args, 3, 0);
             const mi = argToI32(args, 4, 0);
-            const s  = argToI32(args, 5, 0);
+            const s = argToI32(args, 5, 0);
             const ms_ = argToI32(args, 6, 0);
             break :blk fieldsToMs(y, mo, d, h, mi, s, ms_);
         }
@@ -273,6 +282,19 @@ pub fn nativeDateGetMilliseconds(arena: std.mem.Allocator, this_val: Value, _: [
 
 pub fn nativeDateValueOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     return nativeDateGetTime(arena, this_val, args);
+}
+
+/// ES2015 Date.prototype[Symbol.toPrimitive]. `args[0]` is the hint string.
+/// "number" -> numeric timestamp (valueOf); "string"/"default" -> date string.
+pub fn nativeDateToPrimitive(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const hint: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string)
+        args[0].unbox().string
+    else
+        "default";
+    if (std.mem.eql(u8, hint, "number")) {
+        return nativeDateValueOf(arena, this_val, &[_]Value{});
+    }
+    return nativeDateToString(arena, this_val, &[_]Value{});
 }
 
 pub fn nativeDateToISOString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
