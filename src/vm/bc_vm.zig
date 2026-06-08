@@ -21,6 +21,7 @@ const ic_mod = @import("./ic.zig");
 const jit_mod = @import("../jit/jit.zig");
 const loop_jit = @import("../jit/loop_jit.zig");
 const coercion = @import("../runtime/builtins/coercion.zig");
+const function_proto = @import("../runtime/builtins/function_proto.zig");
 const proxy_mod = @import("../runtime/builtins/proxy.zig");
 
 /// Phase 4a: a try entry pushed by PUSH_TRY.
@@ -354,6 +355,13 @@ pub const BcVm = struct {
         };
         const prog = ast_mod.Program{ .body = stmts };
         const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<eval>");
+        // An undefined `break`/`continue` label is an early SyntaxError; the
+        // compiler records it (it can't unwind), and eval surfaces it as a throw.
+        if (compiler_mod.last_label_error) |msg| {
+            compiler_mod.last_label_error = null;
+            realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", msg);
+            return error.JsException;
+        }
         const closure = try self.arena.create(BcClosure);
         closure.* = .{ .func = main_func, .env = @ptrCast(self.realm.global_env) };
         const closure_val = try val_mod.makeBcFunction(self.arena, closure);
@@ -686,9 +694,17 @@ pub const BcVm = struct {
                     const rv = frame.registers[rrhs];
                     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
                     if (isObjectOperand(lv) or isObjectOperand(rv)) {
-                        const ln = try self.toNumberCoerced(lv);
-                        const rn = try self.toNumberCoerced(rv);
                         ac.mode = .unknown;
+                        const ln = self.toNumberCoerced(lv) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in ToPrimitive")) |oc| return oc;
+                            continue;
+                        };
+                        const rn = self.toNumberCoerced(rv) catch |e| {
+                            if (e != error.JsException) return e;
+                            if (try self.raisePendingException("error in ToPrimitive")) |oc| return oc;
+                            continue;
+                        };
                         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, ln / rn);
                     } else {
                         const r = if (ac.mode == .number_pair and isNumberValue(lv) and isNumberValue(rv))
@@ -2708,14 +2724,14 @@ pub const BcVm = struct {
         if (x_obj and !y_obj) {
             if (y.bits == 0) return false; // object == undefined
             if (y.unbox() == .null_ or y.unbox() == .undefined_) return false;
-            const xp = (try coercion.toPrimitive(self.arena, x, .default)) orelse
+            const xp = (try self.coerceToPrimitive(x, .default)) orelse
                 try val_mod.makeString(self.arena, try valueToString(self.arena, x));
             return try self.abstractEqual(xp, y);
         }
         if (y_obj and !x_obj) {
             if (x.bits == 0) return false;
             if (x.unbox() == .null_ or x.unbox() == .undefined_) return false;
-            const yp = (try coercion.toPrimitive(self.arena, y, .default)) orelse
+            const yp = (try self.coerceToPrimitive(y, .default)) orelse
                 try val_mod.makeString(self.arena, try valueToString(self.arena, y));
             return try self.abstractEqual(x, yp);
         }
@@ -2826,6 +2842,14 @@ pub const BcVm = struct {
                 return val_mod.makeUndefined(self.arena);
             },
             .function, .native_function => {
+                // `.length` = declared arity (native_function carries it inline).
+                if (std.mem.eql(u8, key, "length")) {
+                    const len: u8 = switch (obj_val.unbox()) {
+                        .native_function => |e| e.length,
+                        else => 0,
+                    };
+                    return val_mod.makeNumber(self.arena, @floatFromInt(len));
+                }
                 // Phase 4d: delegate to Function.prototype (call, apply, bind).
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
@@ -3482,11 +3506,41 @@ pub const BcVm = struct {
         }
     }
 
+    /// ToPrimitive that also coerces function operands. Functions are callable
+    /// objects: their own props (e.g. a user-assigned `valueOf`) plus
+    /// Function.prototype.toString live on a lazily-materialized backing object,
+    /// so coercion runs OrdinaryToPrimitive against that. Returns null when `v`
+    /// is already primitive or no user hook applies (caller uses `v`).
+    fn coerceToPrimitive(self: *BcVm, v: Value, hint: coercion.Hint) anyerror!?Value {
+        if (v.bits == 0) return null;
+        switch (v.unbox()) {
+            .object => return coercion.toPrimitive(self.arena, v, hint),
+            .bc_function => |closure| {
+                // OrdinaryToPrimitive against the function's backing object, but
+                // invoking valueOf/toString with `this` = the function value (so
+                // Function.prototype.toString reports the real name).
+                const obj = try self.closureBackingObj(closure);
+                const names: [2][]const u8 = if (hint == .string)
+                    .{ "toString", "valueOf" }
+                else
+                    .{ "valueOf", "toString" };
+                for (names) |name| {
+                    const method = obj.get(name) orelse continue;
+                    if (!isCallableValue(method)) continue;
+                    const res = try function_proto.invokeCallback(self.arena, v, method, &[_]Value{});
+                    if (coercion.isPrimitive(res)) return res;
+                }
+                return self.throwTypeErr("Cannot convert function to primitive value");
+            },
+            else => return null,
+        }
+    }
+
     fn jsAdd(self: *BcVm, left: Value, right: Value) !Value {
         // ES2015 11.6.1: lprim = ToPrimitive(left), rprim = ToPrimitive(right),
         // both with the "default" hint, before deciding string vs numeric.
-        const lp = (try coercion.toPrimitive(self.arena, left, .default)) orelse left;
-        const rp = (try coercion.toPrimitive(self.arena, right, .default)) orelse right;
+        const lp = (try self.coerceToPrimitive(left, .default)) orelse left;
+        const rp = (try self.coerceToPrimitive(right, .default)) orelse right;
         const ls = isStringOrObject(lp);
         const rs = isStringOrObject(rp);
         if (ls or rs) {
@@ -3501,19 +3555,19 @@ pub const BcVm = struct {
     /// ToNumber that honors user-defined ToPrimitive(number) on objects.
     /// For non-objects this is exactly `toNumber`.
     fn toNumberCoerced(self: *BcVm, v: Value) !f64 {
-        const p = (try coercion.toPrimitive(self.arena, v, .number)) orelse v;
+        const p = (try self.coerceToPrimitive(v, .number)) orelse v;
         return toNumber(p);
     }
 
     /// ToPrimitive(number) for relational comparison; returns `v` unchanged
     /// when no user hook applies.
     fn coerceForRelational(self: *BcVm, v: Value) !Value {
-        return (try coercion.toPrimitive(self.arena, v, .number)) orelse v;
+        return (try self.coerceToPrimitive(v, .number)) orelse v;
     }
 
     /// ToInt32 honoring user-defined ToPrimitive(number) on objects.
     fn toInt32Coerced(self: *BcVm, v: Value) !i32 {
-        const p = (try coercion.toPrimitive(self.arena, v, .number)) orelse v;
+        const p = (try self.coerceToPrimitive(v, .number)) orelse v;
         return toInt32(p);
     }
 
@@ -3551,10 +3605,7 @@ pub const BcVm = struct {
     /// ToNumeric (ES 7.1.3): ToPrimitive(number) then keep BigInt as-is, throw on
     /// Symbol, else ToNumber. Returns a `.bigint` or `.number` Value.
     fn toNumeric(self: *BcVm, v: Value) !Value {
-        const prim = if (isObjectOperand(v))
-            ((try coercion.toPrimitive(self.arena, v, .number)) orelse v)
-        else
-            v;
+        const prim = (try self.coerceToPrimitive(v, .number)) orelse v;
         if (prim.bits != 0 and prim.unbox() == .bigint) return prim;
         if (prim.bits != 0 and prim.unbox() == .symbol)
             return self.throwTypeErr("Cannot convert a Symbol value to a number");
@@ -3680,10 +3731,27 @@ fn isNumberValue(v: Value) bool {
     return v.bits != 0 and v.unbox() == .number;
 }
 
-/// True when `v` is a plain object (the only operand kind that can carry a
-/// user-defined ToPrimitive hook needing a slow, JS-reentrant coercion path).
+/// True when `v` is an operand kind that may carry a user-defined ToPrimitive
+/// hook needing a slow, JS-reentrant coercion path: a plain object, or a bc
+/// function (callable object whose own props + Function.prototype.toString are
+/// reachable via its backing object).
 fn isObjectOperand(v: Value) bool {
-    return v.bits != 0 and v.unbox() == .object;
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .object, .bc_function => true,
+        else => false,
+    };
+}
+
+/// True when `v` is callable (function-like): a native/bc/legacy function, or a
+/// bound-function object.
+fn isCallableValue(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .function, .native_function, .bc_function => true,
+        .object => |obj| obj.internal_kind == .bound_function or obj.get("__call__") != null,
+        else => false,
+    };
 }
 
 fn classifyTypeof(v: Value) struct {

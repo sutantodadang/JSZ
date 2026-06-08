@@ -24,6 +24,9 @@ pub var g_active_native_data: ?*anyopaque = null;
 pub const NativeFnEntry = struct {
     call: NativeFnPtr,
     data: ?*anyopaque = null,
+    /// ECMAScript `.length` (declared parameter count) reported via property
+    /// access. Defaults to 0; set explicitly for built-ins whose arity is tested.
+    length: u8 = 0,
 
     pub fn invoke(self: NativeFnEntry, arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
         g_active_native_data = self.data;
@@ -427,6 +430,13 @@ pub fn makeSymbol(arena: std.mem.Allocator, description: ?[]const u8) !Value {
 pub fn makeNativeFunction(arena: std.mem.Allocator, fn_ptr: NativeFnPtr) !Value {
     const v = try arena.create(JsValue);
     v.* = .{ .native_function = .{ .call = fn_ptr } };
+    return Value.fromPtr(v);
+}
+
+/// Wrap a native function pointer with an explicit `.length` (arity).
+pub fn makeNativeFunctionLen(arena: std.mem.Allocator, fn_ptr: NativeFnPtr, length: u8) !Value {
+    const v = try arena.create(JsValue);
+    v.* = .{ .native_function = .{ .call = fn_ptr, .length = length } };
     return Value.fromPtr(v);
 }
 

@@ -27,6 +27,11 @@ const LabelEntry = struct {
     loop_start: usize = 0,
 };
 
+/// Set by `compileProgram` when a `break`/`continue` targets an undefined label
+/// (an early SyntaxError per ES). Reset at the start of every `compileProgram`.
+/// `bcEval` reads it after compiling so `eval("break L")` throws a SyntaxError.
+pub var last_label_error: ?[]const u8 = null;
+
 /// Per-loop compilation context for unlabeled (and labeled) `break`/`continue`.
 /// Each `while`/`do-while`/`for` pushes one before compiling its body; `break`
 /// and `continue` register their JMP patch offsets here, resolved when the loop
@@ -1729,7 +1734,9 @@ const FnCompiler = struct {
                             return;
                         }
                     }
-                    // Label not found — leave the stub JMP 0 (no-op fall-through).
+                    // Label not found — undefined label is an early SyntaxError.
+                    if (last_label_error == null)
+                        last_label_error = std.fmt.allocPrint(self.arena, "undefined label '{s}'", .{lname}) catch "undefined label";
                 } else if (self.loop_stack.items.len > 0) {
                     try self.loop_stack.items[self.loop_stack.items.len - 1].break_patches.append(self.arena, patch);
                 }
@@ -1769,8 +1776,11 @@ const FnCompiler = struct {
                 try self.emitI16(0);
                 if (target_idx) |ti| {
                     try self.loop_stack.items[ti].continue_patches.append(self.arena, patch);
+                } else if (label) |lname| {
+                    // Labeled continue with no matching loop — early SyntaxError.
+                    if (last_label_error == null)
+                        last_label_error = std.fmt.allocPrint(self.arena, "undefined label '{s}'", .{lname}) catch "undefined label";
                 }
-                // (Label not found — leave the stub JMP 0.)
             },
             .for_in_stmt => {
                 // W2: for-of (iterate_values) uses the iterator protocol via the
@@ -2059,7 +2069,16 @@ const FnCompiler = struct {
                 // Phase 13: also expose the label to a directly-enclosed loop via
                 // `pending_label` so `break L`/`continue L` target the loop.
                 const ls = node.data.labeled_stmt;
-                self.pending_label = ls.name;
+                // Only hand the label to a DIRECTLY-enclosed loop (so `break L`/
+                // `continue L` target the loop). When the body is a block or other
+                // statement, the label belongs to that statement and break is
+                // resolved via `label_stack` — otherwise the label would leak into
+                // a nested loop and `break L` would exit the loop instead of the
+                // block (e.g. `L: { while(true){break L} unreachable; }`).
+                self.pending_label = switch (ls.body.kind) {
+                    .while_stmt, .do_while_stmt, .for_stmt, .for_in_stmt => ls.name,
+                    else => null,
+                };
                 try self.label_stack.append(self.arena, LabelEntry{
                     .name = ls.name,
                     .loop_start = self.currentOffset(),
@@ -2231,6 +2250,7 @@ pub fn compileProgram(
     program: *const ast.Program,
     source_name: []const u8,
 ) !*BcFunction {
+    last_label_error = null;
     const f = try compileFunctionStrict(
         arena,
         source_name,

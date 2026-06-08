@@ -357,7 +357,51 @@ pub fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]
     var out = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < source.len) {
-        if (source[i] != '`') {
+        const c0 = source[i];
+        // Pass quoted strings through verbatim so a backtick inside a single/
+        // double-quoted string is not mistaken for a template literal.
+        if (c0 == '\'' or c0 == '"') {
+            try out.append(arena, c0);
+            i += 1;
+            while (i < source.len) {
+                const d = source[i];
+                if (d == '\\' and i + 1 < source.len) {
+                    try out.append(arena, d);
+                    try out.append(arena, source[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                try out.append(arena, d);
+                i += 1;
+                if (d == c0 or d == '\n') break; // close (or unterminated → lexer errors)
+            }
+            continue;
+        }
+        // Pass line comments through verbatim.
+        if (c0 == '/' and i + 1 < source.len and source[i + 1] == '/') {
+            while (i < source.len and source[i] != '\n') {
+                try out.append(arena, source[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // Pass block comments through verbatim.
+        if (c0 == '/' and i + 1 < source.len and source[i + 1] == '*') {
+            try out.append(arena, source[i]);
+            try out.append(arena, source[i + 1]);
+            i += 2;
+            while (i < source.len) {
+                if (source[i] == '*' and i + 1 < source.len and source[i + 1] == '/') {
+                    try out.appendSlice(arena, "*/");
+                    i += 2;
+                    break;
+                }
+                try out.append(arena, source[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if (c0 != '`') {
             try out.append(arena, source[i]);
             i += 1;
             continue;

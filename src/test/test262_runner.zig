@@ -229,6 +229,10 @@ const HARDCODED_PRELUDE =
     \\  if (!assert._isSameValue(actual, unexpected)) return;
     \\  throw new Test262Error((message || "") + " Expected SameValue to be false");
     \\};
+    \\assert.notSameValue = function (actual, unexpected, message) {
+    \\  if (!assert._isSameValue(actual, unexpected)) return;
+    \\  throw new Test262Error((message || "") + " Expected SameValue to be false");
+    \\};
     \\assert.throws = function (expectedErrorConstructor, func, message) {
     \\  try { func(); } catch (thrown) { return; }
     \\  throw new Test262Error((message || "") + " Expected a thrown error");

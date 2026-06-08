@@ -237,7 +237,10 @@ pub const Lexer = struct {
             .colon,
             .semicolon,
             .left_brace,
-            .right_brace,
+            // NOTE: `.right_brace` is intentionally NOT regex-allowed. A `}` far
+            // more commonly closes an object literal used as an operand
+            // (`{valueOf(){}} / 1`) than a block followed by a regex, so treat
+            // `/` after `}` as division.
             .left_bracket,
             .kw_return,
             .kw_typeof,
@@ -392,17 +395,35 @@ pub const Lexer = struct {
                     self.column += 2;
                 },
                 'u' => {
-                    if (self.pos + 3 >= self.source.len) return LexError.InvalidEscape;
-                    const h1 = hexVal(self.source[self.pos]) orelse return LexError.InvalidEscape;
-                    const h2 = hexVal(self.source[self.pos + 1]) orelse return LexError.InvalidEscape;
-                    const h3 = hexVal(self.source[self.pos + 2]) orelse return LexError.InvalidEscape;
-                    const h4 = hexVal(self.source[self.pos + 3]) orelse return LexError.InvalidEscape;
-                    const codepoint: u21 = @as(u21, h1) * 4096 + @as(u21, h2) * 256 + @as(u21, h3) * 16 + @as(u21, h4);
-                    var ubuf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(codepoint, &ubuf) catch return LexError.InvalidEscape;
-                    try buf.appendSlice(self.allocator, ubuf[0..len]);
-                    self.pos += 4;
-                    self.column += 4;
+                    // ES6 code-point escape: \u{H+}
+                    if (self.pos < self.source.len and self.source[self.pos] == '{') {
+                        self.pos += 1;
+                        self.column += 1;
+                        var cp: u32 = 0;
+                        var ndigits: usize = 0;
+                        while (self.pos < self.source.len and self.source[self.pos] != '}') {
+                            const hv = hexVal(self.source[self.pos]) orelse return LexError.InvalidEscape;
+                            cp = cp * 16 + hv;
+                            if (cp > 0x10FFFF) return LexError.InvalidEscape;
+                            ndigits += 1;
+                            self.pos += 1;
+                            self.column += 1;
+                        }
+                        if (ndigits == 0 or self.pos >= self.source.len) return LexError.InvalidEscape;
+                        self.pos += 1; // consume '}'
+                        self.column += 1;
+                        try appendWtf8(&buf, self.allocator, cp);
+                    } else {
+                        if (self.pos + 3 >= self.source.len) return LexError.InvalidEscape;
+                        const h1 = hexVal(self.source[self.pos]) orelse return LexError.InvalidEscape;
+                        const h2 = hexVal(self.source[self.pos + 1]) orelse return LexError.InvalidEscape;
+                        const h3 = hexVal(self.source[self.pos + 2]) orelse return LexError.InvalidEscape;
+                        const h4 = hexVal(self.source[self.pos + 3]) orelse return LexError.InvalidEscape;
+                        const codepoint: u32 = @as(u32, h1) * 4096 + @as(u32, h2) * 256 + @as(u32, h3) * 16 + @as(u32, h4);
+                        try appendWtf8(&buf, self.allocator, codepoint);
+                        self.pos += 4;
+                        self.column += 4;
+                    }
                 },
                 else => {
                     // Non-special escape: just emit the character
@@ -817,6 +838,30 @@ pub const Lexer = struct {
         return t;
     }
 };
+
+/// Append a Unicode code point to `buf` as WTF-8 / CESU-8: lone surrogates
+/// (U+D800..U+DFFF) are encoded raw (3 bytes), and astral code points are
+/// encoded as a UTF-16 surrogate pair (two 3-byte sequences). This makes UTF-8
+/// byte-order comparison agree with ECMAScript's UTF-16 code-unit ordering for
+/// `<`/`>` on strings built from `\u` escapes.
+fn appendWtf8(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, cp: u32) error{OutOfMemory}!void {
+    if (cp <= 0x7F) {
+        try buf.append(alloc, @intCast(cp));
+    } else if (cp <= 0x7FF) {
+        try buf.append(alloc, @intCast(0xC0 | (cp >> 6)));
+        try buf.append(alloc, @intCast(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        try buf.append(alloc, @intCast(0xE0 | (cp >> 12)));
+        try buf.append(alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+        try buf.append(alloc, @intCast(0x80 | (cp & 0x3F)));
+    } else {
+        const v = cp - 0x10000;
+        const hi: u32 = 0xD800 + (v >> 10);
+        const lo: u32 = 0xDC00 + (v & 0x3FF);
+        try appendWtf8(buf, alloc, hi);
+        try appendWtf8(buf, alloc, lo);
+    }
+}
 
 fn isIdentStart(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';

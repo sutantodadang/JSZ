@@ -6,6 +6,7 @@ const std = @import("std");
 const Environment = @import("./execution_context.zig").Environment;
 const val_mod = @import("../value/value.zig");
 const Value = val_mod.Value;
+const obj_mod = @import("../object/object.zig");
 const JsObject = @import("../object/object.zig").JsObject;
 const Heap = @import("../gc/heap.zig").Heap;
 
@@ -707,6 +708,41 @@ fn nativeStringValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Val
     return val_mod.makeString(arena, s);
 }
 
+// ---- Object.prototype.toString / valueOf ----
+fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    // ES 20.1.3.6: "[object " + builtinTag + "]". undefined/null get special tags.
+    if (this_val.bits == 0) return val_mod.makeString(arena, "[object Undefined]");
+    const tag: []const u8 = switch (this_val.unbox()) {
+        .undefined_ => "Undefined",
+        .null_ => "Null",
+        .object => |obj| if (obj.is_array) "Array" else if (obj.get("__call__") != null) "Function" else "Object",
+        .function, .bc_function, .native_function => "Function",
+        else => "Object",
+    };
+    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{tag}));
+}
+
+fn nativeObjectProtoValueOf(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    // ES 20.1.3.7: ToObject(this); for our purposes return `this` unchanged.
+    return this_val;
+}
+
+// ---- Function constructor (minimal) ----
+fn nativeNoop(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    return val_mod.makeUndefined(arena);
+}
+
+fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    // Return an empty callable object (truthy; typeof "function"). The function
+    // body string form (`new Function("a", "return a")`) is not supported.
+    const o = if (active_heap) |h|
+        try JsObject.createOnHeap(h, active_function_proto)
+    else
+        try JsObject.create(arena, active_function_proto);
+    try o.set("__call__", try val_mod.makeNativeFunction(arena, nativeNoop));
+    return val_mod.makeObject(arena, o);
+}
+
 // ---- Function.prototype.toString ----
 fn nativeFunctionToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     var name: []const u8 = "";
@@ -846,6 +882,9 @@ fn registerMath(arena: std.mem.Allocator, obj: *JsObject) !void {
         const fn_val = try val_mod.makeNativeFunction(arena, pair[1]);
         try obj.set(pair[0], fn_val);
     }
+    // Math.min/max are variadic but spec `.length` is 2.
+    try obj.set("min", try val_mod.makeNativeFunctionLen(arena, math_mod.nativeMin, 2));
+    try obj.set("max", try val_mod.makeNativeFunctionLen(arena, math_mod.nativeMax, 2));
 }
 
 /// Build a plain object mirroring global env bindings and expose as globalThis/global.
@@ -1046,6 +1085,8 @@ pub const Realm = struct {
         // hasOwnProperty on Object.prototype
         const hop_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeHasOwnProperty);
         try object_proto.set("hasOwnProperty", hop_fn);
+        try object_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeObjectProtoToString));
+        try object_proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeObjectProtoValueOf));
 
         // ---- Phase 4b: Math object ----
         const math_obj = try JsObject.create(arena, null);
@@ -1253,13 +1294,28 @@ pub const Realm = struct {
         const number_ctor_obj = try JsObject.create(arena, null);
         try number_ctor_obj.set("prototype", try val_mod.makeObject(arena, number_proto));
         try number_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeNumberCtor));
-        try number_ctor_obj.set("MAX_VALUE", try val_mod.makeNumber(arena, 1.7976931348623157e+308));
-        try number_ctor_obj.set("MIN_VALUE", try val_mod.makeNumber(arena, 5e-324));
-        try number_ctor_obj.set("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)));
-        try number_ctor_obj.set("POSITIVE_INFINITY", try val_mod.makeNumber(arena, std.math.inf(f64)));
-        try number_ctor_obj.set("NEGATIVE_INFINITY", try val_mod.makeNumber(arena, -std.math.inf(f64)));
+        // Number static constants are non-writable, non-enumerable, non-configurable
+        // (ES 20.1.2): `Number.NaN = 1` must be a silent no-op in sloppy mode.
+        const num_const_attr = obj_mod.PropAttr{ .writable = false, .enumerable = false, .configurable = false };
+        _ = try number_ctor_obj.defineOwnData("MAX_VALUE", try val_mod.makeNumber(arena, 1.7976931348623157e+308), num_const_attr);
+        _ = try number_ctor_obj.defineOwnData("MIN_VALUE", try val_mod.makeNumber(arena, 5e-324), num_const_attr);
+        _ = try number_ctor_obj.defineOwnData("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)), num_const_attr);
+        _ = try number_ctor_obj.defineOwnData("POSITIVE_INFINITY", try val_mod.makeNumber(arena, std.math.inf(f64)), num_const_attr);
+        _ = try number_ctor_obj.defineOwnData("NEGATIVE_INFINITY", try val_mod.makeNumber(arena, -std.math.inf(f64)), num_const_attr);
+        _ = try number_ctor_obj.defineOwnData("EPSILON", try val_mod.makeNumber(arena, 2.220446049250313e-16), num_const_attr);
+        _ = try number_ctor_obj.defineOwnData("MAX_SAFE_INTEGER", try val_mod.makeNumber(arena, 9007199254740991.0), num_const_attr);
+        _ = try number_ctor_obj.defineOwnData("MIN_SAFE_INTEGER", try val_mod.makeNumber(arena, -9007199254740991.0), num_const_attr);
         try number_proto.set("constructor", try val_mod.makeObject(arena, number_ctor_obj));
         try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
+
+        // ---- Function constructor (minimal): callable object so `typeof Function`
+        // is "function" and `new Function()` / `Function()` yield a truthy callable.
+        // Does NOT compile a body string from arguments.
+        const function_ctor_obj = try JsObject.create(arena, null);
+        try function_ctor_obj.set("prototype", try val_mod.makeObject(arena, function_proto));
+        try function_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeFunctionCtor));
+        try function_proto.set("constructor", try val_mod.makeObject(arena, function_ctor_obj));
+        try env.define("Function", try val_mod.makeObject(arena, function_ctor_obj));
 
         // ---- Phase 4: global functions + value globals ----
         const boolean_proto = try JsObject.create(arena, object_proto);

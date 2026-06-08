@@ -33,12 +33,17 @@ pub fn nativeCeil(arena: std.mem.Allocator, _: Value, args: []const Value) anyer
 
 pub fn nativeRound(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const n = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
-    // ES Math.round = floor(n + 0.5) (ties round toward +Infinity), preserving
-    // NaN/±Infinity/±0. Differs from @round, which rounds halves away from zero.
+    // ES Math.round (20.2.2.28): closest integer, ties toward +Infinity, preserving
+    // NaN/±Infinity/±0. NOT `floor(n+0.5)` — that rounds 0.5-ε up to 1 because the
+    // float add loses precision (the spec's #4 carve-out). Compute against floor()
+    // and the exact fractional part instead.
     if (std.math.isNan(n) or std.math.isInf(n) or n == 0) return val_mod.makeNumber(arena, n);
-    const r = @floor(n + 0.5);
-    // Values in (-0.5, 0] produce -0 per spec.
-    if (r == 0 and n < 0) return val_mod.makeNumber(arena, -0.0);
+    // (0, 0.5) → +0 ; (-0.5, 0) and -0.5 → -0.
+    if (n > 0 and n < 0.5) return val_mod.makeNumber(arena, 0.0);
+    if (n < 0 and n >= -0.5) return val_mod.makeNumber(arena, -0.0);
+    const fl = @floor(n);
+    const frac = n - fl;
+    const r = if (frac >= 0.5) fl + 1 else fl; // ties (frac==0.5) round up (+Inf)
     return val_mod.makeNumber(arena, r);
 }
 
