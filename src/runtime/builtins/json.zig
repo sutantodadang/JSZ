@@ -66,7 +66,7 @@ fn stringifyValue(
             }
         },
         // functions, native_function, symbol: produce nothing (caller uses "null" for arrays)
-        .function, .bc_function, .native_function, .symbol => {},
+        .function, .bc_function, .native_function, .symbol, .bigint => {},
     }
 }
 

@@ -20,6 +20,7 @@ fn displayString(arena: std.mem.Allocator, v: Value) ![]const u8 {
         .bc_function => |c| try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{c.func.name orelse ""}),
         .native_function => try arena.dupe(u8, "function () { [native code] }"),
         .symbol => |sd| try std.fmt.allocPrint(arena, "Symbol({s})", .{sd.description orelse ""}),
+        .bigint => |b| try std.fmt.allocPrint(arena, "{s}n", .{try val_mod.bigIntToString(arena, b)}),
         .object => |obj| blk: {
             if (obj.is_array) {
                 var buf = std.ArrayList(u8){};

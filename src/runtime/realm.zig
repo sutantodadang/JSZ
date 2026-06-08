@@ -374,6 +374,25 @@ fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
         return args[0];
     }
+    // ToObject for a primitive arg: box it in a wrapper carrying [[PrimitiveValue]]
+    // (the prototype valueOf/ToPrimitive then unboxes it). null/undefined fall
+    // through to a fresh plain object.
+    if (args.len > 0 and args[0].bits != 0) {
+        const proto: ?*JsObject = switch (args[0].unbox()) {
+            .number => active_number_proto,
+            .boolean => active_boolean_proto,
+            .string, .symbol, .bigint => active_object_proto,
+            else => null,
+        };
+        if (proto) |p| {
+            const w = if (active_heap) |heap|
+                try JsObject.createOnHeap(heap, p)
+            else
+                try JsObject.create(arena, p);
+            try w.set("[[PrimitiveValue]]", args[0]);
+            return val_mod.makeObject(arena, w);
+        }
+    }
     if (this_val.bits != 0 and this_val.unbox() == .object) return this_val;
     const obj = if (active_heap) |heap|
         try JsObject.createOnHeap(heap, active_object_proto)

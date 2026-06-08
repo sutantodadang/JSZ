@@ -271,6 +271,16 @@ pub const Lexer = struct {
                     self.column += 1;
                 }
                 if (self.pos == hex_start) return LexError.InvalidNumericLiteral;
+                // BigInt hex literal: 0x..n
+                if (self.pos < self.source.len and self.source[self.pos] == 'n') {
+                    const digits = self.source[start..self.pos]; // "0x123"
+                    self.pos += 1;
+                    self.column += 1;
+                    var t = Token.initSimple(.bigint, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
+                    t.value_str = digits;
+                    self.prev_kind = .number;
+                    return t;
+                }
                 const slice = self.source[start..self.pos];
                 const hex_val_int = std.fmt.parseUnsigned(u64, slice[2..], 16) catch return LexError.InvalidNumericLiteral;
                 var t = Token.initSimple(.number, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
@@ -285,6 +295,16 @@ pub const Lexer = struct {
         while (self.pos < self.source.len and isDecDigit(self.source[self.pos])) {
             self.pos += 1;
             self.column += 1;
+        }
+        // BigInt decimal literal: 123n (integer only, no fraction/exponent)
+        if (self.pos < self.source.len and self.source[self.pos] == 'n') {
+            const digits = self.source[start..self.pos];
+            self.pos += 1;
+            self.column += 1;
+            var t = Token.initSimple(.bigint, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
+            t.value_str = digits;
+            self.prev_kind = .number;
+            return t;
         }
         // Fractional part
         if (self.pos < self.source.len and self.source[self.pos] == '.') {

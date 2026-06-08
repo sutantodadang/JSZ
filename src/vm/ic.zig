@@ -158,6 +158,7 @@ pub const TypeofTag = enum(u8) {
     symbol,
     function_like,
     object_like,
+    bigint,
 };
 
 pub const TypeofCache = struct {

@@ -2236,6 +2236,11 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.makeNode(.number_literal, start, end, .{ .number_literal = v });
             },
+            .bigint => {
+                const s = self.current.value_str;
+                _ = self.advance();
+                return self.makeNode(.bigint_literal, start, end, .{ .bigint_literal = s });
+            },
             .string => {
                 const s = self.current.value_str;
                 _ = self.advance();
@@ -2387,6 +2392,21 @@ pub const Parser = struct {
         var props = std.ArrayList(ast.ObjectProp){};
         while (!self.check(.right_brace) and !self.check(.eof) and !self.had_error) {
             const prop_start = self.current.start;
+            // ES6 computed key: `{ [expr]: value }`. The key expression is
+            // evaluated at runtime (may produce a symbol).
+            if (self.check(.left_bracket)) {
+                _ = self.advance(); // consume '['
+                const key_expr = self.parseAssignmentExpr() orelse return null;
+                _ = self.expect(.right_bracket) orelse return null;
+                _ = self.expect(.colon) orelse return null;
+                const cval = self.parseAssignmentExpr() orelse return null;
+                props.append(self.arena, ast.ObjectProp{ .key = "", .value = cval, .kind = .init, .computed_key = key_expr }) catch {
+                    self.had_error = true;
+                    return null;
+                };
+                if (!self.match(.comma)) break;
+                continue;
+            }
             // Key: identifier, string literal, or number literal.
             var key: []const u8 = undefined;
             if (self.check(.identifier)) {

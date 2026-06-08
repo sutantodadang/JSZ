@@ -5,6 +5,7 @@ const std = @import("std");
 pub const TokenKind = enum {
     // Literals
     number,
+    bigint,
     string,
     identifier,
     regex,

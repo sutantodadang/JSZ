@@ -319,6 +319,18 @@ const FnCompiler = struct {
                 try self.emitU16(kidx);
                 return r;
             },
+            .bigint_literal => {
+                const r = self.allocReg();
+                const v = val_mod.makeBigIntFromLiteral(self.arena, node.data.bigint_literal) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable, // lexer guarantees valid digits/radix
+                };
+                const kidx = try self.addConstant(v);
+                try self.emitOp(.LOAD_K, line);
+                try self.emitU8(r);
+                try self.emitU16(kidx);
+                return r;
+            },
             .string_literal => {
                 const r = self.allocReg();
                 const v = try val_mod.makeString(self.arena, node.data.string_literal);
@@ -994,6 +1006,19 @@ const FnCompiler = struct {
         try self.emitU8(robj);
 
         for (ol.properties) |prop| {
+            // ES6 computed key `{ [expr]: value }`: evaluate key at runtime and
+            // set dynamically (handles symbol keys).
+            if (prop.computed_key) |key_node| {
+                const rkey = try self.compileExpr(key_node);
+                const rval = try self.compileExpr(prop.value);
+                try self.emitOp(.SET_PROP_DYN, line);
+                try self.emitU8(robj);
+                try self.emitU8(rkey);
+                try self.emitU8(rval);
+                self.freeReg(); // free rval
+                self.freeReg(); // free rkey
+                continue;
+            }
             const rval = try self.compileExpr(prop.value);
             const sv = try val_mod.makeString(self.arena, prop.key);
             const kidx = try self.addConstant(sv);

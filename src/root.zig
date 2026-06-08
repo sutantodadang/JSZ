@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! jsz public API. Phase 3b: eval + manual mark-sweep GC.
 //! Memory model: Values are handles valid until the owning Context is destroyed.
 //! Strings passed into jsz are copied. Strings returned from jsz are borrowed
@@ -187,6 +187,7 @@ pub fn valueToDisplayString(arena: std.mem.Allocator, v: Value) ![]const u8 {
             break :blk val_mod.formatNumber(arena, n);
         },
         .string => |s| try arena.dupe(u8, s),
+        .bigint => |b| try val_mod.bigIntToString(arena, b),
         .function => |f| std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{f.name orelse ""}),
         .bc_function => |c| std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{c.func.name orelse ""}),
         .object => |obj| blk: {

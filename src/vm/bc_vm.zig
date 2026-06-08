@@ -739,13 +739,15 @@ pub const BcVm = struct {
                     frame.pc += 1;
                     const lv = frame.registers[rlhs];
                     const rv = frame.registers[rrhs];
-                    if (isObjectOperand(lv) or isObjectOperand(rv)) {
-                        const ln = try self.toNumberCoerced(lv);
-                        const rn = try self.toNumberCoerced(rv);
-                        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, jsExp(ln, rn));
-                    } else {
-                        frame.registers[rdst] = try val_mod.makeNumber(self.arena, jsExp(toNumber(lv), toNumber(rv)));
-                    }
+                    // ToNumeric both operands (may reenter JS via valueOf → frame realloc),
+                    // then dispatch BigInt vs Number exponentiation. Throws route through
+                    // the VM try/catch machinery.
+                    const result = self.expOp(lv, rv) catch |e| {
+                        if (e != error.JsException) return e;
+                        if (try self.raisePendingException("error in exponentiation")) |oc| return oc;
+                        continue;
+                    };
+                    self.frames.items[self.frames.items.len - 1].registers[rdst] = result;
                 },
                 .NEG => {
                     const rdst = code[frame.pc];
@@ -753,7 +755,9 @@ pub const BcVm = struct {
                     const rsrc = code[frame.pc];
                     frame.pc += 1;
                     const sv = frame.registers[rsrc];
-                    if (isObjectOperand(sv)) {
+                    if (sv.bits != 0 and sv.unbox() == .bigint) {
+                        frame.registers[rdst] = try val_mod.bigIntNegate(self.arena, sv);
+                    } else if (isObjectOperand(sv)) {
                         const n = try self.toNumberCoerced(sv);
                         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, -n);
                     } else {
@@ -3517,6 +3521,66 @@ pub const BcVm = struct {
     fn toUint32Coerced(self: *BcVm, v: Value) !u32 {
         return @bitCast(try self.toInt32Coerced(v));
     }
+
+    /// Throw a `TypeError` (sets pending_exception, returns error.JsException).
+    fn throwTypeErr(self: *BcVm, msg: []const u8) anyerror {
+        const realm_mod = @import("../runtime/realm.zig");
+        const obj = if (realm_mod.active_heap) |h|
+            try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)
+        else
+            try JsObject.create(self.arena, realm_mod.error_proto_TypeError);
+        try obj.set("name", try val_mod.makeString(self.arena, "TypeError"));
+        try obj.set("message", try val_mod.makeString(self.arena, msg));
+        realm_mod.pending_exception = try val_mod.makeObject(self.arena, obj);
+        return error.JsException;
+    }
+
+    /// Throw a `RangeError` (sets pending_exception, returns error.JsException).
+    fn throwRangeErr(self: *BcVm, msg: []const u8) anyerror {
+        const realm_mod = @import("../runtime/realm.zig");
+        const obj = if (realm_mod.active_heap) |h|
+            try JsObject.createOnHeap(h, realm_mod.error_proto_RangeError)
+        else
+            try JsObject.create(self.arena, realm_mod.error_proto_RangeError);
+        try obj.set("name", try val_mod.makeString(self.arena, "RangeError"));
+        try obj.set("message", try val_mod.makeString(self.arena, msg));
+        realm_mod.pending_exception = try val_mod.makeObject(self.arena, obj);
+        return error.JsException;
+    }
+
+    /// ToNumeric (ES 7.1.3): ToPrimitive(number) then keep BigInt as-is, throw on
+    /// Symbol, else ToNumber. Returns a `.bigint` or `.number` Value.
+    fn toNumeric(self: *BcVm, v: Value) !Value {
+        const prim = if (isObjectOperand(v))
+            ((try coercion.toPrimitive(self.arena, v, .number)) orelse v)
+        else
+            v;
+        if (prim.bits != 0 and prim.unbox() == .bigint) return prim;
+        if (prim.bits != 0 and prim.unbox() == .symbol)
+            return self.throwTypeErr("Cannot convert a Symbol value to a number");
+        return val_mod.makeNumber(self.arena, toNumber(prim));
+    }
+
+    /// Exponentiation runtime semantics (ES sec-exp-operator). ToNumeric both
+    /// operands; if their types differ → TypeError; BigInt::exponentiate throws
+    /// RangeError on a negative exponent; otherwise Number::exponentiate.
+    fn expOp(self: *BcVm, lv: Value, rv: Value) !Value {
+        const base = try self.toNumeric(lv);
+        const exp = try self.toNumeric(rv);
+        const base_big = base.unbox() == .bigint;
+        const exp_big = exp.unbox() == .bigint;
+        if (base_big != exp_big)
+            return self.throwTypeErr("Cannot mix BigInt and other types, use explicit conversions");
+        if (base_big) {
+            if (val_mod.bigIntIsNegative(exp))
+                return self.throwRangeErr("Exponent must be non-negative");
+            return val_mod.bigIntPow(self.arena, base, exp) catch |e| switch (e) {
+                error.Overflow => self.throwRangeErr("Maximum BigInt size exceeded"),
+                else => e,
+            };
+        }
+        return val_mod.makeNumber(self.arena, jsExp(toNumber(base), toNumber(exp)));
+    }
 };
 
 // ---------------------------------------------------------------- W2 generator natives ---
@@ -3635,6 +3699,7 @@ fn classifyTypeof(v: Value) struct {
         .number => .{ .tag = .number, .shape = null, .result = "number" },
         .string => .{ .tag = .string, .shape = null, .result = "string" },
         .symbol => .{ .tag = .symbol, .shape = null, .result = "symbol" },
+        .bigint => .{ .tag = .bigint, .shape = null, .result = "bigint" },
         .function, .bc_function, .native_function => .{ .tag = .function_like, .shape = null, .result = "function" },
         .object => |obj| blk: {
             const callable = obj.get("__call__") != null;
@@ -3671,6 +3736,7 @@ pub fn isTruthy(v: Value) bool {
         .object => true,
         .native_function => true,
         .symbol => true,
+        .bigint => |b| !b.toConst().eqlZero(),
     };
 }
 
@@ -3701,6 +3767,7 @@ pub fn typeofValue(v: Value) []const u8 {
         .bc_function => "function",
         .object => |obj| if (obj.get("__call__") != null) "function" else "object",
         .native_function => "function",
+        .bigint => "bigint",
     };
 }
 
@@ -3776,6 +3843,7 @@ pub fn toNumber(v: Value) f64 {
         .object => std.math.nan(f64),
         .native_function => std.math.nan(f64),
         .symbol => std.math.nan(f64),
+        .bigint => v.toF64(),
     };
 }
 
@@ -3807,6 +3875,7 @@ fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
         },
         .native_function => "function () { [native code] }",
         .symbol => |sd| try std.fmt.allocPrint(arena, "Symbol({s})", .{sd.description orelse ""}),
+        .bigint => |b| try std.fmt.allocPrint(arena, "{s}n", .{try val_mod.bigIntToString(arena, b)}),
     };
 }
 
@@ -3902,10 +3971,11 @@ fn jsStrictEqual(x: Value, y: Value) bool {
         .object => return x.toPtr().object == y.toPtr().object,
         .native_function => return x.bits == y.bits,
         .symbol => return x.toPtr().symbol == y.toPtr().symbol,
+        .bigint => return val_mod.bigIntEql(x, y),
     }
 }
 
-const TypeTag = enum { undefined_, null_, boolean, number, string, symbol, function, bc_function, object, native_function };
+const TypeTag = enum { undefined_, null_, boolean, number, string, symbol, function, bc_function, object, native_function, bigint };
 
 fn typeTag(v: Value) TypeTag {
     if (v.bits == 0) return .undefined_;
@@ -3920,6 +3990,7 @@ fn typeTag(v: Value) TypeTag {
         .bc_function => .bc_function,
         .object => .object,
         .native_function => .native_function,
+        .bigint => .bigint,
     };
 }
 

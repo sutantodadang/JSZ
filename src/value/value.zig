@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 3a value representation.
 //! JsValue is an internal tagged union allocated in the eval arena.
 //! The public Value handle (Value{ bits: u64 }) stores a pointer to JsValue.
@@ -41,6 +41,102 @@ pub const SymbolData = struct {
 
 var g_symbol_counter: u64 = 0;
 
+/// Backing data for a BigInt primitive: an arbitrary-precision integer. Stored as
+/// a `std.math.big.int.Const` view whose limbs live in the eval arena.
+pub const BigIntData = struct {
+    limbs: []const std.math.big.Limb,
+    positive: bool,
+
+    pub fn toConst(self: *const BigIntData) std.math.big.int.Const {
+        return .{ .limbs = self.limbs, .positive = self.positive };
+    }
+};
+
+/// Box a big-integer `Const` into a BigInt Value (dups the limbs into `arena`).
+pub fn makeBigInt(arena: std.mem.Allocator, c: std.math.big.int.Const) !Value {
+    const limbs = try arena.dupe(std.math.big.Limb, c.limbs);
+    const data = try arena.create(BigIntData);
+    // Normalize the sign of zero to positive (canonical 0n).
+    const positive = c.positive or c.eqlZero();
+    data.* = .{ .limbs = limbs, .positive = positive };
+    const cell = try arena.create(JsValue);
+    cell.* = .{ .bigint = data };
+    return Value.fromPtr(cell);
+}
+
+/// Box a small signed integer as a BigInt.
+pub fn makeBigIntFromI64(arena: std.mem.Allocator, n: i64) !Value {
+    var m = try std.math.big.int.Managed.initSet(arena, n);
+    return makeBigInt(arena, m.toConst());
+}
+
+/// Decimal string of a BigInt (no `n` suffix), allocated in `arena`.
+pub fn bigIntToString(arena: std.mem.Allocator, data: *const BigIntData) ![]const u8 {
+    return data.toConst().toStringAlloc(arena, 10, .lower);
+}
+
+/// Value equality of two BigInt Values (both must be `.bigint`).
+pub fn bigIntEql(x: Value, y: Value) bool {
+    return x.toPtr().bigint.toConst().eql(y.toPtr().bigint.toConst());
+}
+
+/// Parse a BigInt literal slice (no trailing `n`): optional 0x/0o/0b prefix
+/// selects the radix, otherwise base-10. Returns a boxed BigInt Value.
+pub fn makeBigIntFromLiteral(arena: std.mem.Allocator, lit: []const u8) !Value {
+    var m = try std.math.big.int.Managed.init(arena);
+    if (lit.len >= 2 and lit[0] == '0' and (lit[1] == 'x' or lit[1] == 'X')) {
+        try m.setString(16, lit[2..]);
+    } else if (lit.len >= 2 and lit[0] == '0' and (lit[1] == 'o' or lit[1] == 'O')) {
+        try m.setString(8, lit[2..]);
+    } else if (lit.len >= 2 and lit[0] == '0' and (lit[1] == 'b' or lit[1] == 'B')) {
+        try m.setString(2, lit[2..]);
+    } else {
+        try m.setString(10, lit);
+    }
+    return makeBigInt(arena, m.toConst());
+}
+
+/// True if the BigInt Value is strictly negative.
+pub fn bigIntIsNegative(v: Value) bool {
+    const c = v.toPtr().bigint.toConst();
+    return !c.positive and !c.eqlZero();
+}
+
+/// True if the BigInt Value is zero.
+pub fn bigIntIsZero(v: Value) bool {
+    return v.toPtr().bigint.toConst().eqlZero();
+}
+
+/// BigInt exponentiation by squaring. Caller must ensure `exp_v` >= 0.
+/// Returns error.Overflow if the (positive) exponent exceeds u64 range.
+pub fn bigIntPow(arena: std.mem.Allocator, base_v: Value, exp_v: Value) !Value {
+    const base_c = base_v.toPtr().bigint.toConst();
+    const exp_c = exp_v.toPtr().bigint.toConst();
+    var n: u64 = exp_c.toInt(u64) catch return error.Overflow;
+    var result = try std.math.big.int.Managed.initSet(arena, 1);
+    var b = try base_c.toManaged(arena);
+    var tmp = try std.math.big.int.Managed.init(arena);
+    while (n > 0) {
+        if (n & 1 == 1) {
+            try tmp.mul(&result, &b);
+            result.swap(&tmp);
+        }
+        n >>= 1;
+        if (n > 0) {
+            try tmp.mul(&b, &b);
+            b.swap(&tmp);
+        }
+    }
+    return makeBigInt(arena, result.toConst());
+}
+
+/// BigInt negation (unary minus). `v` must be `.bigint`.
+pub fn bigIntNegate(arena: std.mem.Allocator, v: Value) !Value {
+    var m = try v.toPtr().bigint.toConst().toManaged(arena);
+    m.negate();
+    return makeBigInt(arena, m.toConst());
+}
+
 /// Internal tagged JavaScript value. Arena-allocated per eval call.
 pub const JsValue = union(enum) {
     undefined_,
@@ -58,6 +154,8 @@ pub const JsValue = union(enum) {
     native_function: NativeFnEntry,
     /// ES2015 Symbol primitive (identity by pointer).
     symbol: *SymbolData,
+    /// ES2020 BigInt primitive (arbitrary precision; value equality).
+    bigint: *BigIntData,
 
     pub const Tag = std.meta.Tag(JsValue);
 };
@@ -238,6 +336,11 @@ pub const Value = extern struct {
             .object => std.math.nan(f64),
             .native_function => std.math.nan(f64),
             .symbol => std.math.nan(f64),
+            .bigint => |b| blk: {
+                const c = b.toConst();
+                const i = c.toInt(i64) catch break :blk if (c.positive) std.math.inf(f64) else -std.math.inf(f64);
+                break :blk @floatFromInt(i);
+            },
         };
     }
 
@@ -257,6 +360,7 @@ pub const Value = extern struct {
             .object => "[object Object]",
             .native_function => "function",
             .symbol => "Symbol()",
+            .bigint => "<bigint>", // caller should use bigIntToString for the value
         };
     }
 };

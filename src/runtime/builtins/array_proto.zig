@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 4b: Array.prototype native functions.
 //! push/pop mutate the array. slice/indexOf/join/concat are non-mutating.
 const std = @import("std");
@@ -675,6 +675,7 @@ fn jsStrictEqual(x: Value, y: Value) bool {
             break :blk n == yi.number;
         },
         .string => |s| std.mem.eql(u8, s, yi.string),
+        .bigint => val_mod.bigIntEql(x, y),
         .object => x.bits == y.bits,
         .function => x.bits == y.bits,
         .bc_function => x.bits == y.bits,

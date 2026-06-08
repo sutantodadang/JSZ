@@ -70,6 +70,7 @@ pub const UpdateOp = enum { inc, dec };
 pub const NodeKind = enum {
     // Expressions
     number_literal,
+    bigint_literal,
     string_literal,
     bool_literal,
     null_literal,
@@ -136,6 +137,7 @@ pub const Node = struct {
 
 pub const Data = union(NodeKind) {
     number_literal: f64,
+    bigint_literal: []const u8,
     string_literal: []const u8,
     bool_literal: bool,
     null_literal: void,
@@ -262,9 +264,13 @@ pub const PropKind = enum { init, get, set };
 
 pub const ObjectProp = struct {
     /// Property key (always stored as a string, even for numeric keys).
+    /// Ignored when `computed_key` is set.
     key: []const u8,
     value: *Node,
     kind: PropKind = .init,
+    /// ES6 computed key `{ [expr]: value }`: the key is evaluated at runtime
+    /// (may yield a symbol). `null` for ordinary static keys.
+    computed_key: ?*Node = null,
 };
 
 /// Phase 3a: object literal { key: value, ... }

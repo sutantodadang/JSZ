@@ -19,7 +19,7 @@ pub const Hint = enum { number, string, default };
 pub fn isPrimitive(v: Value) bool {
     if (v.bits == 0) return true; // undefined
     return switch (v.unbox()) {
-        .undefined_, .null_, .boolean, .number, .string, .symbol => true,
+        .undefined_, .null_, .boolean, .number, .string, .symbol, .bigint => true,
         else => false,
     };
 }
@@ -94,6 +94,12 @@ pub fn toPrimitive(arena: std.mem.Allocator, v: Value, hint: Hint) anyerror!?Val
                 return error.JsException;
             }
         }
+    }
+
+    // 1b. Wrapper objects (Number/String/Boolean/BigInt/Symbol) unbox via their
+    // stored [[PrimitiveValue]] — equivalent to the prototype valueOf result.
+    if (obj.get("[[PrimitiveValue]]")) |p| {
+        if (isPrimitive(p)) return p;
     }
 
     // 2. OrdinaryToPrimitive: method order depends on hint.
