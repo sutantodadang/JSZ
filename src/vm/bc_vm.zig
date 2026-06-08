@@ -12,6 +12,7 @@ const JsValue = val_mod.JsValue;
 const JsObject = @import("../object/object.zig").JsObject;
 const Op = @import("../bytecode/opcodes.zig").Op;
 const BcFunction = @import("../bytecode/function.zig").BcFunction;
+const build_options = @import("build_options");
 const BcClosure = @import("../bytecode/function.zig").BcClosure;
 const Environment = @import("../runtime/execution_context.zig").Environment;
 const Realm = @import("../runtime/realm.zig").Realm;
@@ -110,6 +111,10 @@ pub const BcVm = struct {
     context: @import("../runtime/realm.zig").Context = undefined,
     /// Phase 9: optional JIT profiler. Null = no profiling (zero hot-path cost).
     jit: ?*jit_mod.JitCompiler = null,
+    /// Phase 12: per-function JIT plan cache (built lazily on the first hot call
+    /// under `-Djit=true` + `.experimental`). Value is a `*int_fn_jit.JitPlan`
+    /// stored opaque (null = analyzed and NOT JIT-able). Empty/unused by default.
+    jit_plans: std.AutoHashMapUnmanaged(*const BcFunction, ?*anyopaque) = .empty,
     /// W3: resource limits. 0 = unlimited. Enforced in the dispatch loop and
     /// surfaced as an uncatchable interrupt (returns past any JS try/catch).
     gas_limit: u64 = 0,
@@ -2950,6 +2955,51 @@ pub const BcVm = struct {
     }
 
     /// Execute a regular CALL: reads callee from R[base], args from R[base+1..base+1+nargs].
+    /// Phase 12: try to satisfy a call to a pure-int leaf bytecode function with
+    /// natively-compiled code. Returns true (and writes `ret_dst`) when handled;
+    /// false to fall back to the interpreter. Entirely comptime-elided unless the
+    /// binary was built with `-Djit=true` — default builds never reference the
+    /// native backend.
+    fn tryJitCall(self: *BcVm, fn_ptr: *const BcFunction, base: u8, nargs: u8, ret_dst: u8) !bool {
+        // The whole body is inside a comptime-known `if`, so when the binary is
+        // built WITHOUT -Djit the branch is never analyzed — the `@import` of the
+        // native backend is not evaluated and nothing links the Cranelift cdylib.
+        if (comptime build_options.jit_enabled) {
+            const jc = self.jit orelse return false;
+            if (jc.mode != .experimental) return false;
+            if (nargs != fn_ptr.arity or nargs > 16) return false;
+
+            const ifj = @import("../jit/int_fn_jit.zig");
+            const frame = &self.frames.items[self.frames.items.len - 1];
+
+            // Type guard: the fast path is monomorphic-int, so every argument must
+            // be a small integer. Anything else falls back to the interpreter.
+            var args_buf: [16]Value = undefined;
+            var i: usize = 0;
+            while (i < nargs) : (i += 1) {
+                const av = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                if (!av.isSmi()) return false;
+                args_buf[i] = av;
+            }
+
+            // Compile-on-first-use, cached per function (null = analyzed, not JIT-able).
+            const gop = try self.jit_plans.getOrPut(self.arena, fn_ptr);
+            if (!gop.found_existing) {
+                const plan = try ifj.analyze(self.arena, fn_ptr);
+                gop.value_ptr.* = if (plan) |p| @as(?*anyopaque, @ptrCast(p)) else null;
+                if (plan != null) jc.compiled += 1;
+            }
+            const plan_ptr = gop.value_ptr.* orelse return false;
+            const plan: *ifj.JitPlan = @ptrCast(@alignCast(plan_ptr));
+
+            const result = try ifj.run(self.arena, plan, args_buf[0..nargs]);
+            // No JS re-entry happened (pure-int leaf), but re-fetch defensively.
+            self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
+            return true;
+        }
+        return false;
+    }
+
     fn doCall(self: *BcVm, callee_val: Value, this_val: Value, base: u8, nargs: u8, ret_dst: u8) !?[]const u8 {
         @import("../runtime/realm.zig").active_constructing = false;
         const frame = &self.frames.items[self.frames.items.len - 1];
@@ -2979,6 +3029,10 @@ pub const BcVm = struct {
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
+
+                // Phase 12: native fast path for hot pure-int leaf functions
+                // (comptime-elided unless built with -Djit=true).
+                if (try self.tryJitCall(fn_ptr, base, nargs, ret_dst)) return null;
 
                 // Create call environment.
                 const call_env = try Environment.init(self.arena, def_env);
@@ -4134,4 +4188,47 @@ test "Phase 9: hot loop registers a hot back-edge" {
     vm.jit = &jc;
     _ = try vm.run(main_func, @ptrCast(realm.global_env));
     try std.testing.expect(jc.hotCount() > 0);
+}
+
+test "Phase 12: JIT experimental runs a pure-int function (interp/native parity)" {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Pure-int leaf function: JIT-able (no calls/property access/closures).
+    const src = "function sum(n){ var s=0; var i=0; while(i<n){ s=s+i; i=i+1; } return s; } sum(100);";
+    var p = parser_mod.Parser.init(src, arena);
+    const pr = p.parseScript();
+    const stmts = switch (pr) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast_mod.Program{ .body = stmts };
+    const main_func = try compiler_mod.compileProgram(arena, &prog, "<test>");
+
+    var realm = try Realm.init(arena);
+    defer realm.deinit();
+
+    // `.experimental` engages the native fast path (only when built -Djit=true;
+    // otherwise the call site is comptime-elided and the interpreter runs).
+    var jc = jit_mod.JitCompiler.initMode(std.testing.allocator, .experimental);
+    defer jc.deinit();
+
+    var vm = BcVm.init(arena, &realm);
+    vm.jit = &jc;
+    const outcome = try vm.run(main_func, @ptrCast(realm.global_env));
+    const result = switch (outcome) {
+        .ok => |v| v,
+        else => return error.DidNotComplete,
+    };
+    // sum(100) = 0+1+...+99 = 4950, identical whether interpreted or JITed.
+    try std.testing.expectEqual(@as(f64, 4950), result.unbox().number);
+    if (comptime build_options.jit_enabled) {
+        // Under -Djit=true the analyzer must have compiled `sum` to native code.
+        try std.testing.expect(jc.compiled > 0);
+    }
 }

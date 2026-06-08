@@ -11,6 +11,30 @@ pub fn build(b: *std.Build) void {
     const enable_jit = b.option(bool, "jit", "Link the Cranelift native JIT backend into the CLI (requires cargo)") orelse false;
     const jit_options = b.addOptions();
     jit_options.addOption(bool, "jit_enabled", enable_jit);
+    // One shared `build_options` module (importing it twice creates conflicting
+    // module instances of the same name).
+    const build_options_mod = jit_options.createModule();
+
+    // Build the Rust cdylib once (under -Djit); every artifact that embeds the
+    // `jsz` module then links it, because bc_vm references the native JIT under
+    // the `build_options.jit_enabled` comptime gate.
+    const cargo_build_jit: ?*std.Build.Step.Run = if (enable_jit) b.addSystemCommand(&.{
+        "cargo", "build", "--release", "--manifest-path", "jit-native/Cargo.toml",
+    }) else null;
+    const JitLink = struct {
+        b: *std.Build,
+        cargo: ?*std.Build.Step.Run,
+        fn link(self: @This(), step: *std.Build.Step.Compile) void {
+            if (self.cargo) |c| step.step.dependOn(&c.step);
+            step.addLibraryPath(self.b.path("jit-native/target/release"));
+            step.linkSystemLibrary("jit_native.dll"); // MSVC appends .lib
+            step.linkLibC();
+        }
+        fn path(self: @This(), run: *std.Build.Step.Run) void {
+            run.addPathDir(self.b.pathFromRoot("jit-native/target/release"));
+        }
+    };
+    const jit_link = JitLink{ .b = b, .cargo = cargo_build_jit };
 
     // ---------------------------------------------------------------------------
     // Public module: @import("jsz") -> src/root.zig
@@ -19,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    mod.addImport("build_options", build_options_mod);
 
     // ---------------------------------------------------------------------------
     // Main executable: jsz CLI
@@ -34,7 +59,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.root_module.addImport("build_options", jit_options.createModule());
+    exe.root_module.addImport("build_options", build_options_mod);
     b.installArtifact(exe);
 
     // zig build run -- [args]
@@ -48,14 +73,8 @@ pub fn build(b: *std.Build) void {
     // the experimental hot-loop JIT uses Cranelift-compiled native code. The DLL
     // is placed beside the installed binary and on PATH for `zig build run`.
     if (enable_jit) {
-        const cargo_build_jit = b.addSystemCommand(&.{
-            "cargo", "build", "--release", "--manifest-path", "jit-native/Cargo.toml",
-        });
-        exe.step.dependOn(&cargo_build_jit.step);
-        exe.addLibraryPath(b.path("jit-native/target/release"));
-        exe.linkSystemLibrary("jit_native.dll"); // MSVC appends .lib -> jit_native.dll.lib
-        exe.linkLibC();
-        run_cmd.addPathDir(b.pathFromRoot("jit-native/target/release"));
+        jit_link.link(exe);
+        jit_link.path(run_cmd);
         const install_dll = b.addInstallBinFile(
             b.path("jit-native/target/release/jit_native.dll"),
             "jit_native.dll",
@@ -71,13 +90,14 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
-    // exe.root_module pulls native.zig under -Djit=true (via main.zig); link the
-    // cdylib + DLL path so `zig build test -Djit=true` also builds/runs cleanly.
+    // Under -Djit=true the `jsz` module (bc_vm) references the native JIT, so
+    // every artifact embedding it must link the cdylib. Default builds elide the
+    // reference (comptime gate) and need no Rust toolchain.
     if (enable_jit) {
-        exe_tests.addLibraryPath(b.path("jit-native/target/release"));
-        exe_tests.linkSystemLibrary("jit_native.dll");
-        exe_tests.linkLibC();
-        run_exe_tests.addPathDir(b.pathFromRoot("jit-native/target/release"));
+        jit_link.link(mod_tests);
+        jit_link.path(run_mod_tests);
+        jit_link.link(exe_tests);
+        jit_link.path(run_exe_tests);
     }
 
     const test262_runner_tests_mod = b.createModule(.{
@@ -313,6 +333,22 @@ pub fn build(b: *std.Build) void {
     const run_gc_stress = b.addRunArtifact(gc_stress_exe);
     const gc_stress_step = b.step("gc-stress", "Run Phase 3b GC stress test");
     gc_stress_step.dependOn(&run_gc_stress.step);
+
+    // Under -Djit=true, link the cdylib into every remaining artifact that embeds
+    // the `jsz` module (bc_vm references the native JIT). Default build: no-op.
+    if (enable_jit) {
+        for ([_]*std.Build.Step.Compile{
+            conformance_exe, diff_exe,    hello_exe,      embed_exe,
+            bench_exe,       bench_phase6_exe, gc_stress_exe,
+            parser_fuzz,     vm_fuzz,      regex_fuzz,     json_fuzz,
+            test262_runner_tests, docs_mod_test,
+        }) |c| jit_link.link(c);
+        for ([_]*std.Build.Step.Run{
+            run_conformance, run_conformance_summary, run_conformance_delta,
+            run_diff,        run_hello,    run_embed,      run_bench,
+            run_bench_phase6, run_gc_stress, run_test262_runner_tests,
+        }) |r| jit_link.path(r);
+    }
 
     // ---------------------------------------------------------------------------
     // Phase 9 JIT scaffold: zig build jit  (not linked to main binary yet)

@@ -15,6 +15,7 @@ extern fn jsz_clif_compile_const(k: i64) ?*const anyopaque;
 extern fn jsz_clif_compile_count_loop() ?*const anyopaque;
 extern fn jsz_clif_compile_guarded_iadd() ?*const anyopaque;
 extern fn jsz_clif_compile_accumulate_loop() ?*const anyopaque;
+extern fn jsz_clif_compile_int_block(code: [*]const u8, len: usize, kidx_to_slot: ?[*]const i32, n_kidx: usize) ?*const anyopaque;
 
 /// Native `fn(i64, i64) -> i64` compiled by Cranelift.
 pub const AddFn = *const fn (i64, i64) callconv(.c) i64;
@@ -63,6 +64,24 @@ pub fn compileAccumulateLoop() ?AccumulateLoopFn {
     return @ptrCast(p);
 }
 
+/// Phase 12: general int-subset bytecode function compiled to native code.
+/// `regs` = unboxed-i64 register file, `consts` = unboxed-i64 constant pool,
+/// `locals` = unboxed-i64 function-local variable slots. Returns the value of
+/// the RETURNed register.
+pub const IntBlockFn = *const fn (regs: [*]i64, consts: [*]const i64, locals: [*]i64) callconv(.c) i64;
+
+/// Compile a monomorphic-int bytecode function (branches + loops over a register
+/// file + env-local variables) to native code. `kidx_to_slot[k]` maps a
+/// constant-pool index used as a `GET_GLOBAL`/`SET_GLOBAL`/`DEFINE_GLOBAL` name
+/// operand to a `locals` slot, or negative when the name is not a monomorphic-int
+/// local (forcing a bail). Null when the bytecode uses an unsupported opcode or a
+/// non-local name (caller falls back to the interpreter).
+pub fn compileIntBlock(code: []const u8, kidx_to_slot: []const i32) ?IntBlockFn {
+    const map_ptr: ?[*]const i32 = if (kidx_to_slot.len == 0) null else kidx_to_slot.ptr;
+    const p = jsz_clif_compile_int_block(code.ptr, code.len, map_ptr, kidx_to_slot.len) orelse return null;
+    return @ptrCast(p);
+}
+
 test "cranelift backend is available" {
     try std.testing.expect(available());
 }
@@ -108,6 +127,126 @@ test "step 4: guarded add takes fast path or deopts on the type guard" {
     deopt = 0;
     try std.testing.expectEqual(@as(i64, 0), gadd(2, 3, 1, 0, &deopt));
     try std.testing.expectEqual(@as(i32, 1), deopt);
+}
+
+// Opcode byte values mirror src/bytecode/opcodes.zig (Op enum order). The
+// jit-native test module is single-file (can't import opcodes.zig), so these are
+// literals here; opcodes.zig has a comptime test pinning these exact ordinals.
+const OP_LOAD_K: u8 = 0;
+const OP_GET_GLOBAL: u8 = 6;
+const OP_SET_GLOBAL: u8 = 7;
+const OP_MUL: u8 = 12;
+const OP_ADD: u8 = 10;
+const OP_INC: u8 = 24;
+const OP_LT: u8 = 30;
+const OP_JMP: u8 = 36;
+const OP_JMP_IF_FALSE: u8 = 38;
+const OP_RETURN: u8 = 45;
+const OP_CALL: u8 = 44;
+const no_locals = &[_]i32{};
+
+fn i16lo(v: i16) u8 {
+    return @truncate(@as(u16, @bitCast(v)));
+}
+fn i16hi(v: i16) u8 {
+    return @truncate(@as(u16, @bitCast(v)) >> 8);
+}
+
+test "Phase 12: general int-block compiler runs an arbitrary sum loop" {
+    // `s = 0; while (i < limit) { s = s + i; i = i + 1; } return s;`
+    // regs: r0=i, r1=limit, r2=s, r3=cond.
+    // Offsets: LT@0(4) JMP_IF_FALSE@4(4) ADD@8(4) INC@12(3) JMP@15(3) RETURN@18(2)
+    // JMP_IF_FALSE@4: next=8, target=18 -> rel=+10 ; JMP@15: next=18, target=0 -> rel=-18
+    const code = [_]u8{
+        OP_LT,           3, 0, 1, // r3 = i < limit
+        OP_JMP_IF_FALSE, 3, i16lo(10), i16hi(10), // if !r3 goto RETURN
+        OP_ADD,          2, 2, 0, // s = s + i
+        OP_INC,          0, 0, // i = i + 1
+        OP_JMP,          i16lo(-18), i16hi(-18), // back to LT
+        OP_RETURN,       2, // return s
+    };
+
+    const f = compileIntBlock(&code, no_locals) orelse return error.IntBlockReturnedNull;
+
+    var regs1 = [_]i64{ 0, 10, 0, 0 }; // i=0, limit=10, s=0
+    try std.testing.expectEqual(@as(i64, 45), f(&regs1, &[_]i64{}, &[_]i64{})); // sum 0..9
+    try std.testing.expectEqual(@as(i64, 10), regs1[0]); // i ended at 10
+
+    var regs2 = [_]i64{ 0, 5, 0, 0 }; // limit=5
+    try std.testing.expectEqual(@as(i64, 10), f(&regs2, &[_]i64{}, &[_]i64{})); // sum 0..4
+
+    var regs3 = [_]i64{ 7, 5, 0, 0 }; // i already past limit -> no iterations
+    try std.testing.expectEqual(@as(i64, 0), f(&regs3, &[_]i64{}, &[_]i64{}));
+}
+
+test "Phase 12: int-block compiler uses LOAD_K constants and arithmetic" {
+    // `r0 = K0; r1 = K1; r2 = r0 * r1; return r2;`  with consts [6, 7] -> 42
+    const code = [_]u8{
+        OP_LOAD_K, 0, 0, 0, // r0 = consts[0]
+        OP_LOAD_K, 1, 1, 0, // r1 = consts[1]
+        OP_MUL,    2, 0, 1, // r2 = r0 * r1
+        OP_RETURN, 2,
+    };
+    const f = compileIntBlock(&code, no_locals) orelse return error.IntBlockReturnedNull;
+    var regs = [_]i64{ 0, 0, 0 };
+    try std.testing.expectEqual(@as(i64, 42), f(&regs, &[_]i64{ 6, 7 }, &[_]i64{}));
+}
+
+test "Phase 12: int-block compiler bails on an unsupported opcode" {
+    // CALL is outside the int subset -> compiler returns null (interpreter fallback).
+    const code = [_]u8{ OP_CALL, 0, 0, 0 };
+    try std.testing.expect(compileIntBlock(&code, no_locals) == null);
+}
+
+test "Phase 12: int-fn compiler runs a real env-local function (sum)" {
+    // Mirrors the real env-based bytecode for:
+    //   function sum(n){ var s=0; var i=0; while(i<n){ s=s+i; i=i+1; } return s; }
+    // Variables live in the env (GET_GLOBAL/SET_GLOBAL); names map to local slots:
+    //   K0="s"->slot0, K1="i"->slot1, K2="n"->slot2, K3=0 (numeric literal, not a name).
+    const code = [_]u8{
+        OP_LOAD_K,       0, 3, 0, // r0 = consts[3] (=0)
+        OP_SET_GLOBAL,   0, 0, 0, // s = r0            (K0, Rsrc=r0)
+        OP_LOAD_K,       0, 3, 0, // r0 = 0
+        OP_SET_GLOBAL,   1, 0, 0, // i = r0            (K1)
+        // loop@16:
+        OP_GET_GLOBAL,   0, 1, 0, // r0 = i            (K1)
+        OP_GET_GLOBAL,   1, 2, 0, // r1 = n            (K2)
+        OP_LT,           2, 0, 1, // r2 = i < n
+        OP_JMP_IF_FALSE, 2, i16lo(30), i16hi(30), // if !r2 goto end@62
+        OP_GET_GLOBAL,   0, 0, 0, // r0 = s            (K0)
+        OP_GET_GLOBAL,   1, 1, 0, // r1 = i            (K1)
+        OP_ADD,          2, 0, 1, // r2 = s + i
+        OP_SET_GLOBAL,   0, 0, 2, // s = r2            (K0, Rsrc=r2)
+        OP_GET_GLOBAL,   0, 1, 0, // r0 = i            (K1)
+        OP_INC,          1, 0, // r1 = i + 1
+        OP_SET_GLOBAL,   1, 0, 1, // i = r1            (K1, Rsrc=r1)
+        OP_JMP,          i16lo(-46), i16hi(-46), // goto loop@16
+        // end@62:
+        OP_GET_GLOBAL,   0, 0, 0, // r0 = s            (K0)
+        OP_RETURN,       0,
+    };
+    // K0->slot0(s), K1->slot1(i), K2->slot2(n), K3->-1 (numeric const, not a name).
+    const map = [_]i32{ 0, 1, 2, -1 };
+    const f = compileIntBlock(&code, &map) orelse return error.IntFnReturnedNull;
+
+    const consts = [_]i64{ 0, 0, 0, 0 }; // only consts[3] (=0) is read
+    var regs = [_]i64{ 0, 0, 0 };
+    var locals1 = [_]i64{ 0, 0, 10 }; // s=0, i=0, n=10
+    try std.testing.expectEqual(@as(i64, 45), f(&regs, &consts, &locals1)); // sum 0..9
+    try std.testing.expectEqual(@as(i64, 10), locals1[1]); // i ended at 10
+
+    var locals2 = [_]i64{ 0, 0, 100 }; // n=100 -> sum 0..99 = 4950
+    try std.testing.expectEqual(@as(i64, 4950), f(&regs, &consts, &locals2));
+
+    var locals3 = [_]i64{ 0, 0, 0 }; // n=0 -> no iterations -> 0
+    try std.testing.expectEqual(@as(i64, 0), f(&regs, &consts, &locals3));
+}
+
+test "Phase 12: int-fn bails when a name is not a local (true global)" {
+    // GET_GLOBAL of K0 where K0 maps to -1 (a real global like `Math`) -> bail.
+    const code = [_]u8{ OP_GET_GLOBAL, 0, 0, 0, OP_RETURN, 0 };
+    const map = [_]i32{-1};
+    try std.testing.expect(compileIntBlock(&code, &map) == null);
 }
 
 test "native summation accumulator loop matches JS semantics" {

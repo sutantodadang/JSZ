@@ -297,6 +297,42 @@ test "Op enum exists" {
     try std.testing.expect(@intFromEnum(Op.HALT) < 255);
 }
 
+test "JIT contract: int-subset opcode ordinals are pinned" {
+    // The Phase 12 native int-block compiler (jit-native/src/lib.rs +
+    // src/jit/native.zig) hardcodes these byte values. Reordering the Op enum
+    // would silently miscompile JITed code — fail loudly here instead.
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(Op.LOAD_K));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(Op.LOAD_TRUE));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(Op.LOAD_FALSE));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(Op.LOAD_UNDEF));
+    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(Op.MOVE));
+    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(Op.GET_GLOBAL));
+    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(Op.SET_GLOBAL));
+    try std.testing.expectEqual(@as(u8, 10), @intFromEnum(Op.ADD));
+    try std.testing.expectEqual(@as(u8, 11), @intFromEnum(Op.SUB));
+    try std.testing.expectEqual(@as(u8, 12), @intFromEnum(Op.MUL));
+    try std.testing.expectEqual(@as(u8, 24), @intFromEnum(Op.INC));
+    try std.testing.expectEqual(@as(u8, 25), @intFromEnum(Op.DEC));
+    try std.testing.expectEqual(@as(u8, 26), @intFromEnum(Op.EQ));
+    try std.testing.expectEqual(@as(u8, 27), @intFromEnum(Op.NEQ));
+    try std.testing.expectEqual(@as(u8, 28), @intFromEnum(Op.SEQ));
+    try std.testing.expectEqual(@as(u8, 29), @intFromEnum(Op.SNEQ));
+    try std.testing.expectEqual(@as(u8, 30), @intFromEnum(Op.LT));
+    try std.testing.expectEqual(@as(u8, 31), @intFromEnum(Op.LE));
+    try std.testing.expectEqual(@as(u8, 32), @intFromEnum(Op.GT));
+    try std.testing.expectEqual(@as(u8, 33), @intFromEnum(Op.GE));
+    try std.testing.expectEqual(@as(u8, 34), @intFromEnum(Op.NOT));
+    try std.testing.expectEqual(@as(u8, 36), @intFromEnum(Op.JMP));
+    try std.testing.expectEqual(@as(u8, 37), @intFromEnum(Op.JMP_IF_TRUE));
+    try std.testing.expectEqual(@as(u8, 38), @intFromEnum(Op.JMP_IF_FALSE));
+    try std.testing.expectEqual(@as(u8, 44), @intFromEnum(Op.CALL));
+    try std.testing.expectEqual(@as(u8, 45), @intFromEnum(Op.RETURN));
+    try std.testing.expectEqual(@as(u8, 46), @intFromEnum(Op.RETURN_UNDEF));
+    try std.testing.expectEqual(@as(u8, 47), @intFromEnum(Op.HALT));
+    try std.testing.expectEqual(@as(u8, 62), @intFromEnum(Op.DEFINE_GLOBAL));
+    try std.testing.expectEqual(@as(u8, 74), @intFromEnum(Op.HOIST_VAR));
+}
+
 test "instrSize LOAD_K is 4" {
     try std.testing.expectEqual(@as(usize, 4), instrSize(.LOAD_K));
 }
