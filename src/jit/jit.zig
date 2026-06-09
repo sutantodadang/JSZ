@@ -68,10 +68,12 @@ pub const JitCompiler = struct {
     deopt_counts: std.AutoHashMapUnmanaged(HotKey, u32) = .{},
     /// Sites abandoned after repeated fast-forward failures (stop retrying).
     blacklist: std.AutoHashMapUnmanaged(HotKey, void) = .{},
-    /// Number of functions successfully compiled to native code (always 0 today).
+    /// Number of functions successfully compiled to native code.
     compiled: usize = 0,
     /// Number of deoptimizations triggered (failed fast-forward attempts).
     deopts: usize = 0,
+    /// Number of JITed CALLs that invoked an already-compiled function directly.
+    direct_calls: usize = 0,
 
     /// Create a JitCompiler in .off mode.
     pub fn init(allocator: std.mem.Allocator) JitCompiler {

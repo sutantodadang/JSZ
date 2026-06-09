@@ -37,6 +37,17 @@ pub const TryEntry = struct {
 /// owning function and the bytecode offset of its back-edge `JMP`.
 pub const OsrKey = struct { func: *const BcFunction, pc: u32 };
 
+/// Result of a JIT call attempt: `not_jitted` (interpret it), `completed` (native
+/// ran and wrote the result), or `threw` (a re-entrant call threw — the value is
+/// in `realm.pending_exception`; the caller must propagate it without re-running).
+const JitCallResult = enum { not_jitted, completed, threw };
+
+/// Sentinel stored in `jit_plans` for a function permanently rejected by the JIT
+/// analyzer (never dereferenced; distinct from any real `*JitPlan`).
+const jit_rejected: *anyopaque = @ptrFromInt(@alignOf(u64));
+/// Max `.retry` (cold-IC) compile attempts before a function is rejected.
+const jit_warmup_max: u16 = 64;
+
 pub const BcCallFrame = struct {
     func: *const BcFunction,
     pc: usize,
@@ -123,6 +134,11 @@ pub const BcVm = struct {
     /// lazily on the first hot back-edge under `-Djit=true` + `.experimental`;
     /// value is a `*osr_jit.OsrPlan` stored opaque (null = not OSR-able). Default: empty.
     osr_plans: std.AutoHashMapUnmanaged(OsrKey, ?*anyopaque) = .empty,
+    /// Phase 12 boxed tier: per-function count of failed JIT-compile attempts while
+    /// a property site's inline cache is still cold (`analyze` returned `.retry`).
+    /// After `jit_warmup_max` the function is permanently rejected. Lets ICs warm
+    /// over the first few interpreted calls before we bake them into native code.
+    jit_attempts: std.AutoHashMapUnmanaged(*const BcFunction, u16) = .empty,
     /// W3: resource limits. 0 = unlimited. Enforced in the dispatch loop and
     /// surfaced as an uncatchable interrupt (returns past any JS try/catch).
     gas_limit: u64 = 0,
@@ -2971,47 +2987,124 @@ pub const BcVm = struct {
     /// false to fall back to the interpreter. Entirely comptime-elided unless the
     /// binary was built with `-Djit=true` — default builds never reference the
     /// native backend.
-    fn tryJitCall(self: *BcVm, fn_ptr: *const BcFunction, base: u8, nargs: u8, ret_dst: u8) !bool {
+    fn tryJitCall(self: *BcVm, fn_ptr: *const BcFunction, base: u8, nargs: u8, ret_dst: u8) !JitCallResult {
         // The whole body is inside a comptime-known `if`, so when the binary is
         // built WITHOUT -Djit the branch is never analyzed — the `@import` of the
         // native backend is not evaluated and nothing links the Cranelift cdylib.
         if (comptime build_options.jit_enabled) {
-            const jc = self.jit orelse return false;
-            if (jc.mode != .experimental) return false;
-            if (nargs != fn_ptr.arity or nargs > 16) return false;
+            const jc = self.jit orelse return .not_jitted;
+            if (jc.mode != .experimental) return .not_jitted;
+            if (nargs != fn_ptr.arity or nargs > 16) return .not_jitted;
 
             const ifj = @import("../jit/int_fn_jit.zig");
             const frame = &self.frames.items[self.frames.items.len - 1];
 
-            // Type guard: the fast path is monomorphic-int, so every argument must
-            // be a small integer. Anything else falls back to the interpreter.
+            // Boxed leaf: arguments flow in as raw boxed Values (any type). The
+            // native code guards numericity per arithmetic op and deopts (→ the
+            // interpreter) on a non-number operand or a >2^53 result.
             var args_buf: [16]Value = undefined;
             var i: usize = 0;
             while (i < nargs) : (i += 1) {
-                const av = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                if (!av.isSmi()) return false;
-                args_buf[i] = av;
+                args_buf[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
             }
 
-            // Compile-on-first-use, cached per function (null = analyzed, not JIT-able).
+            // Compile lazily, cached per function. `null` = not compiled yet (may
+            // retry while a property IC warms); `jit_rejected` = permanently not
+            // JIT-able. Pure-arithmetic leaves compile on the first call; functions
+            // with property reads compile once their site ICs reach monomorphic.
             const gop = try self.jit_plans.getOrPut(self.arena, fn_ptr);
-            if (!gop.found_existing) {
-                const plan = try ifj.analyze(self.arena, fn_ptr);
-                gop.value_ptr.* = if (plan) |p| @as(?*anyopaque, @ptrCast(p)) else null;
-                if (plan != null) jc.compiled += 1;
+            if (!gop.found_existing) gop.value_ptr.* = null;
+            if (gop.value_ptr.* == jit_rejected) return .not_jitted;
+            if (gop.value_ptr.* == null) {
+                const call_helper: u64 = @intFromPtr(&jsz_jit_call);
+                switch (try ifj.analyze(self.arena, fn_ptr, true, call_helper)) {
+                    .ok => |p| {
+                        gop.value_ptr.* = @ptrCast(p);
+                        jc.compiled += 1;
+                    },
+                    .never => {
+                        gop.value_ptr.* = jit_rejected;
+                        return .not_jitted;
+                    },
+                    .retry => {
+                        const ag = try self.jit_attempts.getOrPut(self.arena, fn_ptr);
+                        if (!ag.found_existing) ag.value_ptr.* = 0;
+                        ag.value_ptr.* += 1;
+                        if (ag.value_ptr.* >= jit_warmup_max) gop.value_ptr.* = jit_rejected;
+                        return .not_jitted; // interpret this call (warms the property IC)
+                    },
+                }
             }
-            const plan_ptr = gop.value_ptr.* orelse return false;
-            const plan: *ifj.JitPlan = @ptrCast(@alignCast(plan_ptr));
+            const plan: *ifj.JitPlan = @ptrCast(@alignCast(gop.value_ptr.*.?));
 
-            // null = the native code hit an overflow guard (a result escaped
-            // ±2^53); discard and re-run the call in the interpreter (sound: the
-            // JITed function is a side-effect-free pure-int leaf).
-            const result = (try ifj.run(self.arena, plan, args_buf[0..nargs])) orelse return false;
-            // No JS re-entry happened (pure-int leaf), but re-fetch defensively.
-            self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
-            return true;
+            switch (try ifj.run(self.arena, plan, args_buf[0..nargs], self)) {
+                .deopt => return .not_jitted, // overflow / non-number / property miss
+                .threw => return .threw, // a re-entrant CALL threw — propagate it
+                .value => |result| {
+                    // A re-entrant CALL may have reallocated self.frames; re-fetch.
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
+                    return .completed;
+                },
+            }
         }
-        return false;
+        return .not_jitted;
+    }
+
+    /// S4 CALL trampoline: a JITed region's native `CALL` re-enters the interpreter
+    /// here. Reads the callee from `regs[base]` and args from `regs[base+1..]` (raw
+    /// boxed Values), invokes the call, writes the result to `regs[ret_dst]`, and
+    /// sets `deopt.* = 2` if it threw (the value is in `realm.pending_exception`).
+    /// callconv(.c): its address is baked into the native code. The active region's
+    /// buffers are GC roots (see `int_fn_jit.active_jit_frame`) while this runs.
+    fn jsz_jit_call(regs: [*]i64, base: u32, nargs: u32, ret_dst: u32, deopt: *i32) callconv(.c) void {
+        const ifj = @import("../jit/int_fn_jit.zig");
+        const vmptr = ifj.active_jit_vm.?;
+        const vm: *BcVm = @ptrCast(@alignCast(vmptr));
+        const callee = Value{ .bits = @bitCast(regs[base]) };
+        const args: []const Value = @as([*]const Value, @ptrCast(regs + base + 1))[0..nargs];
+
+        // S6 fast path: when the callee is an already-JIT-compiled bytecode function
+        // of matching arity, run its native code DIRECTLY — no interpreter frame,
+        // no dispatch loop. A fully-JIT call chain then stays in native code. On a
+        // deopt (the callee hit overflow / a non-number / a property miss — all
+        // before any commit, so re-running is sound) fall through to the
+        // interpreter; a throw propagates.
+        if (callee.bits != 0) {
+            const inner = callee.unbox();
+            if (inner == .bc_function) {
+                const func = inner.bc_function.func;
+                if (vm.jit_plans.get(func)) |maybe| {
+                    if (maybe) |plan_ptr| direct: {
+                        if (plan_ptr == jit_rejected) break :direct;
+                        const plan: *ifj.JitPlan = @ptrCast(@alignCast(plan_ptr));
+                        if (plan.arity != nargs) break :direct;
+                        const out = ifj.run(vm.arena, plan, args, vmptr) catch break :direct;
+                        switch (out) {
+                            .value => |res| {
+                                regs[ret_dst] = @bitCast(res.bits);
+                                if (vm.jit) |jc| jc.direct_calls += 1;
+                                deopt.* = 0;
+                                return;
+                            },
+                            .threw => {
+                                deopt.* = 2;
+                                return;
+                            },
+                            .deopt => break :direct, // interpret the callee instead
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: re-enter the interpreter (handles native/bound/async/generator
+        // callees, cold/non-JITable bc functions, arity mismatch, and JIT deopts).
+        const result = bcInvokeJs(vmptr, vm.arena, Value{}, callee, args) catch {
+            deopt.* = 2; // threw — realm.pending_exception holds the value
+            return;
+        };
+        regs[ret_dst] = @bitCast(result.bits);
+        deopt.* = 0;
     }
 
     /// Phase 12: attempt general loop OSR at a hot back-edge `JMP` (op at
@@ -3072,9 +3165,21 @@ pub const BcVm = struct {
                     return null;
                 }
 
-                // Phase 12: native fast path for hot pure-int leaf functions
+                // Phase 12: native fast path for hot leaf/boxed functions
                 // (comptime-elided unless built with -Djit=true).
-                if (try self.tryJitCall(fn_ptr, base, nargs, ret_dst)) return null;
+                switch (try self.tryJitCall(fn_ptr, base, nargs, ret_dst)) {
+                    .completed => return null,
+                    .threw => {
+                        // A re-entrant CALL inside the JITed function threw; the
+                        // value is in realm.pending_exception. Route it exactly like
+                        // an interpreted call's throw (the `__js_exception__` path).
+                        const realm_mod = @import("../runtime/realm.zig");
+                        self.last_exception_value = realm_mod.pending_exception;
+                        realm_mod.pending_exception = Value{};
+                        return "__js_exception__";
+                    },
+                    .not_jitted => {},
+                }
 
                 // Create call environment.
                 const call_env = try Environment.init(self.arena, def_env);
@@ -3818,6 +3923,19 @@ fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
     for (vm.async_ctxs.items) |actx| {
         gc_mod.traceValue(actx.result, mark_fn);
     }
+    // Phase 12 S4: boxed JIT regions on the stack hold live cell pointers in their
+    // native register/local buffers (e.g. across a re-entrant CALL whose callee may
+    // trigger `__gc__()`). Mark them — the collector is non-moving, so this is
+    // sufficient. Comptime-elided in default builds (the chain is never populated).
+    if (comptime build_options.jit_enabled) {
+        const ifj = @import("../jit/int_fn_jit.zig");
+        var rf = ifj.active_jit_frame;
+        while (rf) |f| {
+            for (f.regs) |bits| gc_mod.traceValue(Value{ .bits = @bitCast(bits) }, mark_fn);
+            for (f.locals) |bits| gc_mod.traceValue(Value{ .bits = @bitCast(bits) }, mark_fn);
+            rf = f.parent;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- semantics helpers ---
@@ -4368,4 +4486,237 @@ test "Phase 12: loop OSR handles an early break (loop-exit edge)" {
     if (comptime build_options.jit_enabled) {
         try std.testing.expect(jc.compiled > 0);
     }
+}
+
+test "Phase 12 boxed leaf: JITs double args + non-number passthrough (capability gain)" {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+
+    // `mul` is called with a DOUBLE arg (the old SMI-only int leaf would bail);
+    // `id` returns a non-number (string) straight through the boxed registers.
+    // Both must JIT under -Djit and give the interpreter's result.
+    const cases = [_]struct { src: []const u8, want: f64, str: ?[]const u8 }{
+        .{ .src = "function mul(a,b){ return a*b; } mul(1.5, 4);", .want = 6, .str = null },
+        .{ .src = "function id(x){ return x; } id(\"hello\").length;", .want = 5, .str = null },
+    };
+    for (cases) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var p = parser_mod.Parser.init(case.src, arena);
+        const pr = p.parseScript();
+        const stmts = switch (pr) {
+            .ok => |s| s,
+            .err => return error.ParseFailed,
+        };
+        const prog = ast_mod.Program{ .body = stmts };
+        const main_func = try compiler_mod.compileProgram(arena, &prog, "<test>");
+
+        var realm = try Realm.init(arena);
+        defer realm.deinit();
+        var jc = jit_mod.JitCompiler.initMode(std.testing.allocator, .experimental);
+        defer jc.deinit();
+        var vm = BcVm.init(arena, &realm);
+        vm.jit = &jc;
+        const outcome = try vm.run(main_func, @ptrCast(realm.global_env));
+        const result = switch (outcome) {
+            .ok => |v| v,
+            else => return error.DidNotComplete,
+        };
+        try std.testing.expectEqual(case.want, result.unbox().number);
+        if (comptime build_options.jit_enabled) {
+            try std.testing.expect(jc.compiled > 0);
+        }
+    }
+}
+
+test "Phase 12 boxed S3: JITs a monomorphic property read (GET_PROP)" {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `getx` reads an own data property. Called in a loop so its property inline
+    // cache warms to monomorphic; the boxed JIT then bakes (shape, slot) and reads
+    // the slot natively via the fast-path helper. obj.x = 42, 200 iters → 8400.
+    const src =
+        "function getx(o){ return o.x; }" ++
+        " var obj = { x: 42 }; var s = 0;" ++
+        " for (var i = 0; i < 200; i = i + 1) { s = s + getx(obj); } s;";
+    var p = parser_mod.Parser.init(src, arena);
+    const pr = p.parseScript();
+    const stmts = switch (pr) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast_mod.Program{ .body = stmts };
+    const main_func = try compiler_mod.compileProgram(arena, &prog, "<test>");
+
+    var realm = try Realm.init(arena);
+    defer realm.deinit();
+    var jc = jit_mod.JitCompiler.initMode(std.testing.allocator, .experimental);
+    defer jc.deinit();
+    var vm = BcVm.init(arena, &realm);
+    vm.jit = &jc;
+    const outcome = try vm.run(main_func, @ptrCast(realm.global_env));
+    const result = switch (outcome) {
+        .ok => |v| v,
+        else => return error.DidNotComplete,
+    };
+    try std.testing.expectEqual(@as(f64, 8400), result.unbox().number);
+    if (comptime build_options.jit_enabled) {
+        // `getx` must have been JIT-compiled with its native GET_PROP fast path.
+        try std.testing.expect(jc.compiled > 0);
+    }
+}
+
+test "Phase 12 boxed S3d: JITs a polymorphic property read" {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `getx` is called with two DIFFERENT shapes (x at different slots), so its
+    // site goes polymorphic — which S3c's monomorphic-only helper could not JIT.
+    // The S3d helper reads the live IC (mono/poly/mega) and resolves both.
+    // 300 * (3 + 5) = 2400.
+    const src =
+        "function getx(o){ return o.x; }" ++
+        " var a = { x: 3 }; var b = { y: 9, x: 5 }; var s = 0;" ++
+        " for (var i = 0; i < 300; i = i + 1) { s = s + getx(a) + getx(b); } s;";
+    var p = parser_mod.Parser.init(src, arena);
+    const pr = p.parseScript();
+    const stmts = switch (pr) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast_mod.Program{ .body = stmts };
+    const main_func = try compiler_mod.compileProgram(arena, &prog, "<test>");
+
+    var realm = try Realm.init(arena);
+    defer realm.deinit();
+    var jc = jit_mod.JitCompiler.initMode(std.testing.allocator, .experimental);
+    defer jc.deinit();
+    var vm = BcVm.init(arena, &realm);
+    vm.jit = &jc;
+    const outcome = try vm.run(main_func, @ptrCast(realm.global_env));
+    const result = switch (outcome) {
+        .ok => |v| v,
+        else => return error.DidNotComplete,
+    };
+    try std.testing.expectEqual(@as(f64, 2400), result.unbox().number);
+    if (comptime build_options.jit_enabled) {
+        try std.testing.expect(jc.compiled > 0);
+    }
+}
+
+test "Phase 12 boxed S3e: JITs an own-data property store (SET_PROP)" {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `setx` writes an existing own data property — a single terminal store with
+    // no fallible op after it (sound under coarse deopt). Called in a loop so its
+    // IC warms; the boxed JIT then stores the slot natively. Final o.x = 199.
+    const src =
+        "function setx(o, v){ o.x = v; }" ++
+        " var o = { x: 0 }; for (var i = 0; i < 200; i = i + 1) { setx(o, i); } o.x;";
+    var p = parser_mod.Parser.init(src, arena);
+    const pr = p.parseScript();
+    const stmts = switch (pr) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast_mod.Program{ .body = stmts };
+    const main_func = try compiler_mod.compileProgram(arena, &prog, "<test>");
+
+    var realm = try Realm.init(arena);
+    defer realm.deinit();
+    var jc = jit_mod.JitCompiler.initMode(std.testing.allocator, .experimental);
+    defer jc.deinit();
+    var vm = BcVm.init(arena, &realm);
+    vm.jit = &jc;
+    const outcome = try vm.run(main_func, @ptrCast(realm.global_env));
+    const result = switch (outcome) {
+        .ok => |v| v,
+        else => return error.DidNotComplete,
+    };
+    try std.testing.expectEqual(@as(f64, 199), result.unbox().number);
+    if (comptime build_options.jit_enabled) {
+        try std.testing.expect(jc.compiled > 0);
+    }
+}
+
+fn runJitScript(src: []const u8) !Value {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var p = parser_mod.Parser.init(src, arena);
+    const stmts = switch (p.parseScript()) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast_mod.Program{ .body = stmts };
+    const main_func = try compiler_mod.compileProgram(arena, &prog, "<test>");
+    var realm = try Realm.init(arena);
+    defer realm.deinit();
+    var jc = jit_mod.JitCompiler.initMode(std.testing.allocator, .experimental);
+    defer jc.deinit();
+    var vm = BcVm.init(arena, &realm);
+    vm.jit = &jc;
+    const outcome = try vm.run(main_func, @ptrCast(realm.global_env));
+    return switch (outcome) {
+        .ok => |v| v,
+        else => error.DidNotComplete,
+    };
+}
+
+test "Phase 12 boxed S4: JITs a call (delegation, nested native call)" {
+    // `callAdd` re-enters via a native CALL to `add` (which itself JITs as a leaf)
+    // — exercising the S4 trampoline + a nested JIT region + GC root frames.
+    // sum over i in [0,100) of (i + 10) = 4950 + 1000 = 5950.
+    const src =
+        "function add(a, b){ return a + b; }" ++
+        " function callAdd(x){ return add(x, 10); }" ++
+        " var s = 0; for (var i = 0; i < 100; i = i + 1) { s = s + callAdd(i); } s;";
+    const r = try runJitScript(src);
+    try std.testing.expectEqual(@as(f64, 5950), r.unbox().number);
+}
+
+test "Phase 12 boxed S4: a thrown exception propagates through a JITed call" {
+    // `caller` JITs and re-enters `thrower`, which throws. The exception must
+    // propagate out of the native region (NOT re-run the call) and be caught.
+    const src =
+        "var caught = 0;" ++
+        " function thrower(){ throw 7; }" ++
+        " function caller(){ return thrower(); }" ++
+        " try { caller(); } catch (e) { caught = e; } caught;";
+    const r = try runJitScript(src);
+    try std.testing.expectEqual(@as(f64, 7), r.unbox().number);
+}
+
+test "Phase 12 boxed S6: self-recursion runs native-to-native (direct dispatch)" {
+    // `count` recurses in tail position (the arg `n-1` is computed before the
+    // call, the result returned after) so it JITs; once its plan is cached, each
+    // recursive CALL is dispatched directly to native code (no interpreter frame).
+    // 50 levels deep, bottoming out at the base case → 5.
+    const src =
+        "function count(n){ if (n <= 0) return 5; return count(n - 1); } count(50);";
+    const r = try runJitScript(src);
+    try std.testing.expectEqual(@as(f64, 5), r.unbox().number);
 }

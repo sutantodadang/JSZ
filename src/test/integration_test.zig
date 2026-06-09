@@ -2,6 +2,7 @@
 //! Integration tests: lex -> parse -> eval end-to-end.
 //! Phase 2: each test runs under BOTH tree and bc modes and asserts identical results.
 const std = @import("std");
+const build_options = @import("build_options");
 const root = @import("../root.zig");
 const val_mod = @import("../value/value.zig");
 
@@ -134,6 +135,40 @@ test "integration: string concat" {
     };
     const s2 = try root.valueToDisplayString(arena.allocator(), v2);
     try std.testing.expectEqualStrings("hello world", s2);
+}
+
+test "S6: JIT direct native-to-native call avoids interpreter frame" {
+    if (!build_options.jit_enabled) return error.SkipZigTest;
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setJitMode(.experimental);
+
+    const result = ctx.eval(
+        \\function leaf(x) { return x + 1; }
+        \\function caller(f, x) { return f(x); }
+        \\leaf(0);
+        \\caller(leaf, 41);
+    , "<jit-s6-direct-call>");
+    const v = switch (result) {
+        .ok => |x| x,
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+
+    const profile = ctx.lastJitProfile();
+    try std.testing.expectEqual(@as(f64, 42), v.toF64());
+    try std.testing.expect(profile.compiled >= 2);
+    try std.testing.expect(profile.direct_calls >= 1);
+    try std.testing.expectEqual(@as(usize, 1), ctx.lastFrameHighWater());
 }
 
 test "integration: function call" {

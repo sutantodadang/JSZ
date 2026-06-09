@@ -72,6 +72,7 @@ pub const JitProfile = struct {
     hot_sites: usize = 0,
     compiled: usize = 0,
     deopts: usize = 0,
+    direct_calls: usize = 0,
 };
 
 /// Phase 11: snapshot of IC hit-rate counters from the most recent bc eval.
@@ -264,6 +265,7 @@ pub const IsolateImpl = struct {
                 .hot_sites = jc.hotCount(),
                 .compiled = jc.compiled,
                 .deopts = jc.deopts,
+                .direct_calls = jc.direct_calls,
             };
         } else {
             self.last_jit_profile = .{};

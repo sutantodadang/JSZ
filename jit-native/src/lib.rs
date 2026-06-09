@@ -339,12 +339,30 @@ const OP_LE: u8 = 31;
 const OP_GT: u8 = 32;
 const OP_GE: u8 = 33;
 const OP_NOT: u8 = 34;
+const OP_CALL: u8 = 44;
 const OP_JMP: u8 = 36;
 const OP_JMP_IF_TRUE: u8 = 37;
 const OP_JMP_IF_FALSE: u8 = 38;
 const OP_RETURN: u8 = 45;
 const OP_RETURN_UNDEF: u8 = 46;
 const OP_HALT: u8 = 47;
+const OP_SET_PROP: u8 = 50;
+const OP_GET_PROP: u8 = 51;
+
+/// One property-access site (boxed tier S3): at bytecode offset `pc`, a `GET_PROP`
+/// reads property `key` consulting the live inline cache `ic`. The native code
+/// passes these to the Zig fast-path helper, which mirrors the interpreter's
+/// non-re-entrant IC lookup (own mono/poly/mega + proto-chain data) and sets
+/// `*miss` (→ coarse deopt) for anything it can't resolve without running JS
+/// (accessors, uncached shapes, non-objects).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PropSite {
+    pub pc: u32,
+    pub key_len: u32,
+    pub key_ptr: u64,
+    pub ic_ptr: u64,
+}
 
 /// Encoded instruction byte length for the supported opcodes; `None` aborts.
 fn int_instr_size(op: u8) -> Option<usize> {
@@ -362,6 +380,9 @@ fn int_instr_size(op: u8) -> Option<usize> {
         OP_JMP_IF_TRUE | OP_JMP_IF_FALSE => 4,
         OP_RETURN => 2,
         OP_RETURN_UNDEF | OP_HALT => 1,
+        OP_GET_PROP => 5, // op, Rdst, Robj, Kname:u16
+        OP_SET_PROP => 5, // op, Robj, Kname:u16, Rval
+        OP_CALL => 4, // op, base, nargs, retDst
         _ => return None, // unsupported opcode -> bail (interpreter fallback)
     })
 }
@@ -420,7 +441,7 @@ pub unsafe extern "C" fn jsz_clif_compile_int_block(
     } else {
         unsafe { std::slice::from_raw_parts(kidx_to_slot, n_kidx) }
     };
-    compile_int_block_impl(code, slots, false).unwrap_or(std::ptr::null())
+    compile_int_block_impl(code, slots, false, &[], 0, 0, 0).unwrap_or(std::ptr::null())
 }
 
 /// Phase 12 boxed tier — compile the same opcode subset as
@@ -436,12 +457,22 @@ pub unsafe extern "C" fn jsz_clif_compile_int_block(
 ///
 /// # Safety
 /// `code`/`kidx_to_slot` must point to `len`/`n_kidx` valid elements for the call.
+/// `prop_sites`/`n_prop_sites` give the monomorphic property-access sites in this
+/// region (see `PropSite`); `get_helper` is the address of the Zig
+/// `jsz_jit_get_own(recv, shape, slot, miss)` fast-path callback the native code
+/// invokes at each `GET_PROP` (it sets `*miss` and the region deopts on a miss).
+/// Both are empty/0 when the region has no property access.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jsz_clif_compile_boxed_block(
     code: *const u8,
     len: usize,
     kidx_to_slot: *const i32,
     n_kidx: usize,
+    prop_sites: *const PropSite,
+    n_prop_sites: usize,
+    get_helper: u64,
+    set_helper: u64,
+    call_helper: u64,
 ) -> *const c_void {
     if code.is_null() || len == 0 {
         return std::ptr::null();
@@ -452,7 +483,13 @@ pub unsafe extern "C" fn jsz_clif_compile_boxed_block(
     } else {
         unsafe { std::slice::from_raw_parts(kidx_to_slot, n_kidx) }
     };
-    compile_int_block_impl(code, slots, true).unwrap_or(std::ptr::null())
+    let sites: &[PropSite] = if prop_sites.is_null() || n_prop_sites == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(prop_sites, n_prop_sites) }
+    };
+    compile_int_block_impl(code, slots, true, sites, get_helper, set_helper, call_helper)
+        .unwrap_or(std::ptr::null())
 }
 
 /// Largest integer exactly representable as an f64 (`2^53`). A JS number stays
@@ -678,7 +715,15 @@ fn slot_of(kidx_to_slot: &[i32], kidx: u16) -> Option<i32> {
     }
 }
 
-fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32], boxed: bool) -> Option<*const c_void> {
+fn compile_int_block_impl(
+    code: &[u8],
+    kidx_to_slot: &[i32],
+    boxed: bool,
+    prop_sites: &[PropSite],
+    get_helper: u64,
+    set_helper: u64,
+    call_helper: u64,
+) -> Option<*const c_void> {
     use std::collections::BTreeSet;
 
     // ---- Pass 1: validate + decode reach, collect basic-block leaders. ----
@@ -760,12 +805,59 @@ fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32], boxed: bool) -> Opt
         fb.ins().store(flags, one_i32, deopt_ptr, 0);
         let deopt_ret = fb.ins().iconst(types::I64, 0);
         fb.ins().return_(&[deopt_ret]);
+        // Shared exception trampoline reached when a JITed `CALL` throws: the call
+        // helper has already set `*deopt = 2`, so just return (do NOT overwrite it
+        // like `deopt_block` does — the caller distinguishes 1=deopt from 2=threw).
+        let throw_block = fb.create_block();
+        fb.switch_to_block(throw_block);
+        let throw_ret = fb.ins().iconst(types::I64, 0);
+        fb.ins().return_(&[throw_ret]);
         // Helpers to read/write the in-memory register file.
         let load_reg = |fb: &mut FunctionBuilder, r: u8| -> cranelift_codegen::ir::Value {
             fb.ins().load(types::I64, flags, regs, (r as i32) * 8)
         };
         let store_reg = |fb: &mut FunctionBuilder, r: u8, v: cranelift_codegen::ir::Value| {
             fb.ins().store(flags, v, regs, (r as i32) * 8);
+        };
+
+        // Signature of the Zig property fast-path callback
+        // `fn(recv: u64, key_ptr: [*]const u8, key_len: usize, ic: *anyopaque,
+        //     miss: *i32) -> u64`.
+        let helper_sig = {
+            let mut hs = module.make_signature();
+            hs.params.push(AbiParam::new(types::I64)); // recv bits
+            hs.params.push(AbiParam::new(ptr_ty)); // key ptr
+            hs.params.push(AbiParam::new(types::I64)); // key len
+            hs.params.push(AbiParam::new(ptr_ty)); // ic ptr
+            hs.params.push(AbiParam::new(ptr_ty)); // miss ptr (*i32)
+            hs.returns.push(AbiParam::new(types::I64)); // value bits
+            fb.import_signature(hs)
+        };
+        // Signature of the Zig property STORE callback
+        // `fn(recv: u64, key_ptr, key_len: usize, ic: *anyopaque, val: u64,
+        //     miss: *i32) -> void`.
+        let set_sig = {
+            let mut ss = module.make_signature();
+            ss.params.push(AbiParam::new(types::I64)); // recv bits
+            ss.params.push(AbiParam::new(ptr_ty)); // key ptr
+            ss.params.push(AbiParam::new(types::I64)); // key len
+            ss.params.push(AbiParam::new(ptr_ty)); // ic ptr
+            ss.params.push(AbiParam::new(types::I64)); // value bits
+            ss.params.push(AbiParam::new(ptr_ty)); // miss ptr (*i32)
+            fb.import_signature(ss)
+        };
+        // Signature of the Zig CALL trampoline
+        // `fn(regs: [*]i64, base: u32, nargs: u32, ret_dst: u32, deopt: *i32)`.
+        // It reads callee/args from `regs`, re-enters the interpreter, writes the
+        // result to regs[ret_dst], and sets *deopt (0 = ok, 2 = the callee threw).
+        let call_sig = {
+            let mut cs = module.make_signature();
+            cs.params.push(AbiParam::new(ptr_ty)); // regs ptr
+            cs.params.push(AbiParam::new(types::I32)); // base
+            cs.params.push(AbiParam::new(types::I32)); // nargs
+            cs.params.push(AbiParam::new(types::I32)); // ret_dst
+            cs.params.push(AbiParam::new(ptr_ty)); // deopt ptr
+            fb.import_signature(cs)
         };
 
         let mut cur = entry;
@@ -959,6 +1051,90 @@ fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32], boxed: bool) -> Opt
                         fb.ins().brif(is_true, fblk, &[], tblk, &[]);
                     }
                     terminated = true;
+                }
+                OP_GET_PROP => {
+                    // Boxed tier S3: monomorphic own-data property read. Calls the
+                    // Zig fast-path helper with the baked (shape, slot); the helper
+                    // sets *deopt on a miss (non-object / wrong shape / accessor /
+                    // proto prop) and the region deopts to the interpreter.
+                    if !boxed {
+                        return None;
+                    }
+                    let rdst = code[pc + 1];
+                    let robj = code[pc + 2];
+                    let site = prop_sites.iter().find(|s| s.pc as usize == pc)?;
+                    let recv = load_reg(&mut fb, robj);
+                    let key_p = fb.ins().iconst(ptr_ty, site.key_ptr as i64);
+                    let key_l = fb.ins().iconst(types::I64, site.key_len as i64);
+                    let ic_p = fb.ins().iconst(ptr_ty, site.ic_ptr as i64);
+                    let callee = fb.ins().iconst(ptr_ty, get_helper as i64);
+                    let call = fb.ins().call_indirect(
+                        helper_sig,
+                        callee,
+                        &[recv, key_p, key_l, ic_p, deopt_ptr],
+                    );
+                    let result = fb.inst_results(call)[0];
+                    let missed = fb.ins().load(types::I32, flags, deopt_ptr, 0);
+                    let cont = fb.create_block();
+                    fb.ins().brif(missed, deopt_block, &[], cont, &[]);
+                    fb.switch_to_block(cont);
+                    cur = cont;
+                    store_reg(&mut fb, rdst, result);
+                }
+                OP_SET_PROP => {
+                    // Boxed tier S3e: own-data property store via the Zig helper.
+                    // The helper sets *deopt on a miss (accessor / read-only / new
+                    // prop / wrong shape / non-object) BEFORE storing, so a miss has
+                    // no side effect; the analyzer guarantees no fallible op runs
+                    // after a successful store, so coarse deopt stays sound.
+                    if !boxed {
+                        return None;
+                    }
+                    let robj = code[pc + 1];
+                    let rval = code[pc + 4];
+                    let site = prop_sites.iter().find(|s| s.pc as usize == pc)?;
+                    let recv = load_reg(&mut fb, robj);
+                    let val = load_reg(&mut fb, rval);
+                    let key_p = fb.ins().iconst(ptr_ty, site.key_ptr as i64);
+                    let key_l = fb.ins().iconst(types::I64, site.key_len as i64);
+                    let ic_p = fb.ins().iconst(ptr_ty, site.ic_ptr as i64);
+                    let callee = fb.ins().iconst(ptr_ty, set_helper as i64);
+                    fb.ins().call_indirect(
+                        set_sig,
+                        callee,
+                        &[recv, key_p, key_l, ic_p, val, deopt_ptr],
+                    );
+                    let missed = fb.ins().load(types::I32, flags, deopt_ptr, 0);
+                    let cont = fb.create_block();
+                    fb.ins().brif(missed, deopt_block, &[], cont, &[]);
+                    fb.switch_to_block(cont);
+                    cur = cont;
+                }
+                OP_CALL => {
+                    // Boxed tier S4: re-enter the interpreter for a call. The Zig
+                    // trampoline reads callee/args from the register file, runs the
+                    // call, writes the result into regs[ret_dst], and sets *deopt = 2
+                    // if the callee threw — in which case we return via `throw_block`
+                    // (preserving the 2) so the caller propagates the exception
+                    // WITHOUT re-running the region (the call's side effects already
+                    // happened — the interpreter would have done the same).
+                    if !boxed {
+                        return None;
+                    }
+                    let base = fb.ins().iconst(types::I32, code[pc + 1] as i64);
+                    let nargs = fb.ins().iconst(types::I32, code[pc + 2] as i64);
+                    let ret_dst = fb.ins().iconst(types::I32, code[pc + 3] as i64);
+                    let callee = fb.ins().iconst(ptr_ty, call_helper as i64);
+                    fb.ins().call_indirect(
+                        call_sig,
+                        callee,
+                        &[regs, base, nargs, ret_dst, deopt_ptr],
+                    );
+                    let threw = fb.ins().load(types::I32, flags, deopt_ptr, 0);
+                    let cont = fb.create_block();
+                    fb.ins().brif(threw, throw_block, &[], cont, &[]);
+                    fb.switch_to_block(cont);
+                    cur = cont;
                 }
                 OP_RETURN => {
                     let v = load_reg(&mut fb, code[pc + 1]);
