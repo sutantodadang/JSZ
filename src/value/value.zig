@@ -494,6 +494,26 @@ test "immediate singletons decode and never look like heap pointers" {
     try std.testing.expect(nul.bits != 0 and (nul.bits & 1) == 0);
 }
 
+test "JIT boxed-tier ABI contract: NaN-box constants are pinned" {
+    // The Rust boxed-block compiler (jit-native/src/lib.rs) hardcodes these exact
+    // values to emit tag tests + box/unbox sequences. Changing the encoding here
+    // without updating the Rust mirror would silently miscompile boxed JIT code —
+    // so pin them loudly. See docs/JIT_BOXED_TIER_PLAN.md §1.
+    try std.testing.expectEqual(@as(u64, 0xfffe_0000_0000_0000), NumberTag);
+    try std.testing.expectEqual(@as(u64, 0x0002_0000_0000_0000), DoubleEncodeOffset);
+    try std.testing.expectEqual(@as(u64, 0xfffe_0000_0000_0002), NotCellMask);
+    try std.testing.expectEqual(@as(u64, 0x2), nb_null);
+    try std.testing.expectEqual(@as(u64, 0x6), nb_false);
+    try std.testing.expectEqual(@as(u64, 0x7), nb_true);
+    try std.testing.expectEqual(@as(i64, -2147483648), smi_min);
+    try std.testing.expectEqual(@as(i64, 2147483647), smi_max);
+    // Cross-check the actual codec matches the pinned constants: a boxed SMI has
+    // exactly the NumberTag bits set; an offset-double decodes by subtracting it.
+    try std.testing.expectEqual(NumberTag, Value.fromSmi(123).bits & NumberTag);
+    const d = Value{ .bits = @as(u64, @bitCast(@as(f64, 1.5))) +% DoubleEncodeOffset };
+    try std.testing.expectEqual(@as(f64, 1.5), d.unbox().number);
+}
+
 test "smiArith integer fast-path: exact, range/overflow/-0 aware" {
     const a = Value.fromSmi(3);
     const b = Value.fromSmi(4);

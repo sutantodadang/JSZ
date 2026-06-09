@@ -33,6 +33,10 @@ pub const TryEntry = struct {
     handler_pc: usize,
 };
 
+/// Phase 12: key for the per-loop OSR plan cache — a loop is identified by its
+/// owning function and the bytecode offset of its back-edge `JMP`.
+pub const OsrKey = struct { func: *const BcFunction, pc: u32 };
+
 pub const BcCallFrame = struct {
     func: *const BcFunction,
     pc: usize,
@@ -115,6 +119,10 @@ pub const BcVm = struct {
     /// under `-Djit=true` + `.experimental`). Value is a `*int_fn_jit.JitPlan`
     /// stored opaque (null = analyzed and NOT JIT-able). Empty/unused by default.
     jit_plans: std.AutoHashMapUnmanaged(*const BcFunction, ?*anyopaque) = .empty,
+    /// Phase 12: per-loop OSR plan cache, keyed by (function, back-edge pc). Built
+    /// lazily on the first hot back-edge under `-Djit=true` + `.experimental`;
+    /// value is a `*osr_jit.OsrPlan` stored opaque (null = not OSR-able). Default: empty.
+    osr_plans: std.AutoHashMapUnmanaged(OsrKey, ?*anyopaque) = .empty,
     /// W3: resource limits. 0 = unlimited. Enforced in the dispatch loop and
     /// surfaced as an uncatchable interrupt (returns past any JS try/catch).
     gas_limit: u64 = 0,
@@ -1192,11 +1200,14 @@ pub const BcVm = struct {
                     const new_pc: i64 = @intCast(frame.pc);
                     frame.pc = @intCast(new_pc + offset);
                     if (offset < 0 and self.noteBackedge(frame.func, op_site)) {
-                        // Hot loop back-edge in experimental mode: try to run the
-                        // remaining iterations natively (count-loop kernel). On
-                        // success, jump straight to the loop exit; otherwise keep
-                        // interpreting (graceful deopt).
-                        if (loop_jit.tryFastForwardLoop(
+                        // Hot loop back-edge in experimental mode. First try general
+                        // OSR (the whole loop body compiled to native code — handles
+                        // arbitrary control flow); fall back to the closed-form
+                        // template recognizer; then deopt. On success jump straight
+                        // to the loop exit, else keep interpreting (graceful deopt).
+                        if (try self.tryOsrLoop(frame.func, op_site, frame.env, frame.registers)) |exit_pc| {
+                            frame.pc = exit_pc;
+                        } else if (loop_jit.tryFastForwardLoop(
                             self.arena,
                             code,
                             frame.func.chunk.constants,
@@ -2992,12 +3003,43 @@ pub const BcVm = struct {
             const plan_ptr = gop.value_ptr.* orelse return false;
             const plan: *ifj.JitPlan = @ptrCast(@alignCast(plan_ptr));
 
-            const result = try ifj.run(self.arena, plan, args_buf[0..nargs]);
+            // null = the native code hit an overflow guard (a result escaped
+            // ±2^53); discard and re-run the call in the interpreter (sound: the
+            // JITed function is a side-effect-free pure-int leaf).
+            const result = (try ifj.run(self.arena, plan, args_buf[0..nargs])) orelse return false;
             // No JS re-entry happened (pure-int leaf), but re-fetch defensively.
             self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
             return true;
         }
         return false;
+    }
+
+    /// Phase 12: attempt general loop OSR at a hot back-edge `JMP` (op at
+    /// `jmp_pc`). On success the loop has run to completion natively and the live
+    /// integer vars were written back; returns the absolute exit PC to resume at.
+    /// Returns null to keep interpreting (not OSR-able, a live value wasn't an
+    /// integer, or an overflow deopt — in all cases the env is left untouched).
+    /// Entirely comptime-elided unless built with `-Djit=true`.
+    fn tryOsrLoop(self: *BcVm, func: *const BcFunction, jmp_pc: usize, env: *Environment, registers: []Value) !?usize {
+        if (comptime build_options.jit_enabled) {
+            const jc = self.jit orelse return null;
+            if (jc.mode != .experimental) return null;
+            const osr = @import("../jit/osr_jit.zig");
+            const key = OsrKey{ .func = func, .pc = @intCast(jmp_pc) };
+            const gop = try self.osr_plans.getOrPut(self.arena, key);
+            if (!gop.found_existing) {
+                const plan = try osr.analyze(self.arena, func, jmp_pc);
+                gop.value_ptr.* = if (plan) |p| @as(?*anyopaque, @ptrCast(p)) else null;
+            }
+            const plan_ptr = gop.value_ptr.* orelse return null;
+            const plan: *osr.OsrPlan = @ptrCast(@alignCast(plan_ptr));
+            if (osr.run(self.arena, plan, env, registers)) |exit_pc| {
+                jc.compiled += 1;
+                return exit_pc;
+            }
+            return null;
+        }
+        return null;
     }
 
     fn doCall(self: *BcVm, callee_val: Value, this_val: Value, base: u8, nargs: u8, ret_dst: u8) !?[]const u8 {
@@ -4229,6 +4271,101 @@ test "Phase 12: JIT experimental runs a pure-int function (interp/native parity)
     try std.testing.expectEqual(@as(f64, 4950), result.unbox().number);
     if (comptime build_options.jit_enabled) {
         // Under -Djit=true the analyzer must have compiled `sum` to native code.
+        try std.testing.expect(jc.compiled > 0);
+    }
+}
+
+test "Phase 12: general loop OSR runs a branchy pure-int loop natively" {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `f` is NOT a JIT-able leaf (the string `var junk` makes the whole-function
+    // analyzer bail), so it runs interpreted — and its hot loop back-edge triggers
+    // general OSR. The loop body contains an `if`, which the closed-form template
+    // recognizer cannot fast-forward, so a native compile here proves OSR fired.
+    // s counts i in [0,1000) over i in [0,2000) → 1000.
+    const src =
+        "function f(n){ var junk=\"x\"; var s=0; var i=0;" ++
+        " while(i<n){ if(i<1000){ s=s+1; } i=i+1; } return s+junk.length-1; }" ++
+        " f(2000);";
+    var p = parser_mod.Parser.init(src, arena);
+    const pr = p.parseScript();
+    const stmts = switch (pr) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast_mod.Program{ .body = stmts };
+    const main_func = try compiler_mod.compileProgram(arena, &prog, "<test>");
+
+    var realm = try Realm.init(arena);
+    defer realm.deinit();
+
+    var jc = jit_mod.JitCompiler.initMode(std.testing.allocator, .experimental);
+    defer jc.deinit();
+    jc.hot_threshold = 50; // fire OSR early so most iterations run natively.
+
+    var vm = BcVm.init(arena, &realm);
+    vm.jit = &jc;
+    const outcome = try vm.run(main_func, @ptrCast(realm.global_env));
+    const result = switch (outcome) {
+        .ok => |v| v,
+        else => return error.DidNotComplete,
+    };
+    // s = 1000; junk.length-1 = 0 → 1000, identical interpreted or OSR-compiled.
+    try std.testing.expectEqual(@as(f64, 1000), result.unbox().number);
+    if (comptime build_options.jit_enabled) {
+        // Under -Djit=true the branchy loop must have been OSR-compiled to native
+        // code (the template recognizer cannot handle the in-loop `if`).
+        try std.testing.expect(jc.compiled > 0);
+    }
+}
+
+test "Phase 12: loop OSR handles an early break (loop-exit edge)" {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Hot loop with a `break` — exercises the OSR loop-exit machinery (a forward
+    // out-of-region edge). `junk` forces the non-leaf path so OSR (not the leaf
+    // analyzer) compiles the loop. Counts to the break at i==1500 → s = 1500.
+    const src =
+        "function g(n){ var junk=\"x\"; var s=0; var i=0;" ++
+        " while(i<n){ if(i==1500){ break; } s=s+1; i=i+1; } return s+junk.length-1; }" ++
+        " g(5000);";
+    var p = parser_mod.Parser.init(src, arena);
+    const pr = p.parseScript();
+    const stmts = switch (pr) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast_mod.Program{ .body = stmts };
+    const main_func = try compiler_mod.compileProgram(arena, &prog, "<test>");
+
+    var realm = try Realm.init(arena);
+    defer realm.deinit();
+
+    var jc = jit_mod.JitCompiler.initMode(std.testing.allocator, .experimental);
+    defer jc.deinit();
+    jc.hot_threshold = 50;
+
+    var vm = BcVm.init(arena, &realm);
+    vm.jit = &jc;
+    const outcome = try vm.run(main_func, @ptrCast(realm.global_env));
+    const result = switch (outcome) {
+        .ok => |v| v,
+        else => return error.DidNotComplete,
+    };
+    try std.testing.expectEqual(@as(f64, 1500), result.unbox().number);
+    if (comptime build_options.jit_enabled) {
         try std.testing.expect(jc.compiled > 0);
     }
 }

@@ -14,8 +14,8 @@
 
 use std::ffi::c_void;
 
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, MemFlags, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -384,9 +384,9 @@ fn is_terminator(op: u8) -> bool {
 
 /// Compile a monomorphic-int bytecode function to native code.
 ///
-/// Returns `fn(regs: *mut i64, consts: *const i64, locals: *mut i64) -> i64`
-/// (the RETURNed value), or null if the bytecode uses an unsupported opcode or
-/// references a non-local name.
+/// Returns `fn(regs: *mut i64, consts: *const i64, locals: *mut i64,
+/// deopt: *mut i32) -> i64` (the RETURNed value), or null if the bytecode uses
+/// an unsupported opcode or references a non-local name.
 ///
 /// `kidx_to_slot[k]` maps a constant-pool index `k` (the name operand of
 /// `GET_GLOBAL`/`SET_GLOBAL`/`DEFINE_GLOBAL`) to a dense `locals` slot, or a
@@ -394,6 +394,13 @@ fn is_terminator(op: u8) -> bool {
 /// global, a closure-captured var, etc.) — any such access aborts compilation so
 /// the caller keeps interpreting. `locals` holds the unboxed-i64 function-local
 /// variables; the caller marshals them in and out around the call.
+///
+/// Every arithmetic op guards its result against ±2^53 (the f64-exact integer
+/// range). If any intermediate escapes, the function writes `1` through `deopt`
+/// and returns early; the caller then discards the result and re-runs the call in
+/// the interpreter (sound because the JITed function is a side-effect-free leaf).
+/// This makes the fast path bit-exact with JS number semantics — no speculative
+/// large-integer rounding boundary remains.
 ///
 /// # Safety
 /// `code`/`kidx_to_slot` must point to `len`/`n_kidx` valid elements for the call.
@@ -413,7 +420,248 @@ pub unsafe extern "C" fn jsz_clif_compile_int_block(
     } else {
         unsafe { std::slice::from_raw_parts(kidx_to_slot, n_kidx) }
     };
-    compile_int_block_impl(code, slots).unwrap_or(std::ptr::null())
+    compile_int_block_impl(code, slots, false).unwrap_or(std::ptr::null())
+}
+
+/// Phase 12 boxed tier — compile the same opcode subset as
+/// `jsz_clif_compile_int_block`, but treating every `regs`/`locals`/`consts` slot
+/// as a raw boxed `Value` (`bits: u64`, WebKit NaN-box) instead of an unboxed i64.
+/// Arithmetic guards both operands are SMI (else sets `deopt` and returns), runs
+/// the i128 + 2^53 overflow guard, then re-boxes the result via `makeNumber`
+/// semantics (SMI when it fits i32, else an offset-double). The returned value is
+/// itself a boxed `Value`. This is the foundation of the non-leaf tier: the
+/// register file now carries boxed values, so later slices can add property
+/// access, calls, and full float arithmetic on the same ABI. See
+/// docs/JIT_BOXED_TIER_PLAN.md.
+///
+/// # Safety
+/// `code`/`kidx_to_slot` must point to `len`/`n_kidx` valid elements for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jsz_clif_compile_boxed_block(
+    code: *const u8,
+    len: usize,
+    kidx_to_slot: *const i32,
+    n_kidx: usize,
+) -> *const c_void {
+    if code.is_null() || len == 0 {
+        return std::ptr::null();
+    }
+    let code = unsafe { std::slice::from_raw_parts(code, len) };
+    let slots: &[i32] = if kidx_to_slot.is_null() || n_kidx == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(kidx_to_slot, n_kidx) }
+    };
+    compile_int_block_impl(code, slots, true).unwrap_or(std::ptr::null())
+}
+
+/// Largest integer exactly representable as an f64 (`2^53`). A JS number stays
+/// bit-exact with its i64 image only while it stays within ±this; the moment an
+/// arithmetic result escapes the range, deferred i64 rounding would diverge from
+/// per-op f64 rounding. So every arithmetic op guards its result against it.
+const F64_SAFE_INT: i64 = 9_007_199_254_740_992;
+
+/// Emit the per-op overflow guard. `val` is the i128 result of an arithmetic op
+/// (operands sign-extended to i128 so the op itself can never wrap). If
+/// |val| > 2^53 the guard branches to `deopt_block` (which flags + returns);
+/// otherwise control continues in a fresh block where `val` is narrowed back to
+/// i64. Returns `(narrowed_i64, continuation_block)` — the caller must set its
+/// current block to the continuation.
+fn guard_i128_to_i64(fb: &mut FunctionBuilder, deopt_block: Block, val: Value) -> (Value, Block) {
+    let lim64 = fb.ins().iconst(types::I64, F64_SAFE_INT);
+    let lim = fb.ins().sextend(types::I128, lim64);
+    let neg = fb.ins().ineg(lim);
+    let too_hi = fb.ins().icmp(IntCC::SignedGreaterThan, val, lim);
+    let too_lo = fb.ins().icmp(IntCC::SignedLessThan, val, neg);
+    let bad = fb.ins().bor(too_hi, too_lo);
+    let cont = fb.create_block();
+    fb.ins().brif(bad, deopt_block, &[], cont, &[]);
+    fb.switch_to_block(cont);
+    let narrowed = fb.ins().ireduce(types::I64, val);
+    (narrowed, cont)
+}
+
+// ---- WebKit JSVALUE64 NaN-box ABI (mirror of src/value/value.zig). ----
+// Pinned by a Zig comptime contract test on the Zig side.
+const NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;
+const DOUBLE_ENCODE_OFFSET: i64 = 0x0002_0000_0000_0000; // 1 << 49
+const NB_FALSE: i64 = 0x6;
+const NB_TRUE: i64 = 0x7;
+const I32_MIN_I64: i64 = -2147483648;
+const I32_MAX_I64: i64 = 2147483647;
+
+/// `(bits & NumberTag) == NumberTag` — true when `v` is an inline int32 SMI.
+fn emit_is_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
+    let masked = fb.ins().band_imm(v, NUMBER_TAG as i64);
+    fb.ins().icmp_imm(IntCC::Equal, masked, NUMBER_TAG as i64)
+}
+
+/// Decode an SMI payload: `sext_i64(i32(bits & 0xffffffff))`. Caller guards isSmi.
+fn emit_unbox_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
+    let lo = fb.ins().band_imm(v, 0xffff_ffff);
+    let i32v = fb.ins().ireduce(types::I32, lo);
+    fb.ins().sextend(types::I64, i32v)
+}
+
+/// Box an i64 back to a `Value` exactly as `value.zig:makeNumber`: an SMI when it
+/// fits i32, else an offset-double. Fragments the CFG (range branch) — returns
+/// the boxed value and the merge block; the caller must set its current block.
+fn emit_box_i64(fb: &mut FunctionBuilder, r: Value) -> (Value, Block) {
+    let smi_blk = fb.create_block();
+    let dbl_blk = fb.create_block();
+    let done = fb.create_block();
+    fb.append_block_param(done, types::I64);
+    let ge = fb.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, r, I32_MIN_I64);
+    let le = fb.ins().icmp_imm(IntCC::SignedLessThanOrEqual, r, I32_MAX_I64);
+    let in_range = fb.ins().band(ge, le);
+    fb.ins().brif(in_range, smi_blk, &[], dbl_blk, &[]);
+    // SMI: NumberTag | (u32)r
+    fb.switch_to_block(smi_blk);
+    let lo = fb.ins().ireduce(types::I32, r);
+    let lou = fb.ins().uextend(types::I64, lo);
+    let smi = fb.ins().bor_imm(lou, NUMBER_TAG as i64);
+    fb.ins().jump(done, &[smi.into()]);
+    // Double: bitcast_u64((f64)r) + DoubleEncodeOffset
+    fb.switch_to_block(dbl_blk);
+    let d = fb.ins().fcvt_from_sint(types::F64, r);
+    let dbits = fb.ins().bitcast(types::I64, MemFlags::new(), d);
+    let boxed = fb.ins().iadd_imm(dbits, DOUBLE_ENCODE_OFFSET);
+    fb.ins().jump(done, &[boxed.into()]);
+    fb.switch_to_block(done);
+    (fb.block_params(done)[0], done)
+}
+
+/// `(bits & NumberTag) != 0` — true when `v` is any number (SMI or double).
+fn emit_is_number(fb: &mut FunctionBuilder, v: Value) -> Value {
+    let masked = fb.ins().band_imm(v, NUMBER_TAG as i64);
+    fb.ins().icmp_imm(IntCC::NotEqual, masked, 0)
+}
+
+/// Decode a boxed number to f64 (branchless select): SMI payload as f64, or the
+/// offset-double. Caller guards `isNumber`.
+fn emit_to_f64(fb: &mut FunctionBuilder, v: Value) -> Value {
+    let is = emit_is_smi(fb, v);
+    let xi = emit_unbox_smi(fb, v);
+    let xf = fb.ins().fcvt_from_sint(types::F64, xi);
+    let dbits = fb.ins().iadd_imm(v, -DOUBLE_ENCODE_OFFSET); // v - offset
+    let df = fb.ins().bitcast(types::F64, MemFlags::new(), dbits);
+    fb.ins().select(is, xf, df)
+}
+
+/// Box an f64 back to a `Value` exactly as `value.zig:makeNumber`: an SMI when it
+/// is an integer in i32 range AND not `-0`, else an offset-double. Fragments the
+/// CFG; returns the boxed value and the merge block.
+fn emit_box_f64(fb: &mut FunctionBuilder, f: Value) -> (Value, Block) {
+    let smi_blk = fb.create_block();
+    let dbl_blk = fb.create_block();
+    let done = fb.create_block();
+    fb.append_block_param(done, types::I64);
+    let tf = fb.ins().trunc(f);
+    let is_int = fb.ins().fcmp(FloatCC::Equal, f, tf);
+    let lo_c = fb.ins().f64const(I32_MIN_I64 as f64);
+    let hi_c = fb.ins().f64const(I32_MAX_I64 as f64);
+    let ge = fb.ins().fcmp(FloatCC::GreaterThanOrEqual, f, lo_c);
+    let le = fb.ins().fcmp(FloatCC::LessThanOrEqual, f, hi_c);
+    let int_and_ge = fb.ins().band(is_int, ge);
+    let in_range = fb.ins().band(int_and_ge, le);
+    // Exclude -0.0 (f == 0 with the sign bit set) — it must stay a double.
+    let zero = fb.ins().f64const(0.0);
+    let is_zero = fb.ins().fcmp(FloatCC::Equal, f, zero);
+    let fbits = fb.ins().bitcast(types::I64, MemFlags::new(), f);
+    let signed = fb.ins().icmp_imm(IntCC::SignedLessThan, fbits, 0);
+    let neg_zero = fb.ins().band(is_zero, signed);
+    let not_nz = fb.ins().bxor_imm(neg_zero, 1);
+    let smi_ok = fb.ins().band(in_range, not_nz);
+    fb.ins().brif(smi_ok, smi_blk, &[], dbl_blk, &[]);
+    // SMI: NumberTag | (u32)(i32)f
+    fb.switch_to_block(smi_blk);
+    let i32v = fb.ins().fcvt_to_sint_sat(types::I32, f);
+    let lou = fb.ins().uextend(types::I64, i32v);
+    let smi = fb.ins().bor_imm(lou, NUMBER_TAG as i64);
+    fb.ins().jump(done, &[smi.into()]);
+    // Double: bitcast_u64(f) + DoubleEncodeOffset
+    fb.switch_to_block(dbl_blk);
+    let dbits = fb.ins().bitcast(types::I64, MemFlags::new(), f);
+    let boxed = fb.ins().iadd_imm(dbits, DOUBLE_ENCODE_OFFSET);
+    fb.ins().jump(done, &[boxed.into()]);
+    fb.switch_to_block(done);
+    (fb.block_params(done)[0], done)
+}
+
+/// Boxed binary number op (`+`/`-`/`*`) matching the interpreter's semantics:
+/// guard both operands numeric (else deopt); when both are SMI use the exact i128
+/// integer path with the 2^53 guard, otherwise compute in f64; re-box via
+/// `makeNumber`. `MUL` whose integer result is `0` is routed through f64 so a JS
+/// `-0` (e.g. `-1 * 0`) is preserved. Returns `(boxed, merge_block)`.
+fn emit_boxed_num_binop(
+    fb: &mut FunctionBuilder,
+    deopt_block: Block,
+    l: Value,
+    r: Value,
+    op: u8,
+) -> (Value, Block) {
+    let lnum = emit_is_number(fb, l);
+    let rnum = emit_is_number(fb, r);
+    let both_num = fb.ins().band(lnum, rnum);
+    let numeric = fb.create_block();
+    fb.ins().brif(both_num, numeric, &[], deopt_block, &[]);
+    fb.switch_to_block(numeric);
+
+    let lsmi = emit_is_smi(fb, l);
+    let rsmi = emit_is_smi(fb, r);
+    let both_smi = fb.ins().band(lsmi, rsmi);
+    let int_blk = fb.create_block();
+    let f64_blk = fb.create_block();
+    let done = fb.create_block();
+    fb.append_block_param(done, types::I64);
+    fb.ins().brif(both_smi, int_blk, &[], f64_blk, &[]);
+
+    // ---- Both SMI: exact integer path. ----
+    fb.switch_to_block(int_blk);
+    let x = emit_unbox_smi(fb, l);
+    let y = emit_unbox_smi(fb, r);
+    let x128 = fb.ins().sextend(types::I128, x);
+    let y128 = fb.ins().sextend(types::I128, y);
+    let wide = match op {
+        OP_ADD => fb.ins().iadd(x128, y128),
+        OP_SUB => fb.ins().isub(x128, y128),
+        _ => fb.ins().imul(x128, y128),
+    };
+    let (narrowed, _c) = guard_i128_to_i64(fb, deopt_block, wide);
+    if op == OP_MUL {
+        // A 0 product may actually be -0 (e.g. -1 * 0): box via f64 to keep sign.
+        let zbox = fb.create_block();
+        let ibox = fb.create_block();
+        let is_zero = fb.ins().icmp_imm(IntCC::Equal, narrowed, 0);
+        fb.ins().brif(is_zero, zbox, &[], ibox, &[]);
+        fb.switch_to_block(zbox);
+        let xf = fb.ins().fcvt_from_sint(types::F64, x);
+        let yf = fb.ins().fcvt_from_sint(types::F64, y);
+        let p = fb.ins().fmul(xf, yf);
+        let (b, _d) = emit_box_f64(fb, p);
+        fb.ins().jump(done, &[b.into()]);
+        fb.switch_to_block(ibox);
+        let (b2, _d2) = emit_box_i64(fb, narrowed);
+        fb.ins().jump(done, &[b2.into()]);
+    } else {
+        let (b, _d) = emit_box_i64(fb, narrowed);
+        fb.ins().jump(done, &[b.into()]);
+    }
+
+    // ---- At least one double (both numeric): f64 path. ----
+    fb.switch_to_block(f64_blk);
+    let lf = emit_to_f64(fb, l);
+    let rf = emit_to_f64(fb, r);
+    let f = match op {
+        OP_ADD => fb.ins().fadd(lf, rf),
+        OP_SUB => fb.ins().fsub(lf, rf),
+        _ => fb.ins().fmul(lf, rf),
+    };
+    let (b, _d) = emit_box_f64(fb, f);
+    fb.ins().jump(done, &[b.into()]);
+
+    fb.switch_to_block(done);
+    (fb.block_params(done)[0], done)
 }
 
 /// Resolve a constant-pool index to a `locals` slot, or `None` to abort.
@@ -430,7 +678,7 @@ fn slot_of(kidx_to_slot: &[i32], kidx: u16) -> Option<i32> {
     }
 }
 
-fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32]) -> Option<*const c_void> {
+fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32], boxed: bool) -> Option<*const c_void> {
     use std::collections::BTreeSet;
 
     // ---- Pass 1: validate + decode reach, collect basic-block leaders. ----
@@ -464,7 +712,7 @@ fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32]) -> Option<*const c_
         pc = next;
     }
 
-    // ---- Build the module + signature: fn(*mut i64, *const i64) -> i64. ----
+    // ---- Build module + signature: fn(*mut i64,*const i64,*mut i64,*mut i32)->i64. ----
     let mut module = make_module()?;
     let ptr_ty = module.target_config().pointer_type();
     let mut ctx = module.make_context();
@@ -472,6 +720,7 @@ fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32]) -> Option<*const c_
     sig.params.push(AbiParam::new(ptr_ty)); // regs: *mut i64
     sig.params.push(AbiParam::new(ptr_ty)); // consts: *const i64
     sig.params.push(AbiParam::new(ptr_ty)); // locals: *mut i64
+    sig.params.push(AbiParam::new(ptr_ty)); // deopt: *mut i32 (overflow flag)
     sig.returns.push(AbiParam::new(types::I64));
     ctx.func.signature = sig;
 
@@ -496,9 +745,21 @@ fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32]) -> Option<*const c_
         let regs = fb.block_params(entry)[0];
         let consts = fb.block_params(entry)[1];
         let locals = fb.block_params(entry)[2];
+        let deopt_ptr = fb.block_params(entry)[3];
         fb.ins().jump(blocks[&0], &[]);
 
         let flags = MemFlags::trusted();
+
+        // Shared deopt trampoline reached when an arithmetic result escapes the
+        // f64-exact range: set `*deopt = 1` and return 0 (the value is discarded
+        // by the caller, which re-runs the call in the interpreter). `deopt_ptr`
+        // is defined in `entry`, which dominates this block, so the use is valid.
+        let deopt_block = fb.create_block();
+        fb.switch_to_block(deopt_block);
+        let one_i32 = fb.ins().iconst(types::I32, 1);
+        fb.ins().store(flags, one_i32, deopt_ptr, 0);
+        let deopt_ret = fb.ins().iconst(types::I64, 0);
+        fb.ins().return_(&[deopt_ret]);
         // Helpers to read/write the in-memory register file.
         let load_reg = |fb: &mut FunctionBuilder, r: u8| -> cranelift_codegen::ir::Value {
             fb.ins().load(types::I64, flags, regs, (r as i32) * 8)
@@ -533,12 +794,13 @@ fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32]) -> Option<*const c_
                     store_reg(&mut fb, rdst, v);
                 }
                 OP_LOAD_TRUE => {
-                    let one = fb.ins().iconst(types::I64, 1);
-                    store_reg(&mut fb, code[pc + 1], one);
+                    // Boxed mode stores the NaN-box immediate; int mode a raw 1.
+                    let t = fb.ins().iconst(types::I64, if boxed { NB_TRUE } else { 1 });
+                    store_reg(&mut fb, code[pc + 1], t);
                 }
                 OP_LOAD_FALSE => {
-                    let zero = fb.ins().iconst(types::I64, 0);
-                    store_reg(&mut fb, code[pc + 1], zero);
+                    let f = fb.ins().iconst(types::I64, if boxed { NB_FALSE } else { 0 });
+                    store_reg(&mut fb, code[pc + 1], f);
                 }
                 OP_LOAD_UNDEF => {
                     // Monomorphic-int model: undefined is 0. Sound only because the
@@ -572,27 +834,80 @@ fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32]) -> Option<*const c_
                 OP_ADD | OP_SUB | OP_MUL => {
                     let l = load_reg(&mut fb, code[pc + 2]);
                     let r = load_reg(&mut fb, code[pc + 3]);
-                    let res = match op {
-                        OP_ADD => fb.ins().iadd(l, r),
-                        OP_SUB => fb.ins().isub(l, r),
-                        _ => fb.ins().imul(l, r),
-                    };
-                    store_reg(&mut fb, code[pc + 1], res);
+                    if boxed {
+                        // Guard both numeric (else deopt); SMI→exact i128 path,
+                        // else f64; re-box (makeNumber), preserving -0 on MUL.
+                        let (res, done) = emit_boxed_num_binop(&mut fb, deopt_block, l, r, op);
+                        cur = done;
+                        store_reg(&mut fb, code[pc + 1], res);
+                    } else {
+                        // Unboxed i64: sign-extend so the op cannot wrap, guard 2^53.
+                        let l128 = fb.ins().sextend(types::I128, l);
+                        let r128 = fb.ins().sextend(types::I128, r);
+                        let wide = match op {
+                            OP_ADD => fb.ins().iadd(l128, r128),
+                            OP_SUB => fb.ins().isub(l128, r128),
+                            _ => fb.ins().imul(l128, r128),
+                        };
+                        let (res, cont) = guard_i128_to_i64(&mut fb, deopt_block, wide);
+                        cur = cont;
+                        store_reg(&mut fb, code[pc + 1], res);
+                    }
                 }
                 OP_INC | OP_DEC => {
                     let v = load_reg(&mut fb, code[pc + 2]);
-                    let res = if op == OP_INC {
-                        fb.ins().iadd_imm(v, 1)
+                    if boxed {
+                        // Guard SMI (else deopt), ±1 in i128 + 2^53 guard, re-box.
+                        let is = emit_is_smi(&mut fb, v);
+                        let ok = fb.create_block();
+                        fb.ins().brif(is, ok, &[], deopt_block, &[]);
+                        fb.switch_to_block(ok);
+                        let x = emit_unbox_smi(&mut fb, v);
+                        let x128 = fb.ins().sextend(types::I128, x);
+                        let one64 = fb.ins().iconst(types::I64, 1);
+                        let one = fb.ins().sextend(types::I128, one64);
+                        let wide = if op == OP_INC {
+                            fb.ins().iadd(x128, one)
+                        } else {
+                            fb.ins().isub(x128, one)
+                        };
+                        let (narrowed, _c) = guard_i128_to_i64(&mut fb, deopt_block, wide);
+                        let (res, done) = emit_box_i64(&mut fb, narrowed);
+                        cur = done;
+                        store_reg(&mut fb, code[pc + 1], res);
                     } else {
-                        fb.ins().iadd_imm(v, -1)
-                    };
-                    store_reg(&mut fb, code[pc + 1], res);
+                        let v128 = fb.ins().sextend(types::I128, v);
+                        let one64 = fb.ins().iconst(types::I64, 1);
+                        let one = fb.ins().sextend(types::I128, one64);
+                        let wide = if op == OP_INC {
+                            fb.ins().iadd(v128, one)
+                        } else {
+                            fb.ins().isub(v128, one)
+                        };
+                        let (res, cont) = guard_i128_to_i64(&mut fb, deopt_block, wide);
+                        cur = cont;
+                        store_reg(&mut fb, code[pc + 1], res);
+                    }
                 }
                 OP_NOT => {
                     let v = load_reg(&mut fb, code[pc + 2]);
-                    let c = fb.ins().icmp_imm(IntCC::Equal, v, 0);
-                    let r = fb.ins().uextend(types::I64, c);
-                    store_reg(&mut fb, code[pc + 1], r);
+                    if boxed {
+                        // Guard SMI (else deopt); result is a raw 0/1 consumed by the
+                        // immediately-following conditional jump (never re-boxed).
+                        let is = emit_is_smi(&mut fb, v);
+                        let ok = fb.create_block();
+                        fb.ins().brif(is, ok, &[], deopt_block, &[]);
+                        fb.switch_to_block(ok);
+                        cur = ok;
+                        let x = emit_unbox_smi(&mut fb, v);
+                        let c = fb.ins().icmp_imm(IntCC::Equal, x, 0);
+                        let r = fb.ins().uextend(types::I64, c);
+                        store_reg(&mut fb, code[pc + 1], r);
+                    } else {
+                        let c = fb.ins().icmp_imm(IntCC::Equal, v, 0);
+                        let r = fb.ins().uextend(types::I64, c);
+                        store_reg(&mut fb, code[pc + 1], r);
+                    }
                 }
                 OP_EQ | OP_NEQ | OP_SEQ | OP_SNEQ | OP_LT | OP_LE | OP_GT | OP_GE => {
                     let l = load_reg(&mut fb, code[pc + 2]);
@@ -605,7 +920,20 @@ fn compile_int_block_impl(code: &[u8], kidx_to_slot: &[i32]) -> Option<*const c_
                         OP_GT => IntCC::SignedGreaterThan,
                         _ => IntCC::SignedGreaterThanOrEqual,
                     };
-                    let c = fb.ins().icmp(cc, l, r);
+                    let (lv, rv) = if boxed {
+                        // Guard both SMI (else deopt), then compare unboxed payloads.
+                        let lsmi = emit_is_smi(&mut fb, l);
+                        let rsmi = emit_is_smi(&mut fb, r);
+                        let both = fb.ins().band(lsmi, rsmi);
+                        let ok = fb.create_block();
+                        fb.ins().brif(both, ok, &[], deopt_block, &[]);
+                        fb.switch_to_block(ok);
+                        cur = ok;
+                        (emit_unbox_smi(&mut fb, l), emit_unbox_smi(&mut fb, r))
+                    } else {
+                        (l, r)
+                    };
+                    let c = fb.ins().icmp(cc, lv, rv);
                     let res = fb.ins().uextend(types::I64, c);
                     store_reg(&mut fb, code[pc + 1], res);
                 }

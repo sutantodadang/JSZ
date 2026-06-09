@@ -19,11 +19,13 @@
 //!     escapes into a stored/returned value (it only gates a branch).
 //!   * not a generator/async function.
 //!
-//! ## Known speculative boundary
-//! Integer arithmetic runs in i64 and is re-boxed at the end. For results that
-//! stay within ±2^53 this matches JS number semantics exactly; beyond that the
-//! deferred rounding can diverge from per-op f64 rounding. Acceptable for the
-//! opt-in experimental tier; a future slice adds per-op overflow deopt.
+//! ## Overflow handling (exact, no speculative boundary)
+//! Each arithmetic op in the native code computes in i128 and guards its result
+//! against ±2^53 (the f64-exact integer range). If any intermediate escapes, the
+//! native function sets an out-flag and returns early; `run` then reports a deopt
+//! (returns null) and the caller re-runs the call in the interpreter. Because a
+//! JITed function is a side-effect-free pure-int leaf, re-interpreting from
+//! scratch is sound. So the fast path is bit-exact with JS number semantics.
 const std = @import("std");
 const val_mod = @import("../value/value.zig");
 const Value = val_mod.Value;
@@ -42,8 +44,9 @@ extern fn jsz_clif_compile_int_block(
     n_kidx: usize,
 ) ?*const anyopaque;
 
-/// Native `fn(regs, consts, locals) -> i64` produced by the int-block compiler.
-pub const IntBlockFn = *const fn (regs: [*]i64, consts: [*]const i64, locals: [*]i64) callconv(.c) i64;
+/// Native `fn(regs, consts, locals, deopt) -> i64` produced by the int-block
+/// compiler. `deopt` is set to 1 when an arithmetic result escapes ±2^53.
+pub const IntBlockFn = *const fn (regs: [*]i64, consts: [*]const i64, locals: [*]i64, deopt: *i32) callconv(.c) i64;
 
 fn compileNative(code: []const u8, kidx_to_slot: []const i32) ?IntBlockFn {
     const map_ptr: ?[*]const i32 = if (kidx_to_slot.len == 0) null else kidx_to_slot.ptr;
@@ -225,8 +228,11 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction) !?*JitPlan {
 }
 
 /// Run `plan` for a call with `args` (all guaranteed SMI by the caller).
-/// Returns the re-boxed result Value. Params occupy local slots 0..arity-1.
-pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, args: []const Value) !Value {
+/// Returns the re-boxed result Value, or null to signal a deopt — an arithmetic
+/// result escaped ±2^53, so the caller must re-run the call in the interpreter
+/// (sound: a JITed function is a side-effect-free pure-int leaf). Params occupy
+/// local slots 0..arity-1.
+pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, args: []const Value) !?Value {
     const regs = try arena.alloc(i64, if (plan.num_regs > 0) plan.num_regs else 1);
     @memset(regs, 0);
     const locals = try arena.alloc(i64, if (plan.n_slots > 0) plan.n_slots else 1);
@@ -235,8 +241,10 @@ pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, args: []const Value) 
     while (i < args.len and i < plan.n_slots) : (i += 1) {
         locals[i] = args[i].smiValue();
     }
-    const r = plan.code_fn(regs.ptr, plan.consts.ptr, locals.ptr);
-    // Re-box: SMI when it fits i32, else a heap double.
+    var deopt: i32 = 0;
+    const r = plan.code_fn(regs.ptr, plan.consts.ptr, locals.ptr, &deopt);
+    if (deopt != 0) return null; // overflow past 2^53 — fall back to interpreter.
+    // Re-box: SMI when it fits i32, else a heap double (exact: |r| <= 2^53).
     if (r >= -2147483648 and r <= 2147483647) return Value.fromSmi(r);
-    return val_mod.makeNumber(arena, @floatFromInt(r));
+    return try val_mod.makeNumber(arena, @floatFromInt(r));
 }
