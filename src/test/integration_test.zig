@@ -171,6 +171,90 @@ test "S6: JIT direct native-to-native call avoids interpreter frame" {
     try std.testing.expectEqual(@as(usize, 1), ctx.lastFrameHighWater());
 }
 
+test "S7: JIT closure correctness: outer creates inner, inner runs via interpreter correctly" {
+    if (!build_options.jit_enabled) return error.SkipZigTest;
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setJitMode(.experimental);
+
+    const result = ctx.eval(
+        \\function makeAdder(n) { return function(x) { return x + n; }; }
+        \\makeAdder(0)(0);
+        \\makeAdder(10)(32);
+    , "<jit-s7-closure>");
+    const v = switch (result) {
+        .ok => |x| x,
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+    try std.testing.expectEqual(@as(f64, 42), v.toF64());
+}
+
+test "JIT double INC/DEC: increment a double stays numeric" {
+    if (!build_options.jit_enabled) return error.SkipZigTest;
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setJitMode(.experimental);
+
+    const result = ctx.eval(
+        \\function inc(x) { return x + 1; }
+        \\inc(0.5);
+        \\inc(0.5);
+    , "<jit-inc-double>");
+    const v = switch (result) {
+        .ok => |x| x,
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+    try std.testing.expectEqual(@as(f64, 1.5), v.toF64());
+}
+
+test "JIT double compare: compare doubles gives correct numeric result" {
+    if (!build_options.jit_enabled) return error.SkipZigTest;
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setJitMode(.experimental);
+
+    const result = ctx.eval(
+        \\function clamp(x) { if (x < 1.5) { return 0; } return x; }
+        \\clamp(0.5);
+        \\clamp(2.5);
+    , "<jit-cmp-double>");
+    const v = switch (result) {
+        .ok => |x| x,
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+    try std.testing.expectEqual(@as(f64, 2.5), v.toF64());
+}
+
 test "integration: function call" {
     const v = try evalToF64(std.testing.allocator, "(function (x) { return x * 2; })(21)");
     try std.testing.expectEqual(@as(f64, 42), v);

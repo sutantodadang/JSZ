@@ -17,7 +17,7 @@ extern fn jsz_clif_compile_guarded_iadd() ?*const anyopaque;
 extern fn jsz_clif_compile_accumulate_loop() ?*const anyopaque;
 extern fn jsz_clif_compile_int_block(code: [*]const u8, len: usize, kidx_to_slot: ?[*]const i32, n_kidx: usize) ?*const anyopaque;
 const PropSite = extern struct { pc: u32, key_len: u32, key_ptr: u64, ic_ptr: u64 };
-extern fn jsz_clif_compile_boxed_block(code: [*]const u8, len: usize, kidx_to_slot: ?[*]const i32, n_kidx: usize, prop_sites: ?[*]const PropSite, n_prop_sites: usize, get_helper: u64, set_helper: u64, call_helper: u64) ?*const anyopaque;
+extern fn jsz_clif_compile_boxed_block(code: [*]const u8, len: usize, kidx_to_slot: ?[*]const i32, n_kidx: usize, prop_sites: ?[*]const PropSite, n_prop_sites: usize, get_helper: u64, set_helper: u64, call_helper: u64, closure_helper: u64) ?*const anyopaque;
 
 /// Native `fn(i64, i64) -> i64` compiled by Cranelift.
 pub const AddFn = *const fn (i64, i64) callconv(.c) i64;
@@ -71,7 +71,7 @@ pub fn compileAccumulateLoop() ?AccumulateLoopFn {
 /// `locals` = unboxed-i64 function-local variable slots, `deopt` = out-flag set
 /// to 1 when an arithmetic result escapes ±2^53 (the caller then discards the
 /// result and re-interprets the call). Returns the value of the RETURNed register.
-pub const IntBlockFn = *const fn (regs: [*]i64, consts: [*]const i64, locals: [*]i64, deopt: *i32) callconv(.c) i64;
+pub const IntBlockFn = *const fn (regs: [*]i64, consts: [*]const i64, locals: [*]i64, deopt: *i32, out_resume_pc: *u32) callconv(.c) i64;
 
 /// Compile a monomorphic-int bytecode function (branches + loops over a register
 /// file + env-local variables) to native code. `kidx_to_slot[k]` maps a
@@ -93,7 +93,7 @@ pub fn compileIntBlock(code: []const u8, kidx_to_slot: []const i32) ?IntBlockFn 
 pub fn compileBoxedBlock(code: []const u8, kidx_to_slot: []const i32) ?IntBlockFn {
     const map_ptr: ?[*]const i32 = if (kidx_to_slot.len == 0) null else kidx_to_slot.ptr;
     // These FFI tests exercise the int-subset only (no property access).
-    const p = jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, null, 0, 0, 0, 0) orelse return null;
+    const p = jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, null, 0, 0, 0, 0, 0) orelse return null;
     return @ptrCast(p);
 }
 
@@ -210,16 +210,17 @@ test "Phase 12: general int-block compiler runs an arbitrary sum loop" {
     const f = compileIntBlock(&code, no_locals) orelse return error.IntBlockReturnedNull;
 
     var deopt: i32 = 0;
+    var resume_pc: u32 = 0xFFFFFFFF;
     var regs1 = [_]i64{ 0, 10, 0, 0 }; // i=0, limit=10, s=0
-    try std.testing.expectEqual(@as(i64, 45), f(&regs1, &[_]i64{}, &[_]i64{}, &deopt)); // sum 0..9
+    try std.testing.expectEqual(@as(i64, 45), f(&regs1, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc)); // sum 0..9
     try std.testing.expectEqual(@as(i64, 10), regs1[0]); // i ended at 10
     try std.testing.expectEqual(@as(i32, 0), deopt); // no overflow
 
     var regs2 = [_]i64{ 0, 5, 0, 0 }; // limit=5
-    try std.testing.expectEqual(@as(i64, 10), f(&regs2, &[_]i64{}, &[_]i64{}, &deopt)); // sum 0..4
+    try std.testing.expectEqual(@as(i64, 10), f(&regs2, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc)); // sum 0..4
 
     var regs3 = [_]i64{ 7, 5, 0, 0 }; // i already past limit -> no iterations
-    try std.testing.expectEqual(@as(i64, 0), f(&regs3, &[_]i64{}, &[_]i64{}, &deopt));
+    try std.testing.expectEqual(@as(i64, 0), f(&regs3, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc));
 }
 
 test "Phase 12: int-block compiler uses LOAD_K constants and arithmetic" {
@@ -233,7 +234,8 @@ test "Phase 12: int-block compiler uses LOAD_K constants and arithmetic" {
     const f = compileIntBlock(&code, no_locals) orelse return error.IntBlockReturnedNull;
     var regs = [_]i64{ 0, 0, 0 };
     var deopt: i32 = 0;
-    try std.testing.expectEqual(@as(i64, 42), f(&regs, &[_]i64{ 6, 7 }, &[_]i64{}, &deopt));
+    var resume_pc: u32 = 0xFFFFFFFF;
+    try std.testing.expectEqual(@as(i64, 42), f(&regs, &[_]i64{ 6, 7 }, &[_]i64{}, &deopt, &resume_pc));
     try std.testing.expectEqual(@as(i32, 0), deopt);
 }
 
@@ -277,16 +279,17 @@ test "Phase 12: int-fn compiler runs a real env-local function (sum)" {
     const consts = [_]i64{ 0, 0, 0, 0 }; // only consts[3] (=0) is read
     var regs = [_]i64{ 0, 0, 0 };
     var deopt: i32 = 0;
+    var resume_pc: u32 = 0xFFFFFFFF;
     var locals1 = [_]i64{ 0, 0, 10 }; // s=0, i=0, n=10
-    try std.testing.expectEqual(@as(i64, 45), f(&regs, &consts, &locals1, &deopt)); // sum 0..9
+    try std.testing.expectEqual(@as(i64, 45), f(&regs, &consts, &locals1, &deopt, &resume_pc)); // sum 0..9
     try std.testing.expectEqual(@as(i64, 10), locals1[1]); // i ended at 10
     try std.testing.expectEqual(@as(i32, 0), deopt);
 
     var locals2 = [_]i64{ 0, 0, 100 }; // n=100 -> sum 0..99 = 4950
-    try std.testing.expectEqual(@as(i64, 4950), f(&regs, &consts, &locals2, &deopt));
+    try std.testing.expectEqual(@as(i64, 4950), f(&regs, &consts, &locals2, &deopt, &resume_pc));
 
     var locals3 = [_]i64{ 0, 0, 0 }; // n=0 -> no iterations -> 0
-    try std.testing.expectEqual(@as(i64, 0), f(&regs, &consts, &locals3, &deopt));
+    try std.testing.expectEqual(@as(i64, 0), f(&regs, &consts, &locals3, &deopt, &resume_pc));
 }
 
 test "Phase 12: int-fn bails when a name is not a local (true global)" {
@@ -308,20 +311,21 @@ test "Phase 12: int-block guards arithmetic overflow past 2^53 and deopts" {
 
     // In range: 1000 * 1000 = 1e6 <= 2^53 -> no deopt, exact result.
     var deopt: i32 = 0;
+    var resume_pc: u32 = 0xFFFFFFFF;
     var regs1 = [_]i64{ 1000, 1000, 0 };
-    try std.testing.expectEqual(@as(i64, 1_000_000), f(&regs1, &[_]i64{}, &[_]i64{}, &deopt));
+    try std.testing.expectEqual(@as(i64, 1_000_000), f(&regs1, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc));
     try std.testing.expectEqual(@as(i32, 0), deopt);
 
     // Overflow: 1e8 * 1e8 = 1e16 > 2^53 (~9.007e15) -> deopt flag set.
     deopt = 0;
     var regs2 = [_]i64{ 100_000_000, 100_000_000, 0 };
-    _ = f(&regs2, &[_]i64{}, &[_]i64{}, &deopt);
+    _ = f(&regs2, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc);
     try std.testing.expectEqual(@as(i32, 1), deopt);
 
     // Boundary: exactly 2^53 is still representable -> no deopt.
     deopt = 0;
     var regs3 = [_]i64{ 9_007_199_254_740_992, 1, 0 };
-    try std.testing.expectEqual(@as(i64, 9_007_199_254_740_992), f(&regs3, &[_]i64{}, &[_]i64{}, &deopt));
+    try std.testing.expectEqual(@as(i64, 9_007_199_254_740_992), f(&regs3, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc));
     try std.testing.expectEqual(@as(i32, 0), deopt);
 }
 
@@ -354,8 +358,9 @@ test "Phase 12 boxed: env-local sum on boxed Values matches the int path (parity
     const consts = [_]i64{ 0, 0, 0, boxSmi(0) }; // only K3 (boxed 0) is read
     var regs = [_]i64{ 0, 0, 0 };
     var deopt: i32 = 0;
+    var resume_pc: u32 = 0xFFFFFFFF;
     var locals = [_]i64{ boxSmi(0), boxSmi(0), boxSmi(100) }; // s=0,i=0,n=100
-    const r = f(&regs, &consts, &locals, &deopt);
+    const r = f(&regs, &consts, &locals, &deopt, &resume_pc);
     try std.testing.expectEqual(@as(i32, 0), deopt);
     try std.testing.expect(isBoxedSmi(r));
     try std.testing.expectEqual(@as(i32, 4950), unboxSmi(r)); // sum 0..99
@@ -373,7 +378,8 @@ test "Phase 12 boxed: arithmetic re-boxes an out-of-i32 result as a double" {
     const f = compileBoxedBlock(&code, no_locals) orelse return error.BoxedBlockReturnedNull;
     var regs = [_]i64{ 0, 0, 0 };
     var deopt: i32 = 0;
-    const r = f(&regs, &[_]i64{ boxSmi(100000), boxSmi(100000) }, &[_]i64{}, &deopt);
+    var resume_pc: u32 = 0xFFFFFFFF;
+    const r = f(&regs, &[_]i64{ boxSmi(100000), boxSmi(100000) }, &[_]i64{}, &deopt, &resume_pc);
     try std.testing.expectEqual(@as(i32, 0), deopt);
     try std.testing.expect(isBoxedDouble(r));
     try std.testing.expectEqual(@as(f64, 1e10), unboxDouble(r));
@@ -386,8 +392,9 @@ test "Phase 12 boxed: arithmetic on a non-number operand deopts" {
     const f = compileBoxedBlock(&code, no_locals) orelse return error.BoxedBlockReturnedNull;
     var regs = [_]i64{ 0, 0, 0 };
     var deopt: i32 = 0;
-    _ = f(&regs, &[_]i64{ NB_NULL, boxSmi(2) }, &[_]i64{}, &deopt);
-    try std.testing.expectEqual(@as(i32, 1), deopt);
+    var resume_pc: u32 = 0xFFFFFFFF;
+    _ = f(&regs, &[_]i64{ NB_NULL, boxSmi(2) }, &[_]i64{}, &deopt, &resume_pc);
+    try std.testing.expect(deopt != 0);
 }
 
 test "Phase 12 boxed: full f64 arithmetic (SMI+double, re-box, -0)" {
@@ -398,36 +405,32 @@ test "Phase 12 boxed: full f64 arithmetic (SMI+double, re-box, -0)" {
     const fmul = compileBoxedBlock(&mcode, no_locals) orelse return error.BoxedBlockReturnedNull;
     const noc = &[_]i64{};
     var d: i32 = 0;
+    var rpc: u32 = 0xFFFFFFFF;
 
-    // 1.5 + 2.5 = 4.0 → integral, re-boxed as an SMI.
     var a1 = [_]i64{ boxDouble(1.5), boxDouble(2.5), 0 };
-    const r1 = fadd(&a1, noc, noc, &d);
+    const r1 = fadd(&a1, noc, noc, &d, &rpc);
     try std.testing.expectEqual(@as(i32, 0), d);
     try std.testing.expect(isBoxedSmi(r1));
     try std.testing.expectEqual(@as(i32, 4), unboxSmi(r1));
 
-    // 0.5 + 0.25 = 0.75 → stays a double.
     var a2 = [_]i64{ boxDouble(0.5), boxDouble(0.25), 0 };
-    const r2 = fadd(&a2, noc, noc, &d);
+    const r2 = fadd(&a2, noc, noc, &d, &rpc);
     try std.testing.expect(isBoxedDouble(r2));
     try std.testing.expectEqual(@as(f64, 0.75), unboxDouble(r2));
 
-    // SMI + double mix: 3 + 1.5 = 4.5 → double.
     var a3 = [_]i64{ boxSmi(3), boxDouble(1.5), 0 };
-    const r3 = fadd(&a3, noc, noc, &d);
+    const r3 = fadd(&a3, noc, noc, &d, &rpc);
     try std.testing.expect(isBoxedDouble(r3));
     try std.testing.expectEqual(@as(f64, 4.5), unboxDouble(r3));
 
-    // -1 * 0 = -0 (SMI operands, zero product) → must be a double with sign bit.
     var a4 = [_]i64{ boxSmi(-1), boxSmi(0), 0 };
-    const r4 = fmul(&a4, noc, noc, &d);
+    const r4 = fmul(&a4, noc, noc, &d, &rpc);
     try std.testing.expect(isBoxedDouble(r4));
     const nz = unboxDouble(r4);
-    try std.testing.expect(nz == 0.0 and std.math.signbit(nz)); // exactly -0
+    try std.testing.expect(nz == 0.0 and std.math.signbit(nz));
 
-    // 0 * 0 = +0 → SMI 0 (no spurious -0).
     var a5 = [_]i64{ boxSmi(0), boxSmi(0), 0 };
-    const r5 = fmul(&a5, noc, noc, &d);
+    const r5 = fmul(&a5, noc, noc, &d, &rpc);
     try std.testing.expect(isBoxedSmi(r5));
     try std.testing.expectEqual(@as(i32, 0), unboxSmi(r5));
 }
@@ -437,8 +440,9 @@ test "Phase 12 boxed: overflow past 2^53 deopts" {
     const f = compileBoxedBlock(&code, no_locals) orelse return error.BoxedBlockReturnedNull;
     var regs = [_]i64{ 0, 0, 0 };
     var deopt: i32 = 0;
-    _ = f(&regs, &[_]i64{ boxSmi(100000000), boxSmi(100000000) }, &[_]i64{}, &deopt); // 1e16
-    try std.testing.expectEqual(@as(i32, 1), deopt);
+    var resume_pc: u32 = 0xFFFFFFFF;
+    _ = f(&regs, &[_]i64{ boxSmi(100000000), boxSmi(100000000) }, &[_]i64{}, &deopt, &resume_pc);
+    try std.testing.expect(deopt != 0);
 }
 
 test "native summation accumulator loop matches JS semantics" {

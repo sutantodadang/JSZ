@@ -53,6 +53,7 @@ extern fn jsz_clif_compile_boxed_block(
     get_helper: u64,
     set_helper: u64,
     call_helper: u64,
+    closure_helper: u64,
 ) ?*const anyopaque;
 
 /// One property-access site, baked into the native code (mirror of the Rust
@@ -180,19 +181,15 @@ pub var active_jit_frame: ?*JitRootFrame = null;
 /// CALL trampoline reads it to re-enter the interpreter. Set by `run`.
 pub var active_jit_vm: ?*anyopaque = null;
 
-/// Native `fn(regs, consts, locals, deopt) -> i64` produced by the int-block
-/// compiler. `deopt` is set to 1 when an arithmetic result escapes ±2^53.
-/// In boxed mode each slot carries a raw `Value.bits` and the return value is a
-/// boxed `Value`; `deopt` also fires on a non-number arithmetic operand.
-pub const IntBlockFn = *const fn (regs: [*]i64, consts: [*]const i64, locals: [*]i64, deopt: *i32) callconv(.c) i64;
+pub const IntBlockFn = *const fn (regs: [*]i64, consts: [*]const i64, locals: [*]i64, deopt: *i32, out_resume_pc: *u32) callconv(.c) i64;
 
-fn compileNative(code: []const u8, kidx_to_slot: []const i32, boxed: bool, prop_sites: []const PropSite, call_helper: u64) ?IntBlockFn {
+fn compileNative(code: []const u8, kidx_to_slot: []const i32, boxed: bool, prop_sites: []const PropSite, call_helper: u64, closure_helper: u64) ?IntBlockFn {
     const map_ptr: ?[*]const i32 = if (kidx_to_slot.len == 0) null else kidx_to_slot.ptr;
     const p = if (boxed) blk: {
         const sites_ptr: ?[*]const PropSite = if (prop_sites.len == 0) null else prop_sites.ptr;
         const get_helper: u64 = @intFromPtr(&jsz_jit_get_prop);
         const set_helper: u64 = @intFromPtr(&jsz_jit_set_own);
-        break :blk jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, sites_ptr, prop_sites.len, get_helper, set_helper, call_helper);
+        break :blk jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, sites_ptr, prop_sites.len, get_helper, set_helper, call_helper, closure_helper);
     } else jsz_clif_compile_int_block(code.ptr, code.len, map_ptr, kidx_to_slot.len);
     return @ptrCast(p orelse return null);
 }
@@ -252,7 +249,7 @@ pub const AnalyzeResult = union(enum) { ok: *JitPlan, retry, never };
 /// arithmetic op); `GET_PROP` is accepted for monomorphic own-data sites (baked
 /// from the inline cache) and falls back to the interpreter on any shape miss. In
 /// int mode every `LOAD_K` must be an integral number and `GET_PROP` is rejected.
-pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, call_helper: u64) !AnalyzeResult {
+pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, call_helper: u64, closure_helper: u64) !AnalyzeResult {
     if (func.is_generator or func.is_async) return .never;
     const code = func.chunk.code;
     const constants = func.chunk.constants;
@@ -267,7 +264,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
     // Also collect jump targets, so an unreachable trailing RETURN_UNDEF epilogue
     // (emitted after an explicit `return`) can be told apart from a live one.
     var jump_targets: std.ArrayListUnmanaged(usize) = .empty;
-    var has_back_edge = false; // any backward jump (a loop) — blocks SET_PROP (S3e)
+    var has_back_edge = false;
     {
         var pc: usize = 0;
         while (pc < code.len) {
@@ -334,8 +331,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
     // the compare-then-jump boolean-containment rule; collect property sites. ----
     var prop_sites: std.ArrayListUnmanaged(PropSite) = .empty;
     var pc: usize = 0;
-    var prev_terminates = false; // previous op was an unconditional RETURN/JMP
-    var seen_commit = false; // a SET_PROP or CALL committed — no coarse-deopt op after
+    var prev_terminates = false;
     while (pc < code.len) {
         const op: Op = @enumFromInt(code[pc]);
         const size = opcodes.instrSize(op);
@@ -369,11 +365,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
                 if (kidx >= constants.len or kidx_to_slot[kidx] < 0) return .never;
             },
             .GET_PROP => {
-                // Boxed-only. The native helper reads the LIVE inline cache (own
-                // mono/poly/mega + proto-chain data); accept once the site IC is
-                // warm — a still-cold IC → retry after it warms via interpretation.
                 if (!boxed) return .never;
-                if (seen_commit) return .never; // fallible op after a committed store
                 const kidx = readU16(code, pc + 3);
                 if (kidx >= constants.len) return .never;
                 const key = constString(constants[kidx]) orelse return .never;
@@ -388,13 +380,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
                 });
             },
             .SET_PROP => {
-                // Boxed tier S3e: own-data store. Sound under coarse deopt only
-                // when no fallible op runs after a committed store, so: reject
-                // loops (`has_back_edge`) and any second store / post-store fallible
-                // op (`seen_commit` guards on every fallible arm). Robj=pc+1,
-                // Kname=pc+2..3, Rval=pc+4.
                 if (!boxed) return .never;
-                if (seen_commit or has_back_edge) return .never;
                 const kidx = readU16(code, pc + 2);
                 if (kidx >= constants.len) return .never;
                 const key = constString(constants[kidx]) orelse return .never;
@@ -407,26 +393,17 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
                     .key_ptr = @intFromPtr(key.ptr),
                     .ic_ptr = @intFromPtr(ic),
                 });
-                seen_commit = true;
             },
             .CALL => {
-                // Boxed tier S4: re-enter the interpreter for a call. A CALL is a
-                // committing side effect (and may throw — propagated, never
-                // re-run), so like a store it requires no loop (`has_back_edge`)
-                // and no coarse-deopt op after it (`seen_commit` guards). Multiple
-                // CALLs in sequence are fine (each either succeeds or throws-and-
-                // propagates). Encoding: op, base, nargs, retDst.
                 if (!boxed) return .never;
-                if (has_back_edge) return .never;
-                seen_commit = true;
+            },
+            .NEW_CLOSURE => {
+                if (!boxed) return .never;
             },
             .HOIST_VAR => {},
-            .ADD, .SUB, .MUL, .INC, .DEC => {
-                if (seen_commit) return .never; // arithmetic can deopt — not after a commit
-            },
+            .ADD, .SUB, .MUL, .INC, .DEC => {},
             .MOVE, .RETURN, .JMP, .JMP_IF_TRUE, .JMP_IF_FALSE => {},
             .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE, .NOT => {
-                if (seen_commit) return .never; // compares can deopt on a non-number
                 // Boolean containment: the result reg (operand 0) must be read by
                 // the very next instruction, which must be a conditional jump on it.
                 const rdst = code[pc + 1];
@@ -443,7 +420,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
     }
 
     // ---- Compile via Cranelift (int or boxed register model). ----
-    const code_fn = compileNative(code, kidx_to_slot, boxed, prop_sites.items, call_helper) orelse return .never;
+    const code_fn = compileNative(code, kidx_to_slot, boxed, prop_sites.items, call_helper, closure_helper) orelse return .never;
     const plan = try arena.create(JitPlan);
     plan.* = .{
         .code_fn = code_fn,
@@ -456,12 +433,12 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
     return .{ .ok = plan };
 }
 
-/// Outcome of running a JIT region. `deopt` = re-run the call in the interpreter
-/// (an arithmetic result escaped ±2^53, a non-number operand, or a property miss —
-/// all side-effect-free, so re-running is sound). `threw` = a re-entrant `CALL`
-/// inside the region threw; `realm.pending_exception` holds the value and the
-/// caller must PROPAGATE it (NOT re-run — the call's side effects already happened).
-pub const RunOut = union(enum) { value: Value, deopt, threw };
+pub const RunOut = union(enum) {
+    value: Value,
+    deopt,
+    threw,
+    resumed: usize,
+};
 
 /// Run `plan` for a call with `args`. Params occupy local slots 0..arity-1. In int
 /// mode `args` are guaranteed SMI by the caller and the result is re-boxed; in
@@ -490,13 +467,28 @@ pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, args: []const Value, 
         active_jit_vm = saved_vm;
     }
     var deopt: i32 = 0;
-    const r = plan.code_fn(regs.ptr, plan.consts.ptr, locals.ptr, &deopt);
-    if (deopt == 2) return .threw; // a re-entrant CALL threw — propagate, don't re-run.
-    if (deopt != 0) return .deopt; // overflow / non-number / property miss — interpret.
-    if (plan.boxed) {
-        return .{ .value = Value{ .bits = @bitCast(r) } }; // already a boxed Value.
+    var resume_pc: u32 = 0xFFFFFFFF;
+    const r = plan.code_fn(regs.ptr, plan.consts.ptr, locals.ptr, &deopt, &resume_pc);
+    if (deopt == 2) return .threw;
+    if (deopt == 3) {
+        if (vm != null) {
+            const bc_vm_mod = @import("../vm/bc_vm.zig");
+            const bvm: *bc_vm_mod.BcVm = @ptrCast(@alignCast(vm.?));
+            if (bvm.frames.items.len > 0) {
+                const frame = &bvm.frames.items[bvm.frames.items.len - 1];
+                const n = @min(regs.len, frame.registers.len);
+                for (0..n) |ri| {
+                    frame.registers[ri] = Value{ .bits = @bitCast(regs[ri]) };
+                }
+                frame.pc = @intCast(resume_pc);
+            }
+        }
+        return .{ .resumed = @intCast(resume_pc) };
     }
-    // Int mode re-box: SMI when it fits i32, else a heap double (exact: |r|<=2^53).
+    if (deopt != 0) return .deopt;
+    if (plan.boxed) {
+        return .{ .value = Value{ .bits = @bitCast(r) } };
+    }
     if (r >= -2147483648 and r <= 2147483647) return .{ .value = Value.fromSmi(r) };
     return .{ .value = try val_mod.makeNumber(arena, @floatFromInt(r)) };
 }

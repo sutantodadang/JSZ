@@ -3017,7 +3017,8 @@ pub const BcVm = struct {
             if (gop.value_ptr.* == jit_rejected) return .not_jitted;
             if (gop.value_ptr.* == null) {
                 const call_helper: u64 = @intFromPtr(&jsz_jit_call);
-                switch (try ifj.analyze(self.arena, fn_ptr, true, call_helper)) {
+                const closure_helper: u64 = @intFromPtr(&jsz_jit_make_closure);
+                switch (try ifj.analyze(self.arena, fn_ptr, true, call_helper, closure_helper)) {
                     .ok => |p| {
                         gop.value_ptr.* = @ptrCast(p);
                         jc.compiled += 1;
@@ -3038,10 +3039,10 @@ pub const BcVm = struct {
             const plan: *ifj.JitPlan = @ptrCast(@alignCast(gop.value_ptr.*.?));
 
             switch (try ifj.run(self.arena, plan, args_buf[0..nargs], self)) {
-                .deopt => return .not_jitted, // overflow / non-number / property miss
-                .threw => return .threw, // a re-entrant CALL threw — propagate it
+                .deopt => return .not_jitted,
+                .threw => return .threw,
+                .resumed => return .completed,
                 .value => |result| {
-                    // A re-entrant CALL may have reallocated self.frames; re-fetch.
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
                     return .completed;
                 },
@@ -3056,6 +3057,43 @@ pub const BcVm = struct {
     /// sets `deopt.* = 2` if it threw (the value is in `realm.pending_exception`).
     /// callconv(.c): its address is baked into the native code. The active region's
     /// buffers are GC roots (see `int_fn_jit.active_jit_frame`) while this runs.
+    fn jsz_jit_make_closure(regs: [*]i64, rdst: u32, fidx: u32, deopt: *i32) callconv(.c) i64 {
+        const ifj = @import("../jit/int_fn_jit.zig");
+        const vm_ptr = ifj.active_jit_vm orelse {
+            deopt.* = 2;
+            return 0;
+        };
+        const vm: *BcVm = @ptrCast(@alignCast(vm_ptr));
+        if (vm.frames.items.len == 0) {
+            deopt.* = 2;
+            return 0;
+        }
+        const top_frame = &vm.frames.items[vm.frames.items.len - 1];
+        const func = top_frame.func;
+        if (fidx >= func.child_functions.len) {
+            deopt.* = 2;
+            return 0;
+        }
+        const child_fn = func.child_functions[fidx];
+        const closure = vm.arena.create(BcClosure) catch {
+            deopt.* = 2;
+            return 0;
+        };
+        closure.* = BcClosure{
+            .func = child_fn,
+            .env = @ptrCast(top_frame.env),
+        };
+        const jsv = vm.arena.create(JsValue) catch {
+            deopt.* = 2;
+            return 0;
+        };
+        jsv.* = JsValue{ .bc_function = closure };
+        const result = val_mod.Value.fromPtr(jsv);
+        regs[rdst] = @bitCast(result.bits);
+        deopt.* = 0;
+        return @bitCast(result.bits);
+    }
+
     fn jsz_jit_call(regs: [*]i64, base: u32, nargs: u32, ret_dst: u32, deopt: *i32) callconv(.c) void {
         const ifj = @import("../jit/int_fn_jit.zig");
         const vmptr = ifj.active_jit_vm.?;
@@ -3090,7 +3128,11 @@ pub const BcVm = struct {
                                 deopt.* = 2;
                                 return;
                             },
-                            .deopt => break :direct, // interpret the callee instead
+                            .resumed => {
+                                deopt.* = 0;
+                                return;
+                            },
+                            .deopt => break :direct,
                         }
                     }
                 }

@@ -339,6 +339,7 @@ const OP_LE: u8 = 31;
 const OP_GT: u8 = 32;
 const OP_GE: u8 = 33;
 const OP_NOT: u8 = 34;
+const OP_NEW_CLOSURE: u8 = 43;
 const OP_CALL: u8 = 44;
 const OP_JMP: u8 = 36;
 const OP_JMP_IF_TRUE: u8 = 37;
@@ -380,10 +381,11 @@ fn int_instr_size(op: u8) -> Option<usize> {
         OP_JMP_IF_TRUE | OP_JMP_IF_FALSE => 4,
         OP_RETURN => 2,
         OP_RETURN_UNDEF | OP_HALT => 1,
-        OP_GET_PROP => 5, // op, Rdst, Robj, Kname:u16
-        OP_SET_PROP => 5, // op, Robj, Kname:u16, Rval
-        OP_CALL => 4, // op, base, nargs, retDst
-        _ => return None, // unsupported opcode -> bail (interpreter fallback)
+        OP_GET_PROP => 5,
+        OP_SET_PROP => 5,
+        OP_CALL => 4,
+        OP_NEW_CLOSURE => 4,
+        _ => return None,
     })
 }
 
@@ -441,7 +443,7 @@ pub unsafe extern "C" fn jsz_clif_compile_int_block(
     } else {
         unsafe { std::slice::from_raw_parts(kidx_to_slot, n_kidx) }
     };
-    compile_int_block_impl(code, slots, false, &[], 0, 0, 0).unwrap_or(std::ptr::null())
+    compile_int_block_impl(code, slots, false, &[], 0, 0, 0, 0).unwrap_or(std::ptr::null())
 }
 
 /// Phase 12 boxed tier — compile the same opcode subset as
@@ -473,6 +475,7 @@ pub unsafe extern "C" fn jsz_clif_compile_boxed_block(
     get_helper: u64,
     set_helper: u64,
     call_helper: u64,
+    closure_helper: u64,
 ) -> *const c_void {
     if code.is_null() || len == 0 {
         return std::ptr::null();
@@ -488,7 +491,7 @@ pub unsafe extern "C" fn jsz_clif_compile_boxed_block(
     } else {
         unsafe { std::slice::from_raw_parts(prop_sites, n_prop_sites) }
     };
-    compile_int_block_impl(code, slots, true, sites, get_helper, set_helper, call_helper)
+    compile_int_block_impl(code, slots, true, sites, get_helper, set_helper, call_helper, closure_helper)
         .unwrap_or(std::ptr::null())
 }
 
@@ -633,6 +636,8 @@ fn emit_box_f64(fb: &mut FunctionBuilder, f: Value) -> (Value, Block) {
 fn emit_boxed_num_binop(
     fb: &mut FunctionBuilder,
     deopt_block: Block,
+    fine_deopt_block: Block,
+    pc: usize,
     l: Value,
     r: Value,
     op: u8,
@@ -641,7 +646,8 @@ fn emit_boxed_num_binop(
     let rnum = emit_is_number(fb, r);
     let both_num = fb.ins().band(lnum, rnum);
     let numeric = fb.create_block();
-    fb.ins().brif(both_num, numeric, &[], deopt_block, &[]);
+    let pc_val = fb.ins().iconst(types::I32, pc as i64);
+    fb.ins().brif(both_num, numeric, &[], fine_deopt_block, &[pc_val.into()]);
     fb.switch_to_block(numeric);
 
     let lsmi = emit_is_smi(fb, l);
@@ -723,6 +729,7 @@ fn compile_int_block_impl(
     get_helper: u64,
     set_helper: u64,
     call_helper: u64,
+    closure_helper: u64,
 ) -> Option<*const c_void> {
     use std::collections::BTreeSet;
 
@@ -762,10 +769,11 @@ fn compile_int_block_impl(
     let ptr_ty = module.target_config().pointer_type();
     let mut ctx = module.make_context();
     let mut sig = module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // regs: *mut i64
-    sig.params.push(AbiParam::new(ptr_ty)); // consts: *const i64
-    sig.params.push(AbiParam::new(ptr_ty)); // locals: *mut i64
-    sig.params.push(AbiParam::new(ptr_ty)); // deopt: *mut i32 (overflow flag)
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(ptr_ty));
     sig.returns.push(AbiParam::new(types::I64));
     ctx.func.signature = sig;
 
@@ -791,23 +799,28 @@ fn compile_int_block_impl(
         let consts = fb.block_params(entry)[1];
         let locals = fb.block_params(entry)[2];
         let deopt_ptr = fb.block_params(entry)[3];
+        let resume_pc_ptr = fb.block_params(entry)[4];
         fb.ins().jump(blocks[&0], &[]);
 
         let flags = MemFlags::trusted();
 
-        // Shared deopt trampoline reached when an arithmetic result escapes the
-        // f64-exact range: set `*deopt = 1` and return 0 (the value is discarded
-        // by the caller, which re-runs the call in the interpreter). `deopt_ptr`
-        // is defined in `entry`, which dominates this block, so the use is valid.
         let deopt_block = fb.create_block();
         fb.switch_to_block(deopt_block);
         let one_i32 = fb.ins().iconst(types::I32, 1);
         fb.ins().store(flags, one_i32, deopt_ptr, 0);
         let deopt_ret = fb.ins().iconst(types::I64, 0);
         fb.ins().return_(&[deopt_ret]);
-        // Shared exception trampoline reached when a JITed `CALL` throws: the call
-        // helper has already set `*deopt = 2`, so just return (do NOT overwrite it
-        // like `deopt_block` does — the caller distinguishes 1=deopt from 2=threw).
+
+        let fine_deopt_block = fb.create_block();
+        fb.append_block_param(fine_deopt_block, types::I32);
+        fb.switch_to_block(fine_deopt_block);
+        let fine_pc = fb.block_params(fine_deopt_block)[0];
+        fb.ins().store(flags, fine_pc, resume_pc_ptr, 0);
+        let three_i32 = fb.ins().iconst(types::I32, 3);
+        fb.ins().store(flags, three_i32, deopt_ptr, 0);
+        let fine_ret = fb.ins().iconst(types::I64, 0);
+        fb.ins().return_(&[fine_ret]);
+
         let throw_block = fb.create_block();
         fb.switch_to_block(throw_block);
         let throw_ret = fb.ins().iconst(types::I64, 0);
@@ -852,12 +865,21 @@ fn compile_int_block_impl(
         // result to regs[ret_dst], and sets *deopt (0 = ok, 2 = the callee threw).
         let call_sig = {
             let mut cs = module.make_signature();
-            cs.params.push(AbiParam::new(ptr_ty)); // regs ptr
-            cs.params.push(AbiParam::new(types::I32)); // base
-            cs.params.push(AbiParam::new(types::I32)); // nargs
-            cs.params.push(AbiParam::new(types::I32)); // ret_dst
-            cs.params.push(AbiParam::new(ptr_ty)); // deopt ptr
+            cs.params.push(AbiParam::new(ptr_ty));
+            cs.params.push(AbiParam::new(types::I32));
+            cs.params.push(AbiParam::new(types::I32));
+            cs.params.push(AbiParam::new(types::I32));
+            cs.params.push(AbiParam::new(ptr_ty));
             fb.import_signature(cs)
+        };
+        let closure_sig = {
+            let mut cls = module.make_signature();
+            cls.params.push(AbiParam::new(ptr_ty));
+            cls.params.push(AbiParam::new(types::I32));
+            cls.params.push(AbiParam::new(types::I32));
+            cls.params.push(AbiParam::new(ptr_ty));
+            cls.returns.push(AbiParam::new(types::I64));
+            fb.import_signature(cls)
         };
 
         let mut cur = entry;
@@ -929,7 +951,7 @@ fn compile_int_block_impl(
                     if boxed {
                         // Guard both numeric (else deopt); SMI→exact i128 path,
                         // else f64; re-box (makeNumber), preserving -0 on MUL.
-                        let (res, done) = emit_boxed_num_binop(&mut fb, deopt_block, l, r, op);
+                        let (res, done) = emit_boxed_num_binop(&mut fb, deopt_block, fine_deopt_block, pc, l, r, op);
                         cur = done;
                         store_reg(&mut fb, code[pc + 1], res);
                     } else {
@@ -949,11 +971,18 @@ fn compile_int_block_impl(
                 OP_INC | OP_DEC => {
                     let v = load_reg(&mut fb, code[pc + 2]);
                     if boxed {
-                        // Guard SMI (else deopt), ±1 in i128 + 2^53 guard, re-box.
-                        let is = emit_is_smi(&mut fb, v);
-                        let ok = fb.create_block();
-                        fb.ins().brif(is, ok, &[], deopt_block, &[]);
-                        fb.switch_to_block(ok);
+                        let isnum = emit_is_number(&mut fb, v);
+                        let num_blk = fb.create_block();
+                        let pc_i32 = fb.ins().iconst(types::I32, pc as i64);
+                        fb.ins().brif(isnum, num_blk, &[], fine_deopt_block, &[pc_i32.into()]);
+                        fb.switch_to_block(num_blk);
+                        let issmi = emit_is_smi(&mut fb, v);
+                        let smi_blk = fb.create_block();
+                        let dbl_blk = fb.create_block();
+                        fb.ins().brif(issmi, smi_blk, &[], dbl_blk, &[]);
+                        let done = fb.create_block();
+                        fb.append_block_param(done, types::I64);
+                        fb.switch_to_block(smi_blk);
                         let x = emit_unbox_smi(&mut fb, v);
                         let x128 = fb.ins().sextend(types::I128, x);
                         let one64 = fb.ins().iconst(types::I64, 1);
@@ -964,8 +993,22 @@ fn compile_int_block_impl(
                             fb.ins().isub(x128, one)
                         };
                         let (narrowed, _c) = guard_i128_to_i64(&mut fb, deopt_block, wide);
-                        let (res, done) = emit_box_i64(&mut fb, narrowed);
+                        let (ri, di) = emit_box_i64(&mut fb, narrowed);
+                        fb.ins().jump(done, &[ri.into()]);
+                        fb.switch_to_block(dbl_blk);
+                        let xf = emit_to_f64(&mut fb, v);
+                        let one_f = fb.ins().f64const(1.0);
+                        let rf = if op == OP_INC {
+                            fb.ins().fadd(xf, one_f)
+                        } else {
+                            fb.ins().fsub(xf, one_f)
+                        };
+                        let (rd, _dd) = emit_box_f64(&mut fb, rf);
+                        fb.ins().jump(done, &[rd.into()]);
+                        fb.switch_to_block(done);
+                        let res = fb.block_params(done)[0];
                         cur = done;
+                        let _ = di;
                         store_reg(&mut fb, code[pc + 1], res);
                     } else {
                         let v128 = fb.ins().sextend(types::I128, v);
@@ -984,11 +1027,10 @@ fn compile_int_block_impl(
                 OP_NOT => {
                     let v = load_reg(&mut fb, code[pc + 2]);
                     if boxed {
-                        // Guard SMI (else deopt); result is a raw 0/1 consumed by the
-                        // immediately-following conditional jump (never re-boxed).
                         let is = emit_is_smi(&mut fb, v);
                         let ok = fb.create_block();
-                        fb.ins().brif(is, ok, &[], deopt_block, &[]);
+                        let pc_not = fb.ins().iconst(types::I32, pc as i64);
+                        fb.ins().brif(is, ok, &[], fine_deopt_block, &[pc_not.into()]);
                         fb.switch_to_block(ok);
                         cur = ok;
                         let x = emit_unbox_smi(&mut fb, v);
@@ -1004,30 +1046,67 @@ fn compile_int_block_impl(
                 OP_EQ | OP_NEQ | OP_SEQ | OP_SNEQ | OP_LT | OP_LE | OP_GT | OP_GE => {
                     let l = load_reg(&mut fb, code[pc + 2]);
                     let r = load_reg(&mut fb, code[pc + 3]);
-                    let cc = match op {
-                        OP_EQ | OP_SEQ => IntCC::Equal,
-                        OP_NEQ | OP_SNEQ => IntCC::NotEqual,
-                        OP_LT => IntCC::SignedLessThan,
-                        OP_LE => IntCC::SignedLessThanOrEqual,
-                        OP_GT => IntCC::SignedGreaterThan,
-                        _ => IntCC::SignedGreaterThanOrEqual,
-                    };
-                    let (lv, rv) = if boxed {
-                        // Guard both SMI (else deopt), then compare unboxed payloads.
+                    if boxed {
+                        let lnum = emit_is_number(&mut fb, l);
+                        let rnum = emit_is_number(&mut fb, r);
+                        let both_num = fb.ins().band(lnum, rnum);
+                        let num_blk = fb.create_block();
+                        let pc_cmp = fb.ins().iconst(types::I32, pc as i64);
+                        fb.ins().brif(both_num, num_blk, &[], fine_deopt_block, &[pc_cmp.into()]);
+                        fb.switch_to_block(num_blk);
                         let lsmi = emit_is_smi(&mut fb, l);
                         let rsmi = emit_is_smi(&mut fb, r);
-                        let both = fb.ins().band(lsmi, rsmi);
-                        let ok = fb.create_block();
-                        fb.ins().brif(both, ok, &[], deopt_block, &[]);
-                        fb.switch_to_block(ok);
-                        cur = ok;
-                        (emit_unbox_smi(&mut fb, l), emit_unbox_smi(&mut fb, r))
+                        let both_smi = fb.ins().band(lsmi, rsmi);
+                        let smi_blk = fb.create_block();
+                        let f64_blk = fb.create_block();
+                        let done = fb.create_block();
+                        fb.append_block_param(done, types::I64);
+                        fb.ins().brif(both_smi, smi_blk, &[], f64_blk, &[]);
+                        fb.switch_to_block(smi_blk);
+                        let lv = emit_unbox_smi(&mut fb, l);
+                        let rv = emit_unbox_smi(&mut fb, r);
+                        let cc_int = match op {
+                            OP_EQ | OP_SEQ => IntCC::Equal,
+                            OP_NEQ | OP_SNEQ => IntCC::NotEqual,
+                            OP_LT => IntCC::SignedLessThan,
+                            OP_LE => IntCC::SignedLessThanOrEqual,
+                            OP_GT => IntCC::SignedGreaterThan,
+                            _ => IntCC::SignedGreaterThanOrEqual,
+                        };
+                        let ci = fb.ins().icmp(cc_int, lv, rv);
+                        let ri = fb.ins().uextend(types::I64, ci);
+                        fb.ins().jump(done, &[ri.into()]);
+                        fb.switch_to_block(f64_blk);
+                        let lf = emit_to_f64(&mut fb, l);
+                        let rf = emit_to_f64(&mut fb, r);
+                        let cc_flt = match op {
+                            OP_EQ | OP_SEQ => FloatCC::Equal,
+                            OP_NEQ | OP_SNEQ => FloatCC::NotEqual,
+                            OP_LT => FloatCC::LessThan,
+                            OP_LE => FloatCC::LessThanOrEqual,
+                            OP_GT => FloatCC::GreaterThan,
+                            _ => FloatCC::GreaterThanOrEqual,
+                        };
+                        let cf = fb.ins().fcmp(cc_flt, lf, rf);
+                        let rf_res = fb.ins().uextend(types::I64, cf);
+                        fb.ins().jump(done, &[rf_res.into()]);
+                        fb.switch_to_block(done);
+                        cur = done;
+                        let res = fb.block_params(done)[0];
+                        store_reg(&mut fb, code[pc + 1], res);
                     } else {
-                        (l, r)
-                    };
-                    let c = fb.ins().icmp(cc, lv, rv);
-                    let res = fb.ins().uextend(types::I64, c);
-                    store_reg(&mut fb, code[pc + 1], res);
+                        let cc = match op {
+                            OP_EQ | OP_SEQ => IntCC::Equal,
+                            OP_NEQ | OP_SNEQ => IntCC::NotEqual,
+                            OP_LT => IntCC::SignedLessThan,
+                            OP_LE => IntCC::SignedLessThanOrEqual,
+                            OP_GT => IntCC::SignedGreaterThan,
+                            _ => IntCC::SignedGreaterThanOrEqual,
+                        };
+                        let c = fb.ins().icmp(cc, l, r);
+                        let res = fb.ins().uextend(types::I64, c);
+                        store_reg(&mut fb, code[pc + 1], res);
+                    }
                 }
                 OP_JMP => {
                     let rel = read_i16_le(code, pc + 1) as isize;
@@ -1135,6 +1214,28 @@ fn compile_int_block_impl(
                     fb.ins().brif(threw, throw_block, &[], cont, &[]);
                     fb.switch_to_block(cont);
                     cur = cont;
+                }
+                OP_NEW_CLOSURE => {
+                    if !boxed {
+                        return None;
+                    }
+                    let rdst = code[pc + 1];
+                    let fidx = read_u16_le(code, pc + 2);
+                    let rdst_i32 = fb.ins().iconst(types::I32, rdst as i64);
+                    let fidx_i32 = fb.ins().iconst(types::I32, fidx as i64);
+                    let callee = fb.ins().iconst(ptr_ty, closure_helper as i64);
+                    let call = fb.ins().call_indirect(
+                        closure_sig,
+                        callee,
+                        &[regs, rdst_i32, fidx_i32, deopt_ptr],
+                    );
+                    let result = fb.inst_results(call)[0];
+                    let threw = fb.ins().load(types::I32, flags, deopt_ptr, 0);
+                    let cont = fb.create_block();
+                    fb.ins().brif(threw, throw_block, &[], cont, &[]);
+                    fb.switch_to_block(cont);
+                    cur = cont;
+                    store_reg(&mut fb, rdst, result);
                 }
                 OP_RETURN => {
                     let v = load_reg(&mut fb, code[pc + 1]);
