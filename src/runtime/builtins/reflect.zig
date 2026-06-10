@@ -8,6 +8,26 @@ const obj_mod = @import("../../object/object.zig");
 const JsObject = obj_mod.JsObject;
 const PropAttr = obj_mod.PropAttr;
 const fp = @import("function_proto.zig");
+const intrinsics = @import("intrinsics.zig");
+
+/// R1: create the Reflect namespace object and bind the `Reflect` global.
+pub fn register(ctx: *const intrinsics.Ctx) !void {
+    const arena = ctx.arena;
+    const reflect_obj = try JsObject.create(arena, ctx.object_proto);
+    try reflect_obj.set("get", try val_mod.makeNativeFunction(arena, nativeReflectGet));
+    try reflect_obj.set("set", try val_mod.makeNativeFunction(arena, nativeReflectSet));
+    try reflect_obj.set("has", try val_mod.makeNativeFunction(arena, nativeReflectHas));
+    try reflect_obj.set("deleteProperty", try val_mod.makeNativeFunction(arena, nativeReflectDeleteProperty));
+    try reflect_obj.set("ownKeys", try val_mod.makeNativeFunction(arena, nativeReflectOwnKeys));
+    try reflect_obj.set("getPrototypeOf", try val_mod.makeNativeFunction(arena, nativeReflectGetPrototypeOf));
+    try reflect_obj.set("defineProperty", try val_mod.makeNativeFunction(arena, nativeReflectDefineProperty));
+    try reflect_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunction(arena, nativeReflectGetOwnPropertyDescriptor));
+    try reflect_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, nativeReflectIsExtensible));
+    try reflect_obj.set("preventExtensions", try val_mod.makeNativeFunction(arena, nativeReflectPreventExtensions));
+    try reflect_obj.set("apply", try val_mod.makeNativeFunction(arena, nativeReflectApply));
+    try reflect_obj.set("construct", try val_mod.makeNativeFunction(arena, nativeReflectConstruct));
+    try ctx.env.define("Reflect", try val_mod.makeObject(arena, reflect_obj));
+}
 
 // ---------------------------------------------------------------- helpers ---
 

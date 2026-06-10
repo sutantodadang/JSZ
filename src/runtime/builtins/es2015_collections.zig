@@ -5,7 +5,90 @@ const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
+const intrinsics = @import("intrinsics.zig");
 const InternalKind = @TypeOf((@as(JsObject, undefined)).internal_kind);
+
+/// R1: install Map/Set/WeakMap/WeakSet prototypes + constructors and bind globals.
+pub fn register(ctx: *const intrinsics.Ctx) !void {
+    const arena = ctx.arena;
+    const object_proto = ctx.object_proto;
+
+    // ---- Map ----
+    const map_proto = try JsObject.create(arena, object_proto);
+    const map_fns = .{
+        .{ "set", nativeMapSet },
+        .{ "get", nativeMapGet },
+        .{ "has", nativeMapHas },
+        .{ "delete", nativeMapDelete },
+        .{ "clear", nativeMapClear },
+        .{ "size", nativeMapSize },
+        .{ "keys", nativeMapKeys },
+        .{ "values", nativeMapValues },
+        .{ "entries", nativeMapEntries },
+        .{ "@@iterator", nativeMapEntries },
+    };
+    inline for (map_fns) |pair| {
+        const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
+        try map_proto.set(pair[0], fn_v);
+    }
+    const map_ctor_obj = try JsObject.create(arena, null);
+    try map_ctor_obj.set("prototype", try val_mod.makeObject(arena, map_proto));
+    try map_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeMapCtor));
+    try ctx.env.define("Map", try val_mod.makeObject(arena, map_ctor_obj));
+
+    // ---- Set ----
+    const set_proto = try JsObject.create(arena, object_proto);
+    const set_fns = .{
+        .{ "add", nativeSetAdd },
+        .{ "has", nativeSetHas },
+        .{ "delete", nativeSetDelete },
+        .{ "clear", nativeSetClear },
+        .{ "size", nativeSetSize },
+        .{ "values", nativeSetValues },
+        .{ "@@iterator", nativeSetValues },
+    };
+    inline for (set_fns) |pair| {
+        const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
+        try set_proto.set(pair[0], fn_v);
+    }
+    const set_ctor_obj = try JsObject.create(arena, null);
+    try set_ctor_obj.set("prototype", try val_mod.makeObject(arena, set_proto));
+    try set_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeSetCtor));
+    try ctx.env.define("Set", try val_mod.makeObject(arena, set_ctor_obj));
+
+    // ---- WeakMap ----
+    const weakmap_proto = try JsObject.create(arena, object_proto);
+    const weakmap_fns = .{
+        .{ "set", nativeMapSet },
+        .{ "get", nativeMapGet },
+        .{ "has", nativeMapHas },
+        .{ "delete", nativeMapDelete },
+    };
+    inline for (weakmap_fns) |pair| {
+        const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
+        try weakmap_proto.set(pair[0], fn_v);
+    }
+    const weakmap_ctor_obj = try JsObject.create(arena, null);
+    try weakmap_ctor_obj.set("prototype", try val_mod.makeObject(arena, weakmap_proto));
+    try weakmap_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakMapCtor));
+    try ctx.env.define("WeakMap", try val_mod.makeObject(arena, weakmap_ctor_obj));
+
+    // ---- WeakSet ----
+    const weakset_proto = try JsObject.create(arena, object_proto);
+    const weakset_fns = .{
+        .{ "add", nativeSetAdd },
+        .{ "has", nativeSetHas },
+        .{ "delete", nativeSetDelete },
+    };
+    inline for (weakset_fns) |pair| {
+        const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
+        try weakset_proto.set(pair[0], fn_v);
+    }
+    const weakset_ctor_obj = try JsObject.create(arena, null);
+    try weakset_ctor_obj.set("prototype", try val_mod.makeObject(arena, weakset_proto));
+    try weakset_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakSetCtor));
+    try ctx.env.define("WeakSet", try val_mod.makeObject(arena, weakset_ctor_obj));
+}
 
 const MapData = struct {
     keys: std.ArrayListUnmanaged(Value) = .empty,

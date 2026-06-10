@@ -4,6 +4,67 @@
 const std = @import("std");
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
+const JsObject = @import("../../object/object.zig").JsObject;
+const intrinsics = @import("intrinsics.zig");
+
+/// R1: create the Math object, populate constants + functions, and bind the `Math` global.
+pub fn register(ctx: *const intrinsics.Ctx) !void {
+    const arena = ctx.arena;
+    const math_obj = try JsObject.create(arena, null);
+    // Constants
+    try math_obj.set("PI", try val_mod.makeNumber(arena, std.math.pi));
+    try math_obj.set("E", try val_mod.makeNumber(arena, std.math.e));
+    try math_obj.set("LN2", try val_mod.makeNumber(arena, std.math.ln2));
+    try math_obj.set("LN10", try val_mod.makeNumber(arena, std.math.ln10));
+    try math_obj.set("LOG2E", try val_mod.makeNumber(arena, std.math.log2e));
+    try math_obj.set("LOG10E", try val_mod.makeNumber(arena, std.math.log10e));
+    try math_obj.set("SQRT2", try val_mod.makeNumber(arena, std.math.sqrt2));
+    try math_obj.set("SQRT1_2", try val_mod.makeNumber(arena, 1.0 / std.math.sqrt2));
+    // Functions
+    const func_fns = .{
+        .{ "abs", nativeAbs },
+        .{ "floor", nativeFloor },
+        .{ "ceil", nativeCeil },
+        .{ "round", nativeRound },
+        .{ "trunc", nativeTrunc },
+        .{ "sqrt", nativeSqrt },
+        .{ "pow", nativePow },
+        .{ "exp", nativeExp },
+        .{ "log", nativeLog },
+        .{ "sin", nativeSin },
+        .{ "cos", nativeCos },
+        .{ "tan", nativeTan },
+        .{ "random", nativeRandom },
+        .{ "acos", nativeAcos },
+        .{ "asin", nativeAsin },
+        .{ "atan", nativeAtan },
+        .{ "atan2", nativeAtan2 },
+        .{ "sign", nativeSign },
+        .{ "cbrt", nativeCbrt },
+        .{ "log2", nativeLog2 },
+        .{ "log10", nativeLog10 },
+        .{ "log1p", nativeLog1p },
+        .{ "expm1", nativeExpm1 },
+        .{ "sinh", nativeSinh },
+        .{ "cosh", nativeCosh },
+        .{ "tanh", nativeTanh },
+        .{ "asinh", nativeAsinh },
+        .{ "acosh", nativeAcosh },
+        .{ "atanh", nativeAtanh },
+        .{ "hypot", nativeHypot },
+        .{ "clz32", nativeClz32 },
+        .{ "fround", nativeFround },
+        .{ "imul", nativeImul },
+    };
+    inline for (func_fns) |pair| {
+        try math_obj.set(pair[0], try val_mod.makeNativeFunction(arena, pair[1]));
+    }
+    // Math.min/max spec `.length` is 2.
+    try math_obj.set("min", try val_mod.makeNativeFunctionLen(arena, nativeMin, 2));
+    try math_obj.set("max", try val_mod.makeNativeFunctionLen(arena, nativeMax, 2));
+    const math_val = try val_mod.makeObject(arena, math_obj);
+    try ctx.env.define("Math", math_val);
+}
 
 fn getNum(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);

@@ -23,6 +23,7 @@ const function_proto_mod = @import("./builtins/function_proto.zig");
 const date_mod = @import("./builtins/date.zig");
 const es2015_collections_mod = @import("./builtins/es2015_collections.zig");
 const typed_array_mod = @import("./builtins/typed_array.zig");
+const intrinsics = @import("./builtins/intrinsics.zig");
 const promise_mod = @import("./builtins/promise.zig");
 const console_mod = @import("./builtins/console.zig");
 // ES2015 Symbol
@@ -822,72 +823,6 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
     }
 }
 
-fn registerMath(arena: std.mem.Allocator, obj: *JsObject) !void {
-    // Constants
-    const pi_val = try val_mod.makeNumber(arena, std.math.pi);
-    const e_val = try val_mod.makeNumber(arena, std.math.e);
-    const ln2_val = try val_mod.makeNumber(arena, std.math.ln2);
-    const ln10_val = try val_mod.makeNumber(arena, std.math.ln10);
-    const log2e_val = try val_mod.makeNumber(arena, std.math.log2e);
-    const log10e_val = try val_mod.makeNumber(arena, std.math.log10e);
-    const sqrt2_val = try val_mod.makeNumber(arena, std.math.sqrt2);
-    const sqrt1_2_val = try val_mod.makeNumber(arena, 1.0 / std.math.sqrt2);
-    try obj.set("PI", pi_val);
-    try obj.set("E", e_val);
-    try obj.set("LN2", ln2_val);
-    try obj.set("LN10", ln10_val);
-    try obj.set("LOG2E", log2e_val);
-    try obj.set("LOG10E", log10e_val);
-    try obj.set("SQRT2", sqrt2_val);
-    try obj.set("SQRT1_2", sqrt1_2_val);
-
-    // Functions
-    const func_fns = .{
-        .{ "abs", math_mod.nativeAbs },
-        .{ "floor", math_mod.nativeFloor },
-        .{ "ceil", math_mod.nativeCeil },
-        .{ "round", math_mod.nativeRound },
-        .{ "trunc", math_mod.nativeTrunc },
-        .{ "sqrt", math_mod.nativeSqrt },
-        .{ "pow", math_mod.nativePow },
-        .{ "exp", math_mod.nativeExp },
-        .{ "log", math_mod.nativeLog },
-        .{ "sin", math_mod.nativeSin },
-        .{ "cos", math_mod.nativeCos },
-        .{ "tan", math_mod.nativeTan },
-        .{ "min", math_mod.nativeMin },
-        .{ "max", math_mod.nativeMax },
-        .{ "random", math_mod.nativeRandom },
-        .{ "acos", math_mod.nativeAcos },
-        .{ "asin", math_mod.nativeAsin },
-        .{ "atan", math_mod.nativeAtan },
-        .{ "atan2", math_mod.nativeAtan2 },
-        .{ "sign", math_mod.nativeSign },
-        .{ "cbrt", math_mod.nativeCbrt },
-        .{ "log2", math_mod.nativeLog2 },
-        .{ "log10", math_mod.nativeLog10 },
-        .{ "log1p", math_mod.nativeLog1p },
-        .{ "expm1", math_mod.nativeExpm1 },
-        .{ "sinh", math_mod.nativeSinh },
-        .{ "cosh", math_mod.nativeCosh },
-        .{ "tanh", math_mod.nativeTanh },
-        .{ "asinh", math_mod.nativeAsinh },
-        .{ "acosh", math_mod.nativeAcosh },
-        .{ "atanh", math_mod.nativeAtanh },
-        .{ "hypot", math_mod.nativeHypot },
-        .{ "clz32", math_mod.nativeClz32 },
-        .{ "fround", math_mod.nativeFround },
-        .{ "imul", math_mod.nativeImul },
-    };
-    inline for (func_fns) |pair| {
-        const fn_val = try val_mod.makeNativeFunction(arena, pair[1]);
-        try obj.set(pair[0], fn_val);
-    }
-    // Math.min/max are variadic but spec `.length` is 2.
-    try obj.set("min", try val_mod.makeNativeFunctionLen(arena, math_mod.nativeMin, 2));
-    try obj.set("max", try val_mod.makeNativeFunctionLen(arena, math_mod.nativeMax, 2));
-}
-
 /// Build a plain object mirroring global env bindings and expose as globalThis/global.
 fn installGlobalThis(arena: std.mem.Allocator, env: *Environment, object_proto: *JsObject) !void {
     const global_obj = try JsObject.create(arena, object_proto);
@@ -1089,41 +1024,6 @@ pub const Realm = struct {
         try object_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeObjectProtoToString));
         try object_proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeObjectProtoValueOf));
 
-        // ---- Phase 4b: Math object ----
-        const math_obj = try JsObject.create(arena, null);
-        try registerMath(arena, math_obj);
-        const math_val = try val_mod.makeObject(arena, math_obj);
-        try env.define("Math", math_val);
-
-        // ---- Phase 4b: JSON object ----
-        const json_obj = try JsObject.create(arena, null);
-        const stringify_fn = try val_mod.makeNativeFunction(arena, json_mod.nativeJsonStringify);
-        const parse_fn = try val_mod.makeNativeFunction(arena, json_mod.nativeJsonParse);
-        try json_obj.set("stringify", stringify_fn);
-        try json_obj.set("parse", parse_fn);
-        const json_val = try val_mod.makeObject(arena, json_obj);
-        try env.define("JSON", json_val);
-
-        // ---- Phase 4c: RegExp constructor + prototype ----
-        const regexp_proto = try JsObject.create(arena, object_proto);
-        // Install prototype methods
-        const re_test_fn = try val_mod.makeNativeFunction(arena, regexp_mod.nativeRegExpTest);
-        const re_exec_fn = try val_mod.makeNativeFunction(arena, regexp_mod.nativeRegExpExec);
-        try regexp_proto.set("test", re_test_fn);
-        try regexp_proto.set("exec", re_exec_fn);
-
-        // Build RegExp constructor object (same pattern as Error constructors)
-        const regexp_ctor_obj = try JsObject.create(arena, null);
-        const regexp_proto_val = try val_mod.makeObject(arena, regexp_proto);
-        try regexp_ctor_obj.set("prototype", regexp_proto_val);
-        const regexp_call_fn = try val_mod.makeNativeFunction(arena, regexp_mod.nativeRegExpCtor);
-        try regexp_ctor_obj.set("__call__", regexp_call_fn);
-        const regexp_ctor_val = try val_mod.makeObject(arena, regexp_ctor_obj);
-        try env.define("RegExp", regexp_ctor_val);
-
-        // Thread-local so RegExp constructor in regexp.zig can access it.
-        active_regexp_proto = regexp_proto;
-
         // ---- Phase 4d: Function.prototype (call, apply, bind) ----
         const function_proto = try JsObject.create(arena, object_proto);
         const fn_call_fn = try val_mod.makeNativeFunction(arena, function_proto_mod.nativeFunctionCall);
@@ -1135,233 +1035,35 @@ pub const Realm = struct {
         try function_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeFunctionToString));
         active_function_proto = function_proto;
 
-        // ---- Phase 4d: Date ----
-        const date_proto = try JsObject.create(arena, object_proto);
-        const date_fns = .{
-            .{ "getTime", date_mod.nativeDateGetTime },
-            .{ "valueOf", date_mod.nativeDateValueOf },
-            .{ "getFullYear", date_mod.nativeDateGetFullYear },
-            .{ "getMonth", date_mod.nativeDateGetMonth },
-            .{ "getDate", date_mod.nativeDateGetDate },
-            .{ "getDay", date_mod.nativeDateGetDay },
-            .{ "getHours", date_mod.nativeDateGetHours },
-            .{ "getMinutes", date_mod.nativeDateGetMinutes },
-            .{ "getSeconds", date_mod.nativeDateGetSeconds },
-            .{ "getMilliseconds", date_mod.nativeDateGetMilliseconds },
-            .{ "toISOString", date_mod.nativeDateToISOString },
-            .{ "toString", date_mod.nativeDateToString },
+        // R1: shared registration context for self-registering builtins (each
+        // installs its own prototype + constructor + global). Built once here,
+        // after the shared prototypes it depends on exist.
+        const reg_ctx = intrinsics.Ctx{
+            .arena = arena,
+            .env = env,
+            .object_proto = object_proto,
+            .function_proto = function_proto,
         };
-        inline for (date_fns) |pair| {
-            const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
-            try date_proto.set(pair[0], fn_v);
-        }
-        date_mod.active_date_proto = date_proto;
 
-        // Build Date constructor.
-        const date_ctor_obj = try JsObject.create(arena, null);
-        const date_proto_val = try val_mod.makeObject(arena, date_proto);
-        try date_ctor_obj.set("prototype", date_proto_val);
-        const date_call_fn = try val_mod.makeNativeFunction(arena, date_mod.nativeDateCtor);
-        try date_ctor_obj.set("__call__", date_call_fn);
-        const date_now_fn = try val_mod.makeNativeFunction(arena, date_mod.nativeDateNow);
-        try date_ctor_obj.set("now", date_now_fn);
-        const date_ctor_val = try val_mod.makeObject(arena, date_ctor_obj);
-        try env.define("Date", date_ctor_val);
+        try date_mod.register(&reg_ctx);
+
+        // ---- Phase 4b: Math object ----
+        try math_mod.register(&reg_ctx);
+
+        // ---- Phase 4b: JSON object ----
+        try json_mod.register(&reg_ctx);
+
+        // ---- Phase 4c: RegExp constructor + prototype ----
+        try regexp_mod.register(&reg_ctx);
 
         // ---- Phase 7 baseline: Map/Set/WeakMap/WeakSet ----
-        const map_proto = try JsObject.create(arena, object_proto);
-        const map_fns = .{
-            .{ "set", es2015_collections_mod.nativeMapSet },
-            .{ "get", es2015_collections_mod.nativeMapGet },
-            .{ "has", es2015_collections_mod.nativeMapHas },
-            .{ "delete", es2015_collections_mod.nativeMapDelete },
-            .{ "clear", es2015_collections_mod.nativeMapClear },
-            .{ "size", es2015_collections_mod.nativeMapSize },
-            .{ "keys", es2015_collections_mod.nativeMapKeys },
-            .{ "values", es2015_collections_mod.nativeMapValues },
-            .{ "entries", es2015_collections_mod.nativeMapEntries },
-            .{ "@@iterator", es2015_collections_mod.nativeMapEntries },
-        };
-        inline for (map_fns) |pair| {
-            const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
-            try map_proto.set(pair[0], fn_v);
-        }
-        const map_ctor_obj = try JsObject.create(arena, null);
-        try map_ctor_obj.set("prototype", try val_mod.makeObject(arena, map_proto));
-        try map_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeMapCtor));
-        try env.define("Map", try val_mod.makeObject(arena, map_ctor_obj));
-
-        const set_proto = try JsObject.create(arena, object_proto);
-        const set_fns = .{
-            .{ "add", es2015_collections_mod.nativeSetAdd },
-            .{ "has", es2015_collections_mod.nativeSetHas },
-            .{ "delete", es2015_collections_mod.nativeSetDelete },
-            .{ "clear", es2015_collections_mod.nativeSetClear },
-            .{ "size", es2015_collections_mod.nativeSetSize },
-            .{ "values", es2015_collections_mod.nativeSetValues },
-            .{ "@@iterator", es2015_collections_mod.nativeSetValues },
-        };
-        inline for (set_fns) |pair| {
-            const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
-            try set_proto.set(pair[0], fn_v);
-        }
-        const set_ctor_obj = try JsObject.create(arena, null);
-        try set_ctor_obj.set("prototype", try val_mod.makeObject(arena, set_proto));
-        try set_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeSetCtor));
-        try env.define("Set", try val_mod.makeObject(arena, set_ctor_obj));
+        try es2015_collections_mod.register(&reg_ctx);
 
         // ---- M15: ArrayBuffer / TypedArrays / DataView ----
-        {
-            const ta = typed_array_mod;
-            // ArrayBuffer
-            const ab_proto = try JsObject.create(arena, object_proto);
-            try ab_proto.set("slice", try val_mod.makeNativeFunction(arena, ta.nativeArrayBufferSlice));
-            ta.active_arraybuffer_proto = ab_proto;
-            const ab_ctor = try JsObject.create(arena, null);
-            try ab_ctor.set("prototype", try val_mod.makeObject(arena, ab_proto));
-            try ab_ctor.set("__call__", try val_mod.makeNativeFunction(arena, ta.nativeArrayBufferCtor));
-            try ab_ctor.set("isView", try val_mod.makeNativeFunction(arena, ta.nativeArrayBufferIsView));
-            try ab_proto.set("constructor", try val_mod.makeObject(arena, ab_ctor));
-            try env.define("ArrayBuffer", try val_mod.makeObject(arena, ab_ctor));
-
-            // %TypedArray%.prototype — shared methods.
-            const ta_proto = try JsObject.create(arena, object_proto);
-            const ta_methods = .{
-                .{ "fill", ta.nativeTaFill },
-                .{ "subarray", ta.nativeTaSubarray },
-                .{ "slice", ta.nativeTaSlice },
-                .{ "set", ta.nativeTaSet },
-                .{ "indexOf", ta.nativeTaIndexOf },
-                .{ "includes", ta.nativeTaIncludes },
-                .{ "join", ta.nativeTaJoin },
-                .{ "toString", ta.nativeTaToString },
-                .{ "reverse", ta.nativeTaReverse },
-                .{ "at", ta.nativeTaAt },
-                .{ "forEach", ta.nativeTaForEach },
-                .{ "map", ta.nativeTaMap },
-                .{ "reduce", ta.nativeTaReduce },
-                .{ "values", ta.nativeTaValues },
-                .{ "keys", ta.nativeTaKeys },
-                .{ "entries", ta.nativeTaEntries },
-                .{ "@@iterator", ta.nativeTaValues },
-            };
-            inline for (ta_methods) |pair| {
-                try ta_proto.set(pair[0], try val_mod.makeNativeFunction(arena, pair[1]));
-            }
-            ta.active_typedarray_proto = ta_proto;
-
-            // Instance accessor getters live on %TypedArray%.prototype (spec: these
-            // are getters, not own data properties).
-            try ta.defineGetter(arena, ta_proto, "length", ta.taGetLength);
-            try ta.defineGetter(arena, ta_proto, "byteLength", ta.taGetByteLength);
-            try ta.defineGetter(arena, ta_proto, "byteOffset", ta.taGetByteOffset);
-            try ta.defineGetter(arena, ta_proto, "buffer", ta.taGetBuffer);
-
-            // %TypedArray% intrinsic constructor (abstract; reachable via
-            // Object.getPrototypeOf(Int8Array) — required by the test262 harness).
-            const ta_ctor = try JsObject.create(arena, function_proto);
-            try ta_ctor.set("prototype", try val_mod.makeObject(arena, ta_proto));
-            try ta_ctor.set("__call__", try val_mod.makeNativeFunction(arena, ta.nativeTaAbstractCtor));
-            try ta_ctor.set("from", try val_mod.makeNativeFunction(arena, ta.nativeTaFrom));
-            try ta_ctor.set("of", try val_mod.makeNativeFunction(arena, ta.nativeTaOf));
-            try ta_proto.set("constructor", try val_mod.makeObject(arena, ta_ctor));
-
-            // TypedArray iterator prototype.
-            const ta_iter_proto = try JsObject.create(arena, object_proto);
-            try ta_iter_proto.set("next", try val_mod.makeNativeFunction(arena, ta.nativeTaIterNext));
-            try ta_iter_proto.set("@@iterator", try val_mod.makeNativeFunction(arena, ta.nativeIterSelf));
-            ta.active_ta_iter_proto = ta_iter_proto;
-
-            // Per-kind constructors + prototypes (inherit %TypedArray% / its prototype).
-            inline for (ta.all_kinds) |kind| {
-                const kp = try JsObject.create(arena, ta_proto);
-                ta.active_ta_protos[@intFromEnum(kind)] = kp;
-                const kctor = try JsObject.create(arena, ta_ctor);
-                ta.active_ta_ctors[@intFromEnum(kind)] = kctor;
-                try kctor.set("prototype", try val_mod.makeObject(arena, kp));
-                try kctor.set("__call__", try val_mod.makeNativeFunction(arena, ta.taCtor(kind)));
-                try kctor.set("from", try val_mod.makeNativeFunction(arena, ta.nativeTaFrom));
-                try kctor.set("of", try val_mod.makeNativeFunction(arena, ta.nativeTaOf));
-                try kctor.set("BYTES_PER_ELEMENT", try val_mod.makeNumber(arena, @floatFromInt(kind.elemSize())));
-                try kp.set("BYTES_PER_ELEMENT", try val_mod.makeNumber(arena, @floatFromInt(kind.elemSize())));
-                try kp.set("constructor", try val_mod.makeObject(arena, kctor));
-                try env.define(kind.ctorName(), try val_mod.makeObject(arena, kctor));
-            }
-
-            // DataView
-            const dv_proto = try JsObject.create(arena, object_proto);
-            try dv_proto.set("getInt8", try val_mod.makeNativeFunction(arena, ta.dvGet(i8, false)));
-            try dv_proto.set("getUint8", try val_mod.makeNativeFunction(arena, ta.dvGet(u8, false)));
-            try dv_proto.set("getInt16", try val_mod.makeNativeFunction(arena, ta.dvGet(i16, false)));
-            try dv_proto.set("getUint16", try val_mod.makeNativeFunction(arena, ta.dvGet(u16, false)));
-            try dv_proto.set("getInt32", try val_mod.makeNativeFunction(arena, ta.dvGet(i32, false)));
-            try dv_proto.set("getUint32", try val_mod.makeNativeFunction(arena, ta.dvGet(u32, false)));
-            try dv_proto.set("getFloat32", try val_mod.makeNativeFunction(arena, ta.dvGet(f32, true)));
-            try dv_proto.set("getFloat64", try val_mod.makeNativeFunction(arena, ta.dvGet(f64, true)));
-            try dv_proto.set("setInt8", try val_mod.makeNativeFunction(arena, ta.dvSet(i8, false)));
-            try dv_proto.set("setUint8", try val_mod.makeNativeFunction(arena, ta.dvSet(u8, false)));
-            try dv_proto.set("setInt16", try val_mod.makeNativeFunction(arena, ta.dvSet(i16, false)));
-            try dv_proto.set("setUint16", try val_mod.makeNativeFunction(arena, ta.dvSet(u16, false)));
-            try dv_proto.set("setInt32", try val_mod.makeNativeFunction(arena, ta.dvSet(i32, false)));
-            try dv_proto.set("setUint32", try val_mod.makeNativeFunction(arena, ta.dvSet(u32, false)));
-            try dv_proto.set("setFloat32", try val_mod.makeNativeFunction(arena, ta.dvSet(f32, true)));
-            try dv_proto.set("setFloat64", try val_mod.makeNativeFunction(arena, ta.dvSet(f64, true)));
-            ta.active_dataview_proto = dv_proto;
-            const dv_ctor = try JsObject.create(arena, null);
-            try dv_ctor.set("prototype", try val_mod.makeObject(arena, dv_proto));
-            try dv_ctor.set("__call__", try val_mod.makeNativeFunction(arena, ta.nativeDataViewCtor));
-            try dv_proto.set("constructor", try val_mod.makeObject(arena, dv_ctor));
-            try env.define("DataView", try val_mod.makeObject(arena, dv_ctor));
-        }
-
-        const weakmap_proto = try JsObject.create(arena, object_proto);
-        const weakmap_fns = .{
-            .{ "set", es2015_collections_mod.nativeMapSet },
-            .{ "get", es2015_collections_mod.nativeMapGet },
-            .{ "has", es2015_collections_mod.nativeMapHas },
-            .{ "delete", es2015_collections_mod.nativeMapDelete },
-        };
-        inline for (weakmap_fns) |pair| {
-            const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
-            try weakmap_proto.set(pair[0], fn_v);
-        }
-        const weakmap_ctor_obj = try JsObject.create(arena, null);
-        try weakmap_ctor_obj.set("prototype", try val_mod.makeObject(arena, weakmap_proto));
-        try weakmap_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeWeakMapCtor));
-        try env.define("WeakMap", try val_mod.makeObject(arena, weakmap_ctor_obj));
-
-        const weakset_proto = try JsObject.create(arena, object_proto);
-        const weakset_fns = .{
-            .{ "add", es2015_collections_mod.nativeSetAdd },
-            .{ "has", es2015_collections_mod.nativeSetHas },
-            .{ "delete", es2015_collections_mod.nativeSetDelete },
-        };
-        inline for (weakset_fns) |pair| {
-            const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
-            try weakset_proto.set(pair[0], fn_v);
-        }
-        const weakset_ctor_obj = try JsObject.create(arena, null);
-        try weakset_ctor_obj.set("prototype", try val_mod.makeObject(arena, weakset_proto));
-        try weakset_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeWeakSetCtor));
-        try env.define("WeakSet", try val_mod.makeObject(arena, weakset_ctor_obj));
+        try typed_array_mod.register(&reg_ctx);
 
         // ---- Phase 7 baseline: Promise ----
-        const promise_proto = try JsObject.create(arena, object_proto);
-        try promise_proto.set("then", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseThen));
-        try promise_proto.set("catch", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseCatch));
-        active_promise_proto = promise_proto;
-
-        const promise_ctor_obj = try JsObject.create(arena, null);
-        try promise_ctor_obj.set("prototype", try val_mod.makeObject(arena, promise_proto));
-        try promise_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseCtor));
-        try promise_ctor_obj.set("resolve", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseResolve));
-        try promise_ctor_obj.set("reject", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseReject));
-        try promise_ctor_obj.set("allSettled", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseAllSettled));
-        try promise_ctor_obj.set("all", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseAll));
-        try promise_ctor_obj.set("race", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseRace));
-        try promise_ctor_obj.set("any", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseAny));
-        try promise_proto.set("finally", try val_mod.makeNativeFunction(arena, promise_mod.nativePromiseFinally));
-        try env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
+        active_promise_proto = try promise_mod.register(&reg_ctx);
         const require_cache_obj = try JsObject.create(arena, object_proto);
         try env.define("__require_cache__", try val_mod.makeObject(arena, require_cache_obj));
         const require_obj = try JsObject.create(arena, function_proto);
@@ -1443,19 +1145,7 @@ pub const Realm = struct {
         try env.define("Infinity", try val_mod.makeNumber(arena, std.math.inf(f64)));
 
         // ---- console global ----
-        const console_obj = try JsObject.create(arena, null);
-        const console_fns = .{
-            .{ "log", console_mod.nativeConsoleLog },
-            .{ "info", console_mod.nativeConsoleInfo },
-            .{ "debug", console_mod.nativeConsoleDebug },
-            .{ "error", console_mod.nativeConsoleError },
-            .{ "warn", console_mod.nativeConsoleWarn },
-        };
-        inline for (console_fns) |pair| {
-            const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
-            try console_obj.set(pair[0], fn_v);
-        }
-        try env.define("console", try val_mod.makeObject(arena, console_obj));
+        try console_mod.register(&reg_ctx);
 
         // ---- ES2015 Symbol ----
         const symbol_proto = try JsObject.create(arena, object_proto);
@@ -1482,24 +1172,13 @@ pub const Realm = struct {
         // `date + x` coerces to a string (default hint) rather than a number.
         active_sym_to_primitive = symbol_ctor.getOwn("toPrimitive");
         if (active_sym_to_primitive) |symv| {
-            try date_proto.setSym(symv, try val_mod.makeNativeFunction(arena, date_mod.nativeDateToPrimitive));
+            if (date_mod.active_date_proto) |dp| {
+                try dp.setSym(symv, try val_mod.makeNativeFunction(arena, date_mod.nativeDateToPrimitive));
+            }
         }
 
         // ---- ES2015 Reflect ----
-        const reflect_obj = try JsObject.create(arena, object_proto);
-        try reflect_obj.set("get", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectGet));
-        try reflect_obj.set("set", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectSet));
-        try reflect_obj.set("has", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectHas));
-        try reflect_obj.set("deleteProperty", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectDeleteProperty));
-        try reflect_obj.set("ownKeys", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectOwnKeys));
-        try reflect_obj.set("getPrototypeOf", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectGetPrototypeOf));
-        try reflect_obj.set("defineProperty", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectDefineProperty));
-        try reflect_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectGetOwnPropertyDescriptor));
-        try reflect_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectIsExtensible));
-        try reflect_obj.set("preventExtensions", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectPreventExtensions));
-        try reflect_obj.set("apply", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectApply));
-        try reflect_obj.set("construct", try val_mod.makeNativeFunction(arena, reflect_mod.nativeReflectConstruct));
-        try env.define("Reflect", try val_mod.makeObject(arena, reflect_obj));
+        try reflect_mod.register(&reg_ctx);
 
         // ---- ES2015 Proxy ----
         active_sym_proxy_target = try val_mod.makeSymbol(arena, "[[ProxyTarget]]");
@@ -1556,7 +1235,7 @@ pub const Realm = struct {
             .reference_error_prototype = reference_error_proto,
             .aggregate_error_prototype = aggregate_error_proto,
             .string_prototype = string_proto,
-            .regexp_prototype = regexp_proto,
+            .regexp_prototype = active_regexp_proto.?,
             .function_prototype = function_proto,
         };
     }

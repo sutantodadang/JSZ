@@ -18,6 +18,112 @@ const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
 const function_proto = @import("function_proto.zig");
+const intrinsics = @import("intrinsics.zig");
+
+/// R1: install ArrayBuffer / %TypedArray% / per-kind ctors / DataView and bind globals.
+pub fn register(ctx: *const intrinsics.Ctx) !void {
+    const arena = ctx.arena;
+    const object_proto = ctx.object_proto;
+    const fn_proto_obj = ctx.function_proto.?;
+
+    // ArrayBuffer
+    const ab_proto = try JsObject.create(arena, object_proto);
+    try ab_proto.set("slice", try val_mod.makeNativeFunction(arena, nativeArrayBufferSlice));
+    active_arraybuffer_proto = ab_proto;
+    const ab_ctor = try JsObject.create(arena, null);
+    try ab_ctor.set("prototype", try val_mod.makeObject(arena, ab_proto));
+    try ab_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeArrayBufferCtor));
+    try ab_ctor.set("isView", try val_mod.makeNativeFunction(arena, nativeArrayBufferIsView));
+    try ab_proto.set("constructor", try val_mod.makeObject(arena, ab_ctor));
+    try ctx.env.define("ArrayBuffer", try val_mod.makeObject(arena, ab_ctor));
+
+    // %TypedArray%.prototype — shared methods.
+    const ta_proto = try JsObject.create(arena, object_proto);
+    const ta_methods = .{
+        .{ "fill", nativeTaFill },
+        .{ "subarray", nativeTaSubarray },
+        .{ "slice", nativeTaSlice },
+        .{ "set", nativeTaSet },
+        .{ "indexOf", nativeTaIndexOf },
+        .{ "includes", nativeTaIncludes },
+        .{ "join", nativeTaJoin },
+        .{ "toString", nativeTaToString },
+        .{ "reverse", nativeTaReverse },
+        .{ "at", nativeTaAt },
+        .{ "forEach", nativeTaForEach },
+        .{ "map", nativeTaMap },
+        .{ "reduce", nativeTaReduce },
+        .{ "values", nativeTaValues },
+        .{ "keys", nativeTaKeys },
+        .{ "entries", nativeTaEntries },
+        .{ "@@iterator", nativeTaValues },
+    };
+    inline for (ta_methods) |pair| {
+        try ta_proto.set(pair[0], try val_mod.makeNativeFunction(arena, pair[1]));
+    }
+    active_typedarray_proto = ta_proto;
+
+    // Instance accessor getters live on %TypedArray%.prototype.
+    try defineGetter(arena, ta_proto, "length", taGetLength);
+    try defineGetter(arena, ta_proto, "byteLength", taGetByteLength);
+    try defineGetter(arena, ta_proto, "byteOffset", taGetByteOffset);
+    try defineGetter(arena, ta_proto, "buffer", taGetBuffer);
+
+    // %TypedArray% intrinsic constructor (abstract).
+    const ta_ctor = try JsObject.create(arena, fn_proto_obj);
+    try ta_ctor.set("prototype", try val_mod.makeObject(arena, ta_proto));
+    try ta_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeTaAbstractCtor));
+    try ta_ctor.set("from", try val_mod.makeNativeFunction(arena, nativeTaFrom));
+    try ta_ctor.set("of", try val_mod.makeNativeFunction(arena, nativeTaOf));
+    try ta_proto.set("constructor", try val_mod.makeObject(arena, ta_ctor));
+
+    // TypedArray iterator prototype.
+    const ta_iter_proto = try JsObject.create(arena, object_proto);
+    try ta_iter_proto.set("next", try val_mod.makeNativeFunction(arena, nativeTaIterNext));
+    try ta_iter_proto.set("@@iterator", try val_mod.makeNativeFunction(arena, nativeIterSelf));
+    active_ta_iter_proto = ta_iter_proto;
+
+    // Per-kind constructors + prototypes (inherit %TypedArray% / its prototype).
+    inline for (all_kinds) |kind| {
+        const kp = try JsObject.create(arena, ta_proto);
+        active_ta_protos[@intFromEnum(kind)] = kp;
+        const kctor = try JsObject.create(arena, ta_ctor);
+        active_ta_ctors[@intFromEnum(kind)] = kctor;
+        try kctor.set("prototype", try val_mod.makeObject(arena, kp));
+        try kctor.set("__call__", try val_mod.makeNativeFunction(arena, taCtor(kind)));
+        try kctor.set("from", try val_mod.makeNativeFunction(arena, nativeTaFrom));
+        try kctor.set("of", try val_mod.makeNativeFunction(arena, nativeTaOf));
+        try kctor.set("BYTES_PER_ELEMENT", try val_mod.makeNumber(arena, @floatFromInt(kind.elemSize())));
+        try kp.set("BYTES_PER_ELEMENT", try val_mod.makeNumber(arena, @floatFromInt(kind.elemSize())));
+        try kp.set("constructor", try val_mod.makeObject(arena, kctor));
+        try ctx.env.define(kind.ctorName(), try val_mod.makeObject(arena, kctor));
+    }
+
+    // DataView
+    const dv_proto = try JsObject.create(arena, object_proto);
+    try dv_proto.set("getInt8", try val_mod.makeNativeFunction(arena, dvGet(i8, false)));
+    try dv_proto.set("getUint8", try val_mod.makeNativeFunction(arena, dvGet(u8, false)));
+    try dv_proto.set("getInt16", try val_mod.makeNativeFunction(arena, dvGet(i16, false)));
+    try dv_proto.set("getUint16", try val_mod.makeNativeFunction(arena, dvGet(u16, false)));
+    try dv_proto.set("getInt32", try val_mod.makeNativeFunction(arena, dvGet(i32, false)));
+    try dv_proto.set("getUint32", try val_mod.makeNativeFunction(arena, dvGet(u32, false)));
+    try dv_proto.set("getFloat32", try val_mod.makeNativeFunction(arena, dvGet(f32, true)));
+    try dv_proto.set("getFloat64", try val_mod.makeNativeFunction(arena, dvGet(f64, true)));
+    try dv_proto.set("setInt8", try val_mod.makeNativeFunction(arena, dvSet(i8, false)));
+    try dv_proto.set("setUint8", try val_mod.makeNativeFunction(arena, dvSet(u8, false)));
+    try dv_proto.set("setInt16", try val_mod.makeNativeFunction(arena, dvSet(i16, false)));
+    try dv_proto.set("setUint16", try val_mod.makeNativeFunction(arena, dvSet(u16, false)));
+    try dv_proto.set("setInt32", try val_mod.makeNativeFunction(arena, dvSet(i32, false)));
+    try dv_proto.set("setUint32", try val_mod.makeNativeFunction(arena, dvSet(u32, false)));
+    try dv_proto.set("setFloat32", try val_mod.makeNativeFunction(arena, dvSet(f32, true)));
+    try dv_proto.set("setFloat64", try val_mod.makeNativeFunction(arena, dvSet(f64, true)));
+    active_dataview_proto = dv_proto;
+    const dv_ctor = try JsObject.create(arena, null);
+    try dv_ctor.set("prototype", try val_mod.makeObject(arena, dv_proto));
+    try dv_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeDataViewCtor));
+    try dv_proto.set("constructor", try val_mod.makeObject(arena, dv_ctor));
+    try ctx.env.define("DataView", try val_mod.makeObject(arena, dv_ctor));
+}
 
 const native_endian = builtin.cpu.arch.endian();
 

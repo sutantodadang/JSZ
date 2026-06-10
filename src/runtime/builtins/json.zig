@@ -5,6 +5,19 @@ const std = @import("std");
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
+const intrinsics = @import("intrinsics.zig");
+
+/// R1: create the JSON object with stringify/parse and bind the `JSON` global.
+pub fn register(ctx: *const intrinsics.Ctx) !void {
+    const arena = ctx.arena;
+    const json_obj = try JsObject.create(arena, null);
+    const stringify_fn = try val_mod.makeNativeFunction(arena, nativeJsonStringify);
+    const parse_fn = try val_mod.makeNativeFunction(arena, nativeJsonParse);
+    try json_obj.set("stringify", stringify_fn);
+    try json_obj.set("parse", parse_fn);
+    const json_val = try val_mod.makeObject(arena, json_obj);
+    try ctx.env.define("JSON", json_val);
+}
 
 // ---------------------------------------------------------------- stringify ---
 

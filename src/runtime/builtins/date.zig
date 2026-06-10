@@ -7,12 +7,38 @@ const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
+const intrinsics = @import("intrinsics.zig");
 
 pub const DateData = struct {
     ms: i64,
 };
 
 pub var active_date_proto: ?*JsObject = null;
+
+/// R1: install Date.prototype + constructor and bind the `Date` global.
+pub fn register(ctx: *const intrinsics.Ctx) !void {
+    const arena = ctx.arena;
+    const date_proto = try JsObject.create(arena, ctx.object_proto);
+    try intrinsics.setMethods(arena, date_proto, .{
+        .{ "getTime", nativeDateGetTime },
+        .{ "valueOf", nativeDateValueOf },
+        .{ "getFullYear", nativeDateGetFullYear },
+        .{ "getMonth", nativeDateGetMonth },
+        .{ "getDate", nativeDateGetDate },
+        .{ "getDay", nativeDateGetDay },
+        .{ "getHours", nativeDateGetHours },
+        .{ "getMinutes", nativeDateGetMinutes },
+        .{ "getSeconds", nativeDateGetSeconds },
+        .{ "getMilliseconds", nativeDateGetMilliseconds },
+        .{ "toISOString", nativeDateToISOString },
+        .{ "toString", nativeDateToString },
+    });
+    active_date_proto = date_proto;
+
+    const date_ctor = try intrinsics.makeCtor(arena, date_proto, nativeDateCtor, null);
+    try intrinsics.setMethod(arena, date_ctor, "now", nativeDateNow);
+    try ctx.defineGlobal("Date", date_ctor);
+}
 
 // ------------------------------------------------------------------ helpers ---
 

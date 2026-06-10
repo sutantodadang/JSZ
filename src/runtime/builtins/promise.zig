@@ -7,6 +7,29 @@ const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
 const fn_proto = @import("./function_proto.zig");
 const iter_mod = @import("./es2015_collections.zig");
+const intrinsics = @import("intrinsics.zig");
+
+/// R1: create Promise.prototype + constructor, bind the `Promise` global, and
+/// return promise_proto so that realm.zig can set active_promise_proto.
+pub fn register(ctx: *const intrinsics.Ctx) !*JsObject {
+    const arena = ctx.arena;
+    const promise_proto = try JsObject.create(arena, ctx.object_proto);
+    try promise_proto.set("then", try val_mod.makeNativeFunction(arena, nativePromiseThen));
+    try promise_proto.set("catch", try val_mod.makeNativeFunction(arena, nativePromiseCatch));
+
+    const promise_ctor_obj = try JsObject.create(arena, null);
+    try promise_ctor_obj.set("prototype", try val_mod.makeObject(arena, promise_proto));
+    try promise_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativePromiseCtor));
+    try promise_ctor_obj.set("resolve", try val_mod.makeNativeFunction(arena, nativePromiseResolve));
+    try promise_ctor_obj.set("reject", try val_mod.makeNativeFunction(arena, nativePromiseReject));
+    try promise_ctor_obj.set("allSettled", try val_mod.makeNativeFunction(arena, nativePromiseAllSettled));
+    try promise_ctor_obj.set("all", try val_mod.makeNativeFunction(arena, nativePromiseAll));
+    try promise_ctor_obj.set("race", try val_mod.makeNativeFunction(arena, nativePromiseRace));
+    try promise_ctor_obj.set("any", try val_mod.makeNativeFunction(arena, nativePromiseAny));
+    try promise_proto.set("finally", try val_mod.makeNativeFunction(arena, nativePromiseFinally));
+    try ctx.env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
+    return promise_proto;
+}
 
 const PromiseState = enum { pending, fulfilled, rejected };
 

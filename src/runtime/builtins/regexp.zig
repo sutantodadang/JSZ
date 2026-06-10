@@ -15,6 +15,27 @@ const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
+const intrinsics = @import("intrinsics.zig");
+
+/// R1: install RegExp.prototype + constructor and bind the `RegExp` global.
+pub fn register(ctx: *const intrinsics.Ctx) !void {
+    const arena = ctx.arena;
+    const regexp_proto = try JsObject.create(arena, ctx.object_proto);
+    const re_test_fn = try val_mod.makeNativeFunction(arena, nativeRegExpTest);
+    const re_exec_fn = try val_mod.makeNativeFunction(arena, nativeRegExpExec);
+    try regexp_proto.set("test", re_test_fn);
+    try regexp_proto.set("exec", re_exec_fn);
+
+    const regexp_ctor_obj = try JsObject.create(arena, null);
+    const regexp_proto_val = try val_mod.makeObject(arena, regexp_proto);
+    try regexp_ctor_obj.set("prototype", regexp_proto_val);
+    const regexp_call_fn = try val_mod.makeNativeFunction(arena, nativeRegExpCtor);
+    try regexp_ctor_obj.set("__call__", regexp_call_fn);
+    const regexp_ctor_val = try val_mod.makeObject(arena, regexp_ctor_obj);
+    try ctx.env.define("RegExp", regexp_ctor_val);
+
+    realm_mod.active_regexp_proto = regexp_proto;
+}
 
 // ============================================================= IR =============
 

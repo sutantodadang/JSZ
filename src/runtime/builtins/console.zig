@@ -5,6 +5,26 @@
 const std = @import("std");
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
+const JsObject = @import("../../object/object.zig").JsObject;
+const intrinsics = @import("intrinsics.zig");
+
+/// R1: create the console object and bind the `console` global.
+pub fn register(ctx: *const intrinsics.Ctx) !void {
+    const arena = ctx.arena;
+    const console_obj = try JsObject.create(arena, null);
+    const console_fns = .{
+        .{ "log", nativeConsoleLog },
+        .{ "info", nativeConsoleInfo },
+        .{ "debug", nativeConsoleDebug },
+        .{ "error", nativeConsoleError },
+        .{ "warn", nativeConsoleWarn },
+    };
+    inline for (console_fns) |pair| {
+        const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
+        try console_obj.set(pair[0], fn_v);
+    }
+    try ctx.env.define("console", try val_mod.makeObject(arena, console_obj));
+}
 
 /// Convert a Value to a console display string.
 /// Mirrors root.zig:valueToDisplayString without importing it.
