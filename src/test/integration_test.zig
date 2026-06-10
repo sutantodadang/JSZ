@@ -199,6 +199,145 @@ test "S7: JIT closure correctness: outer creates inner, inner runs via interpret
     try std.testing.expectEqual(@as(f64, 42), v.toF64());
 }
 
+test "S8: JIT fine-deopt resumes mid-function (string concat) without corrupting the caller" {
+    if (!build_options.jit_enabled) return error.SkipZigTest;
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setJitMode(.experimental);
+
+    // `s + '!'` compiles (ADD accepts any operands), then the non-number operand
+    // fine-deopts at the ADD; the resume must run inside a REAL callee frame —
+    // the old top-frame patch corrupted the caller (index-out-of-bounds panic).
+    const result = ctx.eval(
+        \\function cat(s) { return s + '!'; }
+        \\cat('a');
+        \\cat('b');
+    , "<jit-s8-fine-deopt-resume>");
+    const v = switch (result) {
+        .ok => |x| x,
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const s = try root.valueToDisplayString(arena.allocator(), v);
+    try std.testing.expectEqualStrings("b!", s);
+    try std.testing.expect(ctx.lastJitProfile().compiled >= 1);
+}
+
+test "S8: a property store commits exactly once across an overflow fine-deopt" {
+    if (!build_options.jit_enabled) return error.SkipZigTest;
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setJitMode(.experimental);
+
+    // Each call commits `o.n = o.n + 1`, then `a*b` (1e16 > 2^53) overflow
+    // fine-deopts at the MUL. A coarse re-run would increment twice per call.
+    const result = ctx.eval(
+        \\function h(o, a, b) { o.n = o.n + 1; return a * b; }
+        \\var o = { n: 0 };
+        \\for (var i = 0; i < 100; i++) { h(o, 100000000, 100000000); }
+        \\o.n;
+    , "<jit-s8-store-once>");
+    const v = switch (result) {
+        .ok => |x| x,
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+    try std.testing.expectEqual(@as(f64, 100), v.toF64());
+}
+
+test "S8: JIT executes accessor getters and setters natively (re-entrant helper)" {
+    if (!build_options.jit_enabled) return error.SkipZigTest;
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setJitMode(.experimental);
+
+    // Accessor sites never warm the data IC; after warmup exhaustion the
+    // function compiles anyway and the helper runs the getter/setter while the
+    // region stays native (200 iterations > jit_warmup_max).
+    const result = ctx.eval(
+        \\var o = {};
+        \\Object.defineProperty(o, 'x', { get: function () { return 7; } });
+        \\var bag = { v: 0 };
+        \\Object.defineProperty(bag, 'y', { set: function (n) { this.v = n * 2; } });
+        \\function g(p) { return p.x + 1; }
+        \\function s(p, n) { p.y = n; }
+        \\var r = 0;
+        \\for (var i = 0; i < 200; i++) { r = g(o); s(bag, i); }
+        \\r + bag.v;
+    , "<jit-s8-accessor>");
+    const v = switch (result) {
+        .ok => |x| x,
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+    // r = 8, bag.v = 199*2 = 398 → 406.
+    try std.testing.expectEqual(@as(f64, 406), v.toF64());
+    try std.testing.expect(ctx.lastJitProfile().compiled >= 2);
+}
+
+test "S8: a throwing getter inside a JITed function is catchable" {
+    if (!build_options.jit_enabled) return error.SkipZigTest;
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setJitMode(.experimental);
+
+    const result = ctx.eval(
+        \\var o = {};
+        \\Object.defineProperty(o, 'x', { get: function () { throw 'boom'; } });
+        \\function g(p) { return p.x; }
+        \\var c = '';
+        \\for (var i = 0; i < 100; i++) { try { g(o); } catch (e) { c = e; } }
+        \\c;
+    , "<jit-s8-throwing-getter>");
+    const v = switch (result) {
+        .ok => |x| x,
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse_error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const s = try root.valueToDisplayString(arena.allocator(), v);
+    try std.testing.expectEqualStrings("boom", s);
+}
+
 test "JIT double INC/DEC: increment a double stays numeric" {
     if (!build_options.jit_enabled) return error.SkipZigTest;
 

@@ -2981,13 +2981,27 @@ pub const BcVm = struct {
         }
     }
 
+    /// S8: re-entrant property bridges for the boxed JIT's GET_PROP/SET_PROP
+    /// helpers (`int_fn_jit.jsz_jit_get_prop`/`jsz_jit_set_own` slow paths).
+    /// They run the interpreter's FULL property machinery — accessors, proxies,
+    /// arrays, autoboxing, shape transitions — exactly once, while the calling
+    /// region stays native. Throws error.JsException (realm.pending_exception
+    /// set) when a getter/setter/trap throws.
+    pub fn jitGetPropSlow(self: *BcVm, recv: Value, key: []const u8) anyerror!Value {
+        return self.getProp(recv, key);
+    }
+
+    pub fn jitSetPropSlow(self: *BcVm, recv: Value, key: []const u8, value: Value) anyerror!void {
+        return self.setProp(recv, key, value);
+    }
+
     /// Execute a regular CALL: reads callee from R[base], args from R[base+1..base+1+nargs].
     /// Phase 12: try to satisfy a call to a pure-int leaf bytecode function with
     /// natively-compiled code. Returns true (and writes `ret_dst`) when handled;
     /// false to fall back to the interpreter. Entirely comptime-elided unless the
     /// binary was built with `-Djit=true` — default builds never reference the
     /// native backend.
-    fn tryJitCall(self: *BcVm, fn_ptr: *const BcFunction, base: u8, nargs: u8, ret_dst: u8) !JitCallResult {
+    fn tryJitCall(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, base: u8, nargs: u8, ret_dst: u8) !JitCallResult {
         // The whole body is inside a comptime-known `if`, so when the binary is
         // built WITHOUT -Djit the branch is never analyzed — the `@import` of the
         // native backend is not evaluated and nothing links the Cranelift cdylib.
@@ -3017,8 +3031,17 @@ pub const BcVm = struct {
             if (gop.value_ptr.* == jit_rejected) return .not_jitted;
             if (gop.value_ptr.* == null) {
                 const call_helper: u64 = @intFromPtr(&jsz_jit_call);
-                const closure_helper: u64 = @intFromPtr(&jsz_jit_make_closure);
-                switch (try ifj.analyze(self.arena, fn_ptr, true, call_helper, closure_helper)) {
+                // ABI slot kept for compatibility; boxed NEW_CLOSURE fine-deopts.
+                const closure_helper: u64 = 0;
+                // After `jit_warmup_max` interpreted calls a still-cold property
+                // IC will never warm (e.g. an accessor-only site, which the data
+                // IC never caches) — compile anyway; the re-entrant property
+                // helper serves such sites natively via the interpreter's full
+                // get/set machinery.
+                const ag = try self.jit_attempts.getOrPut(self.arena, fn_ptr);
+                if (!ag.found_existing) ag.value_ptr.* = 0;
+                const allow_cold = ag.value_ptr.* >= jit_warmup_max;
+                switch (try ifj.analyze(self.arena, fn_ptr, true, call_helper, closure_helper, allow_cold)) {
                     .ok => |p| {
                         gop.value_ptr.* = @ptrCast(p);
                         jc.compiled += 1;
@@ -3028,10 +3051,7 @@ pub const BcVm = struct {
                         return .not_jitted;
                     },
                     .retry => {
-                        const ag = try self.jit_attempts.getOrPut(self.arena, fn_ptr);
-                        if (!ag.found_existing) ag.value_ptr.* = 0;
                         ag.value_ptr.* += 1;
-                        if (ag.value_ptr.* >= jit_warmup_max) gop.value_ptr.* = jit_rejected;
                         return .not_jitted; // interpret this call (warms the property IC)
                     },
                 }
@@ -3041,7 +3061,17 @@ pub const BcVm = struct {
             switch (try ifj.run(self.arena, plan, args_buf[0..nargs], self)) {
                 .deopt => return .not_jitted,
                 .threw => return .threw,
-                .resumed => return .completed,
+                .resumed => |st| {
+                    // S2 fine deopt: the region already committed side effects up
+                    // to st.pc — never re-run it. Push a real interpreter frame
+                    // seeded from the exact native state and run it to return.
+                    const result = self.resumeJitFrame(fn_ptr, def_env, this_val, st.regs, plan.local_names, st.locals, st.pc) catch |e| {
+                        if (e == error.JsException) return .threw;
+                        return e;
+                    };
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
+                    return .completed;
+                },
                 .value => |result| {
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
                     return .completed;
@@ -3051,49 +3081,76 @@ pub const BcVm = struct {
         return .not_jitted;
     }
 
+    /// S2/S8 fine-deopt resume: a JITed call for `fn_ptr` stopped at bytecode
+    /// `resume_pc` after possibly committing side effects (stores / calls). Push
+    /// a REAL interpreter frame whose registers come from the native register
+    /// file, whose env-locals are rebuilt from the native `locals` buffer
+    /// (`local_names` is the slot→name map, params first), and run it to
+    /// completion — mirroring `bcInvokeJs`'s run-until-return discipline.
+    /// Throws error.JsException (realm.pending_exception set) on an uncaught
+    /// throw inside the resumed code.
+    pub fn resumeJitFrame(
+        self: *BcVm,
+        fn_ptr: *const BcFunction,
+        def_env: *Environment,
+        this_val: Value,
+        regs_bits: []const i64,
+        local_names: []const []const u8,
+        locals_bits: []const i64,
+        resume_pc: u32,
+    ) anyerror!Value {
+        const call_env = try Environment.init(self.arena, def_env);
+        const n_loc = @min(local_names.len, locals_bits.len);
+        for (0..n_loc) |i| {
+            try call_env.define(local_names[i], Value{ .bits = @bitCast(locals_bits[i]) });
+        }
+        const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
+        const new_regs = try self.arena.alloc(Value, num_regs);
+        for (new_regs) |*r| r.* = Value{};
+        const n_regs = @min(num_regs, regs_bits.len);
+        for (0..n_regs) |i| new_regs[i] = Value{ .bits = @bitCast(regs_bits[i]) };
+        const caller_idx = if (self.frames.items.len > 0) self.frames.items.len - 1 else 0;
+        try self.frames.append(self.arena, BcCallFrame{
+            .func = fn_ptr,
+            .pc = resume_pc,
+            .registers = new_regs,
+            .env = call_env,
+            .return_dst = 255,
+            .caller_idx = if (self.frames.items.len > 0) caller_idx else null,
+            .this_val = this_val,
+        });
+        const frames_before = self.frames.items.len - 1;
+        while (self.frames.items.len > frames_before) {
+            const outcome = try self.runLoop();
+            switch (outcome) {
+                .ok => |v| return v,
+                .exception => {
+                    while (self.frames.items.len > frames_before) _ = self.frames.pop();
+                    const realm_mod = @import("../runtime/realm.zig");
+                    realm_mod.pending_exception = self.last_exception_value;
+                    return error.JsException;
+                },
+                .exception_value => |ev| {
+                    while (self.frames.items.len > frames_before) _ = self.frames.pop();
+                    const realm_mod = @import("../runtime/realm.zig");
+                    realm_mod.pending_exception = ev.value;
+                    return error.JsException;
+                },
+            }
+        }
+        return self.result;
+    }
+
     /// S4 CALL trampoline: a JITed region's native `CALL` re-enters the interpreter
     /// here. Reads the callee from `regs[base]` and args from `regs[base+1..]` (raw
     /// boxed Values), invokes the call, writes the result to `regs[ret_dst]`, and
     /// sets `deopt.* = 2` if it threw (the value is in `realm.pending_exception`).
     /// callconv(.c): its address is baked into the native code. The active region's
     /// buffers are GC roots (see `int_fn_jit.active_jit_frame`) while this runs.
-    fn jsz_jit_make_closure(regs: [*]i64, rdst: u32, fidx: u32, deopt: *i32) callconv(.c) i64 {
-        const ifj = @import("../jit/int_fn_jit.zig");
-        const vm_ptr = ifj.active_jit_vm orelse {
-            deopt.* = 2;
-            return 0;
-        };
-        const vm: *BcVm = @ptrCast(@alignCast(vm_ptr));
-        if (vm.frames.items.len == 0) {
-            deopt.* = 2;
-            return 0;
-        }
-        const top_frame = &vm.frames.items[vm.frames.items.len - 1];
-        const func = top_frame.func;
-        if (fidx >= func.child_functions.len) {
-            deopt.* = 2;
-            return 0;
-        }
-        const child_fn = func.child_functions[fidx];
-        const closure = vm.arena.create(BcClosure) catch {
-            deopt.* = 2;
-            return 0;
-        };
-        closure.* = BcClosure{
-            .func = child_fn,
-            .env = @ptrCast(top_frame.env),
-        };
-        const jsv = vm.arena.create(JsValue) catch {
-            deopt.* = 2;
-            return 0;
-        };
-        jsv.* = JsValue{ .bc_function = closure };
-        const result = val_mod.Value.fromPtr(jsv);
-        regs[rdst] = @bitCast(result.bits);
-        deopt.* = 0;
-        return @bitCast(result.bits);
-    }
-
+    /// (The former `jsz_jit_make_closure` trampoline is gone: boxed `NEW_CLOSURE`
+    /// now fine-deopts unconditionally — a natively created closure cannot share
+    /// the region's private mutable locals, and at the call boundary there is no
+    /// callee frame to resolve `child_functions` against.)
     fn jsz_jit_call(regs: [*]i64, base: u32, nargs: u32, ret_dst: u32, deopt: *i32) callconv(.c) void {
         const ifj = @import("../jit/int_fn_jit.zig");
         const vmptr = ifj.active_jit_vm.?;
@@ -3128,7 +3185,18 @@ pub const BcVm = struct {
                                 deopt.* = 2;
                                 return;
                             },
-                            .resumed => {
+                            .resumed => |st| {
+                                // Fine deopt mid-callee: side effects may have
+                                // committed — resume the callee in the
+                                // interpreter from the exact native state (never
+                                // re-run / fall through to bcInvokeJs).
+                                const cl_env: *Environment = @ptrCast(@alignCast(inner.bc_function.env));
+                                const res = vm.resumeJitFrame(func, cl_env, Value{}, st.regs, plan.local_names, st.locals, st.pc) catch {
+                                    deopt.* = 2;
+                                    return;
+                                };
+                                regs[ret_dst] = @bitCast(res.bits);
+                                if (vm.jit) |jc| jc.direct_calls += 1;
                                 deopt.* = 0;
                                 return;
                             },
@@ -3209,7 +3277,7 @@ pub const BcVm = struct {
 
                 // Phase 12: native fast path for hot leaf/boxed functions
                 // (comptime-elided unless built with -Djit=true).
-                switch (try self.tryJitCall(fn_ptr, base, nargs, ret_dst)) {
+                switch (try self.tryJitCall(fn_ptr, def_env, this_val, base, nargs, ret_dst)) {
                     .completed => return null,
                     .threw => {
                         // A re-entrant CALL inside the JITed function threw; the

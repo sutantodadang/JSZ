@@ -350,12 +350,13 @@ const OP_HALT: u8 = 47;
 const OP_SET_PROP: u8 = 50;
 const OP_GET_PROP: u8 = 51;
 
-/// One property-access site (boxed tier S3): at bytecode offset `pc`, a `GET_PROP`
-/// reads property `key` consulting the live inline cache `ic`. The native code
-/// passes these to the Zig fast-path helper, which mirrors the interpreter's
-/// non-re-entrant IC lookup (own mono/poly/mega + proto-chain data) and sets
-/// `*miss` (→ coarse deopt) for anything it can't resolve without running JS
-/// (accessors, uncached shapes, non-objects).
+/// One property-access site (boxed tier S3/S8): at bytecode offset `pc`, a
+/// `GET_PROP`/`SET_PROP` accesses property `key` consulting the live inline
+/// cache `ic`. The native code passes these to the Zig helper, which first runs
+/// the interpreter's non-re-entrant IC lookup (own mono/poly/mega + proto-chain
+/// data) and otherwise re-enters the interpreter's full property machinery
+/// (accessors, proxies, arrays, transitions). Helper flag: 0 = ok, 2 = threw
+/// (→ throw exit), other = fine-deopt (exact-PC interpreter resume).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PropSite {
@@ -505,9 +506,18 @@ const F64_SAFE_INT: i64 = 9_007_199_254_740_992;
 /// (operands sign-extended to i128 so the op itself can never wrap). If
 /// |val| > 2^53 the guard branches to `deopt_block` (which flags + returns);
 /// otherwise control continues in a fresh block where `val` is narrowed back to
-/// i64. Returns `(narrowed_i64, continuation_block)` — the caller must set its
-/// current block to the continuation.
-fn guard_i128_to_i64(fb: &mut FunctionBuilder, deopt_block: Block, val: Value) -> (Value, Block) {
+/// i64. `deopt_pc` must be `Some(pc)` when `deopt_block` is the FINE-deopt block
+/// (boxed mode — the region may already have committed a store/call, so the only
+/// sound deopt is an exact-PC interpreter resume) and `None` for the coarse
+/// block (int mode — side-effect-free, whole-region re-run is sound). Returns
+/// `(narrowed_i64, continuation_block)` — the caller must set its current block
+/// to the continuation.
+fn guard_i128_to_i64(
+    fb: &mut FunctionBuilder,
+    deopt_block: Block,
+    deopt_pc: Option<Value>,
+    val: Value,
+) -> (Value, Block) {
     let lim64 = fb.ins().iconst(types::I64, F64_SAFE_INT);
     let lim = fb.ins().sextend(types::I128, lim64);
     let neg = fb.ins().ineg(lim);
@@ -515,7 +525,14 @@ fn guard_i128_to_i64(fb: &mut FunctionBuilder, deopt_block: Block, val: Value) -
     let too_lo = fb.ins().icmp(IntCC::SignedLessThan, val, neg);
     let bad = fb.ins().bor(too_hi, too_lo);
     let cont = fb.create_block();
-    fb.ins().brif(bad, deopt_block, &[], cont, &[]);
+    match deopt_pc {
+        Some(pc) => {
+            fb.ins().brif(bad, deopt_block, &[pc.into()], cont, &[]);
+        }
+        None => {
+            fb.ins().brif(bad, deopt_block, &[], cont, &[]);
+        }
+    }
     fb.switch_to_block(cont);
     let narrowed = fb.ins().ireduce(types::I64, val);
     (narrowed, cont)
@@ -635,7 +652,6 @@ fn emit_box_f64(fb: &mut FunctionBuilder, f: Value) -> (Value, Block) {
 /// `-0` (e.g. `-1 * 0`) is preserved. Returns `(boxed, merge_block)`.
 fn emit_boxed_num_binop(
     fb: &mut FunctionBuilder,
-    deopt_block: Block,
     fine_deopt_block: Block,
     pc: usize,
     l: Value,
@@ -670,7 +686,10 @@ fn emit_boxed_num_binop(
         OP_SUB => fb.ins().isub(x128, y128),
         _ => fb.ins().imul(x128, y128),
     };
-    let (narrowed, _c) = guard_i128_to_i64(fb, deopt_block, wide);
+    // Overflow past 2^53 must FINE-deopt (exact-PC resume): in boxed mode the
+    // region may have already committed a property store or call, so a coarse
+    // whole-region re-run would double the side effect.
+    let (narrowed, _c) = guard_i128_to_i64(fb, fine_deopt_block, Some(pc_val), wide);
     if op == OP_MUL {
         // A 0 product may actually be -0 (e.g. -1 * 0): box via f64 to keep sign.
         let zbox = fb.create_block();
@@ -729,7 +748,9 @@ fn compile_int_block_impl(
     get_helper: u64,
     set_helper: u64,
     call_helper: u64,
-    closure_helper: u64,
+    // Kept in the ABI for compatibility; boxed NEW_CLOSURE now always
+    // fine-deopts instead of calling a closure-creation trampoline.
+    _closure_helper: u64,
 ) -> Option<*const c_void> {
     use std::collections::BTreeSet;
 
@@ -755,6 +776,11 @@ fn compile_int_block_impl(
                 let target = (next as isize + rel) as usize;
                 leaders.insert(target);
                 leaders.insert(next); // fallthrough
+            }
+            OP_NEW_CLOSURE => {
+                if boxed {
+                    leaders.insert(next); // boxed NEW_CLOSURE is an unconditional fine-deopt jump
+                }
             }
             _ => {}
         }
@@ -872,15 +898,6 @@ fn compile_int_block_impl(
             cs.params.push(AbiParam::new(ptr_ty));
             fb.import_signature(cs)
         };
-        let closure_sig = {
-            let mut cls = module.make_signature();
-            cls.params.push(AbiParam::new(ptr_ty));
-            cls.params.push(AbiParam::new(types::I32));
-            cls.params.push(AbiParam::new(types::I32));
-            cls.params.push(AbiParam::new(ptr_ty));
-            cls.returns.push(AbiParam::new(types::I64));
-            fb.import_signature(cls)
-        };
 
         let mut cur = entry;
         let mut terminated = true; // entry already ends in a jump to blocks[&0]
@@ -951,7 +968,7 @@ fn compile_int_block_impl(
                     if boxed {
                         // Guard both numeric (else deopt); SMI→exact i128 path,
                         // else f64; re-box (makeNumber), preserving -0 on MUL.
-                        let (res, done) = emit_boxed_num_binop(&mut fb, deopt_block, fine_deopt_block, pc, l, r, op);
+                        let (res, done) = emit_boxed_num_binop(&mut fb, fine_deopt_block, pc, l, r, op);
                         cur = done;
                         store_reg(&mut fb, code[pc + 1], res);
                     } else {
@@ -963,7 +980,7 @@ fn compile_int_block_impl(
                             OP_SUB => fb.ins().isub(l128, r128),
                             _ => fb.ins().imul(l128, r128),
                         };
-                        let (res, cont) = guard_i128_to_i64(&mut fb, deopt_block, wide);
+                        let (res, cont) = guard_i128_to_i64(&mut fb, deopt_block, None, wide);
                         cur = cont;
                         store_reg(&mut fb, code[pc + 1], res);
                     }
@@ -992,7 +1009,10 @@ fn compile_int_block_impl(
                         } else {
                             fb.ins().isub(x128, one)
                         };
-                        let (narrowed, _c) = guard_i128_to_i64(&mut fb, deopt_block, wide);
+                        // Boxed mode: overflow fine-deopts (exact-PC resume) — see
+                        // the ADD/SUB/MUL comment.
+                        let (narrowed, _c) =
+                            guard_i128_to_i64(&mut fb, fine_deopt_block, Some(pc_i32), wide);
                         let (ri, di) = emit_box_i64(&mut fb, narrowed);
                         fb.ins().jump(done, &[ri.into()]);
                         fb.switch_to_block(dbl_blk);
@@ -1019,7 +1039,7 @@ fn compile_int_block_impl(
                         } else {
                             fb.ins().isub(v128, one)
                         };
-                        let (res, cont) = guard_i128_to_i64(&mut fb, deopt_block, wide);
+                        let (res, cont) = guard_i128_to_i64(&mut fb, deopt_block, None, wide);
                         cur = cont;
                         store_reg(&mut fb, code[pc + 1], res);
                     }
@@ -1132,10 +1152,14 @@ fn compile_int_block_impl(
                     terminated = true;
                 }
                 OP_GET_PROP => {
-                    // Boxed tier S3: monomorphic own-data property read. Calls the
-                    // Zig fast-path helper with the baked (shape, slot); the helper
-                    // sets *deopt on a miss (non-object / wrong shape / accessor /
-                    // proto prop) and the region deopts to the interpreter.
+                    // Boxed tier S3/S8: property read via the Zig helper. The
+                    // helper resolves data slots through the live IC without
+                    // re-entering JS, and otherwise runs the interpreter's FULL
+                    // property machinery re-entrantly (accessors, proxies, arrays,
+                    // autoboxing) — so the common miss never deopts. Helper flag:
+                    // 0 = ok, 2 = a getter/trap threw (propagate, no re-run),
+                    // anything else = fine-deopt (exact-PC interpreter resume —
+                    // never coarse: an earlier store/call may have committed).
                     if !boxed {
                         return None;
                     }
@@ -1155,17 +1179,25 @@ fn compile_int_block_impl(
                     let result = fb.inst_results(call)[0];
                     let missed = fb.ins().load(types::I32, flags, deopt_ptr, 0);
                     let cont = fb.create_block();
-                    fb.ins().brif(missed, deopt_block, &[], cont, &[]);
+                    let slow = fb.create_block();
+                    fb.ins().brif(missed, slow, &[], cont, &[]);
+                    fb.switch_to_block(slow);
+                    let is_throw = fb.ins().icmp_imm(IntCC::Equal, missed, 2);
+                    let pc_prop = fb.ins().iconst(types::I32, pc as i64);
+                    fb.ins()
+                        .brif(is_throw, throw_block, &[], fine_deopt_block, &[pc_prop.into()]);
                     fb.switch_to_block(cont);
                     cur = cont;
                     store_reg(&mut fb, rdst, result);
                 }
                 OP_SET_PROP => {
-                    // Boxed tier S3e: own-data property store via the Zig helper.
-                    // The helper sets *deopt on a miss (accessor / read-only / new
-                    // prop / wrong shape / non-object) BEFORE storing, so a miss has
-                    // no side effect; the analyzer guarantees no fallible op runs
-                    // after a successful store, so coarse deopt stays sound.
+                    // Boxed tier S3e/S8: property store via the Zig helper. Fast
+                    // path = existing own writable data slot through the live IC;
+                    // otherwise the helper runs the interpreter's FULL setProp
+                    // re-entrantly (setters, proxies, shape transitions). Flag:
+                    // 0 = ok, 2 = a setter/trap threw (propagate, no re-run),
+                    // anything else = fine-deopt (exact-PC resume; the helper has
+                    // made NO partial store when it sets a non-zero flag).
                     if !boxed {
                         return None;
                     }
@@ -1185,7 +1217,13 @@ fn compile_int_block_impl(
                     );
                     let missed = fb.ins().load(types::I32, flags, deopt_ptr, 0);
                     let cont = fb.create_block();
-                    fb.ins().brif(missed, deopt_block, &[], cont, &[]);
+                    let slow = fb.create_block();
+                    fb.ins().brif(missed, slow, &[], cont, &[]);
+                    fb.switch_to_block(slow);
+                    let is_throw = fb.ins().icmp_imm(IntCC::Equal, missed, 2);
+                    let pc_prop = fb.ins().iconst(types::I32, pc as i64);
+                    fb.ins()
+                        .brif(is_throw, throw_block, &[], fine_deopt_block, &[pc_prop.into()]);
                     fb.switch_to_block(cont);
                     cur = cont;
                 }
@@ -1216,26 +1254,20 @@ fn compile_int_block_impl(
                     cur = cont;
                 }
                 OP_NEW_CLOSURE => {
+                    // Boxed tier: closure creation ALWAYS fine-deopts. A natively
+                    // created closure would have to share the function's mutable
+                    // locals (captured-var semantics), but the JIT keeps them in a
+                    // private buffer — and at the call boundary there is no callee
+                    // frame to resolve `child_functions` against. The exact-PC
+                    // resume rebuilds a real env from the native locals and lets
+                    // the interpreter create the closure against it (everything
+                    // before this op still ran native).
                     if !boxed {
                         return None;
                     }
-                    let rdst = code[pc + 1];
-                    let fidx = read_u16_le(code, pc + 2);
-                    let rdst_i32 = fb.ins().iconst(types::I32, rdst as i64);
-                    let fidx_i32 = fb.ins().iconst(types::I32, fidx as i64);
-                    let callee = fb.ins().iconst(ptr_ty, closure_helper as i64);
-                    let call = fb.ins().call_indirect(
-                        closure_sig,
-                        callee,
-                        &[regs, rdst_i32, fidx_i32, deopt_ptr],
-                    );
-                    let result = fb.inst_results(call)[0];
-                    let threw = fb.ins().load(types::I32, flags, deopt_ptr, 0);
-                    let cont = fb.create_block();
-                    fb.ins().brif(threw, throw_block, &[], cont, &[]);
-                    fb.switch_to_block(cont);
-                    cur = cont;
-                    store_reg(&mut fb, rdst, result);
+                    let pc_v = fb.ins().iconst(types::I32, pc as i64);
+                    fb.ins().jump(fine_deopt_block, &[pc_v.into()]);
+                    terminated = true;
                 }
                 OP_RETURN => {
                     let v = load_reg(&mut fb, code[pc + 1]);
@@ -1265,11 +1297,116 @@ fn compile_int_block_impl(
         .declare_function("jsz_int_block", Linkage::Export, &ctx.func.signature)
         .ok()?;
     module.define_function(id, &mut ctx).ok()?;
+    // Serialize Windows x64 unwind info BEFORE clearing the context. Without a
+    // registered function table, ANY stack walk through a JIT frame
+    // (RtlVirtualUnwind: Zig panic traces, testing-allocator leak traces, SEH,
+    // profilers) is undefined behavior — cranelift-jit itself registers nothing
+    // on Windows. Re-entrant helpers (property accessors, CALL trampoline) make
+    // such walks routine, so this is a correctness requirement, not polish.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let unwind_bytes: Option<Vec<u8>> = {
+        use cranelift_codegen::isa::unwind::UnwindInfo as UI;
+        match ctx
+            .compiled_code()
+            .and_then(|cc| cc.create_unwind_info(module.isa()).ok())
+            .flatten()
+        {
+            Some(UI::WindowsX64(ui)) => {
+                let mut buf = vec![0u8; ui.emit_size()];
+                ui.emit(&mut buf);
+                Some(buf)
+            }
+            _ => None,
+        }
+    };
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let code_len: usize = ctx
+        .compiled_code()
+        .map(|cc| cc.code_buffer().len())
+        .unwrap_or(0);
     module.clear_context(&mut ctx);
     module.finalize_definitions().ok()?;
     let code_ptr = module.get_finalized_function(id);
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if let Some(buf) = unwind_bytes {
+        win_unwind::register(code_ptr as *const c_void, code_len, &buf);
+    }
     std::mem::forget(module);
     Some(code_ptr as *const c_void)
+}
+
+/// Windows x64: register UNWIND_INFO + RUNTIME_FUNCTION for a JITed function so
+/// `RtlVirtualUnwind` can traverse its frames. The blob is allocated within
+/// 2 GiB of the code (the RUNTIME_FUNCTION fields are u32 RVAs from a common
+/// base) and leaked, mirroring the leaked `JITModule`.
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod win_unwind {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct RuntimeFunction {
+        begin: u32,
+        end: u32,
+        unwind_info: u32,
+    }
+
+    unsafe extern "system" {
+        fn RtlAddFunctionTable(
+            function_table: *mut RuntimeFunction,
+            entry_count: u32,
+            base_address: u64,
+        ) -> u8;
+        fn VirtualAlloc(
+            lp_address: *mut c_void,
+            dw_size: usize,
+            fl_allocation_type: u32,
+            fl_protect: u32,
+        ) -> *mut c_void;
+    }
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const PAGE_READWRITE: u32 = 4;
+
+    pub fn register(code: *const c_void, code_len: usize, unwind: &[u8]) {
+        if unwind.is_empty() || code_len == 0 {
+            return;
+        }
+        let need = unwind.len() + 8 + std::mem::size_of::<RuntimeFunction>();
+        // Probe 64 KiB-aligned addresses above the code page so both the code
+        // and the blob share a u32-RVA-reachable base.
+        let base_hint = (code as u64) & !0xFFFF;
+        let mut blob: *mut u8 = std::ptr::null_mut();
+        for k in 1..30000u64 {
+            let cand = base_hint + k * 0x10000;
+            let p = unsafe {
+                VirtualAlloc(
+                    cand as *mut c_void,
+                    need,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            };
+            if !p.is_null() {
+                blob = p as *mut u8;
+                break;
+            }
+        }
+        if blob.is_null() {
+            return; // walkers stay as broken as before; no new failure mode
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(unwind.as_ptr(), blob, unwind.len());
+            let rf_off = (unwind.len() + 3) & !3;
+            let rf = blob.add(rf_off) as *mut RuntimeFunction;
+            let lo = std::cmp::min(code as u64, blob as u64);
+            *rf = RuntimeFunction {
+                begin: (code as u64 - lo) as u32,
+                end: (code as u64 - lo + code_len as u64) as u32,
+                unwind_info: (blob as u64 - lo) as u32,
+            };
+            let _ = RtlAddFunctionTable(rf, 1, lo);
+        }
+    }
 }
 
 /// Phase 9 — native accumulator loop (loop *body* compiled, not just elided).

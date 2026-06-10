@@ -327,6 +327,10 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     var ctx = iso.newContext() catch return .fail;
     defer ctx.deinit();
 
+    // In a -Djit build, run every test under the experimental JIT so the
+    // conformance suite actually gates the native tier (parity requirement).
+    if (jsz.jit_build) ctx.setJitMode(.experimental);
+
     // Per-test resource limits so a looping/allocating test can't hang the
     // whole run. Enforced in the bc VM (the default); a breach surfaces as an
     // `EvalResult.exception` with an "interrupted:"/"out of memory" message,

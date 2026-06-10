@@ -39,6 +39,11 @@ pub const InterpMode = isolate_mod.InterpMode;
 /// Phase 9: JIT profiling mode.
 pub const JitMode = @import("./jit/jit.zig").JitMode;
 
+/// True when this binary was built with `-Djit=true` (Cranelift backend linked).
+/// The differential/conformance harnesses use it to turn on the experimental
+/// JIT, making `-Djit` runs a real interpreter-parity gate.
+pub const jit_build = @import("build_options").jit_enabled;
+
 const loop_jit = @import("./jit/loop_jit.zig");
 
 /// EXPERIMENTAL (unstable, may change before 1.0).

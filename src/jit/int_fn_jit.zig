@@ -64,110 +64,126 @@ pub const PropSite = extern struct { pc: u32, key_len: u32, key_ptr: u64, ic_ptr
 const JsObject = @import("../object/object.zig").JsObject;
 const ic_mod = @import("../vm/ic.zig");
 
-/// Native fast-path callback the boxed JIT invokes at each `GET_PROP`. Mirrors the
-/// interpreter's NON-re-entrant property fast path exactly: the own inline-cache
-/// lookup (`ic.lookup` covers monomorphic / polymorphic / megamorphic data slots)
-/// and the proto-chain method-dispatch cache. Returns the resolved DATA value as
-/// boxed bits, or sets `miss.* = 1` for anything that would require running JS or
-/// the full slow path — accessors, an uncached shape, arrays / `length`, or a
-/// non-object — in which case the region coarse-deopts and the interpreter handles
-/// it (and updates the IC, which this helper reads live on the next call). Because
-/// it runs NO getter and allocates nothing, it triggers no GC and needs no root
-/// registration of the JIT register buffers.
+/// Property-read callback the boxed JIT invokes at each `GET_PROP` (S8). Two
+/// tiers:
+///   1. **Fast path (non-re-entrant, non-allocating)** — the interpreter's own
+///      inline-cache lookup (`ic.lookup`: mono / poly / mega data slots) plus the
+///      proto-chain method-dispatch cache, read LIVE so the site self-heals as it
+///      evolves without recompiling.
+///   2. **Slow path (re-entrant)** — anything else (accessors, proxies, arrays /
+///      `length`, autoboxed primitives, uncached shapes) runs the interpreter's
+///      FULL `getProp` machinery through the active VM, exactly once — so getters
+///      and traps now execute while the region stays native. The region's
+///      `regs`/`locals` buffers are GC roots for the whole run (see
+///      `JitRootFrame`), so a getter's allocation / `__gc__()` is safe.
+/// Miss protocol (written to the region's deopt flag): 0 = ok, 2 = the
+/// getter/trap threw (`realm.pending_exception` holds the value; the region
+/// propagates WITHOUT re-running), 1 = no VM available (FFI tests) → fine-deopt.
 fn jsz_jit_get_prop(recv_bits: u64, key_ptr: [*]const u8, key_len: usize, ic_raw: *anyopaque, miss: *i32) callconv(.c) u64 {
     const v = Value{ .bits = recv_bits };
-    if (v.bits == 0 or v.unbox() != .object) {
-        miss.* = 1;
-        return 0;
-    }
-    const obj = v.toPtr().object;
     const key = key_ptr[0..key_len];
-    // The interpreter special-cases arrays + `length`/`size`; defer those.
-    if (obj.is_array or std.mem.eql(u8, key, "length") or std.mem.eql(u8, key, "size")) {
-        miss.* = 1;
-        return 0;
-    }
-    const ic: *const ic_mod.InlineCache = @ptrCast(@alignCast(ic_raw));
-    const shape = obj.shapePtr();
-    // Own property via the inline cache (mono / poly / mega).
-    if (ic.lookup(key, shape)) |slot| {
-        if (slot < obj.attrs.items.len and obj.attrs.items[slot].is_accessor) {
-            miss.* = 1; // accessor — let the interpreter run the getter
-            return 0;
-        }
-        if (obj.getOwnBySlot(shape, slot)) |val| {
-            miss.* = 0;
-            return val.bits;
-        }
-    }
-    // Proto-chain cache (inherited data property / method dispatch).
-    if (ic.protoKeyMatches(key) and ic.proto_recv_shape == shape) {
-        var cur: *JsObject = obj;
-        var n: u8 = 0;
-        var ok = true;
-        while (n < ic.proto_chain_len) : (n += 1) {
-            const nxt = cur.proto orelse {
-                ok = false;
-                break;
-            };
-            const g = ic.proto_chain[n];
-            if (@as(*anyopaque, @ptrCast(nxt)) != g.obj or nxt.shapePtr() != g.shape) {
-                ok = false;
-                break;
-            }
-            cur = nxt;
-        }
-        if (ok) {
-            const hshape = ic.proto_chain[ic.proto_chain_len - 1].shape;
-            const hslot = ic.proto_slot;
-            if (hslot < cur.attrs.items.len and cur.attrs.items[hslot].is_accessor) {
-                miss.* = 1;
-                return 0;
-            }
-            if (cur.getOwnBySlot(hshape, hslot)) |val| {
+    fast: {
+        if (v.bits == 0 or v.unbox() != .object) break :fast;
+        const obj = v.toPtr().object;
+        // Proxy `get` traps and array / collection-size special cases run JS or
+        // bespoke interpreter logic — slow path.
+        if (obj.internal_kind == .proxy) break :fast;
+        if (obj.is_array or std.mem.eql(u8, key, "length") or std.mem.eql(u8, key, "size")) break :fast;
+        const ic: *const ic_mod.InlineCache = @ptrCast(@alignCast(ic_raw));
+        const shape = obj.shapePtr();
+        // Own property via the inline cache (mono / poly / mega).
+        if (ic.lookup(key, shape)) |slot| {
+            if (slot < obj.attrs.items.len and obj.attrs.items[slot].is_accessor) break :fast;
+            if (obj.getOwnBySlot(shape, slot)) |val| {
                 miss.* = 0;
                 return val.bits;
             }
         }
+        // Proto-chain cache (inherited data property / method dispatch).
+        if (ic.protoKeyMatches(key) and ic.proto_recv_shape == shape) {
+            var cur: *JsObject = obj;
+            var n: u8 = 0;
+            var ok = true;
+            while (n < ic.proto_chain_len) : (n += 1) {
+                const nxt = cur.proto orelse {
+                    ok = false;
+                    break;
+                };
+                const g = ic.proto_chain[n];
+                if (@as(*anyopaque, @ptrCast(nxt)) != g.obj or nxt.shapePtr() != g.shape) {
+                    ok = false;
+                    break;
+                }
+                cur = nxt;
+            }
+            if (ok) {
+                const hshape = ic.proto_chain[ic.proto_chain_len - 1].shape;
+                const hslot = ic.proto_slot;
+                if (hslot < cur.attrs.items.len and cur.attrs.items[hslot].is_accessor) break :fast;
+                if (cur.getOwnBySlot(hshape, hslot)) |val| {
+                    miss.* = 0;
+                    return val.bits;
+                }
+            }
+        }
+        break :fast;
     }
-    miss.* = 1;
-    return 0;
+    // Slow path: re-enter the interpreter's full property machinery.
+    const vmptr = active_jit_vm orelse {
+        miss.* = 1;
+        return 0;
+    };
+    const bc_vm_mod = @import("../vm/bc_vm.zig");
+    const bvm: *bc_vm_mod.BcVm = @ptrCast(@alignCast(vmptr));
+    const out = bvm.jitGetPropSlow(v, key) catch {
+        miss.* = 2; // a getter / proxy trap threw — propagate, never re-run
+        return 0;
+    };
+    miss.* = 0;
+    return out.bits;
 }
 
-/// Native fast-path callback for `SET_PROP` — stores `val` into an EXISTING own
-/// writable data slot resolved via the live inline cache. Sets `miss.* = 1`
-/// (BEFORE any store, so a miss has no side effect) for anything needing the slow
-/// path: a non-object, array / `length`, an uncached shape, a property not yet
-/// own (the interpreter performs the shape transition), an accessor (runs the
-/// setter), or a read-only data property. Non-re-entrant + non-allocating.
+/// Property-store callback for `SET_PROP` (S8). Fast path stores `val` into an
+/// EXISTING own writable data slot resolved via the live inline cache
+/// (non-re-entrant, no allocation). Everything else — a setter, a proxy trap, a
+/// shape transition (new own property), arrays / `length`, read-only slots —
+/// runs the interpreter's FULL `setProp` re-entrantly, exactly once. The helper
+/// performs NO partial store before signalling: on `miss.* != 0` the heap is
+/// untouched by this op. Miss protocol matches `jsz_jit_get_prop`.
 fn jsz_jit_set_own(recv_bits: u64, key_ptr: [*]const u8, key_len: usize, ic_raw: *anyopaque, val_bits: u64, miss: *i32) callconv(.c) void {
     const v = Value{ .bits = recv_bits };
-    if (v.bits == 0 or v.unbox() != .object) {
-        miss.* = 1;
-        return;
-    }
-    const obj = v.toPtr().object;
     const key = key_ptr[0..key_len];
-    if (obj.is_array or std.mem.eql(u8, key, "length")) {
-        miss.* = 1;
-        return;
-    }
-    const ic: *const ic_mod.InlineCache = @ptrCast(@alignCast(ic_raw));
-    const shape = obj.shapePtr();
-    if (ic.lookup(key, shape)) |slot| {
-        if (slot < obj.attrs.items.len) {
-            const a = obj.attrs.items[slot];
-            if (a.is_accessor or !a.writable) {
-                miss.* = 1; // setter / read-only — let the interpreter handle it
+    fast: {
+        if (v.bits == 0 or v.unbox() != .object) break :fast;
+        const obj = v.toPtr().object;
+        if (obj.internal_kind == .proxy) break :fast;
+        if (obj.is_array or std.mem.eql(u8, key, "length")) break :fast;
+        const ic: *const ic_mod.InlineCache = @ptrCast(@alignCast(ic_raw));
+        const shape = obj.shapePtr();
+        if (ic.lookup(key, shape)) |slot| {
+            if (slot < obj.attrs.items.len) {
+                const a = obj.attrs.items[slot];
+                if (a.is_accessor or !a.writable) break :fast;
+            }
+            if (obj.setOwnBySlot(shape, slot, Value{ .bits = val_bits })) {
+                miss.* = 0;
                 return;
             }
         }
-        if (obj.setOwnBySlot(shape, slot, Value{ .bits = val_bits })) {
-            miss.* = 0;
-            return;
-        }
+        break :fast;
     }
-    miss.* = 1; // not an existing own slot of this shape
+    // Slow path: full interpreter setProp (setters, proxies, shape transitions).
+    const vmptr = active_jit_vm orelse {
+        miss.* = 1;
+        return;
+    };
+    const bc_vm_mod = @import("../vm/bc_vm.zig");
+    const bvm: *bc_vm_mod.BcVm = @ptrCast(@alignCast(vmptr));
+    bvm.jitSetPropSlow(v, key, Value{ .bits = val_bits }) catch {
+        miss.* = 2; // a setter / proxy trap threw — propagate, never re-run
+        return;
+    };
+    miss.* = 0;
 }
 
 /// S4: a node in the chain of register/local buffers belonging to JIT regions
@@ -207,6 +223,10 @@ pub const JitPlan = struct {
     /// Boxed mode: slots carry `Value.bits`, the result is a boxed `Value`, and
     /// arithmetic deopts on a non-number operand (vs the int mode's unboxed i64).
     boxed: bool,
+    /// Function-local variable names in slot order (params first, then
+    /// `DEFINE_GLOBAL`/`HOIST_VAR` names) — needed by the fine-deopt resume to
+    /// rebuild the callee's environment from the native `locals` buffer.
+    local_names: []const []const u8,
 };
 
 fn readU16(code: []const u8, at: usize) u16 {
@@ -246,10 +266,14 @@ pub const AnalyzeResult = union(enum) { ok: *JitPlan, retry, never };
 
 /// Analyze + compile `func`. In `boxed` mode the slots carry boxed `Value`s, so
 /// `LOAD_K` may load ANY constant (the native code guards numericity per
-/// arithmetic op); `GET_PROP` is accepted for monomorphic own-data sites (baked
-/// from the inline cache) and falls back to the interpreter on any shape miss. In
-/// int mode every `LOAD_K` must be an integral number and `GET_PROP` is rejected.
-pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, call_helper: u64, closure_helper: u64) !AnalyzeResult {
+/// arithmetic op); `GET_PROP`/`SET_PROP` sites consult their LIVE inline cache at
+/// run time (fast data path) and fall back to the re-entrant interpreter helper
+/// (accessors / proxies / transitions). A site whose IC is still cold returns
+/// `.retry` so it can warm over a few interpreted calls — unless `allow_cold` is
+/// set (warmup exhausted: accessor-only sites never warm their data IC, so the
+/// site is compiled anyway and served by the helper's slow path). In int mode
+/// every `LOAD_K` must be an integral number and `GET_PROP` is rejected.
+pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, call_helper: u64, closure_helper: u64, allow_cold: bool) !AnalyzeResult {
     if (func.is_generator or func.is_async) return .never;
     const code = func.chunk.code;
     const constants = func.chunk.constants;
@@ -371,7 +395,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
                 const key = constString(constants[kidx]) orelse return .never;
                 if (pc >= func.ic_table.len) return .never;
                 const ic = &func.ic_table[pc];
-                if (ic.state == .uninitialized and ic.proto_chain_len == 0) return .retry;
+                if (!allow_cold and ic.state == .uninitialized and ic.proto_chain_len == 0) return .retry;
                 try prop_sites.append(arena, .{
                     .pc = @intCast(pc),
                     .key_len = @intCast(key.len),
@@ -386,7 +410,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
                 const key = constString(constants[kidx]) orelse return .never;
                 if (pc >= func.ic_table.len) return .never;
                 const ic = &func.ic_table[pc];
-                if (ic.state == .uninitialized) return .retry; // IC must know the slot
+                if (!allow_cold and ic.state == .uninitialized) return .retry; // let the data IC warm
                 try prop_sites.append(arena, .{
                     .pc = @intCast(pc),
                     .key_len = @intCast(key.len),
@@ -429,6 +453,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
         .num_regs = func.num_regs,
         .arity = func.arity,
         .boxed = boxed,
+        .local_names = local_names.items,
     };
     return .{ .ok = plan };
 }
@@ -437,7 +462,13 @@ pub const RunOut = union(enum) {
     value: Value,
     deopt,
     threw,
-    resumed: usize,
+    /// S2 fine deopt: the region stopped at bytecode `pc` with its boxed register
+    /// file in `regs` and its env-local slots in `locals` (both arena-owned).
+    /// The caller must resume the interpreter mid-function from EXACTLY this
+    /// state (`BcVm.resumeJitFrame` pushes a real frame seeded from it). It must
+    /// NOT re-run the region — a property store or call may already have
+    /// committed.
+    resumed: struct { regs: []i64, locals: []i64, pc: u32 },
 };
 
 /// Run `plan` for a call with `args`. Params occupy local slots 0..arity-1. In int
@@ -471,19 +502,11 @@ pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, args: []const Value, 
     const r = plan.code_fn(regs.ptr, plan.consts.ptr, locals.ptr, &deopt, &resume_pc);
     if (deopt == 2) return .threw;
     if (deopt == 3) {
-        if (vm != null) {
-            const bc_vm_mod = @import("../vm/bc_vm.zig");
-            const bvm: *bc_vm_mod.BcVm = @ptrCast(@alignCast(vm.?));
-            if (bvm.frames.items.len > 0) {
-                const frame = &bvm.frames.items[bvm.frames.items.len - 1];
-                const n = @min(regs.len, frame.registers.len);
-                for (0..n) |ri| {
-                    frame.registers[ri] = Value{ .bits = @bitCast(regs[ri]) };
-                }
-                frame.pc = @intCast(resume_pc);
-            }
-        }
-        return .{ .resumed = @intCast(resume_pc) };
+        // Fine deopt: hand the exact native state back to the caller, which
+        // pushes a REAL interpreter frame for the callee at `resume_pc`
+        // (resumeJitFrame). The old behavior of patching the TOP frame was
+        // unsound — at the call boundary the top frame is the CALLER.
+        return .{ .resumed = .{ .regs = regs, .locals = locals, .pc = resume_pc } };
     }
     if (deopt != 0) return .deopt;
     if (plan.boxed) {

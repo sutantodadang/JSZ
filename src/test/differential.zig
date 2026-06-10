@@ -12,6 +12,9 @@ fn runJszMode(allocator: std.mem.Allocator, source: []const u8, mode: jsz.Interp
     var ctx = try iso.newContext();
     defer ctx.deinit();
     ctx.setInterpMode(mode);
+    // In a -Djit build, run the whole corpus under the experimental JIT so
+    // differential parity actually gates the native tier.
+    if (jsz.jit_build) ctx.setJitMode(.experimental);
     const result = ctx.eval(source, "<diff>");
     return switch (result) {
         .ok => |v| jsz.valueToDisplayString(allocator, v) catch "?",
