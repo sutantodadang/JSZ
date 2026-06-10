@@ -82,6 +82,11 @@ const FnCompiler = struct {
     /// W2-async: is this an async function body? When true, `__await__(x)`
     /// compiles to a YIELD suspend instead of a synchronous native call.
     is_async: bool = false,
+    /// M14: this function literal is an arrow (no own `arguments`/`this`).
+    is_arrow: bool = false,
+    /// M14: the body read an identifier named `arguments`. Combined with
+    /// `!is_arrow` this drives BcFunction.uses_arguments.
+    saw_arguments: bool = false,
     /// Phase 8: nesting depth of try/catch/finally regions. A call in the
     /// operand of `return` is only in tail position when try_depth == 0
     /// (a pending finally would run after the call returns, so it is not tail).
@@ -209,6 +214,7 @@ const FnCompiler = struct {
 
     /// Load a named identifier into Rdst via env chain lookup.
     fn emitLoad(self: *Self, name: []const u8, rdst: u8, line: u32) !void {
+        if (std.mem.eql(u8, name, "arguments")) self.saw_arguments = true;
         const sv = try val_mod.makeString(self.arena, name);
         const kidx = try self.addConstant(sv);
         try self.emitOp(.GET_GLOBAL, line);
@@ -1389,10 +1395,15 @@ const FnCompiler = struct {
             fe.is_generator,
             fe.is_async,
             false, // function body: no implicit last-expr return
+            fe.is_arrow,
         );
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
         try self.child_functions.append(self.arena, child_fn);
+
+        // An arrow child that references `arguments` resolves it lexically — the
+        // nearest enclosing non-arrow function must materialize the object.
+        if (child_fn.needs_parent_arguments) self.saw_arguments = true;
 
         const r = self.allocReg();
         try self.emitOp(.NEW_CLOSURE, line);
@@ -1452,6 +1463,7 @@ const FnCompiler = struct {
                     fd.is_generator,
                     fd.is_async,
                     false, // function body: no implicit last-expr return
+                    false, // function declarations are never arrows
                 );
                 const child_idx: u16 = @intCast(self.child_functions.items.len);
                 try self.child_functions.append(self.arena, child_fn);
@@ -2175,7 +2187,7 @@ fn compileFunction(
     body: []*Node,
     nfe_name: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false);
+    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false);
 }
 
 fn compileFunctionStrict(
@@ -2188,11 +2200,13 @@ fn compileFunctionStrict(
     is_generator: bool,
     is_async: bool,
     implicit_return: bool,
+    is_arrow: bool,
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
     fc.is_strict = is_strict;
     fc.is_async = is_async;
+    fc.is_arrow = is_arrow;
 
     // Phase 2: all variable access is env-based (GET_GLOBAL/SET_GLOBAL).
     // Params are passed via env on CALL setup (see bc_vm.zig CALL handler).
@@ -2227,6 +2241,8 @@ fn compileFunctionStrict(
         .is_strict = is_strict,
         .is_generator = is_generator,
         .is_async = is_async,
+        .uses_arguments = fc.saw_arguments and !is_arrow,
+        .needs_parent_arguments = is_arrow and fc.saw_arguments,
         .ic_table = ic_table,
         .arith_ic_table = arith_ic_table,
         .typeof_ic_table = typeof_ic_table,
@@ -2261,6 +2277,7 @@ pub fn compileProgram(
         false,
         false,
         true, // top-level program: yield last expression-statement value (eval result)
+        false, // program is not an arrow
     );
     return f;
 }

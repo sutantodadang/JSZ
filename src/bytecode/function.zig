@@ -16,6 +16,13 @@ pub const BcFunction = struct {
     param_names: [][]const u8,
     /// Phase 4d: whether this function was compiled in strict mode.
     is_strict: bool = false,
+    /// M14: body references `arguments` and is not an arrow → the VM materializes
+    /// an `arguments` array-like object in the call env at every invocation site.
+    uses_arguments: bool = false,
+    /// M14: this is an arrow whose body (transitively through nested arrows)
+    /// references `arguments`; the enclosing non-arrow function must therefore
+    /// materialize one. Propagated up at compile time, not used by the VM.
+    needs_parent_arguments: bool = false,
     /// W2: whether this is a generator function (`function*`). When called it
     /// produces a generator object instead of running the body.
     is_generator: bool = false,

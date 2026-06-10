@@ -24,6 +24,7 @@ const loop_jit = @import("../jit/loop_jit.zig");
 const coercion = @import("../runtime/builtins/coercion.zig");
 const function_proto = @import("../runtime/builtins/function_proto.zig");
 const proxy_mod = @import("../runtime/builtins/proxy.zig");
+const typed_array = @import("../runtime/builtins/typed_array.zig");
 
 /// Phase 4a: a try entry pushed by PUSH_TRY.
 pub const TryEntry = struct {
@@ -209,6 +210,7 @@ pub const BcVm = struct {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
                 }
+                try self.defineArguments(call_env, fn_ptr, args);
                 const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
                 const new_regs = try self.arena.alloc(Value, num_regs);
                 for (new_regs) |*r| r.* = Value{};
@@ -1404,6 +1406,7 @@ pub const BcVm = struct {
                                 try val_mod.makeUndefined(self.arena);
                             try call_env.define(pname, av);
                         }
+                        try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
                         if (fn_ptr.name) |fname| {
                             var is_param = false;
                             for (fn_ptr.param_names) |p| {
@@ -1545,6 +1548,7 @@ pub const BcVm = struct {
                                 try val_mod.makeUndefined(self.arena);
                             try call_env.define(pname, av);
                         }
+                        try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)]);
                         if (fn_ptr.name) |fname| {
                             var is_param = false;
                             for (fn_ptr.param_names) |p| {
@@ -2527,6 +2531,7 @@ pub const BcVm = struct {
                         try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
                 }
+                try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
                 const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
                 const new_regs = try self.arena.alloc(Value, num_regs);
                 for (new_regs) |*r| r.* = Value{};
@@ -2822,6 +2827,16 @@ pub const BcVm = struct {
                     const key_v = try val_mod.makeString(self.arena, key);
                     return try self.proxyGet(obj_val, obj, key_v);
                 }
+                // M15: integer-indexed TypedArray element read (exotic). A canonical
+                // index past the end (or on a detached buffer) yields undefined and
+                // never falls through to ordinary property lookup.
+                if (obj.internal_kind == .typed_array) {
+                    if (typed_array.canonicalIndex(key)) |i| {
+                        const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+                        if (td.ab.detached or i >= td.length) return val_mod.makeUndefined(self.arena);
+                        return typed_array.taLoad(self.arena, td, i);
+                    }
+                }
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength()));
                 }
@@ -2952,6 +2967,26 @@ pub const BcVm = struct {
                     const key_v = try val_mod.makeString(self.arena, key);
                     try self.proxySet(obj_val, obj, key_v, value);
                     return;
+                }
+                // M15: integer-indexed TypedArray element write (exotic). Coerce the
+                // value (ToNumber/ToBigInt) then store; out-of-bounds is a silent
+                // no-op and indexed keys never create ordinary properties.
+                if (obj.internal_kind == .typed_array) {
+                    if (typed_array.canonicalIndex(key)) |i| {
+                        const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+                        if (!td.ab.detached and i < td.length) {
+                            if (td.kind.isBigInt()) {
+                                typed_array.taStoreBig(td, i, value);
+                            } else {
+                                const n = self.toNumberCoerced(value) catch |e| {
+                                    if (e != error.JsException) return e;
+                                    return;
+                                };
+                                typed_array.taStoreNumber(td, i, n);
+                            }
+                        }
+                        return;
+                    }
                 }
                 if (obj.findProperty(key)) |loc| {
                     const a = loc.holder.attrAt(loc.slot);
@@ -3302,6 +3337,7 @@ pub const BcVm = struct {
                         try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
                 }
+                try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
                 if (fn_ptr.name) |fname| {
@@ -3528,6 +3564,7 @@ pub const BcVm = struct {
                         try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
                 }
+                try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
                 if (fn_ptr.name) |fname| {
@@ -3656,6 +3693,35 @@ pub const BcVm = struct {
         return val_mod.makeObject(self.arena, obj);
     }
 
+    /// M14: materialize an `arguments` array-like object in the call env when the
+    /// callee references `arguments` (and is not an arrow). Unmapped form: a plain
+    /// object with indexed elements 0..n-1, a `length`, and an `@@iterator` so
+    /// `for (x of arguments)` works. Skipped when a parameter is literally named
+    /// `arguments` (that binding wins per spec). No-op for the common case.
+    fn defineArguments(self: *BcVm, env: *Environment, fn_ptr: *const BcFunction, args: []const Value) !void {
+        if (!fn_ptr.uses_arguments) return;
+        for (fn_ptr.param_names) |p| {
+            if (std.mem.eql(u8, p, "arguments")) return;
+        }
+        const obj = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        for (args, 0..) |a, i| {
+            const key = try std.fmt.allocPrint(self.arena, "{d}", .{i});
+            try obj.set(key, a);
+        }
+        try obj.set("length", try val_mod.makeNumber(self.arena, @floatFromInt(args.len)));
+        // for-of over arguments: the Array iterator works on any array-like
+        // (reads length + indexed). Install it under the real @@iterator symbol.
+        const realm_mod = @import("../runtime/realm.zig");
+        if (realm_mod.active_sym_iterator) |symv| {
+            const coll = @import("../runtime/builtins/es2015_collections.zig");
+            try obj.setSym(symv, try val_mod.makeNativeFunction(self.arena, coll.nativeArrayValues));
+        }
+        try env.define("arguments", try val_mod.makeObject(self.arena, obj));
+    }
+
     /// Build the suspended-frame state shared by generators and async functions:
     /// a fresh call env with params bound, register file with params seeded, and
     /// a BcGeneratorState registered for GC scanning. The frame starts at pc 0.
@@ -3665,6 +3731,7 @@ pub const BcVm = struct {
             const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
             try call_env.define(pname, av);
         }
+        try self.defineArguments(call_env, fn_ptr, args);
         const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
         const regs = try self.arena.alloc(Value, num_regs);
         for (regs) |*r| r.* = Value{};

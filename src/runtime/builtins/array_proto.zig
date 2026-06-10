@@ -8,7 +8,11 @@ const JsObject = @import("../../object/object.zig").JsObject;
 
 /// Extract the array object from this_val or return null.
 fn getArray(this_val: Value) ?*JsObject {
-    if (this_val.bits == 0) return null;
+    // Must be a real heap cell before toPtr(): a boxed primitive `this`
+    // (boolean/number/null via Array.prototype.*.call(primitive)) has nonzero
+    // non-pointer bits, so a bare `bits == 0` guard let it through and
+    // @ptrFromInt() dereferenced garbage (access violation).
+    if (!this_val.isHeapPtr()) return null;
     const inner = this_val.toPtr();
     if (inner.* != .object) return null;
     const obj = inner.object;

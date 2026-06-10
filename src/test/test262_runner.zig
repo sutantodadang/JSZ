@@ -560,6 +560,17 @@ pub fn main() !void {
     var strict_failures = false;
     var dashboard_path: ?[]const u8 = null;
     var write_failing_path: ?[]const u8 = null;
+    // Crash-resilient run support: --progress-file records the test about to run
+    // (truncated+flushed each iteration, so after a hard crash it names the
+    // crasher); --results-file appends one "PASS|FAIL|SKIP <path>" line per test
+    // (append mode, survives across resumed runs); --start-after skips every test
+    // up to and including the named path (resume past a crasher).
+    var progress_file_path: ?[]const u8 = null;
+    var results_file_path: ?[]const u8 = null;
+    var start_after: ?[]const u8 = null;
+    // --filter <substr>: only run tests whose relative path contains <substr>
+    // (full mode only). Lets a single feature area be measured in isolation.
+    var path_filter: ?[]const u8 = null;
     var arg_idx: usize = 1;
     while (arg_idx < argv.len) : (arg_idx += 1) {
         const arg = argv[arg_idx];
@@ -588,6 +599,18 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--write-known-failing") and arg_idx + 1 < argv.len) {
             arg_idx += 1;
             write_failing_path = argv[arg_idx];
+        } else if (std.mem.eql(u8, arg, "--progress-file") and arg_idx + 1 < argv.len) {
+            arg_idx += 1;
+            progress_file_path = argv[arg_idx];
+        } else if (std.mem.eql(u8, arg, "--results-file") and arg_idx + 1 < argv.len) {
+            arg_idx += 1;
+            results_file_path = argv[arg_idx];
+        } else if (std.mem.eql(u8, arg, "--start-after") and arg_idx + 1 < argv.len) {
+            arg_idx += 1;
+            start_after = argv[arg_idx];
+        } else if (std.mem.eql(u8, arg, "--filter") and arg_idx + 1 < argv.len) {
+            arg_idx += 1;
+            path_filter = argv[arg_idx];
         }
     }
 
@@ -605,6 +628,13 @@ pub fn main() !void {
     const tests: []const []const u8 = if (full_mode) blk: {
         var corpus: std.ArrayList([]const u8) = .empty;
         try collectFullCorpus(wl_arena.allocator(), &corpus);
+        // Deterministic order so --start-after resume is stable across runs
+        // (filesystem walk order is not guaranteed identical run-to-run).
+        std.mem.sort([]const u8, corpus.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
         break :blk corpus.items;
     } else whitelist;
 
@@ -685,7 +715,30 @@ pub fn main() !void {
     var unexpected_fail: u32 = 0;
     var unexpected_pass: u32 = 0;
 
+    // Append-mode results sink for crash-resilient runs (one line per test).
+    var results_file: ?std.fs.File = null;
+    if (results_file_path) |rp| {
+        if (std.fs.cwd().createFile(rp, .{ .truncate = false })) |f| {
+            f.seekFromEnd(0) catch {};
+            results_file = f;
+        } else |_| {}
+    }
+    defer if (results_file) |f| f.close();
+
+    // Resume support: when --start-after is set, skip every test up to and
+    // including the named path; begin running at the next one.
+    var resumed = (start_after == null);
+
     for (tests) |rel_path| {
+        if (!resumed) {
+            if (start_after) |sa| {
+                if (std.mem.eql(u8, rel_path, sa)) resumed = true;
+            }
+            continue;
+        }
+        if (path_filter) |pf| {
+            if (std.mem.indexOf(u8, rel_path, pf) == null) continue;
+        }
         const category = classifyCategory(rel_path);
         const cat_idx = @intFromEnum(category);
         const expected_fail = known_failing.contains(rel_path);
@@ -714,7 +767,30 @@ pub fn main() !void {
             continue;
         };
         defer allocator.free(source);
+
+        // Record the test we're about to run (truncate+flush) so a hard crash
+        // inside runOneTest leaves the crasher's path on disk for the wrapper.
+        if (progress_file_path) |pp| {
+            if (std.fs.cwd().createFile(pp, .{ .truncate = true })) |pf| {
+                pf.writeAll(rel_path) catch {};
+                pf.close();
+            } else |_| {}
+        }
+
         const outcome = try runOneTest(allocator, source, full_mode, harness_present);
+
+        // Append the per-test outcome (survives across resumed runs).
+        if (results_file) |f| {
+            const tag = switch (outcome) {
+                .pass => "PASS",
+                .fail => "FAIL",
+                .skip => "SKIP",
+            };
+            var lb: [600]u8 = undefined;
+            if (std.fmt.bufPrint(&lb, "{s} {s}\n", .{ tag, rel_path })) |line| {
+                f.writeAll(line) catch {};
+            } else |_| {}
+        }
 
         switch (outcome) {
             .skip => skipped += 1,

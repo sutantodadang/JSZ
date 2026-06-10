@@ -22,6 +22,7 @@ const regexp_mod = @import("./builtins/regexp.zig");
 const function_proto_mod = @import("./builtins/function_proto.zig");
 const date_mod = @import("./builtins/date.zig");
 const es2015_collections_mod = @import("./builtins/es2015_collections.zig");
+const typed_array_mod = @import("./builtins/typed_array.zig");
 const promise_mod = @import("./builtins/promise.zig");
 const console_mod = @import("./builtins/console.zig");
 // ES2015 Symbol
@@ -1209,6 +1210,110 @@ pub const Realm = struct {
         try set_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeSetCtor));
         try env.define("Set", try val_mod.makeObject(arena, set_ctor_obj));
 
+        // ---- M15: ArrayBuffer / TypedArrays / DataView ----
+        {
+            const ta = typed_array_mod;
+            // ArrayBuffer
+            const ab_proto = try JsObject.create(arena, object_proto);
+            try ab_proto.set("slice", try val_mod.makeNativeFunction(arena, ta.nativeArrayBufferSlice));
+            ta.active_arraybuffer_proto = ab_proto;
+            const ab_ctor = try JsObject.create(arena, null);
+            try ab_ctor.set("prototype", try val_mod.makeObject(arena, ab_proto));
+            try ab_ctor.set("__call__", try val_mod.makeNativeFunction(arena, ta.nativeArrayBufferCtor));
+            try ab_ctor.set("isView", try val_mod.makeNativeFunction(arena, ta.nativeArrayBufferIsView));
+            try ab_proto.set("constructor", try val_mod.makeObject(arena, ab_ctor));
+            try env.define("ArrayBuffer", try val_mod.makeObject(arena, ab_ctor));
+
+            // %TypedArray%.prototype — shared methods.
+            const ta_proto = try JsObject.create(arena, object_proto);
+            const ta_methods = .{
+                .{ "fill", ta.nativeTaFill },
+                .{ "subarray", ta.nativeTaSubarray },
+                .{ "slice", ta.nativeTaSlice },
+                .{ "set", ta.nativeTaSet },
+                .{ "indexOf", ta.nativeTaIndexOf },
+                .{ "includes", ta.nativeTaIncludes },
+                .{ "join", ta.nativeTaJoin },
+                .{ "toString", ta.nativeTaToString },
+                .{ "reverse", ta.nativeTaReverse },
+                .{ "at", ta.nativeTaAt },
+                .{ "forEach", ta.nativeTaForEach },
+                .{ "map", ta.nativeTaMap },
+                .{ "reduce", ta.nativeTaReduce },
+                .{ "values", ta.nativeTaValues },
+                .{ "keys", ta.nativeTaKeys },
+                .{ "entries", ta.nativeTaEntries },
+                .{ "@@iterator", ta.nativeTaValues },
+            };
+            inline for (ta_methods) |pair| {
+                try ta_proto.set(pair[0], try val_mod.makeNativeFunction(arena, pair[1]));
+            }
+            ta.active_typedarray_proto = ta_proto;
+
+            // Instance accessor getters live on %TypedArray%.prototype (spec: these
+            // are getters, not own data properties).
+            try ta.defineGetter(arena, ta_proto, "length", ta.taGetLength);
+            try ta.defineGetter(arena, ta_proto, "byteLength", ta.taGetByteLength);
+            try ta.defineGetter(arena, ta_proto, "byteOffset", ta.taGetByteOffset);
+            try ta.defineGetter(arena, ta_proto, "buffer", ta.taGetBuffer);
+
+            // %TypedArray% intrinsic constructor (abstract; reachable via
+            // Object.getPrototypeOf(Int8Array) — required by the test262 harness).
+            const ta_ctor = try JsObject.create(arena, function_proto);
+            try ta_ctor.set("prototype", try val_mod.makeObject(arena, ta_proto));
+            try ta_ctor.set("__call__", try val_mod.makeNativeFunction(arena, ta.nativeTaAbstractCtor));
+            try ta_ctor.set("from", try val_mod.makeNativeFunction(arena, ta.nativeTaFrom));
+            try ta_ctor.set("of", try val_mod.makeNativeFunction(arena, ta.nativeTaOf));
+            try ta_proto.set("constructor", try val_mod.makeObject(arena, ta_ctor));
+
+            // TypedArray iterator prototype.
+            const ta_iter_proto = try JsObject.create(arena, object_proto);
+            try ta_iter_proto.set("next", try val_mod.makeNativeFunction(arena, ta.nativeTaIterNext));
+            try ta_iter_proto.set("@@iterator", try val_mod.makeNativeFunction(arena, ta.nativeIterSelf));
+            ta.active_ta_iter_proto = ta_iter_proto;
+
+            // Per-kind constructors + prototypes (inherit %TypedArray% / its prototype).
+            inline for (ta.all_kinds) |kind| {
+                const kp = try JsObject.create(arena, ta_proto);
+                ta.active_ta_protos[@intFromEnum(kind)] = kp;
+                const kctor = try JsObject.create(arena, ta_ctor);
+                ta.active_ta_ctors[@intFromEnum(kind)] = kctor;
+                try kctor.set("prototype", try val_mod.makeObject(arena, kp));
+                try kctor.set("__call__", try val_mod.makeNativeFunction(arena, ta.taCtor(kind)));
+                try kctor.set("from", try val_mod.makeNativeFunction(arena, ta.nativeTaFrom));
+                try kctor.set("of", try val_mod.makeNativeFunction(arena, ta.nativeTaOf));
+                try kctor.set("BYTES_PER_ELEMENT", try val_mod.makeNumber(arena, @floatFromInt(kind.elemSize())));
+                try kp.set("BYTES_PER_ELEMENT", try val_mod.makeNumber(arena, @floatFromInt(kind.elemSize())));
+                try kp.set("constructor", try val_mod.makeObject(arena, kctor));
+                try env.define(kind.ctorName(), try val_mod.makeObject(arena, kctor));
+            }
+
+            // DataView
+            const dv_proto = try JsObject.create(arena, object_proto);
+            try dv_proto.set("getInt8", try val_mod.makeNativeFunction(arena, ta.dvGet(i8, false)));
+            try dv_proto.set("getUint8", try val_mod.makeNativeFunction(arena, ta.dvGet(u8, false)));
+            try dv_proto.set("getInt16", try val_mod.makeNativeFunction(arena, ta.dvGet(i16, false)));
+            try dv_proto.set("getUint16", try val_mod.makeNativeFunction(arena, ta.dvGet(u16, false)));
+            try dv_proto.set("getInt32", try val_mod.makeNativeFunction(arena, ta.dvGet(i32, false)));
+            try dv_proto.set("getUint32", try val_mod.makeNativeFunction(arena, ta.dvGet(u32, false)));
+            try dv_proto.set("getFloat32", try val_mod.makeNativeFunction(arena, ta.dvGet(f32, true)));
+            try dv_proto.set("getFloat64", try val_mod.makeNativeFunction(arena, ta.dvGet(f64, true)));
+            try dv_proto.set("setInt8", try val_mod.makeNativeFunction(arena, ta.dvSet(i8, false)));
+            try dv_proto.set("setUint8", try val_mod.makeNativeFunction(arena, ta.dvSet(u8, false)));
+            try dv_proto.set("setInt16", try val_mod.makeNativeFunction(arena, ta.dvSet(i16, false)));
+            try dv_proto.set("setUint16", try val_mod.makeNativeFunction(arena, ta.dvSet(u16, false)));
+            try dv_proto.set("setInt32", try val_mod.makeNativeFunction(arena, ta.dvSet(i32, false)));
+            try dv_proto.set("setUint32", try val_mod.makeNativeFunction(arena, ta.dvSet(u32, false)));
+            try dv_proto.set("setFloat32", try val_mod.makeNativeFunction(arena, ta.dvSet(f32, true)));
+            try dv_proto.set("setFloat64", try val_mod.makeNativeFunction(arena, ta.dvSet(f64, true)));
+            ta.active_dataview_proto = dv_proto;
+            const dv_ctor = try JsObject.create(arena, null);
+            try dv_ctor.set("prototype", try val_mod.makeObject(arena, dv_proto));
+            try dv_ctor.set("__call__", try val_mod.makeNativeFunction(arena, ta.nativeDataViewCtor));
+            try dv_proto.set("constructor", try val_mod.makeObject(arena, dv_ctor));
+            try env.define("DataView", try val_mod.makeObject(arena, dv_ctor));
+        }
+
         const weakmap_proto = try JsObject.create(arena, object_proto);
         const weakmap_fns = .{
             .{ "set", es2015_collections_mod.nativeMapSet },
@@ -1583,6 +1688,12 @@ pub const Realm = struct {
         active_promise_proto = null;
         active_symbol_proto = null;
         active_sym_iterator = null;
+        typed_array_mod.active_arraybuffer_proto = null;
+        typed_array_mod.active_dataview_proto = null;
+        typed_array_mod.active_typedarray_proto = null;
+        typed_array_mod.active_ta_iter_proto = null;
+        for (&typed_array_mod.active_ta_protos) |*p| p.* = null;
+        for (&typed_array_mod.active_ta_ctors) |*p| p.* = null;
         active_global_env = null;
         pending_exception = Value{};
     }

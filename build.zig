@@ -172,6 +172,10 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "jsz", .module = mod }},
         }),
     });
+    // Install a stable-path binary so a resume wrapper can re-invoke it across
+    // crashes (the cache path is content-hashed and unstable).
+    b.installArtifact(conformance_exe);
+
     const run_conformance = b.addRunArtifact(conformance_exe);
     const conformance_step = b.step("conformance", "Run Test262 conformance suite");
     conformance_step.dependOn(&run_conformance.step);
