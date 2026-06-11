@@ -12,3 +12,4 @@ tmp/
 # Phase 9 native JIT backend (Rust cdylib) build artifacts
 jit-native/target/
 .sisyphus/
+.omo/
