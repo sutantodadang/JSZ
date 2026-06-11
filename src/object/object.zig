@@ -406,23 +406,50 @@ pub const JsObject = struct {
         return null;
     }
 
+    pub fn getOwnSymEntry(self: *JsObject, sym_key: Value) ?SymProp {
+        if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return null;
+        const target = sym_key.toPtr().symbol;
+        for (self.sym_props.items) |sp| {
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) return sp;
+        }
+        return null;
+    }
+
     pub fn hasOwnSym(self: *JsObject, sym_key: Value) bool {
         return self.getOwnSym(sym_key) != null;
     }
 
+    /// Get symbol-keyed property with prototype chain walk.
+    pub fn getSym(self: *JsObject, sym_key: Value) ?Value {
+        var depth: usize = 0;
+        var cur: ?*JsObject = self;
+        while (cur) |obj| {
+            if (depth >= MAX_PROTO_DEPTH) break;
+            depth += 1;
+            if (obj.getOwnSym(sym_key)) |v| return v;
+            cur = obj.proto;
+        }
+        return null;
+    }
+
     /// Set/upsert an own symbol-keyed property. Honors writable / extensible.
     pub fn setSym(self: *JsObject, sym_key: Value, value: Value) !void {
+        return self.setSymAttr(sym_key, value, .{});
+    }
+
+    pub fn setSymAttr(self: *JsObject, sym_key: Value, value: Value, attr: PropAttr) !void {
         if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return;
         const target = sym_key.toPtr().symbol;
         for (self.sym_props.items) |*sp| {
             if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
                 if (!sp.attr.writable) return;
                 sp.value = value;
+                sp.attr = attr;
                 return;
             }
         }
         if (!self.extensible) return;
-        try self.sym_props.append(self.arena, .{ .key = sym_key, .value = value });
+        try self.sym_props.append(self.arena, .{ .key = sym_key, .value = value, .attr = attr });
     }
 
     /// Delete own symbol-keyed property; honors configurable. Returns true if removed.

@@ -31,17 +31,19 @@ pub const Ctx = struct {
 };
 
 /// Set many native-function methods on `obj` from a comptime tuple of
-/// `.{ name, fn_ptr }` pairs. Replaces the repeated
-/// `inline for (fns) |p| try obj.set(p[0], try makeNativeFunction(arena, p[1]))`.
+/// `.{ name, fn_ptr }` pairs. Each function gets `.name` and `.length = 0`
+/// stored inline on the NativeFnEntry (accessible via getProp).
 pub fn setMethods(arena: std.mem.Allocator, obj: *JsObject, comptime pairs: anytype) !void {
     inline for (pairs) |pair| {
-        try obj.set(pair[0], try val_mod.makeNativeFunction(arena, pair[1]));
+        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0);
+        try obj.set(pair[0], fn_val);
     }
 }
 
-/// Set a single native-function method.
+/// Set a single native-function method with name/length stored on the entry.
 pub fn setMethod(arena: std.mem.Allocator, obj: *JsObject, name: []const u8, fn_ptr: val_mod.NativeFnPtr) !void {
-    try obj.set(name, try val_mod.makeNativeFunction(arena, fn_ptr));
+    const fn_val = try val_mod.makeNativeFunctionNamed(arena, fn_ptr, name, 0);
+    try obj.set(name, fn_val);
 }
 
 /// Build a constructor object with the `{ prototype, __call__ }` shape used

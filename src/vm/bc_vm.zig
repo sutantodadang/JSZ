@@ -935,6 +935,24 @@ pub const BcVm = struct {
     /// HasProperty(obj, key) for the `in` operator: prototype-chain walk over
     /// string and symbol keys, with Proxy `has` trap dispatch.
     pub fn hasProperty(self: *BcVm, obj_val: Value, key_v: Value) anyerror!bool {
+        // native_function: own props are "length"/"name" (unless deleted); walk Function.prototype chain.
+        if (obj_val.bits != 0 and obj_val.unbox() == .native_function) {
+            const realm_mod = @import("../runtime/realm.zig");
+            const key = try valueToStringArena(self.arena, key_v);
+            const entry = obj_val.unbox().native_function;
+            if (std.mem.eql(u8, key, "length") and !entry.length_deleted) return true;
+            if (std.mem.eql(u8, key, "name")   and !entry.name_deleted)   return true;
+            // Walk Function.prototype chain for inherited props (e.g. "call", "bind", "apply").
+            var cur: ?*JsObject = if (realm_mod.active_function_proto) |p| p else null;
+            var depth: usize = 0;
+            while (cur) |o| {
+                if (depth >= 64) break;
+                depth += 1;
+                if (o.hasOwn(key)) return true;
+                cur = o.proto;
+            }
+            return false;
+        }
         if (obj_val.bits == 0 or obj_val.unbox() != .object) return false;
         const root_obj = obj_val.toPtr().object;
         if (root_obj.internal_kind == .proxy) {
@@ -945,6 +963,15 @@ pub const BcVm = struct {
                 return isTruthy(res);
             }
             return try self.hasProperty(target, key_v);
+        }
+        // M15: TypedArray [[HasProperty]] — integer-indexed exotic.
+        if (root_obj.internal_kind == .typed_array) {
+            const key_str = try valueToStringArena(self.arena, key_v);
+            if (typed_array.canonicalNumericIndexString(key_str)) |idx_f| {
+                const td = typed_array.getTd(obj_val).?;
+                return typed_array.isValidIntegerIndex(td, idx_f);
+            }
+            // Non-canonical-numeric key: fall through to ordinary prototype walk.
         }
         // Symbol key.
         if (key_v.bits != 0 and key_v.unbox() == .symbol) {
@@ -976,6 +1003,16 @@ pub const BcVm = struct {
     /// result. Dispatches the Proxy `deleteProperty` trap; deleting from a
     /// non-object is a no-op that yields `true`.
     pub fn deleteProperty(self: *BcVm, obj_val: Value, key_v: Value) anyerror!bool {
+        // native_function: "length" and "name" are configurable — mark deleted.
+        if (obj_val.bits != 0 and obj_val.unbox() == .native_function) {
+            if (obj_val.isHeapPtr()) {
+                const key = try valueToStringArena(self.arena, key_v);
+                const entry: *val_mod.NativeFnEntry = &obj_val.toPtr().native_function;
+                if (std.mem.eql(u8, key, "length")) { entry.length_deleted = true; return true; }
+                if (std.mem.eql(u8, key, "name"))   { entry.name_deleted   = true; return true; }
+            }
+            return true; // non-own key — no-op, return true
+        }
         if (obj_val.bits == 0 or obj_val.unbox() != .object) return true;
         const obj = obj_val.toPtr().object;
         if (obj.internal_kind == .proxy) {
@@ -986,6 +1023,18 @@ pub const BcVm = struct {
                 return isTruthy(res);
             }
             return try self.deleteProperty(target, key_v);
+        }
+        // M15: TypedArray [[Delete]] — integer-indexed exotic.
+        if (obj.internal_kind == .typed_array) {
+            const key_str2 = try valueToStringArena(self.arena, key_v);
+            if (typed_array.canonicalNumericIndexString(key_str2)) |idx_f| {
+                const td2 = typed_array.getTd(obj_val).?;
+                // Valid index: cannot delete → return false (strict caller throws).
+                if (typed_array.isValidIntegerIndex(td2, idx_f)) return false;
+                // Out-of-range or non-integer canonical numeric: return true (absent).
+                return true;
+            }
+            // Non-canonical key: fall through to ordinary deleteOwn.
         }
         if (key_v.bits != 0 and key_v.unbox() == .symbol) {
             return obj.deleteOwnSym(key_v);
@@ -1134,12 +1183,31 @@ pub const BcVm = struct {
             },
             .function, .native_function => {
                 // `.length` = declared arity (native_function carries it inline).
+                // Respect deletion flag: if deleted, skip own-prop and fall through.
                 if (std.mem.eql(u8, key, "length")) {
-                    const len: u8 = switch (obj_val.unbox()) {
-                        .native_function => |e| e.length,
-                        else => 0,
-                    };
-                    return val_mod.makeNumber(self.arena, @floatFromInt(len));
+                    const deleted = obj_val.unbox() == .native_function and
+                        obj_val.unbox().native_function.length_deleted;
+                    if (!deleted) {
+                        const len: u8 = switch (obj_val.unbox()) {
+                            .native_function => |e| e.length,
+                            else => 0,
+                        };
+                        return val_mod.makeNumber(self.arena, @floatFromInt(len));
+                    }
+                    // deleted — fall through to Function.prototype
+                }
+                // `.name` = function name stored inline on NativeFnEntry.
+                if (std.mem.eql(u8, key, "name")) {
+                    if (obj_val.unbox() == .native_function) {
+                        const entry = obj_val.unbox().native_function;
+                        if (!entry.name_deleted) {
+                            const n = entry.name orelse "";
+                            return val_mod.makeString(self.arena, n);
+                        }
+                        // deleted — fall through to Function.prototype
+                    } else {
+                        return val_mod.makeUndefined(self.arena);
+                    }
                 }
                 // Phase 4d: delegate to Function.prototype (call, apply, bind).
                 const realm_mod = @import("../runtime/realm.zig");

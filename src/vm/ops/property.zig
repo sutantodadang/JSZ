@@ -349,7 +349,12 @@ pub inline fn opIn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const key_v = frame.registers[rkey];
     const obj_v = frame.registers[robj];
-    if (obj_v.bits == 0 or obj_v.unbox() != .object) {
+    // native_function is callable — hasProperty handles it; do NOT throw for it.
+    const obj_is_valid = if (obj_v.bits == 0) false else switch (obj_v.unbox()) {
+        .object, .native_function => true,
+        else => false,
+    };
+    if (!obj_is_valid) {
         const exc = try self.makeErrorObjectBc("TypeError", "Cannot use 'in' operator to search for key in a non-object");
         self.last_exception_value = exc;
         const found = try self.throwException(exc);
@@ -380,6 +385,17 @@ pub inline fn opDeleteProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         if (try self.raisePendingException("error in proxy deleteProperty trap")) |oc| return oc;
         return null;
     };
+    // Spec: strict-mode delete returning false → TypeError.
+    if (!ok and frame.func.is_strict) {
+        const exc = try self.makeErrorObjectBc("TypeError", "Cannot delete property of TypedArray");
+        self.last_exception_value = exc;
+        const found = try self.throwException(exc);
+        if (!found) {
+            const exc_msg = try bcv.formatExceptionMessage(self.arena, exc);
+            return RunOutcome{ .exception_value = .{ .msg = exc_msg, .value = exc } };
+        }
+        return null;
+    }
     self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, ok);
     return null;
 }

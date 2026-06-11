@@ -240,6 +240,16 @@ const HARDCODED_PRELUDE =
     \\
 ;
 
+const DOLLAR262_PRELUDE =
+    \\var $262 = {
+    \\  detachArrayBuffer: function(buffer) { buffer.transfer(0); },
+    \\  global: (function() { return this; })(),
+    \\  createRealm: function() { return $262; },
+    \\  evalScript: function(s) { return eval(s); }
+    \\};
+    \\
+;
+
 /// Return the value region of the `includes:` frontmatter key, covering both the
 /// inline `[a.js, b.js]` form and the indented block-list form.
 fn includesRegion(yaml: []const u8) []const u8 {
@@ -348,7 +358,16 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     defer if (prelude_owned) |p| allocator.free(p);
     const prelude: []const u8 = prelude_owned orelse HARDCODED_PRELUDE;
 
-    const full_source = std.fmt.allocPrint(allocator, "{s}{s}", .{ prelude, source }) catch return .fail;
+    // Only inject $262 when the test actually uses it (or $DETACHBUFFER which
+    // depends on it). This avoids breaking harness/detachArrayBuffer.js which
+    // explicitly tests that $262 is NOT defined by default.
+    const needs_dollar262 = std.mem.indexOf(u8, source, "$262") != null or
+        std.mem.indexOf(u8, source, "$DETACHBUFFER") != null or
+        std.mem.indexOf(u8, prelude, "$262") != null;
+    const full_source = if (needs_dollar262)
+        std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ DOLLAR262_PRELUDE, prelude, source }) catch return .fail
+    else
+        std.fmt.allocPrint(allocator, "{s}{s}", .{ prelude, source }) catch return .fail;
     defer allocator.free(full_source);
 
     const result = ctx.eval(full_source, "<test262>");

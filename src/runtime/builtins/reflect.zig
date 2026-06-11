@@ -9,6 +9,7 @@ const JsObject = obj_mod.JsObject;
 const PropAttr = obj_mod.PropAttr;
 const fp = @import("function_proto.zig");
 const intrinsics = @import("intrinsics.zig");
+const typed_array = @import("typed_array.zig");
 
 /// R1: create the Reflect namespace object and bind the `Reflect` global.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -199,6 +200,16 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
     }
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
+
+    // M15: TypedArray [[HasProperty]] — integer-indexed exotic.
+    if (target_obj.internal_kind == .typed_array) {
+        if (typed_array.canonicalNumericIndexString(k)) |idx_f| {
+            const td = typed_array.getTd(args[0]).?;
+            return val_mod.makeBool(arena, typed_array.isValidIntegerIndex(td, idx_f));
+        }
+        // Non-canonical key: fall through to ordinary prototype walk.
+    }
+
     var depth: usize = 0;
     var cur: ?*JsObject = target_obj;
     while (cur) |o| {
@@ -222,6 +233,17 @@ pub fn nativeReflectDeleteProperty(arena: std.mem.Allocator, _: Value, args: []c
     }
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
+
+    // M15: TypedArray [[Delete]] — integer-indexed exotic.
+    if (target_obj.internal_kind == .typed_array) {
+        if (typed_array.canonicalNumericIndexString(k)) |idx_f| {
+            const td = typed_array.getTd(args[0]).?;
+            // Valid index: cannot delete → false. Out-of-range: true.
+            return val_mod.makeBool(arena, !typed_array.isValidIntegerIndex(td, idx_f));
+        }
+        // Non-canonical key: fall through to ordinary deleteOwn.
+    }
+
     return val_mod.makeBool(arena, try target_obj.deleteOwn(k));
 }
 
@@ -232,12 +254,47 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
 
-    if (args.len == 0 or !isObj(args[0])) {
+    if (args.len == 0) return val_mod.makeObject(arena, arr);
+    // native_function: own keys are "length" then "name" unless deleted (spec §10.3).
+    if (args[0].bits != 0 and args[0].isHeapPtr() and args[0].toPtr().* == .native_function) {
+        const entry = args[0].toPtr().native_function;
+        var idx: u32 = 0;
+        if (!entry.length_deleted) {
+            const k = try std.fmt.allocPrint(arena, "{d}", .{idx});
+            try arr.set(k, try val_mod.makeString(arena, "length"));
+            idx += 1;
+        }
+        if (!entry.name_deleted) {
+            const k = try std.fmt.allocPrint(arena, "{d}", .{idx});
+            try arr.set(k, try val_mod.makeString(arena, "name"));
+            idx += 1;
+        }
+        arr.array_length = idx;
+        return val_mod.makeObject(arena, arr);
+    }
+    if (!isObj(args[0])) {
         return val_mod.makeObject(arena, arr);
     }
     const obj = args[0].toPtr().object;
 
-    var i: u32 = 0;
+    // M15: TypedArray [[OwnPropertyKeys]] — integer indices first, then ordinary, then symbols.
+    var ta_count: u32 = 0;
+    if (isObj(args[0])) {
+        const robj = args[0].toPtr().object;
+        if (robj.internal_kind == .typed_array and robj.internal_slot != null) {
+            const td = typed_array.getTd(args[0]).?;
+            if (!td.ab.detached) {
+                var ti: u32 = 0;
+                while (ti < td.length) : (ti += 1) {
+                    const k_str = try std.fmt.allocPrint(arena, "{d}", .{ti});
+                    const idx_key_ta = try std.fmt.allocPrint(arena, "{d}", .{ta_count});
+                    try arr.set(idx_key_ta, try val_mod.makeString(arena, k_str));
+                    ta_count += 1;
+                }
+            }
+        }
+    }
+    var i: u32 = ta_count;
     for (obj.ownKeys()) |k| {
         const key_val = try val_mod.makeString(arena, k);
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});

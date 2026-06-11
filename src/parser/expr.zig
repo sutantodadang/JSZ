@@ -203,8 +203,27 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
         const right = p.parseAssignmentExpr() orelse return null;
-        return p.makeNode(.assignment_expr, left.start, p.current.start, .{
+        left = p.makeNode(.assignment_expr, left.start, p.current.start, .{
             .assignment_expr = .{ .op = op, .target = left, .value = right },
+        }) orelse return null;
+    }
+    // Comma sequence: `expr, expr2, ...` at statement level (parseExprStmt goes through
+    // parseExpression which handles comma, but parseExprFromIdent does not — fix here).
+    if (p.check(.comma)) {
+        var exprs = std.ArrayList(*Node){};
+        exprs.append(p.arena, left) catch {
+            p.had_error = true;
+            return null;
+        };
+        while (p.match(.comma)) {
+            const e = p.parseAssignmentExpr() orelse return null;
+            exprs.append(p.arena, e) catch {
+                p.had_error = true;
+                return null;
+            };
+        }
+        return p.makeNode(.sequence_expr, exprs.items[0].start, p.current.start, .{
+            .sequence_expr = .{ .exprs = exprs.items },
         });
     }
     return left;

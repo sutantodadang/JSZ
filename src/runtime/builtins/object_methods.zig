@@ -37,7 +37,22 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
         return val_mod.makeObject(arena, arr);
     }
 
-    var i: u32 = 0;
+    // M15: TypedArray integer indices (all enumerable per spec).
+    var ta_key_count: u32 = 0;
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+        if (!td.ab.detached) {
+            var ti: u32 = 0;
+            while (ti < td.length) : (ti += 1) {
+                const k_str = try std.fmt.allocPrint(arena, "{d}", .{ti});
+                const idx_key_ta = try std.fmt.allocPrint(arena, "{d}", .{ta_key_count});
+                try arr.set(idx_key_ta, try val_mod.makeString(arena, k_str));
+                ta_key_count += 1;
+            }
+        }
+    }
+    var i: u32 = ta_key_count;
     for (obj.ownKeys()) |k| {
         if (!obj.isEnumerable(k)) continue;
         const key_val = try val_mod.makeString(arena, k);
@@ -163,16 +178,31 @@ pub fn nativeObjectGetOwnPropertyDescriptors(arena: std.mem.Allocator, _: Value,
 
 /// hasOwnProperty(key): checks if own prop exists (not in proto chain).
 pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0) return val_mod.makeBool(arena, false);
+    // native_function has own "length" and "name" unless deleted (ES spec §10.3).
+    if (this_val.bits != 0 and this_val.unbox() == .native_function) {
+        const key: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
+            args[0].toPtr().string
+        else
+            return val_mod.makeBool(arena, false);
+        const entry = this_val.unbox().native_function;
+        if (std.mem.eql(u8, key, "length")) return val_mod.makeBool(arena, !entry.length_deleted);
+        if (std.mem.eql(u8, key, "name"))   return val_mod.makeBool(arena, !entry.name_deleted);
+        return val_mod.makeBool(arena, false);
+    }
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         return val_mod.makeBool(arena, false);
     }
-    if (args.len == 0) return val_mod.makeBool(arena, false);
+    const obj = this_val.toPtr().object;
+    // Symbol key: check sym_props.
+    if (args[0].bits != 0 and args[0].unbox() == .symbol) {
+        return val_mod.makeBool(arena, obj.getOwnSym(args[0]) != null);
+    }
     const key: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
         args[0].toPtr().string
     else
         return val_mod.makeBool(arena, false);
 
-    const obj = this_val.toPtr().object;
     return val_mod.makeBool(arena, obj.hasOwn(key));
 }
 
@@ -219,6 +249,19 @@ fn coerceKey(arena: std.mem.Allocator, v: Value) !?[]const u8 {
     };
 }
 
+/// Primitive ToNumber for TypedArray element coercion (no valueOf/toString calls).
+fn strToNumCoerce(v: Value) f64 {
+    if (v.bits == 0) return std.math.nan(f64);
+    return switch (v.unbox()) {
+        .undefined_ => std.math.nan(f64),
+        .null_ => 0,
+        .boolean => |b| if (b) 1 else 0,
+        .number => |n| n,
+        .string => |s| std.fmt.parseFloat(f64, std.mem.trim(u8, s, " \t\r\n")) catch std.math.nan(f64),
+        else => std.math.nan(f64),
+    };
+}
+
 fn makeAccessorHolder(arena: std.mem.Allocator, getter: ?Value, setter: ?Value) !Value {
     const realm_mod = @import("../realm.zig");
     const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
@@ -247,6 +290,23 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
     const arr = try JsObject.createArray(arena, arr_proto);
 
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, arr);
+    // native_function: own string keys are "length" and "name" unless deleted (spec §10.3).
+    if (args[0].unbox() == .native_function) {
+        const entry = args[0].unbox().native_function;
+        var idx: u32 = 0;
+        if (!entry.length_deleted) {
+            const k = try std.fmt.allocPrint(arena, "{d}", .{idx});
+            try arr.set(k, try val_mod.makeString(arena, "length"));
+            idx += 1;
+        }
+        if (!entry.name_deleted) {
+            const k = try std.fmt.allocPrint(arena, "{d}", .{idx});
+            try arr.set(k, try val_mod.makeString(arena, "name"));
+            idx += 1;
+        }
+        arr.array_length = idx;
+        return val_mod.makeObject(arena, arr);
+    }
     if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
     const obj = args[0].toPtr().object;
 
@@ -266,7 +326,22 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
         return val_mod.makeObject(arena, arr);
     }
 
-    var i: u32 = 0;
+    // M15: TypedArray [[OwnPropertyKeys]] — integer indices first.
+    var ta_key_count: u32 = 0;
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+        if (!td.ab.detached) {
+            var ti: u32 = 0;
+            while (ti < td.length) : (ti += 1) {
+                const k_str = try std.fmt.allocPrint(arena, "{d}", .{ti});
+                const idx_key_ta = try std.fmt.allocPrint(arena, "{d}", .{ta_key_count});
+                try arr.set(idx_key_ta, try val_mod.makeString(arena, k_str));
+                ta_key_count += 1;
+            }
+        }
+    }
+    var i: u32 = ta_key_count;
     for (obj.ownKeys()) |k| {
         const key_val = try val_mod.makeString(arena, k);
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
@@ -281,7 +356,36 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
 pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
-    if (args[0].unbox() != .object) return val_mod.makeUndefined(arena);
+    const arg0_unboxed = args[0].unbox();
+    // Handle native_function: synthesize descriptors for .name/.length (respecting deletion).
+    if (arg0_unboxed == .native_function) {
+        if (args.len < 2) return val_mod.makeUndefined(arena);
+        const key = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
+        const entry = arg0_unboxed.native_function;
+        const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+        const desc = try JsObject.create(arena, obj_proto);
+        if (std.mem.eql(u8, key, "name")) {
+            if (entry.name_deleted) return val_mod.makeUndefined(arena);
+            const name_val = if (entry.name) |n|
+                try val_mod.makeString(arena, n)
+            else
+                try val_mod.makeString(arena, "");
+            try desc.set("value", name_val);
+            try desc.set("writable", try val_mod.makeBool(arena, false));
+            try desc.set("enumerable", try val_mod.makeBool(arena, false));
+            try desc.set("configurable", try val_mod.makeBool(arena, true));
+            return val_mod.makeObject(arena, desc);
+        } else if (std.mem.eql(u8, key, "length")) {
+            if (entry.length_deleted) return val_mod.makeUndefined(arena);
+            try desc.set("value", try val_mod.makeNumber(arena, @floatFromInt(entry.length)));
+            try desc.set("writable", try val_mod.makeBool(arena, false));
+            try desc.set("enumerable", try val_mod.makeBool(arena, false));
+            try desc.set("configurable", try val_mod.makeBool(arena, true));
+            return val_mod.makeObject(arena, desc);
+        }
+        return val_mod.makeUndefined(arena);
+    }
+    if (arg0_unboxed != .object) return val_mod.makeUndefined(arena);
     const obj = args[0].toPtr().object;
 
     if (args.len < 2) return val_mod.makeUndefined(arena);
@@ -295,6 +399,40 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
             return try nativeObjectGetOwnPropertyDescriptor(arena, args[0], &[_]Value{ target, args[1] });
         }
         return val_mod.makeUndefined(arena);
+    }
+
+    // M15: TypedArray [[GetOwnProperty]] — integer-indexed exotic.
+    if (obj.internal_kind == .typed_array) {
+        const ta_mod = @import("typed_array.zig");
+        const key2 = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
+        if (ta_mod.canonicalNumericIndexString(key2)) |idx_f| {
+            const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+            if (!ta_mod.isValidIntegerIndex(td, idx_f)) return val_mod.makeUndefined(arena);
+            const i: usize = @intFromFloat(idx_f);
+            const realm_mod2 = @import("../realm.zig");
+            const obj_proto3: ?*JsObject = if (realm_mod2.active_object_proto) |p| p else null;
+            const desc3 = try JsObject.create(arena, obj_proto3);
+            const elem = try ta_mod.taLoad(arena, td, i);
+            try desc3.set("value", elem);
+            try desc3.set("writable", try val_mod.makeBool(arena, true));
+            try desc3.set("enumerable", try val_mod.makeBool(arena, true));
+            try desc3.set("configurable", try val_mod.makeBool(arena, true));
+            return val_mod.makeObject(arena, desc3);
+        }
+        // Non-canonical-numeric key: fall through to ordinary property lookup.
+    }
+
+    // Symbol-keyed lookup: check sym_props first.
+    if (args[1].bits != 0 and args[1].unbox() == .symbol) {
+        const sym_val = args[1];
+        const sym_entry = obj.getOwnSymEntry(sym_val) orelse return val_mod.makeUndefined(arena);
+        const obj_proto2: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+        const desc2 = try JsObject.create(arena, obj_proto2);
+        try desc2.set("value", sym_entry.value);
+        try desc2.set("writable", try val_mod.makeBool(arena, sym_entry.attr.writable));
+        try desc2.set("enumerable", try val_mod.makeBool(arena, sym_entry.attr.enumerable));
+        try desc2.set("configurable", try val_mod.makeBool(arena, sym_entry.attr.configurable));
+        return val_mod.makeObject(arena, desc2);
     }
 
     const key = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
@@ -331,6 +469,39 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
 
     const key_raw = if (args.len >= 2) args[1] else Value{};
     const key = (try coerceKey(arena, key_raw)) orelse "";
+
+    // M15: TypedArray [[DefineOwnProperty]] — integer-indexed exotic.
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        if (ta_mod.canonicalNumericIndexString(key)) |idx_f| {
+            const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+            if (!ta_mod.isValidIntegerIndex(td, idx_f))
+                return throwTypeError(arena, "TypedArray: cannot define property with non-valid integer index");
+            if (args.len >= 3 and args[2].bits != 0 and args[2].unbox() == .object) {
+                const desc2 = args[2].toPtr().object;
+                if (desc2.hasOwn("get") or desc2.hasOwn("set"))
+                    return throwTypeError(arena, "TypedArray: cannot define accessor on integer-indexed property");
+                if (desc2.hasOwn("configurable") and !descTruthy(desc2.getOwn("configurable")))
+                    return throwTypeError(arena, "TypedArray: cannot define non-configurable integer-indexed property");
+                if (desc2.hasOwn("enumerable") and !descTruthy(desc2.getOwn("enumerable")))
+                    return throwTypeError(arena, "TypedArray: cannot define non-enumerable integer-indexed property");
+                if (desc2.hasOwn("writable") and !descTruthy(desc2.getOwn("writable")))
+                    return throwTypeError(arena, "TypedArray: cannot define non-writable integer-indexed property");
+                if (desc2.hasOwn("value")) {
+                    const i: usize = @intFromFloat(idx_f);
+                    const val2 = desc2.getOwn("value") orelse Value{};
+                    if (td.kind.isBigInt()) {
+                        ta_mod.taStoreBig(td, i, val2);
+                    } else {
+                        const n = strToNumCoerce(val2);
+                        ta_mod.taStoreNumber(td, i, n);
+                    }
+                }
+            }
+            return args[0];
+        }
+        // Non-canonical-numeric key: fall through to ordinary defineProperty.
+    }
 
     if (args.len < 3 or args[2].bits == 0 or args[2].unbox() != .object) {
         return throwTypeError(arena, "descriptor must be an object");

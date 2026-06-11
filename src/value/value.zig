@@ -27,6 +27,13 @@ pub const NativeFnEntry = struct {
     /// ECMAScript `.length` (declared parameter count) reported via property
     /// access. Defaults to 0; set explicitly for built-ins whose arity is tested.
     length: u8 = 0,
+    /// ECMAScript `.name` – the function name as reported to `Function.prototype.name`.
+    /// Null means not set (property access returns "").
+    name: ?[]const u8 = null,
+    /// Tracks whether the configurable `.length`/`.name` own properties have been
+    /// deleted (e.g. `delete fn.length`).  Both default to present (false = present).
+    length_deleted: bool = false,
+    name_deleted: bool = false,
 
     pub fn invoke(self: NativeFnEntry, arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
         g_active_native_data = self.data;
@@ -430,6 +437,13 @@ pub fn makeSymbol(arena: std.mem.Allocator, description: ?[]const u8) !Value {
 pub fn makeNativeFunction(arena: std.mem.Allocator, fn_ptr: NativeFnPtr) !Value {
     const v = try arena.create(JsValue);
     v.* = .{ .native_function = .{ .call = fn_ptr } };
+    return Value.fromPtr(v);
+}
+
+/// Wrap a native function with a name and length.
+pub fn makeNativeFunctionNamed(arena: std.mem.Allocator, fn_ptr: NativeFnPtr, name: []const u8, length: u8) !Value {
+    const v = try arena.create(JsValue);
+    v.* = .{ .native_function = .{ .call = fn_ptr, .name = name, .length = length } };
     return Value.fromPtr(v);
 }
 

@@ -265,6 +265,10 @@ pub var active_symbol_proto: ?*JsObject = null;
 pub var active_sym_iterator: ?Value = null;
 /// ES2015 Symbol.toPrimitive well-known symbol value (ToPrimitive hook).
 pub var active_sym_to_primitive: ?Value = null;
+/// ES2015 Symbol.toStringTag well-known symbol value.
+pub var active_sym_to_string_tag: ?Value = null;
+/// ES2015 Symbol.species well-known symbol value.
+pub var active_sym_species: ?Value = null;
 /// Phase 13: private symbols storing a Proxy's [[ProxyTarget]]/[[ProxyHandler]]
 /// as GC-traced symbol-keyed own properties.
 pub var active_sym_proxy_target: ?Value = null;
@@ -432,6 +436,97 @@ fn nativeArrayIsArray(arena: std.mem.Allocator, _: Value, args: []const Value) a
         return val_mod.makeBool(arena, args[0].toPtr().object.is_array);
     }
     return val_mod.makeBool(arena, false);
+}
+
+/// ES2015 Array.from(arrayLike [, mapFn [, thisArg]])
+/// Converts any array-like (length + indexed) or iterable to a real Array.
+fn nativeArrayFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    // Helper: create a new array with the given items.
+    const makeJsArray = struct {
+        fn make(alloc: std.mem.Allocator, items: []const Value) !Value {
+            const obj = if (active_heap) |heap|
+                try JsObject.createOnHeap(heap, active_array_proto)
+            else
+                try JsObject.create(alloc, active_array_proto);
+            obj.is_array = true;
+            for (items, 0..) |v, i| {
+                const key = try std.fmt.allocPrint(alloc, "{d}", .{i});
+                try obj.set(key, v);
+            }
+            obj.array_length = @intCast(items.len);
+            return val_mod.makeObject(alloc, obj);
+        }
+    }.make;
+
+    if (args.len == 0 or args[0].bits == 0) return try makeJsArray(arena, &[_]Value{});
+    const src = args[0];
+    const map_fn = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_) args[1] else Value{};
+
+    var items = std.ArrayList(Value){};
+    const src_unboxed = src.unbox();
+    if (src_unboxed == .object) {
+        const obj = src_unboxed.object;
+        if (obj.internal_kind == .typed_array) {
+            // TypedArray: use taLoad to get each element as a JS Value.
+            if (typed_array_mod.getTd(src)) |td| {
+                var i: usize = 0;
+                while (i < td.length) : (i += 1) {
+                    try items.append(arena, try typed_array_mod.taLoad(arena, td, i));
+                }
+            }
+        } else {
+            // Generic array-like: read .length then [0..length-1].
+            const len_v = obj.get("length") orelse Value{};
+            const len: usize = if (len_v.bits != 0 and len_v.unbox() == .number)
+                @intFromFloat(@max(0, len_v.unbox().number))
+            else
+                0;
+            var i: usize = 0;
+            var buf: [32]u8 = undefined;
+            while (i < len) : (i += 1) {
+                const key = try std.fmt.bufPrint(&buf, "{d}", .{i});
+                const v = obj.get(key) orelse Value{};
+                try items.append(arena, v);
+            }
+        }
+    } else if (src_unboxed == .string) {
+        // String: each Unicode code unit becomes an element.
+        const s = src_unboxed.string;
+        var i: usize = 0;
+        while (i < s.len) {
+            const byte_len: usize = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+            const slice = if (i + byte_len <= s.len) s[i .. i + byte_len] else s[i .. i + 1];
+            const cv = try val_mod.makeString(arena, try arena.dupe(u8, slice));
+            try items.append(arena, cv);
+            i += byte_len;
+        }
+    }
+
+    // Apply mapFn if provided.
+    if (map_fn.bits != 0) {
+        const undef = try val_mod.makeUndefined(arena);
+        for (items.items, 0..) |v, i| {
+            const idx = try val_mod.makeNumber(arena, @floatFromInt(i));
+            items.items[i] = try function_proto_mod.invokeCallback(arena, undef, map_fn, &[_]Value{ v, idx });
+        }
+    }
+
+    return try makeJsArray(arena, items.items);
+}
+
+/// ES2015 Array.of(...args) — creates array from arguments (no special-case for length).
+fn nativeArrayOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const obj = if (active_heap) |heap|
+        try JsObject.createOnHeap(heap, active_array_proto)
+    else
+        try JsObject.create(arena, active_array_proto);
+    obj.is_array = true;
+    for (args, 0..) |v, i| {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        try obj.set(key, v);
+    }
+    obj.array_length = @intCast(args.len);
+    return val_mod.makeObject(arena, obj);
 }
 
 fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8 {
@@ -714,14 +809,28 @@ fn nativeStringValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Val
 fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     // ES 20.1.3.6: "[object " + builtinTag + "]". undefined/null get special tags.
     if (this_val.bits == 0) return val_mod.makeString(arena, "[object Undefined]");
-    const tag: []const u8 = switch (this_val.unbox()) {
+    const builtin_tag: []const u8 = switch (this_val.unbox()) {
         .undefined_ => "Undefined",
         .null_ => "Null",
         .object => |obj| if (obj.is_array) "Array" else if (obj.get("__call__") != null) "Function" else "Object",
         .function, .bc_function, .native_function => "Function",
         else => "Object",
     };
-    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{tag}));
+    // ES 20.1.3.6 step 16: check @@toStringTag, override for non-Undefined/Null.
+    if (this_val.unbox() != .undefined_ and this_val.unbox() != .null_) {
+        if (active_sym_to_string_tag) |tag_sym| {
+            if (this_val.unbox() == .object) {
+                const obj = this_val.unbox().object;
+                if (obj.getSym(tag_sym)) |tv| {
+                    const s = tv.unbox();
+                    if (s == .string) {
+                        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{s.string}));
+                    }
+                }
+            }
+        }
+    }
+    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{builtin_tag}));
 }
 
 fn nativeObjectProtoValueOf(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -781,14 +890,15 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "replaceAll", string_proto_mod.nativeReplaceAll },
         .{ "search", string_proto_mod.nativeSearch },
     };
+    const str_method_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (fns) |pair| {
-        const fn_val = try val_mod.makeNativeFunction(arena, pair[1]);
-        try proto.set(pair[0], fn_val);
+        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0);
+        _ = try proto.defineOwnData(pair[0], fn_val, str_method_attr);
     }
     // String.prototype is itself a String object with [[StringData]] = "".
     try proto.set("[[PrimitiveValue]]", try val_mod.makeString(arena, ""));
-    try proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeStringValueOf));
-    try proto.set("toString", try val_mod.makeNativeFunction(arena, nativeStringValueOf));
+    _ = try proto.defineOwnData("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeStringValueOf, "valueOf", 0), str_method_attr);
+    _ = try proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeStringValueOf, "toString", 0), str_method_attr);
 }
 
 fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
@@ -817,9 +927,10 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "at", array_proto_mod.nativeAt },
         .{ "sort", array_proto_mod.nativeSort },
     };
+    const method_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (fns) |pair| {
-        const fn_val = try val_mod.makeNativeFunction(arena, pair[1]);
-        try proto.set(pair[0], fn_val);
+        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0);
+        _ = try proto.defineOwnData(pair[0], fn_val, method_attr);
     }
 }
 
@@ -960,6 +1071,16 @@ pub const Realm = struct {
         const reference_error_ctor_val = try makeErrorCtor(arena, nativeReferenceErrorCtor, reference_error_proto);
         const aggregate_error_ctor_val = try makeErrorCtor(arena, nativeAggregateErrorCtor, aggregate_error_proto);
 
+        // Spec: ErrorPrototype.constructor = ErrorConstructor (non-enumerable, writable, configurable).
+        // Required for `thrown.constructor === TypeError` identity checks in assert.throws.
+        const ctor_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+        _ = try error_proto.defineOwnData("constructor", error_ctor_val, ctor_attr);
+        _ = try type_error_proto.defineOwnData("constructor", type_error_ctor_val, ctor_attr);
+        _ = try syntax_error_proto.defineOwnData("constructor", syntax_error_ctor_val, ctor_attr);
+        _ = try range_error_proto.defineOwnData("constructor", range_error_ctor_val, ctor_attr);
+        _ = try reference_error_proto.defineOwnData("constructor", reference_error_ctor_val, ctor_attr);
+        _ = try aggregate_error_proto.defineOwnData("constructor", aggregate_error_ctor_val, ctor_attr);
+
         try env.define("Error", error_ctor_val);
         try env.define("TypeError", type_error_ctor_val);
         try env.define("SyntaxError", syntax_error_ctor_val);
@@ -1018,21 +1139,25 @@ pub const Realm = struct {
                 try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols));
             }
         }
-        // hasOwnProperty on Object.prototype
-        const hop_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeHasOwnProperty);
-        try object_proto.set("hasOwnProperty", hop_fn);
-        try object_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeObjectProtoToString));
-        try object_proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeObjectProtoValueOf));
+        // hasOwnProperty on Object.prototype (non-enumerable, writable, configurable)
+        const meth_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+        _ = try object_proto.defineOwnData("hasOwnProperty",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeHasOwnProperty, "hasOwnProperty", 1), meth_attr);
+        _ = try object_proto.defineOwnData("toString",
+            try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoToString, "toString", 0), meth_attr);
+        _ = try object_proto.defineOwnData("valueOf",
+            try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoValueOf, "valueOf", 0), meth_attr);
 
         // ---- Phase 4d: Function.prototype (call, apply, bind) ----
         const function_proto = try JsObject.create(arena, object_proto);
-        const fn_call_fn = try val_mod.makeNativeFunction(arena, function_proto_mod.nativeFunctionCall);
-        const fn_apply_fn = try val_mod.makeNativeFunction(arena, function_proto_mod.nativeFunctionApply);
-        const fn_bind_fn = try val_mod.makeNativeFunction(arena, function_proto_mod.nativeFunctionBind);
-        try function_proto.set("call", fn_call_fn);
-        try function_proto.set("apply", fn_apply_fn);
-        try function_proto.set("bind", fn_bind_fn);
-        try function_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeFunctionToString));
+        _ = try function_proto.defineOwnData("call",
+            try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionCall, "call", 1), meth_attr);
+        _ = try function_proto.defineOwnData("apply",
+            try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionApply, "apply", 2), meth_attr);
+        _ = try function_proto.defineOwnData("bind",
+            try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionBind, "bind", 1), meth_attr);
+        _ = try function_proto.defineOwnData("toString",
+            try val_mod.makeNativeFunctionNamed(arena, nativeFunctionToString, "toString", 0), meth_attr);
         active_function_proto = function_proto;
 
         // R1: shared registration context for self-registering builtins (each
@@ -1082,7 +1207,9 @@ pub const Realm = struct {
         const array_ctor_obj = try JsObject.create(arena, null);
         try array_ctor_obj.set("prototype", try val_mod.makeObject(arena, array_proto));
         try array_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeArrayCtor));
-        try array_ctor_obj.set("isArray", try val_mod.makeNativeFunction(arena, nativeArrayIsArray));
+        try array_ctor_obj.set("isArray", try val_mod.makeNativeFunctionNamed(arena, nativeArrayIsArray, "isArray", 1));
+        try array_ctor_obj.set("from", try val_mod.makeNativeFunctionNamed(arena, nativeArrayFrom, "from", 1));
+        try array_ctor_obj.set("of", try val_mod.makeNativeFunctionNamed(arena, nativeArrayOf, "of", 0));
         try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
 
         const string_ctor_obj = try JsObject.create(arena, null);
@@ -1176,6 +1303,12 @@ pub const Realm = struct {
                 try dp.setSym(symv, try val_mod.makeNativeFunction(arena, date_mod.nativeDateToPrimitive));
             }
         }
+        // Capture Symbol.toStringTag and Symbol.species.
+        active_sym_to_string_tag = symbol_ctor.getOwn("toStringTag");
+        active_sym_species = symbol_ctor.getOwn("species");
+        // Wire @@toStringTag + @@species onto TypedArray/ArrayBuffer/DataView protos+ctors now
+        // that the well-known symbols exist (register() ran before Symbol init).
+        try typed_array_mod.registerSymbols(arena);
 
         // ---- ES2015 Reflect ----
         try reflect_mod.register(&reg_ctx);
@@ -1293,20 +1426,24 @@ pub const Realm = struct {
         // Reallocate intrinsics on the heap so they have proper GcHeaders and
         // will be visited during mark. Register them as roots so they survive collect.
         const hp_proto = try heap.allocateObject(null);
-        // Copy properties from arena object to heap object.
+        // Copy properties from arena object to heap object, preserving attrs.
         for (self.object_prototype.ownKeys()) |k| {
-            try hp_proto.set(k, self.object_prototype.getOwn(k).?);
+            const v = self.object_prototype.getOwn(k).?;
+            const a = self.object_prototype.ownAttr(k) orelse obj_mod.PropAttr{};
+            _ = try hp_proto.defineOwnData(k, v, a);
         }
         for (self.object_prototype.sym_props.items) |sp| {
-            try hp_proto.setSym(sp.key, sp.value);
+            try hp_proto.setSymAttr(sp.key, sp.value, sp.attr);
         }
 
         const hp_array_proto = try heap.allocateObject(hp_proto);
         for (self.array_prototype.ownKeys()) |k| {
-            try hp_array_proto.set(k, self.array_prototype.getOwn(k).?);
+            const v = self.array_prototype.getOwn(k).?;
+            const a = self.array_prototype.ownAttr(k) orelse obj_mod.PropAttr{};
+            _ = try hp_array_proto.defineOwnData(k, v, a);
         }
         for (self.array_prototype.sym_props.items) |sp| {
-            try hp_array_proto.setSym(sp.key, sp.value);
+            try hp_array_proto.setSymAttr(sp.key, sp.value, sp.attr);
         }
 
         self.object_prototype = hp_proto;
@@ -1367,6 +1504,11 @@ pub const Realm = struct {
         active_promise_proto = null;
         active_symbol_proto = null;
         active_sym_iterator = null;
+        active_sym_to_primitive = null;
+        active_sym_to_string_tag = null;
+        active_sym_species = null;
+        active_sym_proxy_target = null;
+        active_sym_proxy_handler = null;
         typed_array_mod.active_arraybuffer_proto = null;
         typed_array_mod.active_dataview_proto = null;
         typed_array_mod.active_typedarray_proto = null;
