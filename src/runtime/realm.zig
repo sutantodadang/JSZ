@@ -54,6 +54,12 @@ pub const Context = struct {
     /// (the value of the last expression). Sets pending_exception + returns
     /// error.JsException on a parse error or an uncaught throw.
     eval_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8) anyerror!Value,
+    /// Read a property by string key, firing accessor getters / Proxy traps and
+    /// walking the prototype chain (full [[Get]]). Propagates JS throws.
+    get_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!Value,
+    /// Construct `ctor` with an explicit NewTarget (supplies `[[Prototype]]` via
+    /// GetPrototypeFromConstructor). Used by Reflect.construct.
+    construct_nt_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, ctor_val: Value, args: []const Value, new_target: Value) anyerror!Value,
 
     pub fn invokeJs(self: *Context, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         return self.invoke_fn(self.ptr, arena, this_val, fn_val, args);
@@ -65,6 +71,14 @@ pub const Context = struct {
 
     pub fn evalSource(self: *Context, arena: std.mem.Allocator, source: []const u8) anyerror!Value {
         return self.eval_fn(self.ptr, arena, source);
+    }
+
+    pub fn getProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!Value {
+        return self.get_fn(self.ptr, arena, obj_val, key);
+    }
+
+    pub fn constructNewTarget(self: *Context, arena: std.mem.Allocator, ctor_val: Value, args: []const Value, new_target: Value) anyerror!Value {
+        return self.construct_nt_fn(self.ptr, arena, ctor_val, args, new_target);
     }
 };
 

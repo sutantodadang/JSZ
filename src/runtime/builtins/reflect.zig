@@ -495,5 +495,7 @@ pub fn nativeReflectConstruct(arena: std.mem.Allocator, _: Value, args: []const 
         realm_mod.pending_exception = try val_mod.makeString(arena, "no active context");
         return error.JsException;
     };
-    return ctx.construct(arena, target, arg_list);
+    // Optional 3rd arg newTarget supplies [[Prototype]] via GetPrototypeFromConstructor.
+    const new_target: Value = if (args.len >= 3 and args[2].bits != 0) args[2] else target;
+    return ctx.constructNewTarget(arena, target, arg_list, new_target);
 }

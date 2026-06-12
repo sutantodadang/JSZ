@@ -298,6 +298,22 @@ pub const BcVm = struct {
     /// failure, setting realm pending_exception). Used by Reflect.construct and
     /// Proxy. Mirrors doConstruct's per-callee logic.
     pub fn constructFromArgs(self: *BcVm, ctor: Value, args: []const Value) anyerror!Value {
+        return self.constructImpl(ctor, args, ctor);
+    }
+
+    /// GetPrototypeFromConstructor(newTarget, default): `? Get(newTarget,"prototype")`
+    /// (fires accessor getters / proxy traps, abrupt throws propagate); falls back
+    /// to `default` when the result is not an object.
+    fn protoFromNewTarget(self: *BcVm, new_target: Value, default_proto: ?*JsObject) anyerror!?*JsObject {
+        if (new_target.bits == 0) return default_proto;
+        const pv = try self.getProp(new_target, "prototype");
+        if (pv.bits != 0 and pv.unbox() == .object) return pv.toPtr().object;
+        return default_proto;
+    }
+
+    /// Construct with an explicit NewTarget (Reflect.construct / subclassing).
+    /// `new_target` supplies `[[Prototype]]` via GetPrototypeFromConstructor.
+    pub fn constructImpl(self: *BcVm, ctor: Value, args: []const Value, new_target: Value) anyerror!Value {
         const realm_m = @import("../runtime/realm.zig");
         if (ctor.bits == 0) {
             realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
@@ -305,11 +321,7 @@ pub const BcVm = struct {
         }
         switch (ctor.unbox()) {
             .bc_function => {
-                const proto_v = try self.getProp(ctor, "prototype");
-                const proto: ?*JsObject = if (proto_v.bits != 0 and proto_v.unbox() == .object)
-                    proto_v.toPtr().object
-                else
-                    self.realm.object_prototype;
+                const proto = try self.protoFromNewTarget(new_target, self.realm.object_prototype);
                 const new_obj = if (self.heap) |heap|
                     try JsObject.createOnHeap(heap, proto)
                 else
@@ -319,10 +331,11 @@ pub const BcVm = struct {
                 return if (result.bits != 0 and result.unbox() == .object) result else this_val;
             },
             .native_function => |fn_ptr| {
+                const proto = try self.protoFromNewTarget(new_target, self.realm.object_prototype);
                 const new_obj = if (self.heap) |heap|
-                    try JsObject.createOnHeap(heap, self.realm.object_prototype)
+                    try JsObject.createOnHeap(heap, proto)
                 else
-                    try JsObject.create(self.arena, self.realm.object_prototype);
+                    try JsObject.create(self.arena, proto);
                 const this_val = try val_mod.makeObject(self.arena, new_obj);
                 realm_m.active_constructing = true;
                 const result = fn_ptr.invoke(self.arena, this_val, args) catch |e| {
@@ -336,10 +349,13 @@ pub const BcVm = struct {
                 if (o.internal_kind == .proxy) return try self.proxyConstruct(o, args, ctor);
                 if (o.get("__call__")) |cv| {
                     if (cv.bits != 0 and cv.unbox() == .native_function) {
-                        var proto: ?*JsObject = self.realm.object_prototype;
+                        // Default proto = ctor's own .prototype (the intrinsic per-kind
+                        // prototype); overridden by NewTarget.prototype when present.
+                        var default_proto: ?*JsObject = self.realm.object_prototype;
                         if (o.get("prototype")) |pv| {
-                            if (pv.bits != 0 and pv.unbox() == .object) proto = pv.toPtr().object;
+                            if (pv.bits != 0 and pv.unbox() == .object) default_proto = pv.toPtr().object;
                         }
+                        const proto = try self.protoFromNewTarget(new_target, default_proto);
                         const new_obj = if (self.heap) |heap|
                             try JsObject.createOnHeap(heap, proto)
                         else
@@ -368,6 +384,21 @@ pub const BcVm = struct {
         _ = arena;
         const self: *BcVm = @ptrCast(@alignCast(ptr));
         return self.constructFromArgs(ctor_val, args);
+    }
+
+    /// Context bridge: full [[Get]] of a string-keyed property (fires accessors /
+    /// Proxy traps, walks the prototype chain). Used by native builtins that must
+    /// observe getters (e.g. %TypedArray%.prototype.set / from).
+    fn bcGetProp(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!Value {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        return self.getProp(obj_val, key);
+    }
+
+    fn bcConstructNt(ptr: *anyopaque, arena: std.mem.Allocator, ctor_val: Value, args: []const Value, new_target: Value) anyerror!Value {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        return self.constructImpl(ctor_val, args, new_target);
     }
 
     /// Phase 13: global `eval(source)` — compile + run `source` against the
@@ -416,6 +447,8 @@ pub const BcVm = struct {
             .invoke_fn = bcInvokeJs,
             .construct_fn = bcConstruct,
             .eval_fn = bcEval,
+            .get_fn = bcGetProp,
+            .construct_nt_fn = bcConstructNt,
         };
         realm_mod.active_context = &self.context;
     }
@@ -883,7 +916,14 @@ pub const BcVm = struct {
         while (cur) |o| {
             if (depth >= 64) break;
             depth += 1;
-            if (o.getOwnSym(sym_key)) |v| return v;
+            if (o.getOwnSymEntry(sym_key)) |sp| {
+                if (sp.attr.is_accessor) {
+                    const getter = accessorMember(sp.value, "get");
+                    if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                    return try self.callAccessor(getter, obj_val, &[_]Value{});
+                }
+                return sp.value;
+            }
             cur = o.proto;
         }
         return val_mod.makeUndefined(self.arena);
@@ -1126,7 +1166,7 @@ pub const BcVm = struct {
                 if (obj.internal_kind == .typed_array) {
                     if (typed_array.canonicalIndex(key)) |i| {
                         const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-                        if (td.ab.detached or i >= td.length) return val_mod.makeUndefined(self.arena);
+                        if (i >= typed_array.taCurrentLen(td)) return val_mod.makeUndefined(self.arena);
                         return typed_array.taLoad(self.arena, td, i);
                     }
                 }
@@ -1286,17 +1326,10 @@ pub const BcVm = struct {
                 if (obj.internal_kind == .typed_array) {
                     if (typed_array.canonicalIndex(key)) |i| {
                         const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-                        if (!td.ab.detached and i < td.length) {
-                            if (td.kind.isBigInt()) {
-                                typed_array.taStoreBig(td, i, value);
-                            } else {
-                                const n = self.toNumberCoerced(value) catch |e| {
-                                    if (e != error.JsException) return e;
-                                    return;
-                                };
-                                typed_array.taStoreNumber(td, i, n);
-                            }
-                        }
+                        // IntegerIndexedElementSet: ToNumber/ToBigInt always runs
+                        // (valueOf side effects + abrupt throws propagate); store only
+                        // when the index is still valid.
+                        try typed_array.setElementThrowing(self.arena, td, @floatFromInt(i), value);
                         return;
                     }
                 }

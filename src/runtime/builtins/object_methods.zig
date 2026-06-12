@@ -427,8 +427,14 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
         const sym_entry = obj.getOwnSymEntry(sym_val) orelse return val_mod.makeUndefined(arena);
         const obj_proto2: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
         const desc2 = try JsObject.create(arena, obj_proto2);
-        try desc2.set("value", sym_entry.value);
-        try desc2.set("writable", try val_mod.makeBool(arena, sym_entry.attr.writable));
+        if (sym_entry.attr.is_accessor and sym_entry.value.bits != 0 and sym_entry.value.unbox() == .object) {
+            const hobj = sym_entry.value.toPtr().object;
+            try desc2.set("get", hobj.getOwn("get") orelse try val_mod.makeUndefined(arena));
+            try desc2.set("set", hobj.getOwn("set") orelse try val_mod.makeUndefined(arena));
+        } else {
+            try desc2.set("value", sym_entry.value);
+            try desc2.set("writable", try val_mod.makeBool(arena, sym_entry.attr.writable));
+        }
         try desc2.set("enumerable", try val_mod.makeBool(arena, sym_entry.attr.enumerable));
         try desc2.set("configurable", try val_mod.makeBool(arena, sym_entry.attr.configurable));
         return val_mod.makeObject(arena, desc2);
@@ -487,14 +493,9 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
                 if (desc2.hasOwn("writable") and !descTruthy(desc2.getOwn("writable")))
                     return throwTypeError(arena, "TypedArray: cannot define non-writable integer-indexed property");
                 if (desc2.hasOwn("value")) {
-                    const i: usize = @intFromFloat(idx_f);
                     const val2 = desc2.getOwn("value") orelse Value{};
-                    if (td.kind.isBigInt()) {
-                        ta_mod.taStoreBig(td, i, val2);
-                    } else {
-                        const n = strToNumCoerce(val2);
-                        ta_mod.taStoreNumber(td, i, n);
-                    }
+                    // ToNumber/ToBigInt runs user valueOf (throws propagate).
+                    try ta_mod.setElementThrowing(arena, td, idx_f, val2);
                 }
             }
             return args[0];
@@ -624,7 +625,9 @@ pub fn nativeObjectGetOwnPropertySymbols(arena: std.mem.Allocator, _: Value, arg
     const realm_mod = @import("../realm.zig");
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
-    if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, arr);
+    // ToObject(O): undefined/null throw TypeError; other primitives box → no symbols → [].
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
     if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
     const obj = args[0].toPtr().object;
     var i: u32 = 0;
