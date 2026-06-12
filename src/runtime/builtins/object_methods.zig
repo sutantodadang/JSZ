@@ -96,9 +96,8 @@ pub fn nativeObjectEntries(arena: std.mem.Allocator, _: Value, args: []const Val
     const arr = try JsObject.createArray(arena, arr_proto);
 
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, arr);
-    const inner = args[0].toPtr();
-    if (inner.* != .object) return val_mod.makeObject(arena, arr);
-    const obj = inner.object;
+    if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
+    const obj = args[0].toPtr().object;
 
     var i: u32 = 0;
     for (obj.ownKeys()) |k| {
@@ -626,9 +625,8 @@ pub fn nativeObjectGetOwnPropertySymbols(arena: std.mem.Allocator, _: Value, arg
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, arr);
-    const inner = args[0].toPtr();
-    if (inner.* != .object) return val_mod.makeObject(arena, arr);
-    const obj = inner.object;
+    if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
+    const obj = args[0].toPtr().object;
     var i: u32 = 0;
     for (obj.symKeys()) |sp| {
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});

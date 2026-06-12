@@ -21,6 +21,8 @@ const PropAttr = obj_mod.PropAttr;
 const realm_mod = @import("../realm.zig");
 const function_proto = @import("function_proto.zig");
 const intrinsics = @import("intrinsics.zig");
+const coercion = @import("coercion.zig");
+const coll = @import("es2015_collections.zig");
 
 /// R1: install ArrayBuffer / %TypedArray% / per-kind ctors / DataView and bind globals.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -316,6 +318,80 @@ fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     try obj.set("name", try val_mod.makeString(arena, "RangeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
     return error.JsException;
+}
+
+fn throwSyntaxError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    const obj = try newObject(arena, realm_mod.error_proto_SyntaxError);
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "SyntaxError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
+}
+
+// ----------------------------------------------- spec-faithful coercions ---
+// Throwing variants of ToNumber/ToIndex/ToBigInt that run user `valueOf`/
+// `@@toPrimitive` via the VM (coercion.toPrimitive) and PROPAGATE throws.
+// Symbol/BigInt → TypeError, negative/out-of-range index → RangeError.
+
+/// ToNumber that throws on Symbol/BigInt and runs object coercion hooks.
+fn toNumberThrowing(arena: std.mem.Allocator, v: Value) anyerror!f64 {
+    if (v.bits == 0) return std.math.nan(f64); // undefined
+    switch (v.unbox()) {
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+        .bigint => return throwTypeError(arena, "Cannot convert a BigInt to a number"),
+        .object => {
+            const prim = (try coercion.toPrimitive(arena, v, .number)) orelse v;
+            // Re-dispatch on the primitive (a Symbol/BigInt prim still throws).
+            if (prim.bits == 0) return std.math.nan(f64);
+            switch (prim.unbox()) {
+                .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+                .bigint => return throwTypeError(arena, "Cannot convert a BigInt to a number"),
+                .object => return std.math.nan(f64), // toPrimitive guarantees non-object; defensive
+                else => return toNum(prim),
+            }
+        },
+        else => return toNum(v),
+    }
+}
+
+/// ToIndex: ToIntegerOrInfinity then bound to [0, 2^53-1], throwing RangeError.
+fn toIndexThrowing(arena: std.mem.Allocator, v: Value) anyerror!usize {
+    if (v.bits == 0 or v.unbox() == .undefined_) return 0;
+    const n = try toNumberThrowing(arena, v);
+    // ToIntegerOrInfinity: NaN/±0 → 0, else truncate toward zero.
+    const i: f64 = if (std.math.isNan(n)) 0 else @trunc(n);
+    if (i < 0) return throwRangeError(arena, "Invalid typed array length or offset");
+    // Bound-check in f64 BEFORE @intFromFloat to avoid a conversion panic.
+    if (!std.math.isFinite(i) or i > 9007199254740991.0)
+        return throwRangeError(arena, "Invalid typed array length or offset");
+    return @intFromFloat(i);
+}
+
+/// ToBigInt: throws TypeError for Number/Symbol/undefined/null, SyntaxError for
+/// unparseable strings. Returns a `.bigint` Value.
+fn toBigIntThrowing(arena: std.mem.Allocator, v: Value) anyerror!Value {
+    if (v.bits == 0) return throwTypeError(arena, "Cannot convert undefined to a BigInt");
+    switch (v.unbox()) {
+        .bigint => return v,
+        .boolean => |b| return val_mod.makeBigIntFromI64(arena, if (b) 1 else 0),
+        .string => |s| {
+            const t = std.mem.trim(u8, s, " \t\r\n");
+            const lit = if (t.len == 0) "0" else t;
+            return val_mod.makeBigIntFromLiteral(arena, lit) catch
+                return throwSyntaxError(arena, "Cannot convert string to a BigInt");
+        },
+        .number => return throwTypeError(arena, "Cannot convert a Number to a BigInt"),
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a BigInt"),
+        .undefined_ => return throwTypeError(arena, "Cannot convert undefined to a BigInt"),
+        .null_ => return throwTypeError(arena, "Cannot convert null to a BigInt"),
+        .object => {
+            const prim = (try coercion.toPrimitive(arena, v, .number)) orelse
+                return throwTypeError(arena, "Cannot convert object to a BigInt");
+            // prim is guaranteed primitive; recurse (object case won't re-hit).
+            return toBigIntThrowing(arena, prim);
+        },
+        else => return throwTypeError(arena, "Cannot convert value to a BigInt"),
+    }
 }
 
 /// A canonical non-negative array index ("0","1",...,"4294967294"): all digits,
@@ -655,6 +731,58 @@ pub fn nativeTaAbstractCtor(arena: std.mem.Allocator, _: Value, _: []const Value
     return throwTypeError(arena, "Abstract class TypedArray not directly constructable");
 }
 
+/// GetMethod(source, @@iterator) — tri-state for the ctor/from object-arg path.
+/// `.iterate`  → source has a usable iterator (real @@iterator sym, the internal
+///               "@@iterator" string key used by Set/Map, or a `next` method on a
+///               raw iterator/generator); use IterableToList.
+/// `.array_like` → no @@iterator at all; fall back to ToLength + indexed reads.
+/// error.JsException → @@iterator present but NOT callable (spec TypeError).
+const IterDecision = enum { iterate, array_like };
+fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterDecision {
+    // 1. Well-known Symbol.iterator (arrays + user `{[Symbol.iterator]:...}`).
+    if (realm_mod.active_sym_iterator) |sym| {
+        if (src.getSym(sym)) |m| {
+            // GetMethod: undefined/null → treat as absent; anything else must be callable.
+            if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+                if (!function_proto_isCallable(m))
+                    return throwTypeError(arena, "Symbol.iterator is not a function");
+                return .iterate;
+            }
+        }
+    }
+    // 2. Internal string @@iterator (Set/Map register their iterator here).
+    if (src.get("@@iterator")) |m| {
+        if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+            if (!function_proto_isCallable(m))
+                return throwTypeError(arena, "Symbol.iterator is not a function");
+            return .iterate;
+        }
+    }
+    // 3. Raw iterator / generator: exposes a callable next().
+    if (src.get("next")) |nx| {
+        if (function_proto_isCallable(nx)) return .iterate;
+    }
+    return .array_like;
+}
+
+/// IterableToList(source): drive the iterator protocol via the shared collection
+/// helpers, collecting each yielded `value` until done. Propagates any throw from
+/// @@iterator / next / the value getter.
+fn iterableToList(arena: std.mem.Allocator, source: Value) anyerror!std.ArrayList(Value) {
+    var list: std.ArrayList(Value) = .empty;
+    const iter = try coll.nativeGetIterator(arena, Value{}, &[_]Value{source});
+    while (true) {
+        const step = try coll.nativeIterStep(arena, Value{}, &[_]Value{iter});
+        if (step.bits == 0 or step.unbox() != .object) break;
+        const res = step.toPtr().object;
+        const done = res.get("done") orelse Value{};
+        if (toBool(done)) break;
+        const v = res.get("value") orelse Value{};
+        try list.append(arena, v);
+    }
+    return list;
+}
+
 fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         return throwTypeError(arena, "Constructor TypedArray requires 'new'");
@@ -662,36 +790,33 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
     const this_obj = this_val.toPtr().object;
     const esize = kind.elemSize();
 
-    // Form 1: new TA(length)  (no args → length 0)
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() == .number or args[0].unbox() == .undefined_) {
-        const length: usize = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .number)
-            toIndex(args[0].unbox().number)
-        else
-            0;
-        const res = try makeArrayBuffer(arena, length * esize);
-        _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length);
-        return val_mod.makeObject(arena, this_obj);
-    }
-
-    // arg0 is an object.
-    const a0 = args[0];
-    if (a0.unbox() == .object) {
+    // arg0 is an object → Forms 2/3/4. Everything else → Form 1 (length).
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
+        const a0 = args[0];
         const src = a0.toPtr().object;
 
         // Form 2: new TA(buffer, byteOffset?, length?)  → view onto the buffer.
         if (src.internal_kind == .array_buffer) {
             const ab: *ArrayBufferData = @ptrCast(@alignCast(src.internal_slot.?));
-            const byte_offset: usize = if (args.len > 1) toIndex(toNum(args[1])) else 0;
+            // 1. byteOffset = ToIndex(args[1]) — side-effecting valueOf runs first.
+            const byte_offset = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
+            // 2. byteOffset % elementSize != 0 → RangeError.
             if (byte_offset % esize != 0) return throwRangeError(arena, "start offset is not aligned");
-            if (byte_offset > ab.bytes.len) return throwRangeError(arena, "byteOffset out of bounds");
+            // 3. Detached check (after coercing byteOffset).
+            if (ab.detached) return throwTypeError(arena, "Cannot construct a typed array from a detached ArrayBuffer");
             var length: usize = undefined;
             if (args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_) {
-                length = toIndex(toNum(args[2]));
+                // length = ToIndex(args[2]) — another side-effecting coercion.
+                length = try toIndexThrowing(arena, args[2]);
+                // Re-check detached: a valueOf may have detached mid-construction.
+                if (ab.detached) return throwTypeError(arena, "Cannot construct a typed array from a detached ArrayBuffer");
+                if (byte_offset > ab.bytes.len) return throwRangeError(arena, "byteOffset out of bounds");
+                if (byte_offset + length * esize > ab.bytes.len) return throwRangeError(arena, "length out of bounds");
             } else {
-                if ((ab.bytes.len - byte_offset) % esize != 0) return throwRangeError(arena, "buffer length not aligned");
+                if (ab.bytes.len % esize != 0) return throwRangeError(arena, "buffer length not aligned");
+                if (byte_offset > ab.bytes.len) return throwRangeError(arena, "byteOffset out of bounds");
                 length = (ab.bytes.len - byte_offset) / esize;
             }
-            if (byte_offset + length * esize > ab.bytes.len) return throwRangeError(arena, "length out of bounds");
             _ = try finishTypedArray(arena, this_obj, kind, src, ab, byte_offset, length);
             return val_mod.makeObject(arena, this_obj);
         }
@@ -699,10 +824,12 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
         // Form 3: new TA(typedArray)  → copy elements into a fresh buffer.
         if (src.internal_kind == .typed_array) {
             const std_td: *TypedArrayData = @ptrCast(@alignCast(src.internal_slot.?));
+            // Cross number↔bigint construction is a TypeError.
+            if (std_td.kind.isBigInt() != kind.isBigInt())
+                return throwTypeError(arena, "Cannot mix BigInt and non-BigInt typed arrays");
             const length = std_td.length;
             const res = try makeArrayBuffer(arena, length * esize);
-            const newtd_v = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length);
-            _ = newtd_v;
+            _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length);
             const dst = getTd(val_mod.makeObject(arena, this_obj) catch unreachable) orelse unreachable;
             var i: usize = 0;
             while (i < length) : (i += 1) {
@@ -712,7 +839,30 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
             return val_mod.makeObject(arena, this_obj);
         }
 
-        // Form 4: new TA(arrayLike)  → read .length and index props.
+        // Form 4: new TA(iterable | arrayLike).
+        // Per spec, consult GetMethod(source, @@iterator) first: if a usable
+        // iterator exists → IterableToList; otherwise fall back to array-like.
+        if ((try detectIterable(arena, src)) == .iterate) {
+            const list = try iterableToList(arena, args[0]);
+            const length = list.items.len;
+            const res = try makeArrayBuffer(arena, length * esize);
+            _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length);
+            const dst = getTd(val_mod.makeObject(arena, this_obj) catch unreachable) orelse unreachable;
+            var i: usize = 0;
+            while (i < length) : (i += 1) {
+                const ev = list.items[i];
+                if (kind.isBigInt()) {
+                    const bv = try toBigIntThrowing(arena, ev);
+                    taStoreBig(dst, i, bv);
+                } else {
+                    const nv = try toNumberThrowing(arena, ev);
+                    taStoreNumber(dst, i, nv);
+                }
+            }
+            return val_mod.makeObject(arena, this_obj);
+        }
+
+        // Array-like path: ToLength(source.length) + indexed reads.
         const length = arrayLikeLen(src);
         const res = try makeArrayBuffer(arena, length * esize);
         _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length);
@@ -721,12 +871,24 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
         while (i < length) : (i += 1) {
             const key = try std.fmt.allocPrint(arena, "{d}", .{i});
             const ev = src.get(key) orelse Value{};
-            if (kind.isBigInt()) taStoreBig(dst, i, ev) else taStoreNumber(dst, i, toNum(ev));
+            // Throwing element coercion: runs user valueOf, propagates throws.
+            if (kind.isBigInt()) {
+                const bv = try toBigIntThrowing(arena, ev);
+                taStoreBig(dst, i, bv);
+            } else {
+                const nv = try toNumberThrowing(arena, ev);
+                taStoreNumber(dst, i, nv);
+            }
         }
         return val_mod.makeObject(arena, this_obj);
     }
 
-    return throwTypeError(arena, "invalid TypedArray constructor argument");
+    // Form 1: new TA(length)  (no args → length 0). Non-object arg0 coerces via
+    // ToIndex, which throws on negative / Symbol / out-of-range / throwing-valueOf.
+    const length = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
+    const res = try makeArrayBuffer(arena, length * esize);
+    _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length);
+    return val_mod.makeObject(arena, this_obj);
 }
 
 /// Produce a distinct native ctor fn per kind (comptime specialization).
@@ -891,16 +1053,24 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
 pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
+    // ToIndex(offset) runs first and throws on negative / Symbol / throwing-valueOf.
+    const offset = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
     if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeUndefined(arena);
-    const offset: usize = if (args.len > 1) toIndex(toNum(args[1])) else 0;
     const src = args[0].toPtr().object;
     if (src.internal_kind == .typed_array) {
         const src_td: *TypedArrayData = @ptrCast(@alignCast(src.internal_slot.?));
+        // Cross number↔bigint set is a TypeError.
+        if (src_td.kind.isBigInt() != td.kind.isBigInt())
+            return throwTypeError(arena, "Cannot mix BigInt and non-BigInt typed arrays");
         if (offset + src_td.length > td.length) return throwRangeError(arena, "offset out of bounds");
+        // Read all source elements into a temp buffer first (overlap-safe when
+        // source and target share a backing ArrayBuffer).
+        const tmp = try arena.alloc(Value, src_td.length);
         var i: usize = 0;
+        while (i < src_td.length) : (i += 1) tmp[i] = try taLoad(arena, src_td, i);
+        i = 0;
         while (i < src_td.length) : (i += 1) {
-            const ev = try taLoad(arena, src_td, i);
-            if (td.kind.isBigInt()) taStoreBig(td, offset + i, ev) else taStoreNumber(td, offset + i, toNum(ev));
+            if (td.kind.isBigInt()) taStoreBig(td, offset + i, tmp[i]) else taStoreNumber(td, offset + i, toNum(tmp[i]));
         }
     } else {
         const len = arrayLikeLen(src);
@@ -909,7 +1079,14 @@ pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Valu
         while (i < len) : (i += 1) {
             const key = try std.fmt.allocPrint(arena, "{d}", .{i});
             const ev = src.get(key) orelse Value{};
-            if (td.kind.isBigInt()) taStoreBig(td, offset + i, ev) else taStoreNumber(td, offset + i, toNum(ev));
+            // Throwing element coercion: user valueOf runs and propagates.
+            if (td.kind.isBigInt()) {
+                const bv = try toBigIntThrowing(arena, ev);
+                taStoreBig(td, offset + i, bv);
+            } else {
+                const nv = try toNumberThrowing(arena, ev);
+                taStoreNumber(td, offset + i, nv);
+            }
         }
     }
     return val_mod.makeUndefined(arena);
@@ -1136,35 +1313,56 @@ pub fn nativeTaOf(arena: std.mem.Allocator, this_val: Value, args: []const Value
 /// `%TypedArray%.from` — kind from the `this` constructor.
 pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const kind = kindFromCtor(this_val) orelse return throwTypeError(arena, "TypedArray.from requires a TypedArray constructor as receiver");
+    // mapfn, if supplied (non-undefined), MUST be callable — else TypeError,
+    // and this check happens before any iteration/array-like reads.
+    const map_present = args.len > 1 and !(args[1].bits == 0 or args[1].unbox() == .undefined_);
+    if (map_present and !function_proto_isCallable(args[1]))
+        return throwTypeError(arena, "TypedArray.from: mapfn is not a function");
+    const this_arg: Value = if (args.len > 2) args[2] else Value{};
+
     if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) {
         const a = try allocTA(arena, kind, 0);
         return val_mod.makeObject(arena, a.obj);
     }
     const src = args[0].toPtr().object;
-    const has_cb = args.len > 1 and args[1].bits != 0 and function_proto_isCallable(args[1]);
-    const length: usize = blk: {
-        if (src.internal_kind == .typed_array) {
-            const std_td: *TypedArrayData = @ptrCast(@alignCast(src.internal_slot.?));
-            break :blk std_td.length;
+
+    // Iterable path: IterableToList, then map+coerce+store each element.
+    if ((try detectIterable(arena, src)) == .iterate) {
+        const list = try iterableToList(arena, args[0]);
+        const length = list.items.len;
+        const a = try allocTA(arena, kind, length);
+        var i: usize = 0;
+        while (i < length) : (i += 1) {
+            var ev = list.items[i];
+            if (map_present) {
+                const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
+                ev = try function_proto.invokeCallback(arena, this_arg, args[1], &[_]Value{ ev, idx_v });
+            }
+            if (kind.isBigInt()) {
+                taStoreBig(a.td, i, try toBigIntThrowing(arena, ev));
+            } else {
+                taStoreNumber(a.td, i, try toNumberThrowing(arena, ev));
+            }
         }
-        break :blk arrayLikeLen(src);
-    };
+        return val_mod.makeObject(arena, a.obj);
+    }
+
+    // Array-like path: len = ToLength(source.length), indexed reads.
+    const length = arrayLikeLen(src);
     const a = try allocTA(arena, kind, length);
     var i: usize = 0;
     while (i < length) : (i += 1) {
-        var ev: Value = undefined;
-        if (src.internal_kind == .typed_array) {
-            const std_td: *TypedArrayData = @ptrCast(@alignCast(src.internal_slot.?));
-            ev = try taLoad(arena, std_td, i);
-        } else {
-            const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-            ev = src.get(key) orelse Value{};
-        }
-        if (has_cb) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        var ev = src.get(key) orelse Value{};
+        if (map_present) {
             const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
-            ev = try function_proto.invokeCallback(arena, Value{}, args[1], &[_]Value{ ev, idx_v });
+            ev = try function_proto.invokeCallback(arena, this_arg, args[1], &[_]Value{ ev, idx_v });
         }
-        if (kind.isBigInt()) taStoreBig(a.td, i, ev) else taStoreNumber(a.td, i, toNum(ev));
+        if (kind.isBigInt()) {
+            taStoreBig(a.td, i, try toBigIntThrowing(arena, ev));
+        } else {
+            taStoreNumber(a.td, i, try toNumberThrowing(arena, ev));
+        }
     }
     return val_mod.makeObject(arena, a.obj);
 }
