@@ -333,20 +333,14 @@ pub const BcVm = struct {
                 const result = try bcInvokeJs(self, self.arena, this_val, ctor, args);
                 return if (result.bits != 0 and result.unbox() == .object) result else this_val;
             },
-            .native_function => |fn_ptr| {
-                const proto = try self.protoFromNewTarget(new_target, self.realm.object_prototype);
-                const new_obj = if (self.heap) |heap|
-                    try JsObject.createOnHeap(heap, proto)
-                else
-                    try JsObject.create(self.arena, proto);
-                const this_val = try val_mod.makeObject(self.arena, new_obj);
-                realm_m.active_constructing = true;
-                const result = fn_ptr.invoke(self.arena, this_val, args) catch |e| {
-                    realm_m.active_constructing = false;
-                    return e;
-                };
-                realm_m.active_constructing = false;
-                return if (result.bits != 0 and result.unbox() == .object) result else this_val;
+            .native_function => {
+                // A bare native_function is a built-in *method* (Math.max,
+                // %TypedArray%.prototype.map, …): callable but NOT a constructor.
+                // Built-in constructors (Array, Number, TypedArray, …) are JsObjects
+                // carrying a `__call__` slot and are handled by the `.object` arm.
+                // Per IsConstructor, `new <method>()` must throw TypeError.
+                realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                return error.JsException;
             },
             .object => |o| {
                 if (o.internal_kind == .proxy) return try self.proxyConstruct(o, args, ctor);
@@ -718,25 +712,13 @@ pub const BcVm = struct {
                 if (err != null) return err;
                 return null;
             },
-            .native_function => |fn_ptr| {
-                var args = try self.arena.alloc(Value, nargs);
-                for (0..nargs) |i| {
-                    args[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                }
-                const proto = self.realm.object_prototype;
-                const new_obj = if (self.heap) |heap|
-                    try JsObject.createOnHeap(heap, proto)
-                else
-                    try JsObject.create(self.arena, proto);
-                const this_val = try val_mod.makeObject(self.arena, new_obj);
-                @import("../runtime/realm.zig").active_constructing = true;
-                const result = fn_ptr.invoke(self.arena, this_val, args) catch {
-                    @import("../runtime/realm.zig").active_constructing = false;
-                    return "native constructor threw";
-                };
-                @import("../runtime/realm.zig").active_constructing = false;
-                frame.registers[rdst] = if (result.bits != 0 and result.unbox() == .object) result else this_val;
-                return null;
+            .native_function => {
+                // A bare native_function is a built-in *method* (Math.max,
+                // %TypedArray%.prototype.map, …): callable but NOT a constructor.
+                // Built-in constructors are JsObjects with a `__call__` slot, handled
+                // by the `.object` arm below. `new <method>()` must throw TypeError.
+                self.last_exception_value = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                return "__js_exception__";
             },
             .object => |obj| {
                 // Phase 13: Proxy construct trap (or forward to target).

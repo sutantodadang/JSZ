@@ -453,10 +453,41 @@ pub fn nativeReflectApply(arena: std.mem.Allocator, _: Value, args: []const Valu
 
 // ---------------------------------------------------------------- Reflect.construct ---
 
+/// IsConstructor(v): true iff `v` has a [[Construct]] internal method.
+/// Bare native_function values are built-in *methods* (Math.max, etc.) and are
+/// NOT constructors. Built-in constructors are JsObjects with a `__call__` slot;
+/// user functions (bc_function) construct; bound/proxy mirror their target.
+fn isConstructorVal(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .bc_function => true,
+        .native_function => false,
+        .object => |o| o.get("__call__") != null or
+            o.internal_kind == .bound_function or
+            o.internal_kind == .proxy,
+        else => false,
+    };
+}
+
+fn throwTypeErrorReflect(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    const realm_mod = @import("../realm.zig");
+    const obj = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, realm_mod.error_proto_TypeError)
+    else
+        try JsObject.create(arena, realm_mod.error_proto_TypeError);
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
+}
+
 pub fn nativeReflectConstruct(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
     if (args.len < 1) return val_mod.makeUndefined(arena);
     const target = args[0];
+    // Reflect.construct(target, argsList[, newTarget]):
+    // 1. If IsConstructor(target) is false, throw a TypeError.
+    if (!isConstructorVal(target)) return throwTypeErrorReflect(arena, "Reflect.construct target is not a constructor");
 
     // Unpack argsList (second argument, array-like).
     var arg_list: []Value = &[_]Value{};
@@ -496,6 +527,10 @@ pub fn nativeReflectConstruct(arena: std.mem.Allocator, _: Value, args: []const 
         return error.JsException;
     };
     // Optional 3rd arg newTarget supplies [[Prototype]] via GetPrototypeFromConstructor.
-    const new_target: Value = if (args.len >= 3 and args[2].bits != 0) args[2] else target;
+    // 2. If newTarget is present and IsConstructor(newTarget) is false, throw a TypeError.
+    const new_target: Value = if (args.len >= 3 and args[2].bits != 0) blk: {
+        if (!isConstructorVal(args[2])) return throwTypeErrorReflect(arena, "Reflect.construct newTarget is not a constructor");
+        break :blk args[2];
+    } else target;
     return ctx.constructNewTarget(arena, target, arg_list, new_target);
 }

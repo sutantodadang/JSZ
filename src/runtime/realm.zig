@@ -1538,6 +1538,15 @@ pub const Realm = struct {
         for (&typed_array_mod.active_ta_ctors) |*p| p.* = null;
         active_global_env = null;
         pending_exception = Value{};
+        // Transient execution-state globals: a test/script that unwinds mid-
+        // construct or via an uncaught throw can leave these set. They outlive
+        // the realm (module-level vars) and Realm.init never clears them, so a
+        // reused process (e.g. the test262 runner's isolate-per-test loop) would
+        // inherit dirty state and cascade-fail unrelated later evals. Reset here.
+        active_constructing = false;
+        callback_depth = 0;
+        pending_new_target = Value{};
+        active_context = null;
     }
 };
 
