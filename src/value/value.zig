@@ -170,6 +170,18 @@ pub const JsValue = union(enum) {
     pub const Tag = std.meta.Tag(JsValue);
 };
 
+/// ToIntegerOrInfinity-style float → i64 with saturation: NaN → 0, truncate
+/// toward zero, and clamp ±Infinity / out-of-range to i64 min/max. Safe drop-in
+/// for `@intFromFloat(@trunc(n))` on user-controlled values (which panics on
+/// NaN/±Inf/overflow). Index-style callers bounds-check the result downstream.
+pub fn f64ToI64Sat(n: f64) i64 {
+    if (std.math.isNan(n)) return 0;
+    const t = @trunc(n);
+    if (t >= 9.2233720368547758e18) return std.math.maxInt(i64);
+    if (t <= -9.2233720368547758e18) return std.math.minInt(i64);
+    return @intFromFloat(t);
+}
+
 /// ECMAScript number → string for display (shared by VM + public API).
 pub fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
     if (std.math.isNan(n)) return "NaN";

@@ -497,6 +497,18 @@ fn vmGet(arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!Val
     return Value{};
 }
 
+/// GetPrototypeFromConstructor at the constructor's spec-precise point: read
+/// `? Get(pending_new_target,"prototype")` (fires getters, throws propagate),
+/// set `this_obj`'s prototype when it is an object, and CONSUME the pending
+/// NewTarget so the dispatcher does not re-apply it. No-op when none pending.
+fn applyNewTargetProto(arena: std.mem.Allocator, this_obj: *JsObject) anyerror!void {
+    const nt = realm_mod.pending_new_target;
+    if (nt.bits == 0) return;
+    realm_mod.pending_new_target = Value{}; // consume before the (throwing) Get
+    const pv = try vmGet(arena, nt, "prototype");
+    if (pv.bits != 0 and pv.unbox() == .object) this_obj.proto = pv.toPtr().object;
+}
+
 // ---------------------------------------------------------------- element IO ---
 
 pub fn taLoad(arena: std.mem.Allocator, td: *const TypedArrayData, i: usize) !Value {
@@ -618,6 +630,9 @@ pub fn nativeArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []
     const data = try arena.create(ArrayBufferData);
     data.* = .{ .bytes = bytes, .byte_length = len, .max_byte_length = max_bl };
     const obj = this_val.toPtr().object;
+    // GetPrototypeFromConstructor runs in AllocateArrayBuffer, after ToIndex(length)
+    // + the maxByteLength option (so a primitive-length throw precedes proto access).
+    try applyNewTargetProto(arena, obj);
     obj.internal_kind = .array_buffer;
     obj.internal_slot = data;
     return this_val;
@@ -894,6 +909,10 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
         const a0 = args[0];
         const src = a0.toPtr().object;
 
+        // GetPrototypeFromConstructor runs first for object arguments (before any
+        // byteOffset/length coercion); a throwing NewTarget.prototype getter throws here.
+        try applyNewTargetProto(arena, this_obj);
+
         // Form 2: new TA(buffer, byteOffset?, length?)  → view onto the buffer.
         if (src.internal_kind == .array_buffer) {
             const ab: *ArrayBufferData = @ptrCast(@alignCast(src.internal_slot.?));
@@ -988,8 +1007,10 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
     }
 
     // Form 1: new TA(length)  (no args → length 0). Non-object arg0 coerces via
-    // ToIndex, which throws on negative / Symbol / out-of-range / throwing-valueOf.
+    // ToIndex, which throws on negative / Symbol / out-of-range / throwing-valueOf
+    // — this runs BEFORE GetPrototypeFromConstructor for the primitive path.
     const length = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
+    try applyNewTargetProto(arena, this_obj);
     const res = try makeArrayBuffer(arena, length * esize);
     _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
     return val_mod.makeObject(arena, this_obj);
@@ -1967,9 +1988,11 @@ pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     const track_length = !has_len and ab.max_byte_length != null;
     const byte_length: usize = if (has_len) explicit_len else ab.byte_length - byte_offset;
     if (has_len and byte_offset + byte_length > ab.byte_length) return throwRangeError(arena, "Invalid DataView length");
+    const obj = this_val.toPtr().object;
+    // GetPrototypeFromConstructor runs after offset/length coercion + bounds checks.
+    try applyNewTargetProto(arena, obj);
     const dv = try arena.create(DataViewData);
     dv.* = .{ .buffer_obj = buf_obj, .ab = ab, .byte_offset = byte_offset, .byte_length = byte_length, .track_length = track_length };
-    const obj = this_val.toPtr().object;
     obj.internal_kind = .data_view;
     obj.internal_slot = dv;
     try obj.set("buffer", try val_mod.makeObject(arena, buf_obj));

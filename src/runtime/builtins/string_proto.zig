@@ -22,7 +22,7 @@ fn getThis(this_val: Value) []const u8 {
 /// Returns clamped usize in [0, len].
 fn normalizeIndex(idx: f64, len: usize) usize {
     if (std.math.isNan(idx)) return 0;
-    const i: i64 = @intFromFloat(@trunc(idx));
+    const i: i64 = val_mod.f64ToI64Sat(idx);
     if (i < 0) {
         const pos: i64 = @intCast(len);
         const r = pos + i;
@@ -41,7 +41,7 @@ pub fn nativeCharAt(arena: std.mem.Allocator, this_val: Value, args: []const Val
         }
     else
         0.0;
-    const i: usize = if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeString(arena, "") else @intFromFloat(@trunc(idx));
+    const i: usize = if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeString(arena, "") else @intCast(val_mod.f64ToI64Sat(idx));
     if (i >= s.len) return val_mod.makeString(arena, "");
     const ch = try arena.dupe(u8, s[i .. i + 1]);
     return val_mod.makeString(arena, ch);
@@ -56,7 +56,7 @@ pub fn nativeCharCodeAt(arena: std.mem.Allocator, this_val: Value, args: []const
         }
     else
         0.0;
-    const i: usize = if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeNumber(arena, std.math.nan(f64)) else @intFromFloat(@trunc(idx));
+    const i: usize = if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeNumber(arena, std.math.nan(f64)) else @intCast(val_mod.f64ToI64Sat(idx));
     if (i >= s.len) return val_mod.makeNumber(arena, std.math.nan(f64));
     return val_mod.makeNumber(arena, @floatFromInt(s[i]));
 }
@@ -74,7 +74,7 @@ pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Va
             .number => |n| blk: {
                 if (n < 0.0) break :blk 0;
                 if (std.math.isNan(n)) break :blk 0;
-                const u: usize = @intFromFloat(@trunc(n));
+                const u: usize = @intCast(val_mod.f64ToI64Sat(n));
                 break :blk if (u > s.len) s.len else u;
             },
             else => 0,
@@ -738,7 +738,7 @@ fn padImpl(arena: std.mem.Allocator, this_val: Value, args: []const Value, at_st
     const s = getThis(this_val);
     const target: usize = if (args.len > 0 and args[0].bits != 0)
         switch (args[0].unbox()) {
-            .number => |n| if (n <= 0 or std.math.isNan(n)) 0 else @intFromFloat(@trunc(n)),
+            .number => |n| if (n <= 0 or std.math.isNan(n)) 0 else @intCast(val_mod.f64ToI64Sat(n)),
             else => 0,
         }
     else

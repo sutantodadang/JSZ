@@ -39,7 +39,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
 // ============================================================= IR =============
 
-pub const MAX_CAPTURES = 10;
+pub const MAX_CAPTURES = 64;
 
 /// Char class: set of codepoints encoded as 256-bit bitmap (ASCII) + ranges list.
 pub const CharClass = struct {
@@ -300,12 +300,14 @@ const PatternParser = struct {
 
     fn parseUint(self: *PatternParser) ParseError!u32 {
         if (self.eof() or self.cur() < '0' or self.cur() > '9') return ParseError.InvalidPattern;
-        var n: u32 = 0;
+        var n: u64 = 0;
         while (!self.eof() and self.cur() >= '0' and self.cur() <= '9') {
+            // Saturate huge quantifier bounds (e.g. `a{9999999999}`) instead of overflowing.
             n = n * 10 + (self.cur() - '0');
+            if (n > std.math.maxInt(u32)) n = std.math.maxInt(u32);
             self.advance();
         }
-        return n;
+        return @intCast(n);
     }
 
     fn parseAtom(self: *PatternParser) ParseError!RegexNode {
@@ -812,6 +814,9 @@ fn matchNode(
         },
         .group => |g| {
             const cap_idx = g.idx;
+            // Groups beyond the capture-array capacity match without recording
+            // (never index out of bounds).
+            if (cap_idx >= MAX_CAPTURES) return matchNode(g.inner, input, pos, caps, flags);
             const saved_start = caps[cap_idx].start;
             const saved_end = caps[cap_idx].end;
             const inner_end = matchNode(g.inner, input, pos, caps, flags) orelse {
@@ -867,6 +872,7 @@ fn matchNode(
         .back_ref => |idx| {
             // Backreference: match captured group idx at current position.
             // If the group hasn't matched (span is INVALID_CAP), succeed with 0 consumption (ES5).
+            if (idx >= MAX_CAPTURES) return pos;
             const cap = caps[idx];
             if (cap.start == 0 and cap.end == 0) {
                 // Group hasn't matched yet — treat as empty match (ES5 §15.10.2.9).
@@ -1016,10 +1022,8 @@ pub fn makeRegExpObject(arena: std.mem.Allocator, cr: *CompiledRegex, source: []
 
 /// Extract CompiledRegex from a Value, or return null if not a RegExp.
 pub fn getCompiledRegex(v: Value) ?*CompiledRegex {
-    if (v.bits == 0) return null;
-    const inner = v.toPtr();
-    if (inner.* != .object) return null;
-    const obj = inner.object;
+    if (v.bits == 0 or v.unbox() != .object) return null;
+    const obj = v.toPtr().object;
     if (obj.internal_kind != .regexp) return null;
     return @ptrCast(@alignCast(obj.internal_slot.?));
 }
@@ -1033,7 +1037,7 @@ pub fn getLastIndex(v: Value) usize {
         if (li.bits != 0 and li.unbox() == .number) {
             const n = li.unbox().number;
             if (n < 0 or std.math.isNan(n)) return 0;
-            return @intFromFloat(@trunc(n));
+            return @intCast(val_mod.f64ToI64Sat(n));
         }
     }
     return 0;
@@ -1174,9 +1178,9 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
     const full_val = try val_mod.makeString(arena, full_match);
     try arr.set("0", full_val);
 
-    // Capture groups 1..N
+    // Capture groups 1..N (bounded by the capture-array capacity).
     var i: u32 = 1;
-    while (i <= cr.num_captures) : (i += 1) {
+    while (i <= cr.num_captures and i < MAX_CAPTURES) : (i += 1) {
         const cap = result.state.captures[i];
         const cap_val: Value = if (cap.start == 0 and cap.end == 0 and i > 0)
             try val_mod.makeUndefined(arena)

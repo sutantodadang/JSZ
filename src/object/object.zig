@@ -158,7 +158,8 @@ pub const JsObject = struct {
         }
         if (self.is_array) {
             const idx = std.fmt.parseUnsigned(u32, key, 10) catch return;
-            if (idx >= self.array_length) {
+            // "4294967295" (u32 max) is not a valid array index; `idx + 1` overflows.
+            if (idx != std.math.maxInt(u32) and idx >= self.array_length) {
                 self.array_length = idx + 1;
             }
         }
@@ -291,7 +292,9 @@ pub const JsObject = struct {
             self.attrs.items[new_slot] = attr;
             if (self.is_array) {
                 const idx = std.fmt.parseUnsigned(u32, key, 10) catch return true;
-                if (idx >= self.array_length) self.array_length = idx + 1;
+                // Valid array indices are 0..2^32-2; "4294967295" (u32 max) is a
+                // normal property, and `idx + 1` there would overflow.
+                if (idx != std.math.maxInt(u32) and idx >= self.array_length) self.array_length = idx + 1;
             }
             return true;
         }

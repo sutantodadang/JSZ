@@ -30,7 +30,7 @@ pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Val
         switch (args[2].unbox()) {
             .number => |n| blk: {
                 if (n < 0.0) break :blk 0;
-                const u: usize = @intFromFloat(@trunc(n));
+                const u: usize = @intCast(val_mod.f64ToI64Sat(n));
                 break :blk if (u > 10) 10 else u;
             },
             else => 0,
@@ -39,7 +39,9 @@ pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Val
         0;
 
     var buf = std.ArrayList(u8){};
-    try stringifyValue(arena, &buf, args[0], indent, 0);
+    // Ancestor stack for circular-reference detection (throws TypeError on a cycle).
+    var seen = std.ArrayList(*JsObject){};
+    try stringifyValue(arena, &buf, args[0], indent, 0, &seen);
     // If result is empty (e.g. function top-level), return undefined
     if (buf.items.len == 0) return val_mod.makeUndefined(arena);
     return val_mod.makeString(arena, buf.items);
@@ -51,6 +53,7 @@ fn stringifyValue(
     v: Value,
     indent: usize,
     depth: usize,
+    seen: *std.ArrayList(*JsObject),
 ) anyerror!void {
     if (v.bits == 0) {
         try buf.appendSlice(arena, "undefined");
@@ -72,15 +75,34 @@ fn stringifyValue(
             try buf.append(arena, '"');
         },
         .object => |obj| {
+            // Circular-structure guard: a value currently being stringified that
+            // re-references an ancestor → TypeError (per spec SerializeJSONProperty).
+            for (seen.items) |a| {
+                if (a == obj) return throwStringifyTypeError(arena);
+            }
+            try seen.append(arena, obj);
+            defer _ = seen.pop();
             if (obj.is_array) {
-                try stringifyArray(arena, buf, obj, indent, depth);
+                try stringifyArray(arena, buf, obj, indent, depth, seen);
             } else {
-                try stringifyObject(arena, buf, obj, indent, depth);
+                try stringifyObject(arena, buf, obj, indent, depth, seen);
             }
         },
         // functions, native_function, symbol: produce nothing (caller uses "null" for arrays)
         .function, .bc_function, .native_function, .symbol, .bigint => {},
     }
+}
+
+fn throwStringifyTypeError(arena: std.mem.Allocator) anyerror!void {
+    const realm_mod = @import("../realm.zig");
+    const obj = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, realm_mod.error_proto_TypeError)
+    else
+        try JsObject.create(arena, realm_mod.error_proto_TypeError);
+    try obj.set("message", try val_mod.makeString(arena, "Converting circular structure to JSON"));
+    try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
 }
 
 fn stringifyObject(
@@ -89,6 +111,7 @@ fn stringifyObject(
     obj: *JsObject,
     indent: usize,
     depth: usize,
+    seen: *std.ArrayList(*JsObject),
 ) anyerror!void {
     try buf.append(arena, '{');
     var first = true;
@@ -116,7 +139,7 @@ fn stringifyObject(
         try buf.append(arena, ':');
         if (indent > 0) try buf.append(arena, ' ');
 
-        try stringifyValue(arena, buf, val, indent, depth + 1);
+        try stringifyValue(arena, buf, val, indent, depth + 1, seen);
     }
     if (indent > 0 and !first) {
         try buf.append(arena, '\n');
@@ -131,6 +154,7 @@ fn stringifyArray(
     arr: *JsObject,
     indent: usize,
     depth: usize,
+    seen: *std.ArrayList(*JsObject),
 ) anyerror!void {
     try buf.append(arena, '[');
     const len = arr.array_length;
@@ -154,7 +178,7 @@ fn stringifyArray(
                 try buf.appendSlice(arena, "null");
                 continue;
             }
-            try stringifyValue(arena, buf, elem, indent, depth + 1);
+            try stringifyValue(arena, buf, elem, indent, depth + 1, seen);
         } else {
             try buf.appendSlice(arena, "null");
         }

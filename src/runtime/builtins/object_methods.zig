@@ -14,12 +14,10 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
 
-    if (args.len == 0 or args[0].bits == 0) {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) {
         return val_mod.makeObject(arena, arr);
     }
-    const inner = args[0].toPtr();
-    if (inner.* != .object) return val_mod.makeObject(arena, arr);
-    const obj = inner.object;
+    const obj = args[0].toPtr().object;
 
     // Proxy: ownKeys trap (string keys only for Object.keys).
     if (obj.internal_kind == .proxy) {
@@ -70,12 +68,10 @@ pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Valu
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
 
-    if (args.len == 0 or args[0].bits == 0) {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) {
         return val_mod.makeObject(arena, arr);
     }
-    const inner = args[0].toPtr();
-    if (inner.* != .object) return val_mod.makeObject(arena, arr);
-    const obj = inner.object;
+    const obj = args[0].toPtr().object;
 
     var i: u32 = 0;
     for (obj.ownKeys()) |k| {
@@ -122,10 +118,9 @@ pub fn nativeObjectFromEntries(arena: std.mem.Allocator, _: Value, args: []const
     const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
     const out = try JsObject.create(arena, obj_proto);
 
-    if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, out);
-    const inner = args[0].toPtr();
-    if (inner.* != .object or !inner.object.is_array) return val_mod.makeObject(arena, out);
-    const list = inner.object;
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeObject(arena, out);
+    const list = args[0].toPtr().object;
+    if (!list.is_array) return val_mod.makeObject(arena, out);
 
     var i: usize = 0;
     while (i < list.array_length) : (i += 1) {
@@ -162,10 +157,8 @@ pub fn nativeObjectGetOwnPropertyDescriptors(arena: std.mem.Allocator, _: Value,
     const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
     const out = try JsObject.create(arena, obj_proto);
 
-    if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, out);
-    const inner = args[0].toPtr();
-    if (inner.* != .object) return val_mod.makeObject(arena, out);
-    const obj = inner.object;
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeObject(arena, out);
+    const obj = args[0].toPtr().object;
 
     for (obj.ownKeys()) |k| {
         const v = obj.getOwn(k) orelse continue;

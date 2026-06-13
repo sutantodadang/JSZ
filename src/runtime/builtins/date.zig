@@ -149,17 +149,16 @@ fn msToFields(ms_epoch: i64) DateFields {
 
 /// UTC fields -> milliseconds since epoch.
 fn fieldsToMs(year: i32, month: i32, day: i32, hour: i32, min_: i32, sec_: i32, ms_: i32) i64 {
-    // Normalize month overflow.
-    var y = year;
-    var m = month;
-    while (m >= 12) {
-        m -= 12;
-        y += 1;
-    }
-    while (m < 0) {
-        m += 12;
-        y -= 1;
-    }
+    // Normalize month into [0,11], carrying into the year (i64 math avoids overflow).
+    var y64: i64 = year;
+    y64 += @divFloor(@as(i64, month), 12);
+    const m: i32 = @intCast(@mod(@as(i64, month), 12));
+    // Clamp the year far beyond the valid Date range (±271821); anything outside
+    // yields an out-of-range result the caller maps to NaN. Also bounds the
+    // day-accumulation loop and prevents i32 overflow on extreme inputs.
+    if (y64 > 300000) y64 = 300000;
+    if (y64 < -300000) y64 = -300000;
+    const y: i32 = @intCast(y64);
 
     // Days from epoch to Jan 1 of year.
     var days: i64 = 0;
@@ -210,7 +209,13 @@ fn createDateObject(arena: std.mem.Allocator, ms: i64) !Value {
 fn argToI32(args: []const Value, idx: usize, default: i32) i32 {
     if (idx >= args.len or args[idx].bits == 0) return default;
     return switch (args[idx].unbox()) {
-        .number => |n| @intFromFloat(n),
+        .number => |n| blk: {
+            if (std.math.isNan(n)) break :blk default;
+            const t = @trunc(n);
+            if (t >= 2147483647.0) break :blk std.math.maxInt(i32);
+            if (t <= -2147483648.0) break :blk std.math.minInt(i32);
+            break :blk @intFromFloat(t);
+        },
         else => default,
     };
 }

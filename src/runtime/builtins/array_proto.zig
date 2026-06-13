@@ -99,10 +99,10 @@ pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Va
         switch (args[1].unbox()) {
             .number => |n| blk: {
                 if (n < 0.0) {
-                    const r = @as(i64, @intCast(len)) + @as(i64, @intFromFloat(@trunc(n)));
+                    const r = @as(i64, @intCast(len)) + val_mod.f64ToI64Sat(n);
                     break :blk if (r < 0) 0 else @intCast(r);
                 }
-                break :blk @intFromFloat(@trunc(n));
+                break :blk @intCast(val_mod.f64ToI64Sat(n));
             },
             else => 0,
         }
@@ -130,10 +130,10 @@ pub fn nativeIncludes(arena: std.mem.Allocator, this_val: Value, args: []const V
         switch (args[1].unbox()) {
             .number => |n| blk: {
                 if (n < 0.0) {
-                    const r = @as(i64, @intCast(len)) + @as(i64, @intFromFloat(@trunc(n)));
+                    const r = @as(i64, @intCast(len)) + val_mod.f64ToI64Sat(n);
                     break :blk if (r < 0) 0 else @intCast(r);
                 }
-                break :blk @intFromFloat(@trunc(n));
+                break :blk @intCast(val_mod.f64ToI64Sat(n));
             },
             else => 0,
         }
@@ -172,7 +172,14 @@ pub fn nativeFlat(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const depth: i64 = if (args.len > 0 and args[0].bits != 0)
         switch (args[0].unbox()) {
-            .number => |n| if (std.math.isNan(n)) 0 else @intFromFloat(@trunc(n)),
+            .number => |n| blk: {
+                if (std.math.isNan(n)) break :blk 0;
+                const t = @trunc(n);
+                // Clamp ±Infinity / out-of-range before the int cast (no panic).
+                if (t >= 9.2233720368547758e18) break :blk std.math.maxInt(i64);
+                if (t <= -9.2233720368547758e18) break :blk std.math.minInt(i64);
+                break :blk @intFromFloat(t);
+            },
             else => 1,
         }
     else
@@ -610,7 +617,7 @@ pub fn nativeSort(arena: std.mem.Allocator, this_val: Value, args: []const Value
 
 fn normalizeIndex(idx: f64, len: usize) usize {
     if (std.math.isNan(idx)) return 0;
-    const i: i64 = @intFromFloat(@trunc(idx));
+    const i: i64 = val_mod.f64ToI64Sat(idx);
     if (i < 0) {
         const pos: i64 = @intCast(len);
         const r = pos + i;
@@ -623,7 +630,7 @@ fn normalizeIndex(idx: f64, len: usize) usize {
 /// Relative index for `.at()` — out-of-range indices stay out of range (caller returns undefined).
 fn relativeIndex(idx: f64, len: usize) usize {
     if (std.math.isNan(idx)) return std.math.maxInt(usize);
-    const i: i64 = @intFromFloat(@trunc(idx));
+    const i: i64 = val_mod.f64ToI64Sat(idx);
     if (i < 0) {
         const pos: i64 = @intCast(len);
         const r = pos + i;

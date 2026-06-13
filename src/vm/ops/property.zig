@@ -380,14 +380,18 @@ pub inline fn opDeleteProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const obj_v = frame.registers[robj];
     const key_v = frame.registers[rkey];
+    // Capture before deleteProperty: a Proxy/TypedArray trap can re-enter the VM
+    // (invokeCallback grows self.frames, reallocating the backing array) which
+    // invalidates `frame`. Read frame-derived state now; use indexed access after.
+    const caller_is_strict = frame.func.is_strict;
     const ok = self.deleteProperty(obj_v, key_v) catch |e| {
         if (e != error.JsException) return e;
         if (try self.raisePendingException("error in proxy deleteProperty trap")) |oc| return oc;
         return null;
     };
     // Spec: strict-mode delete returning false → TypeError.
-    if (!ok and frame.func.is_strict) {
-        const exc = try self.makeErrorObjectBc("TypeError", "Cannot delete property of TypedArray");
+    if (!ok and caller_is_strict) {
+        const exc = try self.makeErrorObjectBc("TypeError", "Cannot delete property in strict mode");
         self.last_exception_value = exc;
         const found = try self.throwException(exc);
         if (!found) {

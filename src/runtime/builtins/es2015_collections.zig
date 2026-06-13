@@ -467,6 +467,7 @@ fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
 fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const obj = this_val.toPtr().object;
+    if (obj.internal_slot == null) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const d: *SeqIterData = @ptrCast(@alignCast(obj.internal_slot.?));
     if (d.is_string) {
         const s = d.seq.unbox().string;

@@ -268,6 +268,13 @@ pub var active_boolean_proto: ?*JsObject = null;
 /// primitive under a plain call — the synthesized `this` is identical in both
 /// paths, so prototype identity cannot distinguish them.
 pub var active_constructing: bool = false;
+/// M15: pending NewTarget for an in-flight native construction. A ctor that must
+/// run GetPrototypeFromConstructor at a spec-precise point (e.g. %TypedArray%,
+/// ArrayBuffer, DataView — after ToIndex on a primitive length arg) reads this,
+/// applies the prototype, and CONSUMES it (sets it back to `Value{}`). The
+/// constructor dispatcher applies the prototype post-hoc for any ctor that did
+/// not consume it. Saved/restored around each native construct for re-entrancy.
+pub var pending_new_target: Value = Value{};
 /// Phase 4c: thread-local for RegExp.prototype.
 pub var active_regexp_proto: ?*JsObject = null;
 /// Phase 4d: thread-local for Function.prototype.

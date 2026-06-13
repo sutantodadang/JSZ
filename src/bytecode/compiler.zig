@@ -1456,6 +1456,20 @@ pub const FnCompiler = struct {
             for (hoisted.items) |name| try self.emitHoist(name, 0);
         }
 
+        // Function declarations are fully instantiated (closure created AND
+        // bound) at scope entry, before any statement executes — so forward
+        // references resolve. Emit direct-child function declarations here and
+        // skip them in the statement loop below. (Nested-block function decls
+        // are still lowered at their source position via compileStmt.)
+        {
+            const lower = @import("./lower/stmt.zig");
+            var fd_reg: ?u8 = null;
+            for (body) |stmt| {
+                if (stmt.kind == .function_decl)
+                    try lower.lowerFunctionDecl(self, stmt, &fd_reg);
+            }
+        }
+
         // Completion values (eval/REPL): the top-level program accumulates its
         // completion value into a dedicated register, initialized to `undefined`
         // and updated per the ES statement-completion rules (see writeCompletion/
@@ -1483,6 +1497,9 @@ pub const FnCompiler = struct {
                 if (pr >= reclaim_floor) self.sp = pr;
                 last_other_reg = null;
             }
+
+            // Already instantiated at scope entry (see hoisting pre-pass).
+            if (stmt.kind == .function_decl) continue;
 
             var last_expr_reg: ?u8 = null;
             try self.compileStmt(stmt, &last_expr_reg);

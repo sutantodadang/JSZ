@@ -82,6 +82,9 @@ pub const BcGeneratorState = struct {
     vm: *BcVm,
     done: bool = false,
     started: bool = false,
+    /// True while this coroutine is actively running — re-entrant `.next()`/
+    /// `.throw()` (e.g. a generator resuming itself) must throw, not recurse.
+    executing: bool = false,
     /// Register that receives the value passed to .next(v) on resume.
     resume_reg: u8 = 0,
 };
@@ -350,24 +353,41 @@ pub const BcVm = struct {
                 if (o.get("__call__")) |cv| {
                     if (cv.bits != 0 and cv.unbox() == .native_function) {
                         // Default proto = ctor's own .prototype (the intrinsic per-kind
-                        // prototype); overridden by NewTarget.prototype when present.
+                        // prototype). Create with this provisional proto; the real proto
+                        // comes from GetPrototypeFromConstructor(newTarget), applied either
+                        // by the ctor at its spec-precise point (consuming pending_new_target,
+                        // so e.g. ToIndex on a primitive arg can throw FIRST) or post-hoc here.
                         var default_proto: ?*JsObject = self.realm.object_prototype;
                         if (o.get("prototype")) |pv| {
                             if (pv.bits != 0 and pv.unbox() == .object) default_proto = pv.toPtr().object;
                         }
-                        const proto = try self.protoFromNewTarget(new_target, default_proto);
                         const new_obj = if (self.heap) |heap|
-                            try JsObject.createOnHeap(heap, proto)
+                            try JsObject.createOnHeap(heap, default_proto)
                         else
-                            try JsObject.create(self.arena, proto);
+                            try JsObject.create(self.arena, default_proto);
                         const this_val = try val_mod.makeObject(self.arena, new_obj);
+                        const saved_nt = realm_m.pending_new_target;
+                        realm_m.pending_new_target = new_target;
                         realm_m.active_constructing = true;
                         const result = cv.toPtr().native_function.invoke(self.arena, this_val, args) catch |e| {
                             realm_m.active_constructing = false;
+                            realm_m.pending_new_target = saved_nt;
                             return e;
                         };
                         realm_m.active_constructing = false;
-                        return if (result.bits != 0 and result.unbox() == .object) result else this_val;
+                        const ret = if (result.bits != 0 and result.unbox() == .object) result else this_val;
+                        // Ctor didn't consume the NewTarget → apply prototype now.
+                        if (realm_m.pending_new_target.bits != 0) {
+                            const p = self.protoFromNewTarget(new_target, null) catch |e| {
+                                realm_m.pending_new_target = saved_nt;
+                                return e;
+                            };
+                            if (p) |pp| {
+                                if (ret.bits != 0 and ret.unbox() == .object) ret.toPtr().object.proto = pp;
+                            }
+                        }
+                        realm_m.pending_new_target = saved_nt;
+                        return ret;
                     }
                 }
                 realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
@@ -677,7 +697,9 @@ pub const BcVm = struct {
                     return "constructor threw";
                 };
                 const final = if (result.bits != 0 and result.unbox() == .object) result else this_val;
-                self.frames.items[self.frames.items.len - 1].registers[rdst] = final;
+                if (self.frames.items.len > 0) {
+                    self.frames.items[self.frames.items.len - 1].registers[rdst] = final;
+                }
                 return null;
             },
             .function => {
@@ -1764,7 +1786,9 @@ pub const BcVm = struct {
                     return try std.fmt.allocPrint(self.arena, "TypeError: native function threw", .{});
                 };
                 // Re-read frame after native call (may have triggered re-entrant frames + realloc).
-                self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
+                if (self.frames.items.len > 0) {
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
+                }
                 return null;
             },
             .function => {
@@ -1986,7 +2010,9 @@ pub const BcVm = struct {
                     return try std.fmt.allocPrint(self.arena, "TypeError: native function threw", .{});
                 };
                 // Re-read frame after native call (may have triggered re-entrant frames + realloc).
-                self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
+                if (self.frames.items.len > 0) {
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
+                }
                 return null;
             },
             .function => {
@@ -2128,6 +2154,12 @@ pub const BcVm = struct {
                 .throw_ => |e| SuspendResult{ .threw = e },
             };
         }
+        // Re-entrant resume (generator resuming itself) → TypeError, not recursion.
+        if (state.executing) {
+            return SuspendResult{ .threw = try self.makeErrorObjectBc("TypeError", "Generator is already running") };
+        }
+        state.executing = true;
+        defer state.executing = false;
         const base = self.frames.items.len;
         var frame_copy = state.frame;
         frame_copy.gen = state;
