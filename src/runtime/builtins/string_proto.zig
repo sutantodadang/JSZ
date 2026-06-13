@@ -716,12 +716,7 @@ pub fn nativeTrimEnd(arena: std.mem.Allocator, this_val: Value, _: []const Value
 }
 
 fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
-    if (std.math.isNan(n)) return "NaN";
-    if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
-    if (n == @trunc(n) and @abs(n) < 1e15) {
-        return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
-    }
-    return std.fmt.allocPrint(arena, "{d}", .{n});
+    return val_mod.formatNumber(arena, n);
 }
 
 /// Build a pad filler of `count` bytes by repeating `pad`.

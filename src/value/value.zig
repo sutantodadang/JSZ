@@ -183,13 +183,81 @@ pub fn f64ToI64Sat(n: f64) i64 {
 }
 
 /// ECMAScript number → string for display (shared by VM + public API).
+/// ECMAScript Number::toString (radix 10) — spec 6.1.6.1.20 / 7.1.12.1.
+/// Produces the shortest round-tripping decimal, with JS positioning rules
+/// (plain for 10^-6 ≤ |x| < 10^21, exponential `dde±NN` otherwise).
 pub fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
     if (std.math.isNan(n)) return "NaN";
     if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
-    if (n == @trunc(n) and @abs(n) < 1e15) {
+    if (n == 0) return "0"; // also normalizes -0 → "0"
+
+    // Fast path: integers that fit i64 (≤19 digits, always ≤21 → plain form).
+    if (n == @trunc(n) and @abs(n) < 9.007199254740992e15) {
         return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
     }
-    return std.fmt.allocPrint(arena, "{d}", .{n});
+
+    const neg = n < 0;
+    const x = @abs(n);
+
+    // Shortest scientific representation from Zig's Ryū formatter: "d[.ddd]e±E".
+    var sbuf: [64]u8 = undefined;
+    const sci = try std.fmt.bufPrint(&sbuf, "{e}", .{x});
+
+    // Parse mantissa digits (k of them) and decimal exponent E.
+    const e_idx = std.mem.indexOfScalar(u8, sci, 'e') orelse std.mem.indexOfScalar(u8, sci, 'E').?;
+    const mant = sci[0..e_idx];
+    const exp = try std.fmt.parseInt(i32, sci[e_idx + 1 ..], 10);
+
+    var dbuf: [32]u8 = undefined;
+    var k: usize = 0;
+    for (mant) |c| {
+        if (c >= '0' and c <= '9') {
+            dbuf[k] = c;
+            k += 1;
+        }
+    }
+    // Strip any trailing zeros the formatter may keep (shortest already does, but
+    // be safe so the spec digit count `k` is exact).
+    while (k > 1 and dbuf[k - 1] == '0') k -= 1;
+    const digits = dbuf[0..k];
+    const nn: i32 = exp + 1; // spec `n`: value = digits × 10^(n-k)
+
+    var out: std.ArrayList(u8) = .empty;
+    if (neg) try out.append(arena, '-');
+    const kk: i32 = @intCast(k);
+
+    if (nn >= kk and nn <= 21) {
+        // k ≤ n ≤ 21: all digits then (n-k) trailing zeros.
+        try out.appendSlice(arena, digits);
+        var z: i32 = nn - kk;
+        while (z > 0) : (z -= 1) try out.append(arena, '0');
+    } else if (nn > 0 and nn <= 21) {
+        // 0 < n ≤ 21: digits[0..n] "." digits[n..].
+        const ni: usize = @intCast(nn);
+        try out.appendSlice(arena, digits[0..ni]);
+        try out.append(arena, '.');
+        try out.appendSlice(arena, digits[ni..]);
+    } else if (nn <= 0 and nn > -6) {
+        // -6 < n ≤ 0: "0." then (-n) zeros then digits.
+        try out.appendSlice(arena, "0.");
+        var z: i32 = -nn;
+        while (z > 0) : (z -= 1) try out.append(arena, '0');
+        try out.appendSlice(arena, digits);
+    } else {
+        // n > 21 or n ≤ -6: exponential `d[.ddd]e±(n-1)`.
+        try out.append(arena, digits[0]);
+        if (k > 1) {
+            try out.append(arena, '.');
+            try out.appendSlice(arena, digits[1..]);
+        }
+        try out.append(arena, 'e');
+        const e: i32 = nn - 1;
+        try out.append(arena, if (e >= 0) '+' else '-');
+        var ebuf: [12]u8 = undefined;
+        const es = try std.fmt.bufPrint(&ebuf, "{d}", .{@abs(e)});
+        try out.appendSlice(arena, es);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 // WebKit-style JSVALUE64 NaN-boxed Value representation (committed). Numbers are

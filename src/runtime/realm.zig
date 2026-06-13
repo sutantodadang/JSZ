@@ -60,6 +60,9 @@ pub const Context = struct {
     /// Construct `ctor` with an explicit NewTarget (supplies `[[Prototype]]` via
     /// GetPrototypeFromConstructor). Used by Reflect.construct.
     construct_nt_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, ctor_val: Value, args: []const Value, new_target: Value) anyerror!Value,
+    /// Read a SYMBOL-keyed property, firing accessor getters / Proxy traps and
+    /// walking the prototype chain (full [[Get]]). Propagates JS throws.
+    get_sym_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, sym_key: Value) anyerror!Value,
 
     pub fn invokeJs(self: *Context, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         return self.invoke_fn(self.ptr, arena, this_val, fn_val, args);
@@ -79,6 +82,10 @@ pub const Context = struct {
 
     pub fn constructNewTarget(self: *Context, arena: std.mem.Allocator, ctor_val: Value, args: []const Value, new_target: Value) anyerror!Value {
         return self.construct_nt_fn(self.ptr, arena, ctor_val, args, new_target);
+    }
+
+    pub fn getPropSym(self: *Context, arena: std.mem.Allocator, obj_val: Value, sym_key: Value) anyerror!Value {
+        return self.get_sym_fn(self.ptr, arena, obj_val, sym_key);
     }
 };
 
@@ -1164,6 +1171,8 @@ pub const Realm = struct {
         const meth_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
         _ = try object_proto.defineOwnData("hasOwnProperty",
             try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeHasOwnProperty, "hasOwnProperty", 1), meth_attr);
+        _ = try object_proto.defineOwnData("propertyIsEnumerable",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativePropertyIsEnumerable, "propertyIsEnumerable", 1), meth_attr);
         _ = try object_proto.defineOwnData("toString",
             try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoToString, "toString", 0), meth_attr);
         _ = try object_proto.defineOwnData("valueOf",

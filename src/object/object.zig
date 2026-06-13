@@ -473,7 +473,75 @@ pub const JsObject = struct {
     pub fn symKeys(self: *JsObject) []const SymProp {
         return self.sym_props.items;
     }
+
+    /// [[DefineOwnProperty]] for a symbol-keyed DATA property. Returns false when
+    /// an existing non-configurable property forbids the change (incompatible
+    /// redefine) or the object is non-extensible and the key is absent.
+    pub fn defineOwnDataSym(self: *JsObject, sym_key: Value, value: Value, attr: PropAttr) !bool {
+        if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return false;
+        const target = sym_key.toPtr().symbol;
+        for (self.sym_props.items) |*sp| {
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
+                if (!sp.attr.configurable) {
+                    // Non-configurable: only a compatible no-op redefine is allowed.
+                    if (attr.configurable) return false;
+                    if (attr.enumerable != sp.attr.enumerable) return false;
+                    if (sp.attr.is_accessor) return false; // accessor → data
+                    if (!sp.attr.writable) {
+                        if (attr.writable) return false;
+                        if (!sameValueRough(value, sp.value)) return false;
+                    }
+                }
+                sp.value = value;
+                sp.attr = attr;
+                sp.attr.is_accessor = false;
+                return true;
+            }
+        }
+        if (!self.extensible) return false;
+        var a = attr;
+        a.is_accessor = false;
+        try self.sym_props.append(self.arena, .{ .key = sym_key, .value = value, .attr = a });
+        return true;
+    }
+
+    /// [[DefineOwnProperty]] for a symbol-keyed ACCESSOR property. `holder` is an
+    /// object carrying `get`/`set` (same shape the VM reads via getPropSym).
+    pub fn defineOwnAccessorSym(self: *JsObject, sym_key: Value, holder: Value, attr: PropAttr) !bool {
+        if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return false;
+        const target = sym_key.toPtr().symbol;
+        for (self.sym_props.items) |*sp| {
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
+                if (!sp.attr.configurable) {
+                    if (attr.configurable) return false;
+                    if (attr.enumerable != sp.attr.enumerable) return false;
+                    if (!sp.attr.is_accessor) return false; // data → accessor
+                    return false; // can't change a non-configurable accessor's handlers
+                }
+                sp.value = holder;
+                sp.attr = attr;
+                sp.attr.is_accessor = true;
+                return true;
+            }
+        }
+        if (!self.extensible) return false;
+        var a = attr;
+        a.is_accessor = true;
+        try self.sym_props.append(self.arena, .{ .key = sym_key, .value = holder, .attr = a });
+        return true;
+    }
 };
+
+/// Loose SameValue for redefine compatibility checks: pointer-identity, or
+/// numeric equality (pointer-boxed numbers may differ in bits while equal).
+fn sameValueRough(a: Value, b: Value) bool {
+    if (a.bits == b.bits) return true;
+    if (a.bits == 0 or b.bits == 0) return false;
+    const ua = a.unbox();
+    const ub = b.unbox();
+    if (ua == .number and ub == .number) return ua.number == ub.number;
+    return false;
+}
 
 // ------------------------------------------------------------------- tests ---
 

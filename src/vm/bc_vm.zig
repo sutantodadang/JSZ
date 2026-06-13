@@ -409,6 +409,12 @@ pub const BcVm = struct {
         return self.getProp(obj_val, key);
     }
 
+    fn bcGetPropSym(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, sym_key: Value) anyerror!Value {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        return self.getPropSym(obj_val, sym_key);
+    }
+
     fn bcConstructNt(ptr: *anyopaque, arena: std.mem.Allocator, ctor_val: Value, args: []const Value, new_target: Value) anyerror!Value {
         _ = arena;
         const self: *BcVm = @ptrCast(@alignCast(ptr));
@@ -463,6 +469,7 @@ pub const BcVm = struct {
             .eval_fn = bcEval,
             .get_fn = bcGetProp,
             .construct_nt_fn = bcConstructNt,
+            .get_sym_fn = bcGetPropSym,
         };
         realm_mod.active_context = &self.context;
     }
@@ -1218,6 +1225,15 @@ pub const BcVm = struct {
                 if (closure.obj) |op| {
                     const o: *JsObject = @ptrCast(@alignCast(op));
                     if (o.get(key)) |v| return v;
+                }
+                // Own `name`/`length` for user functions (spec: non-writable,
+                // configurable). `length` = declared arity; `name` = the bound
+                // function name ("" when anonymous and not named-evaluated).
+                if (std.mem.eql(u8, key, "name")) {
+                    return val_mod.makeString(self.arena, closure.func.name orelse "");
+                }
+                if (std.mem.eql(u8, key, "length")) {
+                    return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity));
                 }
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
@@ -2721,12 +2737,8 @@ pub fn formatExceptionMessage(arena: std.mem.Allocator, v: Value) ![]const u8 {
 }
 
 pub fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
-    if (std.math.isNan(n)) return "NaN";
-    if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
-    if (n == @trunc(n) and @abs(n) < 1e15) {
-        return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
-    }
-    return std.fmt.allocPrint(arena, "{d}", .{n});
+    // Delegate to the canonical ECMAScript Number::toString (value.zig).
+    return val_mod.formatNumber(arena, n);
 }
 
 pub fn jsLessThan(left: Value, right: Value) ?bool {

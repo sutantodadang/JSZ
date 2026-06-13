@@ -91,11 +91,13 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "toSorted",        nativeTaToSorted,       @as(u8, 1) },
         .{ "with",            nativeTaWith,           @as(u8, 2) },
     };
+    // Spec §17: built-in methods are { writable:true, enumerable:false, configurable:true }.
+    const m_attr: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (ta_methods) |m| {
-        try ta_proto.set(m[0], try val_mod.makeNativeFunctionNamed(arena, m[1], m[0], m[2]));
+        _ = try ta_proto.defineOwnData(m[0], try val_mod.makeNativeFunctionNamed(arena, m[1], m[0], m[2]), m_attr);
     }
     // @@iterator shares the same fn as values (length 0, no string name needed).
-    try ta_proto.set("@@iterator", try val_mod.makeNativeFunctionNamed(arena, nativeTaValues, "values", 0));
+    _ = try ta_proto.defineOwnData("@@iterator", try val_mod.makeNativeFunctionNamed(arena, nativeTaValues, "values", 0), m_attr);
     active_typedarray_proto = ta_proto;
 
     // Instance accessor getters live on %TypedArray%.prototype.
@@ -106,16 +108,18 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
     // %TypedArray% intrinsic constructor (abstract).
     const ta_ctor = try JsObject.create(arena, fn_proto_obj);
-    try ta_ctor.set("prototype", try val_mod.makeObject(arena, ta_proto));
+    // .prototype: non-writable, non-enumerable, non-configurable (ctor → proto link).
+    _ = try ta_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, ta_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try ta_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeTaAbstractCtor));
-    try ta_ctor.set("from", try val_mod.makeNativeFunction(arena, nativeTaFrom));
-    try ta_ctor.set("of", try val_mod.makeNativeFunction(arena, nativeTaOf));
-    try ta_proto.set("constructor", try val_mod.makeObject(arena, ta_ctor));
+    _ = try ta_ctor.defineOwnData("from", try val_mod.makeNativeFunctionNamed(arena, nativeTaFrom, "from", 1), m_attr);
+    _ = try ta_ctor.defineOwnData("of", try val_mod.makeNativeFunctionNamed(arena, nativeTaOf, "of", 0), m_attr);
+    // %TypedArray%.prototype.constructor: writable, non-enumerable, configurable.
+    _ = try ta_proto.defineOwnData("constructor", try val_mod.makeObject(arena, ta_ctor), m_attr);
 
     // TypedArray iterator prototype.
     const ta_iter_proto = try JsObject.create(arena, object_proto);
-    try ta_iter_proto.set("next", try val_mod.makeNativeFunction(arena, nativeTaIterNext));
-    try ta_iter_proto.set("@@iterator", try val_mod.makeNativeFunction(arena, nativeIterSelf));
+    _ = try ta_iter_proto.defineOwnData("next", try val_mod.makeNativeFunctionNamed(arena, nativeTaIterNext, "next", 0), m_attr);
+    _ = try ta_iter_proto.defineOwnData("@@iterator", try val_mod.makeNativeFunction(arena, nativeIterSelf), m_attr);
     active_ta_iter_proto = ta_iter_proto;
 
     // Per-kind constructors + prototypes (inherit %TypedArray% / its prototype).
@@ -124,10 +128,11 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         active_ta_protos[@intFromEnum(kind)] = kp;
         const kctor = try JsObject.create(arena, ta_ctor);
         active_ta_ctors[@intFromEnum(kind)] = kctor;
-        try kctor.set("prototype", try val_mod.makeObject(arena, kp));
+        // .prototype: non-writable, non-enumerable, non-configurable.
+        _ = try kctor.defineOwnData("prototype", try val_mod.makeObject(arena, kp), .{ .writable = false, .enumerable = false, .configurable = false });
         try kctor.set("__call__", try val_mod.makeNativeFunction(arena, taCtor(kind)));
-        try kctor.set("from", try val_mod.makeNativeFunctionNamed(arena, nativeTaFrom, "from", 1));
-        try kctor.set("of", try val_mod.makeNativeFunctionNamed(arena, nativeTaOf, "of", 0));
+        _ = try kctor.defineOwnData("from", try val_mod.makeNativeFunctionNamed(arena, nativeTaFrom, "from", 1), m_attr);
+        _ = try kctor.defineOwnData("of", try val_mod.makeNativeFunctionNamed(arena, nativeTaOf, "of", 0), m_attr);
         // BYTES_PER_ELEMENT: non-writable, non-enumerable, non-configurable (ES spec §22.2.5.1)
         const bpe_val = try val_mod.makeNumber(arena, @floatFromInt(kind.elemSize()));
         const bpe_attr: PropAttr = .{ .writable = false, .enumerable = false, .configurable = false };
@@ -494,6 +499,14 @@ fn vmGet(arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!Val
     if (realm_mod.active_context) |ctx| return ctx.getProp(arena, obj_val, key);
     if (obj_val.bits != 0 and obj_val.unbox() == .object)
         return obj_val.toPtr().object.get(key) orelse Value{};
+    return Value{};
+}
+
+/// Observable symbol-keyed [[Get]] (fires accessor getters / Proxy traps).
+fn vmGetSym(arena: std.mem.Allocator, obj_val: Value, sym_key: Value) anyerror!Value {
+    if (realm_mod.active_context) |ctx| return ctx.getPropSym(arena, obj_val, sym_key);
+    if (obj_val.bits != 0 and obj_val.unbox() == .object)
+        return obj_val.toPtr().object.getSym(sym_key) orelse Value{};
     return Value{};
 }
 
@@ -898,7 +911,11 @@ fn iterableToList(arena: std.mem.Allocator, source: Value) anyerror!std.ArrayLis
 }
 
 fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
+    // [[Construct]]-only: a plain call (NewTarget undefined) must throw TypeError.
+    // The native construct path sets `active_constructing`; a plain `Int8Array()`
+    // call leaves it false (and passes globalThis as `this`, which is an object —
+    // so the object check alone is insufficient).
+    if (!realm_mod.active_constructing or this_val.bits == 0 or this_val.unbox() != .object) {
         return throwTypeError(arena, "Constructor TypedArray requires 'new'");
     }
     const this_obj = this_val.toPtr().object;
@@ -1074,34 +1091,32 @@ fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedAr
         return throwTypeError(arena, "TypedArray intrinsic constructor not found");
     const default_ctor = try val_mod.makeObject(arena, default_ctor_obj);
 
-    // 2. SpeciesConstructor(exemplar_this, defaultCtor).
+    // 2. SpeciesConstructor(exemplar_this, defaultCtor) — spec-observable.
+    //    a. C ← ? Get(exemplar, "constructor")  (fires a custom getter).
+    //    b. If C is undefined, return defaultCtor.
+    //    c. If C is not an Object, throw TypeError.
+    //    d. S ← ? Get(C, @@species)  (fires a custom getter).
+    //    e. If S is undefined/null, return defaultCtor.
+    //    f. If IsConstructor(S), return S; else throw TypeError.
     var C = default_ctor;
     if (exemplar_this.bits != 0 and exemplar_this.unbox() == .object) {
-        const ex_obj = exemplar_this.toPtr().object;
-        // Get "constructor" property (with proto walk).
-        if (ex_obj.get("constructor")) |ctor_v| {
-            if (ctor_v.bits != 0 and ctor_v.unbox() != .undefined_) {
-                // If not an object → TypeError.
-                if (ctor_v.unbox() != .object) {
-                    return throwTypeError(arena, "TypedArray constructor property is not an object");
-                }
-                const ctor_obj = ctor_v.toPtr().object;
-                // Get @@species from constructor.
-                if (realm_mod.active_sym_species) |spec_sym| {
-                    if (ctor_obj.getSym(spec_sym)) |S| {
-                        if (S.bits == 0 or S.unbox() == .undefined_ or S.unbox() == .null_) {
-                            // @@species is null/undefined → use defaultCtor (already set).
-                        } else if (isConstructor(S)) {
-                            C = S;
-                        } else {
-                            return throwTypeError(arena, "@@species is not a constructor");
-                        }
-                    }
-                    // @@species absent → use defaultCtor (already set).
+        const ctor_v = try vmGet(arena, exemplar_this, "constructor");
+        if (ctor_v.bits != 0 and ctor_v.unbox() != .undefined_) {
+            if (ctor_v.unbox() != .object) {
+                return throwTypeError(arena, "TypedArray constructor property is not an object");
+            }
+            if (realm_mod.active_sym_species) |spec_sym| {
+                const S = try vmGetSym(arena, ctor_v, spec_sym);
+                if (S.bits == 0 or S.unbox() == .undefined_ or S.unbox() == .null_) {
+                    // @@species absent/null/undefined → use defaultCtor (already set).
+                } else if (isConstructor(S)) {
+                    C = S;
+                } else {
+                    return throwTypeError(arena, "@@species is not a constructor");
                 }
             }
-            // "constructor" is undefined → use defaultCtor (already set).
         }
+        // "constructor" undefined → use defaultCtor (already set).
     }
 
     // 3. Construct(C, species_args).

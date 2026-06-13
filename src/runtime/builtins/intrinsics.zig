@@ -30,20 +30,27 @@ pub const Ctx = struct {
     }
 };
 
+/// Spec attributes for a built-in method / data property: writable, NON-enumerable,
+/// configurable (ES §17 "Every other data property ... { [[Writable]]: true,
+/// [[Enumerable]]: false, [[Configurable]]: true }").
+pub const method_attr: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+
 /// Set many native-function methods on `obj` from a comptime tuple of
 /// `.{ name, fn_ptr }` pairs. Each function gets `.name` and `.length = 0`
-/// stored inline on the NativeFnEntry (accessible via getProp).
+/// stored inline on the NativeFnEntry (accessible via getProp). Installed
+/// NON-enumerable per spec.
 pub fn setMethods(arena: std.mem.Allocator, obj: *JsObject, comptime pairs: anytype) !void {
     inline for (pairs) |pair| {
         const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0);
-        try obj.set(pair[0], fn_val);
+        _ = try obj.defineOwnData(pair[0], fn_val, method_attr);
     }
 }
 
 /// Set a single native-function method with name/length stored on the entry.
+/// Installed NON-enumerable per spec.
 pub fn setMethod(arena: std.mem.Allocator, obj: *JsObject, name: []const u8, fn_ptr: val_mod.NativeFnPtr) !void {
     const fn_val = try val_mod.makeNativeFunctionNamed(arena, fn_ptr, name, 0);
-    try obj.set(name, fn_val);
+    _ = try obj.defineOwnData(name, fn_val, method_attr);
 }
 
 /// Build a constructor object with the `{ prototype, __call__ }` shape used

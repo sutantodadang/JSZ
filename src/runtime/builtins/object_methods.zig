@@ -198,6 +198,33 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
     return val_mod.makeBool(arena, obj.hasOwn(key));
 }
 
+/// Object.prototype.propertyIsEnumerable(V): true iff V is an OWN, enumerable
+/// property of ToObject(this). Missing / inherited → false.
+pub fn nativePropertyIsEnumerable(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        return val_mod.makeBool(arena, false);
+    }
+    const obj = this_val.toPtr().object;
+    const key_arg = if (args.len > 0) args[0] else Value{};
+    // Symbol key: consult sym_props.
+    if (key_arg.bits != 0 and key_arg.unbox() == .symbol) {
+        if (obj.getOwnSymEntry(key_arg)) |sp| return val_mod.makeBool(arena, sp.attr.enumerable);
+        return val_mod.makeBool(arena, false);
+    }
+    const key = (try coerceKey(arena, key_arg)) orelse "";
+    // TypedArray integer-indexed elements are own + enumerable when in-bounds.
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        if (ta_mod.canonicalNumericIndexString(key)) |idx_f| {
+            const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+            return val_mod.makeBool(arena, ta_mod.isValidIntegerIndex(td, idx_f));
+        }
+    }
+    if (!obj.hasOwn(key)) return val_mod.makeBool(arena, false);
+    const a = obj.ownAttr(key) orelse return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, a.enumerable);
+}
+
 // ------------------------------------------------------------------ ES5.1 meta-protocol ---
 
 /// Truthiness for descriptor flag values (absent/empty → false).
@@ -393,8 +420,9 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
         return val_mod.makeUndefined(arena);
     }
 
-    // M15: TypedArray [[GetOwnProperty]] — integer-indexed exotic.
-    if (obj.internal_kind == .typed_array) {
+    // M15: TypedArray [[GetOwnProperty]] — integer-indexed exotic. Symbol keys are
+    // never integer indices: skip to the ordinary symbol-property branch below.
+    if (obj.internal_kind == .typed_array and !(args[1].bits != 0 and args[1].unbox() == .symbol)) {
         const ta_mod = @import("typed_array.zig");
         const key2 = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
         if (ta_mod.canonicalNumericIndexString(key2)) |idx_f| {
@@ -466,6 +494,33 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     const obj = args[0].toPtr().object;
 
     const key_raw = if (args.len >= 2) args[1] else Value{};
+
+    // Symbol-keyed [[DefineOwnProperty]]: ordinary, never integer-indexed.
+    if (key_raw.bits != 0 and key_raw.unbox() == .symbol) {
+        if (args.len < 3 or args[2].bits == 0 or args[2].unbox() != .object)
+            return throwTypeError(arena, "descriptor must be an object");
+        const sdesc = args[2].toPtr().object;
+        if (sdesc.hasOwn("get") or sdesc.hasOwn("set")) {
+            const getter: ?Value = if (sdesc.hasOwn("get")) sdesc.getOwn("get") else null;
+            const setter: ?Value = if (sdesc.hasOwn("set")) sdesc.getOwn("set") else null;
+            const holder = try makeAccessorHolder(arena, getter, setter);
+            const sok = try obj.defineOwnAccessorSym(key_raw, holder, .{
+                .enumerable = descTruthy(sdesc.getOwn("enumerable")),
+                .configurable = descTruthy(sdesc.getOwn("configurable")),
+            });
+            if (!sok) return throwTypeError(arena, "cannot redefine property");
+            return args[0];
+        }
+        const sval = sdesc.getOwn("value") orelse try val_mod.makeUndefined(arena);
+        const sok = try obj.defineOwnDataSym(key_raw, sval, .{
+            .writable = descTruthy(sdesc.getOwn("writable")),
+            .enumerable = descTruthy(sdesc.getOwn("enumerable")),
+            .configurable = descTruthy(sdesc.getOwn("configurable")),
+        });
+        if (!sok) return throwTypeError(arena, "cannot redefine property");
+        return args[0];
+    }
+
     const key = (try coerceKey(arena, key_raw)) orelse "";
 
     // M15: TypedArray [[DefineOwnProperty]] — integer-indexed exotic.

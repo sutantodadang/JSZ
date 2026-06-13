@@ -328,8 +328,27 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
     const target_obj = args[0].toPtr().object;
     const key_arg = if (args.len > 1) args[1] else Value{};
 
-    // Symbol keys not supported for defineProperty.
-    if (isSym(key_arg)) return val_mod.makeBool(arena, false);
+    // Symbol-keyed [[DefineOwnProperty]]: ordinary symbol property (data or accessor).
+    if (isSym(key_arg)) {
+        const sdesc = args[2].toPtr().object;
+        if (sdesc.hasOwn("get") or sdesc.hasOwn("set")) {
+            const getter: ?Value = if (sdesc.hasOwn("get")) sdesc.getOwn("get") else null;
+            const setter: ?Value = if (sdesc.hasOwn("set")) sdesc.getOwn("set") else null;
+            const holder = try makeAccessorHolder(arena, getter, setter);
+            const sok = try target_obj.defineOwnAccessorSym(key_arg, holder, .{
+                .enumerable = descTruthy(sdesc.getOwn("enumerable")),
+                .configurable = descTruthy(sdesc.getOwn("configurable")),
+            });
+            return val_mod.makeBool(arena, sok);
+        }
+        const sval = sdesc.getOwn("value") orelse Value{};
+        const sok = try target_obj.defineOwnDataSym(key_arg, sval, .{
+            .writable = descTruthy(sdesc.getOwn("writable")),
+            .enumerable = descTruthy(sdesc.getOwn("enumerable")),
+            .configurable = descTruthy(sdesc.getOwn("configurable")),
+        });
+        return val_mod.makeBool(arena, sok);
+    }
 
     const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeBool(arena, false);
     const desc = args[2].toPtr().object;

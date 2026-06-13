@@ -213,10 +213,7 @@ fn appendJsonString(arena: std.mem.Allocator, buf: *std.ArrayList(u8), s: []cons
 
 fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
     if (std.math.isNan(n) or std.math.isInf(n)) return "null"; // JSON spec
-    if (n == @trunc(n) and @abs(n) < 1e15) {
-        return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
-    }
-    return std.fmt.allocPrint(arena, "{d}", .{n});
+    return val_mod.formatNumber(arena, n);
 }
 
 // ------------------------------------------------------------------ parse ---
