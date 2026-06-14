@@ -44,22 +44,30 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     _ = p.expect(.right_brace) orelse return null;
 
     if (ctor_body.len == 0) {
-        if (super_name != null) {
-            // Derived class default constructor: super.call(this)
-            const id_super = p.makeNode(.identifier, start, start, .{ .identifier = "super" }) orelse return null;
-            const id_call = p.makeNode(.identifier, start, start, .{ .identifier = "call" }) orelse return null;
-            const super_call = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = id_super, .property = id_call, .computed = false },
+        if (super_name) |sname| {
+            // Derived default constructor: `return Reflect.construct(Super,
+            // arguments, ClassName)`. Constructs the parent (incl. built-in
+            // exotics like TypedArray) with NewTarget = the subclass, so the
+            // result carries the parent's internal slots AND the subclass
+            // prototype. The [[Construct]] path adopts the object return.
+            const id_reflect = p.makeNode(.identifier, start, start, .{ .identifier = "Reflect" }) orelse return null;
+            const id_construct = p.makeNode(.identifier, start, start, .{ .identifier = "construct" }) orelse return null;
+            const callee = p.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = id_reflect, .property = id_construct, .computed = false },
             }) orelse return null;
-            const this_expr = p.makeNode(.this_expr, start, start, .{ .this_expr = {} }) orelse return null;
-            var super_args = std.ArrayList(*Node){};
-            super_args.append(p.arena, this_expr) catch return null;
-            const super_call_expr = p.makeNode(.call_expr, start, start, .{
-                .call_expr = .{ .callee = super_call, .args = super_args.items },
+            const id_super_p = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
+            const id_args = p.makeNode(.identifier, start, start, .{ .identifier = "arguments" }) orelse return null;
+            const id_nt = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+            var rc_args = std.ArrayList(*Node){};
+            rc_args.append(p.arena, id_super_p) catch return null;
+            rc_args.append(p.arena, id_args) catch return null;
+            rc_args.append(p.arena, id_nt) catch return null;
+            const rc_call = p.makeNode(.call_expr, start, start, .{
+                .call_expr = .{ .callee = callee, .args = rc_args.items },
             }) orelse return null;
-            const super_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = super_call_expr }) orelse return null;
+            const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = rc_call }) orelse return null;
             var body = std.ArrayList(*Node){};
-            body.append(p.arena, super_stmt) catch return null;
+            body.append(p.arena, ret_stmt) catch return null;
             ctor_body = body.items;
         } else {
             ctor_body = &[_]*Node{};
@@ -100,6 +108,25 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     out.append(p.arena, ctor_decl) catch return null;
 
     if (super_name) |sname| {
+        // Object.setPrototypeOf(ClassName, Super) — static inheritance
+        // (BYTES_PER_ELEMENT, from, of, @@species flow to the subclass ctor).
+        {
+            const id_o = p.makeNode(.identifier, start, start, .{ .identifier = "Object" }) orelse return null;
+            const id_sp = p.makeNode(.identifier, start, start, .{ .identifier = "setPrototypeOf" }) orelse return null;
+            const callee_sp = p.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = id_o, .property = id_sp, .computed = false },
+            }) orelse return null;
+            const a_cls = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+            const a_sup = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
+            var sp_args = std.ArrayList(*Node){};
+            sp_args.append(p.arena, a_cls) catch return null;
+            sp_args.append(p.arena, a_sup) catch return null;
+            const sp_call = p.makeNode(.call_expr, start, start, .{
+                .call_expr = .{ .callee = callee_sp, .args = sp_args.items },
+            }) orelse return null;
+            const sp_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = sp_call }) orelse return null;
+            out.append(p.arena, sp_stmt) catch return null;
+        }
         // ClassName.prototype = Object.create(Super.prototype)
         const id_class = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
         const id_proto = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
@@ -197,6 +224,29 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     if (out.items.len == 1) return out.items[0];
     return p.makeNode(.block_stmt, start, p.current.start, .{
         .block_stmt = .{ .body = out.items },
+    });
+}
+
+/// Class expression (named): `class Name [extends Super] { ... }` used as a
+/// value. Reuses the declaration desugar (which produces `var Name = ...`
+/// statements) and wraps it in an IIFE that returns the bound constructor.
+/// ponytail: named only — anonymous `class {}` not yet handled; the harness
+/// `subClass` uses `class MyX extends X {}`, which is named.
+pub fn parseClassExpr(p: *Parser) ?*Node {
+    const start = p.current.start;
+    if (p.peekNext().kind != .identifier) return null; // anonymous: unsupported
+    const class_name = p.peekNext().value_str;
+    const block = parseClassDeclStmt(p) orelse return null;
+    const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+    const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
+    var body = std.ArrayList(*Node){};
+    body.append(p.arena, block) catch return null;
+    body.append(p.arena, ret_stmt) catch return null;
+    const fn_expr = p.makeNode(.function_expr, start, p.current.start, .{
+        .function_expr = .{ .name = null, .params = &[_][]const u8{}, .body = body.items, .is_arrow = false },
+    }) orelse return null;
+    return p.makeNode(.call_expr, start, p.current.start, .{
+        .call_expr = .{ .callee = fn_expr, .args = &[_]*Node{} },
     });
 }
 

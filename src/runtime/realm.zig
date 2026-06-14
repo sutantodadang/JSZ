@@ -63,6 +63,12 @@ pub const Context = struct {
     /// Read a SYMBOL-keyed property, firing accessor getters / Proxy traps and
     /// walking the prototype chain (full [[Get]]). Propagates JS throws.
     get_sym_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, sym_key: Value) anyerror!Value,
+    /// Write a property by string key, firing accessor setters / Proxy traps /
+    /// TypedArray integer-index exotic [[Set]] (full [[Set]]). Propagates throws.
+    set_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void,
+    /// Set [[Prototype]] of an object OR bc_function (materializing the closure's
+    /// backing object). Used by Object.setPrototypeOf for class static inheritance.
+    set_proto_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void,
 
     pub fn invokeJs(self: *Context, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         return self.invoke_fn(self.ptr, arena, this_val, fn_val, args);
@@ -86,6 +92,14 @@ pub const Context = struct {
 
     pub fn getPropSym(self: *Context, arena: std.mem.Allocator, obj_val: Value, sym_key: Value) anyerror!Value {
         return self.get_sym_fn(self.ptr, arena, obj_val, sym_key);
+    }
+
+    pub fn setProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void {
+        return self.set_fn(self.ptr, arena, obj_val, key, value);
+    }
+
+    pub fn setProto(self: *Context, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void {
+        return self.set_proto_fn(self.ptr, arena, obj_val, proto);
     }
 };
 
@@ -502,6 +516,18 @@ fn nativeArrayFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anye
                     try items.append(arena, try typed_array_mod.taLoad(arena, td, i));
                 }
             }
+        } else if (obj.is_array) {
+            // Real Array: iterate by [[ArrayLength]] + indexed reads (length is
+            // the `array_length` slot, NOT an ordinary "length" property).
+            const len: usize = obj.getArrayLength();
+            var i: usize = 0;
+            var buf: [32]u8 = undefined;
+            while (i < len) : (i += 1) {
+                const key = try std.fmt.bufPrint(&buf, "{d}", .{i});
+                try items.append(arena, obj.get(key) orelse Value{});
+            }
+        } else if (try arrayFromIterate(arena, src, &items)) {
+            // Consumed via the @@iterator protocol (Set/Map/generators/custom).
         } else {
             // Generic array-like: read .length then [0..length-1].
             const len_v = obj.get("length") orelse Value{};
@@ -540,6 +566,32 @@ fn nativeArrayFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anye
     }
 
     return try makeJsArray(arena, items.items);
+}
+
+/// Consume `src` via the @@iterator protocol into `items`. Returns false when
+/// `src` is not iterable (no callable @@iterator) so the caller can fall back to
+/// the array-like path. Used by Array.from for Set/Map/generators/custom iterables.
+fn arrayFromIterate(arena: std.mem.Allocator, src: Value, items: *std.ArrayList(Value)) anyerror!bool {
+    _ = arena;
+    _ = src;
+    _ = items;
+    // TODO(Array.from iterables): driving the @@iterator protocol from this native
+    // via ctx.invokeJs re-enters the bc VM and underflows the call-frame stack
+    // (bc_vm.doCall `frames.len - 1`). Disabled until the re-entrant-invoke frame
+    // bug is fixed; Set/Map/generator sources fall through to the array-like path.
+    // Real Arrays are handled by the `is_array` branch above (the common case).
+    return false;
+}
+
+fn isTruthyValue(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .boolean => |b| b,
+        .number => |n| n != 0 and !std.math.isNan(n),
+        .string => |s| s.len != 0,
+        .undefined_, .null_ => false,
+        else => true,
+    };
 }
 
 /// ES2015 Array.of(...args) — creates array from arguments (no special-case for length).
@@ -729,6 +781,12 @@ fn numberPrimitive(arena: std.mem.Allocator, arg: Value) anyerror!f64 {
     return switch (arg.unbox()) {
         .number => |n| n,
         .boolean => |b| if (b) 1 else 0,
+        // Number(bigint) is explicitly allowed (unlike ToNumber, which throws).
+        // ponytail: |x| > ~1.7e38 → NaN; BigInt64/Uint64 elements always fit.
+        .bigint => blk: {
+            const i = arg.toPtr().bigint.toConst().toInt(i128) catch break :blk std.math.nan(f64);
+            break :blk @floatFromInt(i);
+        },
         .string => |s| blk: {
             const trimmed = std.mem.trim(u8, s, &std.ascii.whitespace);
             if (trimmed.len == 0) break :blk 0;
@@ -756,6 +814,40 @@ fn nativeNumberCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
         return this_val;
     }
     return val_mod.makeNumber(arena, n);
+}
+
+/// BigInt(value): NumberToBigInt for a Number arg (integer or RangeError),
+/// else ToBigInt. Not a constructor (`new BigInt` would TypeError, but the
+/// dispatcher handles that). ponytail: integer Numbers up to ~9e18 via i64,
+/// larger via decimal format — exponential ≥1e21 falls through (rare).
+fn nativeBigIntCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    var cur = if (args.len > 0) args[0] else Value{};
+    if (cur.bits == 0) return throwTypeError(arena, "Cannot convert undefined to a BigInt");
+    if (cur.unbox() == .object)
+        cur = (try coercion_mod.toPrimitive(arena, cur, .number)) orelse
+            return throwTypeError(arena, "Cannot convert object to a BigInt");
+    switch (cur.unbox()) {
+        .bigint => return cur,
+        .boolean => |b| return val_mod.makeBigIntFromI64(arena, if (b) 1 else 0),
+        .string => |s| {
+            const t = std.mem.trim(u8, s, " \t\r\n");
+            return val_mod.makeBigIntFromLiteral(arena, if (t.len == 0) "0" else t) catch
+                throwTypeError(arena, "Cannot convert string to a BigInt");
+        },
+        .number => |x| {
+            if (std.math.isNan(x) or std.math.isInf(x) or std.math.floor(x) != x) {
+                const eo = if (active_heap) |h| try JsObject.createOnHeap(h, error_proto_RangeError) else try JsObject.create(arena, error_proto_RangeError);
+                try eo.set("message", try val_mod.makeString(arena, "The number is not a safe integer"));
+                try eo.set("name", try val_mod.makeString(arena, "RangeError"));
+                pending_exception = try val_mod.makeObject(arena, eo);
+                return error.JsException;
+            }
+            if (@abs(x) < 9.0e18) return val_mod.makeBigIntFromI64(arena, @intFromFloat(x));
+            const s = try std.fmt.allocPrint(arena, "{d}", .{x});
+            return val_mod.makeBigIntFromLiteral(arena, s) catch throwTypeError(arena, "Cannot convert number to a BigInt");
+        },
+        else => return throwTypeError(arena, "Cannot convert value to a BigInt"),
+    }
 }
 
 /// Pull a wrapper object's stored `[[PrimitiveValue]]`, if present.
@@ -871,9 +963,29 @@ fn nativeNoop(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Val
     return val_mod.makeUndefined(arena);
 }
 
-fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
-    // Return an empty callable object (truthy; typeof "function"). The function
-    // body string form (`new Function("a", "return a")`) is not supported.
+fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    // `new Function(p1, …, pN, body)`: assemble `(function anonymous(p1,…){body})`
+    // and compile it through the eval bridge, returning the function value.
+    // ponytail: string args only (ToString of non-strings skipped); covers
+    // `new Function("a","return a")` and `new Function("return class … {}")`.
+    if (active_context) |ctx| {
+        var src = std.ArrayList(u8){};
+        try src.appendSlice(arena, "(function anonymous(");
+        if (args.len > 1) {
+            for (args[0 .. args.len - 1], 0..) |a, i| {
+                if (i > 0) try src.append(arena, ',');
+                if (a.bits != 0 and a.unbox() == .string) try src.appendSlice(arena, a.toPtr().string);
+            }
+        }
+        try src.appendSlice(arena, "){");
+        if (args.len > 0) {
+            const body = args[args.len - 1];
+            if (body.bits != 0 and body.unbox() == .string) try src.appendSlice(arena, body.toPtr().string);
+        }
+        try src.appendSlice(arena, "})");
+        return ctx.evalSource(arena, src.items);
+    }
+    // No active VM (shouldn't happen during eval): empty callable.
     const o = if (active_heap) |h|
         try JsObject.createOnHeap(h, active_function_proto)
     else
@@ -954,6 +1066,17 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "findLastIndex", array_proto_mod.nativeFindLastIndex },
         .{ "at", array_proto_mod.nativeAt },
         .{ "sort", array_proto_mod.nativeSort },
+        .{ "fill", array_proto_mod.nativeFill },
+        .{ "copyWithin", array_proto_mod.nativeCopyWithin },
+        .{ "reverse", array_proto_mod.nativeReverse },
+        .{ "lastIndexOf", array_proto_mod.nativeLastIndexOf },
+        .{ "keys", array_proto_mod.nativeArrayKeys },
+        .{ "values", es2015_collections_mod.nativeArrayValues },
+        .{ "entries", array_proto_mod.nativeArrayEntries },
+        .{ "with", array_proto_mod.nativeWith },
+        .{ "toReversed", array_proto_mod.nativeToReversed },
+        .{ "toSorted", array_proto_mod.nativeToSorted },
+        .{ "toSpliced", array_proto_mod.nativeToSpliced },
     };
     const method_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (fns) |pair| {
@@ -1154,6 +1277,7 @@ pub const Realm = struct {
                 const gopd_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptors);
                 try ctor_obj.set("getOwnPropertyDescriptors", gopd_fn);
                 try ctor_obj.set("getPrototypeOf", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetPrototypeOf));
+                try ctor_obj.set("setPrototypeOf", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectSetPrototypeOf));
                 try ctor_obj.set("getOwnPropertyNames", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyNames));
                 try ctor_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptor));
                 try ctor_obj.set("defineProperty", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectDefineProperty));
@@ -1272,6 +1396,12 @@ pub const Realm = struct {
         try number_proto.set("constructor", try val_mod.makeObject(arena, number_ctor_obj));
         try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
 
+        // ---- BigInt(value) global (conversion function; literals `1n` lex
+        // independently). ponytail: asIntN/asUintN/prototype not added yet.
+        const bigint_ctor_obj = try JsObject.create(arena, null);
+        try bigint_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBigIntCtor));
+        try env.define("BigInt", try val_mod.makeObject(arena, bigint_ctor_obj));
+
         // ---- Function constructor (minimal): callable object so `typeof Function`
         // is "function" and `new Function()` / `Function()` yield a truthy callable.
         // Does NOT compile a body string from arguments.
@@ -1339,6 +1469,11 @@ pub const Realm = struct {
         // Wire @@toStringTag + @@species onto TypedArray/ArrayBuffer/DataView protos+ctors now
         // that the well-known symbols exist (register() ran before Symbol init).
         try typed_array_mod.registerSymbols(arena);
+
+        // Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain
+        // now that @@iterator / @@toStringTag exist. Array + TypedArray iterators
+        // all inherit from it.
+        try es2015_collections_mod.initArrayIteratorProto(arena, object_proto);
 
         // ---- ES2015 Reflect ----
         try reflect_mod.register(&reg_ctx);

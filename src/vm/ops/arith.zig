@@ -31,7 +31,11 @@ pub inline fn opAdd(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     } else if (ac.mode == .number_pair and bcv.isNumberValue(lv) and bcv.isNumberValue(rv)) {
         frame.registers[rdst] = try val_mod.makeNumber(self.arena, lv.unbox().number + rv.unbox().number);
     } else {
-        const sum = try self.jsAdd(lv, rv);
+        const sum = self.jsAdd(lv, rv) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in addition")) |oc| return oc;
+            return null;
+        };
         // jsAdd may invoke user ToPrimitive hooks, which can
         // reallocate self.frames; re-fetch the current frame.
         self.frames.items[self.frames.items.len - 1].registers[rdst] = sum;
@@ -52,6 +56,16 @@ pub inline fn opSub(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        const res = self.bigIntArithChecked(lv, rv, .sub) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in BigInt arithmetic")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        ac.mode = .unknown;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         const ln = try self.toNumberCoerced(lv);
         const rn = try self.toNumberCoerced(rv);
@@ -83,6 +97,16 @@ pub inline fn opMul(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        const res = self.bigIntArithChecked(lv, rv, .mul) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in BigInt arithmetic")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        ac.mode = .unknown;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         const ln = try self.toNumberCoerced(lv);
         const rn = try self.toNumberCoerced(rv);
@@ -114,6 +138,16 @@ pub inline fn opDiv(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        const res = self.bigIntArithChecked(lv, rv, .div) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in BigInt arithmetic")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        ac.mode = .unknown;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         ac.mode = .unknown;
         const ln = self.toNumberCoerced(lv) catch |e| {
@@ -150,6 +184,16 @@ pub inline fn opMod(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        const res = self.bigIntArithChecked(lv, rv, .mod) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in BigInt arithmetic")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        ac.mode = .unknown;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         const l = try self.toNumberCoerced(lv);
         const r = try self.toNumberCoerced(rv);
@@ -224,6 +268,16 @@ pub inline fn opBitAnd(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        const res = self.bigIntBitChecked(lv, rv, .band) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in BigInt bitwise op")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        ac.mode = .unknown;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         const lo = try self.toInt32Coerced(lv);
         const ro = try self.toInt32Coerced(rv);
@@ -258,6 +312,16 @@ pub inline fn opBitOr(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        const res = self.bigIntBitChecked(lv, rv, .bor) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in BigInt bitwise op")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        ac.mode = .unknown;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         const lo = try self.toInt32Coerced(lv);
         const ro = try self.toInt32Coerced(rv);
@@ -292,6 +356,16 @@ pub inline fn opBitXor(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        const res = self.bigIntBitChecked(lv, rv, .bxor) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in BigInt bitwise op")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        ac.mode = .unknown;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         const lo = try self.toInt32Coerced(lv);
         const ro = try self.toInt32Coerced(rv);
@@ -326,6 +400,16 @@ pub inline fn opShl(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        const res = self.bigIntBitChecked(lv, rv, .shl) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in BigInt shift")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        ac.mode = .unknown;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         const l = try self.toInt32Coerced(lv);
         const shift: u5 = @intCast((try self.toUint32Coerced(rv)) & 0x1F);
@@ -360,6 +444,16 @@ pub inline fn opShr(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        const res = self.bigIntBitChecked(lv, rv, .shr) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in BigInt shift")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        ac.mode = .unknown;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         const l = try self.toInt32Coerced(lv);
         const shift: u5 = @intCast((try self.toUint32Coerced(rv)) & 0x1F);
@@ -394,6 +488,12 @@ pub inline fn opUshr(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
+        _ = self.throwTypeErr("BigInts have no unsigned right shift, use >> instead") catch {};
+        ac.mode = .unknown;
+        if (try self.raisePendingException("BigInt >>> unsupported")) |oc| return oc;
+        return null;
+    }
     if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
         const l = try self.toInt32Coerced(lv);
         const u: u32 = @bitCast(l);
@@ -425,7 +525,9 @@ pub inline fn opBitNot(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const sv = frame.registers[rsrc];
-    if (bcv.isObjectOperand(sv)) {
+    if (bcv.BcVm.isBigOperand(sv)) {
+        frame.registers[rdst] = try val_mod.bigIntBitNot(self.arena, sv);
+    } else if (bcv.isObjectOperand(sv)) {
         const r: i32 = ~(try self.toInt32Coerced(sv));
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
     } else {
@@ -442,7 +544,10 @@ pub inline fn opInc(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const sv = frame.registers[rsrc];
-    if (bcv.isObjectOperand(sv)) {
+    if (bcv.BcVm.isBigOperand(sv)) {
+        const one = try val_mod.makeBigIntFromI64(self.arena, 1);
+        frame.registers[rdst] = try val_mod.bigIntBinary(self.arena, sv, one, .add);
+    } else if (bcv.isObjectOperand(sv)) {
         const n = try self.toNumberCoerced(sv);
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, n + 1.0);
     } else {
@@ -458,7 +563,10 @@ pub inline fn opDec(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const sv = frame.registers[rsrc];
-    if (bcv.isObjectOperand(sv)) {
+    if (bcv.BcVm.isBigOperand(sv)) {
+        const one = try val_mod.makeBigIntFromI64(self.arena, 1);
+        frame.registers[rdst] = try val_mod.bigIntBinary(self.arena, sv, one, .sub);
+    } else if (bcv.isObjectOperand(sv)) {
         const n = try self.toNumberCoerced(sv);
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, n - 1.0);
     } else {

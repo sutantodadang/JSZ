@@ -796,6 +796,13 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
             const yielded = if (can_have_arg) p.parseAssignmentExpr() orelse return null else null;
             return p.makeNode(.yield_expr, start, p.current.start, .{ .yield_expr = yielded });
         },
+        .kw_of => {
+            // `of` is a contextual keyword (only special in `for…of`); it is a
+            // valid IdentifierReference everywhere else (e.g. `var of = x; of()`).
+            _ = p.advance();
+            return p.makeNode(.identifier, start, end, .{ .identifier = "of" });
+        },
+        .kw_class => return p.parseClassExpr(),
         .identifier => {
             // W2-async: `async function(){}` / `async function name(){}`
             // expression. Contextual: only when `function` follows on the

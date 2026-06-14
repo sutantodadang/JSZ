@@ -4,9 +4,18 @@ const std = @import("std");
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
+const PropAttr = @import("../../object/object.zig").PropAttr;
 const realm_mod = @import("../realm.zig");
 const intrinsics = @import("intrinsics.zig");
+const ta_mod = @import("typed_array.zig");
 const InternalKind = @TypeOf((@as(JsObject, undefined)).internal_kind);
+
+/// Shared %ArrayIteratorPrototype% — the [[Prototype]] of every iterator
+/// returned by Array.prototype.{values,keys,entries}[@@iterator] AND
+/// %TypedArray%.prototype.{values,keys,entries}[@@iterator]. Built once at realm
+/// init (after the well-known symbols resolve). Its [[Prototype]] is the
+/// %IteratorPrototype%.
+pub var active_array_iter_proto: ?*JsObject = null;
 
 /// R1: install Map/Set/WeakMap/WeakSet prototypes + constructors and bind globals.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -444,24 +453,75 @@ fn iteratorMethod(obj: *JsObject) ?Value {
     return null;
 }
 
-/// Per-instance state for the array/string fallback iterator.
-const SeqIterData = struct { seq: Value, index: usize = 0, is_string: bool };
+/// CreateArrayIterator kind (22.1.5.1 / 23.2.5.1): value, key, or key+value.
+pub const SeqIterKind = enum { value, key, entry };
+
+/// Per-instance state for the unified Array/String/TypedArray iterator.
+/// `is_typed` selects the TypedArray element-load path (which reads the live
+/// [[ArrayLength]] each step, so resize/detach during iteration is observed).
+pub const SeqIterData = struct {
+    seq: Value,
+    index: usize = 0,
+    is_string: bool = false,
+    is_typed: bool = false,
+    kind: SeqIterKind = .value,
+};
+
+/// %IteratorPrototype%[@@iterator] and %ArrayIteratorPrototype% reuse: return
+/// the `this` iterator itself.
+fn nativeIterSelf(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return this_val;
+}
+
+/// Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain. Call
+/// once at realm init, after @@iterator / @@toStringTag are resolved.
+pub fn initArrayIteratorProto(arena: std.mem.Allocator, object_proto: *JsObject) !void {
+    const cfg: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+    // %IteratorPrototype%: { [@@iterator]() { return this } }.
+    const iter_proto = try JsObject.create(arena, object_proto);
+    if (realm_mod.active_sym_iterator) |sym|
+        try iter_proto.setSymAttr(sym, try val_mod.makeNativeFunctionNamed(arena, nativeIterSelf, "[Symbol.iterator]", 0), cfg);
+    // %ArrayIteratorPrototype%: { next, [@@toStringTag]: "Array Iterator" }.
+    const aip = try JsObject.create(arena, iter_proto);
+    _ = try aip.defineOwnData("next", try val_mod.makeNativeFunctionNamed(arena, nativeSeqIterNext, "next", 0), cfg);
+    if (realm_mod.active_sym_to_string_tag) |tag|
+        try aip.setSymAttr(tag, try val_mod.makeString(arena, "Array Iterator"), .{ .writable = false, .enumerable = false, .configurable = true });
+    active_array_iter_proto = aip;
+}
 
 /// Array.prototype[Symbol.iterator] (and values()): index iterator over `this`.
 pub fn nativeArrayValues(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const d = try arena.create(SeqIterData);
-        d.* = .{ .seq = this_val, .index = 0, .is_string = false };
+        d.* = .{ .seq = this_val, .kind = .value };
         return makeSeqIterator(arena, d);
     }
     return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
 }
 
-fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
-    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+/// Wrap iterator state in an object whose [[Prototype]] is the shared
+/// %ArrayIteratorPrototype% (so `next` is inherited, not own).
+pub fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
+    const proto = active_array_iter_proto;
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
     obj.internal_slot = d;
-    try obj.set("next", try val_mod.makeNativeFunction(arena, nativeSeqIterNext));
+    // Fallback when the shared proto is not built (early bootstrap): own next.
+    if (proto == null) try obj.set("next", try val_mod.makeNativeFunction(arena, nativeSeqIterNext));
     return val_mod.makeObject(arena, obj);
+}
+
+fn entryPair(arena: std.mem.Allocator, idx: usize, value: Value) !Value {
+    const pair = try newArrayPair(arena);
+    try pair.set("0", try val_mod.makeNumber(arena, @floatFromInt(idx)));
+    try pair.set("1", value);
+    return val_mod.makeObject(arena, pair);
+}
+
+fn newArrayPair(arena: std.mem.Allocator) !*JsObject {
+    const pair = try JsObject.create(arena, realm_mod.active_array_proto);
+    pair.is_array = true;
+    pair.array_length = 2;
+    return pair;
 }
 
 fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -476,12 +536,28 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
         d.index += 1;
         return makeIteratorResult(arena, try val_mod.makeString(arena, ch), false);
     }
+    if (d.is_typed) {
+        const td = ta_mod.getTd(d.seq) orelse return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+        if (d.index >= ta_mod.taCurrentLen(td)) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+        const idx = d.index;
+        d.index += 1;
+        return switch (d.kind) {
+            .key => makeIteratorResult(arena, try val_mod.makeNumber(arena, @floatFromInt(idx)), false),
+            .value => makeIteratorResult(arena, try ta_mod.taLoad(arena, td, idx), false),
+            .entry => makeIteratorResult(arena, try entryPair(arena, idx, try ta_mod.taLoad(arena, td, idx)), false),
+        };
+    }
     const arr = d.seq.toPtr().object;
     if (d.index >= arr.getArrayLength()) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
-    const idx_str = try std.fmt.allocPrint(arena, "{d}", .{d.index});
-    const v = arr.get(idx_str) orelse try val_mod.makeUndefined(arena);
+    const idx = d.index;
     d.index += 1;
-    return makeIteratorResult(arena, v, false);
+    const idx_str = try std.fmt.allocPrint(arena, "{d}", .{idx});
+    const v = arr.get(idx_str) orelse try val_mod.makeUndefined(arena);
+    return switch (d.kind) {
+        .key => makeIteratorResult(arena, try val_mod.makeNumber(arena, @floatFromInt(idx)), false),
+        .value => makeIteratorResult(arena, v, false),
+        .entry => makeIteratorResult(arena, try entryPair(arena, idx, v), false),
+    };
 }
 
 /// __getIterator__(x): obtain an iterator (object with next()) for `x`.

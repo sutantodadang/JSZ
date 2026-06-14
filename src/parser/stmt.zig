@@ -280,8 +280,8 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     if (p.check(.left_bracket) or p.check(.left_brace)) {
         return p.parseDestructuringDeclarator(kind, start);
     }
-    const name_tok = p.expect(.identifier) orelse return null;
-    const name = name_tok.value_str;
+    const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
+    const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
     var init_node: ?*Node = null;
     if (p.match(.eq)) {
         init_node = p.parseAssignmentExpr();

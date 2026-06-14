@@ -116,6 +116,16 @@ pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value)
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeUndefined(arena);
 
+    // M15: TypedArray integer-indexed exotic [[Get]]: valid index → element,
+    // invalid canonical-numeric (non-integer/-0/OOB/detached) → undefined.
+    if (target_obj.internal_kind == .typed_array) {
+        if (typed_array.canonicalNumericIndexString(k)) |idx_f| {
+            const td = typed_array.getTd(target) orelse return val_mod.makeUndefined(arena);
+            if (!typed_array.isValidIntegerIndex(td, idx_f)) return val_mod.makeUndefined(arena);
+            return typed_array.taLoad(arena, td, @intFromFloat(idx_f));
+        }
+    }
+
     if (target_obj.findProperty(k)) |found| {
         const attr = found.holder.attrAt(found.slot);
         if (attr.is_accessor) {
@@ -151,11 +161,39 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
     const target_obj = target.toPtr().object;
 
     if (isSym(key)) {
+        // OrdinarySet for a symbol key: honor accessor setters and the
+        // [[Writable]] attribute (a non-writable own data prop → false).
+        if (target_obj.getOwnSymEntry(key)) |sp| {
+            if (sp.attr.is_accessor) {
+                if (sp.value.bits != 0 and sp.value.isHeapPtr() and sp.value.toPtr().* == .object) {
+                    const setter = sp.value.toPtr().object.getOwn("set") orelse return val_mod.makeBool(arena, false);
+                    if (isCallable(setter)) {
+                        _ = try fp.invokeCallback(arena, target, setter, &[_]Value{value});
+                        return val_mod.makeBool(arena, true);
+                    }
+                }
+                return val_mod.makeBool(arena, false);
+            }
+            if (!sp.attr.writable) return val_mod.makeBool(arena, false);
+            try target_obj.setSymAttr(key, value, sp.attr);
+            return val_mod.makeBool(arena, true);
+        }
         try target_obj.setSym(key, value);
         return val_mod.makeBool(arena, true);
     }
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
+
+    // M15: TypedArray integer-indexed exotic [[Set]]. ToNumber/ToBigInt always
+    // runs (valueOf side effects + abrupt throws propagate); stores only when the
+    // index is valid; invalid/OOB is a no-op. [[Set]] returns true regardless.
+    if (target_obj.internal_kind == .typed_array) {
+        if (typed_array.canonicalNumericIndexString(k)) |idx_f| {
+            const td = typed_array.getTd(target) orelse return val_mod.makeBool(arena, false);
+            try typed_array.setElementThrowing(arena, td, idx_f, value);
+            return val_mod.makeBool(arena, true);
+        }
+    }
 
     // Check for accessor in proto chain.
     if (target_obj.findProperty(k)) |found| {
@@ -352,6 +390,22 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
 
     const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeBool(arena, false);
     const desc = args[2].toPtr().object;
+
+    // M15: TypedArray [[DefineOwnProperty]] — integer-indexed exotic (ES2023
+    // §10.4.5.3). Reflect returns false (no throw) on rejection.
+    if (target_obj.internal_kind == .typed_array) {
+        if (typed_array.canonicalNumericIndexString(k)) |idx_f| {
+            const td = typed_array.getTd(args[0]).?;
+            if (!typed_array.isValidIntegerIndex(td, idx_f)) return val_mod.makeBool(arena, false);
+            if (desc.hasOwn("configurable") and !descTruthy(desc.getOwn("configurable"))) return val_mod.makeBool(arena, false);
+            if (desc.hasOwn("enumerable") and !descTruthy(desc.getOwn("enumerable"))) return val_mod.makeBool(arena, false);
+            if (desc.hasOwn("get") or desc.hasOwn("set")) return val_mod.makeBool(arena, false);
+            if (desc.hasOwn("writable") and !descTruthy(desc.getOwn("writable"))) return val_mod.makeBool(arena, false);
+            if (desc.hasOwn("value")) try typed_array.setElementThrowing(arena, td, idx_f, desc.getOwn("value").?);
+            return val_mod.makeBool(arena, true);
+        }
+        // Non-canonical key: fall through to ordinary defineOwnData.
+    }
 
     if (desc.hasOwn("get") or desc.hasOwn("set")) {
         const getter: ?Value = if (desc.hasOwn("get")) desc.getOwn("get") else null;

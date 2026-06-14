@@ -193,7 +193,17 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
     const key: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
         args[0].toPtr().string
     else
-        return val_mod.makeBool(arena, false);
+        (try coerceKey(arena, args[0])) orelse return val_mod.makeBool(arena, false);
+
+    // TypedArray integer-indexed elements are own iff a valid integer index;
+    // a canonical-numeric-but-invalid key ("0.1","-0",OOB) is NOT an own prop.
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        if (ta_mod.canonicalNumericIndexString(key)) |idx_f| {
+            const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+            return val_mod.makeBool(arena, ta_mod.isValidIntegerIndex(td, idx_f));
+        }
+    }
 
     return val_mod.makeBool(arena, obj.hasOwn(key));
 }
@@ -300,6 +310,30 @@ pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
     const obj = args[0].toPtr().object;
     if (obj.proto) |p| return val_mod.makeObject(arena, p);
     return val_mod.makeNull(arena);
+}
+
+/// Object.setPrototypeOf(o, proto): set o's [[Prototype]]. Handles plain
+/// objects and bc_function ctors (sets the backing object's proto, so static
+/// members inherit along the constructor chain — needed for class subclassing).
+pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0) return val_mod.makeUndefined(arena);
+    const target = args[0];
+    const new_proto: ?*JsObject = blk: {
+        if (args.len < 2 or args[1].bits == 0) break :blk null;
+        break :blk switch (args[1].unbox()) {
+            .object => |o| o,
+            .null_ => null,
+            else => null,
+        };
+    };
+    if (target.bits != 0) {
+        if (target.unbox() == .object) {
+            target.toPtr().object.proto = new_proto;
+        } else if (@import("../realm.zig").active_context) |ctx| {
+            try ctx.setProto(arena, target, new_proto); // bc_function ctor (static inheritance)
+        }
+    }
+    return target;
 }
 
 /// Object.getOwnPropertyNames(o): all own keys including non-enumerable.

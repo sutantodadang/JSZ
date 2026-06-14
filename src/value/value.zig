@@ -140,6 +140,74 @@ pub fn bigIntPow(arena: std.mem.Allocator, base_v: Value, exp_v: Value) !Value {
     return makeBigInt(arena, result.toConst());
 }
 
+pub const BigOp = enum { add, sub, mul, div, mod };
+
+/// BigInt binary arithmetic on two `.bigint` Values. Division/remainder truncate
+/// toward zero (ES BigInt semantics) and return error.DivisionByZero on a zero
+/// divisor (caller throws RangeError).
+pub fn bigIntBinary(arena: std.mem.Allocator, a_v: Value, b_v: Value, op: BigOp) !Value {
+    var am = try a_v.toPtr().bigint.toConst().toManaged(arena);
+    var bm = try b_v.toPtr().bigint.toConst().toManaged(arena);
+    var r = try std.math.big.int.Managed.init(arena);
+    switch (op) {
+        .add => try r.add(&am, &bm),
+        .sub => try r.sub(&am, &bm),
+        .mul => try r.mul(&am, &bm),
+        .div => {
+            if (bm.toConst().eqlZero()) return error.DivisionByZero;
+            var rem = try std.math.big.int.Managed.init(arena);
+            try r.divTrunc(&rem, &am, &bm);
+        },
+        .mod => {
+            if (bm.toConst().eqlZero()) return error.DivisionByZero;
+            var q = try std.math.big.int.Managed.init(arena);
+            try q.divTrunc(&r, &am, &bm);
+        },
+    }
+    return makeBigInt(arena, r.toConst());
+}
+
+pub const BigBitOp = enum { band, bor, bxor, shl, shr };
+
+/// BigInt bitwise/shift on two `.bigint` Values (two's-complement semantics via
+/// std big.int). Shift count outside u64 → error.Overflow (caller throws Range).
+pub fn bigIntBitwise(arena: std.mem.Allocator, a_v: Value, b_v: Value, op: BigBitOp) !Value {
+    var am = try a_v.toPtr().bigint.toConst().toManaged(arena);
+    var r = try std.math.big.int.Managed.init(arena);
+    switch (op) {
+        .band => {
+            var bm = try b_v.toPtr().bigint.toConst().toManaged(arena);
+            try r.bitAnd(&am, &bm);
+        },
+        .bor => {
+            var bm = try b_v.toPtr().bigint.toConst().toManaged(arena);
+            try r.bitOr(&am, &bm);
+        },
+        .bxor => {
+            var bm = try b_v.toPtr().bigint.toConst().toManaged(arena);
+            try r.bitXor(&am, &bm);
+        },
+        .shl, .shr => {
+            const cnt = b_v.toPtr().bigint.toConst().toInt(i64) catch return error.Overflow;
+            // `>>` by n == `<<` by -n. Negative shift flips direction.
+            const want_left = (op == .shl) == (cnt >= 0);
+            const amt: usize = @intCast(if (cnt < 0) -cnt else cnt);
+            if (want_left) try r.shiftLeft(&am, amt) else try r.shiftRight(&am, amt);
+        },
+    }
+    return makeBigInt(arena, r.toConst());
+}
+
+/// BigInt bitwise NOT: `~x == -(x + 1)`. `v` must be `.bigint`.
+pub fn bigIntBitNot(arena: std.mem.Allocator, v: Value) !Value {
+    var m = try v.toPtr().bigint.toConst().toManaged(arena);
+    var one = try std.math.big.int.Managed.initSet(arena, 1);
+    var t = try std.math.big.int.Managed.init(arena);
+    try t.add(&m, &one);
+    t.negate();
+    return makeBigInt(arena, t.toConst());
+}
+
 /// BigInt negation (unary minus). `v` must be `.bigint`.
 pub fn bigIntNegate(arena: std.mem.Allocator, v: Value) !Value {
     var m = try v.toPtr().bigint.toConst().toManaged(arena);

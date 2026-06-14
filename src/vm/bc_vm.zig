@@ -369,7 +369,12 @@ pub const BcVm = struct {
                             return e;
                         };
                         realm_m.active_constructing = false;
-                        const ret = if (result.bits != 0 and result.unbox() == .object) result else this_val;
+                        // [[Construct]] adopts an Object return; in our split value
+                        // model functions are objects too (e.g. `new Function(body)`).
+                        const ret = if (result.bits != 0 and switch (result.unbox()) {
+                            .object, .bc_function, .native_function, .function => true,
+                            else => false,
+                        }) result else this_val;
                         // Ctor didn't consume the NewTarget → apply prototype now.
                         if (realm_m.pending_new_target.bits != 0) {
                             const p = self.protoFromNewTarget(new_target, null) catch |e| {
@@ -413,6 +418,28 @@ pub const BcVm = struct {
         _ = arena;
         const self: *BcVm = @ptrCast(@alignCast(ptr));
         return self.getPropSym(obj_val, sym_key);
+    }
+
+    fn bcSetProp(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        return self.setProp(obj_val, key, value);
+    }
+
+    fn bcSetProto(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        if (obj_val.bits == 0) return;
+        switch (obj_val.unbox()) {
+            .object => |o| o.proto = proto,
+            // bc_function ctor: set the backing object's proto so static members
+            // resolve along the constructor chain (class subclassing).
+            .bc_function => |c| {
+                const bo = try self.closureBackingObj(c);
+                bo.proto = proto;
+            },
+            else => {},
+        }
     }
 
     fn bcConstructNt(ptr: *anyopaque, arena: std.mem.Allocator, ctor_val: Value, args: []const Value, new_target: Value) anyerror!Value {
@@ -470,6 +497,8 @@ pub const BcVm = struct {
             .get_fn = bcGetProp,
             .construct_nt_fn = bcConstructNt,
             .get_sym_fn = bcGetPropSym,
+            .set_fn = bcSetProp,
+            .set_proto_fn = bcSetProto,
         };
         realm_mod.active_context = &self.context;
     }
@@ -780,7 +809,12 @@ pub const BcVm = struct {
                             return "native constructor threw";
                         };
                         realm_c.active_constructing = false;
-                        const final_r = if (result.bits != 0 and result.unbox() == .object) result else this_val;
+                        // Adopt an Object return; functions are objects too
+                        // (`new Function(body)` returns a compiled function).
+                        const final_r = if (result.bits != 0 and switch (result.unbox()) {
+                            .object, .bc_function, .native_function, .function => true,
+                            else => false,
+                        }) result else this_val;
                         self.frames.items[self.frames.items.len - 1].registers[rdst] = final_r;
                         return null;
                     }
@@ -1175,10 +1209,14 @@ pub const BcVm = struct {
                 // index past the end (or on a detached buffer) yields undefined and
                 // never falls through to ordinary property lookup.
                 if (obj.internal_kind == .typed_array) {
-                    if (typed_array.canonicalIndex(key)) |i| {
+                    // Any canonical numeric index string ("0","0.1","-0","5") is
+                    // handled by the exotic [[Get]]: valid index → element; invalid
+                    // (non-integer, -0, OOB, detached) → undefined; NEVER falls
+                    // through to ordinary property lookup. Non-numeric keys do.
+                    if (typed_array.canonicalNumericIndexString(key)) |idx_f| {
                         const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-                        if (i >= typed_array.taCurrentLen(td)) return val_mod.makeUndefined(self.arena);
-                        return typed_array.taLoad(self.arena, td, i);
+                        if (!typed_array.isValidIntegerIndex(td, idx_f)) return val_mod.makeUndefined(self.arena);
+                        return typed_array.taLoad(self.arena, td, @intFromFloat(idx_f));
                     }
                 }
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
@@ -1344,12 +1382,14 @@ pub const BcVm = struct {
                 // value (ToNumber/ToBigInt) then store; out-of-bounds is a silent
                 // no-op and indexed keys never create ordinary properties.
                 if (obj.internal_kind == .typed_array) {
-                    if (typed_array.canonicalIndex(key)) |i| {
+                    // Any canonical numeric index string routes to the exotic
+                    // [[Set]]: ToNumber/ToBigInt always runs (valueOf side effects +
+                    // abrupt throws propagate); the element stores only when the
+                    // index is valid; invalid indices ("0.1","-0",OOB) are a no-op
+                    // and NEVER create an ordinary property.
+                    if (typed_array.canonicalNumericIndexString(key)) |idx_f| {
                         const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-                        // IntegerIndexedElementSet: ToNumber/ToBigInt always runs
-                        // (valueOf side effects + abrupt throws propagate); store only
-                        // when the index is still valid.
-                        try typed_array.setElementThrowing(self.arena, td, @floatFromInt(i), value);
+                        try typed_array.setElementThrowing(self.arena, td, idx_f, value);
                         return;
                     }
                 }
@@ -1833,7 +1873,14 @@ pub const BcVm = struct {
                             }
                             return try std.fmt.allocPrint(self.arena, "TypeError: bound call threw", .{});
                         };
-                        self.frames.items[self.frames.items.len - 1].registers[ret_dst] = res;
+                        // Re-entrant entry (a native invoked us with no caller frame on
+                        // the stack) → route the result back through `self.result`,
+                        // which `bcInvokeJs` returns; avoids a `len - 1` underflow.
+                        if (self.frames.items.len > 0) {
+                            self.frames.items[self.frames.items.len - 1].registers[ret_dst] = res;
+                        } else {
+                            self.result = res;
+                        }
                         return null;
                     }
                 }
@@ -2038,7 +2085,14 @@ pub const BcVm = struct {
                             }
                             return try std.fmt.allocPrint(self.arena, "TypeError: bound call threw", .{});
                         };
-                        self.frames.items[self.frames.items.len - 1].registers[ret_dst] = res;
+                        // Re-entrant entry (a native invoked us with no caller frame on
+                        // the stack) → route the result back through `self.result`,
+                        // which `bcInvokeJs` returns; avoids a `len - 1` underflow.
+                        if (self.frames.items.len > 0) {
+                            self.frames.items[self.frames.items.len - 1].registers[ret_dst] = res;
+                        } else {
+                            self.result = res;
+                        }
                         return null;
                     }
                 }
@@ -2302,7 +2356,42 @@ pub const BcVm = struct {
             const combined = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ ls_str, rs_str });
             return val_mod.makeString(self.arena, combined);
         }
+        // BigInt + BigInt → BigInt add; one BigInt mixed with a non-BigInt
+        // (and non-string, handled above) → TypeError.
+        const lbig = isBigOperand(lp);
+        const rbig = isBigOperand(rp);
+        if (lbig or rbig) {
+            if (lbig != rbig) return self.throwTypeErr("Cannot mix BigInt and other types, use explicit conversions");
+            return val_mod.bigIntBinary(self.arena, lp, rp, .add);
+        }
         return val_mod.makeNumber(self.arena, toNumber(lp) + toNumber(rp));
+    }
+
+    /// True when `v` is a BigInt value.
+    pub fn isBigOperand(v: Value) bool {
+        return v.bits != 0 and v.unbox() == .bigint;
+    }
+
+    /// SUB/MUL/DIV/MOD on BigInt operands (at least one is a BigInt). Both BigInt →
+    /// result; mixed with a non-BigInt → TypeError; zero divisor → RangeError.
+    pub fn bigIntArithChecked(self: *BcVm, lv: Value, rv: Value, op: val_mod.BigOp) !Value {
+        if (isBigOperand(lv) != isBigOperand(rv))
+            return self.throwTypeErr("Cannot mix BigInt and other types, use explicit conversions");
+        return val_mod.bigIntBinary(self.arena, lv, rv, op) catch |e| {
+            if (e == error.DivisionByZero) return self.throwRangeErr("Division by zero");
+            return e;
+        };
+    }
+
+    /// Bitwise/shift on BigInt operands. Both BigInt → result; mixed → TypeError;
+    /// over-large shift count → RangeError.
+    pub fn bigIntBitChecked(self: *BcVm, lv: Value, rv: Value, op: val_mod.BigBitOp) !Value {
+        if (isBigOperand(lv) != isBigOperand(rv))
+            return self.throwTypeErr("Cannot mix BigInt and other types, use explicit conversions");
+        return val_mod.bigIntBitwise(self.arena, lv, rv, op) catch |e| {
+            if (e == error.Overflow) return self.throwRangeErr("BigInt shift count is too large");
+            return e;
+        };
     }
 
     /// ToNumber that honors user-defined ToPrimitive(number) on objects.
@@ -2330,7 +2419,7 @@ pub const BcVm = struct {
     }
 
     /// Throw a `TypeError` (sets pending_exception, returns error.JsException).
-    fn throwTypeErr(self: *BcVm, msg: []const u8) anyerror {
+    pub fn throwTypeErr(self: *BcVm, msg: []const u8) anyerror {
         const realm_mod = @import("../runtime/realm.zig");
         const obj = if (realm_mod.active_heap) |h|
             try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)

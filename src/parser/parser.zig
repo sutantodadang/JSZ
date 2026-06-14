@@ -641,6 +641,10 @@ pub const Parser = struct {
         return class_mod.parseClassDeclStmt(self);
     }
 
+    pub fn parseClassExpr(self: *Parser) ?*Node {
+        return class_mod.parseClassExpr(self);
+    }
+
     pub fn parseFunctionParams(self: *Parser) ?ParamParse {
         return class_mod.parseFunctionParams(self);
     }
