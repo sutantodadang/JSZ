@@ -520,12 +520,24 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     return val_mod.makeObject(arena, desc);
 }
 
+/// Resolve a defineProperty/defineProperties target to its property-bearing
+/// JsObject. Plain objects resolve directly; functions resolve via the active
+/// context's backing-object bridge (functions are objects). Returns null for
+/// primitives / non-property-bearing values.
+fn defineTarget(arena: std.mem.Allocator, val: Value) anyerror!?*JsObject {
+    if (val.bits == 0) return null;
+    if (val.unbox() == .object) return val.toPtr().object;
+    const realm_mod = @import("../realm.zig");
+    if (realm_mod.active_context) |ctx| return ctx.backingObject(arena, val);
+    return null;
+}
+
 /// Object.defineProperty(o, key, descriptor): define/redefine a data property.
 pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len < 1 or args[0].bits == 0 or args[0].unbox() != .object) {
+    // Functions are objects too: resolve a callable to its backing object so
+    // `Object.defineProperty(fn, ...)` works (not just plain objects).
+    const obj = try defineTarget(arena, if (args.len >= 1) args[0] else Value{}) orelse
         return throwTypeError(arena, "Object.defineProperty called on non-object");
-    }
-    const obj = args[0].toPtr().object;
 
     const key_raw = if (args.len >= 2) args[1] else Value{};
 
@@ -594,9 +606,22 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         const getter: ?Value = if (desc.hasOwn("get")) desc.getOwn("get") else null;
         const setter: ?Value = if (desc.hasOwn("set")) desc.getOwn("set") else null;
         const holder = try makeAccessorHolder(arena, getter, setter);
+        // Partial descriptor: omitted enumerable/configurable keep the EXISTING
+        // own attributes (redefine), else default false (create) — same merge as
+        // the data path. Without this, redefining a configurable accessor with a
+        // bare {get} silently flips it non-configurable and blocks the next redefine.
+        var prev_e = false;
+        var prev_c = false;
+        if (obj.findProperty(key)) |loc| {
+            if (loc.holder == obj) {
+                const a = loc.holder.attrAt(loc.slot);
+                prev_e = a.enumerable;
+                prev_c = a.configurable;
+            }
+        }
         const attr = PropAttr{
-            .enumerable = descTruthy(desc.getOwn("enumerable")),
-            .configurable = descTruthy(desc.getOwn("configurable")),
+            .enumerable = if (desc.hasOwn("enumerable")) descTruthy(desc.getOwn("enumerable")) else prev_e,
+            .configurable = if (desc.hasOwn("configurable")) descTruthy(desc.getOwn("configurable")) else prev_c,
         };
         const ok = try obj.defineOwnAccessor(key, holder, attr);
         if (!ok) return throwTypeError(arena, "cannot redefine property");

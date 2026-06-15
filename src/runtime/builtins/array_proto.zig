@@ -576,6 +576,7 @@ pub fn nativeFind(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (args.len == 0) return val_mod.makeUndefined(arena);
     const cb = args[0];
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
     var i: usize = 0;
     while (i < len) : (i += 1) {
@@ -590,6 +591,7 @@ pub fn nativeFindIndex(arena: std.mem.Allocator, this_val: Value, args: []const 
     if (args.len == 0) return val_mod.makeNumber(arena, -1.0);
     const cb = args[0];
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
     var i: usize = 0;
     while (i < len) : (i += 1) {
@@ -623,6 +625,7 @@ pub fn nativeFindLast(arena: std.mem.Allocator, this_val: Value, args: []const V
     if (args.len == 0) return val_mod.makeUndefined(arena);
     const cb = args[0];
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
     if (len == 0) return val_mod.makeUndefined(arena);
     var i: usize = len;
@@ -640,6 +643,7 @@ pub fn nativeFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []co
     if (args.len == 0) return val_mod.makeNumber(arena, -1.0);
     const cb = args[0];
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
     if (len == 0) return val_mod.makeNumber(arena, -1.0);
     var i: usize = len;
@@ -970,6 +974,77 @@ pub fn nativeToSpliced(arena: std.mem.Allocator, this_val: Value, args: []const 
     }
     new_arr.array_length = @intCast(new_len);
     return arr_val;
+}
+
+/// Array.prototype.splice(start, deleteCount, ...items) — mutating: removes
+/// `deleteCount` elements at `start`, inserts `items`, returns the removed
+/// elements as a new array, and updates `length`.
+/// ponytail: real-array path only (getArray); array-like/proxy receivers are
+/// out of scope — the only thing that exercises a non-array receiver is
+/// `Array.prototype.splice.call(arrayLike)`, which no current test needs.
+pub fn nativeSplice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const arr = getArray(this_val) orelse return val_mod.makeUndefined(arena);
+    const len = arr.array_length;
+    const start = if (args.len > 0) relIndex(toNumArg(args[0]), len) else 0;
+    // Spec §23.1.3.31: 0 args → delete 0; 1 arg → delete to end; ≥2 → clamp.
+    var del_count: usize = 0;
+    if (args.len == 1) {
+        del_count = len - start;
+    } else if (args.len >= 2) {
+        const n = toNumArg(args[1]);
+        const ni = if (std.math.isNan(n)) @as(i64, 0) else val_mod.f64ToI64Sat(n);
+        del_count = if (ni < 0) 0 else @min(@as(usize, @intCast(ni)), len - start);
+    }
+    const items = if (args.len > 2) args[2..] else &[_]Value{};
+
+    // Removed elements → result array.
+    const removed = try newResultArray(arena);
+    {
+        var r: usize = 0;
+        while (r < del_count) : (r += 1) {
+            const sk = try std.fmt.allocPrint(arena, "{d}", .{start + r});
+            if (arr.getOwn(sk)) |v| {
+                const dk = try std.fmt.allocPrint(arena, "{d}", .{r});
+                try removed.set(dk, v);
+            }
+        }
+        removed.array_length = @intCast(del_count);
+    }
+
+    const insert = items.len;
+    const new_len = len - del_count + insert;
+    if (insert < del_count) {
+        // Shift the tail down (low → high is safe when moving toward 0).
+        var i: usize = start + del_count;
+        while (i < len) : (i += 1) {
+            const fk = try std.fmt.allocPrint(arena, "{d}", .{i});
+            const tk = try std.fmt.allocPrint(arena, "{d}", .{i - del_count + insert});
+            if (arr.getOwn(fk)) |v| try arr.set(tk, v) else _ = try arr.deleteOwn(tk);
+        }
+        // Delete now-vacated trailing slots [new_len, len).
+        var d: usize = new_len;
+        while (d < len) : (d += 1) {
+            const dk = try std.fmt.allocPrint(arena, "{d}", .{d});
+            _ = try arr.deleteOwn(dk);
+        }
+    } else if (insert > del_count) {
+        // Shift the tail up (high → low to avoid clobbering).
+        var i: usize = len;
+        while (i > start + del_count) : (i -= 1) {
+            const from = i - 1;
+            const fk = try std.fmt.allocPrint(arena, "{d}", .{from});
+            const tk = try std.fmt.allocPrint(arena, "{d}", .{from - del_count + insert});
+            if (arr.getOwn(fk)) |v| try arr.set(tk, v) else _ = try arr.deleteOwn(tk);
+        }
+    }
+
+    // Write inserted items at `start`.
+    for (items, 0..) |it, j| {
+        const k = try std.fmt.allocPrint(arena, "{d}", .{start + j});
+        try arr.set(k, it);
+    }
+    arr.array_length = @intCast(new_len);
+    return val_mod.makeObject(arena, removed);
 }
 
 fn toNumArg(v: Value) f64 {

@@ -19,7 +19,9 @@ pub inline fn opEq(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
+    // BigInt cross-type abstract equality needs an arena (to build the
+    // comparison BigInt), so route it through the method path too.
+    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or isBigIntOperand(lv) or isBigIntOperand(rv)) {
         const r = self.abstractEqual(lv, rv) catch |e| {
             if (e != error.JsException) return e;
             if (try self.raisePendingException("error in ToPrimitive")) |oc| return oc;
@@ -32,6 +34,10 @@ pub inline fn opEq(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+inline fn isBigIntOperand(v: val_mod.Value) bool {
+    return v.bits != 0 and v.unbox() == .bigint;
+}
+
 pub inline fn opNeq(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const rdst = code[frame.pc];
@@ -42,7 +48,7 @@ pub inline fn opNeq(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
+    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or isBigIntOperand(lv) or isBigIntOperand(rv)) {
         const r = self.abstractEqual(lv, rv) catch |e| {
             if (e != error.JsException) return e;
             if (try self.raisePendingException("error in ToPrimitive")) |oc| return oc;

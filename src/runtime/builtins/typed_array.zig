@@ -30,20 +30,24 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const object_proto = ctx.object_proto;
     const fn_proto_obj = ctx.function_proto.?;
 
-    // ArrayBuffer
+    // ArrayBuffer. Methods registered with spec-exact `.length` (arity) — the
+    // generic setMethods helper hardcodes length 0, which fails the per-method
+    // `length` prop-desc tests.
     const ab_proto = try JsObject.create(arena, object_proto);
-    try intrinsics.setMethods(arena, ab_proto, .{
-        .{ "slice", nativeArrayBufferSlice },
-        .{ "transfer", nativeAbTransfer },
-        .{ "transferToFixedLength", nativeAbTransferToFixedLength },
-        // transferToImmutable / sliceToImmutable (bodies below) NOT registered:
-        // adding a 5th ab_proto method changes heap layout and triggers a
-        // pre-existing latent memory-corruption segfault that only manifests in the
-        // long full built-ins/ArrayBuffer suite run (each dir passes in isolation;
-        // body-independent; non-deterministic crash address; manual-GC). Needs an
-        // ASAN/debugger run to locate the real bug before re-registering.
-        .{ "resize", nativeAbResize },
-    });
+    {
+        const m: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+        const ab_methods = .{
+            .{ "slice", nativeArrayBufferSlice, 2 },
+            .{ "transfer", nativeAbTransfer, 0 },
+            .{ "transferToFixedLength", nativeAbTransferToFixedLength, 0 },
+            .{ "transferToImmutable", nativeAbTransferToImmutable, 0 },
+            .{ "sliceToImmutable", nativeAbSliceToImmutable, 2 },
+            .{ "resize", nativeAbResize, 1 },
+        };
+        inline for (ab_methods) |e| {
+            _ = try ab_proto.defineOwnData(e[0], try val_mod.makeNativeFunctionNamed(arena, e[1], e[0], e[2]), m);
+        }
+    }
     try defineGetter(arena, ab_proto, "detached", abGetDetached);
     try defineGetter(arena, ab_proto, "byteLength", abGetByteLength);
     try defineGetter(arena, ab_proto, "resizable", abGetResizable);
@@ -533,9 +537,78 @@ fn toNum(v: Value) f64 {
     };
 }
 
+/// Spec StringToNumber (§7.1.4.1). Zig's parseFloat is both too lenient (accepts
+/// `_` digit separators and `0x` hex floats) and too strict (no leading `+`, no
+/// `0b`/`0o`/`0x` integer literals), so the JS grammar is enforced explicitly.
+/// StrWhiteSpace codepoint (WhiteSpace + LineTerminator): trimmed off both ends
+/// before parsing a StringNumericLiteral.
+fn isJsWs(cp: u21) bool {
+    return switch (cp) {
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF => true,
+        else => false,
+    };
+}
+
+/// Trim leading/trailing JS whitespace (Unicode-aware). Falls back to ASCII trim
+/// on invalid UTF-8.
+fn trimJsWs(s: []const u8) []const u8 {
+    const view = std.unicode.Utf8View.init(s) catch return std.mem.trim(u8, s, " \t\n\r\x0b\x0c");
+    var start: usize = 0;
+    var it = view.iterator();
+    while (it.nextCodepointSlice()) |sl| {
+        const cp = std.unicode.utf8Decode(sl) catch break;
+        if (!isJsWs(cp)) break;
+        start += sl.len;
+    }
+    var end: usize = start;
+    var pos: usize = start;
+    var it2 = (std.unicode.Utf8View.init(s[start..]) catch return s[start..]).iterator();
+    while (it2.nextCodepointSlice()) |sl| {
+        const cp = std.unicode.utf8Decode(sl) catch {
+            pos += sl.len;
+            end = pos;
+            continue;
+        };
+        pos += sl.len;
+        if (!isJsWs(cp)) end = pos;
+    }
+    return s[start..end];
+}
+
 fn strToNum(s: []const u8) f64 {
-    const t = std.mem.trim(u8, s, " \t\r\n");
+    const t = trimJsWs(s);
     if (t.len == 0) return 0;
+    if (std.mem.eql(u8, t, "Infinity") or std.mem.eql(u8, t, "+Infinity")) return std.math.inf(f64);
+    if (std.mem.eql(u8, t, "-Infinity")) return -std.math.inf(f64);
+    // NonDecimalIntegerLiteral: 0b/0o/0x (no sign, no separators).
+    if (t.len > 2 and t[0] == '0') {
+        const radix: ?u8 = switch (t[1]) {
+            'b', 'B' => 2,
+            'o', 'O' => 8,
+            'x', 'X' => 16,
+            else => null,
+        };
+        if (radix) |r| {
+            var acc: f64 = 0;
+            for (t[2..]) |c| {
+                const d: u8 = switch (c) {
+                    '0'...'9' => c - '0',
+                    'a'...'f' => c - 'a' + 10,
+                    'A'...'F' => c - 'A' + 10,
+                    else => return std.math.nan(f64),
+                };
+                if (d >= r) return std.math.nan(f64);
+                acc = acc * @as(f64, @floatFromInt(r)) + @as(f64, @floatFromInt(d));
+            }
+            return acc;
+        }
+    }
+    // Decimal literal: restrict to the JS charset (rejects `_`, hex, `Infinity`
+    // typos) before handing to parseFloat, which accepts the decimal grammar.
+    for (t) |c| switch (c) {
+        '0'...'9', '.', 'e', 'E', '+', '-' => {},
+        else => return std.math.nan(f64),
+    };
     return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
 }
 
@@ -692,32 +765,36 @@ fn toIndex(x: f64) usize {
 }
 
 pub fn nativeArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
+    // [[Construct]]-only: a plain `ArrayBuffer()` call (NewTarget undefined) must
+    // throw. A plain call passes globalThis as `this` (an object), so the object
+    // check alone is insufficient — gate on the native construct path's flag.
+    if (!realm_mod.active_constructing or this_val.bits == 0 or this_val.unbox() != .object) {
         return throwTypeError(arena, "Constructor ArrayBuffer requires 'new'");
     }
     const len: usize = if (args.len > 0) try toIndexThrowing(arena, args[0]) else 0;
-    // GetArrayBufferMaxByteLengthOption: options.maxByteLength (ToIndex) marks resizable.
+    // GetArrayBufferMaxByteLengthOption: options.maxByteLength (ToIndex) marks
+    // resizable. Read it OBSERVABLY (vmGet fires an accessor getter + propagates
+    // a throw) — a poisoned `get maxByteLength()` must be surfaced.
     var max_bl: ?usize = null;
     if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) {
-        const opts = args[1].toPtr().object;
-        if (opts.get("maxByteLength")) |mv| {
-            if (mv.bits != 0 and mv.unbox() != .undefined_)
-                max_bl = try toIndexThrowing(arena, mv);
-        }
+        const mv = try vmGet(arena, args[1], "maxByteLength");
+        if (mv.bits != 0 and mv.unbox() != .undefined_)
+            max_bl = try toIndexThrowing(arena, mv);
     }
     if (max_bl) |m| {
         if (len > m) return throwRangeError(arena, "ArrayBuffer length exceeds maxByteLength");
     }
+    const obj = this_val.toPtr().object;
+    // AllocateArrayBuffer: GetPrototypeFromConstructor(newTarget) runs BEFORE the
+    // backing-store allocation (after ToIndex(length) + the maxByteLength option),
+    // so a throwing NewTarget.prototype getter throws before any allocation.
+    try applyNewTargetProto(arena, obj);
     if ((max_bl orelse len) > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     const cap = max_bl orelse len;
     const bytes = try arena.alloc(u8, cap);
     @memset(bytes, 0);
     const data = try arena.create(ArrayBufferData);
     data.* = .{ .bytes = bytes, .byte_length = len, .max_byte_length = max_bl };
-    const obj = this_val.toPtr().object;
-    // GetPrototypeFromConstructor runs in AllocateArrayBuffer, after ToIndex(length)
-    // + the maxByteLength option (so a primitive-length throw precedes proto access).
-    try applyNewTargetProto(arena, obj);
     obj.internal_kind = .array_buffer;
     obj.internal_slot = data;
     return this_val;
@@ -738,11 +815,13 @@ pub fn nativeAbResize(arena: std.mem.Allocator, this_val: Value, args: []const V
 
 pub fn abGetResizable(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const ab = getAbData(this_val) orelse return throwTypeError(arena, "get resizable called on non-ArrayBuffer");
+    if (ab.shared) return throwTypeError(arena, "`this` cannot be a SharedArrayBuffer");
     return val_mod.makeBool(arena, ab.max_byte_length != null);
 }
 
 pub fn abGetMaxByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const ab = getAbData(this_val) orelse return throwTypeError(arena, "get maxByteLength called on non-ArrayBuffer");
+    if (ab.shared) return throwTypeError(arena, "`this` cannot be a SharedArrayBuffer");
     if (ab.detached) return val_mod.makeNumber(arena, 0);
     return val_mod.makeNumber(arena, @floatFromInt(ab.max_byte_length orelse ab.byte_length));
 }
@@ -903,6 +982,7 @@ pub fn nativeArrayBufferSlice(arena: std.mem.Allocator, this_val: Value, args: [
     const res_ab = getAbData(result) orelse return throwTypeError(arena, "ArrayBuffer[@@species] result is not an ArrayBuffer");
     if (res_ab.shared) return throwTypeError(arena, "ArrayBuffer[@@species] result is shared");
     if (res_ab.detached) return throwTypeError(arena, "ArrayBuffer[@@species] result is detached");
+    if (res_ab.immutable) return throwTypeError(arena, "ArrayBuffer[@@species] result is immutable");
     if (result.bits == this_val.bits) return throwTypeError(arena, "ArrayBuffer[@@species] returned the same buffer");
     if (res_ab.byte_length < new_len) return throwTypeError(arena, "ArrayBuffer[@@species] result is too small");
     // Re-check source detachment (species ctor could have detached it).
@@ -913,11 +993,13 @@ pub fn nativeArrayBufferSlice(arena: std.mem.Allocator, this_val: Value, args: [
 
 pub fn abGetDetached(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const ab = getAbData(this_val) orelse return throwTypeError(arena, "not an ArrayBuffer");
+    if (ab.shared) return throwTypeError(arena, "`this` cannot be a SharedArrayBuffer");
     return val_mod.makeBool(arena, ab.detached);
 }
 
 pub fn abGetByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const ab = getAbData(this_val) orelse return throwTypeError(arena, "get byteLength called on non-ArrayBuffer");
+    if (ab.shared) return throwTypeError(arena, "`this` cannot be a SharedArrayBuffer");
     if (ab.detached) return val_mod.makeNumber(arena, 0);
     return val_mod.makeNumber(arena, @floatFromInt(ab.byte_length));
 }
@@ -929,12 +1011,14 @@ const MAX_AB_BYTES: usize = 0x4000_0000; // 1 GiB
 fn abTransferImpl(arena: std.mem.Allocator, this_val: Value, args: []const Value, fixed: bool) anyerror!Value {
     const ab = getAbData(this_val) orelse return throwTypeError(arena, "not an ArrayBuffer");
     if (ab.shared) return throwTypeError(arena, "Cannot transfer a SharedArrayBuffer");
-    if (ab.immutable) return throwTypeError(arena, "Cannot transfer an immutable ArrayBuffer");
-    // newLength: undefined → current byteLength; else ToIndex (observable, throws).
+    // Spec ArrayBufferCopyAndDetach: ToIndex(newLength) is observed BEFORE the
+    // detached/immutable mutability checks (tests assert newLength.valueOf runs
+    // even when the receiver is immutable or already detached).
     const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
     const new_len: usize = if (has_arg) try toIndexThrowing(arena, args[0]) else ab.byte_length;
-    if (new_len > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     if (ab.detached) return throwTypeError(arena, "ArrayBuffer is detached");
+    if (ab.immutable) return throwTypeError(arena, "Cannot transfer an immutable ArrayBuffer");
+    if (new_len > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     // transfer() keeps resizability; transferToFixedLength() never does.
     const new_max: ?usize = if (!fixed) ab.max_byte_length else null;
     if (new_max) |m| {
@@ -968,6 +1052,7 @@ pub fn nativeAbTransferToFixedLength(arena: std.mem.Allocator, this_val: Value, 
 /// Immutable ArrayBuffer proposal: get ArrayBuffer.prototype.immutable.
 pub fn abGetImmutable(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const ab = getAbData(this_val) orelse return throwTypeError(arena, "get immutable called on non-ArrayBuffer");
+    if (ab.shared) return throwTypeError(arena, "`this` cannot be a SharedArrayBuffer");
     return val_mod.makeBool(arena, ab.immutable);
 }
 
@@ -976,11 +1061,13 @@ pub fn abGetImmutable(arena: std.mem.Allocator, this_val: Value, _: []const Valu
 pub fn nativeAbTransferToImmutable(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const ab = getAbData(this_val) orelse return throwTypeError(arena, "not an ArrayBuffer");
     if (ab.shared) return throwTypeError(arena, "Cannot transfer a SharedArrayBuffer");
-    if (ab.immutable) return throwTypeError(arena, "Cannot transfer an immutable ArrayBuffer");
+    // ToIndex(newLength) observed before the detached/immutable mutability
+    // checks (newLength.valueOf must run even for an immutable/detached source).
     const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
     const new_len: usize = if (has_arg) try toIndexThrowing(arena, args[0]) else ab.byte_length;
-    if (new_len > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     if (ab.detached) return throwTypeError(arena, "ArrayBuffer is detached");
+    if (ab.immutable) return throwTypeError(arena, "Cannot transfer an immutable ArrayBuffer");
+    if (new_len > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     const bytes = try arena.alloc(u8, new_len);
     @memset(bytes, 0);
     const copy_len = @min(new_len, ab.byte_length);
@@ -1009,6 +1096,11 @@ pub fn nativeAbSliceToImmutable(arena: std.mem.Allocator, this_val: Value, args:
     else
         @floatFromInt(len), len);
     if (ab.detached) return throwTypeError(arena, "ArrayBuffer detached during index coercion");
+    // A resizable buffer may have shrunk during start/end coercion (valueOf):
+    // the range resolved against the original length must still fit the CURRENT
+    // backing store, else the copy would read out of bounds.
+    if (start > ab.byte_length or end > ab.byte_length)
+        return throwRangeError(arena, "ArrayBuffer was resized below the resolved range");
     const new_len = if (end > start) end - start else 0;
     const bytes = try arena.alloc(u8, new_len);
     @memset(bytes, 0);
@@ -1201,10 +1293,11 @@ fn iterableToList(arena: std.mem.Allocator, source: Value) anyerror!std.ArrayLis
     while (true) {
         const step = try coll.nativeIterStep(arena, Value{}, &[_]Value{iter});
         if (step.bits == 0 or step.unbox() != .object) break;
-        const res = step.toPtr().object;
-        const done = res.get("done") orelse Value{};
+        // IteratorComplete/IteratorValue use observable [[Get]] (fire accessor
+        // getters + propagate throws), not a raw own-slot read.
+        const done = try vmGet(arena, step, "done");
         if (toBool(done)) break;
-        const v = res.get("value") orelse Value{};
+        const v = try vmGet(arena, step, "value");
         try list.append(arena, v);
     }
     return list;
@@ -1221,10 +1314,16 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
     const this_obj = this_val.toPtr().object;
     const esize = kind.elemSize();
 
-    // arg0 is an object → Forms 2/3/4. Everything else → Form 1 (length).
-    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
-        const a0 = args[0];
-        const src = a0.toPtr().object;
+    // arg0 is object-like (object OR a function — functions are objects) → Forms
+    // 2/3/4. Everything else → Form 1 (length). A function arg resolves to its
+    // backing object for the internal-slot checks; the iterable/array-like reads
+    // still observe the original value (e.g. a throwing @@iterator getter).
+    const a0_obj: ?*JsObject = if (args.len > 0 and args[0].bits != 0) switch (args[0].unbox()) {
+        .object => args[0].toPtr().object,
+        .bc_function, .function => if (realm_mod.active_context) |ctx| (try ctx.backingObject(arena, args[0])) else null,
+        else => null,
+    } else null;
+    if (a0_obj) |src| {
 
         // GetPrototypeFromConstructor runs first for object arguments (before any
         // byteOffset/length coercion); a throwing NewTarget.prototype getter throws here.
@@ -1469,9 +1568,19 @@ fn validateTypedArray(arena: std.mem.Allocator, td: *TypedArrayData) anyerror!vo
     td.length = taCurrentLen(td);
 }
 
+/// ValidateTypedArray for a receiver that may or may not be a TypedArray. When
+/// it IS a TA (e.g. a generic Array.prototype callback method invoked on a TA),
+/// throws on detached / out-of-bounds and refreshes its live length so the
+/// method observes the post-resize element count. No-op for non-TA receivers.
+pub fn validateReceiver(arena: std.mem.Allocator, this_val: Value) anyerror!void {
+    if (getTd(this_val)) |td| try validateTypedArray(arena, td);
+}
+
 pub fn nativeTaFill(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
+    // Mutability is verified BEFORE reading any argument (spec + tests).
+    if (td.ab.immutable) return throwTypeError(arena, "Cannot fill an immutable-buffer-backed TypedArray");
     const raw_v = if (args.len > 0) args[0] else Value{};
     var fill_num: f64 = 0;
     var fill_big: Value = Value{};
@@ -1544,6 +1653,7 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
 pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
+    if (td.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed TypedArray");
     const target_len = td.length;
     const target_lf: f64 = @floatFromInt(target_len);
     // targetOffset = ToIntegerOrInfinity(offset) (runs valueOf, propagates throws);
@@ -1623,19 +1733,25 @@ pub fn nativeTaIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const 
     }
     const target = toNum(args[0]);
     const want_big: ?i128 = if (is_big) bigintSearch(args[0]) else null;
+    var len: usize = td.length;
     var k: usize = 0;
     if (args.len > 1) {
         const n = try toIntegerThrowing(arena, args[1]);
-        if (n >= @as(f64, @floatFromInt(td.length))) return val_mod.makeNumber(arena, -1);
+        // fromIndex ToInteger may have SHRUNK the buffer (valueOf): clamp the
+        // search to the smaller of the original length and the current length (a
+        // now-OOB fixed view → empty). A grow keeps the original length (spec).
+        len = @min(len, if (taIsOob(td)) 0 else taCurrentLen(td));
+        if (len == 0) return val_mod.makeNumber(arena, -1);
+        if (n >= @as(f64, @floatFromInt(len))) return val_mod.makeNumber(arena, -1);
         var s = n;
         if (s < 0) {
-            s += @floatFromInt(td.length);
+            s += @floatFromInt(len);
             if (s < 0) s = 0;
         }
         k = @intFromFloat(s);
     }
     var i: usize = k;
-    while (i < td.length) : (i += 1) {
+    while (i < len) : (i += 1) {
         if (is_big) {
             if (want_big != null and taBigRaw(td, i) == want_big.?) return val_mod.makeNumber(arena, @floatFromInt(i));
         } else {
@@ -1656,19 +1772,23 @@ pub fn nativeTaIncludes(arena: std.mem.Allocator, this_val: Value, args: []const
     const target = toNum(args[0]);
     const want_nan = std.math.isNan(target);
     const want_big: ?i128 = if (is_big) bigintSearch(args[0]) else null;
+    var len: usize = td.length;
     var k: usize = 0;
     if (args.len > 1) {
         const n = try toIntegerThrowing(arena, args[1]);
+        // fromIndex coercion may have SHRUNK the buffer; clamp (grow keeps original).
+        len = @min(len, if (taIsOob(td)) 0 else taCurrentLen(td));
+        if (len == 0) return val_mod.makeBool(arena, false);
         var s = n;
         if (s < 0) {
-            s += @floatFromInt(td.length);
+            s += @floatFromInt(len);
             if (s < 0) s = 0;
         }
-        if (s >= @as(f64, @floatFromInt(td.length))) return val_mod.makeBool(arena, false);
+        if (s >= @as(f64, @floatFromInt(len))) return val_mod.makeBool(arena, false);
         k = @intFromFloat(s);
     }
     var i: usize = k;
-    while (i < td.length) : (i += 1) {
+    while (i < len) : (i += 1) {
         if (is_big) {
             if (want_big != null and taBigRaw(td, i) == want_big.?) return val_mod.makeBool(arena, true);
         } else {
@@ -1715,6 +1835,7 @@ pub fn nativeTaToString(arena: std.mem.Allocator, this_val: Value, _: []const Va
 pub fn nativeTaReverse(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
+    if (td.ab.immutable) return throwTypeError(arena, "Cannot reverse an immutable-buffer-backed TypedArray");
     if (td.length < 2) return this_val;
     var lo: usize = 0;
     var hi: usize = td.length - 1;
@@ -2037,6 +2158,8 @@ pub fn nativeTaSort(arena: std.mem.Allocator, this_val: Value, args: []const Val
     // Spec step 1: a non-undefined, non-callable comparefn throws (before length).
     if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_ and !function_proto_isCallable(args[0]))
         return throwTypeError(arena, "comparator is not a function");
+    // Verify mutability before sorting (no comparator calls on an immutable buffer).
+    if (td.ab.immutable) return throwTypeError(arena, "Cannot sort an immutable-buffer-backed TypedArray");
     try validateTypedArray(arena, td);
     const n = td.length;
     if (n < 2) return this_val;
@@ -2171,6 +2294,7 @@ pub fn nativeTaSome(arena: std.mem.Allocator, this_val: Value, args: []const Val
 pub fn nativeTaCopyWithin(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
+    if (td.ab.immutable) return throwTypeError(arena, "Cannot copyWithin an immutable-buffer-backed TypedArray");
     const len = td.length;
     const target = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), len);
     const start = relIndex(try toIntegerThrowing(arena, if (args.len > 1) args[1] else Value{}), len);
@@ -2240,20 +2364,24 @@ pub fn nativeTaLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []co
     }
     const target = toNum(args[0]);
     const want_big: ?i128 = if (is_big) bigintSearch(args[0]) else null;
-    var from: i64 = @intCast(td.length - 1);
+    var len: usize = td.length;
+    var from: i64 = @intCast(len - 1);
     if (args.len > 1) {
         const fi = try toIntegerThrowing(arena, args[1]);
+        // fromIndex coercion may have SHRUNK the buffer; clamp (grow keeps original).
+        len = @min(len, if (taIsOob(td)) 0 else taCurrentLen(td));
+        if (len == 0) return val_mod.makeNumber(arena, -1);
         if (std.math.isNan(fi)) return val_mod.makeNumber(arena, -1);
         // Clamp to i64 range before conversion to avoid panic on Inf/huge values.
         if (fi >= 9.007199254740992e15) {
-            // +Inf or very large positive: clamp to length-1 (already set as default)
+            from = @intCast(len - 1);
         } else if (fi < -9.007199254740992e15) {
             return val_mod.makeNumber(arena, -1);
         } else {
             from = @intFromFloat(fi);
-            if (from < 0) from += @intCast(td.length);
+            if (from < 0) from += @intCast(len);
             if (from < 0) return val_mod.makeNumber(arena, -1);
-            if (from >= @as(i64, @intCast(td.length))) from = @intCast(td.length - 1);
+            if (from >= @as(i64, @intCast(len))) from = @intCast(len - 1);
         }
     }
     var i: usize = @intCast(from);
@@ -2336,6 +2464,9 @@ pub fn nativeTaToReversed(arena: std.mem.Allocator, this_val: Value, _: []const 
 
 pub fn nativeTaToSorted(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
+    // Spec step 1: a non-undefined, non-callable comparefn throws (before validate).
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_ and !function_proto_isCallable(args[0]))
+        return throwTypeError(arena, "comparator is not a function");
     try validateTypedArray(arena, td);
     const a = try allocTA(arena, td.kind, td.length);
     var i: usize = 0;
@@ -2389,7 +2520,10 @@ pub fn nativeTaWith(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var new_num: f64 = 0;
     var new_big: Value = Value{};
     if (td.kind.isBigInt()) new_big = try toBigIntThrowing(arena, args[1]) else new_num = try toNumberThrowing(arena, args[1]);
-    if (idx < 0 or idx >= len_f)
+    // Validity is checked against CURRENT bounds (the value coercion's valueOf may
+    // have resized the buffer); negative-index resolution above used the original
+    // length per spec.
+    if (idx < 0 or !isValidIntegerIndex(td, idx))
         return throwRangeError(arena, "Invalid typed array index");
     const final_idx: usize = @intFromFloat(idx);
     const a = try allocTA(arena, td.kind, td.length);

@@ -69,6 +69,16 @@ pub const Context = struct {
     /// Set [[Prototype]] of an object OR bc_function (materializing the closure's
     /// backing object). Used by Object.setPrototypeOf for class static inheritance.
     set_proto_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void,
+    /// Resolve a value to its property-bearing JsObject: an object returns
+    /// itself; a bc_function materializes (lazily creates) its backing object;
+    /// non-property-bearing values (primitives, native_function) return null.
+    /// Lets generic object ops (defineProperty, getOwnPropertyDescriptor) treat
+    /// functions as the objects they are.
+    backing_obj_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, val: Value) anyerror!?*JsObject,
+
+    pub fn backingObject(self: *Context, arena: std.mem.Allocator, val: Value) anyerror!?*JsObject {
+        return self.backing_obj_fn(self.ptr, arena, val);
+    }
 
     pub fn invokeJs(self: *Context, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         return self.invoke_fn(self.ptr, arena, this_val, fn_val, args);
@@ -1162,6 +1172,7 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "toReversed", array_proto_mod.nativeToReversed },
         .{ "toSorted", array_proto_mod.nativeToSorted },
         .{ "toSpliced", array_proto_mod.nativeToSpliced },
+        .{ "splice", array_proto_mod.nativeSplice },
         .{ "toLocaleString", array_proto_mod.nativeArrayToLocaleString },
         .{ "toString", array_proto_mod.nativeArrayToString },
     };
@@ -1241,6 +1252,11 @@ pub const Realm = struct {
         // Define "Object" in global env as the constructor object.
         const ctor_val = try val_mod.makeObject(arena, object_ctor);
         try env.define("Object", ctor_val);
+
+        // Object.prototype.constructor === Object (spec §20.1.2.1). Was absent →
+        // `({}).constructor` / `Object.prototype.constructor` returned undefined
+        // engine-wide (only masked when a nearer proto defined its own constructor).
+        _ = try object_proto.defineOwnData("constructor", ctor_val, .{ .writable = true, .enumerable = false, .configurable = true });
 
         // ---- Phase 4a: Error prototypes and constructors ----
         // Error.prototype: proto = object_prototype.
@@ -1551,6 +1567,10 @@ pub const Realm = struct {
         const symbol_ctor = try JsObject.create(arena, null);
         try symbol_ctor.set("__call__", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolCall));
         try symbol_ctor.set("prototype", try val_mod.makeObject(arena, symbol_proto));
+        // Fresh realm ⇒ fresh per-agent symbol registry. The registry's buffers
+        // live in this realm's arena; a stale registry from a prior (freed) realm
+        // dangles and causes a use-after-free on the next Symbol.for.
+        symbol_mod.resetRegistry();
         try symbol_ctor.set("for", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolFor));
         try symbol_ctor.set("keyFor", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolKeyFor));
         // Well-known symbols (identity constants; inert in S1).

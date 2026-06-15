@@ -443,6 +443,17 @@ pub const BcVm = struct {
         }
     }
 
+    fn bcBackingObj(ptr: *anyopaque, arena: std.mem.Allocator, val: Value) anyerror!?*JsObject {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        if (val.bits == 0) return null;
+        return switch (val.unbox()) {
+            .object => |o| o,
+            .bc_function => |c| try self.closureBackingObj(c),
+            else => null,
+        };
+    }
+
     fn bcConstructNt(ptr: *anyopaque, arena: std.mem.Allocator, ctor_val: Value, args: []const Value, new_target: Value) anyerror!Value {
         _ = arena;
         const self: *BcVm = @ptrCast(@alignCast(ptr));
@@ -500,6 +511,7 @@ pub const BcVm = struct {
             .get_sym_fn = bcGetPropSym,
             .set_fn = bcSetProp,
             .set_proto_fn = bcSetProto,
+            .backing_obj_fn = bcBackingObj,
         };
         realm_mod.active_context = &self.context;
     }
@@ -953,8 +965,12 @@ pub const BcVm = struct {
 
     /// Read a symbol-keyed property, walking the prototype chain (own first).
     pub fn getPropSym(self: *BcVm, obj_val: Value, sym_key: Value) !Value {
-        if (obj_val.bits == 0 or obj_val.unbox() != .object) return val_mod.makeUndefined(self.arena);
-        const root_obj = obj_val.toPtr().object;
+        if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);
+        const root_obj = switch (obj_val.unbox()) {
+            .object => |o| o,
+            .bc_function => |c| try self.closureBackingObj(c),
+            else => return val_mod.makeUndefined(self.arena),
+        };
         if (root_obj.internal_kind == .proxy) {
             return try self.proxyGet(obj_val, root_obj, sym_key);
         }
@@ -976,10 +992,15 @@ pub const BcVm = struct {
         return val_mod.makeUndefined(self.arena);
     }
 
-    /// Set a symbol-keyed own property.
+    /// Set a symbol-keyed own property. Functions are objects: a bc_function
+    /// stores symbol props on its backing object (e.g. `fn[Symbol.iterator]=…`).
     pub fn setPropSym(self: *BcVm, obj_val: Value, sym_key: Value, value: Value) !void {
-        if (obj_val.bits == 0 or obj_val.unbox() != .object) return;
-        const obj = obj_val.toPtr().object;
+        if (obj_val.bits == 0) return;
+        const obj = switch (obj_val.unbox()) {
+            .object => |o| o,
+            .bc_function => |c| try self.closureBackingObj(c),
+            else => return,
+        };
         if (obj.internal_kind == .proxy) {
             try self.proxySet(obj_val, obj, sym_key, value);
             return;
@@ -1152,6 +1173,21 @@ pub const BcVm = struct {
             const yp = (try self.coerceToPrimitive(y, .default)) orelse
                 try val_mod.makeString(self.arena, try valueToString(self.arena, y));
             return try self.abstractEqual(x, yp);
+        }
+        // BigInt cross-type comparisons (spec §7.2.15 steps 6-9) — jsAbstractEqual
+        // is allocation-free and can't build the comparison BigInt, so handle here.
+        const x_big = x.bits != 0 and x.unbox() == .bigint;
+        const y_big = y.bits != 0 and y.unbox() == .bigint;
+        if (x_big != y_big) {
+            const big = if (x_big) x else y;
+            const other = if (x_big) y else x;
+            if (other.bits == 0) return false;
+            switch (other.unbox()) {
+                .number => |n| return bigIntEqualsNumber(self.arena, big, n),
+                .boolean => |b| return bigIntEqualsNumber(self.arena, big, if (b) 1.0 else 0.0),
+                .string => |s| return bigIntEqualsString(self.arena, big, s),
+                else => return false, // null/undefined/symbol
+            }
         }
         return jsAbstractEqual(x, y);
     }
@@ -2886,6 +2922,31 @@ pub fn jsLessThan(left: Value, right: Value) ?bool {
     const rn = toNumber(right);
     if (std.math.isNan(ln) or std.math.isNan(rn)) return null;
     return ln < rn;
+}
+
+/// BigInt == Number (spec): equal iff the Number is a finite integer whose
+/// mathematical value equals the BigInt. NaN/±Inf/non-integers are never equal.
+fn bigIntEqualsNumber(arena: std.mem.Allocator, big: Value, num: f64) bool {
+    if (!std.math.isFinite(num) or num != @trunc(num)) return false;
+    const yb = if (num >= -9.0e18 and num <= 9.0e18)
+        (val_mod.makeBigIntFromI64(arena, @intFromFloat(num)) catch return false)
+    else blk: {
+        const s = std.fmt.allocPrint(arena, "{d}", .{num}) catch return false;
+        break :blk (val_mod.makeBigIntFromLiteral(arena, s) catch return false);
+    };
+    return val_mod.bigIntEql(big, yb);
+}
+
+/// BigInt == String (spec): StringToBigInt(string); equal iff it parses to a
+/// BigInt mathematically equal to `big`. Unparseable strings are never equal.
+fn bigIntEqualsString(arena: std.mem.Allocator, big: Value, s: []const u8) bool {
+    const t = std.mem.trim(u8, s, " \t\n\r\x0b\x0c");
+    const body = if (t.len > 0 and t[0] == '+') t[1..] else t;
+    const yb = if (body.len == 0)
+        (val_mod.makeBigIntFromI64(arena, 0) catch return false)
+    else
+        (val_mod.makeBigIntFromLiteral(arena, body) catch return false);
+    return val_mod.bigIntEql(big, yb);
 }
 
 pub fn jsAbstractEqual(x: Value, y: Value) bool {

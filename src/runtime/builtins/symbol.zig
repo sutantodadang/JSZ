@@ -30,8 +30,21 @@ pub fn nativeSymbolToString(arena: std.mem.Allocator, this_val: Value, _: []cons
 }
 
 /// Global symbol registry for Symbol.for / Symbol.keyFor (single-threaded).
+/// Its backing buffers + stored values live in the per-realm arena (see the
+/// `append(arena, ...)` calls below). The registry is per-agent, so a fresh
+/// realm must start empty — call `resetRegistry()` at realm setup. Without the
+/// reset these globals dangle into the previous realm's freed arena, and the
+/// next `Symbol.for` iterates / reallocs freed memory (a cross-realm
+/// use-after-free that surfaces as a corrupt Value / segfault).
 var registry_keys: std.ArrayListUnmanaged([]const u8) = .empty;
 var registry_syms: std.ArrayListUnmanaged(Value) = .empty;
+
+/// Reset the registry for a new realm. The old buffers are owned by the prior
+/// realm's arena (freed with it), so dropping the structs is leak-free.
+pub fn resetRegistry() void {
+    registry_keys = .empty;
+    registry_syms = .empty;
+}
 
 pub fn nativeSymbolFor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const key: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string)
