@@ -216,7 +216,8 @@ pub const JsObject = struct {
     /// non-configurable (returns false without deleting). Rebuilds `attrs`
     /// parallel to the new slot order.
     pub fn deleteOwn(self: *JsObject, key: []const u8) !bool {
-        const del_slot = self.shape.key_to_slot.get(key) orelse return false;
+        // [[Delete]] of an absent own property succeeds (returns true).
+        const del_slot = self.shape.key_to_slot.get(key) orelse return true;
         if (del_slot < self.attrs.items.len and !self.attrs.items[del_slot].configurable) return false;
         const old_shape = self.shape;
         self.shape = try self.shape_manager.transitionDelete(old_shape, key);
@@ -466,7 +467,8 @@ pub const JsObject = struct {
                 return true;
             }
         }
-        return false;
+        // Absent own symbol property → [[Delete]] succeeds.
+        return true;
     }
 
     /// All own symbol-keyed properties (for Object.getOwnPropertySymbols).

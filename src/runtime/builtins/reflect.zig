@@ -184,13 +184,30 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
 
-    // M15: TypedArray integer-indexed exotic [[Set]]. ToNumber/ToBigInt always
-    // runs (valueOf side effects + abrupt throws propagate); stores only when the
-    // index is valid; invalid/OOB is a no-op. [[Set]] returns true regardless.
+    // M15: TypedArray integer-indexed exotic [[Set]](P, V, Receiver).
+    const receiver = if (args.len > 3) args[3] else target;
     if (target_obj.internal_kind == .typed_array) {
         if (typed_array.canonicalNumericIndexString(k)) |idx_f| {
             const td = typed_array.getTd(target) orelse return val_mod.makeBool(arena, false);
-            try typed_array.setElementThrowing(arena, td, idx_f, value);
+            // If SameValue(O, Receiver): TypedArraySetElement (coerce + store).
+            if (receiver.bits == target.bits) {
+                try typed_array.setElementThrowing(arena, td, idx_f, value);
+                return val_mod.makeBool(arena, true);
+            }
+            // Different receiver + invalid index → return true WITHOUT coercing V.
+            if (!typed_array.isValidIntegerIndex(td, idx_f)) return val_mod.makeBool(arena, true);
+            // Valid index + different receiver → OrdinarySet(O, P, V, Receiver):
+            // the write lands on Receiver, not O.
+            if (!isObj(receiver)) return val_mod.makeBool(arena, false);
+            const robj = receiver.toPtr().object;
+            if (robj.internal_kind == .typed_array) {
+                const rtd = typed_array.getTd(receiver).?;
+                if (!typed_array.isValidIntegerIndex(rtd, idx_f)) return val_mod.makeBool(arena, false);
+                try typed_array.setElementThrowing(arena, rtd, idx_f, value);
+                return val_mod.makeBool(arena, true);
+            }
+            // Plain object receiver: CreateDataProperty (store V unchanged).
+            try robj.set(k, value);
             return val_mod.makeBool(arena, true);
         }
     }
@@ -212,6 +229,8 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
             }
             return val_mod.makeBool(arena, false);
         }
+        // Non-writable data property → OrdinarySet fails (return false).
+        if (!attr.writable) return val_mod.makeBool(arena, false);
     }
 
     try target_obj.set(k, value);

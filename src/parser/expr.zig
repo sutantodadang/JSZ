@@ -527,7 +527,7 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
                         .call_expr = .{ .callee = new_node, .args = call_args },
                     }) orelse return null;
                 } else if (p.match(.dot)) {
-                    const prop_tok2 = p.expect(.identifier) orelse return null;
+                    const prop_tok2 = p.expectIdentifierName() orelse return null;
                     const prop2 = p.makeNode(.identifier, prop_tok2.start, prop_tok2.end, .{
                         .identifier = prop_tok2.value_str,
                     }) orelse return null;
@@ -681,7 +681,7 @@ pub fn parseNewCallee(p: *Parser) ?*Node {
     var base = p.parsePrimaryExpr() orelse return null;
     while (true) {
         if (p.match(.dot)) {
-            const prop_tok = p.expect(.identifier) orelse return null;
+            const prop_tok = p.expectIdentifierName() orelse return null;
             const prop = p.makeNode(.identifier, prop_tok.start, prop_tok.end, .{
                 .identifier = prop_tok.value_str,
             }) orelse return null;

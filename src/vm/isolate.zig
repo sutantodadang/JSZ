@@ -198,7 +198,7 @@ pub const IsolateImpl = struct {
             .bc => {
                 // Compile to bytecode.
                 const ast_mod = @import("../parser/ast.zig");
-                const prog = ast_mod.Program{ .body = stmts };
+                const prog = ast_mod.Program{ .body = stmts, .is_strict = @import("../parser/parser.zig").hasUseStrict(stmts) };
                 const main_func = compiler_mod.compileProgram(arena, &prog, "<eval>") catch |e| {
                     return switch (e) {
                         error.OutOfMemory => error.OutOfMemory,

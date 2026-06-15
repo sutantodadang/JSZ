@@ -36,24 +36,60 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "slice", nativeArrayBufferSlice },
         .{ "transfer", nativeAbTransfer },
         .{ "transferToFixedLength", nativeAbTransferToFixedLength },
+        // transferToImmutable / sliceToImmutable (bodies below) NOT registered:
+        // adding a 5th ab_proto method changes heap layout and triggers a
+        // pre-existing latent memory-corruption segfault that only manifests in the
+        // long full built-ins/ArrayBuffer suite run (each dir passes in isolation;
+        // body-independent; non-deterministic crash address; manual-GC). Needs an
+        // ASAN/debugger run to locate the real bug before re-registering.
         .{ "resize", nativeAbResize },
     });
     try defineGetter(arena, ab_proto, "detached", abGetDetached);
     try defineGetter(arena, ab_proto, "byteLength", abGetByteLength);
     try defineGetter(arena, ab_proto, "resizable", abGetResizable);
     try defineGetter(arena, ab_proto, "maxByteLength", abGetMaxByteLength);
+    try defineGetter(arena, ab_proto, "immutable", abGetImmutable);
     active_arraybuffer_proto = ab_proto;
     const ab_ctor = try JsObject.create(arena, null);
-    try ab_ctor.set("prototype", try val_mod.makeObject(arena, ab_proto));
+    _ = try ab_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, ab_proto),
+        .{ .writable = false, .enumerable = false, .configurable = false });
     try ab_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeArrayBufferCtor));
-    try ab_ctor.set("isView", try val_mod.makeNativeFunctionNamed(arena, nativeArrayBufferIsView, "isView", 1));
+    _ = try ab_ctor.defineOwnData("isView", try val_mod.makeNativeFunctionNamed(arena, nativeArrayBufferIsView, "isView", 1),
+        .{ .writable = true, .enumerable = false, .configurable = true });
     _ = try ab_ctor.defineOwnData("name", try val_mod.makeString(arena, "ArrayBuffer"),
         .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try ab_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1),
         .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try ab_proto.defineOwnData("constructor", try val_mod.makeObject(arena, ab_ctor),
         .{ .writable = true, .enumerable = false, .configurable = true });
+    active_arraybuffer_ctor = ab_ctor;
     try ctx.env.define("ArrayBuffer", try val_mod.makeObject(arena, ab_ctor));
+
+    // SharedArrayBuffer — backed by the same ArrayBufferData (shared=true,
+    // never detachable; growable via maxByteLength). TypedArray/DataView over a
+    // SAB work unchanged (the buffer's internal_kind stays .array_buffer).
+    const sab_proto = try JsObject.create(arena, object_proto);
+    try defineGetter(arena, sab_proto, "byteLength", sabGetByteLength);
+    try defineGetter(arena, sab_proto, "growable", sabGetGrowable);
+    try defineGetter(arena, sab_proto, "maxByteLength", sabGetMaxByteLength);
+    {
+        const sab_m: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+        _ = try sab_proto.defineOwnData("slice", try val_mod.makeNativeFunctionNamed(arena, nativeSabSlice, "slice", 2), sab_m);
+        _ = try sab_proto.defineOwnData("grow", try val_mod.makeNativeFunctionNamed(arena, nativeSabGrow, "grow", 1), sab_m);
+    }
+    active_sharedarraybuffer_proto = sab_proto;
+    const sab_ctor = try JsObject.create(arena, null);
+    _ = try sab_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, sab_proto),
+        .{ .writable = false, .enumerable = false, .configurable = false });
+    try sab_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeSharedArrayBufferCtor));
+    _ = try sab_ctor.defineOwnData("name", try val_mod.makeString(arena, "SharedArrayBuffer"),
+        .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try sab_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1),
+        .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try sab_proto.defineOwnData("constructor", try val_mod.makeObject(arena, sab_ctor),
+        .{ .writable = true, .enumerable = false, .configurable = true });
+    active_sharedarraybuffer_ctor = sab_ctor;
+    try ctx.env.define("SharedArrayBuffer", try val_mod.makeObject(arena, sab_ctor));
 
     // %TypedArray%.prototype — shared methods with spec-correct .length values (ES2023 §22.2.3).
     const ta_proto = try JsObject.create(arena, object_proto);
@@ -134,8 +170,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         // .prototype: non-writable, non-enumerable, non-configurable.
         _ = try kctor.defineOwnData("prototype", try val_mod.makeObject(arena, kp), .{ .writable = false, .enumerable = false, .configurable = false });
         try kctor.set("__call__", try val_mod.makeNativeFunction(arena, taCtor(kind)));
-        _ = try kctor.defineOwnData("from", try val_mod.makeNativeFunctionNamed(arena, nativeTaFrom, "from", 1), m_attr);
-        _ = try kctor.defineOwnData("of", try val_mod.makeNativeFunctionNamed(arena, nativeTaOf, "of", 0), m_attr);
+        // `from`/`of` are inherited from %TypedArray% (NOT own props on per-kind
+        // ctors) — kctor.proto == ta_ctor, which defines them. Spec §23.2.
         // BYTES_PER_ELEMENT: non-writable, non-enumerable, non-configurable (ES spec §22.2.5.1)
         const bpe_val = try val_mod.makeNumber(arena, @floatFromInt(kind.elemSize()));
         const bpe_attr: PropAttr = .{ .writable = false, .enumerable = false, .configurable = false };
@@ -168,6 +204,9 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "setInt16",   dvSet(i16, false), 2 }, .{ "setUint16",   dvSet(u16, false), 2 },
         .{ "setInt32",   dvSet(i32, false), 2 }, .{ "setUint32",   dvSet(u32, false), 2 },
         .{ "setFloat32", dvSet(f32, true),  2 }, .{ "setFloat64",  dvSet(f64, true),  2 },
+        .{ "getBigInt64", dvGetBig(true), 1 }, .{ "getBigUint64", dvGetBig(false), 1 },
+        .{ "setBigInt64", dvSetBig(), 2 },     .{ "setBigUint64", dvSetBig(), 2 },
+        .{ "getFloat16", dvGetF16, 1 },        .{ "setFloat16", dvSetF16, 2 },
     }) |pair| {
         _ = try dv_proto.defineOwnData(pair[0],
             try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], pair[2]), dv_fn_attr);
@@ -175,8 +214,10 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     active_dataview_proto = dv_proto;
     try defineGetter(arena, dv_proto, "byteLength", dvGetByteLength);
     try defineGetter(arena, dv_proto, "byteOffset", dvGetByteOffset);
+    try defineGetter(arena, dv_proto, "buffer", dvGetBuffer);
     const dv_ctor = try JsObject.create(arena, null);
-    try dv_ctor.set("prototype", try val_mod.makeObject(arena, dv_proto));
+    _ = try dv_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, dv_proto),
+        .{ .writable = false, .enumerable = false, .configurable = false });
     try dv_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeDataViewCtor));
     _ = try dv_ctor.defineOwnData("name", try val_mod.makeString(arena, "DataView"),
         .{ .writable = false, .enumerable = false, .configurable = true });
@@ -195,6 +236,7 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
     const tag_attr: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
     if (realm_mod.active_sym_to_string_tag) |tag_sym| {
         if (active_arraybuffer_proto) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "ArrayBuffer"), tag_attr);
+        if (active_sharedarraybuffer_proto) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "SharedArrayBuffer"), tag_attr);
         if (active_dataview_proto) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "DataView"), tag_attr);
         // %TypedArray%.prototype[@@toStringTag] is an accessor getter returning the
         // constructor name (or undefined when `this` has no [[TypedArrayName]]).
@@ -205,6 +247,10 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
     // returning `this`. Per-kind constructors inherit it (no own @@species).
     if (realm_mod.active_sym_species) |spec_sym| {
         if (active_typedarray_ctor) |c|
+            try defineSymGetter(arena, c, spec_sym, taGetSpecies, "get [Symbol.species]");
+        if (active_arraybuffer_ctor) |c|
+            try defineSymGetter(arena, c, spec_sym, taGetSpecies, "get [Symbol.species]");
+        if (active_sharedarraybuffer_ctor) |c|
             try defineSymGetter(arena, c, spec_sym, taGetSpecies, "get [Symbol.species]");
     }
     // @@iterator on %TypedArray%.prototype — wire the real Symbol.iterator sym-key
@@ -230,6 +276,7 @@ pub const TAKind = enum(u8) {
     u16,
     i32,
     u32,
+    f16,
     f32,
     f64,
     i64big,
@@ -238,7 +285,7 @@ pub const TAKind = enum(u8) {
     pub fn elemSize(self: TAKind) usize {
         return switch (self) {
             .i8, .u8, .u8clamped => 1,
-            .i16, .u16 => 2,
+            .i16, .u16, .f16 => 2,
             .i32, .u32, .f32 => 4,
             .f64, .i64big, .u64big => 8,
         };
@@ -257,6 +304,7 @@ pub const TAKind = enum(u8) {
             .u16 => "Uint16Array",
             .i32 => "Int32Array",
             .u32 => "Uint32Array",
+            .f16 => "Float16Array",
             .f32 => "Float32Array",
             .f64 => "Float64Array",
             .i64big => "BigInt64Array",
@@ -265,7 +313,7 @@ pub const TAKind = enum(u8) {
     }
 };
 
-pub const all_kinds = [_]TAKind{ .i8, .u8, .u8clamped, .i16, .u16, .i32, .u32, .f32, .f64, .i64big, .u64big };
+pub const all_kinds = [_]TAKind{ .i8, .u8, .u8clamped, .i16, .u16, .f16, .i32, .u32, .f32, .f64, .i64big, .u64big };
 
 // ---------------------------------------------------------------- backing data ---
 
@@ -275,6 +323,7 @@ pub const ArrayBufferData = struct {
     max_byte_length: ?usize = null, // set => resizable
     detached: bool = false,
     shared: bool = false,
+    immutable: bool = false, // immutable ArrayBuffer proposal: content frozen, non-detachable
 };
 
 pub const TypedArrayData = struct {
@@ -298,6 +347,9 @@ pub const DataViewData = struct {
 // ---------------------------------------------------------------- module protos ---
 
 pub var active_arraybuffer_proto: ?*JsObject = null;
+pub var active_arraybuffer_ctor: ?*JsObject = null;
+pub var active_sharedarraybuffer_proto: ?*JsObject = null;
+pub var active_sharedarraybuffer_ctor: ?*JsObject = null;
 pub var active_dataview_proto: ?*JsObject = null;
 pub var active_typedarray_proto: ?*JsObject = null; // %TypedArray%.prototype
 pub var active_typedarray_ctor: ?*JsObject = null; // %TypedArray% (abstract ctor)
@@ -547,6 +599,7 @@ pub fn taLoad(arena: std.mem.Allocator, td: *const TypedArrayData, i: usize) !Va
         .u16 => val_mod.makeNumber(arena, @floatFromInt(std.mem.readInt(u16, p[0..2], native_endian))),
         .i32 => val_mod.makeNumber(arena, @floatFromInt(std.mem.readInt(i32, p[0..4], native_endian))),
         .u32 => val_mod.makeNumber(arena, @floatFromInt(std.mem.readInt(u32, p[0..4], native_endian))),
+        .f16 => val_mod.makeNumber(arena, @as(f16, @bitCast(std.mem.readInt(u16, p[0..2], native_endian)))),
         .f32 => val_mod.makeNumber(arena, @as(f32, @bitCast(std.mem.readInt(u32, p[0..4], native_endian)))),
         .f64 => val_mod.makeNumber(arena, @as(f64, @bitCast(std.mem.readInt(u64, p[0..8], native_endian)))),
         .i64big => val_mod.makeBigIntFromI64(arena, std.mem.readInt(i64, p[0..8], native_endian)),
@@ -577,6 +630,7 @@ fn clampU8(x: f64) u8 {
 }
 
 pub fn taStoreNumber(td: *const TypedArrayData, i: usize, x: f64) void {
+    if (td.ab.immutable) return; // immutable buffer: writes ignored
     const sz = td.kind.elemSize();
     const base = td.byte_offset + i * sz;
     const b = td.ab.bytes;
@@ -587,6 +641,7 @@ pub fn taStoreNumber(td: *const TypedArrayData, i: usize, x: f64) void {
         .u8clamped => p[0] = clampU8(x),
         .i16, .u16 => std.mem.writeInt(u16, p[0..2], wrapUnsigned(u16, x), native_endian),
         .i32, .u32 => std.mem.writeInt(u32, p[0..4], wrapUnsigned(u32, x), native_endian),
+        .f16 => std.mem.writeInt(u16, p[0..2], @bitCast(@as(f16, @floatCast(x))), native_endian),
         .f32 => std.mem.writeInt(u32, p[0..4], @bitCast(@as(f32, @floatCast(x))), native_endian),
         .f64 => std.mem.writeInt(u64, p[0..8], @bitCast(x), native_endian),
         .i64big, .u64big => {}, // big kinds handled via taStoreBig
@@ -603,6 +658,7 @@ fn bigintLow64(c: std.math.big.int.Const) u64 {
 }
 
 pub fn taStoreBig(td: *const TypedArrayData, i: usize, v: Value) void {
+    if (td.ab.immutable) return; // immutable buffer: writes ignored
     const sz = td.kind.elemSize();
     const base = td.byte_offset + i * sz;
     const b = td.ab.bytes;
@@ -652,6 +708,7 @@ pub fn nativeArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []
     if (max_bl) |m| {
         if (len > m) return throwRangeError(arena, "ArrayBuffer length exceeds maxByteLength");
     }
+    if ((max_bl orelse len) > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     const cap = max_bl orelse len;
     const bytes = try arena.alloc(u8, cap);
     @memset(bytes, 0);
@@ -706,15 +763,152 @@ fn getAbData(v: Value) ?*ArrayBufferData {
     return @ptrCast(@alignCast(o.internal_slot.?));
 }
 
+/// Brand check for SharedArrayBuffer.prototype methods: an ArrayBufferData with
+/// `shared == true`.
+fn getSabData(v: Value) ?*ArrayBufferData {
+    const ab = getAbData(v) orelse return null;
+    return if (ab.shared) ab else null;
+}
+
+pub fn nativeSharedArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        return throwTypeError(arena, "Constructor SharedArrayBuffer requires 'new'");
+    }
+    const len: usize = if (args.len > 0) try toIndexThrowing(arena, args[0]) else 0;
+    // GetArrayBufferMaxByteLengthOption → growable.
+    var max_bl: ?usize = null;
+    if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) {
+        const opts = args[1].toPtr().object;
+        if (opts.get("maxByteLength")) |mv| {
+            if (mv.bits != 0 and mv.unbox() != .undefined_)
+                max_bl = try toIndexThrowing(arena, mv);
+        }
+    }
+    if (max_bl) |m| {
+        if (len > m) return throwRangeError(arena, "SharedArrayBuffer length exceeds maxByteLength");
+    }
+    if ((max_bl orelse len) > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
+    const cap = max_bl orelse len;
+    const bytes = try arena.alloc(u8, cap);
+    @memset(bytes, 0);
+    const data = try arena.create(ArrayBufferData);
+    data.* = .{ .bytes = bytes, .byte_length = len, .max_byte_length = max_bl, .shared = true };
+    const obj = this_val.toPtr().object;
+    try applyNewTargetProto(arena, obj);
+    obj.internal_kind = .array_buffer;
+    obj.internal_slot = data;
+    return this_val;
+}
+
+pub fn sabGetByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const ab = getSabData(this_val) orelse return throwTypeError(arena, "get byteLength called on non-SharedArrayBuffer");
+    return val_mod.makeNumber(arena, @floatFromInt(ab.byte_length));
+}
+
+pub fn sabGetGrowable(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const ab = getSabData(this_val) orelse return throwTypeError(arena, "get growable called on non-SharedArrayBuffer");
+    return val_mod.makeBool(arena, ab.max_byte_length != null);
+}
+
+pub fn sabGetMaxByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const ab = getSabData(this_val) orelse return throwTypeError(arena, "get maxByteLength called on non-SharedArrayBuffer");
+    return val_mod.makeNumber(arena, @floatFromInt(ab.max_byte_length orelse ab.byte_length));
+}
+
+/// SharedArrayBuffer.prototype.grow(newLength): grow-only within maxByteLength.
+pub fn nativeSabGrow(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const ab = getSabData(this_val) orelse return throwTypeError(arena, "SharedArrayBuffer.prototype.grow called on non-SharedArrayBuffer");
+    const max = ab.max_byte_length orelse return throwTypeError(arena, "SharedArrayBuffer is not growable");
+    const new_len = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
+    if (new_len > max or new_len < ab.byte_length) return throwRangeError(arena, "SharedArrayBuffer grow length out of range");
+    if (new_len > ab.byte_length) @memset(ab.bytes[ab.byte_length..new_len], 0);
+    ab.byte_length = new_len;
+    return val_mod.makeUndefined(arena);
+}
+
+pub fn nativeSabSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const ab = getSabData(this_val) orelse return throwTypeError(arena, "SharedArrayBuffer.prototype.slice called on non-SharedArrayBuffer");
+    const len = ab.byte_length;
+    const start = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), len);
+    const end = relIndex(if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        try toIntegerThrowing(arena, args[1])
+    else
+        @floatFromInt(len), len);
+    const new_len = if (end > start) end - start else 0;
+
+    // SpeciesConstructor(O, %SharedArrayBuffer%).
+    const default_ctor_obj = active_sharedarraybuffer_ctor orelse
+        return throwTypeError(arena, "SharedArrayBuffer constructor not found");
+    var C = try val_mod.makeObject(arena, default_ctor_obj);
+    const ctor_v = try vmGet(arena, this_val, "constructor");
+    if (ctor_v.bits != 0 and ctor_v.unbox() != .undefined_) {
+        const c_obj = switch (ctor_v.unbox()) {
+            .object, .function, .bc_function, .native_function => true,
+            else => false,
+        };
+        if (!c_obj) return throwTypeError(arena, "SharedArrayBuffer constructor property is not an object");
+        if (realm_mod.active_sym_species) |spec_sym| {
+            const S = try vmGetSym(arena, ctor_v, spec_sym);
+            if (S.bits != 0 and S.unbox() != .undefined_ and S.unbox() != .null_) {
+                if (!isConstructor(S)) return throwTypeError(arena, "@@species is not a constructor");
+                C = S;
+            }
+        }
+    }
+    const ctx = realm_mod.active_context orelse return throwTypeError(arena, "no active context");
+    const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(new_len))};
+    const result = try ctx.construct(arena, C, &len_arg);
+    const res_ab = getSabData(result) orelse return throwTypeError(arena, "SharedArrayBuffer[@@species] result is not a SharedArrayBuffer");
+    if (result.bits == this_val.bits) return throwTypeError(arena, "SharedArrayBuffer[@@species] returned the same buffer");
+    if (res_ab.byte_length < new_len) return throwTypeError(arena, "SharedArrayBuffer[@@species] result is too small");
+    @memcpy(res_ab.bytes[0..new_len], ab.bytes[start .. start + new_len]);
+    return result;
+}
+
 pub fn nativeArrayBufferSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const ab = getAbData(this_val) orelse return throwTypeError(arena, "ArrayBuffer.prototype.slice called on non-ArrayBuffer");
+    if (ab.shared) return throwTypeError(arena, "ArrayBuffer.prototype.slice called on a SharedArrayBuffer");
+    if (ab.detached) return throwTypeError(arena, "Cannot slice a detached ArrayBuffer");
     const len = ab.byte_length;
-    const start = relIndex(if (args.len > 0) toNum(args[0]) else 0, len);
-    const end = relIndex(if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_) toNum(args[1]) else @floatFromInt(len), len);
+    // ToInteger(start/end) — observable; may detach via valueOf.
+    const start = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), len);
+    const end = relIndex(if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        try toIntegerThrowing(arena, args[1])
+    else
+        @floatFromInt(len), len);
     const new_len = if (end > start) end - start else 0;
-    const res = try makeArrayBuffer(arena, new_len);
-    @memcpy(res.data.bytes[0..new_len], ab.bytes[start .. start + new_len]);
-    return val_mod.makeObject(arena, res.obj);
+
+    // SpeciesConstructor(O, %ArrayBuffer%): observe constructor + @@species.
+    const default_ctor_obj = active_arraybuffer_ctor orelse
+        return throwTypeError(arena, "ArrayBuffer constructor not found");
+    var C = try val_mod.makeObject(arena, default_ctor_obj);
+    const ctor_v = try vmGet(arena, this_val, "constructor");
+    if (ctor_v.bits != 0 and ctor_v.unbox() != .undefined_) {
+        const c_obj = switch (ctor_v.unbox()) {
+            .object, .function, .bc_function, .native_function => true,
+            else => false,
+        };
+        if (!c_obj) return throwTypeError(arena, "ArrayBuffer constructor property is not an object");
+        if (realm_mod.active_sym_species) |spec_sym| {
+            const S = try vmGetSym(arena, ctor_v, spec_sym);
+            if (S.bits != 0 and S.unbox() != .undefined_ and S.unbox() != .null_) {
+                if (!isConstructor(S)) return throwTypeError(arena, "@@species is not a constructor");
+                C = S;
+            }
+        }
+    }
+    const ctx = realm_mod.active_context orelse return throwTypeError(arena, "no active context");
+    const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(new_len))};
+    const result = try ctx.construct(arena, C, &len_arg);
+    const res_ab = getAbData(result) orelse return throwTypeError(arena, "ArrayBuffer[@@species] result is not an ArrayBuffer");
+    if (res_ab.shared) return throwTypeError(arena, "ArrayBuffer[@@species] result is shared");
+    if (res_ab.detached) return throwTypeError(arena, "ArrayBuffer[@@species] result is detached");
+    if (result.bits == this_val.bits) return throwTypeError(arena, "ArrayBuffer[@@species] returned the same buffer");
+    if (res_ab.byte_length < new_len) return throwTypeError(arena, "ArrayBuffer[@@species] result is too small");
+    // Re-check source detachment (species ctor could have detached it).
+    if (ab.detached) return throwTypeError(arena, "source ArrayBuffer detached during species construction");
+    @memcpy(res_ab.bytes[0..new_len], ab.bytes[start .. start + new_len]);
+    return result;
 }
 
 pub fn abGetDetached(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -728,21 +922,103 @@ pub fn abGetByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Val
     return val_mod.makeNumber(arena, @floatFromInt(ab.byte_length));
 }
 
-pub fn nativeAbTransfer(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+/// Implementation-defined ceiling on ArrayBuffer allocation: a length past this
+/// throws RangeError instead of attempting a process-killing allocation/memset.
+const MAX_AB_BYTES: usize = 0x4000_0000; // 1 GiB
+
+fn abTransferImpl(arena: std.mem.Allocator, this_val: Value, args: []const Value, fixed: bool) anyerror!Value {
     const ab = getAbData(this_val) orelse return throwTypeError(arena, "not an ArrayBuffer");
+    if (ab.shared) return throwTypeError(arena, "Cannot transfer a SharedArrayBuffer");
+    if (ab.immutable) return throwTypeError(arena, "Cannot transfer an immutable ArrayBuffer");
+    // newLength: undefined → current byteLength; else ToIndex (observable, throws).
+    const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
+    const new_len: usize = if (has_arg) try toIndexThrowing(arena, args[0]) else ab.byte_length;
+    if (new_len > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     if (ab.detached) return throwTypeError(arena, "ArrayBuffer is detached");
-    const new_len: usize = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_) toIndex(toNum(args[0])) else ab.byte_length;
-    const res = try makeArrayBuffer(arena, new_len);
+    // transfer() keeps resizability; transferToFixedLength() never does.
+    const new_max: ?usize = if (!fixed) ab.max_byte_length else null;
+    if (new_max) |m| {
+        if (new_len > m) return throwRangeError(arena, "transfer length exceeds maxByteLength");
+    }
+    const cap = new_max orelse new_len;
+    const bytes = try arena.alloc(u8, cap);
+    @memset(bytes, 0);
     const copy_len = @min(new_len, ab.byte_length);
-    @memcpy(res.data.bytes[0..copy_len], ab.bytes[0..copy_len]);
+    @memcpy(bytes[0..copy_len], ab.bytes[0..copy_len]);
+    const data = try arena.create(ArrayBufferData);
+    data.* = .{ .bytes = bytes, .byte_length = new_len, .max_byte_length = new_max };
+    const obj = try newObject(arena, active_arraybuffer_proto);
+    obj.internal_kind = .array_buffer;
+    obj.internal_slot = data;
+    // Detach the source.
     ab.detached = true;
     ab.bytes = &[_]u8{};
     ab.byte_length = 0;
-    return val_mod.makeObject(arena, res.obj);
+    return val_mod.makeObject(arena, obj);
+}
+
+pub fn nativeAbTransfer(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return abTransferImpl(arena, this_val, args, false);
 }
 
 pub fn nativeAbTransferToFixedLength(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return nativeAbTransfer(arena, this_val, args);
+    return abTransferImpl(arena, this_val, args, true);
+}
+
+/// Immutable ArrayBuffer proposal: get ArrayBuffer.prototype.immutable.
+pub fn abGetImmutable(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const ab = getAbData(this_val) orelse return throwTypeError(arena, "get immutable called on non-ArrayBuffer");
+    return val_mod.makeBool(arena, ab.immutable);
+}
+
+/// ArrayBuffer.prototype.transferToImmutable([newLength]): move bytes into a new
+/// immutable (frozen, non-resizable, non-detachable) buffer; detaches source.
+pub fn nativeAbTransferToImmutable(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const ab = getAbData(this_val) orelse return throwTypeError(arena, "not an ArrayBuffer");
+    if (ab.shared) return throwTypeError(arena, "Cannot transfer a SharedArrayBuffer");
+    if (ab.immutable) return throwTypeError(arena, "Cannot transfer an immutable ArrayBuffer");
+    const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
+    const new_len: usize = if (has_arg) try toIndexThrowing(arena, args[0]) else ab.byte_length;
+    if (new_len > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
+    if (ab.detached) return throwTypeError(arena, "ArrayBuffer is detached");
+    const bytes = try arena.alloc(u8, new_len);
+    @memset(bytes, 0);
+    const copy_len = @min(new_len, ab.byte_length);
+    @memcpy(bytes[0..copy_len], ab.bytes[0..copy_len]);
+    const data = try arena.create(ArrayBufferData);
+    data.* = .{ .bytes = bytes, .byte_length = new_len, .immutable = true };
+    const obj = try newObject(arena, active_arraybuffer_proto);
+    obj.internal_kind = .array_buffer;
+    obj.internal_slot = data;
+    ab.detached = true;
+    ab.bytes = &[_]u8{};
+    ab.byte_length = 0;
+    return val_mod.makeObject(arena, obj);
+}
+
+/// ArrayBuffer.prototype.sliceToImmutable([start[, end]]): copy a byte range into
+/// a new immutable buffer; the source is NOT detached.
+pub fn nativeAbSliceToImmutable(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const ab = getAbData(this_val) orelse return throwTypeError(arena, "not an ArrayBuffer");
+    if (ab.shared) return throwTypeError(arena, "Cannot slice a SharedArrayBuffer to immutable");
+    if (ab.detached) return throwTypeError(arena, "Cannot slice a detached ArrayBuffer");
+    const len = ab.byte_length;
+    const start = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), len);
+    const end = relIndex(if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        try toIntegerThrowing(arena, args[1])
+    else
+        @floatFromInt(len), len);
+    if (ab.detached) return throwTypeError(arena, "ArrayBuffer detached during index coercion");
+    const new_len = if (end > start) end - start else 0;
+    const bytes = try arena.alloc(u8, new_len);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..new_len], ab.bytes[start .. start + new_len]);
+    const data = try arena.create(ArrayBufferData);
+    data.* = .{ .bytes = bytes, .byte_length = new_len, .immutable = true };
+    const obj = try newObject(arena, active_arraybuffer_proto);
+    obj.internal_kind = .array_buffer;
+    obj.internal_slot = data;
+    return val_mod.makeObject(arena, obj);
 }
 
 /// Detach an ArrayBuffer: mark detached, zero the backing bytes.
@@ -890,14 +1166,15 @@ pub fn nativeTaAbstractCtor(arena: std.mem.Allocator, _: Value, _: []const Value
 const IterDecision = enum { iterate, array_like };
 fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterDecision {
     // 1. Well-known Symbol.iterator (arrays + user `{[Symbol.iterator]:...}`).
+    //    GetMethod is observable: fire an accessor getter and propagate throws.
     if (realm_mod.active_sym_iterator) |sym| {
-        if (src.getSym(sym)) |m| {
-            // GetMethod: undefined/null → treat as absent; anything else must be callable.
-            if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
-                if (!function_proto_isCallable(m))
-                    return throwTypeError(arena, "Symbol.iterator is not a function");
-                return .iterate;
-            }
+        const src_val = try val_mod.makeObject(arena, src);
+        const m = try vmGetSym(arena, src_val, sym);
+        // GetMethod: undefined/null → treat as absent; anything else must be callable.
+        if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+            if (!function_proto_isCallable(m))
+                return throwTypeError(arena, "Symbol.iterator is not a function");
+            return .iterate;
         }
     }
     // 2. Internal string @@iterator (Set/Map register their iterator here).
@@ -972,10 +1249,12 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
                 if (byte_offset > ab.byte_length) return throwRangeError(arena, "byteOffset out of bounds");
                 if (byte_offset + length * esize > ab.byte_length) return throwRangeError(arena, "length out of bounds");
             } else {
-                if (ab.byte_length % esize != 0) return throwRangeError(arena, "buffer length not aligned");
+                // Alignment check applies only to FIXED-length buffers; a resizable
+                // buffer with no explicit length becomes an auto length-tracking view
+                // (length floors, no alignment requirement).
+                if (ab.max_byte_length == null and ab.byte_length % esize != 0) return throwRangeError(arena, "buffer length not aligned");
                 if (byte_offset > ab.byte_length) return throwRangeError(arena, "byteOffset out of bounds");
                 length = (ab.byte_length - byte_offset) / esize;
-                // No explicit length on a resizable buffer → auto length-tracking view.
                 track_len = ab.max_byte_length != null;
             }
             _ = try finishTypedArray(arena, this_obj, kind, src, ab, byte_offset, length, track_len);
@@ -1125,7 +1404,12 @@ fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedAr
     if (exemplar_this.bits != 0 and exemplar_this.unbox() == .object) {
         const ctor_v = try vmGet(arena, exemplar_this, "constructor");
         if (ctor_v.bits != 0 and ctor_v.unbox() != .undefined_) {
-            if (ctor_v.unbox() != .object) {
+            // "If Type(C) is not Object, throw." Functions (bc/native) are Objects.
+            const c_is_object = switch (ctor_v.unbox()) {
+                .object, .function, .bc_function, .native_function => true,
+                else => false,
+            };
+            if (!c_is_object) {
                 return throwTypeError(arena, "TypedArray constructor property is not an object");
             }
             if (realm_mod.active_sym_species) |spec_sym| {
@@ -1213,13 +1497,15 @@ pub fn nativeTaFill(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
 pub fn nativeTaSubarray(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
-    const begin = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), td.length);
+    // Spec subarray does NOT ValidateTypedArray: srcLength is 0 when OOB/detached,
+    // and ToInteger(begin/end) must run observably regardless.
+    const src_len: usize = if (taIsOob(td)) 0 else taCurrentLen(td);
+    const begin = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), src_len);
     const end_v: Value = if (args.len > 1) args[1] else Value{};
     const end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
-        relIndex(try toIntegerThrowing(arena, end_v), td.length)
+        relIndex(try toIntegerThrowing(arena, end_v), src_len)
     else
-        td.length;
+        src_len;
     const new_len = if (end > begin) end - begin else 0;
     // Build subarray args: (buffer, beginByteOffset, newLength) for species ctor.
     const buf_val = try val_mod.makeObject(arena, td.buffer_obj);
@@ -1243,6 +1529,10 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(new_len))};
     const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg);
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
+    // Spec slice step 14: if count > 0 and the source buffer was detached during
+    // SpeciesConstructor (e.g. via the `constructor`/@@species getter), throw.
+    if (new_len > 0 and td.ab.detached)
+        return throwTypeError(arena, "source TypedArray buffer detached during species construction");
     var i: usize = 0;
     while (i < new_len) : (i += 1) {
         const ev = try taLoad(arena, td, start + i);
@@ -1260,10 +1550,19 @@ pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     // negative → RangeError. May be +Inf (caught by the bounds check below).
     const off_f = try toIntegerThrowing(arena, if (args.len > 1) args[1] else Value{});
     if (off_f < 0) return throwRangeError(arena, "Invalid typed array set offset");
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeUndefined(arena);
-    const src = args[0].toPtr().object;
-    if (src.internal_kind == .typed_array) {
+    // The offset's valueOf can detach the target buffer; spec re-validates.
+    if (td.ab.detached) return throwTypeError(arena, "target TypedArray buffer detached during offset coercion");
+    // ToObject(source): null/undefined throw; a TypedArray source uses the fast
+    // overlap-safe path; everything else (objects, strings, primitives) goes
+    // through the observable array-like path (ToObject + indexed [[Get]]).
+    const src_val: Value = if (args.len > 0) args[0] else Value{};
+    if (src_val.bits == 0 or src_val.unbox() == .undefined_ or src_val.unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
+    const is_ta_src = src_val.unbox() == .object and src_val.toPtr().object.internal_kind == .typed_array;
+    if (is_ta_src) {
+        const src = src_val.toPtr().object;
         const src_td: *TypedArrayData = @ptrCast(@alignCast(src.internal_slot.?));
+        if (src_td.ab.detached) return throwTypeError(arena, "source TypedArray buffer detached during offset coercion");
         // Cross number↔bigint set is a TypeError.
         if (src_td.kind.isBigInt() != td.kind.isBigInt())
             return throwTypeError(arena, "Cannot mix BigInt and non-BigInt typed arrays");
@@ -1310,8 +1609,18 @@ pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 pub fn nativeTaIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
+    // Spec: if len is 0, return -1 BEFORE ToInteger(fromIndex).
+    if (td.length == 0) return val_mod.makeNumber(arena, -1);
     if (args.len == 0) return val_mod.makeNumber(arena, -1);
     const is_big = td.kind.isBigInt();
+    // Strict comparison: a non-Number searchElement can never equal a numeric
+    // element (and vice-versa for BigInt views) → -1 without scanning.
+    if (args[0].bits == 0) return val_mod.makeNumber(arena, -1);
+    switch (args[0].unbox()) {
+        .number => if (is_big) return val_mod.makeNumber(arena, -1),
+        .bigint => if (!is_big) return val_mod.makeNumber(arena, -1),
+        else => return val_mod.makeNumber(arena, -1),
+    }
     const target = toNum(args[0]);
     const want_big: ?i128 = if (is_big) bigintSearch(args[0]) else null;
     var k: usize = 0;
@@ -1340,6 +1649,8 @@ pub fn nativeTaIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const 
 pub fn nativeTaIncludes(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
+    // Spec: if len is 0, return false BEFORE ToInteger(fromIndex).
+    if (td.length == 0) return val_mod.makeBool(arena, false);
     if (args.len == 0) return val_mod.makeBool(arena, false);
     const is_big = td.kind.isBigInt();
     const target = toNum(args[0]);
@@ -1372,16 +1683,26 @@ pub fn nativeTaIncludes(arena: std.mem.Allocator, this_val: Value, args: []const
 pub fn nativeTaJoin(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
-    const sep: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) args[0].toPtr().string else ",";
+    // ECMAScript: separator undefined → ","; otherwise ToString(separator),
+    // firing toString/valueOf (throws propagate) and rejecting symbols.
+    const array_proto = @import("array_proto.zig");
+    const sep: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_)
+        try array_proto.valueToJsString(arena, args[0])
+    else
+        ",";
     var buf = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
         if (i > 0) try buf.appendSlice(arena, sep);
         const ev = try taLoad(arena, td, i);
-        const s = if (td.kind.isBigInt())
-            try val_mod.bigIntToString(arena, ev.unbox().bigint)
-        else
-            try val_mod.formatNumber(arena, toNum(ev));
+        // Detached/OOB element reads return undefined → "" (spec join semantics).
+        if (ev.bits == 0) continue;
+        const s: []const u8 = switch (ev.unbox()) {
+            .bigint => try val_mod.bigIntToString(arena, ev.unbox().bigint),
+            .number => |n| try val_mod.formatNumber(arena, n),
+            .undefined_, .null_ => "",
+            else => try val_mod.formatNumber(arena, toNum(ev)),
+        };
         try buf.appendSlice(arena, s);
     }
     return val_mod.makeString(arena, buf.items);
@@ -1560,7 +1881,15 @@ pub fn nativeTaOf(arena: std.mem.Allocator, this_val: Value, args: []const Value
         const a = try allocTA(arena, kind, args.len);
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
-            if (kind.isBigInt()) taStoreBig(a.td, i, args[i]) else taStoreNumber(a.td, i, toNum(args[i]));
+            // Element coercion is observable + throws (ToBigInt/ToNumber of a
+            // Symbol, or cross-type, raises TypeError).
+            if (kind.isBigInt()) {
+                const bv = try toBigIntThrowing(arena, args[i]);
+                taStoreBig(a.td, i, bv);
+            } else {
+                const nv = try toNumberThrowing(arena, args[i]);
+                taStoreNumber(a.td, i, nv);
+            }
         }
         return val_mod.makeObject(arena, a.obj);
     }
@@ -1600,7 +1929,10 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
             length = list.items.len;
         } else {
             arr_src = src;
-            length = arrayLikeLen(src);
+            // LengthOfArrayLike: ToLength(? Get(src,"length")) — fires getter,
+            // propagates abrupt throws (arylk-get-length-error / -to-length-error).
+            const len_f = try toIntegerThrowing(arena, try vmGet(arena, args[0], "length"));
+            length = if (len_f <= 0) 0 else if (len_f > 9007199254740991.0) 9007199254740991 else @intFromFloat(len_f);
         }
     }
 
@@ -1618,11 +1950,10 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
     var i: usize = 0;
     while (i < length) : (i += 1) {
-        var ev = if (arr_src) |s| blk: {
+        var ev = if (arr_src) |_| blk: {
             const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-            break :blk src_get: {
-                break :src_get s.get(key) orelse Value{};
-            };
+            // ? Get(arrayLike, key) — fires accessor getters, propagates throws.
+            break :blk try vmGet(arena, args[0], key);
         } else list_items[i];
         if (map_present) {
             const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
@@ -1683,8 +2014,29 @@ fn bigintSearch(v: Value) ?i128 {
     return v.toPtr().bigint.toConst().toInt(i128) catch null;
 }
 
+/// Default TypedArray numeric SortCompare: ascending, NaN sorts last, -0 before +0.
+fn taNumCompare(x: f64, y: f64) f64 {
+    const xn = std.math.isNan(x);
+    const yn = std.math.isNan(y);
+    if (xn and yn) return 0;
+    if (xn) return 1;
+    if (yn) return -1;
+    if (x < y) return -1;
+    if (x > y) return 1;
+    if (x == 0 and y == 0) {
+        const xneg = std.math.signbit(x);
+        const yneg = std.math.signbit(y);
+        if (xneg and !yneg) return -1;
+        if (!xneg and yneg) return 1;
+    }
+    return 0;
+}
+
 pub fn nativeTaSort(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
+    // Spec step 1: a non-undefined, non-callable comparefn throws (before length).
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_ and !function_proto_isCallable(args[0]))
+        return throwTypeError(arena, "comparator is not a function");
     try validateTypedArray(arena, td);
     const n = td.length;
     if (n < 2) return this_val;
@@ -1705,7 +2057,7 @@ pub fn nativeTaSort(arena: std.mem.Allocator, this_val: Value, args: []const Val
                     break :blk rv > 0;
                 }
                 if (td.kind.isBigInt()) break :blk taBigRaw(td, j - 1) > taBigRaw(td, j);
-                break :blk toNum(a) > toNum(b);
+                break :blk taNumCompare(toNum(a), toNum(b)) > 0;
             };
             if (should_swap) {
                 if (td.kind.isBigInt()) {
@@ -1827,7 +2179,7 @@ pub fn nativeTaCopyWithin(arena: std.mem.Allocator, this_val: Value, args: []con
         relIndex(try toIntegerThrowing(arena, end_v), len)
     else
         len;
-    if (td.ab.detached) return this_val; // detached during coercion → no-op
+    if (td.ab.detached) return throwTypeError(arena, "TypedArray buffer detached during index coercion");
     const count = if (end > start) end - start else 0;
     if (count == 0 or target >= len) return this_val;
     const actual_count = @min(count, len - target);
@@ -1879,6 +2231,13 @@ pub fn nativeTaLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []co
     try validateTypedArray(arena, td);
     if (args.len == 0 or td.length == 0) return val_mod.makeNumber(arena, -1);
     const is_big = td.kind.isBigInt();
+    // Strict comparison: cross-type searchElement can never match.
+    if (args[0].bits == 0) return val_mod.makeNumber(arena, -1);
+    switch (args[0].unbox()) {
+        .number => if (is_big) return val_mod.makeNumber(arena, -1),
+        .bigint => if (!is_big) return val_mod.makeNumber(arena, -1),
+        else => return val_mod.makeNumber(arena, -1),
+    }
     const target = toNum(args[0]);
     const want_big: ?i128 = if (is_big) bigintSearch(args[0]) else null;
     var from: i64 = @intCast(td.length - 1);
@@ -1912,7 +2271,18 @@ pub fn nativeTaLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []co
 }
 
 pub fn nativeTaToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    return nativeTaJoin(arena, this_val, &[_]Value{});
+    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
+    try validateTypedArray(arena, td);
+    const array_proto = @import("array_proto.zig");
+    const len = td.length;
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        if (i > 0) try buf.appendSlice(arena, ",");
+        const ev = try taLoad(arena, td, i);
+        try buf.appendSlice(arena, try array_proto.elemLocaleString(arena, ev));
+    }
+    return val_mod.makeString(arena, buf.items);
 }
 
 pub fn nativeTaFindLast(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1990,7 +2360,7 @@ pub fn nativeTaToSorted(arena: std.mem.Allocator, this_val: Value, args: []const
                     break :blk rv > 0;
                 }
                 if (td.kind.isBigInt()) break :blk taBigRaw(a.td, j - 1) > taBigRaw(a.td, j);
-                break :blk toNum(aa) > toNum(b);
+                break :blk taNumCompare(toNum(aa), toNum(b)) > 0;
             };
             if (should_swap) {
                 if (td.kind.isBigInt()) {
@@ -2010,15 +2380,18 @@ pub fn nativeTaWith(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
     if (args.len < 2) return throwTypeError(arena, "with requires 2 arguments");
+    const len_f: f64 = @floatFromInt(td.length);
     const idx_f = try toIntegerThrowing(arena, args[0]);
     var idx: f64 = idx_f;
-    if (idx < 0) idx += @floatFromInt(td.length);
-    if (idx < 0 or idx >= @as(f64, @floatFromInt(td.length)))
-        return throwRangeError(arena, "Invalid typed array index");
-    const final_idx: usize = @intFromFloat(idx);
+    if (idx < 0) idx += len_f;
+    // Spec: coerce the value (observable, throws propagate) BEFORE the bounds
+    // RangeError check.
     var new_num: f64 = 0;
     var new_big: Value = Value{};
     if (td.kind.isBigInt()) new_big = try toBigIntThrowing(arena, args[1]) else new_num = try toNumberThrowing(arena, args[1]);
+    if (idx < 0 or idx >= len_f)
+        return throwRangeError(arena, "Invalid typed array index");
+    const final_idx: usize = @intFromFloat(idx);
     const a = try allocTA(arena, td.kind, td.length);
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
@@ -2083,8 +2456,12 @@ pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     dv.* = .{ .buffer_obj = buf_obj, .ab = ab, .byte_offset = byte_offset, .byte_length = byte_length, .track_length = track_length };
     obj.internal_kind = .data_view;
     obj.internal_slot = dv;
-    try obj.set("buffer", try val_mod.makeObject(arena, buf_obj));
     return this_val;
+}
+
+pub fn dvGetBuffer(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const dv = getDvData(this_val) orelse return throwTypeError(arena, "get buffer called on non-DataView");
+    return val_mod.makeObject(arena, dv.buffer_obj);
 }
 
 pub fn dvGetByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -2106,8 +2483,10 @@ fn dvLittleEndian(args: []const Value, idx: usize) bool {
     return switch (v.unbox()) {
         .boolean => |b| b,
         .undefined_, .null_ => false,
-        .number => |n| n != 0,
-        else => true,
+        .number => |n| n != 0 and !std.math.isNan(n),
+        .string => |s| s.len > 0,
+        .bigint => !v.toPtr().bigint.toConst().eqlZero(),
+        else => true, // objects/symbols are truthy
     };
 }
 
@@ -2115,14 +2494,13 @@ pub fn dvGet(comptime T: type, comptime is_float: bool) val_mod.NativeFnPtr {
     return struct {
         fn f(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
             const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
-            // Spec: ToIndex(requestIndex) runs BEFORE the detached check.
-            const raw_off = if (args.len > 0) toNum(args[0]) else 0;
-            if (!std.math.isFinite(raw_off) or raw_off < 0) return throwRangeError(arena, "Offset is outside the bounds of the DataView");
-            const off: usize = toIndex(raw_off);
+            // Spec GetViewValue: ToIndex(requestIndex) — observable, throws — then
+            // ToBoolean(littleEndian), then detached/bounds checks.
+            const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
+            const le = dvLittleEndian(args, 1);
             if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
             const size = @sizeOf(T);
             if (off + size > dvCurrentByteLen(dv)) return throwRangeError(arena, "Offset is outside the bounds of the DataView");
-            const le = dvLittleEndian(args, 1);
             const endian: std.builtin.Endian = if (le) .little else .big;
             const base = dv.byte_offset + off;
             const p = dv.ab.bytes[base..];
@@ -2146,15 +2524,14 @@ pub fn dvSet(comptime T: type, comptime is_float: bool) val_mod.NativeFnPtr {
     return struct {
         fn f(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
             const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
-            // Spec: ToIndex(requestIndex) runs BEFORE the detached check.
-            const raw_off = if (args.len > 0) toNum(args[0]) else 0;
-            if (!std.math.isFinite(raw_off) or raw_off < 0) return throwRangeError(arena, "Offset is outside the bounds of the DataView");
-            const off: usize = toIndex(raw_off);
+            // Spec SetViewValue order: ToIndex(requestIndex) → ToBoolean(le) →
+            // ToNumber(value) [observable, throws] → detached/bounds checks.
+            const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
+            const le = dvLittleEndian(args, 2);
+            const x = try toNumberThrowing(arena, if (args.len > 1) args[1] else Value{});
             if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
             const size = @sizeOf(T);
             if (off + size > dvCurrentByteLen(dv)) return throwRangeError(arena, "Offset is outside the bounds of the DataView");
-            const x = if (args.len > 1) toNum(args[1]) else std.math.nan(f64);
-            const le = dvLittleEndian(args, 2);
             const endian: std.builtin.Endian = if (le) .little else .big;
             const base = dv.byte_offset + off;
             const p = dv.ab.bytes[base..];
@@ -2171,6 +2548,66 @@ pub fn dvSet(comptime T: type, comptime is_float: bool) val_mod.NativeFnPtr {
             return val_mod.makeUndefined(arena);
         }
     }.f;
+}
+
+pub fn dvGetBig(comptime signed: bool) val_mod.NativeFnPtr {
+    return struct {
+        fn f(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+            const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
+            const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
+            const le = dvLittleEndian(args, 1);
+            if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+            if (off + 8 > dvCurrentByteLen(dv)) return throwRangeError(arena, "Offset is outside the bounds of the DataView");
+            const endian: std.builtin.Endian = if (le) .little else .big;
+            const p = dv.ab.bytes[dv.byte_offset + off ..];
+            const u = std.mem.readInt(u64, p[0..8], endian);
+            if (signed) return val_mod.makeBigIntFromI64(arena, @bitCast(u));
+            return makeBigU64(arena, u);
+        }
+    }.f;
+}
+
+pub fn dvSetBig() val_mod.NativeFnPtr {
+    return struct {
+        fn f(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+            const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
+            const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
+            const le = dvLittleEndian(args, 2);
+            const bv = try toBigIntThrowing(arena, if (args.len > 1) args[1] else Value{});
+            if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+            if (off + 8 > dvCurrentByteLen(dv)) return throwRangeError(arena, "Offset is outside the bounds of the DataView");
+            const endian: std.builtin.Endian = if (le) .little else .big;
+            const u = bigintLow64(bv.toPtr().bigint.toConst());
+            const p = dv.ab.bytes[dv.byte_offset + off ..];
+            std.mem.writeInt(u64, p[0..8], u, endian);
+            return val_mod.makeUndefined(arena);
+        }
+    }.f;
+}
+
+pub fn dvGetF16(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
+    const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
+    const le = dvLittleEndian(args, 1);
+    if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+    if (off + 2 > dvCurrentByteLen(dv)) return throwRangeError(arena, "Offset is outside the bounds of the DataView");
+    const endian: std.builtin.Endian = if (le) .little else .big;
+    const p = dv.ab.bytes[dv.byte_offset + off ..];
+    const bits = std.mem.readInt(u16, p[0..2], endian);
+    return val_mod.makeNumber(arena, @as(f16, @bitCast(bits)));
+}
+
+pub fn dvSetF16(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
+    const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
+    const le = dvLittleEndian(args, 2);
+    const x = try toNumberThrowing(arena, if (args.len > 1) args[1] else Value{});
+    if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+    if (off + 2 > dvCurrentByteLen(dv)) return throwRangeError(arena, "Offset is outside the bounds of the DataView");
+    const endian: std.builtin.Endian = if (le) .little else .big;
+    const p = dv.ab.bytes[dv.byte_offset + off ..];
+    std.mem.writeInt(u16, p[0..2], @bitCast(@as(f16, @floatCast(x))), endian);
+    return val_mod.makeUndefined(arena);
 }
 
 // ------------------------------------------------------------------- tests ---

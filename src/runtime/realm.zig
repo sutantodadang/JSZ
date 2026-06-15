@@ -283,6 +283,8 @@ pub var active_string_proto: ?*JsObject = null;
 /// Phase 13: thread-locals for Number/Boolean.prototype (autoboxing lookup).
 pub var active_number_proto: ?*JsObject = null;
 pub var active_boolean_proto: ?*JsObject = null;
+/// BigInt.prototype (autoboxing lookup for bigint primitives).
+pub var active_bigint_proto: ?*JsObject = null;
 /// Phase 13: set true by the VM immediately before invoking a native constructor
 /// via `new` (or Reflect.construct); reset false at every plain-call entry. Lets
 /// the Boolean/Number/String factories return a wrapper object under `new` but a
@@ -572,15 +574,50 @@ fn nativeArrayFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anye
 /// `src` is not iterable (no callable @@iterator) so the caller can fall back to
 /// the array-like path. Used by Array.from for Set/Map/generators/custom iterables.
 fn arrayFromIterate(arena: std.mem.Allocator, src: Value, items: *std.ArrayList(Value)) anyerror!bool {
-    _ = arena;
-    _ = src;
-    _ = items;
-    // TODO(Array.from iterables): driving the @@iterator protocol from this native
-    // via ctx.invokeJs re-enters the bc VM and underflows the call-frame stack
-    // (bc_vm.doCall `frames.len - 1`). Disabled until the re-entrant-invoke frame
-    // bug is fixed; Set/Map/generator sources fall through to the array-like path.
-    // Real Arrays are handled by the `is_array` branch above (the common case).
-    return false;
+    // Drive the @@iterator protocol via the hardened re-entrant invoke bridge
+    // (the same one TA.map/sort use). Returns false (→ array-like fallback) only
+    // when the source is not iterable.
+    const sym = active_sym_iterator orelse return false;
+    const ctx = active_context orelse return false;
+    const iter_fn = try ctx.getPropSym(arena, src, sym);
+    if (iter_fn.bits == 0 or iter_fn.unbox() == .undefined_ or iter_fn.unbox() == .null_) return false;
+    if (!isCallableVal(iter_fn)) return false;
+    const iterator = try function_proto_mod.invokeCallback(arena, src, iter_fn, &[_]Value{});
+    if (iterator.bits == 0 or iterator.unbox() != .object) return throwTypeError(arena, "[Symbol.iterator]() returned a non-object");
+    const next_fn = try ctx.getProp(arena, iterator, "next");
+    if (!isCallableVal(next_fn)) return throwTypeError(arena, "iterator.next is not a function");
+    var guard: usize = 0;
+    while (true) {
+        guard += 1;
+        if (guard > 100_000_000) break;
+        const res = try function_proto_mod.invokeCallback(arena, iterator, next_fn, &[_]Value{});
+        if (res.bits == 0 or res.unbox() != .object) return throwTypeError(arena, "iterator.next() returned a non-object");
+        const done = try ctx.getProp(arena, res, "done");
+        if (isTruthyVal(done)) break;
+        const val = try ctx.getProp(arena, res, "value");
+        try items.append(arena, val);
+    }
+    return true;
+}
+
+fn isCallableVal(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .native_function, .bc_function, .function => true,
+        .object => |o| o.get("__call__") != null,
+        else => false,
+    };
+}
+
+fn isTruthyVal(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .undefined_, .null_ => false,
+        .boolean => |b| b,
+        .number => |n| n != 0 and !std.math.isNan(n),
+        .string => |s| s.len > 0,
+        else => true,
+    };
 }
 
 fn isTruthyValue(v: Value) bool {
@@ -850,6 +887,52 @@ fn nativeBigIntCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
     }
 }
 
+/// thisBigIntValue(this): primitive bigint, or a BigInt wrapper's [[PrimitiveValue]].
+fn bigIntThisValue(arena: std.mem.Allocator, this_val: Value) anyerror!Value {
+    if (this_val.bits != 0) {
+        switch (this_val.unbox()) {
+            .bigint => return this_val,
+            .object => |o| {
+                if (o.get("[[PrimitiveValue]]")) |pv| {
+                    if (pv.bits != 0 and pv.unbox() == .bigint) return pv;
+                }
+            },
+            else => {},
+        }
+    }
+    return throwTypeError(arena, "BigInt.prototype method called on incompatible receiver");
+}
+
+fn nativeBigIntProtoToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const b = try bigIntThisValue(arena, this_val);
+    var radix: i64 = 10;
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_) {
+        const prim = (try coercion_mod.toPrimitive(arena, args[0], .number)) orelse args[0];
+        const rn: f64 = switch (prim.unbox()) {
+            .number => |n| n,
+            .boolean => |bo| if (bo) 1 else 0,
+            else => 10,
+        };
+        if (std.math.isNan(rn)) return throwRangeError(arena, "toString() radix must be between 2 and 36");
+        radix = @intFromFloat(@trunc(rn));
+    }
+    if (radix < 2 or radix > 36) return throwRangeError(arena, "toString() radix must be between 2 and 36");
+    const s = try b.toPtr().bigint.toConst().toStringAlloc(arena, @intCast(radix), .lower);
+    return val_mod.makeString(arena, s);
+}
+
+fn nativeBigIntProtoValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return bigIntThisValue(arena, this_val);
+}
+
+fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    const eo = if (active_heap) |h| try JsObject.createOnHeap(h, error_proto_RangeError) else try JsObject.create(arena, error_proto_RangeError);
+    try eo.set("message", try val_mod.makeString(arena, msg));
+    try eo.set("name", try val_mod.makeString(arena, "RangeError"));
+    pending_exception = try val_mod.makeObject(arena, eo);
+    return error.JsException;
+}
+
 /// Pull a wrapper object's stored `[[PrimitiveValue]]`, if present.
 fn wrapperPrimitive(this_val: Value) ?Value {
     if (this_val.bits != 0 and this_val.unbox() == .object) {
@@ -1045,6 +1128,8 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
     const fns = .{
         .{ "push", array_proto_mod.nativePush },
         .{ "pop", array_proto_mod.nativePop },
+        .{ "unshift", array_proto_mod.nativeUnshift },
+        .{ "shift", array_proto_mod.nativeShift },
         .{ "slice", array_proto_mod.nativeSlice },
         .{ "indexOf", array_proto_mod.nativeIndexOf },
         .{ "includes", array_proto_mod.nativeIncludes },
@@ -1077,6 +1162,8 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "toReversed", array_proto_mod.nativeToReversed },
         .{ "toSorted", array_proto_mod.nativeToSorted },
         .{ "toSpliced", array_proto_mod.nativeToSpliced },
+        .{ "toLocaleString", array_proto_mod.nativeArrayToLocaleString },
+        .{ "toString", array_proto_mod.nativeArrayToString },
     };
     const method_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (fns) |pair| {
@@ -1301,6 +1388,8 @@ pub const Realm = struct {
             try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoToString, "toString", 0), meth_attr);
         _ = try object_proto.defineOwnData("valueOf",
             try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoValueOf, "valueOf", 0), meth_attr);
+        _ = try object_proto.defineOwnData("toLocaleString",
+            try val_mod.makeNativeFunctionNamed(arena, array_proto_mod.nativeObjectToLocaleString, "toLocaleString", 0), meth_attr);
 
         // ---- Phase 4d: Function.prototype (call, apply, bind) ----
         const function_proto = try JsObject.create(arena, object_proto);
@@ -1400,6 +1489,27 @@ pub const Realm = struct {
         // independently). ponytail: asIntN/asUintN/prototype not added yet.
         const bigint_ctor_obj = try JsObject.create(arena, null);
         try bigint_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBigIntCtor));
+        // BigInt.prototype: real object so `BigInt.prototype.toString = ...` and
+        // bigint-primitive autoboxing (`(1n).toString()`) work.
+        {
+            const bi_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+            const bigint_proto = try JsObject.create(arena, object_proto);
+            _ = try bigint_proto.defineOwnData("toString",
+                try val_mod.makeNativeFunctionNamed(arena, nativeBigIntProtoToString, "toString", 0), bi_attr);
+            _ = try bigint_proto.defineOwnData("toLocaleString",
+                try val_mod.makeNativeFunctionNamed(arena, nativeBigIntProtoToString, "toLocaleString", 0), bi_attr);
+            _ = try bigint_proto.defineOwnData("valueOf",
+                try val_mod.makeNativeFunctionNamed(arena, nativeBigIntProtoValueOf, "valueOf", 0), bi_attr);
+            if (active_sym_to_string_tag) |tag_sym| {
+                _ = try bigint_proto.defineOwnDataSym(tag_sym,
+                    try val_mod.makeString(arena, "BigInt"),
+                    .{ .writable = false, .enumerable = false, .configurable = true });
+            }
+            _ = try bigint_proto.defineOwnData("constructor",
+                try val_mod.makeObject(arena, bigint_ctor_obj), bi_attr);
+            try bigint_ctor_obj.set("prototype", try val_mod.makeObject(arena, bigint_proto));
+            active_bigint_proto = bigint_proto;
+        }
         try env.define("BigInt", try val_mod.makeObject(arena, bigint_ctor_obj));
 
         // ---- Function constructor (minimal): callable object so `typeof Function`

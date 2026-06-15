@@ -603,11 +603,35 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         return args[0];
     }
 
-    const value = desc.getOwn("value") orelse try val_mod.makeUndefined(arena);
+    // Partial descriptor: fields the descriptor omits default to the EXISTING own
+    // property's attributes (when redefining) or to false (when creating new).
+    var cur_w = false;
+    var cur_e = false;
+    var cur_c = false;
+    var has_own_data = false;
+    var cur_val: ?Value = null;
+    if (obj.findProperty(key)) |loc| {
+        if (loc.holder == obj) {
+            const a = loc.holder.attrAt(loc.slot);
+            if (!a.is_accessor) {
+                cur_w = a.writable;
+                cur_e = a.enumerable;
+                cur_c = a.configurable;
+                cur_val = obj.getOwn(key);
+                has_own_data = true;
+            }
+        }
+    }
+    const value = if (desc.hasOwn("value"))
+        (desc.getOwn("value") orelse try val_mod.makeUndefined(arena))
+    else if (has_own_data and cur_val != null)
+        cur_val.?
+    else
+        try val_mod.makeUndefined(arena);
     const attr = PropAttr{
-        .writable = descTruthy(desc.getOwn("writable")),
-        .enumerable = descTruthy(desc.getOwn("enumerable")),
-        .configurable = descTruthy(desc.getOwn("configurable")),
+        .writable = if (desc.hasOwn("writable")) descTruthy(desc.getOwn("writable")) else cur_w,
+        .enumerable = if (desc.hasOwn("enumerable")) descTruthy(desc.getOwn("enumerable")) else cur_e,
+        .configurable = if (desc.hasOwn("configurable")) descTruthy(desc.getOwn("configurable")) else cur_c,
     };
     const ok = try obj.defineOwnData(key, value, attr);
     if (!ok) return throwTypeError(arena, "cannot redefine property");
@@ -698,8 +722,12 @@ pub fn nativeObjectIsSealed(arena: std.mem.Allocator, _: Value, args: []const Va
 /// Object.isExtensible(o): primitives → false; objects → extensible flag.
 pub fn nativeObjectIsExtensible(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeBool(arena, false);
-    if (args[0].unbox() != .object) return val_mod.makeBool(arena, false);
-    return val_mod.makeBool(arena, args[0].toPtr().object.extensible);
+    return switch (args[0].unbox()) {
+        .object => |o| val_mod.makeBool(arena, o.extensible),
+        // Functions are ordinary (extensible) objects.
+        .native_function, .bc_function, .function => val_mod.makeBool(arena, true),
+        else => val_mod.makeBool(arena, false),
+    };
 }
 
 /// Object.getOwnPropertySymbols(o): array of own symbol keys.

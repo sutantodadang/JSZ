@@ -246,6 +246,133 @@ pub fn nativeJoin(arena: std.mem.Allocator, this_val: Value, args: []const Value
     return val_mod.makeString(arena, buf.items);
 }
 
+/// ToString of an arbitrary Value (spec ToString), firing valueOf/toString on
+/// objects via the VM toPrimitive bridge. Symbols throw TypeError.
+pub fn valueToJsString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
+    if (v.bits == 0) return "undefined";
+    return switch (v.unbox()) {
+        .undefined_ => "undefined",
+        .null_ => "null",
+        .boolean => |b| if (b) "true" else "false",
+        .number => |n| try formatNumber(arena, n),
+        .string => |s| s,
+        .bigint => try val_mod.bigIntToString(arena, v.unbox().bigint),
+        .symbol => {
+            const obj = try JsObject.create(arena, realm_mod.error_proto_TypeError);
+            try obj.set("message", try val_mod.makeString(arena, "Cannot convert a Symbol value to a string"));
+            try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+            realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+            return error.JsException;
+        },
+        else => blk: {
+            const coercion = @import("coercion.zig");
+            const prim = (try coercion.toPrimitive(arena, v, .string)) orelse v;
+            if (prim.bits != 0 and prim.unbox() == .object) break :blk "[object Object]";
+            break :blk try valueToJsString(arena, prim);
+        },
+    };
+}
+
+/// One element of the toLocaleString algorithm: undefined/null → "", otherwise
+/// ToString(? Invoke(element, "toLocaleString")). Resolves the method through
+/// the proto chain (incl. boxed primitives) and fires user overrides.
+pub fn elemLocaleString(arena: std.mem.Allocator, elem: Value) anyerror![]const u8 {
+    if (elem.bits == 0) return "";
+    switch (elem.unbox()) {
+        .undefined_, .null_ => return "",
+        else => {},
+    }
+    const fpm = @import("../builtins/function_proto.zig");
+    const m: Value = if (realm_mod.active_context) |ctx|
+        try ctx.getProp(arena, elem, "toLocaleString")
+    else
+        Value{};
+    const r = try fpm.invokeCallback(arena, elem, m, &[_]Value{});
+    return valueToJsString(arena, r);
+}
+
+/// ES Array.prototype.toLocaleString: join elements, each via Invoke
+/// "toLocaleString", with the implementation-defined list separator ",".
+pub fn nativeArrayToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const len = try genLength(arena, this_val);
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        if (i > 0) try buf.appendSlice(arena, ",");
+        const elem = try genGet(arena, this_val, i);
+        try buf.appendSlice(arena, try elemLocaleString(arena, elem));
+    }
+    return val_mod.makeString(arena, buf.items);
+}
+
+/// ES Array.prototype.toString: let func = Get(array, "join"); if not callable,
+/// fall back to Object.prototype.toString; return func.call(array).
+pub fn nativeArrayToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const fpm = @import("../builtins/function_proto.zig");
+    const join_fn: Value = if (realm_mod.active_context) |ctx|
+        try ctx.getProp(arena, this_val, "join")
+    else
+        Value{};
+    if (join_fn.bits != 0) {
+        const cuni = join_fn.unbox();
+        const callable = cuni == .native_function or cuni == .bc_function or cuni == .function or
+            (cuni == .object and join_fn.toPtr().object.get("__call__") != null);
+        if (callable) return fpm.invokeCallback(arena, this_val, join_fn, &[_]Value{});
+    }
+    // Fallback: "[object Array]"-style tag via the array's own elements is not
+    // applicable here; emulate Object.prototype.toString minimal output.
+    return val_mod.makeString(arena, "[object Array]");
+}
+
+/// ES Object.prototype.toLocaleString: return ? Invoke(this, "toString").
+pub fn nativeObjectToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const fpm = @import("../builtins/function_proto.zig");
+    const m: Value = if (realm_mod.active_context) |ctx|
+        try ctx.getProp(arena, this_val, "toString")
+    else
+        Value{};
+    return fpm.invokeCallback(arena, this_val, m, &[_]Value{});
+}
+
+pub fn nativeUnshift(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const arr = getArray(this_val) orelse return val_mod.makeNumber(arena, 0);
+    const n = args.len;
+    const old_len = arr.array_length;
+    if (n == 0) return val_mod.makeNumber(arena, @floatFromInt(old_len));
+    // Shift existing elements up by n (high → low to avoid clobbering).
+    var i: usize = old_len;
+    while (i > 0) : (i -= 1) {
+        const from = i - 1;
+        const fk = try std.fmt.allocPrint(arena, "{d}", .{from});
+        const tk = try std.fmt.allocPrint(arena, "{d}", .{from + n});
+        if (arr.getOwn(fk)) |v| try arr.set(tk, v) else _ = try arr.deleteOwn(tk);
+    }
+    // Place new items at the front.
+    for (args, 0..) |a, j| {
+        const k = try std.fmt.allocPrint(arena, "{d}", .{j});
+        try arr.set(k, a);
+    }
+    arr.array_length = @intCast(@as(usize, old_len) + n);
+    return val_mod.makeNumber(arena, @floatFromInt(arr.array_length));
+}
+
+pub fn nativeShift(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const arr = getArray(this_val) orelse return val_mod.makeUndefined(arena);
+    const len = arr.array_length;
+    if (len == 0) return val_mod.makeUndefined(arena);
+    const first = arr.getOwn("0") orelse try val_mod.makeUndefined(arena);
+    var i: usize = 1;
+    while (i < len) : (i += 1) {
+        const fk = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const tk = try std.fmt.allocPrint(arena, "{d}", .{i - 1});
+        if (arr.getOwn(fk)) |v| try arr.set(tk, v) else _ = try arr.deleteOwn(tk);
+    }
+    const lastk = try std.fmt.allocPrint(arena, "{d}", .{len - 1});
+    _ = try arr.deleteOwn(lastk);
+    arr.array_length = len - 1;
+    return first;
+}
+
 pub fn nativeConcat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const new_arr = try JsObject.createArray(arena, arr_proto);

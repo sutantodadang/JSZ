@@ -443,6 +443,9 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         // save position: for (var/let/const NAME in ...) is for-in
         const decl_kind: ast.VarKind = if (p.check(.kw_var)) .var_ else if (p.check(.kw_let)) .let else .const_;
         _ = p.advance(); // consume declaration keyword
+        if (p.check(.left_bracket) or p.check(.left_brace)) {
+            return p.parseForDestructuring(start, decl_kind);
+        }
         if (p.check(.identifier)) {
             const name_tok = p.current;
             _ = p.advance(); // consume identifier
@@ -570,6 +573,74 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         _ = p.expect(.semicolon) orelse return null;
         return p.parseForTail(start, null);
     }
+}
+
+/// `for (let [a,b] of x) BODY` / `for (let {k} of x) BODY` (also for-in).
+/// Desugar: `for (let __t of x) { let a = __t[0], b = __t[1]; BODY }`.
+const ForBinding = struct { name: []const u8, key: ?[]const u8, index: usize };
+pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind) ?*Node {
+    var bindings = std.ArrayList(ForBinding){};
+    const is_array = p.match(.left_bracket);
+    if (is_array) {
+        var idx: usize = 0;
+        while (!p.check(.right_bracket) and !p.check(.eof) and !p.had_error) {
+            if (p.check(.comma)) {
+                _ = p.advance();
+                idx += 1;
+                continue;
+            }
+            const t = p.expect(.identifier) orelse return null;
+            bindings.append(p.arena, .{ .name = t.value_str, .key = null, .index = idx }) catch return null;
+            idx += 1;
+            if (!p.match(.comma)) break;
+        }
+        _ = p.expect(.right_bracket) orelse return null;
+    } else {
+        _ = p.match(.left_brace);
+        while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
+            const key = p.expect(.identifier) orelse return null;
+            var bind_name = key.value_str;
+            if (p.match(.colon)) {
+                const alias = p.expect(.identifier) orelse return null;
+                bind_name = alias.value_str;
+            }
+            bindings.append(p.arena, .{ .name = bind_name, .key = key.value_str, .index = 0 }) catch return null;
+            if (!p.match(.comma)) break;
+        }
+        _ = p.expect(.right_brace) orelse return null;
+    }
+
+    const iterate_values = if (p.check(.kw_of)) true else if (p.check(.kw_in)) false else {
+        p.had_error = true;
+        p.error_info = parser_file.ParseError{ .message = "expected 'of' or 'in' in for destructuring", .line = p.current.line, .column = p.current.column };
+        return null;
+    };
+    _ = p.advance(); // consume of/in
+    const right = p.parseExpression() orelse return null;
+    _ = p.expect(.right_paren) orelse return null;
+    const orig_body = p.parseStatement() orelse return null;
+
+    const tmp_name = std.fmt.allocPrint(p.arena, "__forbind_{d}", .{start}) catch return null;
+    // Build the per-iteration destructuring declarations + original body.
+    var body_stmts = std.ArrayList(*Node){};
+    for (bindings.items) |b| {
+        const tmp_id = p.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
+        const access = if (b.key) |k| blk: {
+            const prop = p.makeNode(.identifier, start, start, .{ .identifier = k }) orelse return null;
+            break :blk p.makeNode(.member_expr, start, start, .{ .member_expr = .{ .object = tmp_id, .property = prop, .computed = false } }) orelse return null;
+        } else blk: {
+            const idxn = p.makeNode(.number_literal, start, start, .{ .number_literal = @floatFromInt(b.index) }) orelse return null;
+            break :blk p.makeNode(.member_expr, start, start, .{ .member_expr = .{ .object = tmp_id, .property = idxn, .computed = true } }) orelse return null;
+        };
+        const d = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = kind, .name = b.name, .init = access } }) orelse return null;
+        body_stmts.append(p.arena, d) catch return null;
+    }
+    body_stmts.append(p.arena, orig_body) catch return null;
+    const new_body = p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = body_stmts.items } }) orelse return null;
+    const left = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = kind, .name = tmp_name, .init = null } }) orelse return null;
+    return p.makeNode(.for_in_stmt, start, p.current.start, .{
+        .for_in_stmt = .{ .left = left, .right = right, .body = new_body, .iterate_values = iterate_values },
+    });
 }
 
 pub fn parseForTail(p: *Parser, start: u32, init_node: ?*Node) ?*Node {

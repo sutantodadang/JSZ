@@ -243,7 +243,7 @@ const HARDCODED_PRELUDE =
 const DOLLAR262_PRELUDE =
     \\var $262 = {
     \\  detachArrayBuffer: function(buffer) { buffer.transfer(0); },
-    \\  global: (function() { return this; })(),
+    \\  global: globalThis,
     \\  createRealm: function() { return $262; },
     \\  evalScript: function(s) { return eval(s); }
     \\};
@@ -364,10 +364,16 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     const needs_dollar262 = std.mem.indexOf(u8, source, "$262") != null or
         std.mem.indexOf(u8, source, "$DETACHBUFFER") != null or
         std.mem.indexOf(u8, prelude, "$262") != null;
-    const full_source = if (needs_dollar262)
-        std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ DOLLAR262_PRELUDE, prelude, source }) catch return .fail
+    // onlyStrict tests must run as strict-mode code: prepend a directive prologue
+    // to the whole program (must be the very first token to take effect).
+    const strict_prefix: []const u8 = if (std.mem.indexOf(u8, source, "onlyStrict") != null)
+        "\"use strict\";\n"
     else
-        std.fmt.allocPrint(allocator, "{s}{s}", .{ prelude, source }) catch return .fail;
+        "";
+    const full_source = if (needs_dollar262)
+        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ strict_prefix, DOLLAR262_PRELUDE, prelude, source }) catch return .fail
+    else
+        std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ strict_prefix, prelude, source }) catch return .fail;
     defer allocator.free(full_source);
 
     const result = ctx.eval(full_source, "<test262>");
@@ -391,11 +397,26 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
             .ok => .fail,
         };
     }
-    return switch (result) {
-        .ok => .pass,
-        .exception, .parse_error => .fail,
-    };
+    switch (result) {
+        .ok => return .pass,
+        .exception => |e| {
+            const n = @min(e.message.len, g_fail_msg_buf.len);
+            @memcpy(g_fail_msg_buf[0..n], e.message[0..n]);
+            g_fail_msg_len = n;
+            return .fail;
+        },
+        .parse_error => |e| {
+            const n = @min(e.message.len, g_fail_msg_buf.len);
+            @memcpy(g_fail_msg_buf[0..n], e.message[0..n]);
+            g_fail_msg_len = n;
+            return .fail;
+        },
+    }
 }
+
+var g_fail_msg_buf: [1024]u8 = undefined;
+var g_fail_msg_len: usize = 0;
+var debug_fail: bool = false;
 
 fn loadList(allocator: std.mem.Allocator, path: []const u8, max_size: usize) !struct {
     source: ?[]u8,
@@ -608,6 +629,8 @@ pub fn main() !void {
             fail_on_flips = true;
         } else if (std.mem.eql(u8, arg, "--strict-failures")) {
             strict_failures = true;
+        } else if (std.mem.eql(u8, arg, "--debug-fail")) {
+            debug_fail = true;
         } else if (std.mem.startsWith(u8, arg, "--dashboard=")) {
             dashboard_path = arg["--dashboard=".len..];
         } else if (std.mem.eql(u8, arg, "--dashboard") and arg_idx + 1 < argv.len) {
@@ -822,6 +845,9 @@ pub fn main() !void {
                 }
             },
             .fail => {
+                if (debug_fail) {
+                    std.debug.print("DBG {s} :: {s}\n", .{ rel_path, g_fail_msg_buf[0..g_fail_msg_len] });
+                }
                 fail += 1;
                 categories[cat_idx].fail += 1;
                 if (write_failing_path != null) try failing_list.append(allocator, rel_path);

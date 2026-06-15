@@ -1391,11 +1391,12 @@ pub const FnCompiler = struct {
             fe.params,
             fe.body,
             fe.name, // nfe_name: if named, bind inside
-            fe.is_strict,
+            fe.is_strict or self.is_strict, // strictness is inherited by nested functions
             fe.is_generator,
             fe.is_async,
             false, // function body: no implicit last-expr return
             fe.is_arrow,
+            fe.rest_param,
         );
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
@@ -1531,7 +1532,7 @@ fn compileFunction(
     body: []*Node,
     nfe_name: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false);
+    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null);
 }
 
 pub fn compileFunctionStrict(
@@ -1545,6 +1546,7 @@ pub fn compileFunctionStrict(
     is_async: bool,
     implicit_return: bool,
     is_arrow: bool,
+    rest_param: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
@@ -1582,6 +1584,7 @@ pub fn compileFunctionStrict(
         .num_regs = num_regs,
         .child_functions = child_fns,
         .param_names = params,
+        .rest_param = rest_param,
         .is_strict = is_strict,
         .is_generator = is_generator,
         .is_async = is_async,
@@ -1622,6 +1625,7 @@ pub fn compileProgram(
         false,
         true, // top-level program: yield last expression-statement value (eval result)
         false, // program is not an arrow
+        null, // program has no rest parameter
     );
     return f;
 }

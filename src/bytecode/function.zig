@@ -14,6 +14,9 @@ pub const BcFunction = struct {
     child_functions: []*BcFunction,
     /// Parameter names for binding into env on call.
     param_names: [][]const u8,
+    /// Rest parameter name (`function f(...rest)`), bound at call entry to an
+    /// Array of the arguments past `param_names.len`. Null if none.
+    rest_param: ?[]const u8 = null,
     /// Phase 4d: whether this function was compiled in strict mode.
     is_strict: bool = false,
     /// M14: body references `arguments` and is not an arrow → the VM materializes

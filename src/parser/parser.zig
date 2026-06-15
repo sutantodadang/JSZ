@@ -669,6 +669,10 @@ pub const Parser = struct {
         return stmt_mod.parseForStmt(self);
     }
 
+    pub fn parseForDestructuring(self: *Parser, start: u32, kind: ast.VarKind) ?*Node {
+        return stmt_mod.parseForDestructuring(self, start, kind);
+    }
+
     pub fn parseForTail(self: *Parser, start: u32, init_node: ?*Node) ?*Node {
         return stmt_mod.parseForTail(self, start, init_node);
     }

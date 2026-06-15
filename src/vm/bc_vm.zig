@@ -223,6 +223,7 @@ pub const BcVm = struct {
                     try call_env.define(pname, av);
                 }
                 try self.defineArguments(call_env, fn_ptr, args);
+                try self.bindRestParam(call_env, fn_ptr, args);
                 const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
                 const new_regs = try self.arena.alloc(Value, num_regs);
                 for (new_regs) |*r| r.* = Value{};
@@ -471,7 +472,7 @@ pub const BcVm = struct {
                 return error.JsException;
             },
         };
-        const prog = ast_mod.Program{ .body = stmts };
+        const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(stmts) };
         const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<eval>");
         // An undefined `break`/`continue` label is an early SyntaxError; the
         // compiler records it (it can't unwind), and eval surfaces it as a throw.
@@ -854,6 +855,7 @@ pub const BcVm = struct {
                     try call_env.define(pname, av);
                 }
                 try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
+                try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
                 const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
                 const new_regs = try self.arena.alloc(Value, num_regs);
                 for (new_regs) |*r| r.* = Value{};
@@ -1109,8 +1111,9 @@ pub const BcVm = struct {
             }
             return try self.deleteProperty(target, key_v);
         }
-        // M15: TypedArray [[Delete]] — integer-indexed exotic.
-        if (obj.internal_kind == .typed_array) {
+        // M15: TypedArray [[Delete]] — integer-indexed exotic. Symbol keys are
+        // ordinary (never integer indices) → skip straight to deleteOwnSym.
+        if (obj.internal_kind == .typed_array and !(key_v.bits != 0 and key_v.unbox() == .symbol)) {
             const key_str2 = try valueToStringArena(self.arena, key_v);
             if (typed_array.canonicalNumericIndexString(key_str2)) |idx_f| {
                 const td2 = typed_array.getTd(obj_val).?;
@@ -1333,6 +1336,14 @@ pub const BcVm = struct {
                 // Phase 13: autoboxing for boolean primitives → Boolean.prototype.
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_boolean_proto) |proto| {
+                    if (proto.get(key)) |v| return v;
+                }
+                return val_mod.makeUndefined(self.arena);
+            },
+            .bigint => {
+                // Autoboxing for bigint primitives → BigInt.prototype.
+                const realm_mod = @import("../runtime/realm.zig");
+                if (realm_mod.active_bigint_proto) |proto| {
                     if (proto.get(key)) |v| return v;
                 }
                 return val_mod.makeUndefined(self.arena);
@@ -1743,6 +1754,7 @@ pub const BcVm = struct {
                     try call_env.define(pname, av);
                 }
                 try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
+                try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
                 if (fn_ptr.name) |fname| {
@@ -1979,6 +1991,7 @@ pub const BcVm = struct {
                     try call_env.define(pname, av);
                 }
                 try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)]);
+                try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
                 if (fn_ptr.name) |fname| {
@@ -2143,6 +2156,29 @@ pub const BcVm = struct {
             try obj.setSym(symv, try val_mod.makeNativeFunction(self.arena, coll.nativeArrayValues));
         }
         try env.define("arguments", try val_mod.makeObject(self.arena, obj));
+    }
+
+    /// Bind a rest parameter (`function f(a, ...rest)`) to an Array of the
+    /// arguments past the declared (non-rest) parameter count.
+    pub fn bindRestParam(self: *BcVm, env: *Environment, fn_ptr: *const BcFunction, args: []const Value) !void {
+        const rest_name = fn_ptr.rest_param orelse return;
+        const n = fn_ptr.param_names.len;
+        const arr = if (self.heap) |heap|
+            try JsObject.createArrayOnHeap(heap, self.realm.array_prototype)
+        else
+            try JsObject.createArray(self.arena, self.realm.array_prototype);
+        arr.is_array = true;
+        if (args.len > n) {
+            var i: usize = n;
+            while (i < args.len) : (i += 1) {
+                const key = try std.fmt.allocPrint(self.arena, "{d}", .{i - n});
+                try arr.set(key, args[i]);
+            }
+            arr.array_length = @intCast(args.len - n);
+        } else {
+            arr.array_length = 0;
+        }
+        try env.define(rest_name, try val_mod.makeObject(self.arena, arr));
     }
 
     /// Build the suspended-frame state shared by generators and async functions:
@@ -2813,12 +2849,22 @@ pub fn formatExceptionMessage(arena: std.mem.Allocator, v: Value) ![]const u8 {
     if (v.bits != 0) {
         if (v.unbox() == .object) {
             const obj = v.toPtr().object;
-            const name_v = obj.get("name");
-            const msg_v = obj.get("message");
+            const name_v = obj.get("name") orelse (if (obj.proto) |p| p.get("name") else null);
+            const msg_v = obj.get("message") orelse (if (obj.proto) |p| p.get("message") else null);
             if (name_v != null and msg_v != null) {
                 const name_s = try valueToString(arena, name_v.?);
                 const msg_s = try valueToString(arena, msg_v.?);
                 return std.fmt.allocPrint(arena, "{s}: {s}", .{ name_s, msg_s });
+            }
+            // Error-like with only a message (e.g. Test262Error): surface it.
+            if (msg_v != null) {
+                const ctor_name = if (obj.proto) |p| (if (p.get("constructor")) |c|
+                    (if (c.bits != 0 and c.unbox() == .object) (c.toPtr().object.get("name") orelse Value{}) else Value{})
+                else Value{}) else Value{};
+                const msg_s = try valueToString(arena, msg_v.?);
+                if (ctor_name.bits != 0 and ctor_name.unbox() == .string)
+                    return std.fmt.allocPrint(arena, "{s}: {s}", .{ ctor_name.unbox().string, msg_s });
+                return msg_s;
             }
         }
     }

@@ -23,6 +23,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
 
     _ = p.expect(.left_brace) orelse return null;
     var ctor_params: [][]const u8 = &[_][]const u8{};
+    var ctor_rest: ?[]const u8 = null;
     var ctor_body: []*Node = &[_]*Node{};
     var methods = std.ArrayList(struct { name: []const u8, params: [][]const u8, body: []*Node }){};
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
@@ -36,6 +37,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         const mbody = p.parseFunctionBody() orelse return null;
         if (std.mem.eql(u8, mname, "constructor")) {
             ctor_params = mparams.params;
+            ctor_rest = mparams.rest_param;
             ctor_body = mbody;
         } else {
             methods.append(p.arena, .{ .name = mname, .params = mparams.params, .body = mbody }) catch return null;
@@ -78,14 +80,71 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
 
     var ctor_body_effective = ctor_body;
     if (super_name) |sname| {
-        // Allow `super(...)` in subclass constructors by binding local `super`.
-        const id_super_ctor = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
-        const super_decl = p.makeNode(.var_decl, start, start, .{
-            .var_decl = .{ .kind = .var_, .name = "super", .init = id_super_ctor },
-        }) orelse return null;
+        // Explicit derived constructor. Bind `super` to a helper that performs a
+        // real parent [[Construct]] (so built-in exotics like TypedArray work) and
+        // captures the result in `__superthis`; the ctor returns `__superthis` so
+        // [[Construct]] adopts the proper instance. Desugar:
+        //   var __superthis;
+        //   var super = function () {
+        //     __superthis = Reflect.construct(Super, arguments, ClassName);
+        //     return __superthis;
+        //   };
+        //   <original body>
+        //   return __superthis;
         var ctor_stmts = std.ArrayList(*Node){};
+        // var __superthis;
+        const st_decl = p.makeNode(.var_decl, start, start, .{
+            .var_decl = .{ .kind = .var_, .name = "__superthis", .init = null },
+        }) orelse return null;
+        ctor_stmts.append(p.arena, st_decl) catch return null;
+        // Reflect.construct(Super, arguments, ClassName)
+        const id_reflect = p.makeNode(.identifier, start, start, .{ .identifier = "Reflect" }) orelse return null;
+        const id_construct = p.makeNode(.identifier, start, start, .{ .identifier = "construct" }) orelse return null;
+        const rc_callee = p.makeNode(.member_expr, start, start, .{
+            .member_expr = .{ .object = id_reflect, .property = id_construct, .computed = false },
+        }) orelse return null;
+        const id_super_p = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
+        const id_args = p.makeNode(.identifier, start, start, .{ .identifier = "arguments" }) orelse return null;
+        const id_nt = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+        var rc_args = std.ArrayList(*Node){};
+        rc_args.append(p.arena, id_super_p) catch return null;
+        rc_args.append(p.arena, id_args) catch return null;
+        rc_args.append(p.arena, id_nt) catch return null;
+        const rc_call = p.makeNode(.call_expr, start, start, .{
+            .call_expr = .{ .callee = rc_callee, .args = rc_args.items },
+        }) orelse return null;
+        // __superthis = <rc_call>
+        const id_st_t = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+        const assign = p.makeNode(.assignment_expr, start, start, .{
+            .assignment_expr = .{ .op = .assign, .target = id_st_t, .value = rc_call },
+        }) orelse return null;
+        const assign_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign }) orelse return null;
+        const id_st_r = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+        const helper_ret = p.makeNode(.return_stmt, start, start, .{ .return_stmt = id_st_r }) orelse return null;
+        var helper_body = std.ArrayList(*Node){};
+        helper_body.append(p.arena, assign_stmt) catch return null;
+        helper_body.append(p.arena, helper_ret) catch return null;
+        const helper_fn = p.makeNode(.function_expr, start, start, .{
+            .function_expr = .{
+                .name = null,
+                .params = &[_][]const u8{},
+                .param_defaults = &[_]?*Node{},
+                .rest_param = null,
+                .body = helper_body.items,
+                .is_arrow = false,
+                .is_strict = false,
+                .requires_super = false,
+            },
+        }) orelse return null;
+        const super_decl = p.makeNode(.var_decl, start, start, .{
+            .var_decl = .{ .kind = .var_, .name = "super", .init = helper_fn },
+        }) orelse return null;
         ctor_stmts.append(p.arena, super_decl) catch return null;
         for (ctor_body) |st| ctor_stmts.append(p.arena, st) catch return null;
+        // return __superthis;
+        const id_st_final = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+        const final_ret = p.makeNode(.return_stmt, start, start, .{ .return_stmt = id_st_final }) orelse return null;
+        ctor_stmts.append(p.arena, final_ret) catch return null;
         ctor_body_effective = ctor_stmts.items;
     }
 
@@ -95,7 +154,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
             .name = class_name,
             .params = ctor_params,
             .param_defaults = &[_]?*Node{},
-            .rest_param = null,
+            .rest_param = ctor_rest,
             .body = ctor_body_effective,
             .is_arrow = false,
             .is_strict = parser_file.hasUseStrict(ctor_body_effective),
