@@ -645,6 +645,14 @@ fn validateTypedArrayThis(arena: std.mem.Allocator, this_val: Value) anyerror!*T
     return td;
 }
 
+/// ValidateDataViewThis: extract DataView data and validate, or throw TypeError.
+/// Used by all DataView.prototype methods to ensure `this` is a valid DataView.
+fn validateDataViewThis(arena: std.mem.Allocator, this_val: Value) anyerror!*DataViewData {
+    const dv = getDvData(this_val) orelse return throwTypeError(arena, "DataView.prototype method called on non-DataView");
+    if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+    return dv;
+}
+
 /// GetPrototypeFromConstructor at the constructor's spec-precise point: read
 /// `? Get(pending_new_target,"prototype")` (fires getters, throws propagate),
 /// set `this_obj`'s prototype when it is an object, and CONSUME the pending
@@ -1539,17 +1547,18 @@ fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedAr
 
     // 4. Validate result is a TypedArray.
     const res_td = getTd(result) orelse
-        return throwTypeError(arena, "TypedArray[@@species] result is not a TypedArray");
+        return throwTypeError(arena, "species result is not a TypedArray");
 
     // 5. Detached check.
     if (res_td.ab.detached)
-        return throwTypeError(arena, "TypedArray[@@species] result has detached buffer");
+        return throwTypeError(arena, "species result has detached buffer");
 
-    // 6. If a length argument was passed (single numeric arg), check result.length >= that length.
+    // 6. If a length argument was passed (single numeric arg), validate result.length >= required.
+    // Spec: throws RangeError if result length is insufficient.
     if (species_args.len == 1 and species_args[0].bits != 0 and species_args[0].unbox() == .number) {
         const required: usize = toIndex(species_args[0].unbox().number);
         if (res_td.length < required)
-            return throwTypeError(arena, "TypedArray[@@species] result is too short");
+            return throwRangeError(arena, "species result length is insufficient");
     }
 
     return result;
@@ -2607,14 +2616,12 @@ pub fn dvGetBuffer(arena: std.mem.Allocator, this_val: Value, _: []const Value) 
 }
 
 pub fn dvGetByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dv = getDvData(this_val) orelse return throwTypeError(arena, "get byteLength called on non-DataView");
-    if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+    const dv = try validateDataViewThis(arena, this_val);
     return val_mod.makeNumber(arena, @floatFromInt(dvCurrentByteLen(dv)));
 }
 
 pub fn dvGetByteOffset(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dv = getDvData(this_val) orelse return throwTypeError(arena, "get byteOffset called on non-DataView");
-    if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+    const dv = try validateDataViewThis(arena, this_val);
     return val_mod.makeNumber(arena, @floatFromInt(dv.byte_offset));
 }
 
