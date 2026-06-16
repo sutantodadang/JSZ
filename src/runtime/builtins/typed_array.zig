@@ -637,6 +637,14 @@ fn vmGetSym(arena: std.mem.Allocator, obj_val: Value, sym_key: Value) anyerror!V
     return Value{};
 }
 
+/// ValidateTypedArrayThis: extract TypedArray data and validate, or throw TypeError.
+/// Used by all %TypedArray%.prototype methods to ensure `this` is a valid TypedArray.
+fn validateTypedArrayThis(arena: std.mem.Allocator, this_val: Value) anyerror!*TypedArrayData {
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype method called on non-TypedArray");
+    try validateTypedArray(arena, td);
+    return td;
+}
+
 /// GetPrototypeFromConstructor at the constructor's spec-precise point: read
 /// `? Get(pending_new_target,"prototype")` (fires getters, throws propagate),
 /// set `this_obj`'s prototype when it is an object, and CONSUME the pending
@@ -1867,8 +1875,7 @@ pub fn nativeTaAt(arena: std.mem.Allocator, this_val: Value, args: []const Value
 }
 
 pub fn nativeTaForEach(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
@@ -1884,8 +1891,7 @@ pub fn nativeTaForEach(arena: std.mem.Allocator, this_val: Value, args: []const 
 }
 
 pub fn nativeTaMap(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
@@ -1905,8 +1911,7 @@ pub fn nativeTaMap(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 }
 
 pub fn nativeTaReduce(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     var acc: Value = undefined;
@@ -1997,9 +2002,9 @@ fn taCreateViaConstruct(arena: std.mem.Allocator, ctor: Value, len: usize) anyer
     const result = try ctx.construct(arena, ctor, &[_]Value{try val_mod.makeNumber(arena, @floatFromInt(len))});
     // ValidateTypedArray: the constructor MUST return a (non-detached) TypedArray,
     // and when a length was passed the result must be at least that long.
-    const td = getTd(result) orelse return throwTypeError(arena, "TypedArrayCreate: constructor did not return a TypedArray");
+    const td = getTd(result) orelse return throwTypeError(arena, "constructor result not a TypedArray");
     try validateTypedArray(arena, td);
-    if (taCurrentLen(td) < len) return throwTypeError(arena, "TypedArrayCreate: derived TypedArray is too small");
+    if (taCurrentLen(td) < len) return throwTypeError(arena, "constructor result TypedArray is too small");
     return result;
 }
 
@@ -2203,8 +2208,7 @@ pub fn nativeTaSort(arena: std.mem.Allocator, this_val: Value, args: []const Val
 }
 
 pub fn nativeTaFind(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0 or !function_proto_isCallable(args[0])) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
@@ -2221,8 +2225,7 @@ pub fn nativeTaFind(arena: std.mem.Allocator, this_val: Value, args: []const Val
 }
 
 pub fn nativeTaFindIndex(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0 or !function_proto_isCallable(args[0])) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
@@ -2239,8 +2242,7 @@ pub fn nativeTaFindIndex(arena: std.mem.Allocator, this_val: Value, args: []cons
 }
 
 pub fn nativeTaFilter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0 or !function_proto_isCallable(args[0])) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
@@ -2272,8 +2274,7 @@ pub fn nativeTaFilter(arena: std.mem.Allocator, this_val: Value, args: []const V
 }
 
 pub fn nativeTaEvery(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0 or !function_proto_isCallable(args[0])) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
@@ -2290,8 +2291,7 @@ pub fn nativeTaEvery(arena: std.mem.Allocator, this_val: Value, args: []const Va
 }
 
 pub fn nativeTaSome(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0 or !function_proto_isCallable(args[0])) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
@@ -2342,8 +2342,7 @@ pub fn nativeTaCopyWithin(arena: std.mem.Allocator, this_val: Value, args: []con
 }
 
 pub fn nativeTaReduceRight(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     // §3: IsCallable(callbackfn) check precedes the len/initialValue check, so a
     // non-callable still throws even on a 1-element array (loop never runs).
     if (args.len == 0 or !function_proto_isCallable(args[0])) return throwTypeError(arena, "callback is not a function");
@@ -2432,8 +2431,7 @@ pub fn nativeTaToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []co
 }
 
 pub fn nativeTaFindLast(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0 or !function_proto_isCallable(args[0])) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
@@ -2452,8 +2450,7 @@ pub fn nativeTaFindLast(arena: std.mem.Allocator, this_val: Value, args: []const
 }
 
 pub fn nativeTaFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     if (args.len == 0 or !function_proto_isCallable(args[0])) return throwTypeError(arena, "callback is not a function");
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
