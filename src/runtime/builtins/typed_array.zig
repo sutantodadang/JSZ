@@ -1585,8 +1585,7 @@ pub fn validateReceiver(arena: std.mem.Allocator, this_val: Value) anyerror!void
 }
 
 pub fn nativeTaFill(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     // Mutability is verified BEFORE reading any argument (spec + tests).
     if (td.ab.immutable) return throwTypeError(arena, "Cannot fill an immutable-buffer-backed TypedArray");
     const raw_v = if (args.len > 0) args[0] else Value{};
@@ -1634,8 +1633,7 @@ pub fn nativeTaSubarray(arena: std.mem.Allocator, this_val: Value, args: []const
 }
 
 pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    try validateTypedArray(arena, td);
+    const td = try validateTypedArrayThis(arena, this_val);
     const start = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), td.length);
     const end_v: Value = if (args.len > 1) args[1] else Value{};
     const end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
