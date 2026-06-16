@@ -244,7 +244,14 @@ const DOLLAR262_PRELUDE =
     \\var $262 = {
     \\  detachArrayBuffer: function(buffer) { if (!buffer.detached) buffer.transfer(0); },
     \\  global: globalThis,
-    \\  createRealm: function() { return $262; },
+    \\  createRealm: function() {
+    \\    return {
+    \\      global: globalThis,
+    \\      detachArrayBuffer: function(buffer) { if (!buffer.detached) buffer.transfer(0); },
+    \\      evalScript: function(s) { return eval(s); },
+    \\      createRealm: $262.createRealm
+    \\    };
+    \\  },
     \\  evalScript: function(s) { return eval(s); }
     \\};
     \\
