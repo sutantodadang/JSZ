@@ -645,6 +645,14 @@ fn validateTypedArrayThis(arena: std.mem.Allocator, this_val: Value) anyerror!*T
     return td;
 }
 
+/// ValidateDataViewThis: extract DataView data and validate, or throw TypeError.
+/// Used by all DataView.prototype methods to ensure `this` is a valid DataView.
+fn validateDataViewThis(arena: std.mem.Allocator, this_val: Value) anyerror!*DataViewData {
+    const dv = getDvData(this_val) orelse return throwTypeError(arena, "DataView.prototype method called on non-DataView");
+    if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+    return dv;
+}
+
 /// GetPrototypeFromConstructor at the constructor's spec-precise point: read
 /// `? Get(pending_new_target,"prototype")` (fires getters, throws propagate),
 /// set `this_obj`'s prototype when it is an object, and CONSUME the pending
@@ -1192,23 +1200,23 @@ fn finishTypedArray(arena: std.mem.Allocator, this_obj: *JsObject, kind: TAKind,
 // ---- instance accessor getters (installed on %TypedArray%.prototype) ----
 
 pub fn taGetLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "get length called on non-TypedArray");
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.length accessor called on non-TypedArray");
     return val_mod.makeNumber(arena, @floatFromInt(taCurrentLen(td)));
 }
 
 pub fn taGetByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "get byteLength called on non-TypedArray");
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.byteLength accessor called on non-TypedArray");
     return val_mod.makeNumber(arena, @floatFromInt(taCurrentLen(td) * td.kind.elemSize()));
 }
 
 pub fn taGetByteOffset(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "get byteOffset called on non-TypedArray");
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.byteOffset accessor called on non-TypedArray");
     if (taIsOob(td)) return val_mod.makeNumber(arena, 0);
     return val_mod.makeNumber(arena, @floatFromInt(td.byte_offset));
 }
 
 pub fn taGetBuffer(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "get buffer called on non-TypedArray");
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.buffer accessor called on non-TypedArray");
     return val_mod.makeObject(arena, td.buffer_obj);
 }
 
@@ -1539,17 +1547,18 @@ fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedAr
 
     // 4. Validate result is a TypedArray.
     const res_td = getTd(result) orelse
-        return throwTypeError(arena, "TypedArray[@@species] result is not a TypedArray");
+        return throwTypeError(arena, "species result is not a TypedArray");
 
     // 5. Detached check.
     if (res_td.ab.detached)
-        return throwTypeError(arena, "TypedArray[@@species] result has detached buffer");
+        return throwTypeError(arena, "species result has detached buffer");
 
-    // 6. If a length argument was passed (single numeric arg), check result.length >= that length.
+    // 6. If a length argument was passed (single numeric arg), validate result.length >= required.
+    // Spec: throws RangeError if result length is insufficient.
     if (species_args.len == 1 and species_args[0].bits != 0 and species_args[0].unbox() == .number) {
         const required: usize = toIndex(species_args[0].unbox().number);
         if (res_td.length < required)
-            return throwTypeError(arena, "TypedArray[@@species] result is too short");
+            return throwRangeError(arena, "species result length is insufficient");
     }
 
     return result;
@@ -1874,8 +1883,6 @@ pub fn nativeTaForEach(arena: std.mem.Allocator, this_val: Value, args: []const 
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         _ = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -1893,8 +1900,6 @@ pub fn nativeTaMap(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -1918,8 +1923,6 @@ pub fn nativeTaReduce(arena: std.mem.Allocator, this_val: Value, args: []const V
         i = 1;
     }
     while (i < td.length) : (i += 1) {
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         acc = try function_proto.invokeCallback(arena, Value{}, cb, &[_]Value{ acc, ev, idx_v, this_val });
@@ -2206,8 +2209,6 @@ pub fn nativeTaFind(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2223,8 +2224,6 @@ pub fn nativeTaFindIndex(arena: std.mem.Allocator, this_val: Value, args: []cons
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2243,8 +2242,6 @@ pub fn nativeTaFilter(arena: std.mem.Allocator, this_val: Value, args: []const V
     var out_len: usize = 0;
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2272,8 +2269,6 @@ pub fn nativeTaEvery(arena: std.mem.Allocator, this_val: Value, args: []const Va
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2289,8 +2284,6 @@ pub fn nativeTaSome(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2429,8 +2422,6 @@ pub fn nativeTaFindLast(arena: std.mem.Allocator, this_val: Value, args: []const
     var i: usize = td.length;
     while (i > 0) {
         i -= 1;
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2448,8 +2439,6 @@ pub fn nativeTaFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []
     var i: usize = td.length;
     while (i > 0) {
         i -= 1;
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2607,14 +2596,12 @@ pub fn dvGetBuffer(arena: std.mem.Allocator, this_val: Value, _: []const Value) 
 }
 
 pub fn dvGetByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dv = getDvData(this_val) orelse return throwTypeError(arena, "get byteLength called on non-DataView");
-    if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+    const dv = try validateDataViewThis(arena, this_val);
     return val_mod.makeNumber(arena, @floatFromInt(dvCurrentByteLen(dv)));
 }
 
 pub fn dvGetByteOffset(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dv = getDvData(this_val) orelse return throwTypeError(arena, "get byteOffset called on non-DataView");
-    if (dvIsOob(dv)) return throwTypeError(arena, "Cannot perform operation on an out-of-bounds DataView");
+    const dv = try validateDataViewThis(arena, this_val);
     return val_mod.makeNumber(arena, @floatFromInt(dv.byte_offset));
 }
 
