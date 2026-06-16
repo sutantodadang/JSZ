@@ -1200,23 +1200,23 @@ fn finishTypedArray(arena: std.mem.Allocator, this_obj: *JsObject, kind: TAKind,
 // ---- instance accessor getters (installed on %TypedArray%.prototype) ----
 
 pub fn taGetLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "get length called on non-TypedArray");
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.length accessor called on non-TypedArray");
     return val_mod.makeNumber(arena, @floatFromInt(taCurrentLen(td)));
 }
 
 pub fn taGetByteLength(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "get byteLength called on non-TypedArray");
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.byteLength accessor called on non-TypedArray");
     return val_mod.makeNumber(arena, @floatFromInt(taCurrentLen(td) * td.kind.elemSize()));
 }
 
 pub fn taGetByteOffset(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "get byteOffset called on non-TypedArray");
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.byteOffset accessor called on non-TypedArray");
     if (taIsOob(td)) return val_mod.makeNumber(arena, 0);
     return val_mod.makeNumber(arena, @floatFromInt(td.byte_offset));
 }
 
 pub fn taGetBuffer(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "get buffer called on non-TypedArray");
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.buffer accessor called on non-TypedArray");
     return val_mod.makeObject(arena, td.buffer_obj);
 }
 
