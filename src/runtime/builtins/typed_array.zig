@@ -1874,6 +1874,8 @@ pub fn nativeTaForEach(arena: std.mem.Allocator, this_val: Value, args: []const 
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         _ = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -1892,6 +1894,8 @@ pub fn nativeTaMap(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -1916,6 +1920,8 @@ pub fn nativeTaReduce(arena: std.mem.Allocator, this_val: Value, args: []const V
         i = 1;
     }
     while (i < td.length) : (i += 1) {
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         acc = try function_proto.invokeCallback(arena, Value{}, cb, &[_]Value{ acc, ev, idx_v, this_val });
@@ -2204,6 +2210,8 @@ pub fn nativeTaFind(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2220,6 +2228,8 @@ pub fn nativeTaFindIndex(arena: std.mem.Allocator, this_val: Value, args: []cons
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2239,6 +2249,8 @@ pub fn nativeTaFilter(arena: std.mem.Allocator, this_val: Value, args: []const V
     var out_len: usize = 0;
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2267,6 +2279,8 @@ pub fn nativeTaEvery(arena: std.mem.Allocator, this_val: Value, args: []const Va
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2283,6 +2297,8 @@ pub fn nativeTaSome(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const this_arg = if (args.len > 1) args[1] else Value{};
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2343,6 +2359,8 @@ pub fn nativeTaReduceRight(arena: std.mem.Allocator, this_val: Value, args: []co
     }
     while (i > 0) {
         i -= 1;
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         acc = try function_proto.invokeCallback(arena, Value{}, cb, &[_]Value{ acc, ev, idx_v, this_val });
@@ -2423,6 +2441,8 @@ pub fn nativeTaFindLast(arena: std.mem.Allocator, this_val: Value, args: []const
     var i: usize = td.length;
     while (i > 0) {
         i -= 1;
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2441,6 +2461,8 @@ pub fn nativeTaFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []
     var i: usize = td.length;
     while (i > 0) {
         i -= 1;
+        try validateTypedArray(arena, td);
+        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
