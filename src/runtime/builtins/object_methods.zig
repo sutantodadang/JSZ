@@ -40,9 +40,10 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
         const ta_mod = @import("typed_array.zig");
         const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-        if (!td.ab.detached) {
+        if (!td.ab.detached and !ta_mod.taIsOob(td)) {
+            const ta_len: u32 = @intCast(ta_mod.taCurrentLen(td));
             var ti: u32 = 0;
-            while (ti < td.length) : (ti += 1) {
+            while (ti < ta_len) : (ti += 1) {
                 const k_str = try std.fmt.allocPrint(arena, "{d}", .{ti});
                 const idx_key_ta = try std.fmt.allocPrint(arena, "{d}", .{ta_key_count});
                 try arr.set(idx_key_ta, try val_mod.makeString(arena, k_str));
