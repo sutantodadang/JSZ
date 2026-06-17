@@ -1074,7 +1074,7 @@ pub const BcVm = struct {
             else => return,
         };
         if (obj.internal_kind == .proxy) {
-            try self.proxySet(obj_val, obj, sym_key, value);
+            _ = try self.proxySet(obj_val, obj, sym_key, value, obj_val);
             return;
         }
         try obj.setSym(sym_key, value);
@@ -1096,20 +1096,24 @@ pub const BcVm = struct {
 
     /// Proxy `set` trap dispatch: `handler.set(target, key, value, receiver)`,
     /// falling back to a plain write on the target when no trap is defined.
-    fn proxySet(self: *BcVm, proxy_val: Value, proxy_obj: *JsObject, key: Value, value: Value) anyerror!void {
-        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return;
-        const target = proxy_mod.proxyTarget(proxy_obj) orelse return;
+    fn proxySet(self: *BcVm, proxy_val: Value, proxy_obj: *JsObject, key: Value, value: Value, receiver: Value) anyerror!bool {
+        _ = proxy_val;
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return true;
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return true;
         if (proxy_mod.trap(handler, "set")) |trap_fn| {
-            _ = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key, value, proxy_val });
-            return;
+            const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key, value, receiver });
+            return isTruthy(res);
         }
-        // No trap: forward to the target.
+        // No trap: default [[Set]] forwards to the target, preserving Receiver
+        // (spec: OrdinarySet(target, P, V, Receiver) — the write lands on Receiver,
+        // not the target). Threading Receiver lets a TypedArray's exotic [[Set]]
+        // in the target's proto chain route CreateDataProperty back to the proxy.
         if (key.bits != 0 and key.unbox() == .symbol) {
             try self.setPropSym(target, key, value);
-            return;
+            return true;
         }
         const key_str = try valueToStringArena(self.arena, key);
-        try self.setProp(target, key_str, value);
+        return try self.setPropR(target, key_str, value, receiver);
     }
 
     /// HasProperty(obj, key) for the `in` operator: prototype-chain walk over
@@ -1497,27 +1501,74 @@ pub const BcVm = struct {
     }
 
     pub fn setProp(self: *BcVm, obj_val: Value, key: []const u8, value: Value) !void {
-        if (obj_val.bits == 0) return;
+        _ = try self.setPropR(obj_val, key, value, obj_val);
+    }
+
+    /// SameValue between a Value and a raw JsObject pointer (object identity).
+    fn sameObject(v: Value, ptr: *JsObject) bool {
+        return v.bits != 0 and v.unbox() == .object and v.toPtr().object == ptr;
+    }
+
+    /// [[Set]](P, V, Receiver) with an explicit Receiver. Returns true when the
+    /// set succeeded (or is a spec no-op that must not throw); false when it is a
+    /// failed assignment whose strict-mode caller must raise a TypeError.
+    ///
+    /// Receiver threading matters for TypedArray exotic [[Set]] reached through a
+    /// prototype chain (e.g. `Object.create(ta)[i] = v` or a Proxy of such): the
+    /// exotic method intercepts canonical numeric indices, and for a valid index
+    /// with a different Receiver, OrdinarySet writes onto the Receiver instead.
+    pub fn setPropR(self: *BcVm, obj_val: Value, key: []const u8, value: Value, receiver: Value) anyerror!bool {
+        if (obj_val.bits == 0) return true;
         switch (obj_val.unbox()) {
             .object => |obj| {
                 if (obj.internal_kind == .proxy) {
                     const key_v = try val_mod.makeString(self.arena, key);
-                    try self.proxySet(obj_val, obj, key_v, value);
-                    return;
+                    return try self.proxySet(obj_val, obj, key_v, value, receiver);
                 }
                 // M15: integer-indexed TypedArray element write (exotic). Coerce the
                 // value (ToNumber/ToBigInt) then store; out-of-bounds is a silent
                 // no-op and indexed keys never create ordinary properties.
                 if (obj.internal_kind == .typed_array) {
                     // Any canonical numeric index string routes to the exotic
-                    // [[Set]]: ToNumber/ToBigInt always runs (valueOf side effects +
-                    // abrupt throws propagate); the element stores only when the
-                    // index is valid; invalid indices ("0.1","-0",OOB) are a no-op
-                    // and NEVER create an ordinary property.
+                    // [[Set]]: when SameValue(O, Receiver), ToNumber/ToBigInt always
+                    // runs (valueOf side effects + abrupt throws propagate) and the
+                    // element stores only for a valid index; invalid indices
+                    // ("0.1","-0",OOB) are a no-op and NEVER create an ordinary
+                    // property. A different Receiver short-circuits before coercion.
                     if (typed_array.canonicalNumericIndexString(key)) |idx_f| {
                         const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-                        try typed_array.setElementThrowing(self.arena, td, idx_f, value);
-                        return;
+                        if (receiver.bits == obj_val.bits) {
+                            try typed_array.setElementThrowing(self.arena, td, idx_f, value);
+                            return true;
+                        }
+                        if (!typed_array.isValidIntegerIndex(td, idx_f)) return true;
+                        return try self.ordinarySetReceiverWrite(receiver, key, value);
+                    }
+                } else if (typed_array.canonicalNumericIndexString(key)) |idx_f| {
+                    // Prototype-chain dispatch: a canonical numeric index may be
+                    // intercepted by a TypedArray's exotic [[Set]] sitting in the
+                    // proto chain (OrdinarySet delegates to parent.[[Set]] when O
+                    // lacks an own property). Walk from O; whichever comes first —
+                    // an ordinary own property or a TypedArray — wins. A TypedArray
+                    // intercepts the index before any accessor behind it.
+                    var cur: ?*JsObject = obj;
+                    var depth: usize = 0;
+                    while (cur) |c| {
+                        if (depth >= 64) break;
+                        depth += 1;
+                        if (c.internal_kind == .typed_array) {
+                            const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(c.internal_slot.?));
+                            if (sameObject(receiver, c)) {
+                                try typed_array.setElementThrowing(self.arena, td, idx_f, value);
+                                return true;
+                            }
+                            if (!typed_array.isValidIntegerIndex(td, idx_f)) return true;
+                            return try self.ordinarySetReceiverWrite(receiver, key, value);
+                        }
+                        // Ordinary own property at this level: let the existing
+                        // findProperty logic below handle accessors/data/shadowing.
+                        if (c.resolveOwnSlot(key) != null) break;
+                        cur = c.proto;
                     }
                 }
                 if (obj.findProperty(key)) |loc| {
@@ -1527,25 +1578,87 @@ pub const BcVm = struct {
                         const setter = accessorMember(raw, "set");
                         // Only invoke if setter is an actual callable (not undefined/null).
                         if (isCallable(setter)) _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
-                        return; // accessor with no setter: sloppy no-op
+                        return true; // accessor with no setter: sloppy no-op
                     }
                     if (loc.holder == obj) {
-                        if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return;
+                        if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return true;
                         _ = obj.setOwnBySlot(obj.shapePtr(), loc.slot, value);
-                        return;
+                        return true;
                     }
                     // inherited data property: fall through to create an own (shadow).
                 }
                 try obj.set(key, value);
+                return true;
             },
             // W2 unification: bc functions store own properties (incl.
             // `C.prototype = ...`) on their backing object.
             .bc_function => |closure| {
                 const o = try self.closureBackingObj(closure);
                 try o.set(key, value);
+                return true;
             },
-            else => {},
+            else => return true,
         }
+    }
+
+    /// OrdinarySet's receiver-write step: CreateDataProperty(Receiver, P, V) when
+    /// the Receiver has no own P, or a value update when it owns a writable data
+    /// property. Returns false (failed assignment) for an own accessor, a
+    /// non-writable own data property, or a non-extensible Receiver lacking P.
+    /// A Proxy Receiver routes through its [[DefineOwnProperty]] trap; a
+    /// TypedArray Receiver validates the integer index and coerces+stores.
+    fn ordinarySetReceiverWrite(self: *BcVm, receiver: Value, key: []const u8, value: Value) anyerror!bool {
+        if (receiver.bits == 0 or receiver.unbox() != .object) return false;
+        const robj = receiver.toPtr().object;
+        if (robj.internal_kind == .proxy) {
+            return try self.proxyDefineDataProperty(robj, key, value);
+        }
+        if (robj.internal_kind == .typed_array) {
+            if (typed_array.canonicalNumericIndexString(key)) |idx_f| {
+                const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(robj.internal_slot.?));
+                if (!typed_array.isValidIntegerIndex(td, idx_f)) return false;
+                try typed_array.setElementThrowing(self.arena, td, idx_f, value);
+                return true;
+            }
+        }
+        if (robj.resolveOwnSlot(key)) |slot| {
+            const a = robj.attrAt(slot);
+            if (a.is_accessor) return false;
+            if (!a.writable) return false;
+            _ = robj.setOwnBySlot(robj.shapePtr(), slot, value);
+            return true;
+        }
+        if (!robj.extensible) return false;
+        try robj.set(key, value); // CreateDataProperty (updates array length too)
+        return true;
+    }
+
+    /// CreateDataProperty on a Proxy Receiver: dispatch the `defineProperty` trap
+    /// with a full data descriptor, or forward to the target when no trap exists.
+    fn proxyDefineDataProperty(self: *BcVm, proxy_obj: *JsObject, key: []const u8, value: Value) anyerror!bool {
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return false;
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return false;
+        if (proxy_mod.trap(handler, "defineProperty")) |trap_fn| {
+            const key_v = try val_mod.makeString(self.arena, key);
+            const desc = try self.makeDataDescriptor(value);
+            const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v, desc });
+            return isTruthy(res);
+        }
+        return try self.ordinarySetReceiverWrite(target, key, value);
+    }
+
+    /// Build `{ value, writable: true, enumerable: true, configurable: true }`.
+    fn makeDataDescriptor(self: *BcVm, value: Value) !Value {
+        const o = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        const t = try val_mod.makeBool(self.arena, true);
+        try o.set("value", value);
+        try o.set("writable", t);
+        try o.set("enumerable", t);
+        try o.set("configurable", t);
+        return val_mod.makeObject(self.arena, o);
     }
 
     /// S8: re-entrant property bridges for the boxed JIT's GET_PROP/SET_PROP

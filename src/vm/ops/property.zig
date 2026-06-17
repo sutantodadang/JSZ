@@ -17,6 +17,20 @@ const JsObject = @import("../../object/object.zig").JsObject;
 const ic_mod = @import("../ic.zig");
 const proxy_mod = @import("../../runtime/builtins/proxy.zig");
 
+/// Raise the strict-mode TypeError for a failed property assignment ([[Set]]
+/// returned false). Returns a non-null RunOutcome only when the throw escapes
+/// the current frame uncaught; null means a handler caught it.
+fn strictAssignThrow(self: *BcVm) !?RunOutcome {
+    const exc = try self.makeErrorObjectBc("TypeError", "Cannot assign to read only property");
+    self.last_exception_value = exc;
+    const found = try self.throwException(exc);
+    if (!found) {
+        const exc_msg = try bcv.formatExceptionMessage(self.arena, exc);
+        return RunOutcome{ .exception_value = .{ .msg = exc_msg, .value = exc } };
+    }
+    return null;
+}
+
 pub inline fn opGetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const site_pc = frame.pc - 1;
@@ -230,14 +244,19 @@ pub inline fn opSetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const key = key_val.toPtr().string;
     const obj_val = frame.registers[robj];
     const val = frame.registers[rval];
-    // Save func pointer before setProp: a setter dispatch via bcInvokeJs
-    // may reallocate self.frames, invalidating the `frame` pointer.
+    // Save func pointer/strictness before setProp: a setter dispatch via
+    // bcInvokeJs may reallocate self.frames, invalidating the `frame` pointer.
     const set_func = frame.func;
-    self.setProp(obj_val, key, val) catch |e| {
+    const set_strict = frame.func.is_strict;
+    const set_ok = self.setPropR(obj_val, key, val, obj_val) catch |e| {
         if (e != error.JsException) return e;
         if (try self.raisePendingException("error in setter")) |oc| return oc;
         return null;
     };
+    if (!set_ok and set_strict) {
+        if (try strictAssignThrow(self)) |oc| return oc;
+        return null;
+    }
     const site_cache = &@constCast(set_func.ic_table)[site_pc];
     if (obj_val.bits != 0 and obj_val.unbox() == .object) {
         const obj = obj_val.toPtr().object;
@@ -265,11 +284,16 @@ pub inline fn opSetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     if (key_val.bits != 0 and key_val.unbox() == .string) {
         const key = key_val.toPtr().string;
         const set_dyn_func = frame.func;
-        self.setProp(obj_val, key, val) catch |e| {
+        const set_dyn_strict = frame.func.is_strict;
+        const set_dyn_ok = self.setPropR(obj_val, key, val, obj_val) catch |e| {
             if (e != error.JsException) return e;
             if (try self.raisePendingException("error in setter")) |oc| return oc;
             return null;
         };
+        if (!set_dyn_ok and set_dyn_strict) {
+            if (try strictAssignThrow(self)) |oc| return oc;
+            return null;
+        }
         const site_cache = &@constCast(set_dyn_func.ic_table)[site_pc];
         if (obj_val.bits != 0 and obj_val.unbox() == .object) {
             const obj = obj_val.toPtr().object;
