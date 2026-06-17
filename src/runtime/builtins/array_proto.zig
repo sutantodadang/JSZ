@@ -223,13 +223,10 @@ pub fn nativeJoin(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const arr = getArray(this_val) orelse return val_mod.makeString(arena, "");
     const len = arr.array_length;
 
-    const sep: []const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .string => |s| s,
-            .undefined_ => ",",
-            .null_ => ",",
-            else => ",",
-        }
+    // §23.1.3.18: only `undefined` (or absent) yields the default ",". Every other
+    // value (including null → "null") goes through ToString(separator).
+    const sep: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_)
+        try valueToJsString(arena, args[0])
     else
         ",";
 

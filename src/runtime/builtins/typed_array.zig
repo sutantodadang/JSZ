@@ -106,7 +106,6 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "indexOf",     nativeTaIndexOf,     @as(u8, 1) },
         .{ "includes",    nativeTaIncludes,    @as(u8, 1) },
         .{ "join",        nativeTaJoin,        @as(u8, 1) },
-        .{ "toString",    nativeTaToString,    @as(u8, 0) },
         .{ "reverse",     nativeTaReverse,     @as(u8, 0) },
         .{ "at",          nativeTaAt,          @as(u8, 1) },
         .{ "forEach",     nativeTaForEach,     @as(u8, 1) },
@@ -136,8 +135,22 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     inline for (ta_methods) |m| {
         _ = try ta_proto.defineOwnData(m[0], try val_mod.makeNativeFunctionNamed(arena, m[1], m[0], m[2]), m_attr);
     }
-    // @@iterator shares the same fn as values (length 0, no string name needed).
-    _ = try ta_proto.defineOwnData("@@iterator", try val_mod.makeNativeFunctionNamed(arena, nativeTaValues, "values", 0), m_attr);
+    // §22.2.3.31: %TypedArray%.prototype.toString is the *same* function object as
+    // Array.prototype.toString (not a distinct native fn). Fall back to a fresh
+    // native fn only if Array.prototype isn't available (defensive; it always is).
+    if (ctx.array_proto) |ap| {
+        if (ap.get("toString")) |array_to_string| {
+            _ = try ta_proto.defineOwnData("toString", array_to_string, m_attr);
+        } else {
+            _ = try ta_proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeTaToString, "toString", 0), m_attr);
+        }
+    } else {
+        _ = try ta_proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeTaToString, "toString", 0), m_attr);
+    }
+    // @@iterator is the *same* function object as %TypedArray%.prototype.values.
+    if (ta_proto.get("values")) |values_fn| {
+        _ = try ta_proto.defineOwnData("@@iterator", values_fn, m_attr);
+    }
     active_typedarray_proto = ta_proto;
 
     // Instance accessor getters live on %TypedArray%.prototype.
@@ -1806,16 +1819,22 @@ pub fn nativeTaIncludes(arena: std.mem.Allocator, this_val: Value, args: []const
     if (td.length == 0) return val_mod.makeBool(arena, false);
     if (args.len == 0) return val_mod.makeBool(arena, false);
     const is_big = td.kind.isBigInt();
-    const target = toNum(args[0]);
-    const want_nan = std.math.isNan(target);
+    // includes uses SameValueZero: for a number-element array the search element
+    // only matches when it is itself a Number (undefined/"42"/true/null never do).
+    // NaN matches NaN, and +0/-0 compare equal.
+    const search_is_num = args[0].bits != 0 and args[0].unbox() == .number;
+    const target: f64 = if (search_is_num) args[0].unbox().number else 0;
+    const want_nan = search_is_num and std.math.isNan(target);
     const want_big: ?i128 = if (is_big) bigintSearch(args[0]) else null;
-    var len: usize = td.length;
+    const search_undef = args[0].bits == 0 or args[0].unbox() == .undefined_;
+    // §23.2.3.14: `len` is captured BEFORE ToIntegerOrInfinity(fromIndex) and is NOT
+    // re-clamped if the coercion resizes/detaches the buffer — the loop iterates to
+    // the original length and out-of-bounds reads (taLoad) yield `undefined`, which
+    // SameValueZero-matches an `undefined` search element.
+    const len: usize = td.length;
     var k: usize = 0;
     if (args.len > 1) {
         const n = try toIntegerThrowing(arena, args[1]);
-        // fromIndex coercion may have SHRUNK the buffer; clamp (grow keeps original).
-        len = @min(len, if (taIsOob(td)) 0 else taCurrentLen(td));
-        if (len == 0) return val_mod.makeBool(arena, false);
         var s = n;
         if (s < 0) {
             s += @floatFromInt(len);
@@ -1826,11 +1845,19 @@ pub fn nativeTaIncludes(arena: std.mem.Allocator, this_val: Value, args: []const
     }
     var i: usize = k;
     while (i < len) : (i += 1) {
+        const ev = try taLoad(arena, td, i);
+        const ev_undef = ev.bits == 0 or ev.unbox() == .undefined_;
+        // SameValueZero(searchElement, elementValue).
+        if (search_undef) {
+            if (ev_undef) return val_mod.makeBool(arena, true);
+            continue;
+        }
+        if (ev_undef) continue; // search is a value but element is OOB → undefined
         if (is_big) {
-            if (want_big != null and taBigRaw(td, i) == want_big.?) return val_mod.makeBool(arena, true);
-        } else {
-            const ev = try taLoad(arena, td, i);
-            const n = toNum(ev);
+            if (want_big != null and ev.unbox() == .bigint and taBigRaw(td, i) == want_big.?)
+                return val_mod.makeBool(arena, true);
+        } else if (search_is_num and ev.unbox() == .number) {
+            const n = ev.unbox().number;
             if (n == target or (want_nan and std.math.isNan(n))) return val_mod.makeBool(arena, true);
         }
     }

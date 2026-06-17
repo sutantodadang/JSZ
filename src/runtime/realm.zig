@@ -1146,6 +1146,9 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "padEnd", string_proto_mod.nativePadEnd },
         .{ "trimStart", string_proto_mod.nativeTrimStart },
         .{ "trimEnd", string_proto_mod.nativeTrimEnd },
+        .{ "startsWith", string_proto_mod.nativeStartsWith },
+        .{ "endsWith", string_proto_mod.nativeEndsWith },
+        .{ "includes", string_proto_mod.nativeStringIncludes },
         // Phase 4c: regex-aware string methods
         .{ "match", string_proto_mod.nativeMatch },
         .{ "replace", string_proto_mod.nativeReplace },
@@ -1456,6 +1459,7 @@ pub const Realm = struct {
             .env = env,
             .object_proto = object_proto,
             .function_proto = function_proto,
+            .array_proto = array_proto,
         };
 
         try date_mod.register(&reg_ctx);

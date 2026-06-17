@@ -23,6 +23,10 @@ pub const Ctx = struct {
     env: *Environment,
     object_proto: *JsObject,
     function_proto: ?*JsObject = null,
+    /// Array.prototype, available once registerArrayProto has run. Lets builtins
+    /// share the exact same function object (e.g. %TypedArray%.prototype.toString
+    /// must be the same object as Array.prototype.toString per spec).
+    array_proto: ?*JsObject = null,
 
     /// Define a global binding to a freshly-boxed object value.
     pub fn defineGlobal(self: *const Ctx, name: []const u8, obj: *JsObject) !void {
