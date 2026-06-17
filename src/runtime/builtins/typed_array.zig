@@ -1494,7 +1494,11 @@ pub fn setElementThrowing(arena: std.mem.Allocator, td: *TypedArrayData, idx_f: 
 
 /// ES2023 §22.2.4.7 TypedArraySpeciesCreate(exemplar, argumentList).
 /// Returns the result Value (a TypedArray) or propagates JsException.
-fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedArrayData, exemplar_this: Value, species_args: []const Value) anyerror!Value {
+/// `write_mode` selects ValidateTypedArray's accessMode for the species result:
+/// operations that copy data INTO the result (slice/map/filter) pass `true` and
+/// reject an immutable result buffer; `subarray` merely creates a view sharing
+/// the source buffer and passes `false` (an immutable view is legal).
+fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedArrayData, exemplar_this: Value, species_args: []const Value, write_mode: bool) anyerror!Value {
     _ = exemplar_td; // kind used only to locate defaultCtor below
 
     // 1. defaultCtor = intrinsic ctor for exemplar's kind.
@@ -1558,7 +1562,9 @@ fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedAr
         return throwTypeError(arena, "species result has detached buffer");
 
     // 5b. Immutable buffer check (ValidateTypedArray with accessMode ~write~).
-    if (res_td.ab.immutable)
+    //     Only operations that write into the result reject an immutable buffer;
+    //     subarray (a view over the shared buffer) does not.
+    if (write_mode and res_td.ab.immutable)
         return throwTypeError(arena, "species result has immutable buffer");
 
     // 6. If a length argument was passed (single numeric arg), validate result can hold required elements.
@@ -1633,23 +1639,31 @@ pub fn nativeTaFill(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
 pub fn nativeTaSubarray(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    // Spec subarray does NOT ValidateTypedArray: srcLength is 0 when OOB/detached,
-    // and ToInteger(begin/end) must run observably regardless.
+    // Spec subarray does NOT ValidateTypedArray: srcLength is captured once here
+    // (0 when OOB/detached), BEFORE ToInteger(begin/end), which must run observably
+    // and whose side effects (buffer resize) do not change this srcLength.
     const src_len: usize = if (taIsOob(td)) 0 else taCurrentLen(td);
     const begin = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), src_len);
+    const buf_val = try val_mod.makeObject(arena, td.buffer_obj);
+    const begin_byte_offset = td.byte_offset + begin * td.kind.elemSize();
+    const byte_off_val = try val_mod.makeNumber(arena, @floatFromInt(begin_byte_offset));
     const end_v: Value = if (args.len > 1) args[1] else Value{};
-    const end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
+    const end_undefined = end_v.bits == 0 or end_v.unbox() == .undefined_;
+    if (td.track_length and end_undefined) {
+        // Auto-length view + end undefined: pass « buffer, beginByteOffset » so the
+        // result is itself length-tracking (its length follows the buffer's size).
+        const species_args = [_]Value{ buf_val, byte_off_val };
+        return typedArraySpeciesCreate(arena, td, this_val, &species_args, false);
+    }
+    const end = if (!end_undefined)
         relIndex(try toIntegerThrowing(arena, end_v), src_len)
     else
         src_len;
     const new_len = if (end > begin) end - begin else 0;
-    // Build subarray args: (buffer, beginByteOffset, newLength) for species ctor.
-    const buf_val = try val_mod.makeObject(arena, td.buffer_obj);
-    const begin_byte_offset = td.byte_offset + begin * td.kind.elemSize();
-    const byte_off_val = try val_mod.makeNumber(arena, @floatFromInt(begin_byte_offset));
+    // « buffer, beginByteOffset, newLength » — explicit fixed-length result.
     const new_len_val = try val_mod.makeNumber(arena, @floatFromInt(new_len));
     const species_args = [_]Value{ buf_val, byte_off_val, new_len_val };
-    return typedArraySpeciesCreate(arena, td, this_val, &species_args);
+    return typedArraySpeciesCreate(arena, td, this_val, &species_args, false);
 }
 
 pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1662,7 +1676,7 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
         td.length;
     const new_len = if (end > start) end - start else 0;
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(new_len))};
-    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg);
+    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
     // Spec slice step 14: if count > 0 and the source buffer was detached during
     // SpeciesConstructor (e.g. via the `constructor`/@@species getter), throw.
@@ -1907,7 +1921,7 @@ pub fn nativeTaMap(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(td.length))};
-    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg);
+    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
@@ -2263,7 +2277,7 @@ pub fn nativeTaFilter(arena: std.mem.Allocator, this_val: Value, args: []const V
     }
     // Second pass: create result via species with the exact count.
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(out_len))};
-    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg);
+    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const res_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
     var j: usize = 0;
     while (j < out_len) : (j += 1) {
