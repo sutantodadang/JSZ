@@ -1728,12 +1728,17 @@ pub fn nativeTaSubarray(arena: std.mem.Allocator, this_val: Value, args: []const
 
 pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = try validateTypedArrayThis(arena, this_val);
-    const start = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), td.length);
+    // Spec step 3: srcArrayLength is the CURRENT live length, captured before the
+    // start/end ToInteger coercions (whose valueOf may resize the backing buffer).
+    // For length-tracking views the stored td.length (creation length) is stale, so
+    // read taCurrentLen directly instead of relying on validateTypedArray's refresh.
+    const src_len = taCurrentLen(td);
+    const start = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), src_len);
     const end_v: Value = if (args.len > 1) args[1] else Value{};
     const end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
-        relIndex(try toIntegerThrowing(arena, end_v), td.length)
+        relIndex(try toIntegerThrowing(arena, end_v), src_len)
     else
-        td.length;
+        src_len;
     const new_len = if (end > start) end - start else 0;
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(new_len))};
     const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
