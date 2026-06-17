@@ -431,6 +431,10 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     // strings, Map/Set). for-in (below) keeps key-enumeration.
     if (node.data.for_in_stmt.iterate_values) {
         const fo = node.data.for_in_stmt;
+        // A directly-enclosing label (consumed here) lets `break L`/`continue L`
+        // target this for-of loop.
+        const loop_lbl = self.pending_label;
+        self.pending_label = null;
         const base_sp = self.sp;
         const riter = self.allocReg();
         {
@@ -449,6 +453,14 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             self.sp = riter + 1;
         }
         const rstep = self.allocReg();
+        // Completion value: a loop's value starts fresh at `undefined`; prev_reg
+        // holds the value at the start of each iteration so a `continue` (an empty
+        // completion) reverts to it. No-op outside implicit-return compilation.
+        try self.resetCompletion(line);
+        const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
+        // Permanent registers (riter, rstep, prev_reg) sit below iter_sp; the
+        // per-iteration temporaries above it are reclaimed each pass.
+        const iter_sp = self.sp;
         const loop_start = self.currentOffset();
         {
             const b = self.allocReg();
@@ -464,7 +476,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             try self.emitU8(b);
             try self.emitU8(1);
             try self.emitU8(rstep);
-            self.sp = rstep + 1;
+            self.sp = iter_sp;
         }
         // if (rstep.done) exit
         const rdone = self.allocReg();
@@ -477,7 +489,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         try self.emitU8(rdone);
         const patch_exit = self.currentOffset();
         try self.emitI16(0);
-        self.sp = rstep + 1;
+        self.sp = iter_sp;
         // loopvar = rstep.value
         const rval = self.allocReg();
         const vi = try self.builder.addConstant(try val_mod.makeString(self.arena, "value"));
@@ -496,13 +508,20 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             try self.emitU16(@intCast(ni));
             try self.emitU8(rval);
         }
-        self.sp = rstep + 1;
+        self.sp = iter_sp;
+        // Register the loop so `break`/`continue` (labeled or innermost) resolve to
+        // it; `continue` jumps to loop_start, which advances the iterator (re-calls
+        // __iterStep__) before the next done-check.
+        try self.saveLoopPrev(prev_reg, line);
+        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg });
         try self.compileStmt(fo.body, last_expr_reg);
         try self.emitOp(.JMP, line);
         const back = self.currentOffset();
         try self.emitI16(0);
         self.patchJump(back, loop_start);
-        self.patchJump(patch_exit, self.currentOffset());
+        const exit_offset = self.currentOffset();
+        self.patchJump(patch_exit, exit_offset);
+        self.resolveLoop(loop_start, exit_offset);
         self.sp = base_sp;
         return;
     }
