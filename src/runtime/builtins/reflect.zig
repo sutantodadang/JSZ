@@ -206,7 +206,17 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
                 try typed_array.setElementThrowing(arena, rtd, idx_f, value);
                 return val_mod.makeBool(arena, true);
             }
-            // Plain object receiver: CreateDataProperty (store V unchanged).
+            // Plain object receiver → OrdinarySet(Receiver, P, V): validate the
+            // receiver's own descriptor before CreateDataProperty. An own
+            // accessor or non-writable own data property fails; a non-extensible
+            // receiver lacking the own property cannot have it created.
+            if (robj.resolveOwnSlot(k)) |slot| {
+                const rattr = robj.attrAt(slot);
+                if (rattr.is_accessor) return val_mod.makeBool(arena, false);
+                if (!rattr.writable) return val_mod.makeBool(arena, false);
+            } else if (!robj.extensible) {
+                return val_mod.makeBool(arena, false);
+            }
             try robj.set(k, value);
             return val_mod.makeBool(arena, true);
         }
