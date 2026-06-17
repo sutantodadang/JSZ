@@ -2396,10 +2396,11 @@ pub fn nativeTaReduceRight(arena: std.mem.Allocator, this_val: Value, args: []co
         i = td.length - 1;
         acc = try taLoad(arena, td, i);
     }
+    // No mid-iteration re-validation: `len` was fixed at entry; a detach/shrink
+    // during a callback makes subsequent element reads (taLoad) return undefined
+    // (matching Get(O, k) on an out-of-bounds index), per §23.2.3.21.
     while (i > 0) {
         i -= 1;
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         acc = try function_proto.invokeCallback(arena, Value{}, cb, &[_]Value{ acc, ev, idx_v, this_val });

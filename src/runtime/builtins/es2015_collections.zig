@@ -465,6 +465,10 @@ pub const SeqIterData = struct {
     is_string: bool = false,
     is_typed: bool = false,
     kind: SeqIterKind = .value,
+    /// Once the underlying generator-style iterator completes (exhausted or
+    /// abrupt), it stays done — a later regrow of a length-tracking TypedArray
+    /// must NOT resurrect it.
+    done: bool = false,
 };
 
 /// %IteratorPrototype%[@@iterator] and %ArrayIteratorPrototype% reuse: return
@@ -529,16 +533,31 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
     const obj = this_val.toPtr().object;
     if (obj.internal_slot == null) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const d: *SeqIterData = @ptrCast(@alignCast(obj.internal_slot.?));
+    if (d.done) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     if (d.is_string) {
         const s = d.seq.unbox().string;
-        if (d.index >= s.len) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+        if (d.index >= s.len) {
+            d.done = true;
+            return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+        }
         const ch = try arena.dupe(u8, s[d.index .. d.index + 1]);
         d.index += 1;
         return makeIteratorResult(arena, try val_mod.makeString(arena, ch), false);
     }
     if (d.is_typed) {
         const td = ta_mod.getTd(d.seq) orelse return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
-        if (d.index >= ta_mod.taCurrentLen(td)) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+        // CreateArrayIterator: each step first throws TypeError if the view is
+        // out-of-bounds (fixed-length view over a shrunk/detached buffer), then
+        // ends (permanently) once index reaches the live length.
+        if (ta_mod.taIsOob(td)) {
+            d.done = true;
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "TypedArray is out-of-bounds during iteration");
+            return error.JsException;
+        }
+        if (d.index >= ta_mod.taCurrentLen(td)) {
+            d.done = true;
+            return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+        }
         const idx = d.index;
         d.index += 1;
         return switch (d.kind) {
@@ -548,7 +567,10 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
         };
     }
     const arr = d.seq.toPtr().object;
-    if (d.index >= arr.getArrayLength()) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    if (d.index >= arr.getArrayLength()) {
+        d.done = true;
+        return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    }
     const idx = d.index;
     d.index += 1;
     const idx_str = try std.fmt.allocPrint(arena, "{d}", .{idx});
@@ -602,7 +624,9 @@ pub fn nativeIterStep(arena: std.mem.Allocator, _: Value, args: []const Value) a
 }
 
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
-    const proto: ?*JsObject = if (realm_mod.active_context) |_| null else null;
+    // Use the realm's TypeError.prototype so `err instanceof TypeError` and
+    // `err.constructor === TypeError` hold (assert.throws relies on both).
+    const proto: ?*JsObject = realm_mod.error_proto_TypeError;
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     try obj.set("message", try val_mod.makeString(arena, msg));
