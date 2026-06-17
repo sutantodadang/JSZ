@@ -81,6 +81,16 @@ pub fn toPrimitive(arena: std.mem.Allocator, v: Value, hint: Hint) anyerror!?Val
     // 1. Exotic @@toPrimitive hook.
     if (realm_mod.active_sym_to_primitive) |sym| {
         if (getSymMethod(obj, sym)) |method| {
+            // GetMethod: a present @@toPrimitive that is undefined/null is
+            // skipped; one that is neither but not callable throws a TypeError.
+            const is_nullish = method.bits == 0 or switch (method.unbox()) {
+                .undefined_, .null_ => true,
+                else => false,
+            };
+            if (!is_nullish and !isCallable(method)) {
+                realm_mod.pending_exception = try makeTypeErrorVal(arena, "@@toPrimitive is not a function");
+                return error.JsException;
+            }
             if (isCallable(method)) {
                 const hint_str: []const u8 = switch (hint) {
                     .number => "number",

@@ -219,7 +219,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try defineGetter(arena, dv_proto, "byteLength", dvGetByteLength);
     try defineGetter(arena, dv_proto, "byteOffset", dvGetByteOffset);
     try defineGetter(arena, dv_proto, "buffer", dvGetBuffer);
-    const dv_ctor = try JsObject.create(arena, null);
+    // [[Prototype]] of the DataView constructor is %Function.prototype%.
+    const dv_ctor = try JsObject.create(arena, fn_proto_obj);
     _ = try dv_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, dv_proto),
         .{ .writable = false, .enumerable = false, .configurable = false });
     try dv_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeDataViewCtor));
@@ -409,13 +410,16 @@ fn toNumberThrowing(arena: std.mem.Allocator, v: Value) anyerror!f64 {
         .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
         .bigint => return throwTypeError(arena, "Cannot convert a BigInt to a number"),
         .object => {
-            const prim = (try coercion.toPrimitive(arena, v, .number)) orelse v;
+            // ToPrimitive(number) returning null means OrdinaryToPrimitive found no
+            // callable valueOf/toString — ToNumber on such an object throws TypeError.
+            const prim = (try coercion.toPrimitive(arena, v, .number)) orelse
+                return throwTypeError(arena, "Cannot convert object to a primitive value");
             // Re-dispatch on the primitive (a Symbol/BigInt prim still throws).
             if (prim.bits == 0) return std.math.nan(f64);
             switch (prim.unbox()) {
                 .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
                 .bigint => return throwTypeError(arena, "Cannot convert a BigInt to a number"),
-                .object => return std.math.nan(f64), // toPrimitive guarantees non-object; defensive
+                .object => return throwTypeError(arena, "Cannot convert object to a primitive value"),
                 else => return toNum(prim),
             }
         },
@@ -1490,7 +1494,11 @@ pub fn setElementThrowing(arena: std.mem.Allocator, td: *TypedArrayData, idx_f: 
 
 /// ES2023 §22.2.4.7 TypedArraySpeciesCreate(exemplar, argumentList).
 /// Returns the result Value (a TypedArray) or propagates JsException.
-fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedArrayData, exemplar_this: Value, species_args: []const Value) anyerror!Value {
+/// `write_mode` selects ValidateTypedArray's accessMode for the species result:
+/// operations that copy data INTO the result (slice/map/filter) pass `true` and
+/// reject an immutable result buffer; `subarray` merely creates a view sharing
+/// the source buffer and passes `false` (an immutable view is legal).
+fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedArrayData, exemplar_this: Value, species_args: []const Value, write_mode: bool) anyerror!Value {
     _ = exemplar_td; // kind used only to locate defaultCtor below
 
     // 1. defaultCtor = intrinsic ctor for exemplar's kind.
@@ -1553,12 +1561,21 @@ fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedAr
     if (res_td.ab.detached)
         return throwTypeError(arena, "species result has detached buffer");
 
-    // 6. If a length argument was passed (single numeric arg), validate result.length >= required.
-    // Spec: throws RangeError if result length is insufficient.
+    // 5b. Immutable buffer check (ValidateTypedArray with accessMode ~write~).
+    //     Only operations that write into the result reject an immutable buffer;
+    //     subarray (a view over the shared buffer) does not.
+    if (write_mode and res_td.ab.immutable)
+        return throwTypeError(arena, "species result has immutable buffer");
+
+    // 6. If a length argument was passed (single numeric arg), validate result can hold required elements.
+    // Spec: throws TypeError if result length is insufficient.
+    // For length-tracking TAs, compute live length from buffer via taCurrentLen
+    // instead of using the potentially stale res_td.length.
     if (species_args.len == 1 and species_args[0].bits != 0 and species_args[0].unbox() == .number) {
         const required: usize = toIndex(species_args[0].unbox().number);
-        if (res_td.length < required)
-            return throwRangeError(arena, "species result length is insufficient");
+        const actual_len = if (res_td.track_length) taCurrentLen(res_td) else res_td.length;
+        if (actual_len < required)
+            return throwTypeError(arena, "species result length is insufficient");
     }
 
     return result;
@@ -1622,23 +1639,31 @@ pub fn nativeTaFill(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
 pub fn nativeTaSubarray(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
-    // Spec subarray does NOT ValidateTypedArray: srcLength is 0 when OOB/detached,
-    // and ToInteger(begin/end) must run observably regardless.
+    // Spec subarray does NOT ValidateTypedArray: srcLength is captured once here
+    // (0 when OOB/detached), BEFORE ToInteger(begin/end), which must run observably
+    // and whose side effects (buffer resize) do not change this srcLength.
     const src_len: usize = if (taIsOob(td)) 0 else taCurrentLen(td);
     const begin = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), src_len);
+    const buf_val = try val_mod.makeObject(arena, td.buffer_obj);
+    const begin_byte_offset = td.byte_offset + begin * td.kind.elemSize();
+    const byte_off_val = try val_mod.makeNumber(arena, @floatFromInt(begin_byte_offset));
     const end_v: Value = if (args.len > 1) args[1] else Value{};
-    const end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
+    const end_undefined = end_v.bits == 0 or end_v.unbox() == .undefined_;
+    if (td.track_length and end_undefined) {
+        // Auto-length view + end undefined: pass « buffer, beginByteOffset » so the
+        // result is itself length-tracking (its length follows the buffer's size).
+        const species_args = [_]Value{ buf_val, byte_off_val };
+        return typedArraySpeciesCreate(arena, td, this_val, &species_args, false);
+    }
+    const end = if (!end_undefined)
         relIndex(try toIntegerThrowing(arena, end_v), src_len)
     else
         src_len;
     const new_len = if (end > begin) end - begin else 0;
-    // Build subarray args: (buffer, beginByteOffset, newLength) for species ctor.
-    const buf_val = try val_mod.makeObject(arena, td.buffer_obj);
-    const begin_byte_offset = td.byte_offset + begin * td.kind.elemSize();
-    const byte_off_val = try val_mod.makeNumber(arena, @floatFromInt(begin_byte_offset));
+    // « buffer, beginByteOffset, newLength » — explicit fixed-length result.
     const new_len_val = try val_mod.makeNumber(arena, @floatFromInt(new_len));
     const species_args = [_]Value{ buf_val, byte_off_val, new_len_val };
-    return typedArraySpeciesCreate(arena, td, this_val, &species_args);
+    return typedArraySpeciesCreate(arena, td, this_val, &species_args, false);
 }
 
 pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1651,7 +1676,7 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
         td.length;
     const new_len = if (end > start) end - start else 0;
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(new_len))};
-    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg);
+    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
     // Spec slice step 14: if count > 0 and the source buffer was detached during
     // SpeciesConstructor (e.g. via the `constructor`/@@species getter), throw.
@@ -1896,7 +1921,7 @@ pub fn nativeTaMap(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(td.length))};
-    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg);
+    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
     var i: usize = 0;
     while (i < td.length) : (i += 1) {
@@ -2252,7 +2277,7 @@ pub fn nativeTaFilter(arena: std.mem.Allocator, this_val: Value, args: []const V
     }
     // Second pass: create result via species with the exact count.
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(out_len))};
-    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg);
+    const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const res_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
     var j: usize = 0;
     while (j < out_len) : (j += 1) {
@@ -2562,7 +2587,10 @@ fn dvCurrentByteLen(dv: *const DataViewData) usize {
 }
 
 pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
+    // [[Construct]]-only: a plain `DataView(...)` call (NewTarget undefined) must
+    // throw a TypeError before any argument coercion. The plain-call path passes
+    // a fabricated object `this`, so gate on the native construct flag instead.
+    if (!realm_mod.active_constructing or this_val.bits == 0 or this_val.unbox() != .object) {
         return throwTypeError(arena, "Constructor DataView requires 'new'");
     }
     if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object or args[0].toPtr().object.internal_kind != .array_buffer) {
@@ -2583,6 +2611,11 @@ pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     const obj = this_val.toPtr().object;
     // GetPrototypeFromConstructor runs after offset/length coercion + bounds checks.
     try applyNewTargetProto(arena, obj);
+    // OrdinaryCreateFromConstructor may have run user code (a `prototype` getter)
+    // that detached or resized the buffer; re-validate against the current length.
+    if (ab.detached) return throwTypeError(arena, "Cannot perform operation on a detached ArrayBuffer");
+    if (byte_offset > ab.byte_length) return throwRangeError(arena, "byteOffset out of bounds");
+    if (has_len and byte_offset + byte_length > ab.byte_length) return throwRangeError(arena, "Invalid DataView length");
     const dv = try arena.create(DataViewData);
     dv.* = .{ .buffer_obj = buf_obj, .ab = ab, .byte_offset = byte_offset, .byte_length = byte_length, .track_length = track_length };
     obj.internal_kind = .data_view;
@@ -2653,8 +2686,11 @@ pub fn dvSet(comptime T: type, comptime is_float: bool) val_mod.NativeFnPtr {
     return struct {
         fn f(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
             const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
-            // Spec SetViewValue order: ToIndex(requestIndex) → ToBoolean(le) →
-            // ToNumber(value) [observable, throws] → detached/bounds checks.
+            // Spec SetViewValue: IsImmutableBuffer check (step 3) precedes ToIndex
+            // and ToNumber — the test asserts no argument coercion runs first.
+            if (dv.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed DataView");
+            // Then ToIndex(requestIndex) → ToBoolean(le) → ToNumber(value)
+            // [observable, throws] → detached/bounds checks.
             const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
             const le = dvLittleEndian(args, 2);
             const x = try toNumberThrowing(arena, if (args.len > 1) args[1] else Value{});
@@ -2700,6 +2736,8 @@ pub fn dvSetBig() val_mod.NativeFnPtr {
     return struct {
         fn f(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
             const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
+            // SetViewValue step 3: immutable buffer rejected before argument coercion.
+            if (dv.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed DataView");
             const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
             const le = dvLittleEndian(args, 2);
             const bv = try toBigIntThrowing(arena, if (args.len > 1) args[1] else Value{});
@@ -2728,6 +2766,8 @@ pub fn dvGetF16(arena: std.mem.Allocator, this_val: Value, args: []const Value) 
 
 pub fn dvSetF16(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
+    // SetViewValue step 3: immutable buffer rejected before argument coercion.
+    if (dv.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed DataView");
     const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
     const le = dvLittleEndian(args, 2);
     const x = try toNumberThrowing(arena, if (args.len > 1) args[1] else Value{});
