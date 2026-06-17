@@ -1951,7 +1951,17 @@ pub const BcVm = struct {
                             else
                                 try JsObject.create(self.arena, proto);
                             const this_val_call = try val_mod.makeObject(self.arena, new_obj);
-                            const result = fn_ptr.invoke(self.arena, this_val_call, args) catch {
+                            const result = fn_ptr.invoke(self.arena, this_val_call, args) catch |e| {
+                                // Propagate a real JS throw (e.g. BigInt(1.5) → RangeError)
+                                // instead of masking it with a generic TypeError.
+                                if (e == error.JsException) {
+                                    const realm_mod = @import("../runtime/realm.zig");
+                                    if (realm_mod.pending_exception.bits != 0) {
+                                        self.last_exception_value = realm_mod.pending_exception;
+                                        realm_mod.pending_exception = Value{};
+                                    }
+                                    return "__js_exception__";
+                                }
                                 return "TypeError: Error constructor threw";
                             };
                             // If the factory returned a primitive non-null/undefined value

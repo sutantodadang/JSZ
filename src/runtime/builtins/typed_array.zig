@@ -219,7 +219,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try defineGetter(arena, dv_proto, "byteLength", dvGetByteLength);
     try defineGetter(arena, dv_proto, "byteOffset", dvGetByteOffset);
     try defineGetter(arena, dv_proto, "buffer", dvGetBuffer);
-    const dv_ctor = try JsObject.create(arena, null);
+    // [[Prototype]] of the DataView constructor is %Function.prototype%.
+    const dv_ctor = try JsObject.create(arena, fn_proto_obj);
     _ = try dv_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, dv_proto),
         .{ .writable = false, .enumerable = false, .configurable = false });
     try dv_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeDataViewCtor));
@@ -409,13 +410,16 @@ fn toNumberThrowing(arena: std.mem.Allocator, v: Value) anyerror!f64 {
         .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
         .bigint => return throwTypeError(arena, "Cannot convert a BigInt to a number"),
         .object => {
-            const prim = (try coercion.toPrimitive(arena, v, .number)) orelse v;
+            // ToPrimitive(number) returning null means OrdinaryToPrimitive found no
+            // callable valueOf/toString — ToNumber on such an object throws TypeError.
+            const prim = (try coercion.toPrimitive(arena, v, .number)) orelse
+                return throwTypeError(arena, "Cannot convert object to a primitive value");
             // Re-dispatch on the primitive (a Symbol/BigInt prim still throws).
             if (prim.bits == 0) return std.math.nan(f64);
             switch (prim.unbox()) {
                 .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
                 .bigint => return throwTypeError(arena, "Cannot convert a BigInt to a number"),
-                .object => return std.math.nan(f64), // toPrimitive guarantees non-object; defensive
+                .object => return throwTypeError(arena, "Cannot convert object to a primitive value"),
                 else => return toNum(prim),
             }
         },
@@ -2569,7 +2573,10 @@ fn dvCurrentByteLen(dv: *const DataViewData) usize {
 }
 
 pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
+    // [[Construct]]-only: a plain `DataView(...)` call (NewTarget undefined) must
+    // throw a TypeError before any argument coercion. The plain-call path passes
+    // a fabricated object `this`, so gate on the native construct flag instead.
+    if (!realm_mod.active_constructing or this_val.bits == 0 or this_val.unbox() != .object) {
         return throwTypeError(arena, "Constructor DataView requires 'new'");
     }
     if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object or args[0].toPtr().object.internal_kind != .array_buffer) {
@@ -2590,6 +2597,11 @@ pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     const obj = this_val.toPtr().object;
     // GetPrototypeFromConstructor runs after offset/length coercion + bounds checks.
     try applyNewTargetProto(arena, obj);
+    // OrdinaryCreateFromConstructor may have run user code (a `prototype` getter)
+    // that detached or resized the buffer; re-validate against the current length.
+    if (ab.detached) return throwTypeError(arena, "Cannot perform operation on a detached ArrayBuffer");
+    if (byte_offset > ab.byte_length) return throwRangeError(arena, "byteOffset out of bounds");
+    if (has_len and byte_offset + byte_length > ab.byte_length) return throwRangeError(arena, "Invalid DataView length");
     const dv = try arena.create(DataViewData);
     dv.* = .{ .buffer_obj = buf_obj, .ab = ab, .byte_offset = byte_offset, .byte_length = byte_length, .track_length = track_length };
     obj.internal_kind = .data_view;
@@ -2660,8 +2672,11 @@ pub fn dvSet(comptime T: type, comptime is_float: bool) val_mod.NativeFnPtr {
     return struct {
         fn f(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
             const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
-            // Spec SetViewValue order: ToIndex(requestIndex) → ToBoolean(le) →
-            // ToNumber(value) [observable, throws] → detached/bounds checks.
+            // Spec SetViewValue: IsImmutableBuffer check (step 3) precedes ToIndex
+            // and ToNumber — the test asserts no argument coercion runs first.
+            if (dv.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed DataView");
+            // Then ToIndex(requestIndex) → ToBoolean(le) → ToNumber(value)
+            // [observable, throws] → detached/bounds checks.
             const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
             const le = dvLittleEndian(args, 2);
             const x = try toNumberThrowing(arena, if (args.len > 1) args[1] else Value{});
@@ -2707,6 +2722,8 @@ pub fn dvSetBig() val_mod.NativeFnPtr {
     return struct {
         fn f(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
             const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
+            // SetViewValue step 3: immutable buffer rejected before argument coercion.
+            if (dv.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed DataView");
             const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
             const le = dvLittleEndian(args, 2);
             const bv = try toBigIntThrowing(arena, if (args.len > 1) args[1] else Value{});
@@ -2735,6 +2752,8 @@ pub fn dvGetF16(arena: std.mem.Allocator, this_val: Value, args: []const Value) 
 
 pub fn dvSetF16(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const dv = getDvData(this_val) orelse return throwTypeError(arena, "not a DataView");
+    // SetViewValue step 3: immutable buffer rejected before argument coercion.
+    if (dv.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed DataView");
     const off = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
     const le = dvLittleEndian(args, 2);
     const x = try toNumberThrowing(arena, if (args.len > 1) args[1] else Value{});

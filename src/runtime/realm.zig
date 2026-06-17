@@ -1004,6 +1004,35 @@ fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, _: []const Va
     return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
 }
 
+/// ES Number.isInteger / isFinite / isNaN / isSafeInteger: no coercion — a
+/// non-Number argument yields false rather than being converted.
+fn numberArg(args: []const Value) ?f64 {
+    if (args.len == 0) return null;
+    const v = args[0];
+    if (v.bits == 0 or v.unbox() != .number) return null;
+    return v.unbox().number;
+}
+
+fn nativeNumberIsInteger(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const n = numberArg(args) orelse return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, std.math.isFinite(n) and @trunc(n) == n);
+}
+
+fn nativeNumberIsFinite(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const n = numberArg(args) orelse return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, std.math.isFinite(n));
+}
+
+fn nativeNumberIsNaN(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const n = numberArg(args) orelse return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, std.math.isNan(n));
+}
+
+fn nativeNumberIsSafeInteger(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const n = numberArg(args) orelse return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, std.math.isFinite(n) and @trunc(n) == n and @abs(n) <= 9007199254740991.0);
+}
+
 // ---- String.prototype valueOf/toString ----
 fn thisString(this_val: Value) ?[]const u8 {
     if (this_val.bits != 0 and this_val.unbox() == .string) return this_val.toPtr().string;
@@ -1498,6 +1527,12 @@ pub const Realm = struct {
         _ = try number_ctor_obj.defineOwnData("EPSILON", try val_mod.makeNumber(arena, 2.220446049250313e-16), num_const_attr);
         _ = try number_ctor_obj.defineOwnData("MAX_SAFE_INTEGER", try val_mod.makeNumber(arena, 9007199254740991.0), num_const_attr);
         _ = try number_ctor_obj.defineOwnData("MIN_SAFE_INTEGER", try val_mod.makeNumber(arena, -9007199254740991.0), num_const_attr);
+        // Static methods (ES 21.1.2): writable, non-enumerable, configurable; length 1.
+        const num_method_attr = obj_mod.PropAttr{ .writable = true, .enumerable = false, .configurable = true };
+        _ = try number_ctor_obj.defineOwnData("isInteger", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsInteger, "isInteger", 1), num_method_attr);
+        _ = try number_ctor_obj.defineOwnData("isFinite", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsFinite, "isFinite", 1), num_method_attr);
+        _ = try number_ctor_obj.defineOwnData("isNaN", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsNaN, "isNaN", 1), num_method_attr);
+        _ = try number_ctor_obj.defineOwnData("isSafeInteger", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsSafeInteger, "isSafeInteger", 1), num_method_attr);
         try number_proto.set("constructor", try val_mod.makeObject(arena, number_ctor_obj));
         try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
 
