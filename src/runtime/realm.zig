@@ -1222,7 +1222,7 @@ fn installGlobalThis(arena: std.mem.Allocator, env: *Environment, object_proto: 
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
         if (name.len >= 2 and name[0] == '_' and name[1] == '_') continue;
-        try global_obj.set(name, entry.value_ptr.value);
+        _ = try global_obj.defineOwnData(name, entry.value_ptr.value, .{ .writable = true, .enumerable = false, .configurable = true });
     }
     const global_val = try val_mod.makeObject(arena, global_obj);
     try env.define("globalThis", global_val);

@@ -1529,17 +1529,19 @@ fn elemToNumber(ev: Value) f64 {
 /// user valueOf, propagates abrupt throws), then store only when the index is
 /// still valid (resize/detach-safe). Used by [[Set]]/[[DefineOwnProperty]].
 pub fn setElementThrowing(arena: std.mem.Allocator, td: *TypedArrayData, idx_f: f64, value: Value) anyerror!void {
-    // immutable-arraybuffer: integer-indexed [[Set]] returns false (→ TypeError
-    // under Throw) for a valid index on an immutable buffer, BEFORE coercing the
-    // value — so a side-effecting valueOf must NOT run. Out-of-bounds indices
-    // still coerce (then no-op), matching the spec ordering.
-    if (td.ab.immutable and isValidIntegerIndex(td, idx_f))
-        return throwTypeError(arena, "Cannot assign to an immutable-buffer-backed TypedArray");
+    // Spec ordering: coerce the value FIRST (ToBigInt/ToNumber runs a
+    // side-effecting valueOf), THEN reject a write to an immutable buffer for a
+    // valid index. immutable-arraybuffer: integer-indexed [[Set]] returns false
+    // (→ TypeError under Throw). Out-of-bounds indices coerce (then no-op).
     if (td.kind.isBigInt()) {
         const bv = try toBigIntThrowing(arena, value);
+        if (td.ab.immutable and isValidIntegerIndex(td, idx_f))
+            return throwTypeError(arena, "Cannot assign to an immutable-buffer-backed TypedArray");
         if (isValidIntegerIndex(td, idx_f)) taStoreBig(td, @intFromFloat(idx_f), bv);
     } else {
         const nv = try toNumberThrowing(arena, value);
+        if (td.ab.immutable and isValidIntegerIndex(td, idx_f))
+            return throwTypeError(arena, "Cannot assign to an immutable-buffer-backed TypedArray");
         if (isValidIntegerIndex(td, idx_f)) taStoreNumber(td, @intFromFloat(idx_f), nv);
     }
 }
