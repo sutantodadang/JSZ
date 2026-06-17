@@ -1431,7 +1431,9 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
             // Cross number↔bigint construction is a TypeError.
             if (std_td.kind.isBigInt() != kind.isBigInt())
                 return throwTypeError(arena, "Cannot mix BigInt and non-BigInt typed arrays");
-            const length = std_td.length;
+            // elementLength = TypedArrayLength(srcRecord): the live length, since a
+            // length-tracking source view's stored .length (creation length) is stale.
+            const length = taCurrentLen(std_td);
             const res = try makeArrayBuffer(arena, length * esize);
             _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
             const dst = getTd(val_mod.makeObject(arena, this_obj) catch unreachable) orelse unreachable;
@@ -1785,7 +1787,10 @@ pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     if (is_ta_src) {
         const src = src_val.toPtr().object;
         const src_td: *TypedArrayData = @ptrCast(@alignCast(src.internal_slot.?));
-        if (src_td.ab.detached) return throwTypeError(arena, "source TypedArray buffer detached during offset coercion");
+        // SetTypedArrayFromTypedArray: a source whose backing buffer was detached
+        // OR resized out of bounds is a TypeError, not a silent 0-length copy.
+        // taIsOob already subsumes the detached case.
+        if (taIsOob(src_td)) return throwTypeError(arena, "source TypedArray buffer detached or out of bounds");
         // Cross number↔bigint set is a TypeError.
         if (src_td.kind.isBigInt() != td.kind.isBigInt())
             return throwTypeError(arena, "Cannot mix BigInt and non-BigInt typed arrays");
