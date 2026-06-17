@@ -460,7 +460,10 @@ fn toIntegerThrowing(arena: std.mem.Allocator, v: Value) anyerror!f64 {
     const n = try toNumberThrowing(arena, v);
     if (std.math.isNan(n)) return 0;
     if (!std.math.isFinite(n)) return n;
-    return @trunc(n);
+    // ToIntegerOrInfinity maps both +0 and -0 to +0; `@trunc` of a value in
+    // (-1, 0] yields -0, so add 0.0 to normalize the sign (a -0 index would
+    // otherwise be wrongly rejected by IsValidIntegerIndex).
+    return @trunc(n) + 0.0;
 }
 
 /// ToBigInt: throws TypeError for Number/Symbol/undefined/null, SyntaxError for
@@ -1635,14 +1638,20 @@ pub fn nativeTaFill(arena: std.mem.Allocator, this_val: Value, args: []const Val
     } else {
         fill_num = try toNumberThrowing(arena, raw_v);
     }
-    const start = relIndex(try toIntegerThrowing(arena, if (args.len > 1) args[1] else Value{}), td.length);
+    var start = relIndex(try toIntegerThrowing(arena, if (args.len > 1) args[1] else Value{}), td.length);
     const end_v: Value = if (args.len > 2) args[2] else Value{};
-    const end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
+    var end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
         relIndex(try toIntegerThrowing(arena, end_v), td.length)
     else
         td.length;
-    // Step 10: detach during coercion → TypeError.
+    // §23.2.3.9 step 9: after value/start/end coercion, re-validate — a detach or
+    // a resize that pushes the (fixed-length) view out of bounds throws TypeError;
+    // otherwise re-clamp the fill range to the current (possibly shrunk) length.
     if (td.ab.detached) return throwTypeError(arena, "Cannot fill a detached ArrayBuffer");
+    if (taIsOob(td)) return throwTypeError(arena, "TypedArray went out of bounds during fill coercion");
+    const cur_len = taCurrentLen(td);
+    if (start > cur_len) start = cur_len;
+    if (end > cur_len) end = cur_len;
     var i = start;
     while (i < end) : (i += 1) {
         if (td.kind.isBigInt()) taStoreBig(td, i, fill_big) else taStoreNumber(td, i, fill_num);
@@ -2363,17 +2372,25 @@ pub fn nativeTaCopyWithin(arena: std.mem.Allocator, this_val: Value, args: []con
     const count = if (end > start) end - start else 0;
     if (count == 0 or target >= len) return this_val;
     const actual_count = @min(count, len - target);
+    // §23.2.3.5 step 14: now that count > 0, re-validate after the index
+    // coercions. A fixed-length view pushed out of bounds throws TypeError; a
+    // length-tracking view that merely shrank truncates the copy — each byte is
+    // copied only while BOTH src and dst stay within the current live length.
+    if (taIsOob(td)) return throwTypeError(arena, "TypedArray went out of bounds during copyWithin coercion");
+    const live_len = taCurrentLen(td);
     if (start < target and target < start + count) {
         var i = actual_count;
         while (i > 0) : (i -= 1) {
             const src_idx = start + i - 1;
             const dst_idx = target + i - 1;
+            if (src_idx >= live_len or dst_idx >= live_len) continue;
             const ev = try taLoad(arena, td, src_idx);
             if (td.kind.isBigInt()) taStoreBig(td, dst_idx, ev) else taStoreNumber(td, dst_idx, toNum(ev));
         }
     } else {
         var i: usize = 0;
         while (i < actual_count) : (i += 1) {
+            if (start + i >= live_len or target + i >= live_len) continue;
             const ev = try taLoad(arena, td, start + i);
             if (td.kind.isBigInt()) taStoreBig(td, target + i, ev) else taStoreNumber(td, target + i, toNum(ev));
         }
