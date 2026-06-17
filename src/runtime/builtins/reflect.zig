@@ -10,6 +10,7 @@ const PropAttr = obj_mod.PropAttr;
 const fp = @import("function_proto.zig");
 const intrinsics = @import("intrinsics.zig");
 const typed_array = @import("typed_array.zig");
+const proxy_mod = @import("proxy.zig");
 
 /// R1: create the Reflect namespace object and bind the `Reflect` global.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -282,6 +283,18 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
     while (cur) |o| {
         if (depth >= 64) break;
         depth += 1;
+        // A Proxy anywhere in the chain (including the root) has its own
+        // [[HasProperty]]: dispatch the `has` trap, else forward to the
+        // target's [[HasProperty]] (which walks the target's own chain).
+        if (o.internal_kind == .proxy) {
+            const handler = proxy_mod.proxyHandler(o) orelse return val_mod.makeBool(arena, false);
+            const target = proxy_mod.proxyTarget(o) orelse return val_mod.makeBool(arena, false);
+            if (proxy_mod.trap(handler, "has")) |trap_fn| {
+                const res = try fp.invokeCallback(arena, handler, trap_fn, &[_]Value{ target, key });
+                return val_mod.makeBool(arena, descTruthy(res));
+            }
+            return nativeReflectHas(arena, .{}, &[_]Value{ target, key });
+        }
         if (o.resolveOwnSlot(k) != null) return val_mod.makeBool(arena, true);
         cur = o.proto;
     }

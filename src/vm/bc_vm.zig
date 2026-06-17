@@ -1164,6 +1164,11 @@ pub const BcVm = struct {
             while (cur) |o| {
                 if (depth >= 64) break;
                 depth += 1;
+                // A Proxy in the prototype chain has its own [[HasProperty]];
+                // recurse so the `has` trap (or target walk) is dispatched.
+                if (o != root_obj and o.internal_kind == .proxy) {
+                    return try self.hasProperty(try val_mod.makeObject(self.arena, o), key_v);
+                }
                 if (o.getOwnSym(key_v) != null) return true;
                 cur = o.proto;
             }
@@ -1176,6 +1181,11 @@ pub const BcVm = struct {
         while (cur) |o| {
             if (depth >= 64) break;
             depth += 1;
+            // A Proxy in the prototype chain has its own [[HasProperty]];
+            // recurse so the `has` trap (or target walk) is dispatched.
+            if (o != root_obj and o.internal_kind == .proxy) {
+                return try self.hasProperty(try val_mod.makeObject(self.arena, o), key_v);
+            }
             if (o.is_array and std.mem.eql(u8, key, "length")) return true;
             if (o.hasOwn(key)) return true;
             cur = o.proto;
