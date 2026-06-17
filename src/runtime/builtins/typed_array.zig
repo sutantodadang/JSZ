@@ -1736,10 +1736,10 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(new_len))};
     const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
-    // Spec slice step 14: if count > 0 and the source buffer was detached during
-    // SpeciesConstructor (e.g. via the `constructor`/@@species getter), throw.
-    if (new_len > 0 and td.ab.detached)
-        return throwTypeError(arena, "source TypedArray buffer detached during species construction");
+    // Spec slice step 14: if count > 0 and the source buffer was detached OR resized
+    // so elements are OOB during SpeciesConstructor, throw.
+    if (new_len > 0 and taIsOob(td))
+        return throwTypeError(arena, "source TypedArray buffer detached or resized OOB during species construction");
     var i: usize = 0;
     while (i < new_len) : (i += 1) {
         const ev = try taLoad(arena, td, start + i);
@@ -1997,10 +1997,15 @@ pub fn nativeTaMap(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(td.length))};
+    const len = td.length; // §23.2.3.20: captured BEFORE TypedArraySpeciesCreate;
+    // a species ctor that resizes the source does NOT change this count.
     const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
+    // Spec map does NOT re-validate the source after species construction: Get(O, k)
+    // on an out-of-bounds index yields undefined (the callback observes it), so a
+    // resize/shrink mid-construction must NOT throw — only read OOB slots as undefined.
     var i: usize = 0;
-    while (i < td.length) : (i += 1) {
+    while (i < len) : (i += 1) {
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
