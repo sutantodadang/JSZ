@@ -166,6 +166,11 @@ pub const BcVm = struct {
     gas_limit: u64 = 0,
     gas_used: u64 = 0,
     deadline_ns: i128 = 0,
+    /// W3: a resource-limit interrupt that fired inside a nested `bcInvokeJs`
+    /// run (e.g. a sort comparator). It must NOT become a catchable JS throw —
+    /// the message is stashed here so the outer `runLoop`/`raisePendingException`
+    /// re-surfaces it as an interrupt outcome, bypassing any JS try/catch.
+    interrupt_pending: ?[]const u8 = null,
     /// W2: set by the YIELD handler so the generator driver distinguishes a
     /// suspension from a normal return.
     gen_yielded: bool = false,
@@ -270,8 +275,14 @@ pub const BcVm = struct {
                             // poison the next re-entrant call. Restore to frames_before.
                             while (self.frames.items.len > frames_before) _ = self.frames.pop();
                             const realm_mod = @import("../runtime/realm.zig");
+                            // A resource-limit interrupt is NOT a catchable throw:
+                            // stash it so the outer loop re-surfaces it as an
+                            // interrupt outcome instead of `throw undefined`.
+                            if (std.mem.startsWith(u8, msg, "interrupted:")) {
+                                self.interrupt_pending = msg;
+                                return error.JsException;
+                            }
                             realm_mod.pending_exception = self.last_exception_value;
-                            _ = msg;
                             return error.JsException;
                         },
                         .exception_value => |ev| {
@@ -591,6 +602,12 @@ pub const BcVm = struct {
 
     fn runLoop(self: *BcVm) !RunOutcome {
         while (self.frames.items.len > 0) {
+            // W3: an interrupt that fired in a nested re-entrant run propagates
+            // here past any JS try/catch (checked before instruction dispatch).
+            if (self.interrupt_pending) |m| {
+                self.interrupt_pending = null;
+                return RunOutcome{ .exception = m };
+            }
             // W3: resource limits. Gas is checked per instruction; the wall-clock
             // deadline every 16K instructions (nanoTimestamp is too costly per-op).
             // Returns directly (past any JS try/catch) so scripts can't trap it.
@@ -694,6 +711,11 @@ pub const BcVm = struct {
     /// machinery. Returns a `RunOutcome` the caller must return (no handler
     /// found), or null when a handler was found (caller continues dispatch).
     pub fn raisePendingException(self: *BcVm, fallback_msg: []const u8) !?RunOutcome {
+        // A nested-run interrupt bypasses try/catch: surface it directly.
+        if (self.interrupt_pending) |m| {
+            self.interrupt_pending = null;
+            return RunOutcome{ .exception = m };
+        }
         const realm_mod = @import("../runtime/realm.zig");
         const exc_val = if (realm_mod.pending_exception.bits != 0)
             realm_mod.pending_exception

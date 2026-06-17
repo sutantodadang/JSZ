@@ -899,6 +899,31 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             _ = p.advance(); // consume '['
             const key_expr = p.parseAssignmentExpr() orelse return null;
             _ = p.expect(.right_bracket) orelse return null;
+            // ES6 computed method `{ [expr](params) { body } }` ≡ a function-valued
+            // property with a runtime-evaluated key.
+            if (p.check(.left_paren)) {
+                const cm_params = p.parseFunctionParams() orelse return null;
+                const cm_body = p.parseFunctionBody() orelse return null;
+                const cm_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
+                    .function_expr = .{
+                        .name = null,
+                        .params = cm_params.params,
+                        .param_defaults = cm_params.param_defaults,
+                        .rest_param = cm_params.rest_param,
+                        .body = cm_body,
+                        .is_arrow = false,
+                        .is_generator = false,
+                        .is_async = false,
+                        .is_strict = parser_file.hasUseStrict(cm_body),
+                    },
+                }) orelse return null;
+                props.append(p.arena, ast.ObjectProp{ .key = "", .value = cm_fn, .kind = .init, .computed_key = key_expr }) catch {
+                    p.had_error = true;
+                    return null;
+                };
+                if (!p.match(.comma)) break;
+                continue;
+            }
             _ = p.expect(.colon) orelse return null;
             const cval = p.parseAssignmentExpr() orelse return null;
             props.append(p.arena, ast.ObjectProp{ .key = "", .value = cval, .kind = .init, .computed_key = key_expr }) catch {
@@ -1047,10 +1072,12 @@ pub fn parseArrayLiteral(p: *Parser) ?*Node {
     _ = p.expect(.left_bracket) orelse return null;
     var elements = std.ArrayList(*Node){};
     while (!p.check(.right_bracket) and !p.check(.eof) and !p.had_error) {
-        // Elision: treat as null literal (Phase 3a simplification).
+        // Elision: a hole reads as `undefined` (ToNumber → NaN), matching the
+        // observable value of a sparse-array hole. (We don't model true absence,
+        // so `index in arr` is true for a hole — but the value is spec-correct.)
         if (p.check(.comma)) {
-            const null_node = p.makeNode(.null_literal, p.current.start, p.current.start, .{ .null_literal = {} }) orelse return null;
-            elements.append(p.arena, null_node) catch {
+            const hole_node = p.makeNode(.undefined_literal, p.current.start, p.current.start, .{ .undefined_literal = {} }) orelse return null;
+            elements.append(p.arena, hole_node) catch {
                 p.had_error = true;
                 return null;
             };

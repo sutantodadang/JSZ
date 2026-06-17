@@ -9,6 +9,176 @@ const Node = ast.Node;
 
 pub const ParamParse = parser_file.ParamParse;
 
+const AccessorKind = enum { none, get, set };
+
+/// A parsed non-constructor class member. `computed_key` (when non-null) holds a
+/// runtime key expression (`[expr]`); otherwise `name` is the literal key.
+const ClassMember = struct {
+    is_static: bool = false,
+    accessor: AccessorKind = .none,
+    name: []const u8 = "",
+    computed_key: ?*Node = null,
+    params: [][]const u8 = &[_][]const u8{},
+    rest_param: ?[]const u8 = null,
+    body: []*Node = &[_]*Node{},
+};
+
+const ClassBodyParse = struct {
+    ctor_params: [][]const u8 = &[_][]const u8{},
+    ctor_rest: ?[]const u8 = null,
+    ctor_body: []*Node = &[_]*Node{},
+    members: []ClassMember = &[_]ClassMember{},
+};
+
+/// True when the token after `current` means `current` (a contextual keyword like
+/// `static`/`get`/`set`) is being used as the member NAME rather than a modifier
+/// (e.g. `static() {}`, `get = 1`, a bare `get;`).
+fn nextTokenEndsName(p: *Parser) bool {
+    const k = p.peekNext().kind;
+    return k == .left_paren or k == .eq or k == .semicolon or k == .right_brace;
+}
+
+/// Parse the body of a class (`{` already consumed). Consumes the closing `}`.
+/// Handles `static`, `get`/`set` accessors, and computed `[expr]` keys.
+fn parseClassMembers(p: *Parser) ?ClassBodyParse {
+    var res = ClassBodyParse{};
+    var members = std.ArrayList(ClassMember){};
+    while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
+        if (p.match(.semicolon)) continue;
+
+        var is_static = false;
+        if (p.check(.identifier) and std.mem.eql(u8, p.current.value_str, "static") and !nextTokenEndsName(p)) {
+            is_static = true;
+            _ = p.advance();
+        }
+
+        var accessor: AccessorKind = .none;
+        if (p.check(.identifier) and !nextTokenEndsName(p)) {
+            if (std.mem.eql(u8, p.current.value_str, "get")) {
+                accessor = .get;
+                _ = p.advance();
+            } else if (std.mem.eql(u8, p.current.value_str, "set")) {
+                accessor = .set;
+                _ = p.advance();
+            }
+        }
+
+        var computed_key: ?*Node = null;
+        var name: []const u8 = "";
+        if (p.check(.left_bracket)) {
+            _ = p.advance();
+            const key_expr = p.parseAssignmentExpr() orelse return null;
+            _ = p.expect(.right_bracket) orelse return null;
+            computed_key = key_expr;
+        } else if (p.check(.identifier) or p.check(.string) or p.check(.number)) {
+            name = p.current.value_str;
+            _ = p.advance();
+        } else {
+            // Unsupported member start (e.g. a generator `*`): skip one token so
+            // the loop can't spin, matching the prior lenient behaviour.
+            _ = p.advance();
+            continue;
+        }
+
+        const mparams = p.parseFunctionParams() orelse return null;
+        const mbody = p.parseFunctionBody() orelse return null;
+
+        if (!is_static and accessor == .none and computed_key == null and std.mem.eql(u8, name, "constructor")) {
+            res.ctor_params = mparams.params;
+            res.ctor_rest = mparams.rest_param;
+            res.ctor_body = mbody;
+        } else {
+            members.append(p.arena, .{
+                .is_static = is_static,
+                .accessor = accessor,
+                .name = name,
+                .computed_key = computed_key,
+                .params = mparams.params,
+                .rest_param = mparams.rest_param,
+                .body = mbody,
+            }) catch return null;
+        }
+    }
+    _ = p.expect(.right_brace) orelse return null;
+    res.members = members.items;
+    return res;
+}
+
+fn nodeIdent(p: *Parser, name: []const u8) ?*Node {
+    const s = p.current.start;
+    return p.makeNode(.identifier, s, s, .{ .identifier = name });
+}
+
+fn nodeMember(p: *Parser, obj: *Node, prop: []const u8) ?*Node {
+    const s = p.current.start;
+    const pid = nodeIdent(p, prop) orelse return null;
+    return p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = obj, .property = pid, .computed = false } });
+}
+
+/// Desugar one class member into a single statement (a property assignment for
+/// methods, or `Object.defineProperty(target, key, { get|set, configurable,
+/// enumerable })` for accessors). `target` is the constructor for static members
+/// and `ClassName.prototype` otherwise.
+fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, m: ClassMember) ?*Node {
+    const s = p.current.start;
+
+    // Instance methods of a derived class may use `super.foo()`; bind
+    // `super = Super.prototype` at the top of the body (static members don't).
+    var body = m.body;
+    if (super_name) |sname| {
+        if (!m.is_static) {
+            const sup_cls = nodeIdent(p, sname) orelse return null;
+            const sup_proto = nodeMember(p, sup_cls, "prototype") orelse return null;
+            const sup_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "super", .init = sup_proto } }) orelse return null;
+            var wb = std.ArrayList(*Node){};
+            wb.append(p.arena, sup_decl) catch return null;
+            for (m.body) |st| wb.append(p.arena, st) catch return null;
+            body = wb.items;
+        }
+    }
+
+    const fn_expr = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
+        .name = null,
+        .params = m.params,
+        .rest_param = m.rest_param,
+        .body = body,
+        .is_arrow = false,
+    } }) orelse return null;
+
+    const target = if (m.is_static)
+        (nodeIdent(p, class_name) orelse return null)
+    else
+        (nodeMember(p, nodeIdent(p, class_name) orelse return null, "prototype") orelse return null);
+
+    if (m.accessor == .none) {
+        const lhs = if (m.computed_key) |k|
+            (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = target, .property = k, .computed = true } }) orelse return null)
+        else
+            (nodeMember(p, target, m.name) orelse return null);
+        const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = fn_expr } }) orelse return null;
+        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+    }
+
+    // Accessor: Object.defineProperty(target, key, { get|set: fn, configurable: true, enumerable: false })
+    const key_val = if (m.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = m.name }) orelse return null);
+    const t_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
+    const f_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = false }) orelse return null;
+    var props = std.ArrayList(ast.ObjectProp){};
+    props.append(p.arena, .{ .key = if (m.accessor == .get) "get" else "set", .value = fn_expr }) catch return null;
+    props.append(p.arena, .{ .key = "configurable", .value = t_val }) catch return null;
+    props.append(p.arena, .{ .key = "enumerable", .value = f_val }) catch return null;
+    const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
+
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, target) catch return null;
+    args.append(p.arena, key_val) catch return null;
+    args.append(p.arena, desc) catch return null;
+    const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
+    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
+}
+
 pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     const start = p.current.start;
     _ = p.advance(); // class
@@ -22,28 +192,11 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     }
 
     _ = p.expect(.left_brace) orelse return null;
-    var ctor_params: [][]const u8 = &[_][]const u8{};
-    var ctor_rest: ?[]const u8 = null;
-    var ctor_body: []*Node = &[_]*Node{};
-    var methods = std.ArrayList(struct { name: []const u8, params: [][]const u8, body: []*Node }){};
-    while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
-        if (!p.check(.identifier)) {
-            _ = p.advance();
-            continue;
-        }
-        const mname_tok = p.advance();
-        const mname = mname_tok.value_str;
-        const mparams = p.parseFunctionParams() orelse return null;
-        const mbody = p.parseFunctionBody() orelse return null;
-        if (std.mem.eql(u8, mname, "constructor")) {
-            ctor_params = mparams.params;
-            ctor_rest = mparams.rest_param;
-            ctor_body = mbody;
-        } else {
-            methods.append(p.arena, .{ .name = mname, .params = mparams.params, .body = mbody }) catch return null;
-        }
-    }
-    _ = p.expect(.right_brace) orelse return null;
+    const parsed = parseClassMembers(p) orelse return null;
+    const ctor_params: [][]const u8 = parsed.ctor_params;
+    const ctor_rest: ?[]const u8 = parsed.ctor_rest;
+    var ctor_body: []*Node = parsed.ctor_body;
+    const members = parsed.members;
 
     if (ctor_body.len == 0) {
         if (super_name) |sname| {
@@ -235,48 +388,9 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     const stmt_ctor = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign_ctor }) orelse return null;
     out.append(p.arena, stmt_ctor) catch return null;
 
-    // prototype methods
-    for (methods.items) |m| {
-        const id_class = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-        const id_proto = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
-        const class_proto = p.makeNode(.member_expr, start, start, .{
-            .member_expr = .{ .object = id_class, .property = id_proto, .computed = false },
-        }) orelse return null;
-        const id_method = p.makeNode(.identifier, start, start, .{ .identifier = m.name }) orelse return null;
-        const lhs = p.makeNode(.member_expr, start, start, .{
-            .member_expr = .{ .object = class_proto, .property = id_method, .computed = false },
-        }) orelse return null;
-        var method_body = m.body;
-        if (super_name) |sname| {
-            // Allow `super.foo()` in subclass methods by binding `super = Super.prototype`.
-            const id_super_cls = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
-            const id_proto2 = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
-            const super_proto2 = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = id_super_cls, .property = id_proto2, .computed = false },
-            }) orelse return null;
-            const super_decl2 = p.makeNode(.var_decl, start, start, .{
-                .var_decl = .{ .kind = .var_, .name = "super", .init = super_proto2 },
-            }) orelse return null;
-            var body_with_super = std.ArrayList(*Node){};
-            body_with_super.append(p.arena, super_decl2) catch return null;
-            for (m.body) |st| body_with_super.append(p.arena, st) catch return null;
-            method_body = body_with_super.items;
-        }
-        const fn_expr = p.makeNode(.function_expr, start, p.current.start, .{
-            .function_expr = .{
-                .name = null,
-                .params = m.params,
-                .param_defaults = &[_]?*Node{},
-                .rest_param = null,
-                .body = method_body,
-                .is_arrow = false,
-                .is_strict = parser_file.hasUseStrict(method_body),
-            },
-        }) orelse return null;
-        const assign = p.makeNode(.assignment_expr, start, p.current.start, .{
-            .assignment_expr = .{ .op = .assign, .target = lhs, .value = fn_expr },
-        }) orelse return null;
-        const stmt = p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = assign }) orelse return null;
+    // prototype + static methods/accessors
+    for (members) |m| {
+        const stmt = emitClassMember(p, class_name, super_name, m) orelse return null;
         out.append(p.arena, stmt) catch return null;
     }
 
@@ -314,28 +428,10 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
     }
 
     _ = p.expect(.left_brace) orelse return null;
-        var ctor_params: [][]const u8 = &[_][]const u8{};
-        var ctor_rest: ?[]const u8 = null;
-        var ctor_body: []*Node = &[_]*Node{};
-        var methods = std.ArrayList(struct { name: []const u8, params: [][]const u8, body: []*Node }){};
-        while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
-            if (!p.check(.identifier)) {
-                _ = p.advance();
-                continue;
-            }
-            const mname_tok = p.advance();
-            const mname = mname_tok.value_str;
-            const mparams = p.parseFunctionParams() orelse return null;
-            const mbody = p.parseFunctionBody() orelse return null;
-            if (std.mem.eql(u8, mname, "constructor")) {
-                ctor_params = mparams.params;
-                ctor_rest = mparams.rest_param;
-                ctor_body = mbody;
-            } else {
-                methods.append(p.arena, .{ .name = mname, .params = mparams.params, .body = mbody }) catch return null;
-            }
-        }
-        _ = p.expect(.right_brace) orelse return null;
+        const parsed = parseClassMembers(p) orelse return null;
+        const ctor_params: [][]const u8 = parsed.ctor_params;
+        var ctor_body: []*Node = parsed.ctor_body;
+        const members = parsed.members;
 
         // If no constructor and derives from something, generate default
         if (ctor_body.len == 0 and super_name != null) {
@@ -497,24 +593,9 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             fn_body.append(p.arena, stmt_ctor) catch return null;
         }
 
-        for (methods.items) |method| {
-            const proto_id = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-            const proto_prop = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
-            const proto_access = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = proto_id, .property = proto_prop, .computed = false },
-            }) orelse return null;
-            const method_prop = p.makeNode(.identifier, start, start, .{ .identifier = method.name }) orelse return null;
-            const method_obj = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = proto_access, .property = method_prop, .computed = false },
-            }) orelse return null;
-            const method_fn = p.makeNode(.function_expr, start, start, .{
-                .function_expr = .{ .name = null, .params = method.params, .body = method.body, .is_arrow = false },
-            }) orelse return null;
-            const assign = p.makeNode(.assignment_expr, start, start, .{
-                .assignment_expr = .{ .op = .assign, .target = method_obj, .value = method_fn },
-            }) orelse return null;
-            const assign_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign }) orelse return null;
-            fn_body.append(p.arena, assign_stmt) catch return null;
+        for (members) |m| {
+            const stmt = emitClassMember(p, class_name, super_name, m) orelse return null;
+            fn_body.append(p.arena, stmt) catch return null;
         }
 
         fn_body.append(p.arena, ret_stmt) catch return null;

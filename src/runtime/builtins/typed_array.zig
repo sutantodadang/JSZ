@@ -785,7 +785,10 @@ pub fn taStoreBig(td: *const TypedArrayData, i: usize, v: Value) void {
 const AbResult = struct { obj: *JsObject, data: *ArrayBufferData };
 
 fn makeArrayBuffer(arena: std.mem.Allocator, byte_len: usize) !AbResult {
-    const bytes = try arena.alloc(u8, byte_len);
+    // CreateByteDataBlock: a length above 2^53-1, or a block the allocator cannot
+    // provide, is a RangeError (not a TypeError) per AllocateArrayBuffer.
+    if (byte_len > 9007199254740991) return throwRangeError(arena, "ArrayBuffer length exceeds maximum size");
+    const bytes = arena.alloc(u8, byte_len) catch return throwRangeError(arena, "ArrayBuffer allocation failed");
     @memset(bytes, 0);
     const data = try arena.create(ArrayBufferData);
     data.* = .{ .bytes = bytes, .byte_length = byte_len };
@@ -1292,7 +1295,11 @@ pub fn nativeTaAbstractCtor(arena: std.mem.Allocator, _: Value, _: []const Value
 /// `.array_like` → no @@iterator at all; fall back to ToLength + indexed reads.
 /// error.JsException → @@iterator present but NOT callable (spec TypeError).
 const IterDecision = enum { iterate, array_like };
-fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterDecision {
+/// `method` carries the resolved %Symbol.iterator% function when it was obtained
+/// via an observable [[Get]] (spec `usingIterator`), so the caller can reuse it
+/// without a second @@iterator read (GetMethod must run exactly once).
+const IterProbe = struct { decision: IterDecision, method: Value = .{} };
+fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterProbe {
     // 1. Well-known Symbol.iterator (arrays + user `{[Symbol.iterator]:...}`).
     //    GetMethod is observable: fire an accessor getter and propagate throws.
     if (realm_mod.active_sym_iterator) |sym| {
@@ -1302,7 +1309,7 @@ fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterDecisio
         if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
             if (!function_proto_isCallable(m))
                 return throwTypeError(arena, "Symbol.iterator is not a function");
-            return .iterate;
+            return .{ .decision = .iterate, .method = m };
         }
     }
     // 2. Internal string @@iterator (Set/Map register their iterator here).
@@ -1310,27 +1317,49 @@ fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterDecisio
         if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
             if (!function_proto_isCallable(m))
                 return throwTypeError(arena, "Symbol.iterator is not a function");
-            return .iterate;
+            return .{ .decision = .iterate };
         }
     }
     // 3. Raw iterator / generator: exposes a callable next().
     if (src.get("next")) |nx| {
-        if (function_proto_isCallable(nx)) return .iterate;
+        if (function_proto_isCallable(nx)) return .{ .decision = .iterate };
     }
-    return .array_like;
+    return .{ .decision = .array_like };
 }
 
 /// IterableToList(source): drive the iterator protocol via the shared collection
 /// helpers, collecting each yielded `value` until done. Propagates any throw from
-/// @@iterator / next / the value getter.
-fn iterableToList(arena: std.mem.Allocator, source: Value) anyerror!std.ArrayList(Value) {
+/// @@iterator / next / the value getter. When `method` is non-empty it is the
+/// already-resolved @@iterator function (GetIteratorFromMethod), invoked directly
+/// so the @@iterator property is not read a second time.
+fn iterableToList(arena: std.mem.Allocator, source: Value, method: Value) anyerror!std.ArrayList(Value) {
     var list: std.ArrayList(Value) = .empty;
+    if (method.bits != 0) {
+        // Spec GetIteratorFromMethod + IteratorToList: call the resolved @@iterator
+        // method, cache iterator.next ONCE, then drive it with observable [[Get]]s
+        // of next/done/value (each fires accessor getters exactly when the spec
+        // says, matching test262's call-order assertions).
+        const iter = try function_proto.invokeCallback(arena, source, method, &[_]Value{});
+        if (iter.bits == 0 or iter.unbox() != .object)
+            return throwTypeError(arena, "iterator result is not an object");
+        const next_method = try vmGet(arena, iter, "next");
+        if (!function_proto_isCallable(next_method))
+            return throwTypeError(arena, "iterator.next is not a function");
+        while (true) {
+            const step = try function_proto.invokeCallback(arena, iter, next_method, &[_]Value{});
+            if (step.bits == 0 or step.unbox() != .object)
+                return throwTypeError(arena, "iterator result is not an object");
+            if (toBool(try vmGet(arena, step, "done"))) break;
+            try list.append(arena, try vmGet(arena, step, "value"));
+        }
+        return list;
+    }
+    // Internal/raw iterators (Set/Map/generator/array fallback): no observable
+    // accessor difference, so the shared step helper is sufficient.
     const iter = try coll.nativeGetIterator(arena, Value{}, &[_]Value{source});
     while (true) {
         const step = try coll.nativeIterStep(arena, Value{}, &[_]Value{iter});
         if (step.bits == 0 or step.unbox() != .object) break;
-        // IteratorComplete/IteratorValue use observable [[Get]] (fire accessor
-        // getters + propagate throws), not a raw own-slot read.
         const done = try vmGet(arena, step, "done");
         if (toBool(done)) break;
         const v = try vmGet(arena, step, "value");
@@ -1417,8 +1446,9 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
         // Form 4: new TA(iterable | arrayLike).
         // Per spec, consult GetMethod(source, @@iterator) first: if a usable
         // iterator exists → IterableToList; otherwise fall back to array-like.
-        if ((try detectIterable(arena, src)) == .iterate) {
-            const list = try iterableToList(arena, args[0]);
+        const probe4 = try detectIterable(arena, src);
+        if (probe4.decision == .iterate) {
+            const list = try iterableToList(arena, args[0], probe4.method);
             const length = list.items.len;
             const res = try makeArrayBuffer(arena, length * esize);
             _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
@@ -1499,6 +1529,12 @@ fn elemToNumber(ev: Value) f64 {
 /// user valueOf, propagates abrupt throws), then store only when the index is
 /// still valid (resize/detach-safe). Used by [[Set]]/[[DefineOwnProperty]].
 pub fn setElementThrowing(arena: std.mem.Allocator, td: *TypedArrayData, idx_f: f64, value: Value) anyerror!void {
+    // immutable-arraybuffer: integer-indexed [[Set]] returns false (→ TypeError
+    // under Throw) for a valid index on an immutable buffer, BEFORE coercing the
+    // value — so a side-effecting valueOf must NOT run. Out-of-bounds indices
+    // still coerce (then no-op), matching the spec ordering.
+    if (td.ab.immutable and isValidIntegerIndex(td, idx_f))
+        return throwTypeError(arena, "Cannot assign to an immutable-buffer-backed TypedArray");
     if (td.kind.isBigInt()) {
         const bv = try toBigIntThrowing(arena, value);
         if (isValidIntegerIndex(td, idx_f)) taStoreBig(td, @intFromFloat(idx_f), bv);
@@ -2089,6 +2125,11 @@ pub fn nativeTaOf(arena: std.mem.Allocator, this_val: Value, args: []const Value
     // Generic %TypedArray%.of over a custom constructor: TypedArrayCreate then
     // Set each item through the target's [[Set]] (fires exotic/ordinary write).
     const target = try taCreateViaConstruct(arena, this_val, args.len);
+    // TypedArrayCreateFromConstructor(C, «len», write): reject an immutable
+    // result immediately (before any element is Set / coerced).
+    if (getTd(target)) |rtd| {
+        if (rtd.ab.immutable) return throwTypeError(arena, "TypedArray.of target has an immutable buffer");
+    }
     const ctx = realm_mod.active_context.?;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -2116,8 +2157,9 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var length: usize = 0;
     if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object) {
         const src = args[0].toPtr().object;
-        if ((try detectIterable(arena, src)) == .iterate) {
-            const list = try iterableToList(arena, args[0]);
+        const probe = try detectIterable(arena, src);
+        if (probe.decision == .iterate) {
+            const list = try iterableToList(arena, args[0], probe.method);
             list_items = list.items;
             length = list.items.len;
         } else {
@@ -2139,6 +2181,13 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
         target = try val_mod.makeObject(arena, a.obj);
     } else {
         target = try taCreateViaConstruct(arena, this_val, length);
+    }
+
+    // TypedArrayCreateFromConstructor(C, «len», write): the result must pass
+    // ValidateTypedArray with accessMode ~write~ — an immutable-buffer-backed
+    // result is rejected immediately, BEFORE any source element is read/mapped.
+    if (getTd(target)) |rtd| {
+        if (rtd.ab.immutable) return throwTypeError(arena, "TypedArray.from target has an immutable buffer");
     }
 
     var i: usize = 0;
@@ -2252,7 +2301,10 @@ pub fn nativeTaSort(arena: std.mem.Allocator, this_val: Value, args: []const Val
             const should_swap = blk: {
                 if (cmp_fn.bits != 0) {
                     const cr = try function_proto.invokeCallback(arena, undef, cmp_fn, &[_]Value{ a, key });
-                    break :blk toNum(cr) > 0;
+                    // SortCompare: ToNumber(callResult) is observable (fires
+                    // valueOf / Symbol.toPrimitive, propagates throws); NaN → +0.
+                    const rv = try toNumberThrowing(arena, cr);
+                    break :blk (if (std.math.isNan(rv)) @as(f64, 0) else rv) > 0;
                 }
                 if (td.kind.isBigInt()) break :blk bigintSearch(a).? > bigintSearch(key).?;
                 break :blk taNumCompare(toNum(a), toNum(key)) > 0;

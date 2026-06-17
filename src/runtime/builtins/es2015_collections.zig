@@ -605,6 +605,21 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
             d.* = .{ .seq = x, .index = 0, .is_string = false };
             return makeSeqIterator(arena, d);
         }
+        // Fallback: an accessor-defined @@iterator (a getter) is invisible to the
+        // raw slot reads above. Do an observable [[Get]] (fires the getter / a
+        // Proxy trap) and, if it yields a callable, drive it as the iterator.
+        if (realm_mod.active_context) |ctx| {
+            if (realm_mod.active_sym_iterator) |sym| {
+                const m = try ctx.getPropSym(arena, x, sym);
+                if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+                    if (!isCallable(m)) {
+                        realm_mod.pending_exception = try makeTypeErrorVal(arena, "Symbol.iterator is not a function");
+                        return error.JsException;
+                    }
+                    return function_proto.invokeCallback(arena, x, m, &[_]Value{});
+                }
+            }
+        }
     }
     if (x.bits != 0 and x.unbox() == .string) {
         const d = try arena.create(SeqIterData);
