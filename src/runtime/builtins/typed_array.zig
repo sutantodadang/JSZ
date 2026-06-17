@@ -1553,12 +1553,19 @@ fn typedArraySpeciesCreate(arena: std.mem.Allocator, exemplar_td: *const TypedAr
     if (res_td.ab.detached)
         return throwTypeError(arena, "species result has detached buffer");
 
-    // 6. If a length argument was passed (single numeric arg), validate result.length >= required.
-    // Spec: throws RangeError if result length is insufficient.
+    // 5b. Immutable buffer check (ValidateTypedArray with accessMode ~write~).
+    if (res_td.ab.immutable)
+        return throwTypeError(arena, "species result has immutable buffer");
+
+    // 6. If a length argument was passed (single numeric arg), validate result can hold required elements.
+    // Spec: throws TypeError if result length is insufficient.
+    // For length-tracking TAs, compute live length from buffer via taCurrentLen
+    // instead of using the potentially stale res_td.length.
     if (species_args.len == 1 and species_args[0].bits != 0 and species_args[0].unbox() == .number) {
         const required: usize = toIndex(species_args[0].unbox().number);
-        if (res_td.length < required)
-            return throwRangeError(arena, "species result length is insufficient");
+        const actual_len = if (res_td.track_length) taCurrentLen(res_td) else res_td.length;
+        if (actual_len < required)
+            return throwTypeError(arena, "species result length is insufficient");
     }
 
     return result;
