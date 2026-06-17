@@ -220,7 +220,16 @@ pub const BcVm = struct {
     /// Phase 4d: Context re-entry — called by invokeCallback for JS functions.
     fn bcInvokeJs(ptr: *anyopaque, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         _ = arena;
-        @import("../runtime/realm.zig").active_constructing = false;
+        const realm_nt = @import("../runtime/realm.zig");
+        realm_nt.active_constructing = false;
+        // Capture+consume NewTarget threaded by the construct paths (doConstruct /
+        // constructImpl set `pending_new_target` immediately before invoking). Bound
+        // into the callee's env as `__new_target__` below so a derived ctor's
+        // `Reflect.construct(Super, arguments, __new_target__)` desugaring propagates
+        // the ORIGINAL new.target down a multi-level super chain. Cleared here so an
+        // ordinary call/callback sees new.target = undefined.
+        const captured_nt = realm_nt.pending_new_target;
+        realm_nt.pending_new_target = Value{};
         const self: *BcVm = @ptrCast(@alignCast(ptr));
         const function_proto_mod = @import("../runtime/builtins/function_proto.zig");
         if (fn_val.bits == 0) return error.JsException;
@@ -232,6 +241,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, this_val, args);
                 if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, this_val, args);
                 const call_env = try Environment.init(self.arena, def_env);
+                try call_env.define("__new_target__", if (captured_nt.bits != 0) captured_nt else try val_mod.makeUndefined(self.arena));
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
@@ -370,6 +380,9 @@ pub const BcVm = struct {
                 else
                     try JsObject.create(self.arena, proto);
                 const this_val = try val_mod.makeObject(self.arena, new_obj);
+                // Thread NewTarget into the ctor frame (captured by bcInvokeJs as
+                // `__new_target__`) so a derived ctor's super() forwards it unchanged.
+                realm_m.pending_new_target = new_target;
                 const result = try bcInvokeJs(self, self.arena, this_val, ctor, args);
                 return if (result.bits != 0 and result.unbox() == .object) result else this_val;
             },
@@ -783,6 +796,10 @@ pub const BcVm = struct {
                 else
                     try JsObject.create(self.arena, proto);
                 const this_val = try val_mod.makeObject(self.arena, new_obj);
+                // Top-level `new X()`: NewTarget is the callee. Thread it so a
+                // derived ctor's super() chain propagates it (captured as
+                // `__new_target__` by bcInvokeJs).
+                @import("../runtime/realm.zig").pending_new_target = callee_val;
                 const result = bcInvokeJs(self, self.arena, this_val, callee_val, args) catch |e| {
                     if (e == error.JsException) {
                         const realm_m = @import("../runtime/realm.zig");

@@ -9,6 +9,21 @@ const Node = ast.Node;
 
 pub const ParamParse = parser_file.ParamParse;
 
+/// Build the NewTarget node for a derived constructor's `Reflect.construct(Super,
+/// arguments, <newTarget>)` desugaring: `__new_target__ || ClassName`. The hidden
+/// `__new_target__` binding (set by [[Construct]]) carries the ORIGINAL new.target
+/// down a multi-level super chain (`class C extends B extends A`); using the
+/// lexical class name alone would reset it at each level, giving the wrong
+/// prototype and dropping built-in exotic internal slots (e.g. TypedArray). The
+/// lexical name is kept as a fallback for any path that didn't bind it.
+fn makeNewTargetNode(p: *Parser, start: u32, class_name: []const u8) ?*Node {
+    const id_var = p.makeNode(.identifier, start, start, .{ .identifier = "__new_target__" }) orelse return null;
+    const id_cls = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+    return p.makeNode(.logical_expr, start, start, .{
+        .logical_expr = .{ .op = .or_, .left = id_var, .right = id_cls },
+    });
+}
+
 const AccessorKind = enum { none, get, set };
 
 /// A parsed non-constructor class member. `computed_key` (when non-null) holds a
@@ -212,7 +227,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
             }) orelse return null;
             const id_super_p = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
             const id_args = p.makeNode(.identifier, start, start, .{ .identifier = "arguments" }) orelse return null;
-            const id_nt = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+            const id_nt = makeNewTargetNode(p, start, class_name) orelse return null;
             var rc_args = std.ArrayList(*Node){};
             rc_args.append(p.arena, id_super_p) catch return null;
             rc_args.append(p.arena, id_args) catch return null;
@@ -258,7 +273,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         }) orelse return null;
         const id_super_p = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
         const id_args = p.makeNode(.identifier, start, start, .{ .identifier = "arguments" }) orelse return null;
-        const id_nt = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+        const id_nt = makeNewTargetNode(p, start, class_name) orelse return null;
         var rc_args = std.ArrayList(*Node){};
         rc_args.append(p.arena, id_super_p) catch return null;
         rc_args.append(p.arena, id_args) catch return null;
@@ -443,7 +458,7 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             }) orelse return null;
             const id_super_p = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
             const id_args = p.makeNode(.identifier, start, start, .{ .identifier = "arguments" }) orelse return null;
-            const id_nt = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+            const id_nt = makeNewTargetNode(p, start, class_name) orelse return null;
             var rc_args = std.ArrayList(*Node){};
             rc_args.append(p.arena, id_super_p) catch return null;
             rc_args.append(p.arena, id_args) catch return null;
@@ -473,7 +488,7 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             }) orelse return null;
             const id_super_p = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
             const id_args = p.makeNode(.identifier, start, start, .{ .identifier = "arguments" }) orelse return null;
-            const id_nt = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+            const id_nt = makeNewTargetNode(p, start, class_name) orelse return null;
             var rc_args = std.ArrayList(*Node){};
             rc_args.append(p.arena, id_super_p) catch return null;
             rc_args.append(p.arena, id_args) catch return null;

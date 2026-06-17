@@ -1740,8 +1740,13 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
     // so elements are OOB during SpeciesConstructor, throw.
     if (new_len > 0 and taIsOob(td))
         return throwTypeError(arena, "source TypedArray buffer detached or resized OOB during species construction");
+    // Step 14: copy count = min(new_len, currentLen - start) elements. A species
+    // ctor that shrinks a length-tracking source leaves the trailing result slots
+    // at their initialized 0 (NOT undefined→NaN); only in-bounds indices are read.
+    const cur_len = taCurrentLen(td);
+    const copy_end = if (start < cur_len) @min(new_len, cur_len - start) else 0;
     var i: usize = 0;
-    while (i < new_len) : (i += 1) {
+    while (i < copy_end) : (i += 1) {
         const ev = try taLoad(arena, td, start + i);
         if (td.kind.isBigInt()) taStoreBig(a_td, i, ev) else taStoreNumber(a_td, i, toNum(ev));
     }

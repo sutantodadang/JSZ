@@ -323,6 +323,14 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
         break :blk switch (args[1].unbox()) {
             .object => |o| o,
             .null_ => null,
+            // A class used as a proto (`class B extends A` → setPrototypeOf(B, A))
+            // is a bc_function value; its static members live on a lazily-created
+            // backing object. Resolve to that so the constructor static chain links
+            // (needed for multi-level subclasses: @@species etc. inherit through it).
+            .bc_function, .function => if (@import("../realm.zig").active_context) |ctx|
+                (try ctx.backingObject(arena, args[1]))
+            else
+                null,
             else => null,
         };
     };
