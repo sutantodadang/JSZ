@@ -2236,33 +2236,37 @@ pub fn nativeTaSort(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (n < 2) return this_val;
     const cmp_fn = if (args.len > 0 and function_proto_isCallable(args[0])) args[0] else Value{};
     const undef = try val_mod.makeUndefined(arena);
-    // Insertion sort (n usually small; avoids needing a stack for quicksort).
+    // §23.2.3.30: snapshot the elements, sort the COPY (comparefn may resize or
+    // detach the backing buffer), then write the result back through the exotic
+    // integer-indexed [[Set]] — indices that became out-of-bounds are no-ops.
+    const items = try arena.alloc(Value, n);
+    var r: usize = 0;
+    while (r < n) : (r += 1) items[r] = try taLoad(arena, td, r);
+    // Stable insertion sort over the snapshot.
     var i: usize = 1;
     while (i < n) : (i += 1) {
+        const key = items[i];
         var j = i;
         while (j > 0) : (j -= 1) {
-            const a = try taLoad(arena, td, j - 1);
-            const b = try taLoad(arena, td, j);
-            // Compare: > 0 means a should come after b (swap).
+            const a = items[j - 1];
             const should_swap = blk: {
                 if (cmp_fn.bits != 0) {
-                    const r = try function_proto.invokeCallback(arena, undef, cmp_fn, &[_]Value{ a, b });
-                    const rv = toNum(r);
-                    break :blk rv > 0;
+                    const cr = try function_proto.invokeCallback(arena, undef, cmp_fn, &[_]Value{ a, key });
+                    break :blk toNum(cr) > 0;
                 }
-                if (td.kind.isBigInt()) break :blk taBigRaw(td, j - 1) > taBigRaw(td, j);
-                break :blk taNumCompare(toNum(a), toNum(b)) > 0;
+                if (td.kind.isBigInt()) break :blk bigintSearch(a).? > bigintSearch(key).?;
+                break :blk taNumCompare(toNum(a), toNum(key)) > 0;
             };
-            if (should_swap) {
-                if (td.kind.isBigInt()) {
-                    taStoreBig(td, j - 1, b);
-                    taStoreBig(td, j, a);
-                } else {
-                    taStoreNumber(td, j - 1, toNum(b));
-                    taStoreNumber(td, j, toNum(a));
-                }
-            } else break;
+            if (!should_swap) break;
+            items[j] = a;
         }
+        items[j] = key;
+    }
+    // Write back, guarding each index against the (possibly shrunk) live bounds.
+    var w: usize = 0;
+    while (w < n) : (w += 1) {
+        if (!isValidIntegerIndex(td, @floatFromInt(w))) continue;
+        if (td.kind.isBigInt()) taStoreBig(td, w, items[w]) else taStoreNumber(td, w, toNum(items[w]));
     }
     return this_val;
 }
