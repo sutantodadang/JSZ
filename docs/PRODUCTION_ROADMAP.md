@@ -115,6 +115,27 @@ honest 1-dev estimates.
 - GC integration: backing store as a managed cell; off-heap option.
 - **Gate:** test262 `built-ins/TypedArray*` + `ArrayBuffer*` ≥99%.
 
+**Conformance (2026-06-17):**
+| suite | start | now | change |
+|---|---:|---:|---|
+| TypedArray built-ins | 8.3% | **95.40%** (2076/2176) | +84 |
+| DataView | 11.8% | **96.61%** (542/561) | — |
+| ArrayBuffer | 12.7% | **99.09%** (219/221) | — |
+
+**MI15 Phase 4 landed (2026-06-17):** Fixed two class-expression bugs blocking the
+test262 harness `subClass()` helper (used by resizable-buffer + speciesctor + callbackfn
+clusters):
+1. **Parser fix:** `class MyName extends Base {}` in expression position now parses
+   correctly — was always treated as anonymous because the function checked
+   `p.check(.identifier)` before advancing past the `class` keyword.
+2. **Prototype chain fix:** The class-expression IIFE wrapper was missing static
+   inheritance (`Object.setPrototypeOf`), prototype chain setup
+   (`ClassName.prototype = Object.create(Super.prototype)`), and the constructor
+   back-link — all now generated, matching `parseClassDeclStmt`.
+Combined effect: TypedArray conformance jumped +84 tests (8.3%→95.40%).
+Remaining 100 failures are primarily DataView/ArrayBuffer edge cases and deep
+spec features (resizable-buffer OOB during species, callable-object boxing, etc.).
+
 **Status (2026-06-10): core DONE.** `src/runtime/builtins/typed_array.zig` (~830 LOC) +
 VM property-chokepoint hooks (`bc_vm.getProp/setProp`) + realm registration:
 ArrayBuffer (`slice`/`isView`/`byteLength`), all 11 views, DataView (get/set Int8…
