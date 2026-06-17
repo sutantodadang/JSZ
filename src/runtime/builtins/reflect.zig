@@ -340,9 +340,10 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
         const robj = args[0].toPtr().object;
         if (robj.internal_kind == .typed_array and robj.internal_slot != null) {
             const td = typed_array.getTd(args[0]).?;
-            if (!td.ab.detached) {
+            if (!typed_array.taIsOob(td)) {
+                const cur_len = typed_array.taCurrentLen(td);
                 var ti: u32 = 0;
-                while (ti < td.length) : (ti += 1) {
+                while (ti < cur_len) : (ti += 1) {
                     const k_str = try std.fmt.allocPrint(arena, "{d}", .{ti});
                     const idx_key_ta = try std.fmt.allocPrint(arena, "{d}", .{ta_count});
                     try arr.set(idx_key_ta, try val_mod.makeString(arena, k_str));

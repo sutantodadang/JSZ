@@ -392,9 +392,10 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
         const ta_mod = @import("typed_array.zig");
         const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-        if (!td.ab.detached) {
+        if (!ta_mod.taIsOob(td)) {
+            const cur_len = ta_mod.taCurrentLen(td);
             var ti: u32 = 0;
-            while (ti < td.length) : (ti += 1) {
+            while (ti < cur_len) : (ti += 1) {
                 const k_str = try std.fmt.allocPrint(arena, "{d}", .{ti});
                 const idx_key_ta = try std.fmt.allocPrint(arena, "{d}", .{ta_key_count});
                 try arr.set(idx_key_ta, try val_mod.makeString(arena, k_str));
