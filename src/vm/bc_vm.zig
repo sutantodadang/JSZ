@@ -128,6 +128,15 @@ pub const BcVm = struct {
     /// Phase 3b: optional GC heap.
     heap: ?*Heap = null,
     frames: std.ArrayListUnmanaged(BcCallFrame) = .empty,
+    /// MI15 Phase 4e: re-entrancy floor for exception unwinding. A nested runLoop
+    /// entered from a native (bcInvokeJs / constructImpl / generator resume) sets
+    /// this to the index of the frame it pushed, so `throwException` does NOT
+    /// search the *caller's* (outer) frames for a try handler. Without it an
+    /// uncaught throw inside a re-entrant native call (e.g. a derived-class super
+    /// to a throwing native ctor during species construction) would unwind into
+    /// the outer JS `try`, corrupting control flow and leaking a stale exception.
+    /// Default 0 = the top-level run searches all frames.
+    frame_floor: usize = 0,
     /// Phase 8: high-water mark of the call-frame stack depth across this run.
     /// Used to verify proper tail calls keep stack growth O(1).
     frame_high_water: usize = 0,
@@ -244,6 +253,11 @@ pub const BcVm = struct {
                 });
                 // Run until this frame returns.
                 const frames_before = self.frames.items.len - 1;
+                // Re-entrancy boundary: an uncaught throw inside this nested run
+                // must not unwind into the native caller's outer frames.
+                const saved_floor = self.frame_floor;
+                self.frame_floor = frames_before;
+                defer self.frame_floor = saved_floor;
                 while (self.frames.items.len > frames_before) {
                     const outcome = try self.runLoop();
                     switch (outcome) {
@@ -286,13 +300,27 @@ pub const BcVm = struct {
                         return bcInvokeJs(ptr, self.arena, bd.this_val, bd.target, combined);
                     }
                 }
+                // Built-in callable objects (Array, %TypedArray%, Error, …) carry a
+                // `__call__` native slot. Dispatch to it and propagate its real
+                // exception. A derived class doing `super(a,b,c)` to such a native
+                // parent reaches here; returning a blank exception (the old
+                // behaviour) silently dropped a genuine throw (e.g. a RangeError
+                // from a TypedArray ctor when a resizable buffer shrank mid-call).
+                if (obj.get("__call__")) |cv| {
+                    if (cv.bits != 0 and cv.unbox() == .native_function) {
+                        return cv.toPtr().native_function.invoke(self.arena, this_val, args) catch |e| {
+                            if (e == error.JsException) return error.JsException;
+                            return error.OutOfMemory;
+                        };
+                    }
+                }
                 const realm_mod = @import("../runtime/realm.zig");
-                realm_mod.pending_exception = Value{};
+                realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a function");
                 return error.JsException;
             },
             else => {
                 const realm_mod = @import("../runtime/realm.zig");
-                realm_mod.pending_exception = Value{};
+                realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a function");
                 return error.JsException;
             },
         }
@@ -684,7 +712,12 @@ pub const BcVm = struct {
     /// Throw helper: walk frame stack for a try entry and dispatch. Returns true if handled.
     pub fn throwException(self: *BcVm, thrown_val: Value) !bool {
         var fi: usize = self.frames.items.len;
-        while (fi > 0) {
+        // Stop at `frame_floor`: never unwind into the frames of a native caller
+        // that re-entered the VM (see `frame_floor`). An uncaught throw at/above
+        // the floor returns `false` so the re-entrant runLoop surfaces it to its
+        // native caller as `error.JsException`, instead of jumping into an outer
+        // JS `try` that belongs to a different invocation.
+        while (fi > self.frame_floor) {
             fi -= 1;
             const f = &self.frames.items[fi];
             if (f.try_stack.items.len > 0) {
@@ -1607,6 +1640,9 @@ pub const BcVm = struct {
             .this_val = this_val,
         });
         const frames_before = self.frames.items.len - 1;
+        const saved_floor = self.frame_floor;
+        self.frame_floor = frames_before;
+        defer self.frame_floor = saved_floor;
         while (self.frames.items.len > frames_before) {
             const outcome = try self.runLoop();
             switch (outcome) {
@@ -2324,6 +2360,11 @@ pub const BcVm = struct {
         }
         state.started = true;
         self.gen_yielded = false;
+        // Re-entrancy boundary: an uncaught throw inside the coroutine surfaces
+        // to the .next()/.throw() caller, not into the resumer's outer frames.
+        const saved_floor = self.frame_floor;
+        self.frame_floor = base;
+        defer self.frame_floor = saved_floor;
         while (self.frames.items.len > base) {
             const outcome = try self.runLoop();
             switch (outcome) {
