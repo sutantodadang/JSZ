@@ -454,20 +454,57 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
         const getter: ?Value = if (desc.hasOwn("get")) desc.getOwn("get") else null;
         const setter: ?Value = if (desc.hasOwn("set")) desc.getOwn("set") else null;
         const holder = try makeAccessorHolder(arena, getter, setter);
+        // Partial descriptor: fields the descriptor omits default to the
+        // EXISTING own property's attributes (redefine) or to false (create) —
+        // same merge as Object.defineProperty (object_methods.zig). Without
+        // this, a bare {get} silently flips a configurable prop non-configurable.
+        var prev_e = false;
+        var prev_c = false;
+        if (target_obj.findProperty(k)) |loc| {
+            if (loc.holder == target_obj) {
+                const a = loc.holder.attrAt(loc.slot);
+                prev_e = a.enumerable;
+                prev_c = a.configurable;
+            }
+        }
         const attr = PropAttr{
             .is_accessor = true,
-            .enumerable = descTruthy(desc.getOwn("enumerable")),
-            .configurable = descTruthy(desc.getOwn("configurable")),
+            .enumerable = if (desc.hasOwn("enumerable")) descTruthy(desc.getOwn("enumerable")) else prev_e,
+            .configurable = if (desc.hasOwn("configurable")) descTruthy(desc.getOwn("configurable")) else prev_c,
         };
         const ok = try target_obj.defineOwnAccessor(k, holder, attr);
         return val_mod.makeBool(arena, ok);
     }
 
-    const value = desc.getOwn("value") orelse Value{};
+    // Partial descriptor: fields the descriptor omits default to the EXISTING
+    // own data property's attributes (redefine) or to false (create new).
+    var cur_w = false;
+    var cur_e = false;
+    var cur_c = false;
+    var has_own_data = false;
+    var cur_val: ?Value = null;
+    if (target_obj.findProperty(k)) |loc| {
+        if (loc.holder == target_obj) {
+            const a = loc.holder.attrAt(loc.slot);
+            if (!a.is_accessor) {
+                cur_w = a.writable;
+                cur_e = a.enumerable;
+                cur_c = a.configurable;
+                cur_val = target_obj.getOwn(k);
+                has_own_data = true;
+            }
+        }
+    }
+    const value = if (desc.hasOwn("value"))
+        (desc.getOwn("value") orelse Value{})
+    else if (has_own_data and cur_val != null)
+        cur_val.?
+    else
+        Value{};
     const attr = PropAttr{
-        .writable = descTruthy(desc.getOwn("writable")),
-        .enumerable = descTruthy(desc.getOwn("enumerable")),
-        .configurable = descTruthy(desc.getOwn("configurable")),
+        .writable = if (desc.hasOwn("writable")) descTruthy(desc.getOwn("writable")) else cur_w,
+        .enumerable = if (desc.hasOwn("enumerable")) descTruthy(desc.getOwn("enumerable")) else cur_e,
+        .configurable = if (desc.hasOwn("configurable")) descTruthy(desc.getOwn("configurable")) else cur_c,
     };
     const ok = try target_obj.defineOwnData(k, value, attr);
     return val_mod.makeBool(arena, ok);
