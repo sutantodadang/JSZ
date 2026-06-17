@@ -1339,23 +1339,29 @@ pub const Realm = struct {
         // Create Error constructor objects. Each has a .prototype property
         // and a hidden __proto__ marker so `instanceof` can find the prototype.
         const makeErrorCtor = struct {
-            fn make(a: std.mem.Allocator, ctor_fn: val_mod.NativeFnPtr, proto_obj: *JsObject) !Value {
+            fn make(a: std.mem.Allocator, ctor_fn: val_mod.NativeFnPtr, proto_obj: *JsObject, name: []const u8) !Value {
                 const ctor_obj = try JsObject.create(a, null);
                 const ctor_proto_val = try val_mod.makeObject(a, proto_obj);
                 try ctor_obj.set("prototype", ctor_proto_val);
                 const fn_val = try val_mod.makeNativeFunction(a, ctor_fn);
                 // Store the native fn on the ctor object as "__call__".
                 try ctor_obj.set("__call__", fn_val);
+                // §20.5.x: each Error constructor has `name` (e.g. "TypeError") and
+                // `length` 1, both non-enumerable / configurable. assert.throws and
+                // Function.prototype.toString rely on `name`.
+                const nlen_attr: obj_mod.PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+                _ = try ctor_obj.defineOwnData("name", try val_mod.makeString(a, name), nlen_attr);
+                _ = try ctor_obj.defineOwnData("length", try val_mod.makeNumber(a, 1), nlen_attr);
                 return val_mod.makeObject(a, ctor_obj);
             }
         }.make;
 
-        const error_ctor_val = try makeErrorCtor(arena, nativeErrorCtor, error_proto);
-        const type_error_ctor_val = try makeErrorCtor(arena, nativeTypeErrorCtor, type_error_proto);
-        const syntax_error_ctor_val = try makeErrorCtor(arena, nativeSyntaxErrorCtor, syntax_error_proto);
-        const range_error_ctor_val = try makeErrorCtor(arena, nativeRangeErrorCtor, range_error_proto);
-        const reference_error_ctor_val = try makeErrorCtor(arena, nativeReferenceErrorCtor, reference_error_proto);
-        const aggregate_error_ctor_val = try makeErrorCtor(arena, nativeAggregateErrorCtor, aggregate_error_proto);
+        const error_ctor_val = try makeErrorCtor(arena, nativeErrorCtor, error_proto, "Error");
+        const type_error_ctor_val = try makeErrorCtor(arena, nativeTypeErrorCtor, type_error_proto, "TypeError");
+        const syntax_error_ctor_val = try makeErrorCtor(arena, nativeSyntaxErrorCtor, syntax_error_proto, "SyntaxError");
+        const range_error_ctor_val = try makeErrorCtor(arena, nativeRangeErrorCtor, range_error_proto, "RangeError");
+        const reference_error_ctor_val = try makeErrorCtor(arena, nativeReferenceErrorCtor, reference_error_proto, "ReferenceError");
+        const aggregate_error_ctor_val = try makeErrorCtor(arena, nativeAggregateErrorCtor, aggregate_error_proto, "AggregateError");
 
         // Spec: ErrorPrototype.constructor = ErrorConstructor (non-enumerable, writable, configurable).
         // Required for `thrown.constructor === TypeError` identity checks in assert.throws.

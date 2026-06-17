@@ -1706,14 +1706,18 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
 pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = try validateTypedArrayThis(arena, this_val);
     if (td.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed TypedArray");
-    const target_len = td.length;
-    const target_lf: f64 = @floatFromInt(target_len);
     // targetOffset = ToIntegerOrInfinity(offset) (runs valueOf, propagates throws);
     // negative → RangeError. May be +Inf (caught by the bounds check below).
     const off_f = try toIntegerThrowing(arena, if (args.len > 1) args[1] else Value{});
     if (off_f < 0) return throwRangeError(arena, "Invalid typed array set offset");
-    // The offset's valueOf can detach the target buffer; spec re-validates.
+    // The offset's valueOf can detach/resize the target buffer. Per spec
+    // (SetTypedArrayFromArrayLike / FromTypedArray: "If IsTypedArrayOutOfBounds ...
+    // throw a TypeError"), an out-of-bounds target throws BEFORE the source's
+    // length/element getters run — so use the *current* length below.
     if (td.ab.detached) return throwTypeError(arena, "target TypedArray buffer detached during offset coercion");
+    if (taIsOob(td)) return throwTypeError(arena, "TypedArray target is out of bounds");
+    const target_len = taCurrentLen(td);
+    const target_lf: f64 = @floatFromInt(target_len);
     // ToObject(source): null/undefined throw; a TypedArray source uses the fast
     // overlap-safe path; everything else (objects, strings, primitives) goes
     // through the observable array-like path (ToObject + indexed [[Get]]).
@@ -2416,13 +2420,13 @@ pub fn nativeTaLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []co
     }
     const target = toNum(args[0]);
     const want_big: ?i128 = if (is_big) bigintSearch(args[0]) else null;
-    var len: usize = td.length;
+    // §23.2.3.18: `len` is captured BEFORE ToIntegerOrInfinity(fromIndex) and is NOT
+    // re-clamped if the coercion resizes the buffer — `k` is computed from the
+    // original length and out-of-bounds reads (taLoad → undefined) are skipped.
+    const len: usize = td.length;
     var from: i64 = @intCast(len - 1);
     if (args.len > 1) {
         const fi = try toIntegerThrowing(arena, args[1]);
-        // fromIndex coercion may have SHRUNK the buffer; clamp (grow keeps original).
-        len = @min(len, if (taIsOob(td)) 0 else taCurrentLen(td));
-        if (len == 0) return val_mod.makeNumber(arena, -1);
         if (std.math.isNan(fi)) return val_mod.makeNumber(arena, -1);
         // Clamp to i64 range before conversion to avoid panic on Inf/huge values.
         if (fi >= 9.007199254740992e15) {
@@ -2438,11 +2442,15 @@ pub fn nativeTaLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []co
     }
     var i: usize = @intCast(from);
     while (true) {
-        if (is_big) {
-            if (want_big != null and taBigRaw(td, i) == want_big.?) return val_mod.makeNumber(arena, @floatFromInt(i));
-        } else {
-            const ev = try taLoad(arena, td, i);
-            if (toNum(ev) == target) return val_mod.makeNumber(arena, @floatFromInt(i));
+        const ev = try taLoad(arena, td, i);
+        const ev_undef = ev.bits == 0 or ev.unbox() == .undefined_;
+        if (!ev_undef) {
+            if (is_big) {
+                if (want_big != null and ev.unbox() == .bigint and taBigRaw(td, i) == want_big.?)
+                    return val_mod.makeNumber(arena, @floatFromInt(i));
+            } else if (ev.unbox() == .number and ev.unbox().number == target) {
+                return val_mod.makeNumber(arena, @floatFromInt(i));
+            }
         }
         if (i == 0) break;
         i -= 1;

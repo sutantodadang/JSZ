@@ -1318,6 +1318,14 @@ pub const BcVm = struct {
                 if (std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(s.len));
                 }
+                // String exotic own indexed properties: a canonical integer index in
+                // [0, length) reads the code unit (byte) at that position as a
+                // 1-char string. ToString-round-trip ensures only canonical indices
+                // (no leading zeros / "+1" / "1.0") match.
+                if (asArrayIndex(key)) |i| {
+                    if (i < s.len) return val_mod.makeString(self.arena, s[i .. i + 1]);
+                    return val_mod.makeUndefined(self.arena);
+                }
                 // Delegate to String.prototype
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_string_proto) |proto| {
@@ -2600,6 +2608,21 @@ pub const BcVm = struct {
 };
 
 // ---------------------------------------------------------------- W2 generator natives ---
+
+/// Parse `key` as a canonical array index (the decimal form of a non-negative
+/// integer, no sign / leading zeros / decimal point). Returns null otherwise.
+/// "0" → 0; "00", "+1", "1.0", "01" → null.
+fn asArrayIndex(key: []const u8) ?usize {
+    if (key.len == 0) return null;
+    if (key.len > 1 and key[0] == '0') return null; // no leading zeros
+    var v: usize = 0;
+    for (key) |c| {
+        if (c < '0' or c > '9') return null;
+        v = std.math.mul(usize, v, 10) catch return null;
+        v = std.math.add(usize, v, c - '0') catch return null;
+    }
+    return v;
+}
 
 fn genStateFrom(this_val: Value) ?*BcGeneratorState {
     if (this_val.bits == 0 or this_val.unbox() != .object) return null;
