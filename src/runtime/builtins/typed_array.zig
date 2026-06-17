@@ -1428,6 +1428,9 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
         // Form 3: new TA(typedArray)  → copy elements into a fresh buffer.
         if (src.internal_kind == .typed_array) {
             const std_td: *TypedArrayData = @ptrCast(@alignCast(src.internal_slot.?));
+            // InitializeTypedArrayFromTypedArray step 8 (ValidateTypedArray): a source
+            // whose backing buffer is detached or resized out of bounds is a TypeError.
+            if (taIsOob(std_td)) return throwTypeError(arena, "Cannot construct a typed array from a detached or out-of-bounds TypedArray");
             // Cross number↔bigint construction is a TypeError.
             if (std_td.kind.isBigInt() != kind.isBigInt())
                 return throwTypeError(arena, "Cannot mix BigInt and non-BigInt typed arrays");
