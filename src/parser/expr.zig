@@ -474,6 +474,9 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
     // Phase 8: `await X` desugars to a call __await__(X) (synchronous-drain await).
     // Works at module top level and inside any function; no VM changes needed.
     if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await")) {
+        // `await` is a prefix operator; the next token may be a regex literal.
+        // Patch prev_kind so the lexer treats '/' as regex, not division.
+        p.lexer.prev_kind = .kw_typeof;
         _ = p.advance();
         const operand = p.parseUnaryExpr() orelse return null;
         const callee = p.makeNode(.identifier, start, start, .{ .identifier = "__await__" }) orelse return null;

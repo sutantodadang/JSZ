@@ -537,6 +537,23 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         // for (expr in ...) or for (expr; ...)
         // Parse the expression
         const expr = p.parseAssignmentExpr() orelse return null;
+        // `for (lhs in rhs)`: parseAssignmentExpr eagerly consumed `in` as a
+        // binary operator. Detect this and split it back into a for-in.
+        if (expr.kind == .binary_expr and
+            expr.data.binary_expr.op == .in and
+            p.check(.right_paren))
+        {
+            _ = p.expect(.right_paren) orelse return null;
+            const body = p.parseStatement() orelse return null;
+            return p.makeNode(.for_in_stmt, start, p.current.start, .{
+                .for_in_stmt = .{
+                    .left = expr.data.binary_expr.left,
+                    .right = expr.data.binary_expr.right,
+                    .body = body,
+                    .iterate_values = false,
+                },
+            });
+        }
         if (p.check(.kw_in)) {
             // for-in with assignment expression left side
             _ = p.advance(); // consume 'in'
