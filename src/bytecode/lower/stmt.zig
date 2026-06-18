@@ -6,6 +6,7 @@ const std = @import("std");
 const ast = @import("../../parser/ast.zig");
 const Node = ast.Node;
 const NodeKind = ast.NodeKind;
+const VarKind = ast.VarKind;
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const Op = @import("../opcodes.zig").Op;
@@ -515,6 +516,10 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         try self.emitU8(rval);
         try self.emitU8(rstep);
         try self.emitU16(@intCast(vi));
+        const loop_decl_kind: ?VarKind = switch (fo.left.kind) {
+            .var_decl => fo.left.data.var_decl.kind,
+            else => null,
+        };
         const loop_name: ?[]const u8 = switch (fo.left.kind) {
             .var_decl => if (fo.left.data.var_decl.name.len > 0) fo.left.data.var_decl.name else null,
             .identifier => fo.left.data.identifier,
@@ -522,9 +527,13 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         };
         if (loop_name) |nm| {
             const ni = try self.builder.addConstant(try val_mod.makeString(self.arena, nm));
-            try self.emitOp(.SET_GLOBAL, line);
-            try self.emitU16(@intCast(ni));
-            try self.emitU8(rval);
+            if (loop_decl_kind != null and (loop_decl_kind.? == .let or loop_decl_kind.? == .const_)) {
+                try self.emitInitLexical(nm, rval, line);
+            } else {
+                try self.emitOp(.SET_GLOBAL, line);
+                try self.emitU16(@intCast(ni));
+                try self.emitU8(rval);
+            }
         }
         self.sp = iter_sp;
         // Register the loop so `break`/`continue` (labeled or innermost) resolve to
@@ -611,10 +620,14 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             const vd = fi.left.data.var_decl;
             if (vd.name.len > 0) {
                 const name_idx = try self.builder.addConstant(try val_mod.makeString(self.arena, vd.name));
-                try self.emitOp(.SET_GLOBAL, line);
-                try self.emitU8(@intCast(name_idx & 0xFF));
-                try self.emitU8(@intCast((name_idx >> 8) & 0xFF));
-                try self.emitU8(rkey);
+                if (vd.kind == .let or vd.kind == .const_) {
+                    try self.emitInitLexical(vd.name, rkey, line);
+                } else {
+                    try self.emitOp(.SET_GLOBAL, line);
+                    try self.emitU8(@intCast(name_idx & 0xFF));
+                    try self.emitU8(@intCast((name_idx >> 8) & 0xFF));
+                    try self.emitU8(rkey);
+                }
             }
         },
         .identifier => {
