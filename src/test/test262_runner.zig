@@ -282,12 +282,25 @@ fn isRunnableFull(source: []const u8) bool {
     if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
         const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
         const flags = yaml[fi..line_end];
-        if (std.mem.indexOf(u8, flags, "module") != null) return false;
+        // `module` is now runnable: M16 routes these through `ctx.evalModule`
+        // (strict, import/export desugared). `raw`/`async`/`CanBlockIsFalse`
+        // still need harness features the single-file runner can't provide.
         if (std.mem.indexOf(u8, flags, "raw") != null) return false;
         if (std.mem.indexOf(u8, flags, "async") != null) return false;
         if (std.mem.indexOf(u8, flags, "CanBlockIsFalse") != null) return false;
     }
     return true;
+}
+
+/// True when the test's `flags:` line carries the `module` goal symbol, meaning
+/// the source must be evaluated as ES-module code rather than a script.
+fn hasModuleFlag(source: []const u8) bool {
+    const yaml = frontmatter(source);
+    if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
+        const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
+        return std.mem.indexOf(u8, yaml[fi..line_end], "module") != null;
+    }
+    return false;
 }
 
 /// Collect every non-fixture `.js` test under TEST262_PATH (paths relative to it,
@@ -383,7 +396,11 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
         std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ strict_prefix, prelude, source }) catch return .fail;
     defer allocator.free(full_source);
 
-    const result = ctx.eval(full_source, "<test262>");
+    // `flags: [module]` tests must run as ES-module code (strict; import/export).
+    const result = if (hasModuleFlag(source))
+        ctx.evalModule(full_source, "<test262>")
+    else
+        ctx.eval(full_source, "<test262>");
 
     // A resource-limit interrupt is neither a pass nor a fail — skip it so a
     // looping test cannot masquerade as a passing negative test.
@@ -943,11 +960,19 @@ test "includesRegion extracts inline and block forms" {
     try std.testing.expect(std.mem.indexOf(u8, r2, "features") == null);
 }
 
-test "isRunnableFull rejects module/raw/async flags" {
+test "isRunnableFull rejects raw/async but allows module" {
     try std.testing.expect(isRunnableFull("/*---\nes5id: 1\n---*/\nvar x=1;"));
-    try std.testing.expect(!isRunnableFull("/*---\nflags: [module]\n---*/\n"));
+    // M16: module-flagged tests are now runnable (routed via evalModule).
+    try std.testing.expect(isRunnableFull("/*---\nflags: [module]\n---*/\n"));
     try std.testing.expect(!isRunnableFull("/*---\nflags: [async]\n---*/\n"));
     try std.testing.expect(!isRunnableFull("/*---\nflags: [raw]\n---*/\n"));
+}
+
+test "hasModuleFlag detects the module goal symbol" {
+    try std.testing.expect(hasModuleFlag("/*---\nflags: [module]\n---*/\n"));
+    try std.testing.expect(hasModuleFlag("/*---\nflags: [onlyStrict, module]\n---*/\n"));
+    try std.testing.expect(!hasModuleFlag("/*---\nflags: [onlyStrict]\n---*/\n"));
+    try std.testing.expect(!hasModuleFlag("/*---\nes5id: 1\n---*/\nvar x=1;"));
 }
 
 test "test262_runner compiles" {

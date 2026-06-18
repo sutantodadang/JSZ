@@ -111,6 +111,10 @@ pub const IsolateImpl = struct {
     /// W6: the persistent Realm (global scope + intrinsics), built once on the
     /// first eval and reused across evals so top-level declarations persist.
     realm: ?*@import("../runtime/realm.zig").Realm = null,
+    /// Milestone 16 (ESM) — Phase 1: cache of evaluated module records, keyed by
+    /// canonical specifier. Lazily created on the first `evalModule`; lives in
+    /// the (persistent) eval arena alongside the realm.
+    module_registry: ?@import("../runtime/module.zig").ModuleRegistry = null,
 
     pub fn init(backing: std.mem.Allocator) !*IsolateImpl {
         const impl = try backing.create(IsolateImpl);
@@ -207,6 +211,60 @@ pub const IsolateImpl = struct {
                 return self.runMainBc(arena, main_func);
             },
         }
+    }
+
+    /// Milestone 16 (ESM) — Phase 1: evaluate `source` as ES-module code.
+    /// Mirrors `evalWithMode(.bc)` but parses via `Parser.parseModule` and
+    /// compiles via `compiler.compileModule` so module code runs strict
+    /// (§11.2.2); the import/export → CommonJS desugar already happened in the
+    /// parser. The run is tracked on a `ModuleRecord` in `self.module_registry`
+    /// keyed by `module_id`, transitioning its status across the evaluation.
+    pub fn evalModule(self: *IsolateImpl, source: []const u8, module_id: []const u8) !EvalOutcome {
+        promise_mod.clearMicrotasks();
+        const arena = self.eval_arena.allocator();
+        const transformed_source = try rewriteTemplateLiterals(arena, source);
+
+        const module_mod = @import("../runtime/module.zig");
+        if (self.module_registry == null) self.module_registry = module_mod.ModuleRegistry.init(arena);
+        const rec = try self.module_registry.?.getOrCreate(try arena.dupe(u8, module_id), transformed_source);
+        rec.status = .evaluating;
+
+        const parser_mod = @import("../parser/parser.zig");
+        var p = parser_mod.Parser.init(transformed_source, arena);
+        const parse_result = p.parseModule();
+        const stmts = switch (parse_result) {
+            .ok => |s| s,
+            .err => |e| {
+                rec.status = .errored;
+                return EvalOutcome{ .parse_error = .{
+                    .message = e.message,
+                    .line = e.line,
+                    .column = e.column,
+                } };
+            },
+        };
+        rec.body = stmts;
+
+        const ast_mod = @import("../parser/ast.zig");
+        const prog = ast_mod.Program{ .body = stmts, .is_strict = true, .is_module = true };
+        const main_func = compiler_mod.compileModule(arena, &prog, module_id) catch |e| {
+            rec.status = .errored;
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+            };
+        };
+        rec.func = main_func;
+        rec.status = .linked;
+
+        const outcome = try self.runMainBc(arena, main_func);
+        switch (outcome) {
+            .ok => |v| {
+                rec.namespace = v;
+                rec.status = .evaluated;
+            },
+            else => rec.status = .errored,
+        }
+        return outcome;
     }
 
     /// W6: build the persistent Realm on first use; reuse it thereafter so

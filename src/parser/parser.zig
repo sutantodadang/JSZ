@@ -231,6 +231,36 @@ pub const Parser = struct {
         return ParseResult{ .ok = stmts.items };
     }
 
+    /// Milestone 16 — Phase 1: parse a unit of ES-module code.
+    ///
+    /// Identical statement grammar to `parseScript` (the import/export desugar
+    /// onto CommonJS `require`/`exports` already runs inside `parseStatement`),
+    /// but the result is module code: always strict (§11.2.2). Callers build a
+    /// `Program{ .is_module = true, .is_strict = true }` from `.ok`. Errors use
+    /// the same `ParseResult.err` channel as scripts.
+    pub fn parseModule(self: *Parser) ParseResult {
+        var stmts = std.ArrayList(*Node){};
+        const li_start = self.live_imports.items.len;
+        const le_start = self.live_exports.items.len;
+        while (!self.check(.eof) and !self.had_error) {
+            const s = self.parseStatement() orelse break;
+            stmts.append(self.arena, s) catch {
+                self.had_error = true;
+                break;
+            };
+            self.drainExtraStmts(&stmts);
+        }
+        self.applyLiveBindings(stmts.items, li_start, le_start);
+        if (self.had_error) {
+            return ParseResult{ .err = self.error_info orelse ParseError{
+                .message = "parse error",
+                .line = self.current.line,
+                .column = self.current.column,
+            } };
+        }
+        return ParseResult{ .ok = stmts.items };
+    }
+
     // ---------------------------------------------------- Phase 8: ES modules ---
     // Desugar import/export onto the existing CommonJS require/exports model.
 
@@ -886,6 +916,20 @@ test "Parser: for loop" {
     const result = p.parseScript();
     switch (result) {
         .ok => |stmts| try std.testing.expectEqual(@as(usize, 1), stmts.len),
+        .err => |e| {
+            std.debug.print("parse error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    }
+}
+
+test "Parser: parseModule desugars export var" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var p = Parser.init("export var x = 42;", arena.allocator());
+    const result = p.parseModule();
+    switch (result) {
+        .ok => |stmts| try std.testing.expect(stmts.len >= 1),
         .err => |e| {
             std.debug.print("parse error: {s}\n", .{e.message});
             return error.ParseFailed;

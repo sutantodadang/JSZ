@@ -35,6 +35,8 @@ const Args = struct {
     jit_mode: jsz.JitMode = .off,
     limits: jsz.Limits = .{},
     ic_stats: bool = false,
+    /// M16: run the entry as an ES module (strict; import/export desugar).
+    module: bool = false,
 };
 
 fn parseArgs(argv: []const []const u8) Args {
@@ -105,6 +107,11 @@ fn parseArgs(argv: []const []const u8) Args {
             args.interp = .bc;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--module")) {
+            args.module = true;
+            args.interp = .bc; // module eval runs in the bytecode VM
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--jit=off")) {
             args.jit_mode = .off;
             continue;
@@ -168,6 +175,7 @@ fn printHelp(writer: anytype) !void {
         \\  --mem-limit=<bytes>    Cap live memory; over-budget eval throws instead of crashing
         \\  --gas-limit=<n>        Cap executed bytecode instructions (implies --interp=bc)
         \\  --time-limit=<ms>      Cap wall-clock execution time (implies --interp=bc)
+        \\  --module               Run the entry as an ES module (strict; import/export)
         \\
         \\Examples:
         \\  jsz --version
@@ -194,7 +202,7 @@ fn debugHook(_: ?*anyopaque, stop: jsz.debug.DebugStop) void {
     e.flush() catch {};
 }
 
-fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode, limits: jsz.Limits, ic_stats: bool) !void {
+fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode, limits: jsz.Limits, ic_stats: bool, is_module: bool) !void {
     if (dump_bc or source_map) {
         // Compile-only modes: delegate to the jsz public API and exit.
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -251,7 +259,8 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
     defer arena.deinit();
 
     var uncaught = false;
-    switch (ctx.eval(source, source_name)) {
+    const result = if (is_module) ctx.evalModule(source, source_name) else ctx.eval(source, source_name);
+    switch (result) {
         .ok => |v| {
             const s = jsz.valueToDisplayString(arena.allocator(), v) catch "?";
             try out.print("{s}\n", .{s});
@@ -423,7 +432,7 @@ pub fn main() !void {
             }
         },
         .eval => {
-            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats);
+            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats, args.module);
         },
         .interactive => {
             try runRepl(allocator, args.interp);
@@ -444,7 +453,7 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer allocator.free(cjs_wrapped);
-            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats);
+            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats, args.module);
         },
     }
 }
@@ -610,6 +619,14 @@ test "parseArgs --run-bytecode" {
     const a = parseArgs(&argv);
     try std.testing.expectEqual(Mode.run_bytecode, a.mode);
     try std.testing.expectEqualStrings("out.jbc", a.run_bc_path);
+}
+
+test "parseArgs --module implies bc" {
+    const argv = [_][]const u8{ "mod.js", "--module" };
+    const a = parseArgs(&argv);
+    try std.testing.expect(a.module);
+    try std.testing.expectEqual(Mode.script, a.mode);
+    try std.testing.expectEqual(jsz.InterpMode.bc, a.interp);
 }
 
 test "parseArgs --jit=count implies bc" {

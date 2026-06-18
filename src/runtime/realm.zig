@@ -9,6 +9,11 @@ const Value = val_mod.Value;
 const obj_mod = @import("../object/object.zig");
 const JsObject = @import("../object/object.zig").JsObject;
 const Heap = @import("../gc/heap.zig").Heap;
+// Milestone 16 (ESM) — Phase 1 module records.
+const module_mod = @import("./module.zig");
+pub const ModuleRecord = module_mod.ModuleRecord;
+pub const ModuleRegistry = module_mod.ModuleRegistry;
+pub const ModuleStatus = module_mod.ModuleStatus;
 
 // Phase 4b builtin modules
 const string_proto_mod = @import("./builtins/string_proto.zig");
@@ -112,6 +117,46 @@ pub const Context = struct {
         return self.set_proto_fn(self.ptr, arena, obj_val, proto);
     }
 };
+
+/// Milestone 16 (ESM) — Phase 1: evaluate a registered module through the
+/// active VM `Context`, driving the spec resolve→link→evaluate lifecycle on its
+/// `ModuleRecord`.
+///
+/// Phase 1 reuses the import/export → CommonJS `require`/`exports` desugaring
+/// already produced by `Parser.parseModule`, so "linking" is whatever the
+/// `__modules__` registry + `require()` resolver perform at runtime; this
+/// function owns the record's status transitions, dedup (an already-`evaluated`
+/// record returns its cached namespace), cyclic-import guarding (a re-entered
+/// `.evaluating` record returns its partial namespace rather than re-running),
+/// and error capture. `rec.source` is evaluated as module code via the host
+/// `Context.evalSource` re-entry point.
+pub fn evalModule(
+    ctx: *Context,
+    arena: std.mem.Allocator,
+    registry: *ModuleRegistry,
+    entry_id: []const u8,
+) anyerror!Value {
+    const rec = registry.get(entry_id) orelse return error.ModuleNotFound;
+    switch (rec.status) {
+        .evaluated => return rec.namespace,
+        // Cyclic re-entry: hand back the in-progress namespace (partial exports).
+        .evaluating => return rec.namespace,
+        .errored => {
+            pending_exception = rec.eval_error;
+            return error.JsException;
+        },
+        else => {},
+    }
+    rec.status = .evaluating;
+    const result = ctx.evalSource(arena, rec.source) catch |err| {
+        rec.status = .errored;
+        rec.eval_error = pending_exception;
+        return err;
+    };
+    rec.namespace = result;
+    rec.status = .evaluated;
+    return result;
+}
 
 /// Thread-local pointer to the currently active Context (set by VMs at eval entry).
 pub var active_context: ?*Context = null;
@@ -1887,6 +1932,42 @@ test "Realm: Object.create in env" {
     const obj_val = try realm.global_env.lookup("Object");
     try std.testing.expect(obj_val.bits != 0);
     try std.testing.expect(obj_val.unbox() == .object);
+}
+
+test "evalModule: cached/cyclic/errored records short-circuit without re-running" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A Context whose callbacks are never reached on these early-return paths;
+    // if evalModule wrongly called eval_fn the undefined pointer would trap.
+    var ctx: Context = undefined;
+    var reg = ModuleRegistry.init(arena);
+
+    // Unknown id → ModuleNotFound.
+    try std.testing.expectError(error.ModuleNotFound, evalModule(&ctx, arena, &reg, "missing"));
+
+    // Already-evaluated → returns the cached namespace.
+    const done = try reg.getOrCreate("done", "x");
+    done.status = .evaluated;
+    done.namespace = Value{ .bits = 42 };
+    const got = try evalModule(&ctx, arena, &reg, "done");
+    try std.testing.expectEqual(@as(u64, 42), got.bits);
+
+    // Cyclic re-entry (status == .evaluating) → returns the partial namespace.
+    const cyc = try reg.getOrCreate("cyc", "x");
+    cyc.status = .evaluating;
+    cyc.namespace = Value{ .bits = 7 };
+    const partial = try evalModule(&ctx, arena, &reg, "cyc");
+    try std.testing.expectEqual(@as(u64, 7), partial.bits);
+
+    // Errored → re-raises as a JS exception with the captured value.
+    const bad = try reg.getOrCreate("bad", "x");
+    bad.status = .errored;
+    bad.eval_error = Value{ .bits = 99 };
+    pending_exception = Value{};
+    try std.testing.expectError(error.JsException, evalModule(&ctx, arena, &reg, "bad"));
+    try std.testing.expectEqual(@as(u64, 99), pending_exception.bits);
 }
 
 test "Realm: activateHeap migrates protos to heap" {

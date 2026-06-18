@@ -1630,6 +1630,35 @@ pub fn compileProgram(
     return f;
 }
 
+/// Milestone 16 — Phase 1: compile an ES-module top level to a `BcFunction`.
+///
+/// Same lowering as `compileProgram` (top-level program that yields its last
+/// expression-statement value), but module code is strict by spec (§11.2.2):
+/// strictness is forced on regardless of a "use strict" directive, so nested
+/// functions inherit it. The import/export desugar has already happened in the
+/// parser, so the body is plain (strict) statements over `require`/`exports`.
+pub fn compileModule(
+    arena: std.mem.Allocator,
+    program: *const ast.Program,
+    source_name: []const u8,
+) !*BcFunction {
+    last_label_error = null;
+    const f = try compileFunctionStrict(
+        arena,
+        source_name,
+        &[_][]const u8{},
+        program.body,
+        null,
+        true, // module code is always strict
+        false,
+        false,
+        true, // top-level program: yield last expression-statement value
+        false, // program is not an arrow
+        null, // program has no rest parameter
+    );
+    return f;
+}
+
 // ---------------------------------------------------------------- tests ---
 
 test "compiler: compile empty program" {
@@ -1639,6 +1668,23 @@ test "compiler: compile empty program" {
     const prog = ast.Program{ .body = &[_]*ast.Node{} };
     const f = try compileProgram(alloc, &prog, "<test>");
     try std.testing.expect(f.arity == 0);
+    try std.testing.expect(f.chunk.code.len > 0);
+}
+
+test "compiler: compileModule is always strict" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parser_mod = @import("../parser/parser.zig");
+    var p = parser_mod.Parser.init("export var x = 1;", alloc);
+    const stmts = switch (p.parseModule()) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast.Program{ .body = stmts, .is_strict = true, .is_module = true };
+    const f = try compileModule(alloc, &prog, "<module-test>");
+    try std.testing.expect(f.is_strict);
     try std.testing.expect(f.chunk.code.len > 0);
 }
 

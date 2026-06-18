@@ -384,6 +384,38 @@ pub const Context = struct {
         };
     }
 
+    /// EXPERIMENTAL (unstable, may change before 1.0).
+    /// Milestone 16 (ESM) — Phase 1: evaluate `source` as ES-module code.
+    /// Module code runs strict (§11.2.2); import/export is desugared onto the
+    /// CommonJS `require`/`exports` model. `source_name` is the module's
+    /// canonical specifier (used as the `ModuleRecord` id and source name).
+    pub fn evalModule(self: *Context, source: []const u8, source_name: []const u8) EvalResult {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        impl.setJitMode(self.jit_mode);
+        impl.setIcStats(self.ic_stats);
+        impl.setLimits(self.limits.mem_bytes, self.limits.gas, self.limits.time_ms);
+        const outcome = impl.evalModule(source, source_name) catch {
+            return EvalResult{ .exception = Exception{
+                .value = Value{},
+                .message = "out of memory",
+                .stack = &[_]StackFrame{},
+            } };
+        };
+        return switch (outcome) {
+            .ok => |v| EvalResult{ .ok = Value{ .bits = v.bits } },
+            .exception => |msg| EvalResult{ .exception = Exception{
+                .value = Value{},
+                .message = msg,
+                .stack = &[_]StackFrame{},
+            } },
+            .parse_error => |pe| EvalResult{ .parse_error = ParseError{
+                .message = pe.message,
+                .line = pe.line,
+                .column = pe.column,
+            } },
+        };
+    }
+
     /// STABLE (1.0).
     /// Trigger a manual mark-sweep GC cycle.
     /// Returns cumulative heap stats after the cycle.

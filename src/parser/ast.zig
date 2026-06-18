@@ -293,6 +293,10 @@ pub const Program = struct {
     body: []*Node,
     is_generator: bool = false,
     is_strict: bool = false,
+    /// True when this program is ES-module code (`parseModule`). Module code is
+    /// always strict (§11.2.2); kept distinct from `is_strict` so the compiler
+    /// can apply module-only semantics later without inferring it from strict.
+    is_module: bool = false,
 };
 
 pub const BlockStmt = struct {
