@@ -201,9 +201,17 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     const class_name = name_tok.value_str;
 
     var super_name: ?[]const u8 = null;
+    // When the heritage is a non-identifier expression (e.g. `extends fn(await x)`),
+    // store it here and emit `var __super__ = <expr>;` before the class body.
+    var heritage_expr: ?*Node = null;
     if (p.match(.kw_extends)) {
-        const s = p.expect(.identifier) orelse return null;
-        super_name = s.value_str;
+        const heritage = p.parseCallMemberExpr() orelse return null;
+        if (heritage.kind == .identifier) {
+            super_name = heritage.data.identifier;
+        } else {
+            super_name = "__super__";
+            heritage_expr = heritage;
+        }
     }
 
     _ = p.expect(.left_brace) orelse return null;
@@ -245,6 +253,12 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     }
 
     var out = std.ArrayList(*Node){};
+    if (heritage_expr) |he| {
+        const hv = p.makeNode(.var_decl, start, start, .{
+            .var_decl = .{ .kind = .var_, .name = "__super__", .init = he },
+        }) orelse return null;
+        out.append(p.arena, hv) catch return null;
+    }
 
     var ctor_body_effective = ctor_body;
     if (super_name) |sname| {
@@ -437,9 +451,15 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
     } else synthetic_name;
 
     var super_name: ?[]const u8 = null;
+    var heritage_expr: ?*Node = null;
     if (p.match(.kw_extends)) {
-        const s = p.expect(.identifier) orelse return null;
-        super_name = s.value_str;
+        const heritage = p.parseCallMemberExpr() orelse return null;
+        if (heritage.kind == .identifier) {
+            super_name = heritage.data.identifier;
+        } else {
+            super_name = "__super__";
+            heritage_expr = heritage;
+        }
     }
 
     _ = p.expect(.left_brace) orelse return null;
@@ -528,6 +548,12 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
         const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
         const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
         var fn_body = std.ArrayList(*Node){};
+        if (heritage_expr) |he| {
+            const hv = p.makeNode(.var_decl, start, start, .{
+                .var_decl = .{ .kind = .var_, .name = "__super__", .init = he },
+            }) orelse return null;
+            fn_body.append(p.arena, hv) catch return null;
+        }
 
         const ctor_fn = p.makeNode(.function_expr, start, start, .{
             .function_expr = .{ .name = null, .params = ctor_params, .body = ctor_body_effective, .is_arrow = false },

@@ -987,15 +987,22 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 key = s;
             }
         } else {
-            if (!p.had_error) {
-                p.had_error = true;
-                p.error_info = parser_file.ParseError{
-                    .message = "expected property key",
-                    .line = p.current.line,
-                    .column = p.current.column,
-                };
+            // Reserved words are valid IdentifierNames as property keys (ES5+).
+            const kn = @tagName(p.current.kind);
+            if (kn.len > 3 and std.mem.eql(u8, kn[0..3], "kw_")) {
+                key = kn[3..];
+                _ = p.advance();
+            } else {
+                if (!p.had_error) {
+                    p.had_error = true;
+                    p.error_info = parser_file.ParseError{
+                        .message = "expected property key",
+                        .line = p.current.line,
+                        .column = p.current.column,
+                    };
+                }
+                return null;
             }
-            return null;
         }
         // Accessor: `get name(...) { ... }` / `set name(v) { ... }`.
         // `key` holds "get"/"set"; an accessor only if a property name follows
