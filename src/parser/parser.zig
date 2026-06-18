@@ -394,6 +394,17 @@ pub const Parser = struct {
     /// Turn a `export let/var name = E` into the live form: seed `exports.name = E`,
     /// drop the snapshot assignment, and rewrite all `name` use-sites to `exports.name`.
     pub fn makeExportLive(self: *Parser, stmts: []*Node, name: []const u8) void {
+        // If the only binding for `name` is a function declaration (not a var/let/const),
+        // the snapshot `exports.name = name` is sufficient — function declarations are
+        // hoisted so the snapshot always captures the correct value. Skip live rewriting
+        // to avoid `exports.name = exports.name` circularity.
+        var has_var_decl = false;
+        var has_func_decl = false;
+        for (stmts) |s| {
+            if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, name)) has_var_decl = true;
+            if (s.kind == .function_decl and std.mem.eql(u8, s.data.function_decl.name, name)) has_func_decl = true;
+        }
+        if (has_func_decl and !has_var_decl) return;
         for (stmts) |s| {
             if (isSnapshotAssign(s, name)) {
                 s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };

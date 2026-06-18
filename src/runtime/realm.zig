@@ -1541,6 +1541,7 @@ pub const Realm = struct {
                 const values_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectValues);
                 try ctor_obj.set("keys", keys_fn);
                 try ctor_obj.set("values", values_fn);
+                try ctor_obj.set("assign", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectAssign));
                 const entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectEntries);
                 try ctor_obj.set("entries", entries_fn);
                 const from_entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFromEntries);

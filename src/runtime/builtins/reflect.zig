@@ -11,6 +11,7 @@ const fp = @import("function_proto.zig");
 const intrinsics = @import("intrinsics.zig");
 const typed_array = @import("typed_array.zig");
 const proxy_mod = @import("proxy.zig");
+const namespace_mod = @import("namespace.zig");
 
 /// R1: create the Reflect namespace object and bind the `Reflect` global.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -125,6 +126,12 @@ pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value)
             if (!typed_array.isValidIntegerIndex(td, idx_f)) return val_mod.makeUndefined(arena);
             return typed_array.taLoad(arena, td, @intFromFloat(idx_f));
         }
+    }
+
+    // M16: Module Namespace exotic [[Get]] — reads current value from backing exports.
+    if (target_obj.internal_kind == .module_namespace) {
+        const b = namespace_mod.backing(target_obj) orelse return val_mod.makeUndefined(arena);
+        return b.get(k) orelse val_mod.makeUndefined(arena);
     }
 
     if (target_obj.findProperty(k)) |found| {
@@ -331,6 +338,11 @@ pub fn nativeReflectDeleteProperty(arena: std.mem.Allocator, _: Value, args: []c
             return val_mod.makeBool(arena, !typed_array.isValidIntegerIndex(td, idx_f));
         }
         // Non-canonical key: fall through to ordinary deleteOwn.
+    }
+
+    // M16: Module Namespace exotic [[Delete]] — export names are non-configurable.
+    if (target_obj.internal_kind == .module_namespace) {
+        return val_mod.makeBool(arena, !namespace_mod.hasExport(target_obj, k));
     }
 
     return val_mod.makeBool(arena, try target_obj.deleteOwn(k));

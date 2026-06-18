@@ -100,6 +100,25 @@ pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Valu
     return val_mod.makeObject(arena, arr);
 }
 
+/// ES2015 Object.assign(target, ...sources): copy enumerable own properties.
+pub fn nativeObjectAssign(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) {
+        if (args.len > 0) return args[0];
+        return try val_mod.makeUndefined(arena);
+    }
+    const target_obj = args[0].toPtr().object;
+    for (args[1..]) |src| {
+        if (src.bits == 0 or src.unbox() != .object) continue;
+        const src_obj = src.toPtr().object;
+        for (src_obj.ownKeys()) |k| {
+            if (!src_obj.isEnumerable(k)) continue;
+            const v = src_obj.getOwn(k) orelse continue;
+            try target_obj.set(k, v);
+        }
+    }
+    return args[0];
+}
+
 /// ES2017 Object.entries(o): array of [key, value] pairs.
 pub fn nativeObjectEntries(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");

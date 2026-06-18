@@ -47,7 +47,8 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
         ns_name = t.value_str;
     } else if (p.match(.left_brace)) {
         while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
-            const imp = p.expect(.identifier) orelse return null;
+            // Import name may be identifier, keyword, or string literal (ES2022).
+            const imp = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
             var local = imp.value_str;
             if (p.matchContextual("as")) {
                 const lt = p.expect(.identifier) orelse return null;
@@ -97,15 +98,49 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
         return p.mkExportAssign("default", expr);
     }
 
+    // export * [as ns] from "mod"  — re-export all (or as namespace).
+    if (p.match(.star)) {
+        if (p.matchContextual("as")) {
+            // export * as ns from "mod" → exports.ns = __makeNamespace__(require("mod"))
+            // ns may be an identifier, keyword, or string literal (ES2022).
+            const ns_tok = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
+            if (!p.matchContextual("from")) return p.fail("expected 'from' after export * as");
+            const mod_tok = p.expect(.string) orelse return null;
+            p.consumeSemicolon();
+            const req = p.mkRequire(mod_tok.value_str) orelse return null;
+            const ns_val = p.mkCall1("__makeNamespace__", req) orelse return null;
+            return p.mkExportAssign(ns_tok.value_str, ns_val);
+        } else {
+            // export * from "mod" → Object.assign(exports, require("mod"))
+            if (!p.matchContextual("from")) return p.fail("expected 'from' after export *");
+            const mod_tok = p.expect(.string) orelse return null;
+            p.consumeSemicolon();
+            const req = p.mkRequire(mod_tok.value_str) orelse return null;
+            const obj_id = p.mkIdent("Object") orelse return null;
+            const assign_fn = p.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = obj_id, .property = p.mkIdent("assign") orelse return null, .computed = false },
+            }) orelse return null;
+            const exports_id = p.mkIdent("exports") orelse return null;
+            var aa = std.ArrayList(*Node){};
+            aa.append(p.arena, exports_id) catch return null;
+            aa.append(p.arena, req) catch return null;
+            const call = p.makeNode(.call_expr, start, start, .{
+                .call_expr = .{ .callee = assign_fn, .args = aa.items },
+            }) orelse return null;
+            return p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = call });
+        }
+    }
+
     // export { a, b as c } [from "mod"];
+    // Specifier names may be identifiers, keywords, or string literals (ES2022).
     if (p.match(.left_brace)) {
         const Spec = struct { local: []const u8, exported: []const u8 };
         var specs = std.ArrayList(Spec){};
         while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
-            const l = p.expect(.identifier) orelse return null;
+            const l = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
             var exported = l.value_str;
             if (p.matchContextual("as")) {
-                const e = p.expect(.identifier) orelse return null;
+                const e = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
                 exported = e.value_str;
             }
             specs.append(p.arena, .{ .local = l.value_str, .exported = exported }) catch return null;
