@@ -25,6 +25,7 @@ const coercion = @import("../runtime/builtins/coercion.zig");
 const function_proto = @import("../runtime/builtins/function_proto.zig");
 const proxy_mod = @import("../runtime/builtins/proxy.zig");
 const typed_array = @import("../runtime/builtins/typed_array.zig");
+const namespace_mod = @import("../runtime/builtins/namespace.zig");
 // R2: opcode handlers extracted from runLoop, grouped by category.
 const load_ops = @import("ops/load.zig");
 const jump_ops = @import("ops/jump.zig");
@@ -1176,6 +1177,11 @@ pub const BcVm = struct {
         }
         // String key.
         const key = try valueToStringArena(self.arena, key_v);
+        // M16: Module Namespace exotic [[HasProperty]] — string keys are exactly
+        // the exported names (null prototype, so no inherited keys).
+        if (root_obj.internal_kind == .module_namespace) {
+            return namespace_mod.hasExport(root_obj, key);
+        }
         var cur: ?*JsObject = root_obj;
         var depth: usize = 0;
         while (cur) |o| {
@@ -1235,6 +1241,11 @@ pub const BcVm = struct {
             return obj.deleteOwnSym(key_v);
         }
         const key = try valueToStringArena(self.arena, key_v);
+        // M16: Module Namespace exotic [[Delete]] — an exported name cannot be
+        // deleted (false → strict caller throws); a non-export "succeeds".
+        if (obj.internal_kind == .module_namespace) {
+            return !namespace_mod.hasExport(obj, key);
+        }
         return obj.deleteOwn(key);
     }
 
@@ -1343,6 +1354,13 @@ pub const BcVm = struct {
                         if (!typed_array.isValidIntegerIndex(td, idx_f)) return val_mod.makeUndefined(self.arena);
                         return typed_array.taLoad(self.arena, td, @intFromFloat(idx_f));
                     }
+                }
+                // M16: Module Namespace exotic [[Get]] — a string key resolves to
+                // the named export's *current* value (live), undefined otherwise.
+                if (obj.internal_kind == .module_namespace) {
+                    const b = namespace_mod.backing(obj) orelse return val_mod.makeUndefined(self.arena);
+                    if (!b.hasOwn(key)) return val_mod.makeUndefined(self.arena);
+                    return try self.getProp(try val_mod.makeObject(self.arena, b), key);
                 }
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength()));
@@ -1535,6 +1553,9 @@ pub const BcVm = struct {
                     const key_v = try val_mod.makeString(self.arena, key);
                     return try self.proxySet(obj_val, obj, key_v, value, receiver);
                 }
+                // M16: Module Namespace exotic [[Set]] always fails (the strict
+                // module caller turns the false return into a TypeError).
+                if (obj.internal_kind == .module_namespace) return false;
                 // M15: integer-indexed TypedArray element write (exotic). Coerce the
                 // value (ToNumber/ToBigInt) then store; out-of-bounds is a silent
                 // no-op and indexed keys never create ordinary properties.

@@ -185,6 +185,9 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
 
+    // M16: Module Namespace exotic [[Set]] always fails.
+    if (target_obj.internal_kind == .module_namespace) return val_mod.makeBool(arena, false);
+
     // M15: TypedArray integer-indexed exotic [[Set]](P, V, Receiver).
     const receiver = if (args.len > 3) args[3] else target;
     if (target_obj.internal_kind == .typed_array) {
@@ -268,6 +271,12 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
     }
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
+
+    // M16: Module Namespace exotic [[HasProperty]] — string keys are exactly the
+    // exported names (null prototype, no inherited keys).
+    if (target_obj.internal_kind == .module_namespace) {
+        return val_mod.makeBool(arena, @import("namespace.zig").hasExport(target_obj, k));
+    }
 
     // M15: TypedArray [[HasProperty]] — integer-indexed exotic.
     if (target_obj.internal_kind == .typed_array) {

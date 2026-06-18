@@ -304,6 +304,13 @@ pub const Parser = struct {
         args.append(self.arena, arg) catch return null;
         return self.makeNode(.call_expr, self.current.start, self.current.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
     }
+    /// Build a one-argument call `callee_name(arg)` (e.g. `__makeNamespace__(x)`).
+    pub fn mkCall1(self: *Parser, callee_name: []const u8, arg: *Node) ?*Node {
+        const callee = self.mkIdent(callee_name) orelse return null;
+        var args = std.ArrayList(*Node){};
+        args.append(self.arena, arg) catch return null;
+        return self.makeNode(.call_expr, self.current.start, self.current.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+    }
     pub fn mkVar(self: *Parser, name: []const u8, init_node: *Node) ?*Node {
         return self.makeNode(.var_decl, self.current.start, self.current.start, .{ .var_decl = .{ .kind = .var_, .name = name, .init = init_node } });
     }
@@ -393,7 +400,15 @@ pub const Parser = struct {
                     const asn = self.makeNode(.assignment_expr, s.start, s.start, .{ .assignment_expr = .{ .op = .assign, .target = tgt, .value = init_node } }) orelse continue;
                     s.* = Node{ .kind = .expr_stmt, .start = s.start, .end = s.end, .data = .{ .expr_stmt = asn } };
                 } else {
-                    s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
+                    // `export var/let x;` with no initializer still creates the
+                    // exported binding (value undefined) so it appears in the
+                    // module namespace's keys: rewrite to `exports.x = undefined`.
+                    const obj = self.makeNode(.identifier, s.start, s.start, .{ .identifier = "exports" }) orelse continue;
+                    const p = self.makeNode(.identifier, s.start, s.start, .{ .identifier = name }) orelse continue;
+                    const tgt = self.makeNode(.member_expr, s.start, s.start, .{ .member_expr = .{ .object = obj, .property = p, .computed = false } }) orelse continue;
+                    const undef = self.makeNode(.identifier, s.start, s.start, .{ .identifier = "undefined" }) orelse continue;
+                    const asn = self.makeNode(.assignment_expr, s.start, s.start, .{ .assignment_expr = .{ .op = .assign, .target = tgt, .value = undef } }) orelse continue;
+                    s.* = Node{ .kind = .expr_stmt, .start = s.start, .end = s.end, .data = .{ .expr_stmt = asn } };
                 }
             }
         }

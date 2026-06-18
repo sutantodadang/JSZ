@@ -7,6 +7,7 @@ const obj_mod = @import("../../object/object.zig");
 const JsObject = obj_mod.JsObject;
 const PropAttr = obj_mod.PropAttr;
 const proxy_mod = @import("proxy.zig");
+const namespace_mod = @import("namespace.zig");
 
 /// Object.keys(o): returns array of own enumerable string property names.
 pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
@@ -18,6 +19,19 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
         return val_mod.makeObject(arena, arr);
     }
     const obj = args[0].toPtr().object;
+
+    // M16: Module Namespace — enumerable own string keys are the exported names,
+    // sorted by code unit.
+    if (obj.internal_kind == .module_namespace) {
+        var pi: u32 = 0;
+        for (try namespace_mod.sortedNames(arena, obj)) |k| {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{pi});
+            try arr.set(idx_key, try val_mod.makeString(arena, k));
+            pi += 1;
+        }
+        arr.array_length = pi;
+        return val_mod.makeObject(arena, arr);
+    }
 
     // Proxy: ownKeys trap (string keys only for Object.keys).
     if (obj.internal_kind == .proxy) {
@@ -206,6 +220,11 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
         }
     }
 
+    // M16: Module Namespace own string keys are exactly the exported names.
+    if (obj.internal_kind == .module_namespace) {
+        return val_mod.makeBool(arena, namespace_mod.hasExport(obj, key));
+    }
+
     return val_mod.makeBool(arena, obj.hasOwn(key));
 }
 
@@ -230,6 +249,10 @@ pub fn nativePropertyIsEnumerable(arena: std.mem.Allocator, this_val: Value, arg
             const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
             return val_mod.makeBool(arena, ta_mod.isValidIntegerIndex(td, idx_f));
         }
+    }
+    // M16: Module Namespace exported names are own + enumerable.
+    if (obj.internal_kind == .module_namespace) {
+        return val_mod.makeBool(arena, namespace_mod.hasExport(obj, key));
     }
     if (!obj.hasOwn(key)) return val_mod.makeBool(arena, false);
     const a = obj.ownAttr(key) orelse return val_mod.makeBool(arena, false);
@@ -335,6 +358,14 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
             else => null,
         };
     };
+    // M16: Module Namespace [[SetPrototypeOf]] is SetImmutablePrototype — only a
+    // no-op to null succeeds; any other target throws (Object.setPrototypeOf).
+    if (target.bits != 0 and target.unbox() == .object and
+        target.toPtr().object.internal_kind == .module_namespace)
+    {
+        if (new_proto == null) return target;
+        return throwTypeError(arena, "cannot set prototype of a module namespace object");
+    }
     if (target.bits != 0) {
         if (target.unbox() == .object) {
             target.toPtr().object.proto = new_proto;
@@ -371,6 +402,19 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
     }
     if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
     const obj = args[0].toPtr().object;
+
+    // M16: Module Namespace [[OwnPropertyKeys]] — exported names sorted by code
+    // unit (symbol keys are excluded from getOwnPropertyNames).
+    if (obj.internal_kind == .module_namespace) {
+        var pi: u32 = 0;
+        for (try namespace_mod.sortedNames(arena, obj)) |k| {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{pi});
+            try arr.set(idx_key, try val_mod.makeString(arena, k));
+            pi += 1;
+        }
+        arr.array_length = pi;
+        return val_mod.makeObject(arena, arr);
+    }
 
     // Proxy: ownKeys trap (all string keys for getOwnPropertyNames).
     if (obj.internal_kind == .proxy) {
@@ -484,6 +528,28 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
             return val_mod.makeObject(arena, desc3);
         }
         // Non-canonical-numeric key: fall through to ordinary property lookup.
+    }
+
+    // M16: Module Namespace exotic [[GetOwnProperty]] for a string key — an
+    // exported name yields { value, writable: true, enumerable: true,
+    // configurable: false }; a non-export yields undefined. (Symbol keys fall
+    // through to the ordinary sym_props branch below — e.g. @@toStringTag.)
+    if (obj.internal_kind == .module_namespace and !(args[1].bits != 0 and args[1].unbox() == .symbol)) {
+        const nkey = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
+        if (!namespace_mod.hasExport(obj, nkey)) return val_mod.makeUndefined(arena);
+        const realm_mod3 = @import("../realm.zig");
+        const b = namespace_mod.backing(obj).?;
+        const value = if (realm_mod3.active_context) |ctx|
+            try ctx.getProp(arena, try val_mod.makeObject(arena, b), nkey)
+        else
+            (b.get(nkey) orelse try val_mod.makeUndefined(arena));
+        const np: ?*JsObject = if (realm_mod3.active_object_proto) |p| p else null;
+        const ndesc = try JsObject.create(arena, np);
+        try ndesc.set("value", value);
+        try ndesc.set("writable", try val_mod.makeBool(arena, true));
+        try ndesc.set("enumerable", try val_mod.makeBool(arena, true));
+        try ndesc.set("configurable", try val_mod.makeBool(arena, false));
+        return val_mod.makeObject(arena, ndesc);
     }
 
     // Symbol-keyed lookup: check sym_props first.

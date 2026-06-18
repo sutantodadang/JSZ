@@ -99,6 +99,186 @@ pub const ModuleRegistry = struct {
     }
 };
 
+// ------------------------------------------------- host filesystem loader ---
+//
+// The spec's `HostResolveImportedModule` + the `InnerModuleLinking` graph walk,
+// realised against the existing import/export → CommonJS `require`/`exports`
+// desugar: rather than build live-binding module environments, we discover the
+// dependency graph from disk, register each reachable module as a factory in a
+// `__modules__` registry, and let the runtime `require()` resolver perform the
+// actual linking/evaluation (cache-before-invoke already gives cyclic safety).
+//
+// The discovery DFS is comment/string/template aware (test262 license and
+// `info:` blocks are full of apostrophes that a naive quote scan mis-pairs).
+
+/// `dirname` for a '/'-separated canonical id ("" when there is no separator).
+pub fn dirnameSlash(id: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, id, '/')) |idx| return id[0..idx];
+    return "";
+}
+
+/// Normalize a '/'-or-'\\'-separated path: drop "."/empty segments, resolve "..".
+pub fn normalizeRel(allocator: std.mem.Allocator, p: []const u8) ![]const u8 {
+    var parts = std.ArrayList([]const u8){};
+    defer parts.deinit(allocator);
+    var it = std.mem.splitAny(u8, p, "/\\");
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            if (parts.items.len > 0) _ = parts.pop();
+            continue;
+        }
+        try parts.append(allocator, seg);
+    }
+    return std.mem.join(allocator, "/", parts.items);
+}
+
+/// Resolve a relative specifier against the importer's canonical id (the spec's
+/// HostResolveImportedModule name-resolution half).
+pub fn resolveSpec(allocator: std.mem.Allocator, importer_id: []const u8, spec: []const u8) ![]const u8 {
+    const base = dirnameSlash(importer_id);
+    const joined = if (base.len == 0)
+        try allocator.dupe(u8, spec)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, spec });
+    return normalizeRel(allocator, joined);
+}
+
+/// Append canonical ids of relative module specifiers found in `src` (resolved
+/// against `importer_id`) to `out`. Skips line/block comments and treats string
+/// and template-literal bodies as opaque, so prose apostrophes/quotes inside
+/// comments cannot be mistaken for specifier delimiters.
+pub fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        // Comments: consume to the comment's end without inspecting contents.
+        if (c == '/' and i + 1 < src.len) {
+            if (src[i + 1] == '/') {
+                i += 2;
+                while (i < src.len and src[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (src[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) : (i += 1) {}
+                i += 2;
+                continue;
+            }
+        }
+        // Template literal: opaque body (nested `${}` substitutions may contain
+        // strings, but they cannot be a top-level import specifier, so skipping
+        // the whole template is safe for discovery).
+        if (c == '`') {
+            i += 1;
+            while (i < src.len and src[i] != '`') : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '"' or c == '\'') {
+            const start = i + 1;
+            var j = start;
+            while (j < src.len and src[j] != c) : (j += 1) {
+                if (src[j] == '\\') j += 1;
+            }
+            if (j <= src.len) {
+                const end = @min(j, src.len);
+                const lit = src[start..end];
+                if (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../")) {
+                    const id = resolveSpec(allocator, importer_id, lit) catch "";
+                    if (id.len > 0) out.append(allocator, id) catch {};
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Read a module file under `base_dir` by canonical id, trying `id` then `id.js`.
+fn readModuleFile(allocator: std.mem.Allocator, base_dir: []const u8, id: []const u8) ?[]const u8 {
+    const max = 10 * 1024 * 1024;
+    const p1 = std.fs.path.join(allocator, &.{ base_dir, id }) catch return null;
+    if (std.fs.cwd().readFileAlloc(allocator, p1, max)) |s| return s else |_| {}
+    const p2 = std.fmt.allocPrint(allocator, "{s}.js", .{p1}) catch return null;
+    if (std.fs.cwd().readFileAlloc(allocator, p2, max)) |s| return s else |_| {}
+    return null;
+}
+
+/// The id used for the bundle entry point (its own relative imports resolve
+/// against `base_dir`, i.e. as if it lived directly in that directory).
+pub const ENTRY_ID = "__entry__";
+
+/// Build a self-contained script: a `__modules__` registry of every relative
+/// module transitively reachable from `entry_src` (read from disk under
+/// `base_dir`), each wrapped as a `function(require, module, exports)` factory
+/// keyed by its canonical id, followed by the entry body. This realises the
+/// link phase: the runtime `require()` resolver evaluates factories on demand
+/// with cache-before-invoke cyclic safety. Modules absent on disk are skipped
+/// (left to resolve — and fail — at runtime, matching a missing dependency).
+///
+/// `entry_id` is the entry module's own canonical id (its `null` form falls
+/// back to `ENTRY_ID`). The entry body is always inlined at top level so its
+/// declarations live in module scope and a parse error in it surfaces directly
+/// (negative parse-phase tests rely on this). When `entry_id` is non-null the
+/// entry's `module` object is *pre-registered* in `__modules__` under that id
+/// before the body runs, so a module that imports itself
+/// (`import * as ns from './self.js'`) — or a cycle resolving back to the entry
+/// — observes the very same live `exports` object rather than a second
+/// evaluation.
+///
+/// Allocations use `gpa`; the returned slice is owned by the caller.
+pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]const u8, entry_src: []const u8) ![]const u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const self_id = entry_id orelse ENTRY_ID;
+    var registry = std.StringArrayHashMap([]const u8).init(arena);
+    var queue = std.ArrayList([]const u8){};
+    scanSpecifiers(entry_src, self_id, &queue, arena);
+    var qi: usize = 0;
+    while (qi < queue.items.len) : (qi += 1) {
+        const id = queue.items[qi];
+        // The entry resolves to itself via the pre-registered `module` (below),
+        // not a disk re-read, so skip its own id here.
+        if (std.mem.eql(u8, id, self_id)) continue;
+        if (registry.contains(id)) continue;
+        const src = readModuleFile(arena, base_dir, id) orelse continue;
+        try registry.put(id, src);
+        scanSpecifiers(src, id, &queue, arena);
+    }
+
+    var sb = std.ArrayList(u8){};
+    errdefer sb.deinit(gpa);
+    try sb.appendSlice(gpa, "var __modules__ = {};\n");
+    var it = registry.iterator();
+    while (it.next()) |e| {
+        try sb.appendSlice(gpa, "__modules__[\"");
+        try sb.appendSlice(gpa, e.key_ptr.*);
+        try sb.appendSlice(gpa, "\"] = function(require, module, exports){\nvar __module_id__ = \"");
+        try sb.appendSlice(gpa, e.key_ptr.*);
+        try sb.appendSlice(gpa, "\";\n");
+        try sb.appendSlice(gpa, e.value_ptr.*);
+        try sb.appendSlice(gpa, "\n};\n");
+    }
+    try sb.appendSlice(gpa, "var module = { exports: {} }; var exports = module.exports;\nvar __module_id__ = \"");
+    try sb.appendSlice(gpa, self_id);
+    try sb.appendSlice(gpa, "\";\n");
+    if (entry_id != null) {
+        // Pre-register the entry so a self-/cyclic `require` returns this exact
+        // (partial) exports object — cache-before-invoke for the entry itself.
+        try sb.appendSlice(gpa, "__modules__[\"");
+        try sb.appendSlice(gpa, self_id);
+        try sb.appendSlice(gpa, "\"] = module;\n");
+    }
+    try sb.appendSlice(gpa, entry_src);
+    return sb.toOwnedSlice(gpa);
+}
+
 // ------------------------------------------------------------------- tests ---
 
 test "ModuleRegistry: getOrCreate dedups by id" {
@@ -127,4 +307,44 @@ test "ModuleRecord: default namespace is the empty sentinel" {
     const rec = ModuleRecord.init("m", "");
     try std.testing.expectEqual(@as(u64, 0), rec.namespace.bits);
     try std.testing.expectEqual(ModuleStatus.unlinked, rec.status);
+}
+
+test "scanSpecifiers: ignores apostrophes/quotes inside comments and templates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\// it's a comment with a 'quote and "another
+        \\/* block: don't be fooled by './fake.js' */
+        \\const t = `template with './also-fake.js' ${x}`;
+        \\import { y } from './real.js';
+        \\export { z } from '../up/real2.js';
+    ;
+    var out: std.ArrayList([]const u8) = .empty;
+    scanSpecifiers(src, "dir/entry.js", &out, a);
+    // Only the two genuine specifiers, resolved against "dir/entry.js".
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("dir/real.js", out.items[0]);
+    try std.testing.expectEqualStrings("up/real2.js", out.items[1]);
+}
+
+test "scanSpecifiers: bare/absolute specifiers are not relative imports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out: std.ArrayList([]const u8) = .empty;
+    scanSpecifiers("import x from 'lodash'; import y from '/abs.js';", ENTRY_ID, &out, a);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "buildBundle: registers reachable factory and pre-registers a self-import entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // No disk fixtures here, so only the entry self-registration is exercised.
+    const out = try buildBundle(a, ".", "self.js", "import * as ns from './self.js'; export var v = 1;");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "var __modules__ = {};") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "__modules__[\"self.js\"] = module;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "var __module_id__ = \"self.js\";") != null);
 }

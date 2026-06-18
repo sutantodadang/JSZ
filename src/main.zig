@@ -467,108 +467,16 @@ pub fn main() !void {
 // nested relative imports resolve against the module's own directory.
 // ---------------------------------------------------------------------------
 
-const entry_id = "__entry__";
-
-fn dirnameSlash(id: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, id, '/')) |idx| return id[0..idx];
-    return "";
-}
-
-/// Normalize a '/'-or-'\\'-separated path: drop "."/empty segments, resolve "..".
-fn normalizeRel(allocator: std.mem.Allocator, p: []const u8) ![]const u8 {
-    var parts = std.ArrayList([]const u8){};
-    defer parts.deinit(allocator);
-    var it = std.mem.splitAny(u8, p, "/\\");
-    while (it.next()) |seg| {
-        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
-        if (std.mem.eql(u8, seg, "..")) {
-            if (parts.items.len > 0) _ = parts.pop();
-            continue;
-        }
-        try parts.append(allocator, seg);
-    }
-    return std.mem.join(allocator, "/", parts.items);
-}
-
-/// Resolve a relative specifier against the importer's canonical id.
-fn resolveSpec(allocator: std.mem.Allocator, importer_id: []const u8, spec: []const u8) ![]const u8 {
-    const base = dirnameSlash(importer_id);
-    const joined = if (base.len == 0)
-        try allocator.dupe(u8, spec)
-    else
-        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, spec });
-    return normalizeRel(allocator, joined);
-}
-
-/// Append canonical ids of relative module specifiers found in `src` (resolved
-/// against `importer_id`) to `out`.
-fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
-    var i: usize = 0;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (c == '"' or c == '\'') {
-            const start = i + 1;
-            var j = start;
-            while (j < src.len and src[j] != c) : (j += 1) {}
-            if (j < src.len) {
-                const lit = src[start..j];
-                if (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../")) {
-                    const id = resolveSpec(allocator, importer_id, lit) catch "";
-                    if (id.len > 0) out.append(allocator, id) catch {};
-                }
-            }
-            i = j;
-        }
-    }
-}
-
-fn readModuleFile(allocator: std.mem.Allocator, base_dir: []const u8, id: []const u8) ?[]const u8 {
-    const max = 10 * 1024 * 1024;
-    const p1 = std.fs.path.join(allocator, &.{ base_dir, id }) catch return null;
-    if (std.fs.cwd().readFileAlloc(allocator, p1, max)) |s| return s else |_| {}
-    const p2 = std.fmt.allocPrint(allocator, "{s}.js", .{p1}) catch return null;
-    if (std.fs.cwd().readFileAlloc(allocator, p2, max)) |s| return s else |_| {}
-    return null;
-}
-
-/// Build the entry source wrapped with a `__modules__` registry of all transitively
-/// reachable relative modules. Modules absent on disk are skipped (resolved at runtime).
+/// Build the entry source wrapped with a `__modules__` registry of all
+/// transitively reachable relative modules (delegates to the shared host
+/// loader in `runtime/module.zig`). Modules absent on disk are skipped
+/// (resolved at runtime). Appends a trailing `module.exports;` so the script's
+/// completion value is the entry module's exports.
 fn buildWrappedScript(gpa: std.mem.Allocator, script_path: []const u8, entry_src: []const u8) ![]const u8 {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
     const base_dir = std.fs.path.dirname(script_path) orelse ".";
-    var registry = std.StringArrayHashMap([]const u8).init(arena);
-    var queue = std.ArrayList([]const u8){};
-    scanSpecifiers(entry_src, entry_id, &queue, arena);
-    var qi: usize = 0;
-    while (qi < queue.items.len) : (qi += 1) {
-        const id = queue.items[qi];
-        if (registry.contains(id)) continue;
-        const src = readModuleFile(arena, base_dir, id) orelse continue;
-        try registry.put(id, src);
-        scanSpecifiers(src, id, &queue, arena);
-    }
-
-    var sb = std.ArrayList(u8){};
-    try sb.appendSlice(gpa, "var __modules__ = {};\n");
-    var it = registry.iterator();
-    while (it.next()) |e| {
-        try sb.appendSlice(gpa, "__modules__[\"");
-        try sb.appendSlice(gpa, e.key_ptr.*);
-        try sb.appendSlice(gpa, "\"] = function(require, module, exports){\nvar __module_id__ = \"");
-        try sb.appendSlice(gpa, e.key_ptr.*);
-        try sb.appendSlice(gpa, "\";\n");
-        try sb.appendSlice(gpa, e.value_ptr.*);
-        try sb.appendSlice(gpa, "\n};\n");
-    }
-    try sb.appendSlice(gpa, "var module = { exports: {} }; var exports = module.exports;\nvar __module_id__ = \"");
-    try sb.appendSlice(gpa, entry_id);
-    try sb.appendSlice(gpa, "\";\n");
-    try sb.appendSlice(gpa, entry_src);
-    try sb.appendSlice(gpa, "\nmodule.exports;");
-    return sb.toOwnedSlice(gpa);
+    const wrapped_src = try std.fmt.allocPrint(gpa, "{s}\nmodule.exports;", .{entry_src});
+    defer gpa.free(wrapped_src);
+    return jsz.module_loader.buildBundle(gpa, base_dir, null, wrapped_src);
 }
 
 test "parseArgs --version" {

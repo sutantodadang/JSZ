@@ -303,6 +303,18 @@ fn hasModuleFlag(source: []const u8) bool {
     return false;
 }
 
+/// True when the source references at least one relative module specifier
+/// ("./…" or "../…"), discovered with the host loader's comment/string-aware
+/// scan. Used to decide whether a module test needs disk-fixture bundling.
+fn hasRelativeImport(source: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var found: std.ArrayList([]const u8) = .empty;
+    jsz.module_loader.scanSpecifiers(source, jsz.module_loader.ENTRY_ID, &found, a);
+    return found.items.len > 0;
+}
+
 /// Collect every non-fixture `.js` test under TEST262_PATH (paths relative to it,
 /// forward-slash normalized). Runnability is decided per-test at run time.
 fn collectFullCorpus(arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {
@@ -348,7 +360,7 @@ fn buildHarnessPrelude(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
-fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool, harness_present: bool) !Outcome {
+fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool, harness_present: bool, test_path: []const u8) !Outcome {
     if (full_mode and !isRunnableFull(source)) return .skip;
     const meta = try parseMeta(allocator, source);
 
@@ -397,8 +409,24 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     defer allocator.free(full_source);
 
     // `flags: [module]` tests must run as ES-module code (strict; import/export).
-    const result = if (hasModuleFlag(source))
-        ctx.evalModule(full_source, "<test262>")
+    // When the test has relative imports, link its dependency graph from disk:
+    // the host loader reads every reachable fixture (relative to the test file's
+    // directory) and bundles them as a `__modules__` registry the runtime
+    // `require()` resolver evaluates. Tests with no relative imports run the
+    // source directly (no prelude injected) to avoid perturbing scope.
+    const is_module = hasModuleFlag(source);
+    var module_bundle: ?[]const u8 = null;
+    defer if (module_bundle) |b| allocator.free(b);
+    if (is_module and hasRelativeImport(full_source)) {
+        const base_dir = std.fs.path.dirname(test_path) orelse ".";
+        // Register the entry under its own filename so self-/cyclic imports
+        // (`import * as ns from './<thisfile>.js'`) resolve to the same record.
+        const entry_id = std.fs.path.basename(test_path);
+        module_bundle = jsz.module_loader.buildBundle(allocator, base_dir, entry_id, full_source) catch null;
+    }
+    const module_src = module_bundle orelse full_source;
+    const result = if (is_module)
+        ctx.evalModule(module_src, "<test262>")
     else
         ctx.eval(full_source, "<test262>");
 
@@ -843,7 +871,7 @@ pub fn main() !void {
             } else |_| {}
         }
 
-        const outcome = try runOneTest(allocator, source, full_mode, harness_present);
+        const outcome = try runOneTest(allocator, source, full_mode, harness_present, full);
 
         // Append the per-test outcome (survives across resumed runs).
         if (results_file) |f| {

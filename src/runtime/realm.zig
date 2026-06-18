@@ -259,6 +259,46 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
     return throwModuleNotFound(arena, name);
 }
 
+/// M16 Phase 2: wrap an imported module's live `exports` object in a Module
+/// Namespace exotic object (ES §10.4.6). Emitted by the `import * as ns`
+/// desugar as `var ns = __makeNamespace__(require('m'))`. A non-object argument
+/// (a malformed/absent module) is returned unchanged.
+pub fn nativeMakeNamespace(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) {
+        if (args.len == 0) return val_mod.makeUndefined(arena);
+        return args[0];
+    }
+    const exports_obj = args[0].toPtr().object;
+    // Idempotent: a namespace passed back in stays the same namespace.
+    if (exports_obj.internal_kind == .module_namespace) return args[0];
+    // GetModuleNamespace: return the cached namespace for this module if one was
+    // already created (stored under a private symbol on the live exports object,
+    // invisible to the namespace's own string keys).
+    if (active_sym_module_ns) |ns_sym| {
+        if (exports_obj.getOwnSym(ns_sym)) |cached| return cached;
+    }
+    const ns = if (active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    ns.internal_kind = .module_namespace;
+    ns.internal_slot = @ptrCast(exports_obj);
+    // @@toStringTag = "Module" (non-writable, non-enumerable, non-configurable),
+    // set before sealing so the append is permitted.
+    if (active_sym_to_string_tag) |tag| {
+        try ns.setSymAttr(tag, try val_mod.makeString(arena, "Module"), .{
+            .writable = false,
+            .enumerable = false,
+            .configurable = false,
+        });
+    }
+    ns.extensible = false;
+    const ns_val = try val_mod.makeObject(arena, ns);
+    // Cache on the exports object so subsequent imports observe the same object.
+    if (active_sym_module_ns) |ns_sym| try exports_obj.setSym(ns_sym, ns_val);
+    return ns_val;
+}
+
 fn throwModuleNotFound(arena: std.mem.Allocator, name: []const u8) !Value {
     const msg = try std.fmt.allocPrint(arena, "Cannot find module '{s}'", .{name});
     const err_obj = if (active_heap) |h|
@@ -372,6 +412,10 @@ pub var active_sym_species: ?Value = null;
 /// as GC-traced symbol-keyed own properties.
 pub var active_sym_proxy_target: ?Value = null;
 pub var active_sym_proxy_handler: ?Value = null;
+/// M16: private symbol caching a module's namespace exotic object on its live
+/// exports object, so GetModuleNamespace returns the *same* object each time
+/// (`import * as a` and `import * as b` of one module compare ===).
+pub var active_sym_module_ns: ?Value = null;
 
 /// Phase 4b: pending JS exception Value (set by JSON.parse on error).
 /// VMs check this after catching error.JsException from a native call.
@@ -1701,6 +1745,7 @@ pub const Realm = struct {
         // ---- ES2015 Proxy ----
         active_sym_proxy_target = try val_mod.makeSymbol(arena, "[[ProxyTarget]]");
         active_sym_proxy_handler = try val_mod.makeSymbol(arena, "[[ProxyHandler]]");
+        active_sym_module_ns = try val_mod.makeSymbol(arena, "[[Module.Namespace]]");
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
         try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
@@ -1892,6 +1937,7 @@ pub const Realm = struct {
         active_sym_to_primitive = null;
         active_sym_to_string_tag = null;
         active_sym_species = null;
+        active_sym_module_ns = null;
         active_sym_proxy_target = null;
         active_sym_proxy_handler = null;
         typed_array_mod.active_arraybuffer_proto = null;

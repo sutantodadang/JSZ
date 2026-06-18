@@ -57,6 +57,40 @@ test "esm: import namespace" {
 }
 
 
+test "esm: import * as ns is a Module Namespace exotic object" {
+    // Null [[Prototype]], non-extensible, @@toStringTag "Module".
+    const v = try evalToBool(std.testing.allocator,
+        "var __modules__={m:({exports:({k:3})})}; import * as ns from 'm';" ++
+        " Object.getPrototypeOf(ns)===null && Object.isExtensible(ns)===false && ns[Symbol.toStringTag]==='Module'");
+    try std.testing.expect(v);
+}
+
+
+test "esm: namespace own keys are the exports, sorted" {
+    const v = try evalToString(std.testing.allocator,
+        "var __modules__={m:({exports:({b:1,a:2,c:3})})}; import * as ns from 'm';" ++
+        " Object.getOwnPropertyNames(ns).join(',')");
+    defer std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("a,b,c", v);
+}
+
+
+test "esm: namespace property descriptor is writable data, non-configurable" {
+    const v = try evalToString(std.testing.allocator,
+        "var __modules__={m:({exports:({k:3})})}; import * as ns from 'm';" ++
+        " var d=Object.getOwnPropertyDescriptor(ns,'k'); d.value+'/'+d.writable+'/'+d.enumerable+'/'+d.configurable");
+    defer std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("3/true/true/false", v);
+}
+
+
+test "esm: two namespaces of the same module are identical (GetModuleNamespace)" {
+    const v = try evalToBool(std.testing.allocator,
+        "var __modules__={m:({exports:({k:3})})}; import * as a from 'm'; import * as b from 'm'; a===b");
+    try std.testing.expect(v);
+}
+
+
 test "esm: re-export from module" {
     const v = try evalToF64(std.testing.allocator, "var exports={}; var __modules__={m:({exports:({a:4})})}; export {a as z} from 'm'; exports.z");
     try std.testing.expectEqual(@as(f64, 4), v);

@@ -67,7 +67,10 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
         p.live_imports.append(p.arena, .{ .name = d, .ns = tmp, .prop = "default" }) catch return null;
     }
     if (ns_name) |n| {
-        out.append(p.arena, p.mkVar(n, p.mkIdent(tmp) orelse return null) orelse return null) catch return null;
+        // `import * as n` → n is a Module Namespace exotic object wrapping the
+        // imported module's live exports (ES §10.4.6), not the exports itself.
+        const ns_val = p.mkCall1("__makeNamespace__", p.mkIdent(tmp) orelse return null) orelse return null;
+        out.append(p.arena, p.mkVar(n, ns_val) orelse return null) catch return null;
     }
     for (named.items) |nb| {
         const m = p.mkMember(p.mkIdent(tmp) orelse return null, nb.imp) orelse return null;

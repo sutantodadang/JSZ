@@ -267,6 +267,12 @@ pub const _regex = @import("./runtime/builtins/regexp.zig");
 /// embedding surface; most users go through `Context.compileSnapshot`/`evalSnapshot`.
 pub const snapshot = @import("./bytecode/snapshot.zig");
 
+/// Milestone 16 (ESM): host filesystem module loader. `buildBundle` discovers
+/// the relative-import dependency graph from disk and wraps it as a `__modules__`
+/// registry the runtime `require()` resolver links/evaluates. Used by the CLI
+/// script loader and the Test262 module-test path.
+pub const module_loader = @import("./runtime/module.zig");
+
 /// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 8: compile `source` and write a bytecode→source JSON source map to
 /// `writer`. Maps each opcode (and nested function literals) back to a
