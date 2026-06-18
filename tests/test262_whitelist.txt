@@ -1,6 +1,7 @@
 # Test262 whitelist (Phase 5 — representative ES5 set via directory globs).
 # Entries ending in '/' are recursively expanded and filtered to pure ES5
 # (es5id present, includes ⊆ {assert.js, sta.js}, no module/raw/async flags).
+# A leading "es6:" also accepts esid tests; "module:" also accepts module-flagged tests.
 # Paths are relative to external/test262/test.
 
 # expressions
@@ -45,6 +46,19 @@ language/statements/return/
 language/statements/throw/
 language/statements/empty/
 language/statements/block/
+
+# M16 Phase 4: top-level-await syntax tests (all module-flagged)
+module:language/module-code/top-level-await/syntax/
+
+# M16 Phase 4: for-await-of noStrict tests (no module/async flags)
+language/statements/for-await-of/escaped-of.js
+language/statements/for-await-of/head-await-using-init.js
+language/statements/for-await-of/head-const-init.js
+language/statements/for-await-of/head-let-init.js
+language/statements/for-await-of/head-var-init.js
+language/statements/for-await-of/let-array-with-newline.js
+language/statements/for-await-of/let-block-with-newline.js
+language/statements/for-await-of/let-identifier-with-newline.js
 
 # built-ins
 built-ins/Math/

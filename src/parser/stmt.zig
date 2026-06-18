@@ -262,7 +262,17 @@ pub fn parseVarDeclStmt(p: *Parser) ?*Node {
 
 pub fn parseLexicalDeclStmt(p: *Parser, kind: ast.VarKind) ?*Node {
     const start = p.current.start;
+    const kw_line = p.current.line;
     _ = p.advance(); // consume let/const
+    // ASI: `let` followed by `{` or `[` on a DIFFERENT line is an expression
+    // statement `let;` in non-strict mode (let is a valid identifier).
+    // `const` has no such ASI case (it is always a declaration).
+    if (kind == .let and p.current.line > kw_line and
+        (p.current.kind == .left_brace or p.current.kind == .left_bracket))
+    {
+        const id = p.makeNode(.identifier, start, start, .{ .identifier = "let" }) orelse return null;
+        return p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = id });
+    }
     return p.parseVarDeclarators(start, kind, true);
 }
 
@@ -321,6 +331,10 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
             }
             const t = p.expect(.identifier) orelse return null;
             names.append(p.arena, t.value_str) catch return null;
+            // Skip optional default value (= expr) — runtime falls back to undefined.
+            if (p.match(.eq)) {
+                _ = p.parseAssignmentExpr();
+            }
             if (!p.match(.comma)) break;
         }
         _ = p.expect(.right_bracket) orelse return null;
@@ -334,6 +348,10 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
                 bind_name = alias.value_str;
             }
             names.append(p.arena, bind_name) catch return null;
+            // Skip optional default value (= expr) — runtime falls back to undefined.
+            if (p.match(.eq)) {
+                _ = p.parseAssignmentExpr();
+            }
             if (!p.match(.comma)) break;
         }
         _ = p.expect(.right_brace) orelse return null;
@@ -445,6 +463,10 @@ pub fn parseDoWhileStmt(p: *Parser) ?*Node {
 pub fn parseForStmt(p: *Parser) ?*Node {
     const start = p.current.start;
     _ = p.advance(); // consume 'for'
+    // `for await (... of ...)`: consume 'await', treat as regular for-of.
+    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await")) {
+        _ = p.advance();
+    }
     _ = p.expect(.left_paren) orelse return null;
 
     // Detect for-in: for (var/let/const x in obj) or for (x in obj)
@@ -794,6 +816,26 @@ pub fn parseThrowStmt(p: *Parser) ?*Node {
     return p.makeNode(.throw_stmt, start, p.current.start, .{ .throw_stmt = argument });
 }
 
+/// Skip a balanced `{...}` or `[...]` destructuring pattern at current position.
+fn skipDestructuringPattern(p: *Parser) void {
+    const open = p.current.kind;
+    const close: @TypeOf(open) = if (open == .left_brace) .right_brace else .right_bracket;
+    var depth: u32 = 1;
+    _ = p.advance(); // consume opening bracket
+    while (!p.check(.eof)) {
+        if (p.current.kind == open) {
+            depth += 1;
+        } else if (p.current.kind == close) {
+            depth -= 1;
+            if (depth == 0) {
+                _ = p.advance(); // consume closing bracket
+                return;
+            }
+        }
+        _ = p.advance();
+    }
+}
+
 pub fn parseTryStmt(p: *Parser) ?*Node {
     const start = p.current.start;
     _ = p.advance(); // consume 'try'
@@ -805,11 +847,19 @@ pub fn parseTryStmt(p: *Parser) ?*Node {
     if (p.check(.kw_catch)) {
         _ = p.advance(); // consume 'catch'
         _ = p.expect(.left_paren) orelse return null;
-        const param_tok = p.expect(.identifier) orelse return null;
+        const catch_param_name: []const u8 = if (p.check(.left_brace) or p.check(.left_bracket)) blk: {
+            // Destructuring catch param: skip balanced pattern, bind exc to temp.
+            const tmp = std.fmt.allocPrint(p.arena, "__catch_{d}", .{start}) catch return null;
+            skipDestructuringPattern(p);
+            break :blk tmp;
+        } else blk: {
+            const tok = p.expect(.identifier) orelse return null;
+            break :blk tok.value_str;
+        };
         _ = p.expect(.right_paren) orelse return null;
         const catch_body = p.parseBlock() orelse return null;
         handler = ast.CatchClause{
-            .param_name = param_tok.value_str,
+            .param_name = catch_param_name,
             .body = catch_body,
         };
     }

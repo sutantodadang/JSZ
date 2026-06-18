@@ -130,7 +130,7 @@ fn frontmatter(source: []const u8) []const u8 {
 /// Eligibility for auto-expansion: pure ES5 (has es5id), no unsupported
 /// harness includes, and no module/raw/async flags. Keeps the auto-grown
 /// set to tests our engine + minimal prelude (assert.js/sta.js) can run.
-fn isEligibleEs5(source: []const u8, allow_es6: bool) bool {
+fn isEligibleEs5(source: []const u8, allow_es6: bool, allow_module: bool) bool {
     const yaml = frontmatter(source);
     if (yaml.len == 0) return false;
     // ES5 (es5id) always; later-spec (esid) only for directories opted in via "es6:".
@@ -141,7 +141,7 @@ fn isEligibleEs5(source: []const u8, allow_es6: bool) bool {
     if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
         const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
         const flags = yaml[fi..line_end];
-        if (std.mem.indexOf(u8, flags, "module") != null) return false;
+        if (std.mem.indexOf(u8, flags, "module") != null and !allow_module) return false;
         if (std.mem.indexOf(u8, flags, "raw") != null) return false;
         if (std.mem.indexOf(u8, flags, "async") != null) return false;
         if (std.mem.indexOf(u8, flags, "CanBlockIsFalse") != null) return false;
@@ -164,7 +164,7 @@ fn isEligibleEs5(source: []const u8, allow_es6: bool) bool {
 
 /// Append all eligible ES5 .js tests under `rel_dir` (relative to TEST262_PATH)
 /// to `out`, with paths allocated from `arena`. Skips _FIXTURE files.
-fn expandDir(arena: std.mem.Allocator, rel_dir: []const u8, allow_es6: bool, out: *std.ArrayList([]const u8)) !void {
+fn expandDir(arena: std.mem.Allocator, rel_dir: []const u8, allow_es6: bool, allow_module: bool, out: *std.ArrayList([]const u8)) !void {
     var path_buf: [512]u8 = undefined;
     const abs_dir = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ TEST262_PATH, rel_dir }) catch return;
     var dir = std.fs.cwd().openDir(abs_dir, .{ .iterate = true }) catch return;
@@ -178,7 +178,7 @@ fn expandDir(arena: std.mem.Allocator, rel_dir: []const u8, allow_es6: bool, out
         var full_buf: [768]u8 = undefined;
         const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ abs_dir, entry.path }) catch continue;
         const src = std.fs.cwd().readFileAlloc(arena, full, 512 * 1024) catch continue;
-        if (!isEligibleEs5(src, allow_es6)) continue;
+        if (!isEligibleEs5(src, allow_es6, allow_module)) continue;
         // Normalize Windows backslashes in entry.path to forward slashes.
         const norm = try arena.dupe(u8, entry.path);
         for (norm) |*c| {
@@ -191,15 +191,19 @@ fn expandDir(arena: std.mem.Allocator, rel_dir: []const u8, allow_es6: bool, out
 
 /// Expand whitelist entries: entries ending in '/' are directory globs
 /// (recursively expanded, ES5-filtered). A leading "es6:" opts the directory
-/// into also accepting esid (ES2015+) tests. Other entries are kept as-is.
+/// into also accepting esid (ES2015+) tests. A leading "module:" further opts
+/// the directory into including tests with flags: [module] (runs as modules).
+/// Other entries are kept as-is.
 fn expandWhitelist(arena: std.mem.Allocator, raw: []const []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (raw) |entry| {
         if (std.mem.endsWith(u8, entry, "/")) {
-            const allow_es6 = std.mem.startsWith(u8, entry, "es6:");
-            const dir_full = if (allow_es6) entry[4..] else entry;
+            const allow_module = std.mem.startsWith(u8, entry, "module:");
+            const allow_es6 = allow_module or std.mem.startsWith(u8, entry, "es6:");
+            const prefix_len: usize = if (allow_module) "module:".len else if (allow_es6) "es6:".len else 0;
+            const dir_full = entry[prefix_len..];
             const dir = dir_full[0 .. dir_full.len - 1];
-            try expandDir(arena, dir, allow_es6, &out);
+            try expandDir(arena, dir, allow_es6, allow_module, &out);
         } else {
             try out.append(arena, entry);
         }
