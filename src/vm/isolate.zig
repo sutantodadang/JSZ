@@ -256,6 +256,15 @@ pub const IsolateImpl = struct {
         rec.func = main_func;
         rec.status = .linked;
 
+        // M16 Phase 3: point the module-scoped `import.meta` binding at this
+        // module's specifier before evaluation (HostGetImportMetaProperties → url).
+        const realm = try self.ensureRealm(arena);
+        if (realm.global_env.lookup("__import_meta__")) |meta_val| {
+            if (meta_val.bits != 0 and meta_val.unbox() == .object) {
+                try meta_val.toPtr().object.set("url", try val_mod.makeString(arena, module_id));
+            }
+        } else |_| {}
+
         const outcome = try self.runMainBc(arena, main_func);
         switch (outcome) {
             .ok => |v| {
@@ -290,6 +299,9 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__getIterator__", try val_mod.makeNativeFunction(arena, es2015.nativeGetIterator));
         try realm.global_env.define("__makeNamespace__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeNamespace));
         try realm.global_env.define("__iterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeIterStep));
+        // M16 Phase 3: dynamic import() native + the import.meta object binding.
+        try realm.global_env.define("__import__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImport));
+        try realm.global_env.define("__import_meta__", try @import("../runtime/realm.zig").makeImportMeta(arena, ""));
 
         try realm.registerRoots();
         self.realm = realm;

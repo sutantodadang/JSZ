@@ -14,6 +14,12 @@ const NodeKind = ast.NodeKind;
 
 pub fn parseImportDecl(p: *Parser) ?*Node {
     const start = p.current.start;
+    // M16 Phase 3: `import(` (dynamic import) and `import.meta` are expressions,
+    // not import declarations — route them through expression-statement parsing.
+    const nxt = p.peekNext().kind;
+    if (nxt == .left_paren or nxt == .dot) {
+        return p.parseExprStmt();
+    }
     _ = p.advance(); // import
 
     // import "mod";  (side-effect only)

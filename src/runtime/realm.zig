@@ -299,6 +299,47 @@ pub fn nativeMakeNamespace(arena: std.mem.Allocator, _: Value, args: []const Val
     return ns_val;
 }
 
+/// M16 Phase 3: dynamic `import(specifier)`. Desugared by the parser to a call
+/// `__import__(specifier)`. Resolves and loads the module through the same
+/// `__modules__` registry + `require()` resolver used by static imports, wraps
+/// the resulting live `exports` in a Module Namespace exotic object, and hands
+/// back a Promise (ES §16.2.1.8 ImportCall): fulfilled with the namespace, or
+/// rejected with whatever the resolve/evaluation threw. The specifier argument
+/// is already evaluated by the VM before this native runs, so an abrupt
+/// specifier expression propagates synchronously (never as a rejection).
+pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    // Load the module like `require()`. A resolution/evaluation throw is captured
+    // and turned into a rejected promise rather than propagated synchronously.
+    const exports_val = nativeRequire(arena, Value{}, args) catch |err| {
+        if (err == error.JsException) {
+            const reason = pending_exception;
+            pending_exception = Value{};
+            return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{reason});
+        }
+        return err;
+    };
+    const ns = try nativeMakeNamespace(arena, Value{}, &[_]Value{exports_val});
+    // A fresh promise per call (ImportCall NewPromiseCapability) fulfilled with
+    // the namespace. `nativePromiseResolve` only short-circuits for a promise
+    // argument; a namespace is an ordinary object, so a new promise is created.
+    return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{ns});
+}
+
+/// M16 Phase 3: the `import.meta` object (ES §16.2.1.10). Created once per realm
+/// as an ordinary object with a null [[Prototype]] (extensible) carrying the
+/// host `url` property; the parser desugars every `import.meta` to a reference
+/// to the module-scoped `__import_meta__` binding holding this object, so all
+/// references within a module observe the same object. `evalModule` updates
+/// `url` to the active module's specifier before evaluation.
+pub fn makeImportMeta(arena: std.mem.Allocator, url: []const u8) !Value {
+    const obj = if (active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    try obj.set("url", try val_mod.makeString(arena, url));
+    return val_mod.makeObject(arena, obj);
+}
+
 fn throwModuleNotFound(arena: std.mem.Allocator, name: []const u8) !Value {
     const msg = try std.fmt.allocPrint(arena, "Cannot find module '{s}'", .{name});
     const err_obj = if (active_heap) |h|

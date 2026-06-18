@@ -97,6 +97,59 @@ test "esm: re-export from module" {
 }
 
 
+// ---- M16 Phase 3: dynamic import() + import.meta ----
+
+test "esm: dynamic import() resolves to the module namespace" {
+    const v = try evalToF64(std.testing.allocator,
+        "var __modules__={m:({exports:({k:42})})}; var r=0;" ++
+        " import('m').then(function(ns){ r = ns.k; }); __runMicrotasks__(); r");
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+test "esm: dynamic import() result is a Module Namespace exotic object" {
+    const v = try evalToBool(std.testing.allocator,
+        "var __modules__={m:({exports:({k:3})})}; var ok=false;" ++
+        " import('m').then(function(ns){ ok = Object.getPrototypeOf(ns)===null" ++
+        " && ns[Symbol.toStringTag]==='Module' && ns.k===3; }); __runMicrotasks__(); ok");
+    try std.testing.expect(v);
+}
+
+test "esm: dynamic import() returns a fresh Promise each call" {
+    const v = try evalToBool(std.testing.allocator,
+        "var __modules__={m:({exports:({k:1})})}; var p1=import('m'); var p2=import('m');" ++
+        " p1!==p2 && Object.getPrototypeOf(p1)===Promise.prototype");
+    try std.testing.expect(v);
+}
+
+test "esm: dynamic import() of a missing module rejects (no synchronous throw)" {
+    const v = try evalToString(std.testing.allocator,
+        "var __modules__={}; var s='pending';" ++
+        " import('nope').then(function(){ s='fulfilled'; }, function(){ s='rejected'; });" ++
+        " __runMicrotasks__(); s");
+    defer std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("rejected", v);
+}
+
+test "esm: dynamic import() specifier is evaluated synchronously (abrupt propagates)" {
+    // A throwing specifier expression must throw at the call site, not reject.
+    try std.testing.expectError(error.JsException, evalToF64(std.testing.allocator,
+        "var __modules__={}; var o={get s(){ throw 1; }}; import(o.s)"));
+}
+
+test "esm: import.meta is an ordinary object with a url" {
+    const v = try evalToBool(std.testing.allocator,
+        "typeof import.meta==='object' && import.meta!==null" ++
+        " && Object.getPrototypeOf(import.meta)===null" ++
+        " && typeof import.meta.url==='string' && Object.isExtensible(import.meta)");
+    try std.testing.expect(v);
+}
+
+test "esm: import.meta is the same object across references" {
+    const v = try evalToBool(std.testing.allocator,
+        "var a=import.meta; var b=(function(){ return import.meta; })(); a===b && a===import.meta");
+    try std.testing.expect(v);
+}
+
 // ---- Phase 8: factory-form modules (both VMs) + cyclic require safety ----
 
 test "esm: factory module require works in tree+bc" {

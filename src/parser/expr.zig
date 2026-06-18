@@ -760,6 +760,26 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
             _ = p.advance();
             return p.makeNode(.identifier, start, end, .{ .identifier = "super" });
         },
+        .kw_import => {
+            // M16 Phase 3: `import` in expression position is either a dynamic
+            // `import(specifier)` call or the `import.meta` meta-property — never
+            // an import declaration (that path is handled in parseImportDecl).
+            _ = p.advance();
+            if (p.match(.dot)) {
+                const meta = p.expectIdentifierName() orelse return null;
+                if (!std.mem.eql(u8, meta.value_str, "meta")) return p.fail("expected 'meta' after 'import.'");
+                // `import.meta` → the hidden, module-scoped meta object binding.
+                return p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__import_meta__" });
+            }
+            if (p.check(.left_paren)) {
+                // `import(spec)` → `__import__(spec)`: return the native callee and
+                // let parseCallMemberExpr consume the argument list. The argument
+                // is evaluated by the VM before the call, so an abrupt specifier
+                // (throwing getter / bad reference) propagates synchronously.
+                return p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__import__" });
+            }
+            return p.fail("expected '(' or '.' after 'import'");
+        },
         .kw_yield => {
             if (!p.in_generator_function) {
                 if (!p.had_error) {
