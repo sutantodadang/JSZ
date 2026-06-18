@@ -317,7 +317,10 @@ pub const FnCompiler = struct {
                 try self.collectLexicalNames(node.data.for_stmt.body, list);
             },
             .for_in_stmt => {
-                try self.collectLexicalNames(node.data.for_in_stmt.left, list);
+                // Do NOT recurse into for_in_stmt.left — loop-scoped let/const
+                // bindings are per-iteration and should NOT be hoisted to the
+                // enclosing function/module scope. They are initialized directly
+                // by the for-in/for-of lowering via INIT_LEX each iteration.
                 try self.collectLexicalNames(node.data.for_in_stmt.body, list);
             },
             .try_stmt => {
