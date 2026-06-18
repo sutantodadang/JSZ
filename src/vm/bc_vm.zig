@@ -1078,6 +1078,12 @@ pub const BcVm = struct {
             _ = try self.proxySet(obj_val, obj, sym_key, value, obj_val);
             return;
         }
+        // M16: Module Namespace exotic [[Set]] always fails.
+        if (obj.internal_kind == .module_namespace) {
+            const realm_m = @import("../runtime/realm.zig");
+            realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot set property on module namespace object");
+            return error.JsException;
+        }
         try obj.setSym(sym_key, value);
     }
 

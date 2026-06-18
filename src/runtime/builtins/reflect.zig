@@ -169,6 +169,8 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
     const target_obj = target.toPtr().object;
 
     if (isSym(key)) {
+        // M16: Module Namespace exotic [[Set]] always fails for symbol keys too.
+        if (target_obj.internal_kind == .module_namespace) return val_mod.makeBool(arena, false);
         // OrdinarySet for a symbol key: honor accessor setters and the
         // [[Writable]] attribute (a non-writable own data prop → false).
         if (target_obj.getOwnSymEntry(key)) |sp| {
@@ -378,6 +380,24 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
     }
     const obj = args[0].toPtr().object;
 
+    // M16: Module Namespace exotic [[OwnPropertyKeys]] — sorted export names then symbol keys.
+    if (obj.internal_kind == .module_namespace) {
+        const names = try namespace_mod.sortedNames(arena, obj);
+        var ni: u32 = 0;
+        for (names) |name| {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
+            try arr.set(idx_key, try val_mod.makeString(arena, name));
+            ni += 1;
+        }
+        for (obj.symKeys()) |sp| {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
+            try arr.set(idx_key, sp.key);
+            ni += 1;
+        }
+        arr.array_length = ni;
+        return val_mod.makeObject(arena, arr);
+    }
+
     // M15: TypedArray [[OwnPropertyKeys]] — integer indices first, then ordinary, then symbols.
     var ta_count: u32 = 0;
     if (isObj(args[0])) {
@@ -454,6 +474,29 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
 
     const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeBool(arena, false);
     const desc = args[2].toPtr().object;
+
+    // M16: Module Namespace exotic [[DefineOwnProperty]] for string keys (§10.4.6.7).
+    if (target_obj.internal_kind == .module_namespace) {
+        if (!namespace_mod.hasExport(target_obj, k)) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("get") or desc.hasOwn("set")) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("configurable") and descTruthy(desc.getOwn("configurable"))) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("enumerable") and !descTruthy(desc.getOwn("enumerable"))) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("writable") and !descTruthy(desc.getOwn("writable"))) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("value")) {
+            const new_val = desc.getOwn("value") orelse Value{};
+            const b = namespace_mod.backing(target_obj).?;
+            const cur_val = b.get(k) orelse Value{};
+            const same = if (new_val.bits == cur_val.bits)
+                true
+            else if (new_val.bits != 0 and cur_val.bits != 0 and
+                new_val.unbox() == .number and cur_val.unbox() == .number)
+                new_val.unbox().number == cur_val.unbox().number
+            else
+                false;
+            if (!same) return val_mod.makeBool(arena, false);
+        }
+        return val_mod.makeBool(arena, true);
+    }
 
     // M15: TypedArray [[DefineOwnProperty]] — integer-indexed exotic (ES2023
     // §10.4.5.3). Reflect returns false (no throw) on rejection.

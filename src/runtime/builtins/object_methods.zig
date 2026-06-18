@@ -664,6 +664,44 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
 
     const key = (try coerceKey(arena, key_raw)) orelse "";
 
+    // M16: Module Namespace exotic [[DefineOwnProperty]] for string keys (§10.4.6.7).
+    // Symbol keys already went through OrdinaryDefineOwnProperty above.
+    if (obj.internal_kind == .module_namespace) {
+        // Step 3: key must be an export.
+        if (!namespace_mod.hasExport(obj, key))
+            return throwTypeError(arena, "Cannot define property on module namespace object");
+        const ns_desc = if (args.len >= 3 and args[2].bits != 0 and args[2].unbox() == .object)
+            args[2].toPtr().object
+        else
+            null;
+        if (ns_desc) |d| {
+            // Steps 6, 5, 6 (IsAccessorDescriptor), 7, 8.
+            if (d.hasOwn("get") or d.hasOwn("set"))
+                return throwTypeError(arena, "Cannot redefine module namespace export as accessor");
+            if (d.hasOwn("configurable") and descTruthy(d.getOwn("configurable")))
+                return throwTypeError(arena, "Cannot redefine module namespace export as configurable");
+            if (d.hasOwn("enumerable") and !descTruthy(d.getOwn("enumerable")))
+                return throwTypeError(arena, "Cannot redefine module namespace export as non-enumerable");
+            if (d.hasOwn("writable") and !descTruthy(d.getOwn("writable")))
+                return throwTypeError(arena, "Cannot redefine module namespace export as non-writable");
+            if (d.hasOwn("value")) {
+                const new_val = d.getOwn("value") orelse Value{};
+                const b = namespace_mod.backing(obj).?;
+                const cur_val = b.get(key) orelse Value{};
+                // SameValue check: bits-equal covers most cases; for numbers, compare by value.
+                const same = if (new_val.bits == cur_val.bits)
+                    true
+                else if (new_val.bits != 0 and cur_val.bits != 0 and
+                    new_val.unbox() == .number and cur_val.unbox() == .number)
+                    new_val.unbox().number == cur_val.unbox().number
+                else
+                    false;
+                if (!same) return throwTypeError(arena, "Cannot change value of module namespace export");
+            }
+        }
+        return args[0];
+    }
+
     // M15: TypedArray [[DefineOwnProperty]] — integer-indexed exotic.
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
         const ta_mod = @import("typed_array.zig");
