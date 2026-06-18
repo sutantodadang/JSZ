@@ -2644,6 +2644,10 @@ pub const BcVm = struct {
         const ls = isStringOrObject(lp);
         const rs = isStringOrObject(rp);
         if (ls or rs) {
+            // String branch: ? ToString(lprim) / ? ToString(rprim). Unlike the
+            // explicit String() constructor, implicit ToString throws on a Symbol.
+            if (isSymbol(lp) or isSymbol(rp))
+                return self.throwTypeErr("Cannot convert a Symbol value to a string");
             const ls_str = try valueToString(self.arena, lp);
             const rs_str = try valueToString(self.arena, rp);
             const combined = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ ls_str, rs_str });
@@ -2657,7 +2661,15 @@ pub const BcVm = struct {
             if (lbig != rbig) return self.throwTypeErr("Cannot mix BigInt and other types, use explicit conversions");
             return val_mod.bigIntBinary(self.arena, lp, rp, .add);
         }
+        // Numeric branch: ? ToNumber on each operand, which throws on a Symbol.
+        if (isSymbol(lp) or isSymbol(rp))
+            return self.throwTypeErr("Cannot convert a Symbol value to a number");
         return val_mod.makeNumber(self.arena, toNumber(lp) + toNumber(rp));
+    }
+
+    /// True when `v` is a Symbol value.
+    fn isSymbol(v: Value) bool {
+        return v.bits != 0 and v.unbox() == .symbol;
     }
 
     /// True when `v` is a BigInt value.
