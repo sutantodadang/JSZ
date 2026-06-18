@@ -533,6 +533,45 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
                 try writer.print(" K{d}", .{kidx});
             }
         },
+        .HOIST_LEX => {
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
+            const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+            if (kidx < chunk.constants.len and chunk.constants[kidx].bits != 0) {
+                const inner = chunk.constants[kidx].unbox();
+                switch (inner) {
+                    .string => |s| try writer.print(" \"{s}\"", .{s}),
+                    else => try writer.print(" K{d}", .{kidx}),
+                }
+            } else {
+                try writer.print(" K{d}", .{kidx});
+            }
+        },
+        .INIT_LEX => {
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
+            const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+            const rsrc = code[new_pc];
+            new_pc += 1;
+            if (kidx < chunk.constants.len) {
+                const cv = chunk.constants[kidx];
+                if (cv.bits != 0) {
+                    const inner = cv.unbox();
+                    switch (inner) {
+                        .string => |s| try writer.print(" \"{s}\" R{d}", .{ s, rsrc }),
+                        else => try writer.print(" K{d} R{d}", .{ kidx, rsrc }),
+                    }
+                } else {
+                    try writer.print(" K{d} R{d}", .{ kidx, rsrc });
+                }
+            } else {
+                try writer.print(" K{d} R{d}", .{ kidx, rsrc });
+            }
+        },
         .DEFINE_GLOBAL => {
             const lo = code[new_pc];
             new_pc += 1;

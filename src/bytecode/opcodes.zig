@@ -204,6 +204,15 @@ pub const Op = enum(u8) {
     /// current env if it has no own binding yet (var/function-decl hoisting).
     /// Never clobbers a parameter or an already-defined binding.
     HOIST_VAR,
+    /// HOIST_LEX | 3 | op, Kname u16-LE. Declares `name` as an uninitialized
+    /// lexical binding (TDZ) in the current env if it has no own binding yet.
+    /// Used for `let`/`const` declarations and module import bindings.
+    HOIST_LEX,
+    /// INIT_LEX | 4 | op, Kname u16-LE, Rsrc u8. Initializes an existing lexical
+    /// binding `name` in the current env with the value in R[Rsrc], taking it
+    /// out of the Temporal Dead Zone. Used for `let`/`const` assignments at
+    /// their source position.
+    INIT_LEX,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -218,6 +227,8 @@ pub fn instrSize(op: Op) usize {
         .GET_GLOBAL => 4,
         .GET_GLOBAL_OPT => 4,
         .HOIST_VAR => 3,
+        .HOIST_LEX => 3,
+        .INIT_LEX => 4,
         .SET_GLOBAL => 4,
         .GET_LOCAL => 3,
         .SET_LOCAL => 3,

@@ -29,20 +29,38 @@ pub fn lowerVarDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     _ = last_expr_reg;
     const line: u32 = node.start;
     const vd = node.data.var_decl;
-    if (vd.init) |init_node| {
-        const r = try self.compileExpr(init_node);
-        // Phase 4d: var declarations always define (not assign) — use DEFINE_GLOBAL
-        // so strict-mode functions don't throw ReferenceError for var bindings.
-        try self.emitDefine(vd.name, r, line);
-        self.freeReg();
-    } else if (vd.kind != .var_) {
-        // Phase 7 baseline: emit explicit undefined initialization for let.
-        // (TDZ for bc path will be added in a dedicated lexical-scope bytecode pass.)
-        const r = self.allocReg();
-        try self.emitOp(.LOAD_UNDEF, line);
-        try self.emitU8(r);
-        try self.emitDefine(vd.name, r, line);
-        self.freeReg();
+    if (vd.kind == .let or vd.kind == .const_) {
+        // Lexical declaration: the binding was already declared at scope entry
+        // via HOIST_LEX (in TDZ). Now initialize it at its source position.
+        if (vd.init) |init_node| {
+            const r = try self.compileExpr(init_node);
+            try self.emitInitLexical(vd.name, r, line);
+            self.freeReg();
+        } else {
+            // No initializer: initialize with undefined.
+            const r = self.allocReg();
+            try self.emitOp(.LOAD_UNDEF, line);
+            try self.emitU8(r);
+            try self.emitInitLexical(vd.name, r, line);
+            self.freeReg();
+        }
+    } else {
+        // var declaration: use DEFINE_GLOBAL (define-or-assign).
+        if (vd.init) |init_node| {
+            const r = try self.compileExpr(init_node);
+            // Phase 4d: var declarations always define (not assign) — use DEFINE_GLOBAL
+            // so strict-mode functions don't throw ReferenceError for var bindings.
+            try self.emitDefine(vd.name, r, line);
+            self.freeReg();
+        } else if (vd.kind != .var_) {
+            // Phase 7 baseline: emit explicit undefined initialization for let.
+            // (TDZ for bc path will be added in a dedicated lexical-scope bytecode pass.)
+            const r = self.allocReg();
+            try self.emitOp(.LOAD_UNDEF, line);
+            try self.emitU8(r);
+            try self.emitDefine(vd.name, r, line);
+            self.freeReg();
+        }
     }
 }
 

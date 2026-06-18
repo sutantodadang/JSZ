@@ -293,6 +293,48 @@ pub const FnCompiler = struct {
         }
     }
 
+    /// Collect `let`/`const` declaration names reachable at function/script scope
+    /// (recursing through nested statements but NOT into nested function bodies).
+    /// These need HOIST_LEX emitted at scope entry to put them in TDZ.
+    pub fn collectLexicalNames(self: *Self, node: *ast.Node, list: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        switch (node.kind) {
+            .var_decl => {
+                if (node.data.var_decl.kind == .let or node.data.var_decl.kind == .const_) {
+                    try self.addHoistName(list, node.data.var_decl.name);
+                }
+            },
+            .block_stmt => {
+                for (node.data.block_stmt.body) |c| try self.collectLexicalNames(c, list);
+            },
+            .if_stmt => {
+                try self.collectLexicalNames(node.data.if_stmt.consequent, list);
+                if (node.data.if_stmt.alternate) |a| try self.collectLexicalNames(a, list);
+            },
+            .while_stmt => try self.collectLexicalNames(node.data.while_stmt.body, list),
+            .do_while_stmt => try self.collectLexicalNames(node.data.do_while_stmt.body, list),
+            .for_stmt => {
+                if (node.data.for_stmt.init) |i| try self.collectLexicalNames(i, list);
+                try self.collectLexicalNames(node.data.for_stmt.body, list);
+            },
+            .for_in_stmt => {
+                try self.collectLexicalNames(node.data.for_in_stmt.left, list);
+                try self.collectLexicalNames(node.data.for_in_stmt.body, list);
+            },
+            .try_stmt => {
+                try self.collectLexicalNames(node.data.try_stmt.block, list);
+                if (node.data.try_stmt.handler) |h| try self.collectLexicalNames(h.body, list);
+                if (node.data.try_stmt.finalizer) |f| try self.collectLexicalNames(f, list);
+            },
+            .switch_stmt => {
+                for (node.data.switch_stmt.cases) |case| {
+                    for (case.body) |c| try self.collectLexicalNames(c, list);
+                }
+            },
+            .labeled_stmt => try self.collectLexicalNames(node.data.labeled_stmt.body, list),
+            else => {},
+        }
+    }
+
     // --------------------------------------------------------- emit name store ---
 
     pub fn emitStore(self: *Self, name: []const u8, rsrc: u8, line: u32) !void {
@@ -309,6 +351,25 @@ pub const FnCompiler = struct {
         const sv = try val_mod.makeString(self.arena, name);
         const kidx = try self.addConstant(sv);
         try self.emitOp(.DEFINE_GLOBAL, line);
+        try self.emitU16(kidx);
+        try self.emitU8(rsrc);
+    }
+
+    /// Emit a HOIST_LEX for `name` (declares it as an uninitialized lexical
+    /// binding in TDZ at scope entry).
+    pub fn emitHoistLexical(self: *Self, name: []const u8, line: u32) !void {
+        const sv = try val_mod.makeString(self.arena, name);
+        const kidx = try self.addConstant(sv);
+        try self.emitOp(.HOIST_LEX, line);
+        try self.emitU16(kidx);
+    }
+
+    /// Emit an INIT_LEX for `name` (initializes an existing lexical binding
+    /// with R[rsrc], taking it out of TDZ).
+    pub fn emitInitLexical(self: *Self, name: []const u8, rsrc: u8, line: u32) !void {
+        const sv = try val_mod.makeString(self.arena, name);
+        const kidx = try self.addConstant(sv);
+        try self.emitOp(.INIT_LEX, line);
         try self.emitU16(kidx);
         try self.emitU8(rsrc);
     }
@@ -1455,6 +1516,15 @@ pub const FnCompiler = struct {
             var hoisted: std.ArrayList([]const u8) = .empty;
             for (body) |stmt| try self.collectHoistedNames(stmt, &hoisted);
             for (hoisted.items) |name| try self.emitHoist(name, 0);
+        }
+
+        // Lexical hoisting pre-pass: declare every `let`/`const` name as an
+        // uninitialized lexical binding (TDZ) at scope entry, so reads before
+        // initialization throw ReferenceError instead of returning undefined.
+        {
+            var lexical: std.ArrayList([]const u8) = .empty;
+            for (body) |stmt| try self.collectLexicalNames(stmt, &lexical);
+            for (lexical.items) |name| try self.emitHoistLexical(name, 0);
         }
 
         // Function declarations are fully instantiated (closure created AND
