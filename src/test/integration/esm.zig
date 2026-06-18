@@ -97,6 +97,43 @@ test "esm: re-export from module" {
 }
 
 
+// ---- M16 Phase 4: TLA (top-level await desugaring) ----
+
+test "tla: await on a plain value returns the value" {
+    const v = try evalToF64(std.testing.allocator, "__await__(42)");
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+test "tla: await on an already-fulfilled Promise returns its value" {
+    const v = try evalToF64(std.testing.allocator,
+        "var p = Promise.resolve(99); __await__(p)");
+    try std.testing.expectEqual(@as(f64, 99), v);
+}
+
+test "tla: await on a thenable resolves via then()" {
+    const v = try evalToF64(std.testing.allocator,
+        "__await__({ then: function(resolve) { resolve(7); } })");
+    try std.testing.expectEqual(@as(f64, 7), v);
+}
+
+test "tla: await on a rejecting thenable propagates the rejection" {
+    const err = std.testing.expectError(error.JsException,
+        evalToF64(std.testing.allocator,
+            "__await__({ then: function(_, reject) { reject(new Error('boom')); } })"));
+    try err;
+}
+
+test "tla: new await is a SyntaxError in module context" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    switch (ctx.evalModule("new await Promise.resolve(1)", "<test>")) {
+        .parse_error => {},
+        else => return error.ExpectedParseError,
+    }
+}
+
 // ---- M16 Phase 3: dynamic import() + import.meta ----
 
 test "esm: dynamic import() resolves to the module namespace" {

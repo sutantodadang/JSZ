@@ -56,6 +56,9 @@ pub const Parser = struct {
     had_error: bool,
     error_info: ?ParseError,
     in_generator_function: bool,
+    /// M16 Phase 4: true when parsing a module (not a script), so `await` is a
+    /// reserved word and `new await` / `(await x) = y` are early SyntaxErrors.
+    is_module: bool,
     /// Phase 8: statements produced by desugaring ES-module import/export that must be
     /// spliced into the program body after the primary statement (kept at module scope).
     extra_stmts: std.ArrayList(*Node),
@@ -74,6 +77,7 @@ pub const Parser = struct {
             .had_error = false,
             .error_info = null,
             .in_generator_function = false,
+            .is_module = false,
             .extra_stmts = .{},
             .live_imports = .{},
             .live_exports = .{},
@@ -239,6 +243,7 @@ pub const Parser = struct {
     /// `Program{ .is_module = true, .is_strict = true }` from `.ok`. Errors use
     /// the same `ParseResult.err` channel as scripts.
     pub fn parseModule(self: *Parser) ParseResult {
+        self.is_module = true;
         var stmts = std.ArrayList(*Node){};
         const li_start = self.live_imports.items.len;
         const le_start = self.live_exports.items.len;

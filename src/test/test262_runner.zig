@@ -283,10 +283,15 @@ fn isRunnableFull(source: []const u8) bool {
         const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
         const flags = yaml[fi..line_end];
         // `module` is now runnable: M16 routes these through `ctx.evalModule`
-        // (strict, import/export desugared). `raw`/`async`/`CanBlockIsFalse`
-        // still need harness features the single-file runner can't provide.
+        // (strict, import/export desugared). `raw`/`CanBlockIsFalse` still need
+        // harness features the single-file runner can't provide.
+        // M16 Phase 4: `[module, async]` (TLA tests) are now runnable — the
+        // `await` desugaring handles synchronous draining; plain `[async]`
+        // (non-module async scripts) are still skipped.
         if (std.mem.indexOf(u8, flags, "raw") != null) return false;
-        if (std.mem.indexOf(u8, flags, "async") != null) return false;
+        if (std.mem.indexOf(u8, flags, "async") != null) {
+            if (std.mem.indexOf(u8, flags, "module") == null) return false;
+        }
         if (std.mem.indexOf(u8, flags, "CanBlockIsFalse") != null) return false;
     }
     return true;
@@ -402,10 +407,28 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
         "\"use strict\";\n"
     else
         "";
-    const full_source = if (needs_dollar262)
-        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ strict_prefix, DOLLAR262_PRELUDE, prelude, source }) catch return .fail
+    // M16 Phase 4: [module, async] tests (TLA) use $DONE() as the async
+    // completion signal. Define it as a synchronous throw-on-error wrapper;
+    // since our `await` desugaring drains microtasks inline, $DONE() is
+    // always called synchronously before evalModule returns.
+    const is_tla_module = blk: {
+        const yaml = frontmatter(source);
+        if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
+            const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
+            const flags_line = yaml[fi..line_end];
+            break :blk std.mem.indexOf(u8, flags_line, "module") != null and
+                std.mem.indexOf(u8, flags_line, "async") != null;
+        }
+        break :blk false;
+    };
+    const done_prefix: []const u8 = if (is_tla_module)
+        "function $DONE(err) { if (err) throw err; }\n"
     else
-        std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ strict_prefix, prelude, source }) catch return .fail;
+        "";
+    const full_source = if (needs_dollar262)
+        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ strict_prefix, DOLLAR262_PRELUDE, prelude, done_prefix, source }) catch return .fail
+    else
+        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ strict_prefix, prelude, done_prefix, source }) catch return .fail;
     defer allocator.free(full_source);
 
     // `flags: [module]` tests must run as ES-module code (strict; import/export).

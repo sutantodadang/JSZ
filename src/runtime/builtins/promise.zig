@@ -949,9 +949,14 @@ pub fn clearMicrotasks() void {
 }
 
 /// Top-level-await for a single-threaded engine: drain the microtask queue until
-/// the awaited promise settles. Non-promises (and unsettleable pendings) pass through.
+/// the awaited value settles. Plain values, thenables, and actual Promises are
+/// all routed through Promise.resolve() so thenables are assimilated and plain
+/// primitives surface immediately as fulfilled values.
 pub fn awaitValue(arena: std.mem.Allocator, v: Value) anyerror!Value {
-    const data = getData(v) orelse return v;
+    // Promise.resolve(promise) → identity; Promise.resolve(thenable) → calls
+    // then(resolve,reject) synchronously; Promise.resolve(primitive) → fulfilled.
+    const p = nativePromiseResolve(arena, Value{}, &[_]Value{v}) catch return v;
+    const data = getData(p) orelse return v;
     runMicrotasks(arena);
     return switch (data.state) {
         .fulfilled => data.value,

@@ -509,6 +509,13 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
         },
         .kw_new => {
             _ = p.advance();
+            // M16 Phase 4: `await` is reserved in module code; `new await …` is
+            // a SyntaxError per spec (await is not a valid NewExpression callee).
+            if (p.is_module and p.current.kind == .identifier and
+                std.mem.eql(u8, p.current.value_str, "await"))
+            {
+                return p.fail("SyntaxError: 'await' expression cannot follow 'new'");
+            }
             // For `new`, parse only member expressions (no call) as the callee,
             // then optionally consume argument list.
             const callee = p.parseNewCallee() orelse return null;
