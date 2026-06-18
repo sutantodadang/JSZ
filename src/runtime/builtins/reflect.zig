@@ -10,6 +10,7 @@ const PropAttr = obj_mod.PropAttr;
 const fp = @import("function_proto.zig");
 const intrinsics = @import("intrinsics.zig");
 const typed_array = @import("typed_array.zig");
+const proxy_mod = @import("proxy.zig");
 
 /// R1: create the Reflect namespace object and bind the `Reflect` global.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -206,7 +207,17 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
                 try typed_array.setElementThrowing(arena, rtd, idx_f, value);
                 return val_mod.makeBool(arena, true);
             }
-            // Plain object receiver: CreateDataProperty (store V unchanged).
+            // Plain object receiver → OrdinarySet(Receiver, P, V): validate the
+            // receiver's own descriptor before CreateDataProperty. An own
+            // accessor or non-writable own data property fails; a non-extensible
+            // receiver lacking the own property cannot have it created.
+            if (robj.resolveOwnSlot(k)) |slot| {
+                const rattr = robj.attrAt(slot);
+                if (rattr.is_accessor) return val_mod.makeBool(arena, false);
+                if (!rattr.writable) return val_mod.makeBool(arena, false);
+            } else if (!robj.extensible) {
+                return val_mod.makeBool(arena, false);
+            }
             try robj.set(k, value);
             return val_mod.makeBool(arena, true);
         }
@@ -272,6 +283,18 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
     while (cur) |o| {
         if (depth >= 64) break;
         depth += 1;
+        // A Proxy anywhere in the chain (including the root) has its own
+        // [[HasProperty]]: dispatch the `has` trap, else forward to the
+        // target's [[HasProperty]] (which walks the target's own chain).
+        if (o.internal_kind == .proxy) {
+            const handler = proxy_mod.proxyHandler(o) orelse return val_mod.makeBool(arena, false);
+            const target = proxy_mod.proxyTarget(o) orelse return val_mod.makeBool(arena, false);
+            if (proxy_mod.trap(handler, "has")) |trap_fn| {
+                const res = try fp.invokeCallback(arena, handler, trap_fn, &[_]Value{ target, key });
+                return val_mod.makeBool(arena, descTruthy(res));
+            }
+            return nativeReflectHas(arena, .{}, &[_]Value{ target, key });
+        }
         if (o.resolveOwnSlot(k) != null) return val_mod.makeBool(arena, true);
         cur = o.proto;
     }
@@ -340,9 +363,10 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
         const robj = args[0].toPtr().object;
         if (robj.internal_kind == .typed_array and robj.internal_slot != null) {
             const td = typed_array.getTd(args[0]).?;
-            if (!td.ab.detached) {
+            if (!typed_array.taIsOob(td)) {
+                const cur_len = typed_array.taCurrentLen(td);
                 var ti: u32 = 0;
-                while (ti < td.length) : (ti += 1) {
+                while (ti < cur_len) : (ti += 1) {
                     const k_str = try std.fmt.allocPrint(arena, "{d}", .{ti});
                     const idx_key_ta = try std.fmt.allocPrint(arena, "{d}", .{ta_count});
                     try arr.set(idx_key_ta, try val_mod.makeString(arena, k_str));
@@ -430,20 +454,57 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
         const getter: ?Value = if (desc.hasOwn("get")) desc.getOwn("get") else null;
         const setter: ?Value = if (desc.hasOwn("set")) desc.getOwn("set") else null;
         const holder = try makeAccessorHolder(arena, getter, setter);
+        // Partial descriptor: fields the descriptor omits default to the
+        // EXISTING own property's attributes (redefine) or to false (create) —
+        // same merge as Object.defineProperty (object_methods.zig). Without
+        // this, a bare {get} silently flips a configurable prop non-configurable.
+        var prev_e = false;
+        var prev_c = false;
+        if (target_obj.findProperty(k)) |loc| {
+            if (loc.holder == target_obj) {
+                const a = loc.holder.attrAt(loc.slot);
+                prev_e = a.enumerable;
+                prev_c = a.configurable;
+            }
+        }
         const attr = PropAttr{
             .is_accessor = true,
-            .enumerable = descTruthy(desc.getOwn("enumerable")),
-            .configurable = descTruthy(desc.getOwn("configurable")),
+            .enumerable = if (desc.hasOwn("enumerable")) descTruthy(desc.getOwn("enumerable")) else prev_e,
+            .configurable = if (desc.hasOwn("configurable")) descTruthy(desc.getOwn("configurable")) else prev_c,
         };
         const ok = try target_obj.defineOwnAccessor(k, holder, attr);
         return val_mod.makeBool(arena, ok);
     }
 
-    const value = desc.getOwn("value") orelse Value{};
+    // Partial descriptor: fields the descriptor omits default to the EXISTING
+    // own data property's attributes (redefine) or to false (create new).
+    var cur_w = false;
+    var cur_e = false;
+    var cur_c = false;
+    var has_own_data = false;
+    var cur_val: ?Value = null;
+    if (target_obj.findProperty(k)) |loc| {
+        if (loc.holder == target_obj) {
+            const a = loc.holder.attrAt(loc.slot);
+            if (!a.is_accessor) {
+                cur_w = a.writable;
+                cur_e = a.enumerable;
+                cur_c = a.configurable;
+                cur_val = target_obj.getOwn(k);
+                has_own_data = true;
+            }
+        }
+    }
+    const value = if (desc.hasOwn("value"))
+        (desc.getOwn("value") orelse Value{})
+    else if (has_own_data and cur_val != null)
+        cur_val.?
+    else
+        Value{};
     const attr = PropAttr{
-        .writable = descTruthy(desc.getOwn("writable")),
-        .enumerable = descTruthy(desc.getOwn("enumerable")),
-        .configurable = descTruthy(desc.getOwn("configurable")),
+        .writable = if (desc.hasOwn("writable")) descTruthy(desc.getOwn("writable")) else cur_w,
+        .enumerable = if (desc.hasOwn("enumerable")) descTruthy(desc.getOwn("enumerable")) else cur_e,
+        .configurable = if (desc.hasOwn("configurable")) descTruthy(desc.getOwn("configurable")) else cur_c,
     };
     const ok = try target_obj.defineOwnData(k, value, attr);
     return val_mod.makeBool(arena, ok);

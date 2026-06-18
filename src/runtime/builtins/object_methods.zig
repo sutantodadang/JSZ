@@ -40,9 +40,10 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
         const ta_mod = @import("typed_array.zig");
         const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-        if (!td.ab.detached) {
+        if (!td.ab.detached and !ta_mod.taIsOob(td)) {
+            const ta_len: u32 = @intCast(ta_mod.taCurrentLen(td));
             var ti: u32 = 0;
-            while (ti < td.length) : (ti += 1) {
+            while (ti < ta_len) : (ti += 1) {
                 const k_str = try std.fmt.allocPrint(arena, "{d}", .{ti});
                 const idx_key_ta = try std.fmt.allocPrint(arena, "{d}", .{ta_key_count});
                 try arr.set(idx_key_ta, try val_mod.makeString(arena, k_str));
@@ -323,6 +324,14 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
         break :blk switch (args[1].unbox()) {
             .object => |o| o,
             .null_ => null,
+            // A class used as a proto (`class B extends A` → setPrototypeOf(B, A))
+            // is a bc_function value; its static members live on a lazily-created
+            // backing object. Resolve to that so the constructor static chain links
+            // (needed for multi-level subclasses: @@species etc. inherit through it).
+            .bc_function, .function => if (@import("../realm.zig").active_context) |ctx|
+                (try ctx.backingObject(arena, args[1]))
+            else
+                null,
             else => null,
         };
     };
@@ -384,9 +393,10 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
         const ta_mod = @import("typed_array.zig");
         const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-        if (!td.ab.detached) {
+        if (!ta_mod.taIsOob(td)) {
+            const cur_len = ta_mod.taCurrentLen(td);
             var ti: u32 = 0;
-            while (ti < td.length) : (ti += 1) {
+            while (ti < cur_len) : (ti += 1) {
                 const k_str = try std.fmt.allocPrint(arena, "{d}", .{ti});
                 const idx_key_ta = try std.fmt.allocPrint(arena, "{d}", .{ta_key_count});
                 try arr.set(idx_key_ta, try val_mod.makeString(arena, k_str));

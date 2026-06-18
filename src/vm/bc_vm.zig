@@ -166,6 +166,11 @@ pub const BcVm = struct {
     gas_limit: u64 = 0,
     gas_used: u64 = 0,
     deadline_ns: i128 = 0,
+    /// W3: a resource-limit interrupt that fired inside a nested `bcInvokeJs`
+    /// run (e.g. a sort comparator). It must NOT become a catchable JS throw —
+    /// the message is stashed here so the outer `runLoop`/`raisePendingException`
+    /// re-surfaces it as an interrupt outcome, bypassing any JS try/catch.
+    interrupt_pending: ?[]const u8 = null,
     /// W2: set by the YIELD handler so the generator driver distinguishes a
     /// suspension from a normal return.
     gen_yielded: bool = false,
@@ -215,7 +220,16 @@ pub const BcVm = struct {
     /// Phase 4d: Context re-entry — called by invokeCallback for JS functions.
     fn bcInvokeJs(ptr: *anyopaque, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         _ = arena;
-        @import("../runtime/realm.zig").active_constructing = false;
+        const realm_nt = @import("../runtime/realm.zig");
+        realm_nt.active_constructing = false;
+        // Capture+consume NewTarget threaded by the construct paths (doConstruct /
+        // constructImpl set `pending_new_target` immediately before invoking). Bound
+        // into the callee's env as `__new_target__` below so a derived ctor's
+        // `Reflect.construct(Super, arguments, __new_target__)` desugaring propagates
+        // the ORIGINAL new.target down a multi-level super chain. Cleared here so an
+        // ordinary call/callback sees new.target = undefined.
+        const captured_nt = realm_nt.pending_new_target;
+        realm_nt.pending_new_target = Value{};
         const self: *BcVm = @ptrCast(@alignCast(ptr));
         const function_proto_mod = @import("../runtime/builtins/function_proto.zig");
         if (fn_val.bits == 0) return error.JsException;
@@ -227,6 +241,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, this_val, args);
                 if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, this_val, args);
                 const call_env = try Environment.init(self.arena, def_env);
+                try call_env.define("__new_target__", if (captured_nt.bits != 0) captured_nt else try val_mod.makeUndefined(self.arena));
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
@@ -270,8 +285,14 @@ pub const BcVm = struct {
                             // poison the next re-entrant call. Restore to frames_before.
                             while (self.frames.items.len > frames_before) _ = self.frames.pop();
                             const realm_mod = @import("../runtime/realm.zig");
+                            // A resource-limit interrupt is NOT a catchable throw:
+                            // stash it so the outer loop re-surfaces it as an
+                            // interrupt outcome instead of `throw undefined`.
+                            if (std.mem.startsWith(u8, msg, "interrupted:")) {
+                                self.interrupt_pending = msg;
+                                return error.JsException;
+                            }
                             realm_mod.pending_exception = self.last_exception_value;
-                            _ = msg;
                             return error.JsException;
                         },
                         .exception_value => |ev| {
@@ -359,6 +380,9 @@ pub const BcVm = struct {
                 else
                     try JsObject.create(self.arena, proto);
                 const this_val = try val_mod.makeObject(self.arena, new_obj);
+                // Thread NewTarget into the ctor frame (captured by bcInvokeJs as
+                // `__new_target__`) so a derived ctor's super() forwards it unchanged.
+                realm_m.pending_new_target = new_target;
                 const result = try bcInvokeJs(self, self.arena, this_val, ctor, args);
                 return if (result.bits != 0 and result.unbox() == .object) result else this_val;
             },
@@ -591,6 +615,12 @@ pub const BcVm = struct {
 
     fn runLoop(self: *BcVm) !RunOutcome {
         while (self.frames.items.len > 0) {
+            // W3: an interrupt that fired in a nested re-entrant run propagates
+            // here past any JS try/catch (checked before instruction dispatch).
+            if (self.interrupt_pending) |m| {
+                self.interrupt_pending = null;
+                return RunOutcome{ .exception = m };
+            }
             // W3: resource limits. Gas is checked per instruction; the wall-clock
             // deadline every 16K instructions (nanoTimestamp is too costly per-op).
             // Returns directly (past any JS try/catch) so scripts can't trap it.
@@ -694,6 +724,11 @@ pub const BcVm = struct {
     /// machinery. Returns a `RunOutcome` the caller must return (no handler
     /// found), or null when a handler was found (caller continues dispatch).
     pub fn raisePendingException(self: *BcVm, fallback_msg: []const u8) !?RunOutcome {
+        // A nested-run interrupt bypasses try/catch: surface it directly.
+        if (self.interrupt_pending) |m| {
+            self.interrupt_pending = null;
+            return RunOutcome{ .exception = m };
+        }
         const realm_mod = @import("../runtime/realm.zig");
         const exc_val = if (realm_mod.pending_exception.bits != 0)
             realm_mod.pending_exception
@@ -761,6 +796,10 @@ pub const BcVm = struct {
                 else
                     try JsObject.create(self.arena, proto);
                 const this_val = try val_mod.makeObject(self.arena, new_obj);
+                // Top-level `new X()`: NewTarget is the callee. Thread it so a
+                // derived ctor's super() chain propagates it (captured as
+                // `__new_target__` by bcInvokeJs).
+                @import("../runtime/realm.zig").pending_new_target = callee_val;
                 const result = bcInvokeJs(self, self.arena, this_val, callee_val, args) catch |e| {
                     if (e == error.JsException) {
                         const realm_m = @import("../runtime/realm.zig");
@@ -1035,7 +1074,7 @@ pub const BcVm = struct {
             else => return,
         };
         if (obj.internal_kind == .proxy) {
-            try self.proxySet(obj_val, obj, sym_key, value);
+            _ = try self.proxySet(obj_val, obj, sym_key, value, obj_val);
             return;
         }
         try obj.setSym(sym_key, value);
@@ -1057,20 +1096,24 @@ pub const BcVm = struct {
 
     /// Proxy `set` trap dispatch: `handler.set(target, key, value, receiver)`,
     /// falling back to a plain write on the target when no trap is defined.
-    fn proxySet(self: *BcVm, proxy_val: Value, proxy_obj: *JsObject, key: Value, value: Value) anyerror!void {
-        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return;
-        const target = proxy_mod.proxyTarget(proxy_obj) orelse return;
+    fn proxySet(self: *BcVm, proxy_val: Value, proxy_obj: *JsObject, key: Value, value: Value, receiver: Value) anyerror!bool {
+        _ = proxy_val;
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return true;
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return true;
         if (proxy_mod.trap(handler, "set")) |trap_fn| {
-            _ = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key, value, proxy_val });
-            return;
+            const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key, value, receiver });
+            return isTruthy(res);
         }
-        // No trap: forward to the target.
+        // No trap: default [[Set]] forwards to the target, preserving Receiver
+        // (spec: OrdinarySet(target, P, V, Receiver) — the write lands on Receiver,
+        // not the target). Threading Receiver lets a TypedArray's exotic [[Set]]
+        // in the target's proto chain route CreateDataProperty back to the proxy.
         if (key.bits != 0 and key.unbox() == .symbol) {
             try self.setPropSym(target, key, value);
-            return;
+            return true;
         }
         const key_str = try valueToStringArena(self.arena, key);
-        try self.setProp(target, key_str, value);
+        return try self.setPropR(target, key_str, value, receiver);
     }
 
     /// HasProperty(obj, key) for the `in` operator: prototype-chain walk over
@@ -1121,6 +1164,11 @@ pub const BcVm = struct {
             while (cur) |o| {
                 if (depth >= 64) break;
                 depth += 1;
+                // A Proxy in the prototype chain has its own [[HasProperty]];
+                // recurse so the `has` trap (or target walk) is dispatched.
+                if (o != root_obj and o.internal_kind == .proxy) {
+                    return try self.hasProperty(try val_mod.makeObject(self.arena, o), key_v);
+                }
                 if (o.getOwnSym(key_v) != null) return true;
                 cur = o.proto;
             }
@@ -1133,6 +1181,11 @@ pub const BcVm = struct {
         while (cur) |o| {
             if (depth >= 64) break;
             depth += 1;
+            // A Proxy in the prototype chain has its own [[HasProperty]];
+            // recurse so the `has` trap (or target walk) is dispatched.
+            if (o != root_obj and o.internal_kind == .proxy) {
+                return try self.hasProperty(try val_mod.makeObject(self.arena, o), key_v);
+            }
             if (o.is_array and std.mem.eql(u8, key, "length")) return true;
             if (o.hasOwn(key)) return true;
             cur = o.proto;
@@ -1318,6 +1371,14 @@ pub const BcVm = struct {
                 if (std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(s.len));
                 }
+                // String exotic own indexed properties: a canonical integer index in
+                // [0, length) reads the code unit (byte) at that position as a
+                // 1-char string. ToString-round-trip ensures only canonical indices
+                // (no leading zeros / "+1" / "1.0") match.
+                if (asArrayIndex(key)) |i| {
+                    if (i < s.len) return val_mod.makeString(self.arena, s[i .. i + 1]);
+                    return val_mod.makeUndefined(self.arena);
+                }
                 // Delegate to String.prototype
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_string_proto) |proto| {
@@ -1450,27 +1511,74 @@ pub const BcVm = struct {
     }
 
     pub fn setProp(self: *BcVm, obj_val: Value, key: []const u8, value: Value) !void {
-        if (obj_val.bits == 0) return;
+        _ = try self.setPropR(obj_val, key, value, obj_val);
+    }
+
+    /// SameValue between a Value and a raw JsObject pointer (object identity).
+    fn sameObject(v: Value, ptr: *JsObject) bool {
+        return v.bits != 0 and v.unbox() == .object and v.toPtr().object == ptr;
+    }
+
+    /// [[Set]](P, V, Receiver) with an explicit Receiver. Returns true when the
+    /// set succeeded (or is a spec no-op that must not throw); false when it is a
+    /// failed assignment whose strict-mode caller must raise a TypeError.
+    ///
+    /// Receiver threading matters for TypedArray exotic [[Set]] reached through a
+    /// prototype chain (e.g. `Object.create(ta)[i] = v` or a Proxy of such): the
+    /// exotic method intercepts canonical numeric indices, and for a valid index
+    /// with a different Receiver, OrdinarySet writes onto the Receiver instead.
+    pub fn setPropR(self: *BcVm, obj_val: Value, key: []const u8, value: Value, receiver: Value) anyerror!bool {
+        if (obj_val.bits == 0) return true;
         switch (obj_val.unbox()) {
             .object => |obj| {
                 if (obj.internal_kind == .proxy) {
                     const key_v = try val_mod.makeString(self.arena, key);
-                    try self.proxySet(obj_val, obj, key_v, value);
-                    return;
+                    return try self.proxySet(obj_val, obj, key_v, value, receiver);
                 }
                 // M15: integer-indexed TypedArray element write (exotic). Coerce the
                 // value (ToNumber/ToBigInt) then store; out-of-bounds is a silent
                 // no-op and indexed keys never create ordinary properties.
                 if (obj.internal_kind == .typed_array) {
                     // Any canonical numeric index string routes to the exotic
-                    // [[Set]]: ToNumber/ToBigInt always runs (valueOf side effects +
-                    // abrupt throws propagate); the element stores only when the
-                    // index is valid; invalid indices ("0.1","-0",OOB) are a no-op
-                    // and NEVER create an ordinary property.
+                    // [[Set]]: when SameValue(O, Receiver), ToNumber/ToBigInt always
+                    // runs (valueOf side effects + abrupt throws propagate) and the
+                    // element stores only for a valid index; invalid indices
+                    // ("0.1","-0",OOB) are a no-op and NEVER create an ordinary
+                    // property. A different Receiver short-circuits before coercion.
                     if (typed_array.canonicalNumericIndexString(key)) |idx_f| {
                         const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
-                        try typed_array.setElementThrowing(self.arena, td, idx_f, value);
-                        return;
+                        if (receiver.bits == obj_val.bits) {
+                            try typed_array.setElementThrowing(self.arena, td, idx_f, value);
+                            return true;
+                        }
+                        if (!typed_array.isValidIntegerIndex(td, idx_f)) return true;
+                        return try self.ordinarySetReceiverWrite(receiver, key, value);
+                    }
+                } else if (typed_array.canonicalNumericIndexString(key)) |idx_f| {
+                    // Prototype-chain dispatch: a canonical numeric index may be
+                    // intercepted by a TypedArray's exotic [[Set]] sitting in the
+                    // proto chain (OrdinarySet delegates to parent.[[Set]] when O
+                    // lacks an own property). Walk from O; whichever comes first —
+                    // an ordinary own property or a TypedArray — wins. A TypedArray
+                    // intercepts the index before any accessor behind it.
+                    var cur: ?*JsObject = obj;
+                    var depth: usize = 0;
+                    while (cur) |c| {
+                        if (depth >= 64) break;
+                        depth += 1;
+                        if (c.internal_kind == .typed_array) {
+                            const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(c.internal_slot.?));
+                            if (sameObject(receiver, c)) {
+                                try typed_array.setElementThrowing(self.arena, td, idx_f, value);
+                                return true;
+                            }
+                            if (!typed_array.isValidIntegerIndex(td, idx_f)) return true;
+                            return try self.ordinarySetReceiverWrite(receiver, key, value);
+                        }
+                        // Ordinary own property at this level: let the existing
+                        // findProperty logic below handle accessors/data/shadowing.
+                        if (c.resolveOwnSlot(key) != null) break;
+                        cur = c.proto;
                     }
                 }
                 if (obj.findProperty(key)) |loc| {
@@ -1480,25 +1588,87 @@ pub const BcVm = struct {
                         const setter = accessorMember(raw, "set");
                         // Only invoke if setter is an actual callable (not undefined/null).
                         if (isCallable(setter)) _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
-                        return; // accessor with no setter: sloppy no-op
+                        return true; // accessor with no setter: sloppy no-op
                     }
                     if (loc.holder == obj) {
-                        if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return;
+                        if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return true;
                         _ = obj.setOwnBySlot(obj.shapePtr(), loc.slot, value);
-                        return;
+                        return true;
                     }
                     // inherited data property: fall through to create an own (shadow).
                 }
                 try obj.set(key, value);
+                return true;
             },
             // W2 unification: bc functions store own properties (incl.
             // `C.prototype = ...`) on their backing object.
             .bc_function => |closure| {
                 const o = try self.closureBackingObj(closure);
                 try o.set(key, value);
+                return true;
             },
-            else => {},
+            else => return true,
         }
+    }
+
+    /// OrdinarySet's receiver-write step: CreateDataProperty(Receiver, P, V) when
+    /// the Receiver has no own P, or a value update when it owns a writable data
+    /// property. Returns false (failed assignment) for an own accessor, a
+    /// non-writable own data property, or a non-extensible Receiver lacking P.
+    /// A Proxy Receiver routes through its [[DefineOwnProperty]] trap; a
+    /// TypedArray Receiver validates the integer index and coerces+stores.
+    fn ordinarySetReceiverWrite(self: *BcVm, receiver: Value, key: []const u8, value: Value) anyerror!bool {
+        if (receiver.bits == 0 or receiver.unbox() != .object) return false;
+        const robj = receiver.toPtr().object;
+        if (robj.internal_kind == .proxy) {
+            return try self.proxyDefineDataProperty(robj, key, value);
+        }
+        if (robj.internal_kind == .typed_array) {
+            if (typed_array.canonicalNumericIndexString(key)) |idx_f| {
+                const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(robj.internal_slot.?));
+                if (!typed_array.isValidIntegerIndex(td, idx_f)) return false;
+                try typed_array.setElementThrowing(self.arena, td, idx_f, value);
+                return true;
+            }
+        }
+        if (robj.resolveOwnSlot(key)) |slot| {
+            const a = robj.attrAt(slot);
+            if (a.is_accessor) return false;
+            if (!a.writable) return false;
+            _ = robj.setOwnBySlot(robj.shapePtr(), slot, value);
+            return true;
+        }
+        if (!robj.extensible) return false;
+        try robj.set(key, value); // CreateDataProperty (updates array length too)
+        return true;
+    }
+
+    /// CreateDataProperty on a Proxy Receiver: dispatch the `defineProperty` trap
+    /// with a full data descriptor, or forward to the target when no trap exists.
+    fn proxyDefineDataProperty(self: *BcVm, proxy_obj: *JsObject, key: []const u8, value: Value) anyerror!bool {
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return false;
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return false;
+        if (proxy_mod.trap(handler, "defineProperty")) |trap_fn| {
+            const key_v = try val_mod.makeString(self.arena, key);
+            const desc = try self.makeDataDescriptor(value);
+            const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v, desc });
+            return isTruthy(res);
+        }
+        return try self.ordinarySetReceiverWrite(target, key, value);
+    }
+
+    /// Build `{ value, writable: true, enumerable: true, configurable: true }`.
+    fn makeDataDescriptor(self: *BcVm, value: Value) !Value {
+        const o = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        const t = try val_mod.makeBool(self.arena, true);
+        try o.set("value", value);
+        try o.set("writable", t);
+        try o.set("enumerable", t);
+        try o.set("configurable", t);
+        return val_mod.makeObject(self.arena, o);
     }
 
     /// S8: re-entrant property bridges for the boxed JIT's GET_PROP/SET_PROP
@@ -2474,6 +2644,10 @@ pub const BcVm = struct {
         const ls = isStringOrObject(lp);
         const rs = isStringOrObject(rp);
         if (ls or rs) {
+            // String branch: ? ToString(lprim) / ? ToString(rprim). Unlike the
+            // explicit String() constructor, implicit ToString throws on a Symbol.
+            if (isSymbol(lp) or isSymbol(rp))
+                return self.throwTypeErr("Cannot convert a Symbol value to a string");
             const ls_str = try valueToString(self.arena, lp);
             const rs_str = try valueToString(self.arena, rp);
             const combined = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ ls_str, rs_str });
@@ -2487,7 +2661,15 @@ pub const BcVm = struct {
             if (lbig != rbig) return self.throwTypeErr("Cannot mix BigInt and other types, use explicit conversions");
             return val_mod.bigIntBinary(self.arena, lp, rp, .add);
         }
+        // Numeric branch: ? ToNumber on each operand, which throws on a Symbol.
+        if (isSymbol(lp) or isSymbol(rp))
+            return self.throwTypeErr("Cannot convert a Symbol value to a number");
         return val_mod.makeNumber(self.arena, toNumber(lp) + toNumber(rp));
+    }
+
+    /// True when `v` is a Symbol value.
+    fn isSymbol(v: Value) bool {
+        return v.bits != 0 and v.unbox() == .symbol;
     }
 
     /// True when `v` is a BigInt value.
@@ -2600,6 +2782,21 @@ pub const BcVm = struct {
 };
 
 // ---------------------------------------------------------------- W2 generator natives ---
+
+/// Parse `key` as a canonical array index (the decimal form of a non-negative
+/// integer, no sign / leading zeros / decimal point). Returns null otherwise.
+/// "0" → 0; "00", "+1", "1.0", "01" → null.
+fn asArrayIndex(key: []const u8) ?usize {
+    if (key.len == 0) return null;
+    if (key.len > 1 and key[0] == '0') return null; // no leading zeros
+    var v: usize = 0;
+    for (key) |c| {
+        if (c < '0' or c > '9') return null;
+        v = std.math.mul(usize, v, 10) catch return null;
+        v = std.math.add(usize, v, c - '0') catch return null;
+    }
+    return v;
+}
 
 fn genStateFrom(this_val: Value) ?*BcGeneratorState {
     if (this_val.bits == 0 or this_val.unbox() != .object) return null;

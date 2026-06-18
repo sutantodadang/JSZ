@@ -1146,6 +1146,9 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "padEnd", string_proto_mod.nativePadEnd },
         .{ "trimStart", string_proto_mod.nativeTrimStart },
         .{ "trimEnd", string_proto_mod.nativeTrimEnd },
+        .{ "startsWith", string_proto_mod.nativeStartsWith },
+        .{ "endsWith", string_proto_mod.nativeEndsWith },
+        .{ "includes", string_proto_mod.nativeStringIncludes },
         // Phase 4c: regex-aware string methods
         .{ "match", string_proto_mod.nativeMatch },
         .{ "replace", string_proto_mod.nativeReplace },
@@ -1219,7 +1222,7 @@ fn installGlobalThis(arena: std.mem.Allocator, env: *Environment, object_proto: 
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
         if (name.len >= 2 and name[0] == '_' and name[1] == '_') continue;
-        try global_obj.set(name, entry.value_ptr.value);
+        _ = try global_obj.defineOwnData(name, entry.value_ptr.value, .{ .writable = true, .enumerable = false, .configurable = true });
     }
     const global_val = try val_mod.makeObject(arena, global_obj);
     try env.define("globalThis", global_val);
@@ -1336,23 +1339,29 @@ pub const Realm = struct {
         // Create Error constructor objects. Each has a .prototype property
         // and a hidden __proto__ marker so `instanceof` can find the prototype.
         const makeErrorCtor = struct {
-            fn make(a: std.mem.Allocator, ctor_fn: val_mod.NativeFnPtr, proto_obj: *JsObject) !Value {
+            fn make(a: std.mem.Allocator, ctor_fn: val_mod.NativeFnPtr, proto_obj: *JsObject, name: []const u8) !Value {
                 const ctor_obj = try JsObject.create(a, null);
                 const ctor_proto_val = try val_mod.makeObject(a, proto_obj);
                 try ctor_obj.set("prototype", ctor_proto_val);
                 const fn_val = try val_mod.makeNativeFunction(a, ctor_fn);
                 // Store the native fn on the ctor object as "__call__".
                 try ctor_obj.set("__call__", fn_val);
+                // §20.5.x: each Error constructor has `name` (e.g. "TypeError") and
+                // `length` 1, both non-enumerable / configurable. assert.throws and
+                // Function.prototype.toString rely on `name`.
+                const nlen_attr: obj_mod.PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+                _ = try ctor_obj.defineOwnData("name", try val_mod.makeString(a, name), nlen_attr);
+                _ = try ctor_obj.defineOwnData("length", try val_mod.makeNumber(a, 1), nlen_attr);
                 return val_mod.makeObject(a, ctor_obj);
             }
         }.make;
 
-        const error_ctor_val = try makeErrorCtor(arena, nativeErrorCtor, error_proto);
-        const type_error_ctor_val = try makeErrorCtor(arena, nativeTypeErrorCtor, type_error_proto);
-        const syntax_error_ctor_val = try makeErrorCtor(arena, nativeSyntaxErrorCtor, syntax_error_proto);
-        const range_error_ctor_val = try makeErrorCtor(arena, nativeRangeErrorCtor, range_error_proto);
-        const reference_error_ctor_val = try makeErrorCtor(arena, nativeReferenceErrorCtor, reference_error_proto);
-        const aggregate_error_ctor_val = try makeErrorCtor(arena, nativeAggregateErrorCtor, aggregate_error_proto);
+        const error_ctor_val = try makeErrorCtor(arena, nativeErrorCtor, error_proto, "Error");
+        const type_error_ctor_val = try makeErrorCtor(arena, nativeTypeErrorCtor, type_error_proto, "TypeError");
+        const syntax_error_ctor_val = try makeErrorCtor(arena, nativeSyntaxErrorCtor, syntax_error_proto, "SyntaxError");
+        const range_error_ctor_val = try makeErrorCtor(arena, nativeRangeErrorCtor, range_error_proto, "RangeError");
+        const reference_error_ctor_val = try makeErrorCtor(arena, nativeReferenceErrorCtor, reference_error_proto, "ReferenceError");
+        const aggregate_error_ctor_val = try makeErrorCtor(arena, nativeAggregateErrorCtor, aggregate_error_proto, "AggregateError");
 
         // Spec: ErrorPrototype.constructor = ErrorConstructor (non-enumerable, writable, configurable).
         // Required for `thrown.constructor === TypeError` identity checks in assert.throws.
@@ -1456,6 +1465,7 @@ pub const Realm = struct {
             .env = env,
             .object_proto = object_proto,
             .function_proto = function_proto,
+            .array_proto = array_proto,
         };
 
         try date_mod.register(&reg_ctx);

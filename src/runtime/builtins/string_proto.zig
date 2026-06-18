@@ -697,6 +697,75 @@ pub fn nativeConcat(arena: std.mem.Allocator, this_val: Value, args: []const Val
     return val_mod.makeString(arena, buf.items);
 }
 
+/// Coerce an argument to a string slice for search methods (string/number/bool/
+/// null/undefined; objects → "[object Object]"). Mirrors nativeConcat's coercion.
+fn argToStr(arena: std.mem.Allocator, a: Value) ![]const u8 {
+    if (a.bits == 0) return "undefined";
+    return switch (a.unbox()) {
+        .string => |ss| ss,
+        .number => |n| try formatNumber(arena, n),
+        .boolean => |b| if (b) "true" else "false",
+        .null_ => "null",
+        .undefined_ => "undefined",
+        else => "[object Object]",
+    };
+}
+
+/// Throw a TypeError if `a` is a RegExp (per String.prototype.{startsWith,endsWith,
+/// includes}: a RegExp searchString is not allowed).
+fn rejectRegExp(arena: std.mem.Allocator, a: Value) !void {
+    if (a.bits != 0 and a.unbox() == .object and a.toPtr().object.internal_kind == .regexp) {
+        const JsObject = @import("../../object/object.zig").JsObject;
+        const obj = try JsObject.create(arena, realm_mod.error_proto_TypeError);
+        try obj.set("message", try val_mod.makeString(arena, "First argument to String.prototype.startsWith/endsWith/includes must not be a regular expression"));
+        try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+        realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+        return error.JsException;
+    }
+}
+
+/// ES2015 String.prototype.startsWith(searchString [, position]).
+pub fn nativeStartsWith(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    if (args.len > 0) try rejectRegExp(arena, args[0]);
+    const search = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    const pos: usize = if (args.len > 1) normalizeIndex(toNum(args[1]), s.len) else 0;
+    if (pos + search.len > s.len) return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, std.mem.eql(u8, s[pos .. pos + search.len], search));
+}
+
+/// ES2015 String.prototype.endsWith(searchString [, endPosition]).
+pub fn nativeEndsWith(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    if (args.len > 0) try rejectRegExp(arena, args[0]);
+    const search = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    const end_: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        normalizeIndex(toNum(args[1]), s.len)
+    else
+        s.len;
+    if (search.len > end_) return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, std.mem.eql(u8, s[end_ - search.len .. end_], search));
+}
+
+/// ES2015 String.prototype.includes(searchString [, position]).
+pub fn nativeStringIncludes(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    if (args.len > 0) try rejectRegExp(arena, args[0]);
+    const search = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    const pos: usize = if (args.len > 1) normalizeIndex(toNum(args[1]), s.len) else 0;
+    if (pos > s.len) return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, std.mem.indexOf(u8, s[pos..], search) != null);
+}
+
+/// ToNumber for a position arg (number → itself; absent/other → 0). NaN handled by normalizeIndex.
+fn toNum(a: Value) f64 {
+    if (a.bits == 0) return 0;
+    return switch (a.unbox()) {
+        .number => |n| n,
+        else => 0,
+    };
+}
+
 pub fn nativeTrim(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const s = getThis(this_val);
     const trimmed = std.mem.trim(u8, s, " \t\n\r");

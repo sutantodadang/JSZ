@@ -106,7 +106,6 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "indexOf",     nativeTaIndexOf,     @as(u8, 1) },
         .{ "includes",    nativeTaIncludes,    @as(u8, 1) },
         .{ "join",        nativeTaJoin,        @as(u8, 1) },
-        .{ "toString",    nativeTaToString,    @as(u8, 0) },
         .{ "reverse",     nativeTaReverse,     @as(u8, 0) },
         .{ "at",          nativeTaAt,          @as(u8, 1) },
         .{ "forEach",     nativeTaForEach,     @as(u8, 1) },
@@ -136,8 +135,22 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     inline for (ta_methods) |m| {
         _ = try ta_proto.defineOwnData(m[0], try val_mod.makeNativeFunctionNamed(arena, m[1], m[0], m[2]), m_attr);
     }
-    // @@iterator shares the same fn as values (length 0, no string name needed).
-    _ = try ta_proto.defineOwnData("@@iterator", try val_mod.makeNativeFunctionNamed(arena, nativeTaValues, "values", 0), m_attr);
+    // §22.2.3.31: %TypedArray%.prototype.toString is the *same* function object as
+    // Array.prototype.toString (not a distinct native fn). Fall back to a fresh
+    // native fn only if Array.prototype isn't available (defensive; it always is).
+    if (ctx.array_proto) |ap| {
+        if (ap.get("toString")) |array_to_string| {
+            _ = try ta_proto.defineOwnData("toString", array_to_string, m_attr);
+        } else {
+            _ = try ta_proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeTaToString, "toString", 0), m_attr);
+        }
+    } else {
+        _ = try ta_proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeTaToString, "toString", 0), m_attr);
+    }
+    // @@iterator is the *same* function object as %TypedArray%.prototype.values.
+    if (ta_proto.get("values")) |values_fn| {
+        _ = try ta_proto.defineOwnData("@@iterator", values_fn, m_attr);
+    }
     active_typedarray_proto = ta_proto;
 
     // Instance accessor getters live on %TypedArray%.prototype.
@@ -447,7 +460,10 @@ fn toIntegerThrowing(arena: std.mem.Allocator, v: Value) anyerror!f64 {
     const n = try toNumberThrowing(arena, v);
     if (std.math.isNan(n)) return 0;
     if (!std.math.isFinite(n)) return n;
-    return @trunc(n);
+    // ToIntegerOrInfinity maps both +0 and -0 to +0; `@trunc` of a value in
+    // (-1, 0] yields -0, so add 0.0 to normalize the sign (a -0 index would
+    // otherwise be wrongly rejected by IsValidIntegerIndex).
+    return @trunc(n) + 0.0;
 }
 
 /// ToBigInt: throws TypeError for Number/Symbol/undefined/null, SyntaxError for
@@ -769,7 +785,10 @@ pub fn taStoreBig(td: *const TypedArrayData, i: usize, v: Value) void {
 const AbResult = struct { obj: *JsObject, data: *ArrayBufferData };
 
 fn makeArrayBuffer(arena: std.mem.Allocator, byte_len: usize) !AbResult {
-    const bytes = try arena.alloc(u8, byte_len);
+    // CreateByteDataBlock: a length above 2^53-1, or a block the allocator cannot
+    // provide, is a RangeError (not a TypeError) per AllocateArrayBuffer.
+    if (byte_len > 9007199254740991) return throwRangeError(arena, "ArrayBuffer length exceeds maximum size");
+    const bytes = arena.alloc(u8, byte_len) catch return throwRangeError(arena, "ArrayBuffer allocation failed");
     @memset(bytes, 0);
     const data = try arena.create(ArrayBufferData);
     data.* = .{ .bytes = bytes, .byte_length = byte_len };
@@ -1276,7 +1295,11 @@ pub fn nativeTaAbstractCtor(arena: std.mem.Allocator, _: Value, _: []const Value
 /// `.array_like` → no @@iterator at all; fall back to ToLength + indexed reads.
 /// error.JsException → @@iterator present but NOT callable (spec TypeError).
 const IterDecision = enum { iterate, array_like };
-fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterDecision {
+/// `method` carries the resolved %Symbol.iterator% function when it was obtained
+/// via an observable [[Get]] (spec `usingIterator`), so the caller can reuse it
+/// without a second @@iterator read (GetMethod must run exactly once).
+const IterProbe = struct { decision: IterDecision, method: Value = .{} };
+fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterProbe {
     // 1. Well-known Symbol.iterator (arrays + user `{[Symbol.iterator]:...}`).
     //    GetMethod is observable: fire an accessor getter and propagate throws.
     if (realm_mod.active_sym_iterator) |sym| {
@@ -1286,7 +1309,7 @@ fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterDecisio
         if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
             if (!function_proto_isCallable(m))
                 return throwTypeError(arena, "Symbol.iterator is not a function");
-            return .iterate;
+            return .{ .decision = .iterate, .method = m };
         }
     }
     // 2. Internal string @@iterator (Set/Map register their iterator here).
@@ -1294,27 +1317,49 @@ fn detectIterable(arena: std.mem.Allocator, src: *JsObject) anyerror!IterDecisio
         if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
             if (!function_proto_isCallable(m))
                 return throwTypeError(arena, "Symbol.iterator is not a function");
-            return .iterate;
+            return .{ .decision = .iterate };
         }
     }
     // 3. Raw iterator / generator: exposes a callable next().
     if (src.get("next")) |nx| {
-        if (function_proto_isCallable(nx)) return .iterate;
+        if (function_proto_isCallable(nx)) return .{ .decision = .iterate };
     }
-    return .array_like;
+    return .{ .decision = .array_like };
 }
 
 /// IterableToList(source): drive the iterator protocol via the shared collection
 /// helpers, collecting each yielded `value` until done. Propagates any throw from
-/// @@iterator / next / the value getter.
-fn iterableToList(arena: std.mem.Allocator, source: Value) anyerror!std.ArrayList(Value) {
+/// @@iterator / next / the value getter. When `method` is non-empty it is the
+/// already-resolved @@iterator function (GetIteratorFromMethod), invoked directly
+/// so the @@iterator property is not read a second time.
+fn iterableToList(arena: std.mem.Allocator, source: Value, method: Value) anyerror!std.ArrayList(Value) {
     var list: std.ArrayList(Value) = .empty;
+    if (method.bits != 0) {
+        // Spec GetIteratorFromMethod + IteratorToList: call the resolved @@iterator
+        // method, cache iterator.next ONCE, then drive it with observable [[Get]]s
+        // of next/done/value (each fires accessor getters exactly when the spec
+        // says, matching test262's call-order assertions).
+        const iter = try function_proto.invokeCallback(arena, source, method, &[_]Value{});
+        if (iter.bits == 0 or iter.unbox() != .object)
+            return throwTypeError(arena, "iterator result is not an object");
+        const next_method = try vmGet(arena, iter, "next");
+        if (!function_proto_isCallable(next_method))
+            return throwTypeError(arena, "iterator.next is not a function");
+        while (true) {
+            const step = try function_proto.invokeCallback(arena, iter, next_method, &[_]Value{});
+            if (step.bits == 0 or step.unbox() != .object)
+                return throwTypeError(arena, "iterator result is not an object");
+            if (toBool(try vmGet(arena, step, "done"))) break;
+            try list.append(arena, try vmGet(arena, step, "value"));
+        }
+        return list;
+    }
+    // Internal/raw iterators (Set/Map/generator/array fallback): no observable
+    // accessor difference, so the shared step helper is sufficient.
     const iter = try coll.nativeGetIterator(arena, Value{}, &[_]Value{source});
     while (true) {
         const step = try coll.nativeIterStep(arena, Value{}, &[_]Value{iter});
         if (step.bits == 0 or step.unbox() != .object) break;
-        // IteratorComplete/IteratorValue use observable [[Get]] (fire accessor
-        // getters + propagate throws), not a raw own-slot read.
         const done = try vmGet(arena, step, "done");
         if (toBool(done)) break;
         const v = try vmGet(arena, step, "value");
@@ -1383,10 +1428,15 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
         // Form 3: new TA(typedArray)  → copy elements into a fresh buffer.
         if (src.internal_kind == .typed_array) {
             const std_td: *TypedArrayData = @ptrCast(@alignCast(src.internal_slot.?));
+            // InitializeTypedArrayFromTypedArray step 8 (ValidateTypedArray): a source
+            // whose backing buffer is detached or resized out of bounds is a TypeError.
+            if (taIsOob(std_td)) return throwTypeError(arena, "Cannot construct a typed array from a detached or out-of-bounds TypedArray");
             // Cross number↔bigint construction is a TypeError.
             if (std_td.kind.isBigInt() != kind.isBigInt())
                 return throwTypeError(arena, "Cannot mix BigInt and non-BigInt typed arrays");
-            const length = std_td.length;
+            // elementLength = TypedArrayLength(srcRecord): the live length, since a
+            // length-tracking source view's stored .length (creation length) is stale.
+            const length = taCurrentLen(std_td);
             const res = try makeArrayBuffer(arena, length * esize);
             _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
             const dst = getTd(val_mod.makeObject(arena, this_obj) catch unreachable) orelse unreachable;
@@ -1401,8 +1451,9 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
         // Form 4: new TA(iterable | arrayLike).
         // Per spec, consult GetMethod(source, @@iterator) first: if a usable
         // iterator exists → IterableToList; otherwise fall back to array-like.
-        if ((try detectIterable(arena, src)) == .iterate) {
-            const list = try iterableToList(arena, args[0]);
+        const probe4 = try detectIterable(arena, src);
+        if (probe4.decision == .iterate) {
+            const list = try iterableToList(arena, args[0], probe4.method);
             const length = list.items.len;
             const res = try makeArrayBuffer(arena, length * esize);
             _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
@@ -1483,11 +1534,19 @@ fn elemToNumber(ev: Value) f64 {
 /// user valueOf, propagates abrupt throws), then store only when the index is
 /// still valid (resize/detach-safe). Used by [[Set]]/[[DefineOwnProperty]].
 pub fn setElementThrowing(arena: std.mem.Allocator, td: *TypedArrayData, idx_f: f64, value: Value) anyerror!void {
+    // Spec ordering: coerce the value FIRST (ToBigInt/ToNumber runs a
+    // side-effecting valueOf), THEN reject a write to an immutable buffer for a
+    // valid index. immutable-arraybuffer: integer-indexed [[Set]] returns false
+    // (→ TypeError under Throw). Out-of-bounds indices coerce (then no-op).
     if (td.kind.isBigInt()) {
         const bv = try toBigIntThrowing(arena, value);
+        if (td.ab.immutable and isValidIntegerIndex(td, idx_f))
+            return throwTypeError(arena, "Cannot assign to an immutable-buffer-backed TypedArray");
         if (isValidIntegerIndex(td, idx_f)) taStoreBig(td, @intFromFloat(idx_f), bv);
     } else {
         const nv = try toNumberThrowing(arena, value);
+        if (td.ab.immutable and isValidIntegerIndex(td, idx_f))
+            return throwTypeError(arena, "Cannot assign to an immutable-buffer-backed TypedArray");
         if (isValidIntegerIndex(td, idx_f)) taStoreNumber(td, @intFromFloat(idx_f), nv);
     }
 }
@@ -1622,14 +1681,20 @@ pub fn nativeTaFill(arena: std.mem.Allocator, this_val: Value, args: []const Val
     } else {
         fill_num = try toNumberThrowing(arena, raw_v);
     }
-    const start = relIndex(try toIntegerThrowing(arena, if (args.len > 1) args[1] else Value{}), td.length);
+    var start = relIndex(try toIntegerThrowing(arena, if (args.len > 1) args[1] else Value{}), td.length);
     const end_v: Value = if (args.len > 2) args[2] else Value{};
-    const end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
+    var end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
         relIndex(try toIntegerThrowing(arena, end_v), td.length)
     else
         td.length;
-    // Step 10: detach during coercion → TypeError.
+    // §23.2.3.9 step 9: after value/start/end coercion, re-validate — a detach or
+    // a resize that pushes the (fixed-length) view out of bounds throws TypeError;
+    // otherwise re-clamp the fill range to the current (possibly shrunk) length.
     if (td.ab.detached) return throwTypeError(arena, "Cannot fill a detached ArrayBuffer");
+    if (taIsOob(td)) return throwTypeError(arena, "TypedArray went out of bounds during fill coercion");
+    const cur_len = taCurrentLen(td);
+    if (start > cur_len) start = cur_len;
+    if (end > cur_len) end = cur_len;
     var i = start;
     while (i < end) : (i += 1) {
         if (td.kind.isBigInt()) taStoreBig(td, i, fill_big) else taStoreNumber(td, i, fill_num);
@@ -1668,22 +1733,32 @@ pub fn nativeTaSubarray(arena: std.mem.Allocator, this_val: Value, args: []const
 
 pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = try validateTypedArrayThis(arena, this_val);
-    const start = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), td.length);
+    // Spec step 3: srcArrayLength is the CURRENT live length, captured before the
+    // start/end ToInteger coercions (whose valueOf may resize the backing buffer).
+    // For length-tracking views the stored td.length (creation length) is stale, so
+    // read taCurrentLen directly instead of relying on validateTypedArray's refresh.
+    const src_len = taCurrentLen(td);
+    const start = relIndex(try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{}), src_len);
     const end_v: Value = if (args.len > 1) args[1] else Value{};
     const end = if (end_v.bits != 0 and end_v.unbox() != .undefined_)
-        relIndex(try toIntegerThrowing(arena, end_v), td.length)
+        relIndex(try toIntegerThrowing(arena, end_v), src_len)
     else
-        td.length;
+        src_len;
     const new_len = if (end > start) end - start else 0;
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(new_len))};
     const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
-    // Spec slice step 14: if count > 0 and the source buffer was detached during
-    // SpeciesConstructor (e.g. via the `constructor`/@@species getter), throw.
-    if (new_len > 0 and td.ab.detached)
-        return throwTypeError(arena, "source TypedArray buffer detached during species construction");
+    // Spec slice step 14: if count > 0 and the source buffer was detached OR resized
+    // so elements are OOB during SpeciesConstructor, throw.
+    if (new_len > 0 and taIsOob(td))
+        return throwTypeError(arena, "source TypedArray buffer detached or resized OOB during species construction");
+    // Step 14: copy count = min(new_len, currentLen - start) elements. A species
+    // ctor that shrinks a length-tracking source leaves the trailing result slots
+    // at their initialized 0 (NOT undefined→NaN); only in-bounds indices are read.
+    const cur_len = taCurrentLen(td);
+    const copy_end = if (start < cur_len) @min(new_len, cur_len - start) else 0;
     var i: usize = 0;
-    while (i < new_len) : (i += 1) {
+    while (i < copy_end) : (i += 1) {
         const ev = try taLoad(arena, td, start + i);
         if (td.kind.isBigInt()) taStoreBig(a_td, i, ev) else taStoreNumber(a_td, i, toNum(ev));
     }
@@ -1693,14 +1768,18 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
 pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = try validateTypedArrayThis(arena, this_val);
     if (td.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed TypedArray");
-    const target_len = td.length;
-    const target_lf: f64 = @floatFromInt(target_len);
     // targetOffset = ToIntegerOrInfinity(offset) (runs valueOf, propagates throws);
     // negative → RangeError. May be +Inf (caught by the bounds check below).
     const off_f = try toIntegerThrowing(arena, if (args.len > 1) args[1] else Value{});
     if (off_f < 0) return throwRangeError(arena, "Invalid typed array set offset");
-    // The offset's valueOf can detach the target buffer; spec re-validates.
+    // The offset's valueOf can detach/resize the target buffer. Per spec
+    // (SetTypedArrayFromArrayLike / FromTypedArray: "If IsTypedArrayOutOfBounds ...
+    // throw a TypeError"), an out-of-bounds target throws BEFORE the source's
+    // length/element getters run — so use the *current* length below.
     if (td.ab.detached) return throwTypeError(arena, "target TypedArray buffer detached during offset coercion");
+    if (taIsOob(td)) return throwTypeError(arena, "TypedArray target is out of bounds");
+    const target_len = taCurrentLen(td);
+    const target_lf: f64 = @floatFromInt(target_len);
     // ToObject(source): null/undefined throw; a TypedArray source uses the fast
     // overlap-safe path; everything else (objects, strings, primitives) goes
     // through the observable array-like path (ToObject + indexed [[Get]]).
@@ -1711,7 +1790,10 @@ pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     if (is_ta_src) {
         const src = src_val.toPtr().object;
         const src_td: *TypedArrayData = @ptrCast(@alignCast(src.internal_slot.?));
-        if (src_td.ab.detached) return throwTypeError(arena, "source TypedArray buffer detached during offset coercion");
+        // SetTypedArrayFromTypedArray: a source whose backing buffer was detached
+        // OR resized out of bounds is a TypeError, not a silent 0-length copy.
+        // taIsOob already subsumes the detached case.
+        if (taIsOob(src_td)) return throwTypeError(arena, "source TypedArray buffer detached or out of bounds");
         // Cross number↔bigint set is a TypeError.
         if (src_td.kind.isBigInt() != td.kind.isBigInt())
             return throwTypeError(arena, "Cannot mix BigInt and non-BigInt typed arrays");
@@ -1806,16 +1888,22 @@ pub fn nativeTaIncludes(arena: std.mem.Allocator, this_val: Value, args: []const
     if (td.length == 0) return val_mod.makeBool(arena, false);
     if (args.len == 0) return val_mod.makeBool(arena, false);
     const is_big = td.kind.isBigInt();
-    const target = toNum(args[0]);
-    const want_nan = std.math.isNan(target);
+    // includes uses SameValueZero: for a number-element array the search element
+    // only matches when it is itself a Number (undefined/"42"/true/null never do).
+    // NaN matches NaN, and +0/-0 compare equal.
+    const search_is_num = args[0].bits != 0 and args[0].unbox() == .number;
+    const target: f64 = if (search_is_num) args[0].unbox().number else 0;
+    const want_nan = search_is_num and std.math.isNan(target);
     const want_big: ?i128 = if (is_big) bigintSearch(args[0]) else null;
-    var len: usize = td.length;
+    const search_undef = args[0].bits == 0 or args[0].unbox() == .undefined_;
+    // §23.2.3.14: `len` is captured BEFORE ToIntegerOrInfinity(fromIndex) and is NOT
+    // re-clamped if the coercion resizes/detaches the buffer — the loop iterates to
+    // the original length and out-of-bounds reads (taLoad) yield `undefined`, which
+    // SameValueZero-matches an `undefined` search element.
+    const len: usize = td.length;
     var k: usize = 0;
     if (args.len > 1) {
         const n = try toIntegerThrowing(arena, args[1]);
-        // fromIndex coercion may have SHRUNK the buffer; clamp (grow keeps original).
-        len = @min(len, if (taIsOob(td)) 0 else taCurrentLen(td));
-        if (len == 0) return val_mod.makeBool(arena, false);
         var s = n;
         if (s < 0) {
             s += @floatFromInt(len);
@@ -1826,11 +1914,19 @@ pub fn nativeTaIncludes(arena: std.mem.Allocator, this_val: Value, args: []const
     }
     var i: usize = k;
     while (i < len) : (i += 1) {
+        const ev = try taLoad(arena, td, i);
+        const ev_undef = ev.bits == 0 or ev.unbox() == .undefined_;
+        // SameValueZero(searchElement, elementValue).
+        if (search_undef) {
+            if (ev_undef) return val_mod.makeBool(arena, true);
+            continue;
+        }
+        if (ev_undef) continue; // search is a value but element is OOB → undefined
         if (is_big) {
-            if (want_big != null and taBigRaw(td, i) == want_big.?) return val_mod.makeBool(arena, true);
-        } else {
-            const ev = try taLoad(arena, td, i);
-            const n = toNum(ev);
+            if (want_big != null and ev.unbox() == .bigint and taBigRaw(td, i) == want_big.?)
+                return val_mod.makeBool(arena, true);
+        } else if (search_is_num and ev.unbox() == .number) {
+            const n = ev.unbox().number;
             if (n == target or (want_nan and std.math.isNan(n))) return val_mod.makeBool(arena, true);
         }
     }
@@ -1921,10 +2017,15 @@ pub fn nativeTaMap(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const cb = args[0];
     const this_arg = if (args.len > 1) args[1] else Value{};
     const len_arg = [_]Value{try val_mod.makeNumber(arena, @floatFromInt(td.length))};
+    const len = td.length; // §23.2.3.20: captured BEFORE TypedArraySpeciesCreate;
+    // a species ctor that resizes the source does NOT change this count.
     const result = try typedArraySpeciesCreate(arena, td, this_val, &len_arg, true);
     const a_td = getTd(result) orelse return throwTypeError(arena, "species result not a TypedArray");
+    // Spec map does NOT re-validate the source after species construction: Get(O, k)
+    // on an out-of-bounds index yields undefined (the callback observes it), so a
+    // resize/shrink mid-construction must NOT throw — only read OOB slots as undefined.
     var i: usize = 0;
-    while (i < td.length) : (i += 1) {
+    while (i < len) : (i += 1) {
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         const r = try function_proto.invokeCallback(arena, this_arg, cb, &[_]Value{ ev, idx_v, this_val });
@@ -2049,6 +2150,11 @@ pub fn nativeTaOf(arena: std.mem.Allocator, this_val: Value, args: []const Value
     // Generic %TypedArray%.of over a custom constructor: TypedArrayCreate then
     // Set each item through the target's [[Set]] (fires exotic/ordinary write).
     const target = try taCreateViaConstruct(arena, this_val, args.len);
+    // TypedArrayCreateFromConstructor(C, «len», write): reject an immutable
+    // result immediately (before any element is Set / coerced).
+    if (getTd(target)) |rtd| {
+        if (rtd.ab.immutable) return throwTypeError(arena, "TypedArray.of target has an immutable buffer");
+    }
     const ctx = realm_mod.active_context.?;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -2076,8 +2182,9 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var length: usize = 0;
     if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object) {
         const src = args[0].toPtr().object;
-        if ((try detectIterable(arena, src)) == .iterate) {
-            const list = try iterableToList(arena, args[0]);
+        const probe = try detectIterable(arena, src);
+        if (probe.decision == .iterate) {
+            const list = try iterableToList(arena, args[0], probe.method);
             list_items = list.items;
             length = list.items.len;
         } else {
@@ -2099,6 +2206,13 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
         target = try val_mod.makeObject(arena, a.obj);
     } else {
         target = try taCreateViaConstruct(arena, this_val, length);
+    }
+
+    // TypedArrayCreateFromConstructor(C, «len», write): the result must pass
+    // ValidateTypedArray with accessMode ~write~ — an immutable-buffer-backed
+    // result is rejected immediately, BEFORE any source element is read/mapped.
+    if (getTd(target)) |rtd| {
+        if (rtd.ab.immutable) return throwTypeError(arena, "TypedArray.from target has an immutable buffer");
     }
 
     var i: usize = 0;
@@ -2196,33 +2310,40 @@ pub fn nativeTaSort(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (n < 2) return this_val;
     const cmp_fn = if (args.len > 0 and function_proto_isCallable(args[0])) args[0] else Value{};
     const undef = try val_mod.makeUndefined(arena);
-    // Insertion sort (n usually small; avoids needing a stack for quicksort).
+    // §23.2.3.30: snapshot the elements, sort the COPY (comparefn may resize or
+    // detach the backing buffer), then write the result back through the exotic
+    // integer-indexed [[Set]] — indices that became out-of-bounds are no-ops.
+    const items = try arena.alloc(Value, n);
+    var r: usize = 0;
+    while (r < n) : (r += 1) items[r] = try taLoad(arena, td, r);
+    // Stable insertion sort over the snapshot.
     var i: usize = 1;
     while (i < n) : (i += 1) {
+        const key = items[i];
         var j = i;
         while (j > 0) : (j -= 1) {
-            const a = try taLoad(arena, td, j - 1);
-            const b = try taLoad(arena, td, j);
-            // Compare: > 0 means a should come after b (swap).
+            const a = items[j - 1];
             const should_swap = blk: {
                 if (cmp_fn.bits != 0) {
-                    const r = try function_proto.invokeCallback(arena, undef, cmp_fn, &[_]Value{ a, b });
-                    const rv = toNum(r);
-                    break :blk rv > 0;
+                    const cr = try function_proto.invokeCallback(arena, undef, cmp_fn, &[_]Value{ a, key });
+                    // SortCompare: ToNumber(callResult) is observable (fires
+                    // valueOf / Symbol.toPrimitive, propagates throws); NaN → +0.
+                    const rv = try toNumberThrowing(arena, cr);
+                    break :blk (if (std.math.isNan(rv)) @as(f64, 0) else rv) > 0;
                 }
-                if (td.kind.isBigInt()) break :blk taBigRaw(td, j - 1) > taBigRaw(td, j);
-                break :blk taNumCompare(toNum(a), toNum(b)) > 0;
+                if (td.kind.isBigInt()) break :blk bigintSearch(a).? > bigintSearch(key).?;
+                break :blk taNumCompare(toNum(a), toNum(key)) > 0;
             };
-            if (should_swap) {
-                if (td.kind.isBigInt()) {
-                    taStoreBig(td, j - 1, b);
-                    taStoreBig(td, j, a);
-                } else {
-                    taStoreNumber(td, j - 1, toNum(b));
-                    taStoreNumber(td, j, toNum(a));
-                }
-            } else break;
+            if (!should_swap) break;
+            items[j] = a;
         }
+        items[j] = key;
+    }
+    // Write back, guarding each index against the (possibly shrunk) live bounds.
+    var w: usize = 0;
+    while (w < n) : (w += 1) {
+        if (!isValidIntegerIndex(td, @floatFromInt(w))) continue;
+        if (td.kind.isBigInt()) taStoreBig(td, w, items[w]) else taStoreNumber(td, w, toNum(items[w]));
     }
     return this_val;
 }
@@ -2332,17 +2453,25 @@ pub fn nativeTaCopyWithin(arena: std.mem.Allocator, this_val: Value, args: []con
     const count = if (end > start) end - start else 0;
     if (count == 0 or target >= len) return this_val;
     const actual_count = @min(count, len - target);
+    // §23.2.3.5 step 14: now that count > 0, re-validate after the index
+    // coercions. A fixed-length view pushed out of bounds throws TypeError; a
+    // length-tracking view that merely shrank truncates the copy — each byte is
+    // copied only while BOTH src and dst stay within the current live length.
+    if (taIsOob(td)) return throwTypeError(arena, "TypedArray went out of bounds during copyWithin coercion");
+    const live_len = taCurrentLen(td);
     if (start < target and target < start + count) {
         var i = actual_count;
         while (i > 0) : (i -= 1) {
             const src_idx = start + i - 1;
             const dst_idx = target + i - 1;
+            if (src_idx >= live_len or dst_idx >= live_len) continue;
             const ev = try taLoad(arena, td, src_idx);
             if (td.kind.isBigInt()) taStoreBig(td, dst_idx, ev) else taStoreNumber(td, dst_idx, toNum(ev));
         }
     } else {
         var i: usize = 0;
         while (i < actual_count) : (i += 1) {
+            if (start + i >= live_len or target + i >= live_len) continue;
             const ev = try taLoad(arena, td, start + i);
             if (td.kind.isBigInt()) taStoreBig(td, target + i, ev) else taStoreNumber(td, target + i, toNum(ev));
         }
@@ -2365,10 +2494,11 @@ pub fn nativeTaReduceRight(arena: std.mem.Allocator, this_val: Value, args: []co
         i = td.length - 1;
         acc = try taLoad(arena, td, i);
     }
+    // No mid-iteration re-validation: `len` was fixed at entry; a detach/shrink
+    // during a callback makes subsequent element reads (taLoad) return undefined
+    // (matching Get(O, k) on an out-of-bounds index), per §23.2.3.21.
     while (i > 0) {
         i -= 1;
-        try validateTypedArray(arena, td);
-        if (i >= td.length) break;
         const ev = try taLoad(arena, td, i);
         const idx_v = try val_mod.makeNumber(arena, @floatFromInt(i));
         acc = try function_proto.invokeCallback(arena, Value{}, cb, &[_]Value{ acc, ev, idx_v, this_val });
@@ -2389,13 +2519,13 @@ pub fn nativeTaLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []co
     }
     const target = toNum(args[0]);
     const want_big: ?i128 = if (is_big) bigintSearch(args[0]) else null;
-    var len: usize = td.length;
+    // §23.2.3.18: `len` is captured BEFORE ToIntegerOrInfinity(fromIndex) and is NOT
+    // re-clamped if the coercion resizes the buffer — `k` is computed from the
+    // original length and out-of-bounds reads (taLoad → undefined) are skipped.
+    const len: usize = td.length;
     var from: i64 = @intCast(len - 1);
     if (args.len > 1) {
         const fi = try toIntegerThrowing(arena, args[1]);
-        // fromIndex coercion may have SHRUNK the buffer; clamp (grow keeps original).
-        len = @min(len, if (taIsOob(td)) 0 else taCurrentLen(td));
-        if (len == 0) return val_mod.makeNumber(arena, -1);
         if (std.math.isNan(fi)) return val_mod.makeNumber(arena, -1);
         // Clamp to i64 range before conversion to avoid panic on Inf/huge values.
         if (fi >= 9.007199254740992e15) {
@@ -2411,11 +2541,15 @@ pub fn nativeTaLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []co
     }
     var i: usize = @intCast(from);
     while (true) {
-        if (is_big) {
-            if (want_big != null and taBigRaw(td, i) == want_big.?) return val_mod.makeNumber(arena, @floatFromInt(i));
-        } else {
-            const ev = try taLoad(arena, td, i);
-            if (toNum(ev) == target) return val_mod.makeNumber(arena, @floatFromInt(i));
+        const ev = try taLoad(arena, td, i);
+        const ev_undef = ev.bits == 0 or ev.unbox() == .undefined_;
+        if (!ev_undef) {
+            if (is_big) {
+                if (want_big != null and ev.unbox() == .bigint and taBigRaw(td, i) == want_big.?)
+                    return val_mod.makeNumber(arena, @floatFromInt(i));
+            } else if (ev.unbox() == .number and ev.unbox().number == target) {
+                return val_mod.makeNumber(arena, @floatFromInt(i));
+            }
         }
         if (i == 0) break;
         i -= 1;
