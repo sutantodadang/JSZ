@@ -68,6 +68,10 @@ pub const Parser = struct {
     /// Phase 8: `export let`/`export var` names collected per module unit, used to rewrite
     /// their use-sites to `exports.name` so reassignments are observed live by importers.
     live_exports: std.ArrayList([]const u8),
+    /// M16 Phase 4: all exported names (deduplicated), collected so the module namespace
+    /// exotic object can distinguish "uninitialized export" (TDZ → ReferenceError) from
+    /// "not an export" (→ undefined), even on self-import before the export assignments run.
+    all_export_names: std.ArrayList([]const u8),
 
     pub fn init(source: []const u8, arena: std.mem.Allocator) Parser {
         var p = Parser{
@@ -81,6 +85,7 @@ pub const Parser = struct {
             .extra_stmts = .{},
             .live_imports = .{},
             .live_exports = .{},
+            .all_export_names = .{},
         };
         // Prime the lookahead.
         p.current = p.lexNext();
@@ -323,6 +328,13 @@ pub const Parser = struct {
         const exports_id = self.mkIdent("exports") orelse return null;
         const target = self.mkMember(exports_id, exported) orelse return null;
         const assign = self.makeNode(.assignment_expr, self.current.start, self.current.start, .{ .assignment_expr = .{ .op = .assign, .target = target, .value = value } }) orelse return null;
+        // Track every exported name so the namespace exotic can distinguish
+        // "uninitialized export" from "not an export" during self-/cyclic imports.
+        var dup = false;
+        for (self.all_export_names.items) |n| {
+            if (std.mem.eql(u8, n, exported)) { dup = true; break; }
+        }
+        if (!dup) self.all_export_names.append(self.arena, exported) catch {};
         return self.makeNode(.expr_stmt, self.current.start, self.current.start, .{ .expr_stmt = assign });
     }
 

@@ -463,11 +463,20 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
             });
             return val_mod.makeBool(arena, sok);
         }
-        const sval = sdesc.getOwn("value") orelse Value{};
+        // Preserve existing own symbol property's value when the descriptor omits
+        // "value" (ES §9.1.6.3 OrdinaryDefineOwnProperty step 4 / §10.4.6.7).
+        // Without this, a bare {} descriptor overwrites e.g. Symbol.toStringTag's
+        // "Module" value with undefined.
+        const sval = if (sdesc.hasOwn("value"))
+            (sdesc.getOwn("value") orelse Value{})
+        else if (target_obj.getOwnSym(key_arg)) |existing|
+            existing
+        else
+            Value{};
         const sok = try target_obj.defineOwnDataSym(key_arg, sval, .{
-            .writable = descTruthy(sdesc.getOwn("writable")),
-            .enumerable = descTruthy(sdesc.getOwn("enumerable")),
-            .configurable = descTruthy(sdesc.getOwn("configurable")),
+            .writable = if (sdesc.hasOwn("writable")) descTruthy(sdesc.getOwn("writable")) else if (target_obj.getOwnSymEntry(key_arg)) |e| e.attr.writable else false,
+            .enumerable = if (sdesc.hasOwn("enumerable")) descTruthy(sdesc.getOwn("enumerable")) else if (target_obj.getOwnSymEntry(key_arg)) |e| e.attr.enumerable else false,
+            .configurable = if (sdesc.hasOwn("configurable")) descTruthy(sdesc.getOwn("configurable")) else if (target_obj.getOwnSymEntry(key_arg)) |e| e.attr.configurable else false,
         });
         return val_mod.makeBool(arena, sok);
     }
