@@ -1439,7 +1439,11 @@ pub const BcVm = struct {
                 // configurable). `length` = declared arity; `name` = the bound
                 // function name ("" when anonymous and not named-evaluated).
                 if (std.mem.eql(u8, key, "name")) {
-                    return val_mod.makeString(self.arena, closure.func.name orelse "");
+                    const raw = closure.func.name orelse "";
+                    // Translate internal sentinels for anonymous default exports to "default".
+                    const display = if (std.mem.eql(u8, raw, "__esm_dflt_fn__") or
+                        std.mem.eql(u8, raw, "__esm_dflt_gen__")) "default" else raw;
+                    return val_mod.makeString(self.arena, display);
                 }
                 if (std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity));

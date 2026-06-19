@@ -421,13 +421,19 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), out_tdz
                 // so the bundle can pre-hoist exports["default"] = NAME;
                 if (is_fn_hoisted) {
                     var j: usize = if (is_async_fn) @as(usize, 14) else @as(usize, 8);
-                    if (j < after_default.len and after_default[j] == '*') j += 1;
+                    const is_gen_default = j < after_default.len and after_default[j] == '*';
+                    if (is_gen_default) j += 1;
                     while (j < after_default.len and after_default[j] == ' ') : (j += 1) {}
                     const name_start = j;
                     while (j < after_default.len and (std.ascii.isAlphanumeric(after_default[j]) or
                         after_default[j] == '_' or after_default[j] == '$')) : (j += 1) {}
                     if (j > name_start) {
                         out_default_fn_binding.append(allocator, after_default[name_start..j]) catch {};
+                    } else {
+                        // Anonymous default function/generator: use sentinel so the bundle can
+                        // pre-hoist exports["default"] = __esm_dflt_fn__ / __esm_dflt_gen__.
+                        const sentinel = if (is_gen_default) "__esm_dflt_gen__" else "__esm_dflt_fn__";
+                        out_default_fn_binding.append(allocator, sentinel) catch {};
                     }
                 }
                 continue;
@@ -531,12 +537,75 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), out_tdz
                         j = k + 2;
                         while (j < rest.len and (rest[j] == ' ' or rest[j] == '\t' or rest[j] == '\n')) : (j += 1) {}
                         const name_start = j;
-                        while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
-                        if (j > name_start) {
-                            const exported_name = rest[name_start..j];
-                            out.append(allocator, exported_name) catch {};
-                            if (is_tdz_local) {
-                                out_tdz.append(allocator, exported_name) catch {};
+                        // Handle \uXXXX / \u{XXXX} Unicode-escape identifiers as
+                        // exported names (e.g. `export { x as μ }`).
+                        if (j + 1 < rest.len and rest[j] == '\\' and rest[j + 1] == 'u') {
+                            var cp: u32 = 0;
+                            var ei = j + 2;
+                            var parsed = false;
+                            if (ei < rest.len and rest[ei] == '{') {
+                                ei += 1;
+                                var any = false;
+                                while (ei < rest.len and rest[ei] != '}') : (ei += 1) {
+                                    const hv: u32 = switch (rest[ei]) {
+                                        '0'...'9' => rest[ei] - '0',
+                                        'a'...'f' => rest[ei] - 'a' + 10,
+                                        'A'...'F' => rest[ei] - 'A' + 10,
+                                        else => 255,
+                                    };
+                                    if (hv > 15) break;
+                                    cp = (cp << 4) | hv;
+                                    any = true;
+                                }
+                                if (ei < rest.len and rest[ei] == '}' and any) { ei += 1; parsed = true; }
+                            } else if (ei + 4 <= rest.len) {
+                                var ok = true;
+                                var ki: usize = 0;
+                                while (ki < 4) : (ki += 1) {
+                                    const hv: u32 = switch (rest[ei + ki]) {
+                                        '0'...'9' => rest[ei + ki] - '0',
+                                        'a'...'f' => rest[ei + ki] - 'a' + 10,
+                                        'A'...'F' => rest[ei + ki] - 'A' + 10,
+                                        else => blk: { ok = false; break :blk 0; },
+                                    };
+                                    cp = (cp << 4) | hv;
+                                }
+                                if (ok) { ei += 4; parsed = true; }
+                            }
+                            if (parsed) {
+                                j = ei;
+                                // Also consume any following ASCII ident chars.
+                                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$' or rest[j] >= 0x80)) : (j += 1) {}
+                                // Encode cp to UTF-8
+                                var utf8: [4]u8 = undefined;
+                                const utf8_len: usize = if (cp <= 0x7F) blk: {
+                                    utf8[0] = @intCast(cp); break :blk 1;
+                                } else if (cp <= 0x7FF) blk: {
+                                    utf8[0] = @intCast(0xC0 | (cp >> 6));
+                                    utf8[1] = @intCast(0x80 | (cp & 0x3F));
+                                    break :blk 2;
+                                } else if (cp <= 0xFFFF) blk: {
+                                    utf8[0] = @intCast(0xE0 | (cp >> 12));
+                                    utf8[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+                                    utf8[2] = @intCast(0x80 | (cp & 0x3F));
+                                    break :blk 3;
+                                } else 0;
+                                if (utf8_len > 0) {
+                                    if (allocator.dupe(u8, utf8[0..utf8_len])) |en| {
+                                        out.append(allocator, en) catch {};
+                                        if (is_tdz_local) out_tdz.append(allocator, en) catch {};
+                                    } else |_| {}
+                                }
+                            }
+                        } else {
+                            // Regular identifier — accept raw UTF-8 bytes (>= 0x80) too.
+                            while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$' or rest[j] >= 0x80)) : (j += 1) {}
+                            if (j > name_start) {
+                                const exported_name = rest[name_start..j];
+                                out.append(allocator, exported_name) catch {};
+                                if (is_tdz_local) {
+                                    out_tdz.append(allocator, exported_name) catch {};
+                                }
                             }
                         }
                     } else {

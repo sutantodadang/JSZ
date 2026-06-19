@@ -156,7 +156,10 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
                 out2.append(p.arena, assign) catch return null;
                 return p.finishMulti(out2.items);
             } else {
-                // Anonymous: export default function(){} → fn_expr with name "default"
+                // Anonymous: export default function(){} or function*(){}
+                // Use a hoistable function declaration with an internal sentinel name so
+                // self-importing cycles see the default export before the body runs.
+                // The sentinel is translated to "default" by the fn.name getter at runtime.
                 const parsed_params = p.parseFunctionParams() orelse return null;
                 const prev_gen = p.in_generator_function;
                 p.in_generator_function = is_gen;
@@ -166,21 +169,26 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
                 };
                 p.in_generator_function = prev_gen;
                 const is_strict = parser_file.hasUseStrict(body);
-                const fn_expr = p.makeNode(.function_expr, fn_start, p.current.start, .{
-                    .function_expr = .{
-                        .name = "default",
+                const internal_name = if (is_gen) "__esm_dflt_gen__" else "__esm_dflt_fn__";
+                const fn_decl = p.makeNode(.function_decl, fn_start, p.current.start, .{
+                    .function_decl = .{
+                        .name = internal_name,
                         .params = parsed_params.params,
                         .param_defaults = parsed_params.param_defaults,
                         .rest_param = parsed_params.rest_param,
                         .body = body,
-                        .is_arrow = false,
                         .is_generator = is_gen,
                         .is_async = is_async,
                         .is_strict = is_strict,
                     },
                 }) orelse return null;
                 p.consumeSemicolon();
-                return p.mkExportAssign("default", fn_expr);
+                const ident = p.mkIdent(internal_name) orelse return null;
+                const assign = p.mkExportAssign("default", ident) orelse return null;
+                var out = std.ArrayList(*Node){};
+                out.append(p.arena, fn_decl) catch return null;
+                out.append(p.arena, assign) catch return null;
+                return p.finishMulti(out.items);
             }
         }
         // Set name hint for anonymous class / other anonymous expression.
