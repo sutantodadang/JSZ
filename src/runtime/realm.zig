@@ -303,10 +303,13 @@ pub fn nativeMakeNamespace(arena: std.mem.Allocator, _: Value, args: []const Val
 /// namespace exotic can detect TDZ (known exports missing from the backing).
 /// Called ONCE per module, immediately before the module body executes:
 /// `__initExports__(exports, ["name1", "name2", ...])`
-/// Pre-populates each export on the backing object with a TDZ marker — a
-/// unique symbol value the namespace [[Get]] recognises and throws ReferenceError
-/// for. When the module body's export assignments run, they overwrite the TDZ
-/// marker with real values.
+///   or: `__initExports__(exports, ["all", "names"], ["tdz", "names"])`
+///
+/// Stores the full export names list under a private symbol for hasExport and
+/// sortedNames. When a third argument (TDZ-only names) is provided, only those
+/// names get TDZ markers on the backing object (let/const/class are uninitialized
+/// during instantiation; var/function are hoisted and NOT in TDZ). When only
+/// two arguments are provided, all names get TDZ markers (backwards compat).
 pub fn nativeInitExports(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len < 2) return val_mod.makeUndefined(arena);
     if (args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeUndefined(arena);
@@ -319,18 +322,44 @@ pub fn nativeInitExports(arena: std.mem.Allocator, _: Value, args: []const Value
     if (active_sym_export_names) |sym| {
         try exports_obj.setSym(sym, args[1]);
     }
-    // Pre-populate each export with a TDZ marker symbol so [[Get]] throws
-    // ReferenceError before the module body's export assignments run.
-    const marker = tdz_marker orelse return val_mod.makeUndefined(arena);
-    const n = names_arr.getArrayLength();
-    var i: u32 = 0;
-    var buf: [32]u8 = undefined;
-    while (i < n) : (i += 1) {
-        const idx_key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
-        if (names_arr.get(idx_key)) |name_val| {
-            if (name_val.bits != 0 and name_val.unbox() == .string) {
-                const name_str = name_val.toPtr().string;
-                try exports_obj.set(name_str, marker);
+    // When a third argument (TDZ-only names) is provided, store it separately
+    // and only set TDZ markers for those names. Otherwise (backwards compat),
+    // set markers for ALL names.
+    var has_tdz_list = false;
+    if (args.len >= 3 and args[2].bits != 0 and args[2].unbox() == .object) {
+        const tdz_arr = args[2].toPtr().object;
+        if (active_sym_tdz_export_names) |sym| {
+            try exports_obj.setSym(sym, args[2]);
+        }
+        // Set TDZ markers only for names in the TDZ list
+        const marker = tdz_marker orelse return val_mod.makeUndefined(arena);
+        const n = tdz_arr.getArrayLength();
+        var i: u32 = 0;
+        var buf: [32]u8 = undefined;
+        while (i < n) : (i += 1) {
+            const idx_key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
+            if (tdz_arr.get(idx_key)) |name_val| {
+                if (name_val.bits != 0 and name_val.unbox() == .string) {
+                    const name_str = name_val.toPtr().string;
+                    try exports_obj.set(name_str, marker);
+                }
+            }
+        }
+        has_tdz_list = true;
+    }
+    // Backwards compat (no TDZ list): mark ALL names as TDZ
+    if (!has_tdz_list) {
+        const marker = tdz_marker orelse return val_mod.makeUndefined(arena);
+        const n = names_arr.getArrayLength();
+        var i: u32 = 0;
+        var buf: [32]u8 = undefined;
+        while (i < n) : (i += 1) {
+            const idx_key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
+            if (names_arr.get(idx_key)) |name_val| {
+                if (name_val.bits != 0 and name_val.unbox() == .string) {
+                    const name_str = name_val.toPtr().string;
+                    try exports_obj.set(name_str, marker);
+                }
             }
         }
     }
@@ -499,6 +528,13 @@ pub var active_sym_module_ns: ?Value = null;
 /// live exports object, so the namespace exotic can check TDZ for uninitialized
 /// exports even before the module body runs (self-imports).
 pub var active_sym_export_names: ?Value = null;
+
+/// M16 Phase 4: private symbol storing a module's TDZ-only export names array
+/// on its live exports object. This is a subset of export_names — only the
+/// names from `let`, `const`, and `class` declarations that are uninitialized
+/// during instantiation. Used by the namespace exotic to distinguish TDZ
+/// bindings from hoisted (var/function) bindings.
+pub var active_sym_tdz_export_names: ?Value = null;
 
 /// M16 Phase 4: shared TDZ marker — a symbol pre-populated on every export
 /// property before its module body runs. The namespace [[Get]] checks for this
@@ -1836,6 +1872,7 @@ pub const Realm = struct {
         active_sym_proxy_handler = try val_mod.makeSymbol(arena, "[[ProxyHandler]]");
         active_sym_module_ns = try val_mod.makeSymbol(arena, "[[Module.Namespace]]");
         active_sym_export_names = try val_mod.makeSymbol(arena, "[[Module.ExportNames]]");
+        active_sym_tdz_export_names = try val_mod.makeSymbol(arena, "[[Module.TdzNames]]");
         tdz_marker = try val_mod.makeSymbol(arena, "[[TDZ]]");
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
@@ -2030,6 +2067,7 @@ pub const Realm = struct {
         active_sym_species = null;
         active_sym_module_ns = null;
         active_sym_export_names = null;
+        active_sym_tdz_export_names = null;
         tdz_marker = null;
         active_sym_proxy_target = null;
         active_sym_proxy_handler = null;

@@ -216,7 +216,148 @@ pub const ENTRY_ID = "__entry__";
 /// comment/string/template skipping (reuses the same skip logic as
 /// `scanSpecifiers`). This is a syntactic scan, not a full parse — sufficient
 /// for the CJS-desugar module namespace TDZ setup in `buildBundle`.
-pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
+///
+/// `out_tdz` receives ONLY the names that are in the temporal dead zone
+/// (let, const, class declarations). var and function declarations are
+/// hoisted/initialized at instantiation and are NOT added to out_tdz.
+/// Re-exports (export { x } from, export * from) are also not in TDZ.
+///
+/// `out_fn` receives names that are function/generator declarations
+/// (hoisted and initialized to the function value during instantiation).
+/// These are emitted as `exports.NAME = NAME;` in the bundle prelude.
+///
+/// To correctly handle `export { localName as renamed }` where `localName`
+/// may be a let/const/class, the function does a pre-pass to collect all
+/// let/const/class local declarations (including non-exported ones) before
+/// processing export-names in `export { ... }` lists.
+pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), out_tdz: *std.ArrayList([]const u8), out_fn: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
+    // Pre-pass: collect ALL let/const/class local binding names (exported or
+    // not), so `export { local2 as renamed }` can detect that `local2` is TDZ.
+    var tdz_locals = std.StringHashMap(void).init(allocator);
+    defer tdz_locals.deinit();
+    {
+        var i: usize = 0;
+        while (i < src.len) {
+            const c = src[i];
+            // Skip comments and strings (same logic as main loop)
+            if (c == '/' and i + 1 < src.len) {
+                if (src[i + 1] == '/') { i += 2; while (i < src.len and src[i] != '\n') : (i += 1) {} continue; }
+                if (src[i + 1] == '*') { i += 2; while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) : (i += 1) {} i += 2; continue; }
+            }
+            if (c == '`') { i += 1; while (i < src.len and src[i] != '`') : (i += 1) { if (src[i] == '\\') i += 1; } i += 1; continue; }
+            if (c == '"' or c == '\'') { const q = c; i += 1; while (i < src.len and src[i] != q) : (i += 1) { if (src[i] == '\\') i += 1; } i += 1; continue; }
+
+            // Check for `let `, `const `, `class ` (non-export) or after `export ` keyword
+            const is_let = i + 4 <= src.len and std.mem.eql(u8, src[i..i + 4], "let ");
+            const is_const = i + 6 <= src.len and std.mem.eql(u8, src[i..i + 6], "const ");
+            const is_class = i + 6 <= src.len and std.mem.eql(u8, src[i..i + 6], "class ");
+            // Also handle `export let/const/class` — skip past the "export " prefix
+            var after_export: ?usize = null;
+            if (i + 7 <= src.len and std.mem.eql(u8, src[i..i + 7], "export ")) {
+                after_export = i + 7;
+                const rest = src[after_export.?..];
+                if (std.mem.startsWith(u8, rest, "let ")) {
+                    var j: usize = 4;
+                    while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                    const name_start = j;
+                    while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                    if (j > name_start) {
+                        tdz_locals.put(rest[name_start..j], {}) catch {};
+                    }
+                    i = after_export.? + j;
+                    continue;
+                }
+                if (std.mem.startsWith(u8, rest, "const ")) {
+                    var j: usize = 6;
+                    while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                    const name_start = j;
+                    while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                    if (j > name_start) {
+                        tdz_locals.put(rest[name_start..j], {}) catch {};
+                    }
+                    i = after_export.? + j;
+                    continue;
+                }
+                if (std.mem.startsWith(u8, rest, "class ")) {
+                    var j: usize = 6;
+                    while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                    const name_start = j;
+                    while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                    if (j > name_start) {
+                        tdz_locals.put(rest[name_start..j], {}) catch {};
+                    }
+                    i = after_export.? + j;
+                    continue;
+                }
+                // For `export default class` — named or anonymous, `default` is TDZ
+                if (std.mem.startsWith(u8, rest, "default class") and rest.len > 13) {
+                    const after_class = rest[13..];
+                    // Check for named class: `default class C`
+                    if (after_class.len > 0 and after_class[0] == ' ') {
+                        var j: usize = 1;
+                        while (j < after_class.len and after_class[j] == ' ') : (j += 1) {}
+                        if (j < after_class.len) {
+                            const name_start = j;
+                            var k = name_start;
+                            while (k < after_class.len and (std.ascii.isAlphanumeric(after_class[k]) or after_class[k] == '_' or after_class[k] == '$')) : (k += 1) {}
+                            if (k > name_start) {
+                                tdz_locals.put(after_class[name_start..k], {}) catch {};
+                            }
+                            i = after_export.? + 13 + k;
+                        } else {
+                            i = after_export.? + 13 + j;
+                        }
+                    } else {
+                        // Anonymous class `export default class{` or `export default class {`
+                        i = after_export.? + 13;
+                        // skip past `{` if directly following
+                        if (i < src.len and src[i] == '{') i += 1;
+                    }
+                    // default itself is also TDZ
+                    tdz_locals.put("default", {}) catch {};
+                    continue;
+                }
+            }
+            // Non-exported let/const/class declarations
+            if (is_let) {
+                var j: usize = 4;
+                while (j < src.len - i and src[i + j] == ' ') : (j += 1) {}
+                const name_start = i + j;
+                var k = name_start;
+                while (k < src.len and (std.ascii.isAlphanumeric(src[k]) or src[k] == '_' or src[k] == '$')) : (k += 1) {}
+                if (k > name_start) {
+                    tdz_locals.put(src[name_start..k], {}) catch {};
+                }
+                i = k;
+                continue;
+            }
+            if (is_const) {
+                var j: usize = 6;
+                while (j < src.len - i and src[i + j] == ' ') : (j += 1) {}
+                const name_start = i + j;
+                var k = name_start;
+                while (k < src.len and (std.ascii.isAlphanumeric(src[k]) or src[k] == '_' or src[k] == '$')) : (k += 1) {}
+                if (k > name_start) {
+                    tdz_locals.put(src[name_start..k], {}) catch {};
+                }
+                i = k;
+                continue;
+            }
+            if (is_class) {
+                var j: usize = 6;
+                while (j < src.len - i and src[i + j] == ' ') : (j += 1) {}
+                const name_start = i + j;
+                var k = name_start;
+                while (k < src.len and (std.ascii.isAlphanumeric(src[k]) or src[k] == '_' or src[k] == '$')) : (k += 1) {}
+                if (k > name_start) {
+                    tdz_locals.put(src[name_start..k], {}) catch {};
+                }
+                i = k;
+                continue;
+            }
+            i += 1;
+        }
+    }
     var i: usize = 0;
     while (i < src.len) {
         const c = src[i];
@@ -258,6 +399,18 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), allocat
             // export default
             if (std.mem.startsWith(u8, rest, "default ")) {
                 out.append(allocator, "default") catch {};
+                // default is in TDZ unless it's a function/generator
+                // declaration (which are hoisted and initialized during
+                // instantiation). Anonymous or named function defaults
+                // are initialized; class defaults and expression defaults
+                // are uninitialized (TDZ).
+                const after_default = rest["default ".len..];
+                const is_fn_hoisted = std.mem.startsWith(u8, after_default, "function ") or
+                    std.mem.startsWith(u8, after_default, "async function ") or
+                    std.mem.startsWith(u8, after_default, "async\nfunction ");
+                if (!is_fn_hoisted) {
+                    out_tdz.append(allocator, "default") catch {};
+                }
                 continue;
             }
             // export * as name from
@@ -272,7 +425,7 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), allocat
                 }
                 continue;
             }
-            // export function <name>
+            // export function <name> (hoisted)
             if (std.mem.startsWith(u8, rest, "function ")) {
                 var j: usize = 9;
                 while (j < rest.len and rest[j] == ' ') : (j += 1) {}
@@ -280,6 +433,46 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), allocat
                 while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
                 if (j > name_start) {
                     out.append(allocator, rest[name_start..j]) catch {};
+                    out_fn.append(allocator, rest[name_start..j]) catch {}; // function is hoisted
+                }
+                continue;
+            }
+            // export function* <name> (generator, hoisted)
+            // Check for "function*" (no space) or "function *" (with space)
+            if (std.mem.startsWith(u8, rest, "function*") or std.mem.startsWith(u8, rest, "function *")) {
+                var j: usize = 8;
+                if (j < rest.len and rest[j] == '*') j += 1;
+                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                const name_start = j;
+                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                if (j > name_start) {
+                    out.append(allocator, rest[name_start..j]) catch {};
+                    out_fn.append(allocator, rest[name_start..j]) catch {}; // generator is hoisted
+                }
+                continue;
+            }
+            // export async function <name> (async fn, hoisted)
+            if (std.mem.startsWith(u8, rest, "async function ")) {
+                var j: usize = 15; // "async function ".len
+                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                const name_start = j;
+                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                if (j > name_start) {
+                    out.append(allocator, rest[name_start..j]) catch {};
+                    out_fn.append(allocator, rest[name_start..j]) catch {}; // async fn is hoisted
+                }
+                continue;
+            }
+            // export async function* <name> (async generator, hoisted)
+            if (std.mem.startsWith(u8, rest, "async function*") or std.mem.startsWith(u8, rest, "async function *")) {
+                var j: usize = 14; // "async function".len
+                if (j < rest.len and rest[j] == '*') j += 1;
+                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                const name_start = j;
+                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                if (j > name_start) {
+                    out.append(allocator, rest[name_start..j]) catch {};
+                    out_fn.append(allocator, rest[name_start..j]) catch {}; // async generator is hoisted
                 }
                 continue;
             }
@@ -291,6 +484,7 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), allocat
                 while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
                 if (j > name_start) {
                     out.append(allocator, rest[name_start..j]) catch {};
+                    out_tdz.append(allocator, rest[name_start..j]) catch {}; // class is TDZ
                 }
                 continue;
             }
@@ -305,9 +499,10 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), allocat
                     const local_start = j;
                     while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
                     if (j >= rest.len or j == local_start) continue;
+                    const local_name = rest[local_start..j];
+                    const is_tdz_local = tdz_locals.contains(local_name);
                     // Check if followed by 'as' keyword — if so, the identifier
                     // before 'as' is the local name, not the exported name.
-                    // Skip past 'as' and read the exported name.
                     var k = j;
                     while (k < rest.len and (rest[k] == ' ' or rest[k] == '\t' or rest[k] == '\n')) : (k += 1) {}
                     if (k + 2 < rest.len and std.mem.eql(u8, rest[k..k + 2], "as") and
@@ -319,26 +514,55 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), allocat
                         const name_start = j;
                         while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
                         if (j > name_start) {
-                            out.append(allocator, rest[name_start..j]) catch {};
+                            const exported_name = rest[name_start..j];
+                            out.append(allocator, exported_name) catch {};
+                            if (is_tdz_local) {
+                                out_tdz.append(allocator, exported_name) catch {};
+                            }
                         }
                     } else {
                         // No 'as' — the identifier itself is the exported name.
-                        out.append(allocator, rest[local_start..j]) catch {};
+                        out.append(allocator, local_name) catch {};
+                        if (is_tdz_local) {
+                            out_tdz.append(allocator, local_name) catch {};
+                        }
                     }
                 }
                 continue;
             }
-            // export let/var/const <name>
-            if (std.mem.startsWith(u8, rest, "let ") or
-                std.mem.startsWith(u8, rest, "var ") or
-                std.mem.startsWith(u8, rest, "const "))
-            {
+            // export let <name> (TDZ)
+            if (std.mem.startsWith(u8, rest, "let ")) {
                 var j: usize = 4;
                 while (j < rest.len and rest[j] == ' ') : (j += 1) {}
                 const name_start = j;
                 while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
                 if (j > name_start) {
                     out.append(allocator, rest[name_start..j]) catch {};
+                    out_tdz.append(allocator, rest[name_start..j]) catch {}; // let is TDZ
+                }
+                continue;
+            }
+            // export var <name> (hoisted, NOT TDZ)
+            if (std.mem.startsWith(u8, rest, "var ")) {
+                var j: usize = 4;
+                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                const name_start = j;
+                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                if (j > name_start) {
+                    out.append(allocator, rest[name_start..j]) catch {};
+                    // var is NOT added to out_tdz — hoisted, initialized to undefined
+                }
+                continue;
+            }
+            // export const <name> (TDZ)
+            if (std.mem.startsWith(u8, rest, "const ")) {
+                var j: usize = 6;
+                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                const name_start = j;
+                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                if (j > name_start) {
+                    out.append(allocator, rest[name_start..j]) catch {};
+                    out_tdz.append(allocator, rest[name_start..j]) catch {}; // const is TDZ
                 }
                 continue;
             }
@@ -400,7 +624,9 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         // can detect TDZ (known exports missing from the backing). Scan the
         // source for export names and call __initModuleExports__(exports, [...]).
         var export_names = std.ArrayList([]const u8){};
-        findExportNames(e.value_ptr.*, &export_names, arena);
+        var tdz_names = std.ArrayList([]const u8){};
+        var fn_names = std.ArrayList([]const u8){};
+        findExportNames(e.value_ptr.*, &export_names, &tdz_names, &fn_names, arena);
         if (export_names.items.len > 0) {
             try sb.appendSlice(gpa, "__initExports__(exports,[");
             for (export_names.items, 0..) |nm, eni| {
@@ -415,7 +641,29 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
                 }
                 try sb.appendSlice(gpa, "\"");
             }
+            try sb.appendSlice(gpa, "],[");
+            for (tdz_names.items, 0..) |nm, eni| {
+                if (eni > 0) try sb.appendSlice(gpa, ",");
+                try sb.appendSlice(gpa, "\"");
+                for (nm) |ch| {
+                    if (ch == '\\' or ch == '"') try sb.appendSlice(gpa, "\\");
+                    try sb.appendSlice(gpa, &.{ch});
+                }
+                try sb.appendSlice(gpa, "\"");
+            }
             try sb.appendSlice(gpa, "]);\n");
+            // Hoisted function/generator exports: pre-initialize exports.NAME = NAME
+            // before the module body runs so self-imports see the function value.
+            for (fn_names.items) |nm| {
+                try sb.appendSlice(gpa, "exports.");
+                try sb.appendSlice(gpa, nm);
+                try sb.appendSlice(gpa, " = ");
+                // The function name may need escaping for keywords (rare in practice).
+                // Use bracket notation for safety: exports["NAME"] = NAME
+                // But direct exports.NAME = NAME works for valid identifiers.
+                try sb.appendSlice(gpa, nm);
+                try sb.appendSlice(gpa, ";\n");
+            }
         }
         try sb.appendSlice(gpa, e.value_ptr.*);
         try sb.appendSlice(gpa, "\n};\n");
@@ -432,7 +680,9 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     }
     // M16 Phase 4: inject export name setup for the entry module too.
     var entry_names = std.ArrayList([]const u8){};
-    findExportNames(entry_src, &entry_names, arena);
+    var entry_tdz = std.ArrayList([]const u8){};
+    var entry_fn = std.ArrayList([]const u8){};
+    findExportNames(entry_src, &entry_names, &entry_tdz, &entry_fn, arena);
     if (entry_names.items.len > 0) {
         try sb.appendSlice(gpa, "__initExports__(exports,[");
         for (entry_names.items, 0..) |nm, eni| {
@@ -444,7 +694,25 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
             }
             try sb.appendSlice(gpa, "\"");
         }
+        try sb.appendSlice(gpa, "],[");
+        for (entry_tdz.items, 0..) |nm, eni| {
+            if (eni > 0) try sb.appendSlice(gpa, ",");
+            try sb.appendSlice(gpa, "\"");
+            for (nm) |ch| {
+                if (ch == '\\' or ch == '"') try sb.appendSlice(gpa, "\\");
+                try sb.appendSlice(gpa, &.{ch});
+            }
+            try sb.appendSlice(gpa, "\"");
+        }
         try sb.appendSlice(gpa, "]);\n");
+        // Hoisted function/generator exports for the entry module too.
+        for (entry_fn.items) |nm| {
+            try sb.appendSlice(gpa, "exports.");
+            try sb.appendSlice(gpa, nm);
+            try sb.appendSlice(gpa, " = ");
+            try sb.appendSlice(gpa, nm);
+            try sb.appendSlice(gpa, ";\n");
+        }
     }
     try sb.appendSlice(gpa, entry_src);
     return sb.toOwnedSlice(gpa);
