@@ -1367,6 +1367,11 @@ pub const BcVm = struct {
                 // the named export's *current* value (live), throwing ReferenceError
                 // for uninitialized (TDZ) bindings.
                 if (obj.internal_kind == .module_namespace) {
+                    // M16 Phase 5: "__ns__" is a synthetic key used by `import * as ns`
+                    // live binding rewriting so that reads of `ns` return the namespace
+                    // object itself while writes (`ns = x`) invoke namespace [[Set]]
+                    // and throw TypeError in strict mode.
+                    if (std.mem.eql(u8, key, "__ns__")) return obj_val;
                     const b = namespace_mod.backing(obj) orelse return val_mod.makeUndefined(self.arena);
                     if (namespace_mod.isTDZ(obj, key)) {
                         const realm_m = @import("../runtime/realm.zig");

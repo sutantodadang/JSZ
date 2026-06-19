@@ -230,7 +230,7 @@ pub const ENTRY_ID = "__entry__";
 /// may be a let/const/class, the function does a pre-pass to collect all
 /// let/const/class local declarations (including non-exported ones) before
 /// processing export-names in `export { ... }` lists.
-pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), out_tdz: *std.ArrayList([]const u8), out_fn: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
+pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), out_tdz: *std.ArrayList([]const u8), out_fn: *std.ArrayList([]const u8), out_default_fn_binding: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
     // Pre-pass: collect ALL let/const/class local binding names (exported or
     // not), so `export { local2 as renamed }` can detect that `local2` is TDZ.
     var tdz_locals = std.StringHashMap(void).init(allocator);
@@ -401,15 +401,34 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), out_tdz
                 out.append(allocator, "default") catch {};
                 // default is in TDZ unless it's a function/generator
                 // declaration (which are hoisted and initialized during
-                // instantiation). Anonymous or named function defaults
-                // are initialized; class defaults and expression defaults
-                // are uninitialized (TDZ).
+                // instantiation). Both named and anonymous function/generator
+                // defaults are initialized; class defaults and expression
+                // defaults are uninitialized (TDZ).
                 const after_default = rest["default ".len..];
-                const is_fn_hoisted = std.mem.startsWith(u8, after_default, "function ") or
-                    std.mem.startsWith(u8, after_default, "async function ") or
-                    std.mem.startsWith(u8, after_default, "async\nfunction ");
+                // Match "function" or "async function" followed by ' ', '*', or
+                // '(' — covering named, anonymous, and generator variants.
+                const is_sync_fn = std.mem.startsWith(u8, after_default, "function") and
+                    after_default.len >= 9 and
+                    (after_default[8] == ' ' or after_default[8] == '*' or after_default[8] == '(');
+                const is_async_fn = std.mem.startsWith(u8, after_default, "async function") and
+                    after_default.len >= 15 and
+                    (after_default[14] == ' ' or after_default[14] == '*' or after_default[14] == '(');
+                const is_fn_hoisted = is_sync_fn or is_async_fn;
                 if (!is_fn_hoisted) {
                     out_tdz.append(allocator, "default") catch {};
+                }
+                // Extract binding name for named default function/generator
+                // so the bundle can pre-hoist exports["default"] = NAME;
+                if (is_fn_hoisted) {
+                    var j: usize = if (is_async_fn) @as(usize, 14) else @as(usize, 8);
+                    if (j < after_default.len and after_default[j] == '*') j += 1;
+                    while (j < after_default.len and after_default[j] == ' ') : (j += 1) {}
+                    const name_start = j;
+                    while (j < after_default.len and (std.ascii.isAlphanumeric(after_default[j]) or
+                        after_default[j] == '_' or after_default[j] == '$')) : (j += 1) {}
+                    if (j > name_start) {
+                        out_default_fn_binding.append(allocator, after_default[name_start..j]) catch {};
+                    }
                 }
                 continue;
             }
@@ -613,6 +632,7 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     var sb = std.ArrayList(u8){};
     errdefer sb.deinit(gpa);
     try sb.appendSlice(gpa, "var __modules__ = {};\n");
+    try sb.appendSlice(gpa, "function __exportStar__(t,s){var ks=Object.keys(s);for(var i=0;i<ks.length;i++){if(ks[i]!==\"default\")t[ks[i]]=s[ks[i]];}}\n");
     var it = registry.iterator();
     while (it.next()) |e| {
         try sb.appendSlice(gpa, "__modules__[\"");
@@ -626,7 +646,8 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         var export_names = std.ArrayList([]const u8){};
         var tdz_names = std.ArrayList([]const u8){};
         var fn_names = std.ArrayList([]const u8){};
-        findExportNames(e.value_ptr.*, &export_names, &tdz_names, &fn_names, arena);
+        var fn_default_binding = std.ArrayList([]const u8){};
+        findExportNames(e.value_ptr.*, &export_names, &tdz_names, &fn_names, &fn_default_binding, arena);
         if (export_names.items.len > 0) {
             try sb.appendSlice(gpa, "__initExports__(exports,[");
             for (export_names.items, 0..) |nm, eni| {
@@ -658,10 +679,13 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
                 try sb.appendSlice(gpa, "exports.");
                 try sb.appendSlice(gpa, nm);
                 try sb.appendSlice(gpa, " = ");
-                // The function name may need escaping for keywords (rare in practice).
-                // Use bracket notation for safety: exports["NAME"] = NAME
-                // But direct exports.NAME = NAME works for valid identifiers.
                 try sb.appendSlice(gpa, nm);
+                try sb.appendSlice(gpa, ";\n");
+            }
+            // Named default function/generator pre-hoist: exports["default"] = NAME
+            for (fn_default_binding.items) |bn| {
+                try sb.appendSlice(gpa, "exports[\"default\"] = ");
+                try sb.appendSlice(gpa, bn);
                 try sb.appendSlice(gpa, ";\n");
             }
         }
@@ -682,7 +706,8 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     var entry_names = std.ArrayList([]const u8){};
     var entry_tdz = std.ArrayList([]const u8){};
     var entry_fn = std.ArrayList([]const u8){};
-    findExportNames(entry_src, &entry_names, &entry_tdz, &entry_fn, arena);
+    var entry_default_fn = std.ArrayList([]const u8){};
+    findExportNames(entry_src, &entry_names, &entry_tdz, &entry_fn, &entry_default_fn, arena);
     if (entry_names.items.len > 0) {
         try sb.appendSlice(gpa, "__initExports__(exports,[");
         for (entry_names.items, 0..) |nm, eni| {
@@ -713,7 +738,18 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
             try sb.appendSlice(gpa, nm);
             try sb.appendSlice(gpa, ";\n");
         }
+        // Named default function/generator pre-hoist for entry module.
+        for (entry_default_fn.items) |bn| {
+            try sb.appendSlice(gpa, "exports[\"default\"] = ");
+            try sb.appendSlice(gpa, bn);
+            try sb.appendSlice(gpa, ";\n");
+        }
     }
+    // M16 Phase 5: marker for the parser to identify where entry body starts,
+    // so hoisted import require() calls land AFTER the bundle header (which sets
+    // up __modules__ / __initExports__ / pre-registered self-module) but BEFORE
+    // entry body assertions that appear before `import` in source order.
+    try sb.appendSlice(gpa, "var __esm_hoist_point__=1;\n");
     try sb.appendSlice(gpa, entry_src);
     return sb.toOwnedSlice(gpa);
 }

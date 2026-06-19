@@ -1149,6 +1149,11 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
         name = p.current.value_str;
         _ = p.advance();
     }
+    // M16 Phase 5: anonymous function in export default inherits name "default".
+    if (name == null and p.export_default_name_hint != null) {
+        name = p.export_default_name_hint;
+        p.export_default_name_hint = null;
+    }
     const parsed_params = p.parseFunctionParams() orelse return null;
     const prev_gen = p.in_generator_function;
     p.in_generator_function = is_generator;

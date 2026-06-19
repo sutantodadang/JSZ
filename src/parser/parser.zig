@@ -72,6 +72,20 @@ pub const Parser = struct {
     /// exotic object can distinguish "uninitialized export" (TDZ → ReferenceError) from
     /// "not an export" (→ undefined), even on self-import before the export assignments run.
     all_export_names: std.ArrayList([]const u8),
+    /// M16 Phase 5: nesting depth inside function bodies. 0 = top-level module code;
+    /// incremented by parseFunctionBody so import hoisting only applies at top level.
+    fn_nesting_depth: u32,
+    /// M16 Phase 5: import statements collected at top level (fn_nesting_depth == 0)
+    /// to be inserted before entry body stmts, so require() runs before any assertions.
+    hoisted_import_stmts: std.ArrayList(*Node),
+    /// M16 Phase 5: set when `var __esm_hoist_point__=1;` is seen in the bundle header.
+    /// Only then do we hoist imports — unit tests have no marker so they keep source order.
+    hoist_point_seen: bool,
+    /// M16 Phase 5: index into the stmt list after which hoisted imports are inserted.
+    hoist_point_idx: usize,
+    /// M16 Phase 5: name hint set by parseExportDecl for `export default class/function`
+    /// anonymous expressions, consumed by parseClassExpr / parseFunctionExpr.
+    export_default_name_hint: ?[]const u8,
 
     pub fn init(source: []const u8, arena: std.mem.Allocator) Parser {
         var p = Parser{
@@ -86,6 +100,11 @@ pub const Parser = struct {
             .live_imports = .{},
             .live_exports = .{},
             .all_export_names = .{},
+            .fn_nesting_depth = 0,
+            .hoisted_import_stmts = .{},
+            .hoist_point_seen = false,
+            .hoist_point_idx = 0,
+            .export_default_name_hint = null,
         };
         // Prime the lookahead.
         p.current = p.lexNext();
@@ -278,6 +297,33 @@ pub const Parser = struct {
                 break;
             };
             self.drainExtraStmts(&stmts);
+            // M16 Phase 5: detect the hoist-point marker emitted by buildBundle right
+            // before entry_src. Imports hoisted after this marker land after the full
+            // bundle header (which initialises __modules__ / __initExports__) but before
+            // entry body assertions that precede `import` declarations in source order.
+            if (s.kind == .var_decl and
+                std.mem.eql(u8, s.data.var_decl.name, "__esm_hoist_point__"))
+            {
+                self.hoist_point_seen = true;
+                self.hoist_point_idx = stmts.items.len;
+            }
+        }
+        // M16 Phase 5: insert hoisted imports at the hoist point (after bundle header,
+        // before entry body). Only active when the bundle marker was seen; unit tests
+        // have no marker so hoisted_import_stmts is always empty for them.
+        if (self.hoisted_import_stmts.items.len > 0) {
+            var final_stmts = std.ArrayList(*Node){};
+            final_stmts.appendSlice(self.arena, stmts.items[0..self.hoist_point_idx]) catch {
+                self.had_error = true;
+            };
+            final_stmts.appendSlice(self.arena, self.hoisted_import_stmts.items) catch {
+                self.had_error = true;
+            };
+            final_stmts.appendSlice(self.arena, stmts.items[self.hoist_point_idx..]) catch {
+                self.had_error = true;
+            };
+            self.hoisted_import_stmts.clearRetainingCapacity();
+            stmts = final_stmts;
         }
         self.applyLiveBindings(stmts.items, li_start, le_start);
         if (self.had_error) {
@@ -396,6 +442,17 @@ pub const Parser = struct {
             const imp = self.live_imports.items[i];
             if ((counts.get(imp.name) orelse 0) <= 1) {
                 for (stmts) |s| self.rewriteName(s, imp.name, imp.ns, imp.prop);
+                // In bundle mode (hoist_point_seen), clear the snapshot init
+                // `var local = ns.prop` so TDZ exports don't throw — all uses
+                // are already rewritten to `ns.prop` above. Not needed for unit
+                // tests (no hoist) since imports run after their module is ready.
+                if (self.fn_nesting_depth == 0 and self.hoist_point_seen) {
+                    for (stmts) |s| {
+                        if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, imp.name)) {
+                            s.data.var_decl.init = null;
+                        }
+                    }
+                }
             }
         }
         var j = le_start;

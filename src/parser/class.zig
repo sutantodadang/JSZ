@@ -555,8 +555,14 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             fn_body.append(p.arena, hv) catch return null;
         }
 
+        // Named class → ctor name = class_name; anonymous with export-default hint → "default"; else null.
+        const ctor_fn_name: ?[]const u8 = if (has_name) class_name else blk: {
+            const hint = p.export_default_name_hint;
+            p.export_default_name_hint = null;
+            break :blk hint;
+        };
         const ctor_fn = p.makeNode(.function_expr, start, start, .{
-            .function_expr = .{ .name = null, .params = ctor_params, .body = ctor_body_effective, .is_arrow = false },
+            .function_expr = .{ .name = ctor_fn_name, .params = ctor_params, .body = ctor_body_effective, .is_arrow = false },
         }) orelse return null;
         const ctor_var = p.makeNode(.var_decl, start, start, .{
             .var_decl = .{ .kind = .var_, .name = class_name, .init = ctor_fn },
@@ -708,6 +714,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
 
 pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     _ = p.expect(.left_brace) orelse return null;
+    p.fn_nesting_depth += 1;
     var body = std.ArrayList(*Node){};
     const li_start = p.live_imports.items.len;
     const le_start = p.live_exports.items.len;
@@ -720,6 +727,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
         p.drainExtraStmts(&body);
     }
     p.applyLiveBindings(body.items, li_start, le_start);
+    p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
     return body.items;
 }

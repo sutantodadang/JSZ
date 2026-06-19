@@ -85,7 +85,11 @@ pub fn hasExport(o: *JsObject, key: []const u8) bool {
             }
         }
     }
-    return false;
+    // `export * from 'mod'` copies keys onto the backing object at runtime via
+    // __exportStar__ but does not add them to the __initExports__ list (which
+    // only covers the direct module source). Fall back to the backing's own
+    // properties so `'starName' in ns` returns true for star re-exports.
+    return b.hasOwn(key);
 }
 
 /// True when `key` is a known export name whose backing property is still

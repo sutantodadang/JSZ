@@ -28,7 +28,15 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
         _ = p.advance();
         p.consumeSemicolon();
         const req = p.mkRequire(modname) orelse return null;
-        return p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = req });
+        const stmt = p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = req }) orelse return null;
+        // M16 Phase 5: hoist side-effect imports to the bundle hoist point so
+        // require() runs after __modules__ is initialised but before entry assertions.
+        // Only hoist when the bundle marker has been seen (not in unit tests).
+        if (p.fn_nesting_depth == 0 and p.hoist_point_seen) {
+            p.hoisted_import_stmts.append(p.arena, stmt) catch {};
+            return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
+        }
+        return stmt;
     }
 
     var default_name: ?[]const u8 = null;
@@ -67,7 +75,10 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     const tmp = std.fmt.allocPrint(p.arena, "__esm_{d}", .{start}) catch return null;
     var out = std.ArrayList(*Node){};
     const req = p.mkRequire(modname) orelse return null;
-    out.append(p.arena, p.mkVar(tmp, req) orelse return null) catch return null;
+    // M16 Phase 5: wrap in namespace so named/default imports get live binding,
+    // TDZ detection, and assignment-rejection semantics.
+    const ns_req = p.mkCall1("__makeNamespace__", req) orelse return null;
+    out.append(p.arena, p.mkVar(tmp, ns_req) orelse return null) catch return null;
     if (default_name) |d| {
         const m = p.mkMember(p.mkIdent(tmp) orelse return null, "default") orelse return null;
         out.append(p.arena, p.mkVar(d, m) orelse return null) catch return null;
@@ -78,11 +89,24 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
         // imported module's live exports (ES §10.4.6), not the exports itself.
         const ns_val = p.mkCall1("__makeNamespace__", p.mkIdent(tmp) orelse return null) orelse return null;
         out.append(p.arena, p.mkVar(n, ns_val) orelse return null) catch return null;
+        // Treat n as a live import pointing to the namespace's "__ns__" property:
+        // reads of `n` return the namespace itself (via __ns__ [[Get]]) and
+        // writes (`n = x`) call namespace [[Set]] which throws TypeError in strict mode.
+        p.live_imports.append(p.arena, .{ .name = n, .ns = tmp, .prop = "__ns__" }) catch return null;
     }
     for (named.items) |nb| {
         const m = p.mkMember(p.mkIdent(tmp) orelse return null, nb.imp) orelse return null;
         out.append(p.arena, p.mkVar(nb.local, m) orelse return null) catch return null;
         p.live_imports.append(p.arena, .{ .name = nb.local, .ns = tmp, .prop = nb.imp }) catch return null;
+    }
+    // M16 Phase 5: hoist import stmts to the bundle hoist point so require() runs
+    // after __modules__ / __initExports__ are set up but before entry assertions.
+    // Guard on hoist_point_seen so unit tests (no bundle marker) keep source order.
+    if (p.fn_nesting_depth == 0 and p.hoist_point_seen) {
+        for (out.items) |s| {
+            p.hoisted_import_stmts.append(p.arena, s) catch {};
+        }
+        return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
     }
     return p.finishMulti(out.items);
 }
@@ -93,7 +117,76 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
 
     // export default <assignmentExpr>;
     if (p.match(.kw_default)) {
+        // export default function [*] [Name]() {} — detect as function declaration.
+        const is_async_kw = p.currentIsAsyncKw() and p.peekNext().kind == .kw_function and !p.peekNext().line_terminator_before;
+        if (p.current.kind == .kw_function or is_async_kw) {
+            const fn_start = p.current.start;
+            const is_async = is_async_kw;
+            if (is_async) _ = p.advance(); // consume 'async'
+            _ = p.advance(); // consume 'function'
+            const is_gen = p.match(.star);
+            if (p.current.kind == .identifier) {
+                // Named: export default function F(){} → function_decl F + exports.default = F
+                const fn_name = p.current.value_str;
+                _ = p.advance();
+                const parsed_params = p.parseFunctionParams() orelse return null;
+                const prev_gen = p.in_generator_function;
+                p.in_generator_function = is_gen;
+                const body = p.parseFunctionBody() orelse {
+                    p.in_generator_function = prev_gen;
+                    return null;
+                };
+                p.in_generator_function = prev_gen;
+                const is_strict = parser_file.hasUseStrict(body);
+                const fn_decl = p.makeNode(.function_decl, fn_start, p.current.start, .{
+                    .function_decl = .{
+                        .name = fn_name,
+                        .params = parsed_params.params,
+                        .param_defaults = parsed_params.param_defaults,
+                        .rest_param = parsed_params.rest_param,
+                        .body = body,
+                        .is_generator = is_gen,
+                        .is_async = is_async,
+                        .is_strict = is_strict,
+                    },
+                }) orelse return null;
+                const assign = p.mkExportAssign("default", p.mkIdent(fn_name) orelse return null) orelse return null;
+                var out2 = std.ArrayList(*Node){};
+                out2.append(p.arena, fn_decl) catch return null;
+                out2.append(p.arena, assign) catch return null;
+                return p.finishMulti(out2.items);
+            } else {
+                // Anonymous: export default function(){} → fn_expr with name "default"
+                const parsed_params = p.parseFunctionParams() orelse return null;
+                const prev_gen = p.in_generator_function;
+                p.in_generator_function = is_gen;
+                const body = p.parseFunctionBody() orelse {
+                    p.in_generator_function = prev_gen;
+                    return null;
+                };
+                p.in_generator_function = prev_gen;
+                const is_strict = parser_file.hasUseStrict(body);
+                const fn_expr = p.makeNode(.function_expr, fn_start, p.current.start, .{
+                    .function_expr = .{
+                        .name = "default",
+                        .params = parsed_params.params,
+                        .param_defaults = parsed_params.param_defaults,
+                        .rest_param = parsed_params.rest_param,
+                        .body = body,
+                        .is_arrow = false,
+                        .is_generator = is_gen,
+                        .is_async = is_async,
+                        .is_strict = is_strict,
+                    },
+                }) orelse return null;
+                p.consumeSemicolon();
+                return p.mkExportAssign("default", fn_expr);
+            }
+        }
+        // Set name hint for anonymous class / other anonymous expression.
+        p.export_default_name_hint = "default";
         const expr = p.parseAssignmentExpr() orelse return null;
+        p.export_default_name_hint = null;
         p.consumeSemicolon();
         return p.mkExportAssign("default", expr);
     }
@@ -111,21 +204,19 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             const ns_val = p.mkCall1("__makeNamespace__", req) orelse return null;
             return p.mkExportAssign(ns_tok.value_str, ns_val);
         } else {
-            // export * from "mod" → Object.assign(exports, require("mod"))
+            // export * from "mod" → __exportStar__(exports, require("mod"))
+            // __exportStar__ copies all properties except 'default' (ES spec §2.2.2.3).
             if (!p.matchContextual("from")) return p.fail("expected 'from' after export *");
             const mod_tok = p.expect(.string) orelse return null;
             p.consumeSemicolon();
             const req = p.mkRequire(mod_tok.value_str) orelse return null;
-            const obj_id = p.mkIdent("Object") orelse return null;
-            const assign_fn = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = obj_id, .property = p.mkIdent("assign") orelse return null, .computed = false },
-            }) orelse return null;
+            const callee = p.mkIdent("__exportStar__") orelse return null;
             const exports_id = p.mkIdent("exports") orelse return null;
             var aa = std.ArrayList(*Node){};
             aa.append(p.arena, exports_id) catch return null;
             aa.append(p.arena, req) catch return null;
             const call = p.makeNode(.call_expr, start, start, .{
-                .call_expr = .{ .callee = assign_fn, .args = aa.items },
+                .call_expr = .{ .callee = callee, .args = aa.items },
             }) orelse return null;
             return p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = call });
         }
