@@ -542,6 +542,7 @@ fn sameValueRough(a: Value, b: Value) bool {
     const ua = a.unbox();
     const ub = b.unbox();
     if (ua == .number and ub == .number) return ua.number == ub.number;
+    if (ua == .string and ub == .string) return std.mem.eql(u8, ua.string, ub.string);
     return false;
 }
 

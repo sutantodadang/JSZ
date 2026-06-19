@@ -557,6 +557,40 @@ pub const Lexer = struct {
             return t;
         }
 
+        // Unicode-escape identifier: \uXXXX or \u{XXXX}
+        // e.g. `export { x as μ }` — the escape must be decoded into UTF-8
+        // so the exported name string equals the actual Unicode character.
+        if (c == '\\' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == 'u') {
+            if (parseUnicodeEscape(self.source, self.pos + 2)) |r| {
+                var buf = std.ArrayList(u8){};
+                defer buf.deinit(self.allocator);
+                try appendWtf8(&buf, self.allocator, r.cp);
+                self.column += @intCast(r.end - self.pos);
+                self.pos = r.end;
+                // Consume any following raw ident chars or additional \uXXXX escapes.
+                while (self.pos < self.source.len) {
+                    const nc = self.source[self.pos];
+                    if (isIdentChar(nc)) {
+                        try buf.append(self.allocator, nc);
+                        self.pos += 1;
+                        self.column += 1;
+                    } else if (nc == '\\' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == 'u') {
+                        if (parseUnicodeEscape(self.source, self.pos + 2)) |r2| {
+                            try appendWtf8(&buf, self.allocator, r2.cp);
+                            self.column += @intCast(r2.end - self.pos);
+                            self.pos = r2.end;
+                        } else break;
+                    } else break;
+                }
+                const owned = self.allocator.dupe(u8, buf.items) catch return LexError.OutOfMemory;
+                const kind = lookupKeyword(owned) orelse .identifier;
+                var t = Token.initSimple(kind, @intCast(start), @intCast(self.pos), start_line, start_col, lt_before);
+                t.value_str = owned;
+                self.prev_kind = kind;
+                return t;
+            }
+        }
+
         // Number
         if (isDecDigit(c) or (c == '.' and self.pos + 1 < self.source.len and isDecDigit(self.source[self.pos + 1]))) {
             if (c == '.') {
@@ -864,7 +898,7 @@ fn appendWtf8(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, cp: u32) error{
 }
 
 fn isIdentStart(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$' or c >= 0x80;
 }
 
 fn isIdentChar(c: u8) bool {
@@ -884,6 +918,36 @@ fn hexVal(c: u8) ?u8 {
     if (c >= 'a' and c <= 'f') return c - 'a' + 10;
     if (c >= 'A' and c <= 'F') return c - 'A' + 10;
     return null;
+}
+
+/// Parse `\uXXXX` or `\u{XXXX}` where `i` is the index in `src` right after
+/// the `\u` (i.e. the first hex digit or `{`). Returns `{.cp, .end}` on
+/// success (`.end` is the source index past the last consumed char); returns
+/// null on malformed input without consuming anything.
+fn parseUnicodeEscape(src: []const u8, i: usize) ?struct { cp: u32, end: usize } {
+    if (i >= src.len) return null;
+    if (src[i] == '{') {
+        var j = i + 1;
+        var cp: u32 = 0;
+        var any: bool = false;
+        while (j < src.len and src[j] != '}') : (j += 1) {
+            const h = hexVal(src[j]) orelse return null;
+            cp = (cp << 4) | @as(u32, h);
+            if (cp > 0x10FFFF) return null;
+            any = true;
+        }
+        if (j >= src.len or !any) return null;
+        return .{ .cp = cp, .end = j + 1 };
+    } else {
+        if (i + 4 > src.len) return null;
+        var cp: u32 = 0;
+        var j: usize = 0;
+        while (j < 4) : (j += 1) {
+            const h = hexVal(src[i + j]) orelse return null;
+            cp = (cp << 4) | @as(u32, h);
+        }
+        return .{ .cp = cp, .end = i + 4 };
+    }
 }
 
 // ------------------------------------------------------------------ tests ---

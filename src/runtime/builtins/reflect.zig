@@ -467,6 +467,13 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
             });
             return val_mod.makeBool(arena, sok);
         }
+        // ES §10.1.6.3 ValidateAndApplyPropertyDescriptor step 4: a generic
+        // descriptor (no fields at all) on an existing property is a no-op → true.
+        // A generic descriptor on a non-existing property on a non-extensible
+        // object → false (handled below via defineOwnDataSym).
+        const is_generic = !sdesc.hasOwn("value") and !sdesc.hasOwn("writable") and
+            !sdesc.hasOwn("enumerable") and !sdesc.hasOwn("configurable");
+        if (is_generic and target_obj.hasOwnSym(key_arg)) return val_mod.makeBool(arena, true);
         // Preserve existing own symbol property's value when the descriptor omits
         // "value" (ES §9.1.6.3 OrdinaryDefineOwnProperty step 4 / §10.4.6.7).
         // Without this, a bare {} descriptor overwrites e.g. Symbol.toStringTag's

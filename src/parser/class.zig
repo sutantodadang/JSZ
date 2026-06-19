@@ -344,7 +344,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         },
     }) orelse return null;
     const ctor_decl = p.makeNode(.var_decl, start, p.current.start, .{
-        .var_decl = .{ .kind = .var_, .name = class_name, .init = ctor_fn },
+        .var_decl = .{ .kind = .let, .name = class_name, .init = ctor_fn },
     }) orelse return null;
     out.append(p.arena, ctor_decl) catch return null;
 
@@ -718,6 +718,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     var body = std.ArrayList(*Node){};
     const li_start = p.live_imports.items.len;
     const le_start = p.live_exports.items.len;
+    const la_start = p.live_export_aliases.items.len;
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const s = p.parseStatement() orelse break;
         body.append(p.arena, s) catch {
@@ -726,7 +727,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
         };
         p.drainExtraStmts(&body);
     }
-    p.applyLiveBindings(body.items, li_start, le_start);
+    p.applyLiveBindings(body.items, li_start, le_start, la_start);
     p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
     return body.items;

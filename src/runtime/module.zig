@@ -816,7 +816,7 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     }
     // M16 Phase 5: marker for the parser to identify where entry body starts,
     // so hoisted import require() calls land AFTER the bundle header (which sets
-    // up __modules__ / __initExports__ / pre-registered self-module) but BEFORE
+    // up __modules__ / __initExports__ / pre-registered self-module) BUT BEFORE
     // entry body assertions that appear before `import` in source order.
     try sb.appendSlice(gpa, "var __esm_hoist_point__=1;\n");
     try sb.appendSlice(gpa, entry_src);

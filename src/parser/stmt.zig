@@ -210,7 +210,14 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             p.consumeSemicolon();
             const req = p.mkRequire(mod_tok.value_str) orelse return null;
             const ns_val = p.mkCall1("__makeNamespace__", req) orelse return null;
-            return p.mkExportAssign(ns_tok.value_str, ns_val);
+            const stmt = p.mkExportAssign(ns_tok.value_str, ns_val);
+            // Hoist in bundle mode so source-order eval matches spec (import and
+            // export-from declarations all run before the module body).
+            if (p.fn_nesting_depth == 0 and p.hoist_point_seen) {
+                if (stmt) |s| p.hoisted_import_stmts.append(p.arena, s) catch {};
+                return p.makeNode(.empty_stmt, start, start, .{ .empty_stmt = {} });
+            }
+            return stmt;
         } else {
             // export * from "mod" → __exportStar__(exports, require("mod"))
             // __exportStar__ copies all properties except 'default' (ES spec §2.2.2.3).
@@ -226,7 +233,13 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             const call = p.makeNode(.call_expr, start, start, .{
                 .call_expr = .{ .callee = callee, .args = aa.items },
             }) orelse return null;
-            return p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = call });
+            const stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = call });
+            // Hoist in bundle mode.
+            if (p.fn_nesting_depth == 0 and p.hoist_point_seen) {
+                if (stmt) |s| p.hoisted_import_stmts.append(p.arena, s) catch {};
+                return p.makeNode(.empty_stmt, start, start, .{ .empty_stmt = {} });
+            }
+            return stmt;
         }
     }
 
@@ -262,13 +275,25 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             else
                 (p.mkIdent(sp.local) orelse return null);
             out.append(p.arena, p.mkExportAssign(sp.exported, value) orelse return null) catch return null;
-            // A non-aliased local export (`export { a }`, not `a as c`, not a
-            // re-export `from`) is made live so later reassignments to `a` are
-            // seen by importers. `makeExportLive` keys on the shared name, so it
-            // only applies when local == exported and there is a local binding.
-            if (tmp == null and std.mem.eql(u8, sp.local, sp.exported)) {
-                p.live_exports.append(p.arena, sp.local) catch {};
+            if (tmp == null) {
+                if (std.mem.eql(u8, sp.local, sp.exported)) {
+                    // Non-aliased local export (`export { a }`): make live so
+                    // reassignments to `a` are observed by importers.
+                    p.live_exports.append(p.arena, sp.local) catch {};
+                } else {
+                    // Aliased local export (`export { local2 as renamed }`): rewrite
+                    // all uses of `local2` to `exports.renamed` so mutations propagate.
+                    p.live_export_aliases.append(p.arena, .{ .local = sp.local, .exported = sp.exported }) catch {};
+                }
             }
+        }
+        // Hoist ONLY empty-binding re-exports (`export {} from 'mod'`) in bundle mode:
+        // these are pure side-effect imports and must run before the module body to
+        // match spec evaluation order. Non-empty re-exports (`export { a } from`) are
+        // left in place because they snapshot live values that may not be initialized yet.
+        if (p.fn_nesting_depth == 0 and p.hoist_point_seen and tmp != null and specs.items.len == 0) {
+            for (out.items) |s| p.hoisted_import_stmts.append(p.arena, s) catch {};
+            return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
         }
         return p.finishMulti(out.items);
     }
@@ -284,10 +309,17 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             return null;
         };
     }
-    // A single reassignable declarator (`export let`/`export var x = E`) is made live:
-    // its use-sites are rewritten to `exports.x` so reassignments are seen by importers.
-    if (decl.kind == .var_decl and (decl.data.var_decl.kind == .let or decl.data.var_decl.kind == .var_)) {
-        p.live_exports.append(p.arena, decl.data.var_decl.name) catch {};
+    // var exports are always made live (no TDZ, fine in all modes).
+    // let/const exports are made live only when __initExports__ will pre-set TDZ
+    // markers on the exports object: bundle dep factories (fn_nesting_depth > 0),
+    // bundle entry (hoist_point_seen), or script mode (unit tests, !is_module).
+    // Standalone evalModule (no bundle) keeps env-level TDZ for let/const — the
+    // GET_GLOBAL_OPT handler already throws for TemporalDeadZone.
+    if (decl.kind == .var_decl) {
+        const vkind = decl.data.var_decl.kind;
+        if (vkind == .var_ or !p.is_module or p.fn_nesting_depth > 0 or p.hoist_point_seen) {
+            p.live_exports.append(p.arena, decl.data.var_decl.name) catch {};
+        }
     }
     return decl;
 }

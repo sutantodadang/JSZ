@@ -160,25 +160,42 @@ pub fn sortedNames(arena: std.mem.Allocator, o: *JsObject) ![]const []const u8 {
     // Prefer the export-names list for deterministic order.
     if (exportNamesArr(b)) |arr| {
         const n = arr.getArrayLength();
-        var names = try std.ArrayList([]const u8).initCapacity(arena, n);
+        var names = try std.ArrayList([]const u8).initCapacity(arena, n + 8);
         var i: u32 = 0;
         var buf: [32]u8 = undefined;
         while (i < n) : (i += 1) {
             const idx_key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
             if (arr.get(idx_key)) |name_val| {
                 if (name_val.bits != 0 and name_val.unbox() == .string) {
-                    names.appendAssumeCapacity(name_val.toPtr().string);
+                    try names.append(arena, name_val.toPtr().string);
                 }
             }
+        }
+        // Also include star re-export keys from the backing's own string properties:
+        // `export * from 'mod'` copies keys via __exportStar__ at runtime but does
+        // NOT add them to the exportNamesArr (which only covers direct source exports).
+        // Skip __esModule — it's a CJS interop marker, not an exported name.
+        outer: for (b.ownKeys()) |k| {
+            if (std.mem.eql(u8, k, "__esModule")) continue;
+            for (names.items) |existing| {
+                if (std.mem.eql(u8, existing, k)) continue :outer;
+            }
+            try names.append(arena, k);
         }
         const out = try arena.alloc([]const u8, names.items.len);
         @memcpy(out, names.items);
         std.mem.sort([]const u8, out, {}, lessThanCodeUnit);
         return out;
     }
-    const keys = b.ownKeys();
-    const out = try arena.alloc([]const u8, keys.len);
-    @memcpy(out, keys);
+    // No exportNamesArr: fall back to the backing's own keys, but skip
+    // __esModule — it's a CJS interop marker, not an exported name.
+    var names = try std.ArrayList([]const u8).initCapacity(arena, 8);
+    for (b.ownKeys()) |k| {
+        if (std.mem.eql(u8, k, "__esModule")) continue;
+        try names.append(arena, k);
+    }
+    const out = try arena.alloc([]const u8, names.items.len);
+    @memcpy(out, names.items);
     std.mem.sort([]const u8, out, {}, lessThanCodeUnit);
     return out;
 }

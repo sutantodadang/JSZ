@@ -692,11 +692,25 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
             if (!sok) return throwTypeError(arena, "cannot redefine property");
             return args[0];
         }
-        const sval = sdesc.getOwn("value") orelse try val_mod.makeUndefined(arena);
+        // ES §10.1.6.3 step 4: generic descriptor (no fields) on an existing prop → true.
+        const is_generic_sym = !sdesc.hasOwn("value") and !sdesc.hasOwn("writable") and
+            !sdesc.hasOwn("enumerable") and !sdesc.hasOwn("configurable");
+        if (is_generic_sym and obj.hasOwnSym(key_raw)) return args[0];
+        // Preserve existing value/attrs for omitted descriptor fields (partial-descriptor
+        // semantics: an empty {} leaves everything unchanged on a non-configurable prop).
+        const existing_sym = obj.getOwnSymEntry(key_raw);
+        const sval = if (sdesc.hasOwn("value"))
+            (sdesc.getOwn("value") orelse try val_mod.makeUndefined(arena))
+        else if (existing_sym) |ee| if (!ee.attr.is_accessor)
+            (obj.getOwnSym(key_raw) orelse try val_mod.makeUndefined(arena))
+        else
+            try val_mod.makeUndefined(arena)
+        else
+            try val_mod.makeUndefined(arena);
         const sok = try obj.defineOwnDataSym(key_raw, sval, .{
-            .writable = descTruthy(sdesc.getOwn("writable")),
-            .enumerable = descTruthy(sdesc.getOwn("enumerable")),
-            .configurable = descTruthy(sdesc.getOwn("configurable")),
+            .writable = if (sdesc.hasOwn("writable")) descTruthy(sdesc.getOwn("writable")) else if (existing_sym) |ee| ee.attr.writable else false,
+            .enumerable = if (sdesc.hasOwn("enumerable")) descTruthy(sdesc.getOwn("enumerable")) else if (existing_sym) |ee| ee.attr.enumerable else false,
+            .configurable = if (sdesc.hasOwn("configurable")) descTruthy(sdesc.getOwn("configurable")) else if (existing_sym) |ee| ee.attr.configurable else false,
         });
         if (!sok) return throwTypeError(arena, "cannot redefine property");
         return args[0];
@@ -883,7 +897,14 @@ pub fn nativeObjectDefineProperties(arena: std.mem.Allocator, _: Value, args: []
 pub fn nativeObjectFreeze(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
     if (args[0].unbox() != .object) return args[0];
-    args[0].toPtr().object.freezeSelf();
+    const obj = args[0].toPtr().object;
+    // Module Namespace: [[DefineOwnProperty]] rejects {writable:false} for exports
+    // (§10.4.6.7), so SetIntegrityLevel("frozen") always throws TypeError.
+    if (obj.internal_kind == .module_namespace) {
+        const names = try namespace_mod.sortedNames(arena, obj);
+        if (names.len > 0) return throwTypeError(arena, "Cannot define property on module namespace");
+    }
+    obj.freezeSelf();
     return args[0];
 }
 
@@ -907,7 +928,13 @@ pub fn nativeObjectPreventExtensions(arena: std.mem.Allocator, _: Value, args: [
 pub fn nativeObjectIsFrozen(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeBool(arena, true);
     if (args[0].unbox() != .object) return val_mod.makeBool(arena, true);
-    return val_mod.makeBool(arena, args[0].toPtr().object.isFrozenSelf());
+    const obj = args[0].toPtr().object;
+    // Module Namespace exports always have writable:true → namespace is never frozen.
+    if (obj.internal_kind == .module_namespace) {
+        const names = try namespace_mod.sortedNames(arena, obj);
+        if (names.len > 0) return val_mod.makeBool(arena, false);
+    }
+    return val_mod.makeBool(arena, obj.isFrozenSelf());
 }
 
 /// Object.isSealed(o): primitives → true; objects → isSealedSelf().

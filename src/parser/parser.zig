@@ -68,6 +68,9 @@ pub const Parser = struct {
     /// Phase 8: `export let`/`export var` names collected per module unit, used to rewrite
     /// their use-sites to `exports.name` so reassignments are observed live by importers.
     live_exports: std.ArrayList([]const u8),
+    /// M16 Phase 5: aliased live exports, e.g. `export { local2 as renamed }` where
+    /// local != exported. All uses of `local` are rewritten to `exports.exported`.
+    live_export_aliases: std.ArrayList(struct { local: []const u8, exported: []const u8 }),
     /// M16 Phase 4: all exported names (deduplicated), collected so the module namespace
     /// exotic object can distinguish "uninitialized export" (TDZ → ReferenceError) from
     /// "not an export" (→ undefined), even on self-import before the export assignments run.
@@ -99,6 +102,7 @@ pub const Parser = struct {
             .extra_stmts = .{},
             .live_imports = .{},
             .live_exports = .{},
+            .live_export_aliases = .{},
             .all_export_names = .{},
             .fn_nesting_depth = 0,
             .hoisted_import_stmts = .{},
@@ -259,6 +263,7 @@ pub const Parser = struct {
         var stmts = std.ArrayList(*Node){};
         const li_start = self.live_imports.items.len;
         const le_start = self.live_exports.items.len;
+        const la_start = self.live_export_aliases.items.len;
         while (!self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
             stmts.append(self.arena, s) catch {
@@ -267,7 +272,7 @@ pub const Parser = struct {
             };
             self.drainExtraStmts(&stmts);
         }
-        self.applyLiveBindings(stmts.items, li_start, le_start);
+        self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
         if (self.had_error) {
             return ParseResult{ .err = self.error_info orelse ParseError{
                 .message = "parse error",
@@ -290,6 +295,7 @@ pub const Parser = struct {
         var stmts = std.ArrayList(*Node){};
         const li_start = self.live_imports.items.len;
         const le_start = self.live_exports.items.len;
+        const la_start = self.live_export_aliases.items.len;
         while (!self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
             stmts.append(self.arena, s) catch {
@@ -325,7 +331,7 @@ pub const Parser = struct {
             self.hoisted_import_stmts.clearRetainingCapacity();
             stmts = final_stmts;
         }
-        self.applyLiveBindings(stmts.items, li_start, le_start);
+        self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
         if (self.had_error) {
             return ParseResult{ .err = self.error_info orelse ParseError{
                 .message = "parse error",
@@ -426,15 +432,17 @@ pub const Parser = struct {
     // `export let/var` use-site to `exports.name`, when the local name has no declaration
     // other than its own binding (count <= 1) — sound (no shadowing possible). Shadowed
     // names keep CJS-snapshot semantics.
-    pub fn applyLiveBindings(self: *Parser, stmts: []*Node, li_start: usize, le_start: usize) void {
+    pub fn applyLiveBindings(self: *Parser, stmts: []*Node, li_start: usize, le_start: usize, la_start: usize) void {
         if (self.had_error) {
             self.live_imports.shrinkRetainingCapacity(li_start);
             self.live_exports.shrinkRetainingCapacity(le_start);
+            self.live_export_aliases.shrinkRetainingCapacity(la_start);
             return;
         }
         const n = self.live_imports.items.len;
         const ne = self.live_exports.items.len;
-        if (n <= li_start and ne <= le_start) return;
+        const na = self.live_export_aliases.items.len;
+        if (n <= li_start and ne <= le_start and na <= la_start) return;
         var counts = std.StringHashMap(u32).init(self.arena);
         for (stmts) |s| self.countDecls(s, &counts);
         var i = li_start;
@@ -460,8 +468,16 @@ pub const Parser = struct {
             const name = self.live_exports.items[j];
             if ((counts.get(name) orelse 0) <= 1) self.makeExportLive(stmts, name);
         }
+        var k = la_start;
+        while (k < na) : (k += 1) {
+            const alias = self.live_export_aliases.items[k];
+            if ((counts.get(alias.local) orelse 0) <= 1) {
+                self.makeExportLiveAlias(stmts, alias.local, alias.exported);
+            }
+        }
         self.live_imports.shrinkRetainingCapacity(li_start);
         self.live_exports.shrinkRetainingCapacity(le_start);
+        self.live_export_aliases.shrinkRetainingCapacity(la_start);
     }
 
     /// Is `s` the generated snapshot `exports.name = name;`?
@@ -517,6 +533,55 @@ pub const Parser = struct {
             }
         }
         for (stmts) |s| self.rewriteName(s, name, "exports", name);
+    }
+
+    /// Like `makeExportLive` but for `export { local as exported }` where local != exported.
+    /// Rewrites all uses of `local` to `exports.exported` and seeds the initializer.
+    pub fn makeExportLiveAlias(self: *Parser, stmts: []*Node, local: []const u8, exported: []const u8) void {
+        var has_var_decl = false;
+        var has_func_decl = false;
+        for (stmts) |s| {
+            if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, local)) has_var_decl = true;
+            if (s.kind == .function_decl and std.mem.eql(u8, s.data.function_decl.name, local)) has_func_decl = true;
+        }
+        if (has_func_decl and !has_var_decl) return;
+        for (stmts) |s| {
+            // Remove snapshot `exports.exported = local`
+            if (s.kind == .expr_stmt) {
+                const e = s.data.expr_stmt;
+                if (e.kind == .assignment_expr) {
+                    const a = e.data.assignment_expr;
+                    if (a.value.kind == .identifier and std.mem.eql(u8, a.value.data.identifier, local)) {
+                        const t = a.target;
+                        if (t.kind == .member_expr and !t.data.member_expr.computed) {
+                            const obj = t.data.member_expr.object;
+                            const prop = t.data.member_expr.property;
+                            if (obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "exports") and
+                                prop.kind == .identifier and std.mem.eql(u8, prop.data.identifier, exported))
+                            {
+                                s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // Convert `var local = init` → `exports.exported = init`
+            if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, local)) {
+                const obj = self.makeNode(.identifier, s.start, s.start, .{ .identifier = "exports" }) orelse continue;
+                const ep = self.makeNode(.identifier, s.start, s.start, .{ .identifier = exported }) orelse continue;
+                const tgt = self.makeNode(.member_expr, s.start, s.start, .{ .member_expr = .{ .object = obj, .property = ep, .computed = false } }) orelse continue;
+                if (s.data.var_decl.init) |init_node| {
+                    const asn = self.makeNode(.assignment_expr, s.start, s.start, .{ .assignment_expr = .{ .op = .assign, .target = tgt, .value = init_node } }) orelse continue;
+                    s.* = Node{ .kind = .expr_stmt, .start = s.start, .end = s.end, .data = .{ .expr_stmt = asn } };
+                } else {
+                    const undef = self.makeNode(.identifier, s.start, s.start, .{ .identifier = "undefined" }) orelse continue;
+                    const asn = self.makeNode(.assignment_expr, s.start, s.start, .{ .assignment_expr = .{ .op = .assign, .target = tgt, .value = undef } }) orelse continue;
+                    s.* = Node{ .kind = .expr_stmt, .start = s.start, .end = s.end, .data = .{ .expr_stmt = asn } };
+                }
+            }
+        }
+        for (stmts) |s| self.rewriteName(s, local, "exports", exported);
     }
 
     pub fn incCount(self: *Parser, counts: *std.StringHashMap(u32), name: []const u8) void {
@@ -936,6 +1001,7 @@ pub const Parser = struct {
         var stmts = std.ArrayList(*Node){};
         const li_start = self.live_imports.items.len;
         const le_start = self.live_exports.items.len;
+        const la_start = self.live_export_aliases.items.len;
         while (!self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
             stmts.append(self.arena, s) catch {
@@ -944,7 +1010,7 @@ pub const Parser = struct {
             };
             self.drainExtraStmts(&stmts);
         }
-        self.applyLiveBindings(stmts.items, li_start, le_start);
+        self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
         const is_strict = hasUseStrict(stmts.items);
         return .{ .stmts = stmts.items, .is_strict = is_strict };
     }
