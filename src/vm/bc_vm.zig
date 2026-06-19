@@ -2086,6 +2086,16 @@ pub const BcVm = struct {
                     }
                 }
 
+                // Sloppy-mode this correction (ES §10.2.1.1 step 2): non-strict
+                // function called with undefined/null this → substitute global object.
+                const frame_this: Value = if (!fn_ptr.is_strict and (this_val.isUndefined() or this_val.isNull())) blk: {
+                    const realm_m = @import("../runtime/realm.zig");
+                    if (realm_m.active_global_env) |genv| {
+                        break :blk genv.lookup("globalThis") catch this_val;
+                    }
+                    break :blk this_val;
+                } else this_val;
+
                 const caller_idx = self.frames.items.len - 1;
                 try self.frames.append(self.arena, BcCallFrame{
                     .func = fn_ptr,
@@ -2094,7 +2104,7 @@ pub const BcVm = struct {
                     .env = call_env,
                     .return_dst = ret_dst,
                     .caller_idx = caller_idx,
-                    .this_val = this_val,
+                    .this_val = frame_this,
                 });
                 return null;
             },
