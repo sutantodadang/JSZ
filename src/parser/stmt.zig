@@ -12,6 +12,37 @@ const NodeKind = ast.NodeKind;
 
 // ---------------------------------------------------------------- statements ---
 
+/// M16 Phase 5: skip an import-attributes `with { ... }` or `assert { ... }`
+/// clause that may follow a module specifier in import/export declarations.
+/// The clause is parsed and discarded (JSZ does not enforce attributes).
+fn skipImportAttributes(p: *Parser) void {
+    // `with` is a reserved-word token (kw_with); `assert` is a contextual kw.
+    const is_with = p.current.kind == .kw_with;
+    const is_assert = p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "assert");
+    if (!is_with and !is_assert) return;
+    _ = p.advance(); // consume `with` / `assert`
+    // Expect `{ ... }` — skip the braced block, tolerating nested braces and
+    // string literals (attribute values are string literals).
+    if (!p.match(.left_brace)) {
+        // Not a braces block — nothing to skip (allow `with` as a no-op).
+        return;
+    }
+    var depth: u32 = 1;
+    while (depth > 0 and !p.check(.eof) and !p.had_error) {
+        if (p.check(.left_brace)) {
+            depth += 1;
+            _ = p.advance();
+        } else if (p.check(.right_brace)) {
+            depth -= 1;
+            _ = p.advance();
+        } else if (p.check(.string)) {
+            _ = p.advance(); // skip string literal (attribute value)
+        } else {
+            _ = p.advance(); // skip any other token (keys, colons, commas)
+        }
+    }
+}
+
 pub fn parseImportDecl(p: *Parser) ?*Node {
     const start = p.current.start;
     // M16 Phase 3: `import(` (dynamic import) and `import.meta` are expressions,
@@ -26,13 +57,14 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     if (p.current.kind == .string) {
         const modname = p.current.value_str;
         _ = p.advance();
+        skipImportAttributes(p); // `with { ... }` / `assert { ... }`
         p.consumeSemicolon();
         const req = p.mkRequire(modname) orelse return null;
         const stmt = p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = req }) orelse return null;
         // M16 Phase 5: hoist side-effect imports to the bundle hoist point so
         // require() runs after __modules__ is initialised but before entry assertions.
         // Only hoist when the bundle marker has been seen (not in unit tests).
-        if (p.fn_nesting_depth == 0 and p.hoist_point_seen) {
+        if (p.hoist_point_seen) {
             p.hoisted_import_stmts.append(p.arena, stmt) catch {};
             return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
         }
@@ -70,6 +102,7 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
     const modtok = p.expect(.string) orelse return null;
     const modname = modtok.value_str;
+    skipImportAttributes(p); // `with { ... }` / `assert { ... }`
     p.consumeSemicolon();
 
     const tmp = std.fmt.allocPrint(p.arena, "__esm_{d}", .{start}) catch return null;
@@ -102,7 +135,7 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     // M16 Phase 5: hoist import stmts to the bundle hoist point so require() runs
     // after __modules__ / __initExports__ are set up but before entry assertions.
     // Guard on hoist_point_seen so unit tests (no bundle marker) keep source order.
-    if (p.fn_nesting_depth == 0 and p.hoist_point_seen) {
+    if (p.hoist_point_seen) {
         for (out.items) |s| {
             p.hoisted_import_stmts.append(p.arena, s) catch {};
         }
@@ -207,13 +240,14 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             const ns_tok = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
             if (!p.matchContextual("from")) return p.fail("expected 'from' after export * as");
             const mod_tok = p.expect(.string) orelse return null;
+            skipImportAttributes(p);
             p.consumeSemicolon();
             const req = p.mkRequire(mod_tok.value_str) orelse return null;
             const ns_val = p.mkCall1("__makeNamespace__", req) orelse return null;
             const stmt = p.mkExportAssign(ns_tok.value_str, ns_val);
             // Hoist in bundle mode so source-order eval matches spec (import and
             // export-from declarations all run before the module body).
-            if (p.fn_nesting_depth == 0 and p.hoist_point_seen) {
+            if (p.hoist_point_seen) {
                 if (stmt) |s| p.hoisted_import_stmts.append(p.arena, s) catch {};
                 return p.makeNode(.empty_stmt, start, start, .{ .empty_stmt = {} });
             }
@@ -223,6 +257,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             // __exportStar__ copies all properties except 'default' (ES spec §2.2.2.3).
             if (!p.matchContextual("from")) return p.fail("expected 'from' after export *");
             const mod_tok = p.expect(.string) orelse return null;
+            skipImportAttributes(p);
             p.consumeSemicolon();
             const req = p.mkRequire(mod_tok.value_str) orelse return null;
             const callee = p.mkIdent("__exportStar__") orelse return null;
@@ -235,7 +270,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             }) orelse return null;
             const stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = call });
             // Hoist in bundle mode.
-            if (p.fn_nesting_depth == 0 and p.hoist_point_seen) {
+            if (p.hoist_point_seen) {
                 if (stmt) |s| p.hoisted_import_stmts.append(p.arena, s) catch {};
                 return p.makeNode(.empty_stmt, start, start, .{ .empty_stmt = {} });
             }
@@ -264,6 +299,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
         var out = std.ArrayList(*Node){};
         if (p.matchContextual("from")) {
             const modtok = p.expect(.string) orelse return null;
+            skipImportAttributes(p);
             tmp = std.fmt.allocPrint(p.arena, "__esm_{d}", .{start}) catch return null;
             const req = p.mkRequire(modtok.value_str) orelse return null;
             out.append(p.arena, p.mkVar(tmp.?, req) orelse return null) catch return null;
@@ -291,7 +327,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
         // these are pure side-effect imports and must run before the module body to
         // match spec evaluation order. Non-empty re-exports (`export { a } from`) are
         // left in place because they snapshot live values that may not be initialized yet.
-        if (p.fn_nesting_depth == 0 and p.hoist_point_seen and tmp != null and specs.items.len == 0) {
+        if (p.hoist_point_seen and tmp != null and specs.items.len == 0) {
             for (out.items) |s| p.hoisted_import_stmts.append(p.arena, s) catch {};
             return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
         }

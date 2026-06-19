@@ -701,7 +701,7 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     var sb = std.ArrayList(u8){};
     errdefer sb.deinit(gpa);
     try sb.appendSlice(gpa, "var __modules__ = {};\n");
-    try sb.appendSlice(gpa, "function __exportStar__(t,s){var ks=Object.keys(s);for(var i=0;i<ks.length;i++){if(ks[i]!==\"default\")t[ks[i]]=s[ks[i]];}}\n");
+    try sb.appendSlice(gpa, "function __exportStar__(t,s){var ks=Object.keys(s);for(var i=0;i<ks.length;i++){var k=ks[i];if(k!==\"default\"){if(t.hasOwnProperty(k)){delete t[k];}else{t[k]=s[k];}}}}\n");
     var it = registry.iterator();
     while (it.next()) |e| {
         try sb.appendSlice(gpa, "__modules__[\"");

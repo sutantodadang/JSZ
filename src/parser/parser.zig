@@ -454,10 +454,19 @@ pub const Parser = struct {
                 // `var local = ns.prop` so TDZ exports don't throw — all uses
                 // are already rewritten to `ns.prop` above. Not needed for unit
                 // tests (no hoist) since imports run after their module is ready.
-                if (self.fn_nesting_depth == 0 and self.hoist_point_seen) {
+                if (self.hoist_point_seen) {
                     for (stmts) |s| {
                         if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, imp.name)) {
-                            s.data.var_decl.init = null;
+                            // M16 Phase 5: remove the import binding declaration
+                            // entirely.  All uses of `imp.name` have been rewritten
+                            // to `ns.prop` above, so the `var local = ns.prop`
+                            // declaration is dead code.  Removing it prevents the
+                            // entry module's import bindings (e.g. `var B` from
+                            // `import { B }`) from leaking to the top-level scope
+                            // and being visible inside dependency factory functions
+                            // via the scope chain — which would cause tests expecting
+                            // ReferenceError for re-export names to see `undefined`.
+                            s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
                         }
                     }
                 }
@@ -502,6 +511,15 @@ pub const Parser = struct {
         // the snapshot `exports.name = name` is sufficient — function declarations are
         // hoisted so the snapshot always captures the correct value. Skip live rewriting
         // to avoid `exports.name = exports.name` circularity.
+        //
+        // If NO binding is found at the top level (has_var_decl=false AND
+        // has_func_decl=false), the export lives inside a bundle dependency factory
+        // function body (fn_nesting_depth > 0 during parse). `makeExportLive` operates
+        // on top-level stmts only — it can't find the var_decl inside the function_expr
+        // to rewrite it, but `rewriteName` DOES recurse into function bodies, which
+        // would break references (e.g. rewriting `results.push(...)` to
+        // `exports.results.push(...)` while `exports.results` is still a TDZ marker).
+        // Return early to preserve the CJS snapshot for factory-body and class exports.
         var has_var_decl = false;
         var has_func_decl = false;
         for (stmts) |s| {
@@ -509,6 +527,7 @@ pub const Parser = struct {
             if (s.kind == .function_decl and std.mem.eql(u8, s.data.function_decl.name, name)) has_func_decl = true;
         }
         if (has_func_decl and !has_var_decl) return;
+        if (!has_var_decl and !has_func_decl) return;
         for (stmts) |s| {
             if (isSnapshotAssign(s, name)) {
                 s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
@@ -545,6 +564,7 @@ pub const Parser = struct {
             if (s.kind == .function_decl and std.mem.eql(u8, s.data.function_decl.name, local)) has_func_decl = true;
         }
         if (has_func_decl and !has_var_decl) return;
+        if (!has_var_decl and !has_func_decl) return; // factory-body/class export: preserve snapshot
         for (stmts) |s| {
             // Remove snapshot `exports.exported = local`
             if (s.kind == .expr_stmt) {
@@ -606,6 +626,17 @@ pub const Parser = struct {
             },
             .function_expr => {
                 const f = n.data.function_expr;
+                // M16 Phase 5: skip bundle dependency factory function bodies —
+                // their declarations belong to a separate module scope and
+                // must not inflate entry-module binding counts (which control
+                // live-binding eligibility).
+                if (f.params.len == 3 and
+                    std.mem.eql(u8, f.params[0], "require") and
+                    std.mem.eql(u8, f.params[1], "module") and
+                    std.mem.eql(u8, f.params[2], "exports"))
+                {
+                    return;
+                }
                 if (f.name) |nm| self.incCount(counts, nm);
                 for (f.params) |p| self.incCount(counts, p);
                 if (f.rest_param) |r| self.incCount(counts, r);
@@ -712,7 +743,24 @@ pub const Parser = struct {
                 }
             },
             .function_decl => for (n.data.function_decl.body) |s| self.rewriteName(s, name, ns, prop),
-            .function_expr => for (n.data.function_expr.body) |s| self.rewriteName(s, name, ns, prop),
+            .function_expr => {
+                // M16 Phase 5: skip bundle dependency factory functions — they
+                // have params (require, module, exports) and represent separate
+                // module scopes. Rewriting inside them conflates the entry
+                // module's import/export names with the dependency's own free
+                // variables (e.g. the fixture's `A` in `try { A; }` is NOT the
+                // entry's export `A`). User nested functions (no such params)
+                // are still recursed into so closures see live bindings.
+                const fe = n.data.function_expr;
+                if (fe.params.len == 3 and
+                    std.mem.eql(u8, fe.params[0], "require") and
+                    std.mem.eql(u8, fe.params[1], "module") and
+                    std.mem.eql(u8, fe.params[2], "exports"))
+                {
+                    return;
+                }
+                for (fe.body) |s| self.rewriteName(s, name, ns, prop);
+            },
             .program => for (n.data.program.body) |s| self.rewriteName(s, name, ns, prop),
             .block_stmt => for (n.data.block_stmt.body) |s| self.rewriteName(s, name, ns, prop),
             .var_decl => if (n.data.var_decl.init) |x| self.rewriteName(x, name, ns, prop),
