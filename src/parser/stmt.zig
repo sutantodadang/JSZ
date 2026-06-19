@@ -306,19 +306,26 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
         }
         p.consumeSemicolon();
         for (specs.items) |sp| {
-            const value = if (tmp) |t|
-                (p.mkMember(p.mkIdent(t) orelse return null, sp.local) orelse return null)
-            else
-                (p.mkIdent(sp.local) orelse return null);
-            out.append(p.arena, p.mkExportAssign(sp.exported, value) orelse return null) catch return null;
-            if (tmp == null) {
+            if (tmp) |t| {
+                // Re-export (`export { X as Y } from './mod'`):
+                // In bundle mode (hoist_point_seen), use a live getter so the
+                // binding is read at access time — fixes circular dependency
+                // cycles where the source module hasn't evaluated yet.
+                // In standalone mode, use snapshot (no cycles possible).
+                if (p.hoist_point_seen) {
+                    const src = p.mkMember(p.mkIdent(t) orelse return null, sp.local) orelse return null;
+                    out.append(p.arena, p.mkExportGetter(sp.exported, src) orelse return null) catch return null;
+                } else {
+                    const value = (p.mkMember(p.mkIdent(t) orelse return null, sp.local) orelse return null);
+                    out.append(p.arena, p.mkExportAssign(sp.exported, value) orelse return null) catch return null;
+                }
+            } else {
+                // Local export (`export { X }` or `export { X as Y }`): snapshot
+                const value = (p.mkIdent(sp.local) orelse return null);
+                out.append(p.arena, p.mkExportAssign(sp.exported, value) orelse return null) catch return null;
                 if (std.mem.eql(u8, sp.local, sp.exported)) {
-                    // Non-aliased local export (`export { a }`): make live so
-                    // reassignments to `a` are observed by importers.
                     p.live_exports.append(p.arena, sp.local) catch {};
                 } else {
-                    // Aliased local export (`export { local2 as renamed }`): rewrite
-                    // all uses of `local2` to `exports.renamed` so mutations propagate.
                     p.live_export_aliases.append(p.arena, .{ .local = sp.local, .exported = sp.exported }) catch {};
                 }
             }

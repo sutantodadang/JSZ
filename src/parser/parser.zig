@@ -395,6 +395,40 @@ pub const Parser = struct {
     pub fn mkVar(self: *Parser, name: []const u8, init_node: *Node) ?*Node {
         return self.makeNode(.var_decl, self.current.start, self.current.start, .{ .var_decl = .{ .kind = .var_, .name = name, .init = init_node } });
     }
+    /// M16 Phase 5: Build `__liveReexport__(exports, 'name', source, 'prop')`
+    /// for live re-exports (`export { X as Y } from './mod'`).  The getter makes
+    /// the re-export a live binding to the source module's export, so circular
+    /// dependencies resolve correctly — the value is read at access time, not
+    /// at re-export time.
+    pub fn mkExportGetter(self: *Parser, exported: []const u8, source: *Node) ?*Node {
+        // source is already a member expression like __esm_X.A
+        // We need to decompose it: source = __esm_X.A → source_obj=__esm_X, prop="A"
+        if (source.kind != .member_expr or source.data.member_expr.computed) return null;
+        const src_obj = source.data.member_expr.object;
+        const src_prop = source.data.member_expr.property;
+        if (src_obj.kind != .identifier or src_prop.kind != .identifier) return null;
+        const src_obj_name = src_obj.data.identifier;
+        const src_prop_name = src_prop.data.identifier;
+
+        // __liveReexport__(exports, 'exported', __esm_X, 'A')
+        const callee = self.mkIdent("__liveReexport__") orelse return null;
+        const exports_arg = self.mkIdent("exports") orelse return null;
+        const name_arg = self.makeNode(.string_literal, self.current.start, self.current.start, .{ .string_literal = exported }) orelse return null;
+        const source_arg = self.mkIdent(src_obj_name) orelse return null;
+        const prop_arg = self.makeNode(.string_literal, self.current.start, self.current.start, .{ .string_literal = src_prop_name }) orelse return null;
+
+        const args = self.arena.alloc(*Node, 4) catch return null;
+        args[0] = exports_arg;
+        args[1] = name_arg;
+        args[2] = source_arg;
+        args[3] = prop_arg;
+        const call = self.makeNode(.call_expr, self.current.start, self.current.start, .{
+            .call_expr = .{ .callee = callee, .args = args },
+        }) orelse return null;
+
+        return self.makeNode(.expr_stmt, self.current.start, self.current.start, .{ .expr_stmt = call });
+    }
+
     pub fn mkExportAssign(self: *Parser, exported: []const u8, value: *Node) ?*Node {
         const exports_id = self.mkIdent("exports") orelse return null;
         const target = self.mkMember(exports_id, exported) orelse return null;

@@ -299,6 +299,58 @@ pub fn nativeMakeNamespace(arena: std.mem.Allocator, _: Value, args: []const Val
     return ns_val;
 }
 
+/// M16 Phase 5: define a live re-export getter on the exports object.
+/// `__liveReexport__(exports, 'name', sourceObj, 'prop')` creates a getter
+/// that reads `sourceObj.prop` at access time, making the re-export a live
+/// binding to the source module's export. Used by `export { X as Y } from './mod'`.
+pub fn nativeLiveReexport(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len < 4) return val_mod.makeUndefined(arena);
+    if (args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeUndefined(arena);
+    if (args[1].bits == 0 or args[1].unbox() != .string) return val_mod.makeUndefined(arena);
+    if (args[2].bits == 0 or args[2].unbox() != .object) return val_mod.makeUndefined(arena);
+    if (args[3].bits == 0 or args[3].unbox() != .string) return val_mod.makeUndefined(arena);
+
+    const exports_obj = args[0].toPtr().object;
+    const name = args[1].toPtr().string;
+    const source_obj = args[2].toPtr().object;
+    const prop = args[3].toPtr().string;
+
+    // Create a getter holder object: { get: nativeFn, source: sourceObj, prop: propName }
+    // The getter reads source[prop] at access time.
+    const getter_holder = try JsObject.create(arena, null);
+    // Store the source and prop as hidden properties for the getter to use.
+    // We need a native getter function that reads source[prop].
+    // Since we can't create closures in native code, store source+prop on the holder
+    // and use a generic getter that reads them back.
+    try getter_holder.set("__source__", args[2]);
+    try getter_holder.set("__prop__", args[3]);
+    try getter_holder.set("get", try val_mod.makeNativeFunction(arena, liveReexportGetter));
+    const holder_val = try val_mod.makeObject(arena, getter_holder);
+
+    const ok = try exports_obj.defineOwnAccessor(name, holder_val, .{
+        .enumerable = true,
+        .configurable = true,
+    });
+    if (!ok) {
+        // If define fails (non-configurable), fall back to direct assignment
+        const val = source_obj.get(prop) orelse try val_mod.makeUndefined(arena);
+        try exports_obj.set(name, val);
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+/// Getter function for live re-exports: reads `this.__source__[this.__prop__]`.
+fn liveReexportGetter(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object) return val_mod.makeUndefined(arena);
+    const holder = this_val.toPtr().object;
+    const source = holder.get("__source__") orelse return val_mod.makeUndefined(arena);
+    const prop_val = holder.get("__prop__") orelse return val_mod.makeUndefined(arena);
+    if (source.bits == 0 or source.unbox() != .object) return val_mod.makeUndefined(arena);
+    if (prop_val.bits == 0 or prop_val.unbox() != .string) return val_mod.makeUndefined(arena);
+    const prop = prop_val.toPtr().string;
+    return source.toPtr().object.get(prop) orelse try val_mod.makeUndefined(arena);
+}
+
 /// M16 Phase 4: store a module's export names on its live exports object so the
 /// namespace exotic can detect TDZ (known exports missing from the backing).
 /// Called ONCE per module, immediately before the module body executes:
