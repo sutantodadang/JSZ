@@ -16,6 +16,7 @@ const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
 const ic_mod = @import("../ic.zig");
 const proxy_mod = @import("../../runtime/builtins/proxy.zig");
+const namespace_mod = @import("../../runtime/builtins/namespace.zig");
 
 /// Raise the strict-mode TypeError for a failed property assignment ([[Set]]
 /// returned false). Returns a non-null RunOutcome only when the throw escapes
@@ -454,12 +455,24 @@ pub inline fn opGetKeys(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 }
             }
         } else if (iv == .object) {
-            for (iv.object.ownKeys()) |k| {
-                if (!iv.object.isEnumerable(k)) continue;
-                const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
-                const key_val2 = try val_mod.makeString(self.arena, k);
-                arr_obj.set(idx_str, key_val2) catch {};
-                count += 1;
+            // M16: Module Namespace — enumerable own string keys are the exported
+            // names, sorted by code unit.
+            if (iv.object.internal_kind == .module_namespace) {
+                const names = try namespace_mod.sortedNames(self.arena, iv.object);
+                for (names) |k| {
+                    const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
+                    const key_val2 = try val_mod.makeString(self.arena, k);
+                    arr_obj.set(idx_str, key_val2) catch {};
+                    count += 1;
+                }
+            } else {
+                for (iv.object.ownKeys()) |k| {
+                    if (!iv.object.isEnumerable(k)) continue;
+                    const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
+                    const key_val2 = try val_mod.makeString(self.arena, k);
+                    arr_obj.set(idx_str, key_val2) catch {};
+                    count += 1;
+                }
             }
         }
     }

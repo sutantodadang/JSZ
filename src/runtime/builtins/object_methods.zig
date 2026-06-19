@@ -240,8 +240,14 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
     }
 
     // M16: Module Namespace own string keys are exactly the exported names.
+    // [[GetOwnProperty]] calls [[Get]] for the value, which throws ReferenceError
+    // for uninitialized (TDZ) bindings (ES §10.4.6.4 step 4).
     if (obj.internal_kind == .module_namespace) {
-        return val_mod.makeBool(arena, namespace_mod.hasExport(obj, key));
+        if (!namespace_mod.hasExport(obj, key)) return val_mod.makeBool(arena, false);
+        if (namespace_mod.isTDZ(obj, key)) {
+            return throwReferenceErrorObj(arena, key);
+        }
+        return val_mod.makeBool(arena, true);
     }
 
     return val_mod.makeBool(arena, obj.hasOwn(key));
@@ -270,8 +276,14 @@ pub fn nativePropertyIsEnumerable(arena: std.mem.Allocator, this_val: Value, arg
         }
     }
     // M16: Module Namespace exported names are own + enumerable.
+    // [[GetOwnProperty]] calls [[Get]] for the value, which throws ReferenceError
+    // for uninitialized (TDZ) bindings (ES §10.4.6.4 step 4).
     if (obj.internal_kind == .module_namespace) {
-        return val_mod.makeBool(arena, namespace_mod.hasExport(obj, key));
+        if (!namespace_mod.hasExport(obj, key)) return val_mod.makeBool(arena, false);
+        if (namespace_mod.isTDZ(obj, key)) {
+            return throwReferenceErrorObj(arena, key);
+        }
+        return val_mod.makeBool(arena, true);
     }
     if (!obj.hasOwn(key)) return val_mod.makeBool(arena, false);
     const a = obj.ownAttr(key) orelse return val_mod.makeBool(arena, false);
@@ -305,9 +317,27 @@ fn makeTypeErrorObj(arena: std.mem.Allocator, msg: []const u8) !Value {
     return val_mod.makeObject(arena, obj);
 }
 
+fn makeReferenceErrorObj(arena: std.mem.Allocator, name: []const u8) !Value {
+    const realm_mod = @import("../realm.zig");
+    const msg = try std.fmt.allocPrint(arena, "{s} is not defined", .{name});
+    const obj = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, realm_mod.error_proto_ReferenceError)
+    else
+        try JsObject.create(arena, realm_mod.error_proto_ReferenceError);
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "ReferenceError"));
+    return val_mod.makeObject(arena, obj);
+}
+
 fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const realm_mod = @import("../realm.zig");
     realm_mod.pending_exception = try makeTypeErrorObj(arena, msg);
+    return error.JsException;
+}
+
+fn throwReferenceErrorObj(arena: std.mem.Allocator, name: []const u8) anyerror {
+    const realm_mod = @import("../realm.zig");
+    realm_mod.pending_exception = try makeReferenceErrorObj(arena, name);
     return error.JsException;
 }
 
@@ -553,9 +583,14 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     // exported name yields { value, writable: true, enumerable: true,
     // configurable: false }; a non-export yields undefined. (Symbol keys fall
     // through to the ordinary sym_props branch below — e.g. @@toStringTag.)
+    // [[GetOwnProperty]] calls [[Get]] for the value (step 4), which throws
+    // ReferenceError for uninitialized (TDZ) bindings.
     if (obj.internal_kind == .module_namespace and !(args[1].bits != 0 and args[1].unbox() == .symbol)) {
         const nkey = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
         if (!namespace_mod.hasExport(obj, nkey)) return val_mod.makeUndefined(arena);
+        if (namespace_mod.isTDZ(obj, nkey)) {
+            return throwReferenceErrorObj(arena, nkey);
+        }
         const realm_mod3 = @import("../realm.zig");
         const b = namespace_mod.backing(obj).?;
         const value = if (realm_mod3.active_context) |ctx|

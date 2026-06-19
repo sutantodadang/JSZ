@@ -192,6 +192,25 @@ pub const Parser = struct {
         return n;
     }
 
+    /// Build a string-literal AST node (e.g. for export-name array elements).
+    pub fn mkStringLiteral(self: *Parser, value: []const u8) ?*Node {
+        return self.makeNode(.string_literal, self.current.start, self.current.start, .{ .string_literal = value });
+    }
+
+    /// Build a two-argument call `callee_name(arg1, arg2)`.
+    pub fn mkCall2(self: *Parser, callee_name: []const u8, arg1: *Node, arg2: *Node) ?*Node {
+        const callee = self.mkIdent(callee_name) orelse return null;
+        var args = std.ArrayList(*Node){};
+        args.append(self.arena, arg1) catch return null;
+        args.append(self.arena, arg2) catch return null;
+        return self.makeNode(.call_expr, self.current.start, self.current.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+    }
+
+    /// Build an array-literal AST node `[elem1, elem2, ...]`.
+    pub fn mkArrayLiteral(self: *Parser, elements: []*Node) ?*Node {
+        return self.makeNode(.array_literal, self.current.start, self.current.start, .{ .array_literal = .{ .elements = elements } });
+    }
+
     // ----------------------------------------------------------------- ASI ---
 
     /// Check if a semicolon can be auto-inserted:

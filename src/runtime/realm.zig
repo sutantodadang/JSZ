@@ -299,6 +299,44 @@ pub fn nativeMakeNamespace(arena: std.mem.Allocator, _: Value, args: []const Val
     return ns_val;
 }
 
+/// M16 Phase 4: store a module's export names on its live exports object so the
+/// namespace exotic can detect TDZ (known exports missing from the backing).
+/// Called ONCE per module, immediately before the module body executes:
+/// `__initExports__(exports, ["name1", "name2", ...])`
+/// Pre-populates each export on the backing object with a TDZ marker — a
+/// unique symbol value the namespace [[Get]] recognises and throws ReferenceError
+/// for. When the module body's export assignments run, they overwrite the TDZ
+/// marker with real values.
+pub fn nativeInitExports(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len < 2) return val_mod.makeUndefined(arena);
+    if (args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeUndefined(arena);
+    if (args[1].bits == 0 or args[1].unbox() != .object) return val_mod.makeUndefined(arena);
+    const exports_obj = args[0].toPtr().object;
+    const names_arr = args[1].toPtr().object;
+    // Store the export names array on the exports object as a symbol-keyed property
+    // so the namespace exotic can read it to distinguish "known but uninitialized"
+    // exports from non-exports.
+    if (active_sym_export_names) |sym| {
+        try exports_obj.setSym(sym, args[1]);
+    }
+    // Pre-populate each export with a TDZ marker symbol so [[Get]] throws
+    // ReferenceError before the module body's export assignments run.
+    const marker = tdz_marker orelse return val_mod.makeUndefined(arena);
+    const n = names_arr.getArrayLength();
+    var i: u32 = 0;
+    var buf: [32]u8 = undefined;
+    while (i < n) : (i += 1) {
+        const idx_key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
+        if (names_arr.get(idx_key)) |name_val| {
+            if (name_val.bits != 0 and name_val.unbox() == .string) {
+                const name_str = name_val.toPtr().string;
+                try exports_obj.set(name_str, marker);
+            }
+        }
+    }
+    return val_mod.makeUndefined(arena);
+}
+
 /// M16 Phase 3: dynamic `import(specifier)`. Desugared by the parser to a call
 /// `__import__(specifier)`. Resolves and loads the module through the same
 /// `__modules__` registry + `require()` resolver used by static imports, wraps
@@ -457,6 +495,15 @@ pub var active_sym_proxy_handler: ?Value = null;
 /// exports object, so GetModuleNamespace returns the *same* object each time
 /// (`import * as a` and `import * as b` of one module compare ===).
 pub var active_sym_module_ns: ?Value = null;
+/// M16 Phase 4: private symbol storing a module's export names array on its
+/// live exports object, so the namespace exotic can check TDZ for uninitialized
+/// exports even before the module body runs (self-imports).
+pub var active_sym_export_names: ?Value = null;
+
+/// M16 Phase 4: shared TDZ marker — a symbol pre-populated on every export
+/// property before its module body runs. The namespace [[Get]] checks for this
+/// symbol and throws ReferenceError when found.
+pub var tdz_marker: ?Value = null;
 
 /// Phase 4b: pending JS exception Value (set by JSON.parse on error).
 /// VMs check this after catching error.JsException from a native call.
@@ -1788,6 +1835,8 @@ pub const Realm = struct {
         active_sym_proxy_target = try val_mod.makeSymbol(arena, "[[ProxyTarget]]");
         active_sym_proxy_handler = try val_mod.makeSymbol(arena, "[[ProxyHandler]]");
         active_sym_module_ns = try val_mod.makeSymbol(arena, "[[Module.Namespace]]");
+        active_sym_export_names = try val_mod.makeSymbol(arena, "[[Module.ExportNames]]");
+        tdz_marker = try val_mod.makeSymbol(arena, "[[TDZ]]");
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
         try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
@@ -1980,6 +2029,8 @@ pub const Realm = struct {
         active_sym_to_string_tag = null;
         active_sym_species = null;
         active_sym_module_ns = null;
+        active_sym_export_names = null;
+        tdz_marker = null;
         active_sym_proxy_target = null;
         active_sym_proxy_handler = null;
         typed_array_mod.active_arraybuffer_proto = null;

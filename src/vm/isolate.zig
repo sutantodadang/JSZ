@@ -298,6 +298,7 @@ pub const IsolateImpl = struct {
         const es2015 = @import("../runtime/builtins/es2015_collections.zig");
         try realm.global_env.define("__getIterator__", try val_mod.makeNativeFunction(arena, es2015.nativeGetIterator));
         try realm.global_env.define("__makeNamespace__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeNamespace));
+        try realm.global_env.define("__initExports__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeInitExports));
         try realm.global_env.define("__iterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeIterStep));
         // M16 Phase 3: dynamic import() native + the import.meta object binding.
         try realm.global_env.define("__import__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImport));

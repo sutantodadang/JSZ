@@ -129,7 +129,11 @@ pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value)
     }
 
     // M16: Module Namespace exotic [[Get]] — reads current value from backing exports.
+    // Throws ReferenceError for uninitialized (TDZ) bindings.
     if (target_obj.internal_kind == .module_namespace) {
+        if (namespace_mod.isTDZ(target_obj, k)) {
+            return throwReferenceErrorReflect(arena, k);
+        }
         const b = namespace_mod.backing(target_obj) orelse return val_mod.makeUndefined(arena);
         return b.get(k) orelse val_mod.makeUndefined(arena);
     }
@@ -703,6 +707,20 @@ fn throwTypeErrorReflect(arena: std.mem.Allocator, msg: []const u8) anyerror {
         try JsObject.create(arena, realm_mod.error_proto_TypeError);
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
+}
+
+/// Throw a ReferenceError with a descriptive message (used by namespace TDZ).
+fn throwReferenceErrorReflect(arena: std.mem.Allocator, name: []const u8) anyerror {
+    const realm_mod = @import("../realm.zig");
+    const msg = try std.fmt.allocPrint(arena, "{s} is not defined", .{name});
+    const obj = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, realm_mod.error_proto_ReferenceError)
+    else
+        try JsObject.create(arena, realm_mod.error_proto_ReferenceError);
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "ReferenceError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
     return error.JsException;
 }

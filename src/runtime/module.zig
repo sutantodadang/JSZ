@@ -212,8 +212,142 @@ fn readModuleFile(allocator: std.mem.Allocator, base_dir: []const u8, id: []cons
 /// against `base_dir`, i.e. as if it lived directly in that directory).
 pub const ENTRY_ID = "__entry__";
 
+/// Scan `src` for every exported name and append them to `out`. Handles
+/// comment/string/template skipping (reuses the same skip logic as
+/// `scanSpecifiers`). This is a syntactic scan, not a full parse — sufficient
+/// for the CJS-desugar module namespace TDZ setup in `buildBundle`.
+pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        // Comments and strings: skip entirely (same as scanSpecifiers).
+        if (c == '/' and i + 1 < src.len) {
+            if (src[i + 1] == '/') {
+                i += 2;
+                while (i < src.len and src[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (src[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) : (i += 1) {}
+                i += 2;
+                continue;
+            }
+        }
+        if (c == '`') {
+            i += 1;
+            while (i < src.len and src[i] != '`') : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '"' or c == '\'') {
+            const q = c;
+            i += 1;
+            while (i < src.len and src[i] != q) : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // Look for `export ` keyword.
+        if (i + 7 <= src.len and std.mem.eql(u8, src[i..i + 7], "export ")) {
+            i += 7;
+            const rest = src[i..];
+            // export default
+            if (std.mem.startsWith(u8, rest, "default ")) {
+                out.append(allocator, "default") catch {};
+                continue;
+            }
+            // export * as name from
+            if (std.mem.startsWith(u8, rest, "* as ")) {
+                var j: usize = 5;
+                // skip spaces before identifier
+                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                const name_start = j;
+                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                if (j > name_start) {
+                    out.append(allocator, rest[name_start..j]) catch {};
+                }
+                continue;
+            }
+            // export function <name>
+            if (std.mem.startsWith(u8, rest, "function ")) {
+                var j: usize = 9;
+                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                const name_start = j;
+                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                if (j > name_start) {
+                    out.append(allocator, rest[name_start..j]) catch {};
+                }
+                continue;
+            }
+            // export class <name>
+            if (std.mem.startsWith(u8, rest, "class ")) {
+                var j: usize = 6;
+                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                const name_start = j;
+                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                if (j > name_start) {
+                    out.append(allocator, rest[name_start..j]) catch {};
+                }
+                continue;
+            }
+            // export { a, b as c, ... } [from "mod"]
+            if (rest.len > 0 and rest[0] == '{') {
+                var j: usize = 1;
+                while (j < rest.len and rest[j] != '}') : (j += 1) {
+                    // Skip whitespace, commas, and braces
+                    if (rest[j] == ' ' or rest[j] == '\t' or rest[j] == '\n' or rest[j] == ',' or rest[j] == '{') continue;
+                    if (rest[j] == '}') break;
+                    // Read identifier (the local name)
+                    const local_start = j;
+                    while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                    if (j >= rest.len or j == local_start) continue;
+                    // Check if followed by 'as' keyword — if so, the identifier
+                    // before 'as' is the local name, not the exported name.
+                    // Skip past 'as' and read the exported name.
+                    var k = j;
+                    while (k < rest.len and (rest[k] == ' ' or rest[k] == '\t' or rest[k] == '\n')) : (k += 1) {}
+                    if (k + 2 < rest.len and std.mem.eql(u8, rest[k..k + 2], "as") and
+                        (k + 2 >= rest.len or rest[k + 2] == ' ' or rest[k + 2] == '\t' or rest[k + 2] == '\n' or rest[k + 2] == '}'))
+                    {
+                        // Skip 'as' and whitespace, then read the exported name.
+                        j = k + 2;
+                        while (j < rest.len and (rest[j] == ' ' or rest[j] == '\t' or rest[j] == '\n')) : (j += 1) {}
+                        const name_start = j;
+                        while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                        if (j > name_start) {
+                            out.append(allocator, rest[name_start..j]) catch {};
+                        }
+                    } else {
+                        // No 'as' — the identifier itself is the exported name.
+                        out.append(allocator, rest[local_start..j]) catch {};
+                    }
+                }
+                continue;
+            }
+            // export let/var/const <name>
+            if (std.mem.startsWith(u8, rest, "let ") or
+                std.mem.startsWith(u8, rest, "var ") or
+                std.mem.startsWith(u8, rest, "const "))
+            {
+                var j: usize = 4;
+                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
+                const name_start = j;
+                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
+                if (j > name_start) {
+                    out.append(allocator, rest[name_start..j]) catch {};
+                }
+                continue;
+            }
+            continue;
+        }
+        i += 1;
+    }
+}
 /// Build a self-contained script: a `__modules__` registry of every relative
-/// module transitively reachable from `entry_src` (read from disk under
 /// `base_dir`), each wrapped as a `function(require, module, exports)` factory
 /// keyed by its canonical id, followed by the entry body. This realises the
 /// link phase: the runtime `require()` resolver evaluates factories on demand
@@ -262,6 +396,27 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         try sb.appendSlice(gpa, "\"] = function(require, module, exports){\nvar __module_id__ = \"");
         try sb.appendSlice(gpa, e.key_ptr.*);
         try sb.appendSlice(gpa, "\";\n");
+        // M16 Phase 4: inject export name setup so the module namespace exotic
+        // can detect TDZ (known exports missing from the backing). Scan the
+        // source for export names and call __initModuleExports__(exports, [...]).
+        var export_names = std.ArrayList([]const u8){};
+        findExportNames(e.value_ptr.*, &export_names, arena);
+        if (export_names.items.len > 0) {
+            try sb.appendSlice(gpa, "__initExports__(exports,[");
+            for (export_names.items, 0..) |nm, eni| {
+                if (eni > 0) try sb.appendSlice(gpa, ",");
+                try sb.appendSlice(gpa, "\"");
+                // Escape any embedded quotes/backslashes in the name.
+                for (nm) |ch| {
+                    if (ch == '\\' or ch == '"') {
+                        try sb.appendSlice(gpa, "\\");
+                    }
+                    try sb.appendSlice(gpa, &.{ch});
+                }
+                try sb.appendSlice(gpa, "\"");
+            }
+            try sb.appendSlice(gpa, "]);\n");
+        }
         try sb.appendSlice(gpa, e.value_ptr.*);
         try sb.appendSlice(gpa, "\n};\n");
     }
@@ -274,6 +429,22 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         try sb.appendSlice(gpa, "__modules__[\"");
         try sb.appendSlice(gpa, self_id);
         try sb.appendSlice(gpa, "\"] = module;\n");
+    }
+    // M16 Phase 4: inject export name setup for the entry module too.
+    var entry_names = std.ArrayList([]const u8){};
+    findExportNames(entry_src, &entry_names, arena);
+    if (entry_names.items.len > 0) {
+        try sb.appendSlice(gpa, "__initExports__(exports,[");
+        for (entry_names.items, 0..) |nm, eni| {
+            if (eni > 0) try sb.appendSlice(gpa, ",");
+            try sb.appendSlice(gpa, "\"");
+            for (nm) |ch| {
+                if (ch == '\\' or ch == '"') try sb.appendSlice(gpa, "\\");
+                try sb.appendSlice(gpa, &.{ch});
+            }
+            try sb.appendSlice(gpa, "\"");
+        }
+        try sb.appendSlice(gpa, "]);\n");
     }
     try sb.appendSlice(gpa, entry_src);
     return sb.toOwnedSlice(gpa);

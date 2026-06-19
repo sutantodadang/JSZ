@@ -1364,9 +1364,16 @@ pub const BcVm = struct {
                     }
                 }
                 // M16: Module Namespace exotic [[Get]] — a string key resolves to
-                // the named export's *current* value (live), undefined otherwise.
+                // the named export's *current* value (live), throwing ReferenceError
+                // for uninitialized (TDZ) bindings.
                 if (obj.internal_kind == .module_namespace) {
                     const b = namespace_mod.backing(obj) orelse return val_mod.makeUndefined(self.arena);
+                    if (namespace_mod.isTDZ(obj, key)) {
+                        const realm_m = @import("../runtime/realm.zig");
+                        const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{key});
+                        realm_m.pending_exception = try self.makeErrorObjectBc("ReferenceError", msg);
+                        return error.JsException;
+                    }
                     if (!b.hasOwn(key)) return val_mod.makeUndefined(self.arena);
                     return try self.getProp(try val_mod.makeObject(self.arena, b), key);
                 }
