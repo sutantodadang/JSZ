@@ -182,6 +182,8 @@ pub inline fn opInitLexical(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const rsrc = code[frame.pc];
     frame.pc += 1;
+    const is_const = code[frame.pc] != 0;
+    frame.pc += 1;
     const name = frame.func.chunk.constants[kidx].toPtr().string;
     const value = frame.registers[rsrc];
     // Initialize the existing lexical binding (take out of TDZ).
@@ -196,6 +198,8 @@ pub inline fn opInitLexical(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         error.TemporalDeadZone => unreachable, // INIT_LEX should only target declared-but-uninitialized bindings
         error.ConstAssignment => unreachable, // INIT_LEX is not an assignment
     };
+    // Upgrade binding to const_ so subsequent assignments throw TypeError.
+    if (is_const) frame.env.upgradeToConst(name);
     return null;
 }
 

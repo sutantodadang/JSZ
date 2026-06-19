@@ -33,16 +33,17 @@ pub fn lowerVarDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     if (vd.kind == .let or vd.kind == .const_) {
         // Lexical declaration: the binding was already declared at scope entry
         // via HOIST_LEX (in TDZ). Now initialize it at its source position.
+        const is_const = vd.kind == .const_;
         if (vd.init) |init_node| {
             const r = try self.compileExpr(init_node);
-            try self.emitInitLexical(vd.name, r, line);
+            try self.emitInitLexical(vd.name, r, line, is_const);
             self.freeReg();
         } else {
             // No initializer: initialize with undefined.
             const r = self.allocReg();
             try self.emitOp(.LOAD_UNDEF, line);
             try self.emitU8(r);
-            try self.emitInitLexical(vd.name, r, line);
+            try self.emitInitLexical(vd.name, r, line, is_const);
             self.freeReg();
         }
     } else {
@@ -528,7 +529,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         if (loop_name) |nm| {
             const ni = try self.builder.addConstant(try val_mod.makeString(self.arena, nm));
             if (loop_decl_kind != null and (loop_decl_kind.? == .let or loop_decl_kind.? == .const_)) {
-                try self.emitInitLexical(nm, rval, line);
+                try self.emitInitLexical(nm, rval, line, loop_decl_kind.? == .const_);
             } else {
                 try self.emitOp(.SET_GLOBAL, line);
                 try self.emitU16(@intCast(ni));
@@ -621,7 +622,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             if (vd.name.len > 0) {
                 const name_idx = try self.builder.addConstant(try val_mod.makeString(self.arena, vd.name));
                 if (vd.kind == .let or vd.kind == .const_) {
-                    try self.emitInitLexical(vd.name, rkey, line);
+                    try self.emitInitLexical(vd.name, rkey, line, vd.kind == .const_);
                 } else {
                     try self.emitOp(.SET_GLOBAL, line);
                     try self.emitU8(@intCast(name_idx & 0xFF));

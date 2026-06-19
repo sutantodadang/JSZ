@@ -557,19 +557,22 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
             const rsrc = code[new_pc];
             new_pc += 1;
+            const is_const = code[new_pc] != 0;
+            new_pc += 1;
+            const kind_str: []const u8 = if (is_const) " const" else "";
             if (kidx < chunk.constants.len) {
                 const cv = chunk.constants[kidx];
                 if (cv.bits != 0) {
                     const inner = cv.unbox();
                     switch (inner) {
-                        .string => |s| try writer.print(" \"{s}\" R{d}", .{ s, rsrc }),
-                        else => try writer.print(" K{d} R{d}", .{ kidx, rsrc }),
+                        .string => |s| try writer.print(" \"{s}\" R{d}{s}", .{ s, rsrc, kind_str }),
+                        else => try writer.print(" K{d} R{d}{s}", .{ kidx, rsrc, kind_str }),
                     }
                 } else {
-                    try writer.print(" K{d} R{d}", .{ kidx, rsrc });
+                    try writer.print(" K{d} R{d}{s}", .{ kidx, rsrc, kind_str });
                 }
             } else {
-                try writer.print(" K{d} R{d}", .{ kidx, rsrc });
+                try writer.print(" K{d} R{d}{s}", .{ kidx, rsrc, kind_str });
             }
         },
         .DEFINE_GLOBAL => {

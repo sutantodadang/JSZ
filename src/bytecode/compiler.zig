@@ -368,13 +368,15 @@ pub const FnCompiler = struct {
     }
 
     /// Emit an INIT_LEX for `name` (initializes an existing lexical binding
-    /// with R[rsrc], taking it out of TDZ).
-    pub fn emitInitLexical(self: *Self, name: []const u8, rsrc: u8, line: u32) !void {
+    /// with R[rsrc], taking it out of TDZ). is_const=true marks the binding
+    /// as immutable so later assignments throw TypeError.
+    pub fn emitInitLexical(self: *Self, name: []const u8, rsrc: u8, line: u32, is_const: bool) !void {
         const sv = try val_mod.makeString(self.arena, name);
         const kidx = try self.addConstant(sv);
         try self.emitOp(.INIT_LEX, line);
         try self.emitU16(kidx);
         try self.emitU8(rsrc);
+        try self.emitU8(if (is_const) 1 else 0);
     }
 
     // -------------------------------------------------------- compile expr -> R ---
