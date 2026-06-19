@@ -21,10 +21,15 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
     const obj = args[0].toPtr().object;
 
     // M16: Module Namespace — enumerable own string keys are the exported names,
-    // sorted by code unit.
+    // sorted by code unit. [[GetOwnProperty]] is called for each key (per
+    // EnumerableOwnProperties step 4.a.i), which throws ReferenceError for
+    // uninitialized (TDZ) bindings.
     if (obj.internal_kind == .module_namespace) {
         var pi: u32 = 0;
         for (try namespace_mod.sortedNames(arena, obj)) |k| {
+            if (namespace_mod.isTDZ(obj, k)) {
+                return throwReferenceErrorObj(arena, k);
+            }
             const idx_key = try std.fmt.allocPrint(arena, "{d}", .{pi});
             try arr.set(idx_key, try val_mod.makeString(arena, k));
             pi += 1;

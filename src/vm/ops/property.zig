@@ -456,10 +456,18 @@ pub inline fn opGetKeys(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             }
         } else if (iv == .object) {
             // M16: Module Namespace — enumerable own string keys are the exported
-            // names, sorted by code unit.
+            // names, sorted by code unit. [[Get]] is called for each export to
+            // check TDZ (per [[GetOwnProperty]] step 4), which throws ReferenceError
+            // for uninitialized bindings.
             if (iv.object.internal_kind == .module_namespace) {
                 const names = try namespace_mod.sortedNames(self.arena, iv.object);
                 for (names) |k| {
+                    if (namespace_mod.isTDZ(iv.object, k)) {
+                        const realm_m = @import("../../runtime/realm.zig");
+                        const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{k});
+                        realm_m.pending_exception = try self.makeErrorObjectBc("ReferenceError", msg);
+                        return error.JsException;
+                    }
                     const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
                     const key_val2 = try val_mod.makeString(self.arena, k);
                     arr_obj.set(idx_str, key_val2) catch {};
