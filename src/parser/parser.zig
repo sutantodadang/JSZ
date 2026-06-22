@@ -653,28 +653,16 @@ pub const Parser = struct {
             },
             .function_decl => {
                 const f = n.data.function_decl;
+                // Only count the function's own name (it creates an outer-scope
+                // binding). Params and body vars are function-scoped — counting
+                // them would inflate counts and block live-binding rewrites for
+                // same-named identifiers in the outer (entry) scope.
                 self.incCount(counts, f.name);
-                for (f.params) |p| self.incCount(counts, p);
-                if (f.rest_param) |r| self.incCount(counts, r);
-                for (f.body) |s| self.countDecls(s, counts);
             },
             .function_expr => {
-                const f = n.data.function_expr;
-                // M16 Phase 5: skip bundle dependency factory function bodies —
-                // their declarations belong to a separate module scope and
-                // must not inflate entry-module binding counts (which control
-                // live-binding eligibility).
-                if (f.params.len == 3 and
-                    std.mem.eql(u8, f.params[0], "require") and
-                    std.mem.eql(u8, f.params[1], "module") and
-                    std.mem.eql(u8, f.params[2], "exports"))
-                {
-                    return;
-                }
-                if (f.name) |nm| self.incCount(counts, nm);
-                for (f.params) |p| self.incCount(counts, p);
-                if (f.rest_param) |r| self.incCount(counts, r);
-                for (f.body) |s| self.countDecls(s, counts);
+                // Function expressions create no outer-scope bindings. Skip all
+                // (dep-factory or user function): their params and body vars are
+                // function-scoped and must not inflate entry-module counts.
             },
             .program => for (n.data.program.body) |s| self.countDecls(s, counts),
             .block_stmt => for (n.data.block_stmt.body) |s| self.countDecls(s, counts),
@@ -767,6 +755,63 @@ pub const Parser = struct {
         }
     }
 
+    /// Returns true if any `var <name>` declaration appears anywhere in `stmts`,
+    /// recursing through blocks/if/for/etc. but NOT into nested function bodies
+    /// (those create their own scope). Used by `rewriteName` to avoid rewriting
+    /// identifiers inside functions that shadow the module-level binding with a
+    /// local `var`.
+    fn fnBodyHasVar(stmts: []*Node, name: []const u8) bool {
+        for (stmts) |s| {
+            if (fnNodeHasVar(s, name)) return true;
+        }
+        return false;
+    }
+
+    fn fnNodeHasVar(n: *Node, name: []const u8) bool {
+        switch (n.kind) {
+            .var_decl => return std.mem.eql(u8, n.data.var_decl.name, name),
+            .block_stmt => return fnBodyHasVar(n.data.block_stmt.body, name),
+            .if_stmt => {
+                const i = n.data.if_stmt;
+                if (fnNodeHasVar(i.consequent, name)) return true;
+                if (i.alternate) |a| return fnNodeHasVar(a, name);
+                return false;
+            },
+            .while_stmt => return fnNodeHasVar(n.data.while_stmt.body, name),
+            .do_while_stmt => return fnNodeHasVar(n.data.do_while_stmt.body, name),
+            .for_stmt => {
+                const f = n.data.for_stmt;
+                if (f.init) |x| if (fnNodeHasVar(x, name)) return true;
+                return fnNodeHasVar(f.body, name);
+            },
+            .for_in_stmt => {
+                const f = n.data.for_in_stmt;
+                if (fnNodeHasVar(f.left, name)) return true;
+                return fnNodeHasVar(f.body, name);
+            },
+            .try_stmt => {
+                const t = n.data.try_stmt;
+                if (fnNodeHasVar(t.block, name)) return true;
+                if (t.handler) |h| {
+                    if (std.mem.eql(u8, h.param_name, name)) return true;
+                    if (fnNodeHasVar(h.body, name)) return true;
+                }
+                if (t.finalizer) |fz| return fnNodeHasVar(fz, name);
+                return false;
+            },
+            .switch_stmt => {
+                for (n.data.switch_stmt.cases) |c| {
+                    for (c.body) |st| if (fnNodeHasVar(st, name)) return true;
+                }
+                return false;
+            },
+            .labeled_stmt => return fnNodeHasVar(n.data.labeled_stmt.body, name),
+            // function_decl / function_expr: separate scope — stop here
+            .function_decl, .function_expr => return false,
+            else => return false,
+        }
+    }
+
     pub fn rewriteName(self: *Parser, n: *Node, name: []const u8, ns: []const u8, prop: []const u8) void {
         switch (n.kind) {
             .identifier => {
@@ -776,7 +821,14 @@ pub const Parser = struct {
                     n.* = Node{ .kind = .member_expr, .start = n.start, .end = n.end, .data = .{ .member_expr = .{ .object = obj, .property = p, .computed = false } } };
                 }
             },
-            .function_decl => for (n.data.function_decl.body) |s| self.rewriteName(s, name, ns, prop),
+            .function_decl => {
+                const fd = n.data.function_decl;
+                // Skip if a param or local var shadows the name (inner scope).
+                for (fd.params) |p| if (std.mem.eql(u8, p, name)) return;
+                if (fd.rest_param) |r| if (std.mem.eql(u8, r, name)) return;
+                if (fnBodyHasVar(fd.body, name)) return;
+                for (fd.body) |s| self.rewriteName(s, name, ns, prop);
+            },
             .function_expr => {
                 // M16 Phase 5: skip bundle dependency factory functions — they
                 // have params (require, module, exports) and represent separate
@@ -784,7 +836,8 @@ pub const Parser = struct {
                 // module's import/export names with the dependency's own free
                 // variables (e.g. the fixture's `A` in `try { A; }` is NOT the
                 // entry's export `A`). User nested functions (no such params)
-                // are still recursed into so closures see live bindings.
+                // are still recursed into so closures see live bindings, but
+                // we skip if a param shadows the name being rewritten.
                 const fe = n.data.function_expr;
                 if (fe.params.len == 3 and
                     std.mem.eql(u8, fe.params[0], "require") and
@@ -793,6 +846,9 @@ pub const Parser = struct {
                 {
                     return;
                 }
+                for (fe.params) |p| if (std.mem.eql(u8, p, name)) return;
+                if (fe.rest_param) |r| if (std.mem.eql(u8, r, name)) return;
+                if (fnBodyHasVar(fe.body, name)) return;
                 for (fe.body) |s| self.rewriteName(s, name, ns, prop);
             },
             .program => for (n.data.program.body) |s| self.rewriteName(s, name, ns, prop),

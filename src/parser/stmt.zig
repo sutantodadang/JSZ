@@ -308,11 +308,12 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
         for (specs.items) |sp| {
             if (tmp) |t| {
                 // Re-export (`export { X as Y } from './mod'`):
-                // In bundle mode (hoist_point_seen), use a live getter so the
-                // binding is read at access time — fixes circular dependency
-                // cycles where the source module hasn't evaluated yet.
-                // In standalone mode, use snapshot (no cycles possible).
-                if (p.hoist_point_seen) {
+                // Use a live getter (via __liveReexport__) both in bundle entry
+                // mode (hoist_point_seen) AND in dep factory bodies
+                // (fn_nesting_depth > 0) — live getters fix circular dependency
+                // cycles where the source module hasn't fully evaluated yet.
+                // Standalone mode (no bundle marker, no nesting) uses a snapshot.
+                if (p.hoist_point_seen or p.fn_nesting_depth > 0) {
                     const src = p.mkMember(p.mkIdent(t) orelse return null, sp.local) orelse return null;
                     out.append(p.arena, p.mkExportGetter(sp.exported, src) orelse return null) catch return null;
                 } else {
