@@ -271,6 +271,34 @@ pub const Parser = struct {
                 break;
             };
             self.drainExtraStmts(&stmts);
+            // M16 Phase 5: detect the bundle hoist-point marker. A buildBundle
+            // output is CJS-desugared script source (run via parseScript), but it
+            // still carries ES `import`/`export` statements and the
+            // `__esm_hoist_point__` marker emitted right before the entry body.
+            // Mirror parseModule so the entry's import bindings are hoisted and
+            // their leaked `var local` declarations removed (so dependency factory
+            // bodies don't see entry imports via the shared top-level scope).
+            // Plain scripts have no marker, so this is a no-op for them.
+            if (s.kind == .var_decl and
+                std.mem.eql(u8, s.data.var_decl.name, "__esm_hoist_point__"))
+            {
+                self.hoist_point_seen = true;
+                self.hoist_point_idx = stmts.items.len;
+            }
+        }
+        if (self.hoisted_import_stmts.items.len > 0) {
+            var final_stmts = std.ArrayList(*Node){};
+            final_stmts.appendSlice(self.arena, stmts.items[0..self.hoist_point_idx]) catch {
+                self.had_error = true;
+            };
+            final_stmts.appendSlice(self.arena, self.hoisted_import_stmts.items) catch {
+                self.had_error = true;
+            };
+            final_stmts.appendSlice(self.arena, stmts.items[self.hoist_point_idx..]) catch {
+                self.had_error = true;
+            };
+            self.hoisted_import_stmts.clearRetainingCapacity();
+            stmts = final_stmts;
         }
         self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
         if (self.had_error) {

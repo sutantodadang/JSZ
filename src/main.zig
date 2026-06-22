@@ -476,7 +476,10 @@ fn buildWrappedScript(gpa: std.mem.Allocator, script_path: []const u8, entry_src
     const base_dir = std.fs.path.dirname(script_path) orelse ".";
     const wrapped_src = try std.fmt.allocPrint(gpa, "{s}\nmodule.exports;", .{entry_src});
     defer gpa.free(wrapped_src);
-    return jsz.module_loader.buildBundle(gpa, base_dir, null, wrapped_src);
+    const entry_id = std.fs.path.basename(script_path);
+    const __b = try jsz.module_loader.buildBundle(gpa, base_dir, entry_id, wrapped_src);
+    if (std.posix.getenv("JSZ_DUMP_BUNDLE") != null) std.debug.print("===BUNDLE===\n{s}\n===END===\n", .{__b});
+    return __b;
 }
 
 test "parseArgs --version" {
