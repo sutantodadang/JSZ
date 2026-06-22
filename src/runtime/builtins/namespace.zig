@@ -111,6 +111,10 @@ pub fn isTDZ(o: *JsObject, key: []const u8) bool {
         }
         return false; // initialized (any non-marker value)
     }
+    // getOwn returns null for accessor properties; if the key exists as an
+    // accessor (live re-export getter installed via __liveReexport__), the
+    // binding IS initialized — don't fall through to the TDZ list.
+    if (b.hasOwn(key)) return false;
     // No own property: check the TDZ-only export list (let/const/class bindings
     // are uninitialized during instantiation). var/function bindings are NOT
     // TDZ — they are initialized to undefined / function value and so are not
