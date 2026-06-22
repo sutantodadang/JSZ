@@ -702,7 +702,7 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     errdefer sb.deinit(gpa);
     try sb.appendSlice(gpa, "var __modules__ = {};\n");
     try sb.appendSlice(gpa, "function __exportStarGetter__(s,k){return function(){return s[k];};}\n");
-    try sb.appendSlice(gpa, "function __exportStar__(t,s){var ks=Object.keys(s);for(var i=0;i<ks.length;i++){var k=ks[i];if(k!==\"default\")Object.defineProperty(t,k,{get:__exportStarGetter__(s,k),enumerable:true,configurable:true});}}\n");
+    try sb.appendSlice(gpa, "function __exportStar__(t,s){var ks=Object.keys(s);for(var i=0;i<ks.length;i++){var k=ks[i];if(k===\"default\")continue;var sd=Object.getOwnPropertyDescriptor(s,k);if(sd&&sd.get&&Object.prototype.hasOwnProperty.call(t,k))continue;Object.defineProperty(t,k,{get:__exportStarGetter__(s,k),enumerable:true,configurable:true});}}\n");
     try sb.appendSlice(gpa, "function __liveReexport__(e,n,s,p){Object.defineProperty(e,n,{get:function(){return s[p];},enumerable:true,configurable:true});}\n");
     var it = registry.iterator();
     while (it.next()) |e| {
@@ -822,7 +822,13 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     // entry body assertions that appear before `import` in source order.
     try sb.appendSlice(gpa, "var __esm_hoist_point__=1;\n");
     try sb.appendSlice(gpa, entry_src);
-    return sb.toOwnedSlice(gpa);
+    const result = try sb.toOwnedSlice(gpa);
+    if (self_id.len > 20 and std.mem.indexOf(u8, self_id, "export-star-as-from-and-import-star-as-and-export") != null) {
+        const f = std.fs.cwd().createFile("/tmp/bundle_dump.js", .{}) catch return result;
+        defer f.close();
+        _ = f.writeAll(result) catch {};
+    }
+    return result;
 }
 
 // ------------------------------------------------------------------- tests ---
