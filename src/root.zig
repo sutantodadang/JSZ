@@ -273,6 +273,14 @@ pub const snapshot = @import("./bytecode/snapshot.zig");
 /// script loader and the Test262 module-test path.
 pub const module_loader = @import("./runtime/module.zig");
 
+/// M16 TLA: whether the most recent eval signalled async-test completion via
+/// `$DONE` (wired to `__jszAsyncDone__`/`__jszAsyncFail__`). A `[module, async]`
+/// test that finished `.ok` without signalling never completed (e.g. a hung
+/// promise / deadlocked async dependency) and should be treated as a failure.
+pub fn asyncDoneSignaled() bool {
+    return realm_mod.async_done_signaled;
+}
+
 /// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 8: compile `source` and write a bytecode→source JSON source map to
 /// `writer`. Maps each opcode (and nested function literals) back to a

@@ -84,11 +84,21 @@ pub const Parser = struct {
     /// M16 Phase 5: set when `var __esm_hoist_point__=1;` is seen in the bundle header.
     /// Only then do we hoist imports — unit tests have no marker so they keep source order.
     hoist_point_seen: bool,
+    /// M16 Phase 5: set when `var __esm_hoist_point_no_se__=1;` is emitted by buildBundle
+    /// for sync entries with function exports.  Named imports are still hoisted (so their
+    /// `var __esm_N__` lives at module scope before the IIFE), but bare side-effect imports
+    /// (`import './dep'`) are NOT hoisted — they stay in the IIFE body and run AFTER the
+    /// pre-hoist `exports.fn = fn` assignments, so circular deps can call the function.
+    hoist_no_se: bool,
     /// M16 Phase 5: index into the stmt list after which hoisted imports are inserted.
     hoist_point_idx: usize,
     /// M16 Phase 5: name hint set by parseExportDecl for `export default class/function`
     /// anonymous expressions, consumed by parseClassExpr / parseFunctionExpr.
     export_default_name_hint: ?[]const u8,
+    /// M16 TLA: set when an `await` is parsed at module top level (function
+    /// nesting depth 0). The module then has top-level await and its top-level
+    /// program is compiled/driven as an async body (real per-await suspension).
+    saw_top_level_await: bool,
 
     pub fn init(source: []const u8, arena: std.mem.Allocator) Parser {
         var p = Parser{
@@ -107,8 +117,10 @@ pub const Parser = struct {
             .fn_nesting_depth = 0,
             .hoisted_import_stmts = .{},
             .hoist_point_seen = false,
+            .hoist_no_se = false,
             .hoist_point_idx = 0,
             .export_default_name_hint = null,
+            .saw_top_level_await = false,
         };
         // Prime the lookahead.
         p.current = p.lexNext();
@@ -285,6 +297,16 @@ pub const Parser = struct {
                 self.hoist_point_seen = true;
                 self.hoist_point_idx = stmts.items.len;
             }
+            // M16 Phase 5: variant for sync entries with function exports — hoist
+            // named imports but NOT bare side-effect imports (which must stay in the
+            // IIFE body so they run after the pre-hoist `exports.fn = fn` assignments).
+            if (s.kind == .var_decl and
+                std.mem.eql(u8, s.data.var_decl.name, "__esm_hoist_point_no_se__"))
+            {
+                self.hoist_point_seen = true;
+                self.hoist_no_se = true;
+                self.hoist_point_idx = stmts.items.len;
+            }
         }
         if (self.hoisted_import_stmts.items.len > 0) {
             var final_stmts = std.ArrayList(*Node){};
@@ -339,6 +361,15 @@ pub const Parser = struct {
                 std.mem.eql(u8, s.data.var_decl.name, "__esm_hoist_point__"))
             {
                 self.hoist_point_seen = true;
+                self.hoist_point_idx = stmts.items.len;
+            }
+            // M16 Phase 5: variant emitted for sync entries with function exports — hoist
+            // named imports but NOT bare side-effect imports.
+            if (s.kind == .var_decl and
+                std.mem.eql(u8, s.data.var_decl.name, "__esm_hoist_point_no_se__"))
+            {
+                self.hoist_point_seen = true;
+                self.hoist_no_se = true;
                 self.hoist_point_idx = stmts.items.len;
             }
         }

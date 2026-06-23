@@ -297,6 +297,9 @@ pub const Program = struct {
     /// always strict (§11.2.2); kept distinct from `is_strict` so the compiler
     /// can apply module-only semantics later without inferring it from strict.
     is_module: bool = false,
+    /// M16 TLA: the module has top-level await, so its top-level body must be
+    /// compiled as async (and driven as a coroutine) for real await suspension.
+    has_tla: bool = false,
 };
 
 pub const BlockStmt = struct {

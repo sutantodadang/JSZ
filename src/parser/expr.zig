@@ -500,6 +500,9 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
     if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await") and
         (p.is_module or isAwaitOperandStart(p.peekNext().kind)))
     {
+        // M16 TLA: an `await` at module top level (not inside any function) makes
+        // this module's top-level body async (real suspension, not sync-drain).
+        if (p.is_module and p.fn_nesting_depth == 0) p.saw_top_level_await = true;
         // `await` is a prefix operator; the next token may be a regex literal.
         // Patch prev_kind so the lexer treats '/' as regex, not division.
         p.lexer.prev_kind = .kw_typeof;

@@ -64,8 +64,11 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
         const stmt = p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = req }) orelse return null;
         // M16 Phase 5: hoist side-effect imports to the bundle hoist point so
         // require() runs after __modules__ is initialised but before entry assertions.
-        // Only hoist when the bundle marker has been seen (not in unit tests).
-        if (p.hoist_point_seen) {
+        // When hoist_no_se is set (sync entries with function exports), side-effect
+        // imports are NOT hoisted — they stay in the IIFE body and execute AFTER the
+        // pre-hoist `exports.fn = fn` assignments at the top of the IIFE.  This lets
+        // circular deps that import the entry's function exports find them callable.
+        if (p.hoist_point_seen and !p.hoist_no_se) {
             p.hoisted_import_stmts.append(p.arena, stmt) catch {};
             return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
         }

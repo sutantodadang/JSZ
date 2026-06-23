@@ -208,6 +208,406 @@ fn readModuleFile(allocator: std.mem.Allocator, base_dir: []const u8, id: []cons
     return null;
 }
 
+// ----------------------------------------------- M16 TLA: async classification ---
+//
+// Top-level await needs the spec's async InnerModuleEvaluation ordering. JSZ
+// realises it on the desugar model: a module that has top-level await — or that
+// (transitively) imports such a module — is evaluated as an `async function`
+// factory whose result Promise is its evaluation-completion promise. Importers
+// of an async module insert an `await __awaitDeps__([...])` barrier after their
+// import prologue so their body runs only once every async dependency has
+// finished evaluating (matching the spec's PendingAsyncDependencies gate).
+
+/// True when the next `len`-bounded run starting at `i` is an identifier
+/// character (used to find word boundaries).
+fn isIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
+}
+
+/// Skip whitespace and line/block comments starting at `i`; return the new index.
+fn skipWsComments(src: []const u8, start: usize) usize {
+    var i = start;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len) {
+            if (src[i + 1] == '/') {
+                i += 2;
+                while (i < src.len and src[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (src[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) : (i += 1) {}
+                i = @min(i + 2, src.len);
+                continue;
+            }
+        }
+        break;
+    }
+    return i;
+}
+
+/// True when `src` contains a *top-level* `await` (one not lexically inside any
+/// function body) — i.e. the module has top-level await (spec [[HasTLA]]).
+/// Comment/string/template aware. Function nesting is tracked with a brace
+/// stack: a `{` opens a function body when preceded by `=>`, or by a `)` whose
+/// matching `(` is not a control-flow header (if/for/while/switch/catch/with) —
+/// which covers `function`, methods, getters and parenthesised arrows. An
+/// `await` keyword seen at function-depth 0 (and not after `.`) reports TLA.
+pub fn hasTopLevelAwait(src: []const u8) bool {
+    const cap = 256;
+    var brace_is_fn: [cap]bool = undefined; // stack of brace kinds
+    var brace_n: usize = 0;
+    var paren_ctrl: [cap]bool = undefined; // per-`(`: was its prefix a control kw?
+    var paren_n: usize = 0;
+    var fn_depth: u32 = 0;
+
+    // Classification of the previous significant token, for `{`/`(` decisions.
+    const Prev = enum { none, arrow, close_paren, word, dot, other };
+    var prev: Prev = .none;
+    var prev_word_ctrl = false; // last word was a control-flow keyword
+
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        // Comments.
+        if (c == '/' and i + 1 < src.len and (src[i + 1] == '/' or src[i + 1] == '*')) {
+            i = skipWsComments(src, i);
+            continue;
+        }
+        // Template / strings: opaque bodies.
+        if (c == '`') {
+            i += 1;
+            while (i < src.len and src[i] != '`') : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            prev = .other;
+            continue;
+        }
+        if (c == '"' or c == '\'') {
+            i += 1;
+            while (i < src.len and src[i] != c) : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            prev = .other;
+            continue;
+        }
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            i += 1;
+            continue;
+        }
+        // Identifier / keyword.
+        if (isIdentChar(c) and !std.ascii.isDigit(c)) {
+            const start = i;
+            while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
+            const word = src[start..i];
+            if (std.mem.eql(u8, word, "await") and fn_depth == 0 and prev != .dot) {
+                return true;
+            }
+            prev_word_ctrl = std.mem.eql(u8, word, "if") or std.mem.eql(u8, word, "for") or
+                std.mem.eql(u8, word, "while") or std.mem.eql(u8, word, "switch") or
+                std.mem.eql(u8, word, "catch") or std.mem.eql(u8, word, "with");
+            prev = .word;
+            continue;
+        }
+        // Arrow.
+        if (c == '=' and i + 1 < src.len and src[i + 1] == '>') {
+            i += 2;
+            prev = .arrow;
+            continue;
+        }
+        switch (c) {
+            '(' => {
+                if (paren_n < cap) {
+                    paren_ctrl[paren_n] = (prev == .word and prev_word_ctrl);
+                    paren_n += 1;
+                }
+                prev = .other;
+            },
+            ')' => {
+                if (paren_n > 0) paren_n -= 1;
+                prev = .close_paren;
+            },
+            '{' => {
+                var is_fn = false;
+                if (prev == .arrow) {
+                    is_fn = true;
+                } else if (prev == .close_paren) {
+                    // The brace follows `)`: a function/method body unless the
+                    // matching `(` was a control-flow header.
+                    is_fn = !(paren_n < cap and paren_ctrl[paren_n]);
+                }
+                if (brace_n < cap) {
+                    brace_is_fn[brace_n] = is_fn;
+                    brace_n += 1;
+                }
+                if (is_fn) fn_depth += 1;
+                prev = .other;
+            },
+            '}' => {
+                if (brace_n > 0) {
+                    brace_n -= 1;
+                    if (brace_is_fn[brace_n] and fn_depth > 0) fn_depth -= 1;
+                }
+                prev = .other;
+            },
+            '.' => prev = .dot,
+            else => prev = .other,
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// Return the byte offset just past a module's leading `import` declaration
+/// prologue — the point at which an async-dependency `await` barrier may be
+/// spliced so it runs after every static import's `require()` but before the
+/// module body. Stops at the first top-level statement that is not a plain
+/// `import` declaration (dynamic `import(`, `import.meta`, exports, code).
+pub fn findImportPrologueEnd(src: []const u8) usize {
+    var i: usize = 0;
+    while (true) {
+        i = skipWsComments(src, i);
+        const stmt_start = i;
+        if (i >= src.len) return i;
+        // Must begin with the `import` keyword as a standalone word.
+        if (!(i + 6 <= src.len and std.mem.eql(u8, src[i .. i + 6], "import") and
+            (i + 6 == src.len or !isIdentChar(src[i + 6])))) return stmt_start;
+        var j = skipWsComments(src, i + 6);
+        // `import(` (dynamic) or `import.meta` are expressions, not a prologue.
+        if (j < src.len and (src[j] == '(' or src[j] == '.')) return stmt_start;
+        // Advance to the statement terminator `;` at top nesting, skipping
+        // strings/comments. Import declarations in practice end with `;`.
+        var depth: i32 = 0;
+        while (j < src.len) {
+            const c = src[j];
+            if (c == '/' and j + 1 < src.len and (src[j + 1] == '/' or src[j + 1] == '*')) {
+                j = skipWsComments(src, j);
+                continue;
+            }
+            if (c == '"' or c == '\'' or c == '`') {
+                const q = c;
+                j += 1;
+                while (j < src.len and src[j] != q) : (j += 1) {
+                    if (src[j] == '\\') j += 1;
+                }
+                j += 1;
+                continue;
+            }
+            if (c == '{' or c == '(' or c == '[') depth += 1;
+            if (c == '}' or c == ')' or c == ']') depth -= 1;
+            if (c == ';' and depth <= 0) {
+                j += 1;
+                break;
+            }
+            j += 1;
+        }
+        i = j;
+    }
+}
+
+/// Compute the set of module ids (within `sources`, plus `entry_id`/`entry_src`)
+/// that are async: they have top-level await, or transitively import a module
+/// that does. Returns a set of ids (arena-owned keys reference `sources`/given
+/// ids). `dep_of` is filled with each id's relative dependency id list.
+fn computeAsyncSet(
+    arena: std.mem.Allocator,
+    sources: *std.StringArrayHashMap([]const u8),
+    entry_id: []const u8,
+    entry_src: []const u8,
+    dep_of: *std.StringHashMap([]const []const u8),
+) !std.StringHashMap(void) {
+    var async_set = std.StringHashMap(void).init(arena);
+    // Direct TLA + dependency lists for every module and the entry.
+    var direct = std.StringHashMap(bool).init(arena);
+    {
+        var it = sources.iterator();
+        while (it.next()) |e| {
+            const id = e.key_ptr.*;
+            const src = e.value_ptr.*;
+            try direct.put(id, hasTopLevelAwait(src));
+            var deps = std.ArrayList([]const u8){};
+            scanSpecifiers(src, id, &deps, arena);
+            try dep_of.put(id, deps.items);
+        }
+        try direct.put(entry_id, hasTopLevelAwait(entry_src));
+        var edeps = std.ArrayList([]const u8){};
+        scanSpecifiers(entry_src, entry_id, &edeps, arena);
+        try dep_of.put(entry_id, edeps.items);
+    }
+    // Seed with direct-TLA modules.
+    {
+        var it = direct.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.*) try async_set.put(e.key_ptr.*, {});
+        }
+    }
+    // Fixpoint: a module is async if any dependency is async.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var it = dep_of.iterator();
+        while (it.next()) |e| {
+            const id = e.key_ptr.*;
+            if (async_set.contains(id)) continue;
+            for (e.value_ptr.*) |d| {
+                if (async_set.contains(d)) {
+                    try async_set.put(id, {});
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    return async_set;
+}
+
+/// DFS pre-order discovery times from `entry_id` following `dep_of` edges.
+/// Modules not reachable from the entry get no entry (treated as order = maxInt).
+fn computeDfsOrder(
+    arena: std.mem.Allocator,
+    dep_of: *std.StringHashMap([]const []const u8),
+    entry_id: []const u8,
+) std.StringHashMap(usize) {
+    var order = std.StringHashMap(usize).init(arena);
+    var counter: usize = 0;
+    var stack = std.ArrayList([]const u8){};
+    stack.append(arena, entry_id) catch return order;
+    while (stack.items.len > 0) {
+        const id = stack.pop() orelse break;
+        if (order.contains(id)) continue;
+        order.put(id, counter) catch {};
+        counter += 1;
+        const ds = dep_of.get(id) orelse continue;
+        // Push in reverse so left-most dep is processed first.
+        var i: usize = ds.len;
+        while (i > 0) {
+            i -= 1;
+            if (!order.contains(ds[i])) stack.append(arena, ds[i]) catch {};
+        }
+    }
+    return order;
+}
+
+/// True when `target` is reachable from `from` by following dep_of edges.
+fn canReach(
+    arena: std.mem.Allocator,
+    dep_of: *std.StringHashMap([]const []const u8),
+    from: []const u8,
+    target: []const u8,
+) bool {
+    var visited = std.StringHashMap(void).init(arena);
+    var queue = std.ArrayList([]const u8){};
+    const start_deps = dep_of.get(from) orelse return false;
+    for (start_deps) |d| queue.append(arena, d) catch {};
+    while (queue.items.len > 0) {
+        const curr = queue.orderedRemove(0);
+        if (std.mem.eql(u8, curr, target)) return true;
+        if (visited.contains(curr)) continue;
+        visited.put(curr, {}) catch {};
+        const ds = dep_of.get(curr) orelse continue;
+        for (ds) |d| if (!visited.contains(d)) queue.append(arena, d) catch {};
+    }
+    return false;
+}
+
+/// Return the SCC representative of `id`: the member of `id`'s SCC with the
+/// smallest DFS discovery time.  If `id` is a singleton (not in any cycle)
+/// this returns `id` itself.
+fn findSccRoot(
+    arena: std.mem.Allocator,
+    dep_of: *std.StringHashMap([]const []const u8),
+    dfs_order: *std.StringHashMap(usize),
+    id: []const u8,
+) []const u8 {
+    var root = id;
+    var root_order = dfs_order.get(id) orelse 0;
+    // Walk all modules reachable from `id`; keep those that can also reach `id`.
+    var visited = std.StringHashMap(void).init(arena);
+    var queue = std.ArrayList([]const u8){};
+    queue.append(arena, id) catch return id;
+    while (queue.items.len > 0) {
+        const curr = queue.orderedRemove(0);
+        if (visited.contains(curr)) continue;
+        visited.put(curr, {}) catch {};
+        if (!std.mem.eql(u8, curr, id) and canReach(arena, dep_of, curr, id)) {
+            const ord = dfs_order.get(curr) orelse std.math.maxInt(usize);
+            if (ord < root_order) {
+                root_order = ord;
+                root = curr;
+            }
+        }
+        const ds = dep_of.get(curr) orelse continue;
+        for (ds) |d| if (!visited.contains(d)) queue.append(arena, d) catch {};
+    }
+    return root;
+}
+
+/// The (deduplicated) list of `id`'s dependency ids that are async modules,
+/// with cycle-awareness mirroring the spec's InnerModuleEvaluation logic:
+///
+///  - If dep D and module M are in the **same SCC** and D has a *lower* DFS
+///    discovery time than M, then D is a cycle ancestor (back-edge dep) — skip
+///    it (M will not wait for its ancestor; the ancestor will wait for M).
+///
+///  - If D is in a **different SCC** from M, use D's SCC root (CycleRoot) as
+///    the actual dep — this matches spec step 11.c.iv which redirects to the
+///    cycle root when the dep's status is evaluating-async.
+fn asyncDepsList(
+    arena: std.mem.Allocator,
+    async_set: *std.StringHashMap(void),
+    dep_of: *std.StringHashMap([]const []const u8),
+    dfs_order: *std.StringHashMap(usize),
+    id: []const u8,
+) []const []const u8 {
+    const deps = dep_of.get(id) orelse return &[_][]const u8{};
+    var out = std.ArrayList([]const u8){};
+    var seen = std.StringHashMap(void).init(arena);
+    const my_order = dfs_order.get(id) orelse std.math.maxInt(usize);
+    for (deps) |d| {
+        if (!async_set.contains(d)) continue;
+        const d_order = dfs_order.get(d) orelse std.math.maxInt(usize);
+        const in_same_scc = canReach(arena, dep_of, d, id);
+        const actual_dep: []const u8 = blk: {
+            if (in_same_scc) {
+                // Back-edge: d was visited before id in DFS → id should NOT wait for d.
+                if (d_order < my_order) continue;
+                // Tree/forward edge within the SCC: id does wait for d.
+                break :blk d;
+            } else {
+                // Different SCC: use d's SCC root (spec CycleRoot).
+                break :blk findSccRoot(arena, dep_of, dfs_order, d);
+            }
+        };
+        if (!async_set.contains(actual_dep)) continue;
+        if (seen.contains(actual_dep)) continue;
+        seen.put(actual_dep, {}) catch {};
+        out.append(arena, actual_dep) catch {};
+    }
+    return out.items;
+}
+
+/// Emit `await __awaitDeps__(["id1","id2"]);` — the async-dependency barrier.
+fn emitAwaitDeps(gpa: std.mem.Allocator, sb: *std.ArrayList(u8), deps: []const []const u8) !void {
+    try sb.appendSlice(gpa, "await __awaitDeps__([");
+    for (deps, 0..) |d, i| {
+        if (i > 0) try sb.appendSlice(gpa, ",");
+        try sb.appendSlice(gpa, "\"");
+        for (d) |ch| {
+            if (ch == '\\' or ch == '"') try sb.appendSlice(gpa, "\\");
+            try sb.appendSlice(gpa, &.{ch});
+        }
+        try sb.appendSlice(gpa, "\"");
+    }
+    try sb.appendSlice(gpa, "]);\n");
+}
+
 /// The id used for the bundle entry point (its own relative imports resolve
 /// against `base_dir`, i.e. as if it lived directly in that directory).
 pub const ENTRY_ID = "__entry__";
@@ -698,6 +1098,14 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         scanSpecifiers(src, id, &queue, arena);
     }
 
+    // M16 TLA: classify which modules (and the entry) must evaluate as async
+    // factories, and each module's async-dependency id list for the barrier.
+    var dep_of = std.StringHashMap([]const []const u8).init(arena);
+    var async_set = try computeAsyncSet(arena, &registry, self_id, entry_src, &dep_of);
+    // DFS pre-order discovery times from entry — used by asyncDepsList to detect
+    // back-edge (cycle-ancestor) deps and redirect cross-SCC deps to their SCC root.
+    var dfs_order = computeDfsOrder(arena, &dep_of, self_id);
+
     var sb = std.ArrayList(u8){};
     errdefer sb.deinit(gpa);
     try sb.appendSlice(gpa, "var __modules__ = {};\n");
@@ -720,10 +1128,15 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     try sb.appendSlice(gpa, "function __liveLocalExport__(e,n,g){var w={};Object.defineProperty(w,\"v\",{get:g,enumerable:true,configurable:true});__liveReexport__(e,n,w,\"v\");}\n");
     var it = registry.iterator();
     while (it.next()) |e| {
+        const mod_id = e.key_ptr.*;
+        const mod_is_async = async_set.contains(mod_id);
         try sb.appendSlice(gpa, "__modules__[\"");
-        try sb.appendSlice(gpa, e.key_ptr.*);
-        try sb.appendSlice(gpa, "\"] = function(require, module, exports){\nvar __module_id__ = \"");
-        try sb.appendSlice(gpa, e.key_ptr.*);
+        try sb.appendSlice(gpa, mod_id);
+        if (mod_is_async)
+            try sb.appendSlice(gpa, "\"] = async function(require, module, exports){\nvar __module_id__ = \"")
+        else
+            try sb.appendSlice(gpa, "\"] = function(require, module, exports){\nvar __module_id__ = \"");
+        try sb.appendSlice(gpa, mod_id);
         try sb.appendSlice(gpa, "\";\n");
         // M16 Phase 4: inject export name setup so the module namespace exotic
         // can detect TDZ (known exports missing from the backing). Scan the
@@ -774,7 +1187,20 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
                 try sb.appendSlice(gpa, ";\n");
             }
         }
-        try sb.appendSlice(gpa, e.value_ptr.*);
+        // M16 TLA: for an async module, insert an `await __awaitDeps__([...])`
+        // barrier after the import prologue so the body runs only once every
+        // async dependency has finished evaluating (spec PendingAsyncDependencies).
+        const mod_src = e.value_ptr.*;
+        const async_deps = asyncDepsList(arena, &async_set, &dep_of, &dfs_order, mod_id);
+        if (mod_is_async and async_deps.len > 0) {
+            const split = findImportPrologueEnd(mod_src);
+            try sb.appendSlice(gpa, mod_src[0..split]);
+            try sb.appendSlice(gpa, "\n");
+            try emitAwaitDeps(gpa, &sb, async_deps);
+            try sb.appendSlice(gpa, mod_src[split..]);
+        } else {
+            try sb.appendSlice(gpa, mod_src);
+        }
         try sb.appendSlice(gpa, "\n};\n");
     }
     try sb.appendSlice(gpa, "var module = { exports: {} }; var exports = module.exports;\nvar __module_id__ = \"");
@@ -836,11 +1262,23 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         try sb.appendSlice(gpa, prelude_part);
         try sb.appendSlice(gpa, "\n");
     }
-    // M16 Phase 5: marker for the parser to identify where entry body starts,
-    // so hoisted import require() calls land AFTER the bundle header (which sets
-    // up __modules__ / __initExports__ / pre-registered self-module) BUT BEFORE
-    // entry body assertions that appear before `import` in source order.
-    try sb.appendSlice(gpa, "var __esm_hoist_point__=1;\n");
+    // M16 TLA: compute entry_is_async here (before the hoist marker) so we can
+    // choose the right marker variant.
+    const entry_is_async = async_set.contains(self_id);
+    // M16 Phase 5: marker for the parser to identify where entry body starts.
+    // For sync entries with function exports we use the `_no_se` variant: named
+    // imports are still hoisted (so their `var __esm_N__` lives at module scope)
+    // but bare side-effect imports stay in the IIFE body so they run AFTER the
+    // pre-hoist `exports.fn = fn` assignments at the top of the IIFE.  This
+    // guarantees that circular deps which import the entry's function exports see
+    // them as callable (not undefined) when their factory runs.
+    // For async entries or entries without function exports the original marker
+    // hoists all imports — async entries need deps loaded before __awaitDeps__.
+    if (!entry_is_async and entry_fn.items.len > 0) {
+        try sb.appendSlice(gpa, "var __esm_hoist_point_no_se__=1;\n");
+    } else {
+        try sb.appendSlice(gpa, "var __esm_hoist_point__=1;\n");
+    }
     // M16 Phase 5: wrap the entry body in an IIFE so its function/class/var
     // declarations are scoped to the IIFE, NOT the module scope.  Without this,
     // hoisted function declarations from the entry body (e.g. `export function A()`)
@@ -850,7 +1288,13 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     // exports from the module scope so imports/exports still work; hoisted import
     // vars (inserted at the hoist point above) are also in the module scope and
     // accessible from the IIFE.
-    try sb.appendSlice(gpa, "(function(require,module,exports){\"use strict\";\n");
+    // M16 TLA: the entry runs as an async IIFE when it (transitively) depends on
+    // an async module or itself has top-level await, so its body can `await` the
+    // dependency barrier / suspend at its own top-level awaits.
+    if (entry_is_async)
+        try sb.appendSlice(gpa, "(async function(require,module,exports){\"use strict\";\n")
+    else
+        try sb.appendSlice(gpa, "(function(require,module,exports){\"use strict\";\n");
     // Pre-hoist function/generator exports INSIDE the IIFE so the function
     // declaration (hoisted within the IIFE) is available for exports.NAME = NAME.
     for (entry_fn.items) |nm| {
@@ -866,8 +1310,21 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         try sb.appendSlice(gpa, bn);
         try sb.appendSlice(gpa, ";\n");
     }
+    // M16 TLA: the entry's static imports are hoisted to module scope (before the
+    // IIFE runs), so all dependency `require()`s have completed; barrier here
+    // awaits any async dependency's evaluation-completion promise before the body.
+    if (entry_is_async) {
+        const entry_async_deps = asyncDepsList(arena, &async_set, &dep_of, &dfs_order, self_id);
+        if (entry_async_deps.len > 0) try emitAwaitDeps(gpa, &sb, entry_async_deps);
+    }
     try sb.appendSlice(gpa, body_part);
-    try sb.appendSlice(gpa, "\n})(require,module,exports);\n");
+    if (entry_is_async)
+        // Record an unhandled rejection of the entry's async evaluation (spec
+        // Evaluate() promise rejection) so the host can surface it as the eval
+        // exception (negative module tests / uncaught async module errors).
+        try sb.appendSlice(gpa, "\n})(require,module,exports).then(void 0,__jszModuleReject__);\n")
+    else
+        try sb.appendSlice(gpa, "\n})(require,module,exports);\n");
     const result = try sb.toOwnedSlice(gpa);
     if (std.posix.getenv("JSZ_DUMP_BUNDLE") != null) {
         const f = std.fs.cwd().createFile("/tmp/bundle_dump.js", .{}) catch return result;

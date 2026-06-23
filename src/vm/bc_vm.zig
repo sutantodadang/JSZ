@@ -330,7 +330,13 @@ pub const BcVm = struct {
                 // from a TypedArray ctor when a resizable buffer shrank mid-call).
                 if (obj.get("__call__")) |cv| {
                     if (cv.bits != 0 and cv.unbox() == .native_function) {
-                        return cv.toPtr().native_function.invoke(self.arena, this_val, args) catch |e| {
+                        // A non-constructor callable object (no `prototype`, e.g. a
+                        // Promise resolve/reject function) needs the callable object
+                        // itself as `this` so its native can read its internal slot —
+                        // matching `doCall`. Constructor-like callables (Error, Array,
+                        // …) keep the externally supplied `this`.
+                        const call_this = if (obj.get("prototype") == null) fn_val else this_val;
+                        return cv.toPtr().native_function.invoke(self.arena, call_this, args) catch |e| {
                             if (e == error.JsException) return error.JsException;
                             return error.OutOfMemory;
                         };
@@ -573,6 +579,18 @@ pub const BcVm = struct {
         @import("../runtime/realm.zig").active_context = null;
     }
 
+    /// Drain the microtask (promise reaction) queue with this VM's context
+    /// active, so plain promise reactions can invoke their JS callbacks (which
+    /// re-enter through the active context). Used for the end-of-run drain after
+    /// the top-level `run`/`runLoop` returned and deactivated the context — async
+    /// coroutine resumes carry their own VM pointer, but ordinary `.then`
+    /// reactions need the active context to call back into JS.
+    pub fn drainMicrotasks(self: *BcVm) void {
+        self.activateContext();
+        defer self.deactivateContext();
+        @import("../runtime/builtins/promise.zig").runMicrotasks(self.arena);
+    }
+
     /// Phase 9: record a loop back-edge as a hot-site signal. Returns true when
     /// this site just crossed the hot threshold AND the JIT is in experimental
     /// mode — the caller may then attempt a native fast-forward. No-op when off.
@@ -612,6 +630,34 @@ pub const BcVm = struct {
         });
 
         return self.runLoop();
+    }
+
+    /// M16 TLA: run a module whose top-level body is async (top-level await) as a
+    /// coroutine. Builds the async invocation (driving it to the first `await`),
+    /// and subscribes a rejection recorder so an uncaught top-level-await
+    /// rejection surfaces as the module's evaluation error. Completion happens
+    /// later as microtasks drain (in the caller). Returns `.ok` synchronously.
+    pub fn runMainAsync(
+        self: *BcVm,
+        main_func: *const BcFunction,
+        captured_env: *anyopaque,
+    ) !RunOutcome {
+        self.activateContext();
+        defer self.deactivateContext();
+        const realm_mod = @import("../runtime/realm.zig");
+        const promise_mod = @import("../runtime/builtins/promise.zig");
+        const global_env: *Environment = @ptrCast(@alignCast(captured_env));
+        const result = self.buildAsyncFunction(main_func, global_env, Value{}, &[_]Value{}) catch |e| {
+            if (e == error.JsException) {
+                return RunOutcome{ .exception_value = .{ .msg = "module evaluation failed", .value = realm_mod.pending_exception } };
+            }
+            return e;
+        };
+        // Record an uncaught rejection of the top-level async body as the module
+        // evaluation error (so negative module tests / uncaught errors surface).
+        const rec_fn = try val_mod.makeNativeFunction(self.arena, realm_mod.nativeModuleReject);
+        try promise_mod.subscribeAwait(self.arena, result, Value{}, rec_fn);
+        return RunOutcome{ .ok = try val_mod.makeUndefined(self.arena) };
     }
 
     fn runLoop(self: *BcVm) !RunOutcome {
@@ -2420,6 +2466,36 @@ pub const BcVm = struct {
                             self.frames.items[self.frames.items.len - 1].registers[ret_dst] = res;
                         } else {
                             self.result = res;
+                        }
+                        return null;
+                    }
+                }
+                // Callable object with a `__call__` native slot (e.g. a Promise
+                // resolve/reject function) reached via a member call
+                // `obj.method(...)`. Mirror `doCall`: the native receives the
+                // callable object itself as `this` so it can read its internal slot.
+                if (obj.get("__call__")) |call_val| {
+                    if (call_val.bits != 0 and call_val.unbox() == .native_function) {
+                        const fn_ptr = call_val.toPtr().native_function;
+                        var args = try self.arena.alloc(Value, nargs);
+                        for (0..nargs) |i| {
+                            args[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
+                        }
+                        const result = fn_ptr.invoke(self.arena, callee_val, args) catch |e| {
+                            if (e == error.JsException) {
+                                const realm_mod = @import("../runtime/realm.zig");
+                                if (realm_mod.pending_exception.bits != 0) {
+                                    self.last_exception_value = realm_mod.pending_exception;
+                                    realm_mod.pending_exception = Value{};
+                                }
+                                return "__js_exception__";
+                            }
+                            return "TypeError: object call threw";
+                        };
+                        if (self.frames.items.len > 0) {
+                            self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
+                        } else {
+                            self.result = result;
                         }
                         return null;
                     }

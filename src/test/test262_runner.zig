@@ -435,8 +435,11 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
         }
         break :blk false;
     };
+    // M16 TLA: with true async module evaluation $DONE may be called from a
+    // microtask after the synchronous run; route it through host completion
+    // signals so a late failure/never-completion is observable (see runMainBc).
     const done_prefix: []const u8 = if (is_tla_module)
-        "function $DONE(err) { if (err) throw err; }\n"
+        "function $DONE(err) { if (err) { __jszAsyncFail__(err); } else { __jszAsyncDone__(); } }\n"
     else
         "";
     // The `/*__JSZ_PRELUDE_END__*/` sentinel marks where the harness prelude ends
@@ -482,6 +485,17 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
         {
             return .skip;
         }
+    }
+
+    // M16 TLA: a `[module, async]` test must call $DONE to pass. With true async
+    // module evaluation a completion can be deferred to a microtask; if the run
+    // ended `.ok` but $DONE never fired (e.g. a deadlocked async dependency), the
+    // test never actually completed and must not count as a pass.
+    if (is_tla_module and result == .ok and !jsz.asyncDoneSignaled()) {
+        const msg = "async test did not complete ($DONE not called)";
+        @memcpy(g_fail_msg_buf[0..msg.len], msg);
+        g_fail_msg_len = msg.len;
+        return .fail;
     }
 
     if (meta.negative) {

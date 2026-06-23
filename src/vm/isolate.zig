@@ -183,6 +183,7 @@ pub const IsolateImpl = struct {
     pub fn evalWithMode(self: *IsolateImpl, source: []const u8, mode: InterpMode, native_bindings: []const val_mod.NativeBinding) !EvalOutcome {
         _ = native_bindings;
         promise_mod.clearMicrotasks();
+        @import("../runtime/realm.zig").resetAsyncDone();
         const arena = self.eval_arena.allocator();
         const transformed_source = try rewriteTemplateLiterals(arena, source);
 
@@ -219,8 +220,10 @@ pub const IsolateImpl = struct {
     /// (§11.2.2); the import/export → CommonJS desugar already happened in the
     /// parser. The run is tracked on a `ModuleRecord` in `self.module_registry`
     /// keyed by `module_id`, transitioning its status across the evaluation.
+
     pub fn evalModule(self: *IsolateImpl, source: []const u8, module_id: []const u8) !EvalOutcome {
         promise_mod.clearMicrotasks();
+        @import("../runtime/realm.zig").resetAsyncDone();
         const arena = self.eval_arena.allocator();
         const transformed_source = try rewriteTemplateLiterals(arena, source);
 
@@ -246,7 +249,9 @@ pub const IsolateImpl = struct {
         rec.body = stmts;
 
         const ast_mod = @import("../parser/ast.zig");
-        const prog = ast_mod.Program{ .body = stmts, .is_strict = true, .is_module = true };
+        // M16 TLA: a module with top-level await compiles its top-level body as
+        // async so `await` truly suspends (runMainBc drives it as a coroutine).
+        const prog = ast_mod.Program{ .body = stmts, .is_strict = true, .is_module = true, .has_tla = p.saw_top_level_await };
         const main_func = compiler_mod.compileModule(arena, &prog, module_id) catch |e| {
             rec.status = .errored;
             return switch (e) {
@@ -303,6 +308,12 @@ pub const IsolateImpl = struct {
         // M16 Phase 3: dynamic import() native + the import.meta object binding.
         try realm.global_env.define("__import__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImport));
         try realm.global_env.define("__import_meta__", try @import("../runtime/realm.zig").makeImportMeta(arena, ""));
+        // M16 TLA: async-dependency evaluation barrier used by async-module factories.
+        try realm.global_env.define("__awaitDeps__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAwaitDeps));
+        // M16 TLA: `[module, async]` completion signals wired to the harness $DONE.
+        try realm.global_env.define("__jszAsyncDone__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncDone));
+        try realm.global_env.define("__jszAsyncFail__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncFail));
+        try realm.global_env.define("__jszModuleReject__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeModuleReject));
 
         try realm.registerRoots();
         self.realm = realm;
@@ -329,7 +340,13 @@ pub const IsolateImpl = struct {
         // Register roots AFTER bc_vm/realm are in final stack location.
         try bc_vm.registerHeapCallback(&self.heap);
         defer bc_vm.unregisterHeapCallback(&self.heap);
-        const outcome = try bc_vm.run(main_func, @ptrCast(realm.global_env));
+        // M16 TLA: a module top-level compiled as async (top-level await) is
+        // driven as a coroutine so its awaits truly suspend and interleave with
+        // the microtask queue, rather than synchronously draining at each await.
+        const outcome = if (main_func.is_async)
+            try bc_vm.runMainAsync(main_func, @ptrCast(realm.global_env))
+        else
+            try bc_vm.run(main_func, @ptrCast(realm.global_env));
         self.last_frame_high_water = bc_vm.frame_high_water;
         // Phase 9: capture JIT profile snapshot.
         if (self.jit_mode != .off) {
@@ -351,7 +368,20 @@ pub const IsolateImpl = struct {
         } else {
             self.last_ic_profile = .{};
         }
-        promise_mod.runMicrotasks(arena);
+        // M16 TLA: drain microtasks with the VM context active so ordinary
+        // promise reactions (`.then` callbacks, e.g. `.then($DONE)`) can re-enter
+        // JS — the top-level run already deactivated the context on return.
+        bc_vm.drainMicrotasks();
+        const realm_mod = @import("../runtime/realm.zig");
+        // M16 TLA: surface the entry module's async evaluation rejection (spec
+        // Evaluate() promise rejection), then a failure signalled by $DONE from a
+        // microtask. Only when the synchronous run itself completed `.ok`.
+        if (outcome == .ok and realm_mod.module_eval_error.bits != 0) {
+            return EvalOutcome{ .exception = realm_mod.errorValueMessage(arena, realm_mod.module_eval_error) };
+        }
+        if (outcome == .ok and realm_mod.async_done_error.bits != 0) {
+            return EvalOutcome{ .exception = realm_mod.errorValueMessage(arena, realm_mod.async_done_error) };
+        }
         return switch (outcome) {
             .ok => |v| EvalOutcome{ .ok = v },
             .exception => |msg| EvalOutcome{ .exception = msg },

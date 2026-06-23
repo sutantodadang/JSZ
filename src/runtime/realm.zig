@@ -202,6 +202,7 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
         return val_mod.makeUndefined(arena);
     }
     const name = args[0].toPtr().string;
+    if (std.posix.getenv("JSZ_DBG") != null) std.debug.print("REQUIRE {s}\n", .{name});
     const env = active_global_env orelse return val_mod.makeUndefined(arena);
     if (std.mem.eql(u8, name, "module")) {
         return env.lookup("module") catch return val_mod.makeUndefined(arena);
@@ -243,12 +244,21 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
             }
             try syncRequireCache(env, lookup_name, module_val);
             const require_fn = env.lookup("require") catch try val_mod.makeUndefined(arena);
-            _ = function_proto_mod.invokeCallback(
+            const factory_ret = function_proto_mod.invokeCallback(
                 arena,
                 exports_val,
                 entry,
                 &[_]Value{ require_fn, module_val, exports_val },
             ) catch return val_mod.makeUndefined(arena);
+            // M16 TLA: an async-module factory returns its evaluation-completion
+            // Promise (resolves when the module body, including top-level await,
+            // finishes). Stash it so importers/`__awaitDeps__`/dynamic `import()`
+            // can wait for the module to fully evaluate.
+            if (factory_ret.bits != 0 and factory_ret.unbox() == .object and
+                factory_ret.toPtr().object.internal_kind == .promise)
+            {
+                try module_obj.set("__evalPromise__", factory_ret);
+            }
             const final_exports = module_obj.get("exports") orelse exports_val;
             try module_obj.set("loaded", try val_mod.makeBool(arena, true));
             return final_exports;
@@ -452,6 +462,58 @@ pub fn nativeInitExports(arena: std.mem.Allocator, _: Value, args: []const Value
     return val_mod.makeUndefined(arena);
 }
 
+/// Context block for a deferred dynamic import: carries the module specifier
+/// and the pending result promise that the microtask will resolve/reject.
+const DeferredImportCtx = struct {
+    name: []const u8, // resolved module id (canonical specifier)
+    result: Value, // pending promise to settle once evaluated
+};
+
+/// Microtask body for a deferred dynamic `import()`. Runs after the current
+/// synchronous evaluation chain (static-import DFS) completes, so the module's
+/// factory will have already been invoked through the static-import hoist by
+/// the time this fires. Settles `result` with the module namespace (or rejects
+/// if require throws).
+fn deferredImportResolve(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const ctx: *DeferredImportCtx = @ptrCast(@alignCast(slot));
+    if (std.posix.getenv("JSZ_DBG") != null) std.debug.print("deferredImportResolve name={s} result_bits={x}\n", .{ ctx.name, ctx.result.bits });
+    const name_val = val_mod.makeString(arena, ctx.name) catch return val_mod.makeUndefined(arena);
+    const exports_val = nativeRequire(arena, Value{}, &[_]Value{name_val}) catch |err| {
+        if (err == error.JsException) {
+            const reason = pending_exception;
+            pending_exception = Value{};
+            promise_mod.settleResult(arena, ctx.result, reason, false);
+            return val_mod.makeUndefined(arena);
+        }
+        return err;
+    };
+    const ns = nativeMakeNamespace(arena, Value{}, &[_]Value{exports_val}) catch exports_val;
+    // Handle async modules: chain onto their eval promise so this import only
+    // fulfills once the module's top-level-await body finishes.
+    if (lookupEvalPromise(arena, ctx.name)) |eval_promise| {
+        const ns_box = arena.create(Value) catch {
+            promise_mod.settleResult(arena, ctx.result, ns, true);
+            return val_mod.makeUndefined(arena);
+        };
+        ns_box.* = ns;
+        const returner = val_mod.makeNativeFunctionData(arena, importNsReturner, ns_box) catch {
+            promise_mod.settleResult(arena, ctx.result, ns, true);
+            return val_mod.makeUndefined(arena);
+        };
+        // .then(returner) on the eval promise produces a chained promise whose
+        // value is the namespace; adopt it as the resolution of our result.
+        const chained = promise_mod.nativePromiseThen(arena, eval_promise, &[_]Value{ returner, Value{} }) catch {
+            promise_mod.settleResult(arena, ctx.result, ns, true);
+            return val_mod.makeUndefined(arena);
+        };
+        promise_mod.settleResult(arena, ctx.result, chained, true); // thenable adoption
+        return val_mod.makeUndefined(arena);
+    }
+    promise_mod.settleResult(arena, ctx.result, ns, true);
+    return val_mod.makeUndefined(arena);
+}
+
 /// M16 Phase 3: dynamic `import(specifier)`. Desugared by the parser to a call
 /// `__import__(specifier)`. Resolves and loads the module through the same
 /// `__modules__` registry + `require()` resolver used by static imports, wraps
@@ -460,7 +522,67 @@ pub fn nativeInitExports(arena: std.mem.Allocator, _: Value, args: []const Value
 /// rejected with whatever the resolve/evaluation threw. The specifier argument
 /// is already evaluated by the VM before this native runs, so an abrupt
 /// specifier expression propagates synchronously (never as a rejection).
+///
+/// DFS-ordering guarantee: when the target module is a not-yet-evaluated
+/// factory (it will be invoked by the static-import hoist of the calling
+/// module's entry), evaluation is deferred to a microtask. This ensures that
+/// the static DFS chain (A's body → entry's B require) runs before the dynamic
+/// import's side-effects, matching the spec's InnerModuleEvaluation order.
 pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (std.posix.getenv("JSZ_DBG") != null and args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) std.debug.print("IMPORT {s}\n", .{args[0].toPtr().string});
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
+        return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{
+            try val_mod.makeString(arena, "TypeError: import() requires a string specifier"),
+        });
+    }
+    const raw_name = args[0].toPtr().string;
+    // Resolve the specifier to the canonical id used in __modules__.
+    const env = active_global_env orelse {
+        // No environment — fall through to synchronous load.
+        return nativeImportSync(arena, args);
+    };
+    const registry = env.lookup("__modules__") catch {
+        return nativeImportSync(arena, args);
+    };
+    if (registry.bits == 0 or registry.unbox() != .object) return nativeImportSync(arena, args);
+    const modules_obj = registry.toPtr().object;
+    const resolved = resolveModuleName(arena, env, raw_name) catch raw_name;
+    const lookup_name = if (modules_obj.get(resolved) != null) resolved else raw_name;
+    // Check the current state of the module in the registry.
+    if (modules_obj.get(lookup_name)) |entry| {
+        if (entry.bits != 0 and entry.unbox() == .object) {
+            const mod_obj = entry.toPtr().object;
+            if (mod_obj.get("exports") != null) {
+                // Already evaluated (module object cached) — resolve immediately.
+                return nativeImportSync(arena, args);
+            }
+        }
+        if (isCallableValue(entry)) {
+            // Factory not yet invoked: defer evaluation to a microtask so the
+            // calling module's static-import DFS runs first (spec §16.2.1.5.1
+            // step 11.c.iv — pending-dependency ordering).
+            const result_p = try promise_mod.newPendingPromise(arena);
+            if (std.posix.getenv("JSZ_DBG") != null) std.debug.print("nativeImport deferred name={s} result_bits={x}\n", .{ lookup_name, result_p.bits });
+            const ctx = try arena.create(DeferredImportCtx);
+            ctx.* = .{ .name = lookup_name, .result = result_p };
+            const resolve_fn = try val_mod.makeNativeFunctionData(arena, deferredImportResolve, ctx);
+            // Enqueue via Promise.resolve(undefined).then(resolve_fn) so
+            // resolve_fn fires as the next microtask after the sync chain.
+            const trigger = try promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{
+                try val_mod.makeUndefined(arena),
+            });
+            _ = try promise_mod.nativePromiseThen(arena, trigger, &[_]Value{ resolve_fn, Value{} });
+            return result_p;
+        }
+    }
+    // Module not in registry (bare specifier, external, etc.) — synchronous load.
+    return nativeImportSync(arena, args);
+}
+
+/// Synchronous path for `nativeImport`: evaluate the module immediately and
+/// return a (possibly deferred) promise for its namespace. Used when the module
+/// is already evaluated (cached) or when the deferred path is unavailable.
+fn nativeImportSync(arena: std.mem.Allocator, args: []const Value) anyerror!Value {
     // Load the module like `require()`. A resolution/evaluation throw is captured
     // and turned into a rejected promise rather than propagated synchronously.
     const exports_val = nativeRequire(arena, Value{}, args) catch |err| {
@@ -472,10 +594,145 @@ pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) any
         return err;
     };
     const ns = try nativeMakeNamespace(arena, Value{}, &[_]Value{exports_val});
+    // M16 TLA: if the imported module is async (its factory returned an
+    // evaluation-completion promise), the dynamic import must fulfil only once
+    // the module has finished evaluating (including top-level await), and reject
+    // if its evaluation rejects. Chain the namespace onto the eval promise.
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) {
+        if (lookupEvalPromise(arena, args[0].toPtr().string)) |eval_promise| {
+            const ns_box = try arena.create(Value);
+            ns_box.* = ns;
+            const returner = try val_mod.makeNativeFunctionData(arena, importNsReturner, ns_box);
+            return promise_mod.nativePromiseThen(arena, eval_promise, &[_]Value{returner});
+        }
+    }
     // A fresh promise per call (ImportCall NewPromiseCapability) fulfilled with
     // the namespace. `nativePromiseResolve` only short-circuits for a promise
     // argument; a namespace is an ordinary object, so a new promise is created.
     return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{ns});
+}
+
+/// Promise `then` reaction (dynamic import): ignore the eval result, return the
+/// bound module namespace value (carried as native data).
+fn importNsReturner(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const ns_box: *Value = @ptrCast(@alignCast(slot));
+    return ns_box.*;
+}
+
+/// Look up a (resolved) module's evaluation-completion promise, if it is an
+/// async module that stashed one during `require()`. `name` is the raw specifier.
+fn lookupEvalPromise(arena: std.mem.Allocator, name: []const u8) ?Value {
+    const env = active_global_env orelse return null;
+    const registry = env.lookup("__modules__") catch return null;
+    if (registry.bits == 0 or registry.unbox() != .object) return null;
+    const modules_obj = registry.toPtr().object;
+    const resolved = resolveModuleName(arena, env, name) catch name;
+    const lookup_name = if (modules_obj.get(resolved) != null) resolved else name;
+    const mod_val = modules_obj.get(lookup_name) orelse return null;
+    if (mod_val.bits == 0 or mod_val.unbox() != .object) return null;
+    const ep = mod_val.toPtr().object.get("__evalPromise__") orelse return null;
+    if (ep.bits == 0 or ep.unbox() != .object) return null;
+    if (ep.toPtr().object.internal_kind != .promise) return null;
+    return ep;
+}
+
+/// M16 TLA: `__awaitDeps__([id, ...])` — the async-dependency barrier. Returns a
+/// Promise that settles when every listed module's evaluation-completion promise
+/// settles (Promise.all), so an async-module body resumes only after all of its
+/// async dependencies have finished evaluating. Ids whose module has no eval
+/// promise (already evaluated / synchronous) are treated as resolved.
+pub fn nativeAwaitDeps(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const undef = try val_mod.makeUndefined(arena);
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object)
+        return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    const env = active_global_env orelse return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    const registry = env.lookup("__modules__") catch return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    if (registry.bits == 0 or registry.unbox() != .object)
+        return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    const modules_obj = registry.toPtr().object;
+    const ids_arr = args[0].toPtr().object;
+    const promises = try JsObject.createArray(arena, active_array_proto);
+    var n: u32 = 0;
+    const len = ids_arr.getArrayLength();
+    var i: u32 = 0;
+    var buf: [32]u8 = undefined;
+    while (i < len) : (i += 1) {
+        const key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
+        const id_val = ids_arr.get(key) orelse continue;
+        if (id_val.bits == 0 or id_val.unbox() != .string) continue;
+        const mod_val = modules_obj.get(id_val.toPtr().string) orelse continue;
+        if (mod_val.bits == 0 or mod_val.unbox() != .object) continue;
+        const ep = mod_val.toPtr().object.get("__evalPromise__") orelse continue;
+        const idx_key = try std.fmt.allocPrint(arena, "{d}", .{n});
+        try promises.set(idx_key, ep);
+        n += 1;
+    }
+    promises.array_length = n;
+    if (n == 0) return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    return promise_mod.nativePromiseAll(arena, Value{}, &[_]Value{try val_mod.makeObject(arena, promises)});
+}
+
+// M16 TLA: completion tracking for `[module, async]` tests. With true async
+// module evaluation, `$DONE` may be invoked from a microtask after the
+// synchronous run returns, and an assertion that throws inside a promise
+// reaction is otherwise swallowed. The harness `$DONE` is wired to these
+// natives so the host can detect success (signaled, no error) vs. failure (an
+// error value) vs. never-completed (not signaled) after draining microtasks.
+pub var async_done_signaled: bool = false;
+pub var async_done_error: Value = .{};
+/// Set when the entry module's async evaluation (the async IIFE / top-level
+/// async body) rejects — the spec's `Evaluate()` promise rejection. Surfaced as
+/// the eval outcome's exception so negative module tests and uncaught async
+/// module errors are observable even though the synchronous run returned `.ok`.
+pub var module_eval_error: Value = .{};
+
+/// Reset async-test completion state at the start of an evaluation.
+pub fn resetAsyncDone() void {
+    async_done_signaled = false;
+    async_done_error = Value{};
+    module_eval_error = Value{};
+}
+
+/// `__jszModuleReject__(err)` — records the entry module's evaluation rejection.
+pub fn nativeModuleReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (module_eval_error.bits == 0)
+        module_eval_error = if (args.len > 0 and args[0].bits != 0) args[0] else try val_mod.makeString(arena, "module evaluation failed");
+    return val_mod.makeUndefined(arena);
+}
+
+/// Best-effort message string for a thrown/rejected value (Error object's
+/// name+message, a raw string, else a generic). Used to report async failures.
+pub fn errorValueMessage(arena: std.mem.Allocator, v: Value) []const u8 {
+    if (v.bits == 0) return "async test failed";
+    switch (v.unbox()) {
+        .string => |s| return s,
+        .object => |obj| {
+            const name = if (obj.get("name")) |nv|
+                (if (nv.bits != 0 and nv.unbox() == .string) nv.toPtr().string else "Error")
+            else
+                "Error";
+            const msg = if (obj.get("message")) |mv|
+                (if (mv.bits != 0 and mv.unbox() == .string) mv.toPtr().string else "")
+            else
+                "";
+            return std.fmt.allocPrint(arena, "{s}: {s}", .{ name, msg }) catch "async test failed";
+        },
+        else => return "async test failed",
+    }
+}
+
+/// `__jszAsyncDone__()` — the test signalled successful async completion.
+pub fn nativeAsyncDone(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    async_done_signaled = true;
+    return val_mod.makeUndefined(arena);
+}
+
+/// `__jszAsyncFail__(err)` — the test signalled async failure with `err`.
+pub fn nativeAsyncFail(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    async_done_signaled = true;
+    async_done_error = if (args.len > 0 and args[0].bits != 0) args[0] else try val_mod.makeString(arena, "async test failed");
+    return val_mod.makeUndefined(arena);
 }
 
 /// M16 Phase 3: the `import.meta` object (ES §16.2.1.10). Created once per realm

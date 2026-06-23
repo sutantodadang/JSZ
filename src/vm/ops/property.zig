@@ -463,10 +463,17 @@ pub inline fn opGetKeys(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 const names = try namespace_mod.sortedNames(self.arena, iv.object);
                 for (names) |k| {
                     if (namespace_mod.isTDZ(iv.object, k)) {
+                        // Per [[GetOwnProperty]] step 4, enumerating a namespace
+                        // calls [[Get]] for each export; an uninitialized (TDZ)
+                        // binding throws ReferenceError. Route through
+                        // `throwException` (frame unwinding) so a JS try/catch
+                        // around the for-in actually catches it — returning
+                        // `error.JsException` raw bypasses the handler and the
+                        // caller spins re-raising it (observed as OOM).
                         const realm_m = @import("../../runtime/realm.zig");
                         const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{k});
                         realm_m.pending_exception = try self.makeErrorObjectBc("ReferenceError", msg);
-                        return error.JsException;
+                        return try self.raisePendingException(msg);
                     }
                     const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
                     const key_val2 = try val_mod.makeString(self.arena, k);

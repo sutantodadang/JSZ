@@ -26,6 +26,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !*JsObject {
     try promise_ctor_obj.set("all", try val_mod.makeNativeFunction(arena, nativePromiseAll));
     try promise_ctor_obj.set("race", try val_mod.makeNativeFunction(arena, nativePromiseRace));
     try promise_ctor_obj.set("any", try val_mod.makeNativeFunction(arena, nativePromiseAny));
+    try promise_ctor_obj.set("withResolvers", try val_mod.makeNativeFunction(arena, nativePromiseWithResolvers));
     try promise_proto.set("finally", try val_mod.makeNativeFunction(arena, nativePromiseFinally));
     try ctx.env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
     return promise_proto;
@@ -252,6 +253,51 @@ pub fn nativePromiseCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
         return this_val;
     }
     return makePromise(arena, .pending, try val_mod.makeUndefined(arena));
+}
+
+/// True when `v` is a constructor (mirrors Reflect's IsConstructor check): the
+/// native-built Promise constructor is an ordinary object carrying `__call__`.
+fn isConstructorVal(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .bc_function => true,
+        .object => |o| o.get("__call__") != null or
+            o.internal_kind == .bound_function or
+            o.internal_kind == .proxy,
+        else => false,
+    };
+}
+
+/// Promise.withResolvers() (ES2024): returns `{ promise, resolve, reject }`
+/// where `resolve`/`reject` settle the new pending `promise`. The receiver `C`
+/// must be a constructor — `NewPromiseCapability(C)` throws a TypeError otherwise.
+pub fn nativePromiseWithResolvers(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (!isConstructorVal(this_val)) {
+        const err = if (realm_mod.active_heap) |h|
+            try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)
+        else
+            try JsObject.create(arena, realm_mod.error_proto_TypeError);
+        try err.set("name", try val_mod.makeString(arena, "TypeError"));
+        try err.set("message", try val_mod.makeString(arena, "Promise.withResolvers called on a non-constructor"));
+        realm_mod.pending_exception = try val_mod.makeObject(arena, err);
+        return error.JsException;
+    }
+    const p = try makePendingPromise(arena);
+    const data = getData(p) orelse return p;
+    const resolve_data = try arena.create(ResolverData);
+    const reject_data = try arena.create(ResolverData);
+    resolve_data.* = .{ .promise = data, .resolve_mode = true };
+    reject_data.* = .{ .promise = data, .resolve_mode = false };
+    const resolve_val = try makeResolverObject(arena, resolve_data);
+    const reject_val = try makeResolverObject(arena, reject_data);
+    const obj = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+    try obj.set("promise", p);
+    try obj.set("resolve", resolve_val);
+    try obj.set("reject", reject_val);
+    return val_mod.makeObject(arena, obj);
 }
 
 pub fn nativePromiseResolve(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {

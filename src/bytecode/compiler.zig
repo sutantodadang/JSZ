@@ -1727,7 +1727,9 @@ pub fn compileModule(
         null,
         true, // module code is always strict
         false,
-        false,
+        program.has_tla, // M16 TLA: a module with top-level await compiles its
+        // body as async so `await` truly suspends (driven as a coroutine by
+        // runMainAsync); modules without TLA stay synchronous.
         true, // top-level program: yield last expression-statement value
         false, // program is not an arrow
         null, // program has no rest parameter
