@@ -25,6 +25,7 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
     // EnumerableOwnProperties step 4.a.i), which throws ReferenceError for
     // uninitialized (TDZ) bindings.
     if (obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerAll(arena, obj); // import-defer: [[OwnPropertyKeys]]
         var pi: u32 = 0;
         for (try namespace_mod.sortedNames(arena, obj)) |k| {
             if (namespace_mod.isTDZ(obj, k)) {
@@ -248,6 +249,7 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
     // [[GetOwnProperty]] calls [[Get]] for the value, which throws ReferenceError
     // for uninitialized (TDZ) bindings (ES §10.4.6.4 step 4).
     if (obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerForStringKey(arena, obj, key); // import-defer: [[GetOwnProperty]]
         if (!namespace_mod.hasExport(obj, key)) return val_mod.makeBool(arena, false);
         if (namespace_mod.isTDZ(obj, key)) {
             return throwReferenceErrorObj(arena, key);
@@ -284,6 +286,7 @@ pub fn nativePropertyIsEnumerable(arena: std.mem.Allocator, this_val: Value, arg
     // [[GetOwnProperty]] calls [[Get]] for the value, which throws ReferenceError
     // for uninitialized (TDZ) bindings (ES §10.4.6.4 step 4).
     if (obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerForStringKey(arena, obj, key); // import-defer: [[GetOwnProperty]]
         if (!namespace_mod.hasExport(obj, key)) return val_mod.makeBool(arena, false);
         if (namespace_mod.isTDZ(obj, key)) {
             return throwReferenceErrorObj(arena, key);
@@ -431,6 +434,16 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
 }
 
 /// Object.getOwnPropertyNames(o): all own keys including non-enumerable.
+/// True if `key` is a canonical array-index string (a base-10 integer in
+/// [0, 2^32-2], no leading zeros). Used to place the synthetic "length" key
+/// after an array's integer-index keys in [[OwnPropertyKeys]] order.
+fn isArrayIndexKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    if (key.len > 1 and key[0] == '0') return false;
+    const idx = std.fmt.parseUnsigned(u32, key, 10) catch return false;
+    return idx != std.math.maxInt(u32);
+}
+
 pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
@@ -460,6 +473,7 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
     // M16: Module Namespace [[OwnPropertyKeys]] — exported names sorted by code
     // unit (symbol keys are excluded from getOwnPropertyNames).
     if (obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerAll(arena, obj); // import-defer: [[OwnPropertyKeys]]
         var pi: u32 = 0;
         for (try namespace_mod.sortedNames(arena, obj)) |k| {
             const idx_key = try std.fmt.allocPrint(arena, "{d}", .{pi});
@@ -483,6 +497,33 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
             }
             arr.array_length = pi;
         }
+        return val_mod.makeObject(arena, arr);
+    }
+
+    // Array [[OwnPropertyKeys]]: integer-index keys (ascending, as stored),
+    // then "length" (a synthetic own data property not held in `ownKeys()`),
+    // then any remaining non-index string keys in insertion order. Without this,
+    // `Object.getOwnPropertyNames(arr)` would omit "length".
+    if (obj.is_array) {
+        var ai: u32 = 0;
+        var length_emitted = false;
+        for (obj.ownKeys()) |k| {
+            if (!length_emitted and !isArrayIndexKey(k)) {
+                const len_key = try std.fmt.allocPrint(arena, "{d}", .{ai});
+                try arr.set(len_key, try val_mod.makeString(arena, "length"));
+                ai += 1;
+                length_emitted = true;
+            }
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{ai});
+            try arr.set(idx_key, try val_mod.makeString(arena, k));
+            ai += 1;
+        }
+        if (!length_emitted) {
+            const len_key = try std.fmt.allocPrint(arena, "{d}", .{ai});
+            try arr.set(len_key, try val_mod.makeString(arena, "length"));
+            ai += 1;
+        }
+        arr.array_length = ai;
         return val_mod.makeObject(arena, arr);
     }
 
@@ -592,6 +633,7 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     // ReferenceError for uninitialized (TDZ) bindings.
     if (obj.internal_kind == .module_namespace and !(args[1].bits != 0 and args[1].unbox() == .symbol)) {
         const nkey = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
+        try namespace_mod.triggerForStringKey(arena, obj, nkey); // import-defer: [[GetOwnProperty]]
         if (!namespace_mod.hasExport(obj, nkey)) return val_mod.makeUndefined(arena);
         if (namespace_mod.isTDZ(obj, nkey)) {
             return throwReferenceErrorObj(arena, nkey);
@@ -721,6 +763,7 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     // M16: Module Namespace exotic [[DefineOwnProperty]] for string keys (§10.4.6.7).
     // Symbol keys already went through OrdinaryDefineOwnProperty above.
     if (obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerForStringKey(arena, obj, key); // import-defer: [[DefineOwnProperty]]
         // Step 3: key must be an export.
         if (!namespace_mod.hasExport(obj, key))
             return throwTypeError(arena, "Cannot define property on module namespace object");
@@ -965,6 +1008,9 @@ pub fn nativeObjectGetOwnPropertySymbols(arena: std.mem.Allocator, _: Value, arg
         return throwTypeError(arena, "Cannot convert undefined or null to object");
     if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
     const obj = args[0].toPtr().object;
+    // import-defer: [[OwnPropertyKeys]] triggers evaluation; it also clears the
+    // internal deferred-id symbol so it does not leak as an own symbol key.
+    if (obj.internal_kind == .module_namespace) try namespace_mod.triggerAll(arena, obj);
     var i: u32 = 0;
     for (obj.symKeys()) |sp| {
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});

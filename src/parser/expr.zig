@@ -845,9 +845,17 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
             _ = p.advance();
             if (p.match(.dot)) {
                 const meta = p.expectIdentifierName() orelse return null;
-                if (!std.mem.eql(u8, meta.value_str, "meta")) return p.fail("expected 'meta' after 'import.'");
-                // `import.meta` → the hidden, module-scoped meta object binding.
-                return p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__import_meta__" });
+                if (std.mem.eql(u8, meta.value_str, "meta")) {
+                    // `import.meta` → the hidden, module-scoped meta object binding.
+                    return p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__import_meta__" });
+                }
+                // `import.defer(spec)` → `__importDeferDyn__(spec)`: dynamic deferred
+                // import (ES import-defer proposal). parseCallMemberExpr consumes the
+                // argument list; the native returns a promise of the deferred namespace.
+                if (std.mem.eql(u8, meta.value_str, "defer")) {
+                    return p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__importDeferDyn__" });
+                }
+                return p.fail("expected 'meta' or 'defer' after 'import.'");
             }
             if (p.check(.left_paren)) {
                 // `import(spec)` → `__import__(spec)`: return the native callee and

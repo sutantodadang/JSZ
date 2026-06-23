@@ -25,6 +25,22 @@ const JsObject = object.JsObject;
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 
+/// import-defer: if `o` is a not-yet-evaluated deferred namespace and `key` is a
+/// triggering string key (any string except "then"), evaluate the underlying
+/// module now and wire its live exports. No-op for ordinary/already-evaluated
+/// namespaces. Propagates a module-evaluation throw. Call this at the start of
+/// every string-keyed namespace operation that consults the exports.
+pub fn triggerForStringKey(arena: std.mem.Allocator, o: *JsObject, key: []const u8) !void {
+    return @import("../realm.zig").maybeTriggerDeferredStr(arena, o, key);
+}
+
+/// import-defer: unconditionally evaluate `o`'s deferred module (if deferred).
+/// Used by enumerating operations ([[OwnPropertyKeys]]: Object.keys / values /
+/// entries / getOwnPropertyNames / getOwnPropertySymbols / Reflect.ownKeys).
+pub fn triggerAll(arena: std.mem.Allocator, o: *JsObject) !void {
+    return @import("../realm.zig").triggerDeferredNamespace(arena, o);
+}
+
 /// True if `v` is a Module Namespace exotic object.
 pub fn isNamespace(v: Value) bool {
     return v.bits != 0 and v.unbox() == .object and v.toPtr().object.internal_kind == .module_namespace;

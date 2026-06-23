@@ -187,8 +187,16 @@ pub fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayL
                 const end = @min(j, src.len);
                 const lit = src[start..end];
                 if (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../")) {
-                    const id = resolveSpec(allocator, importer_id, lit) catch "";
-                    if (id.len > 0) out.append(allocator, id) catch {};
+                    var id = resolveSpec(allocator, importer_id, lit) catch "";
+                    // A `with { type: '...' }` attribute right after the specifier
+                    // makes this a typed (JSON/text) module: encode the type into
+                    // the id so it keys distinctly and gets a synthetic factory.
+                    if (id.len > 0) {
+                        if (attrTypeAfter(src, j + 1)) |ty| {
+                            id = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ id, ty }) catch id;
+                        }
+                        out.append(allocator, id) catch {};
+                    }
                 }
             }
             i = j + 1;
@@ -198,8 +206,111 @@ pub fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayL
     }
 }
 
+/// Strip the `\x00<type>` attribute suffix from a canonical id, leaving the
+/// bare on-disk path (typed modules — JSON/text — encode their type into the id
+/// so they key distinctly from a plain JS import of the same path).
+pub fn bareId(id: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, id, 0)) |n| return id[0..n];
+    return id;
+}
+
+/// The module-type attribute encoded in a typed id (`\x00json` / `\x00text`),
+/// or null for an ordinary JS module.
+pub fn idType(id: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, id, 0)) |n| return id[n + 1 ..];
+    return null;
+}
+
+/// Append `s` to `sb` as a double-quoted JS string literal, escaping characters
+/// that cannot appear literally inside one (quotes, backslash, control chars,
+/// line separators). UTF-8 bytes pass through unchanged. Used to embed arbitrary
+/// file content (JSON / text module bodies, typed-module keys) into the bundle.
+fn appendJsString(gpa: std.mem.Allocator, sb: *std.ArrayList(u8), s: []const u8) !void {
+    try sb.append(gpa, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try sb.appendSlice(gpa, "\\\""),
+            '\\' => try sb.appendSlice(gpa, "\\\\"),
+            '\n' => try sb.appendSlice(gpa, "\\n"),
+            '\r' => try sb.appendSlice(gpa, "\\r"),
+            '\t' => try sb.appendSlice(gpa, "\\t"),
+            0x08 => try sb.appendSlice(gpa, "\\b"),
+            0x0c => try sb.appendSlice(gpa, "\\f"),
+            0...7, 0x0b, 0x0e...0x1f => {
+                var buf: [6]u8 = undefined;
+                const hex = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{ch}) catch unreachable;
+                try sb.appendSlice(gpa, hex);
+            },
+            else => try sb.append(gpa, ch),
+        }
+    }
+    try sb.append(gpa, '"');
+}
+
+/// If a `with { type: '...' }` / `assert { ... }` import-attribute clause begins
+/// at `pos` (after optional whitespace/comments), return the `type` attribute's
+/// string value (e.g. "json", "text"); otherwise null. Used by `scanSpecifiers`
+/// to classify a discovered specifier as a typed (synthetic) module.
+fn attrTypeAfter(src: []const u8, pos: usize) ?[]const u8 {
+    var i = skipWsComments(src, pos);
+    // Match the `with` / `assert` keyword as a standalone word.
+    const kw_with = i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "with") and
+        (i + 4 == src.len or !isIdentChar(src[i + 4]));
+    const kw_assert = i + 6 <= src.len and std.mem.eql(u8, src[i .. i + 6], "assert") and
+        (i + 6 == src.len or !isIdentChar(src[i + 6]));
+    if (kw_with) {
+        i += 4;
+    } else if (kw_assert) {
+        i += 6;
+    } else return null;
+    i = skipWsComments(src, i);
+    if (i >= src.len or src[i] != '{') return null;
+    i += 1;
+    // Scan the brace body for a `type` key followed by a string value.
+    var saw_type_key = false;
+    var saw_colon = false;
+    while (i < src.len and src[i] != '}') {
+        const c = src[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n' or c == ',') {
+            if (c == ',') {
+                saw_type_key = false;
+                saw_colon = false;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == ':') {
+            saw_colon = true;
+            i += 1;
+            continue;
+        }
+        if (c == '"' or c == '\'') {
+            const s = i + 1;
+            var k = s;
+            while (k < src.len and src[k] != c) : (k += 1) {
+                if (src[k] == '\\') k += 1;
+            }
+            const val = src[s..@min(k, src.len)];
+            if (saw_type_key and saw_colon) return val;
+            // A bare string token at key position: is it the `type` key?
+            if (!saw_colon and std.mem.eql(u8, val, "type")) saw_type_key = true;
+            i = k + 1;
+            continue;
+        }
+        if (isIdentChar(c)) {
+            const s = i;
+            while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
+            if (!saw_colon and std.mem.eql(u8, src[s..i], "type")) saw_type_key = true;
+            continue;
+        }
+        i += 1;
+    }
+    return null;
+}
+
 /// Read a module file under `base_dir` by canonical id, trying `id` then `id.js`.
-fn readModuleFile(allocator: std.mem.Allocator, base_dir: []const u8, id: []const u8) ?[]const u8 {
+fn readModuleFile(allocator: std.mem.Allocator, base_dir: []const u8, id_in: []const u8) ?[]const u8 {
+    const id = bareId(id_in);
     const max = 10 * 1024 * 1024;
     const p1 = std.fs.path.join(allocator, &.{ base_dir, id }) catch return null;
     if (std.fs.cwd().readFileAlloc(allocator, p1, max)) |s| return s else |_| {}
@@ -430,6 +541,14 @@ fn computeAsyncSet(
         var it = sources.iterator();
         while (it.next()) |e| {
             const id = e.key_ptr.*;
+            // Typed (JSON/text/bytes) modules are opaque data, not JS: never async
+            // and have no dependencies. Skip scanning their (possibly binary)
+            // content for `await`/specifiers, which could otherwise misfire.
+            if (idType(id) != null) {
+                try direct.put(id, false);
+                try dep_of.put(id, &[_][]const u8{});
+                continue;
+            }
             const src = e.value_ptr.*;
             try direct.put(id, hasTopLevelAwait(src));
             var deps = std.ArrayList([]const u8){};
@@ -1095,7 +1214,10 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         if (registry.contains(id)) continue;
         const src = readModuleFile(arena, base_dir, id) orelse continue;
         try registry.put(id, src);
-        scanSpecifiers(src, id, &queue, arena);
+        // Typed (JSON/text) modules are opaque data, not JS — don't scan their
+        // contents for nested specifiers (a JSON string value could look like a
+        // relative path).
+        if (idType(id) == null) scanSpecifiers(src, id, &queue, arena);
     }
 
     // M16 TLA: classify which modules (and the entry) must evaluate as async
@@ -1129,6 +1251,37 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     var it = registry.iterator();
     while (it.next()) |e| {
         const mod_id = e.key_ptr.*;
+        // Typed (JSON/text) module: emit a synthetic factory whose only export is
+        // `default` (the parsed JSON value or the raw text), per the JSON-modules
+        // and import-text specs. No import/export desugaring applies to the data.
+        if (idType(mod_id)) |ty| {
+            try sb.appendSlice(gpa, "__modules__[");
+            try appendJsString(gpa, &sb, mod_id);
+            try sb.appendSlice(gpa, "] = function(require, module, exports){\nmodule.exports = { default: ");
+            if (std.mem.eql(u8, ty, "json")) {
+                try sb.appendSlice(gpa, "JSON.parse(");
+                try appendJsString(gpa, &sb, e.value_ptr.*);
+                try sb.appendSlice(gpa, ")");
+            } else if (std.mem.eql(u8, ty, "bytes")) {
+                // import-bytes: the default export is an immutable-ArrayBuffer-
+                // backed Uint8Array of the file's raw bytes (sec-create-bytes-
+                // module). Built in an IIFE so transferToImmutable — which detaches
+                // the mutable source buffer — yields a single default-export
+                // expression with the bytes frozen and the buffer non-resizable.
+                try sb.appendSlice(gpa, "(function(){var __b=[");
+                var nbuf: [4]u8 = undefined;
+                for (e.value_ptr.*, 0..) |byte, bi| {
+                    if (bi > 0) try sb.appendSlice(gpa, ",");
+                    try sb.appendSlice(gpa, std.fmt.bufPrint(&nbuf, "{d}", .{byte}) catch "0");
+                }
+                try sb.appendSlice(gpa, "];var __ab=new ArrayBuffer(__b.length);var __t=new Uint8Array(__ab);for(var __i=0;__i<__b.length;__i++){__t[__i]=__b[__i];}return new Uint8Array(__ab.transferToImmutable());})()");
+            } else {
+                // text (and any other non-JSON type): the raw source as a string.
+                try appendJsString(gpa, &sb, e.value_ptr.*);
+            }
+            try sb.appendSlice(gpa, " };\n};\n");
+            continue;
+        }
         const mod_is_async = async_set.contains(mod_id);
         try sb.appendSlice(gpa, "__modules__[\"");
         try sb.appendSlice(gpa, mod_id);

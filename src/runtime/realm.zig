@@ -224,6 +224,15 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
         if (entry.bits != 0 and entry.unbox() == .object) {
             const mod_obj = entry.toPtr().object;
             if (mod_obj.get("exports")) |exports_val| {
+                // A module that threw during evaluation stays errored: re-require
+                // re-throws the SAME error value (so an import-defer trigger, a
+                // dynamic import(), and an eager import all observe one error).
+                if (mod_obj.get("__evalError__")) |ev| {
+                    if (ev.bits != 0) {
+                        pending_exception = ev;
+                        return error.JsException;
+                    }
+                }
                 try syncRequireCache(env, lookup_name, entry);
                 return exports_val;
             }
@@ -249,7 +258,14 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
                 exports_val,
                 entry,
                 &[_]Value{ require_fn, module_val, exports_val },
-            ) catch return val_mod.makeUndefined(arena);
+            ) catch |err| {
+                // Module evaluation threw: record the error on the module record so
+                // a later require() (eager re-import or import-defer trigger)
+                // re-throws the same value, and propagate it to this importer.
+                if (err == error.JsException and pending_exception.bits != 0)
+                    module_obj.set("__evalError__", pending_exception) catch {};
+                return err;
+            };
             // M16 TLA: an async-module factory returns its evaluation-completion
             // Promise (resolves when the module body, including top-level await,
             // finishes). Stash it so importers/`__awaitDeps__`/dynamic `import()`
@@ -307,6 +323,149 @@ pub fn nativeMakeNamespace(arena: std.mem.Allocator, _: Value, args: []const Val
     // Cache on the exports object so subsequent imports observe the same object.
     if (active_sym_module_ns) |ns_sym| try exports_obj.setSym(ns_sym, ns_val);
     return ns_val;
+}
+
+/// Deferred import: `import defer * as ns from 'm'` desugars to
+/// `var ns = __importDefer__('m')`. Build a Module Namespace exotic object whose
+/// backing module is NOT yet evaluated: it carries the canonical module id under
+/// `active_sym_deferred_id` and an empty backing. A later triggering operation
+/// (`[[Get]]`/`[[HasProperty]]`/`[[Delete]]`/`[[DefineOwnProperty]]`/
+/// `[[GetOwnProperty]]`/`[[OwnPropertyKeys]]` on a non-symbol-like key) evaluates
+/// the module and wires the live exports in. Symbol keys (and the deferred `then`)
+/// never trigger evaluation.
+pub fn nativeImportDefer(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string)
+        return val_mod.makeUndefined(arena);
+    const spec = args[0].toPtr().string;
+    // Resolve to the canonical registry id NOW (we are in the importing module's
+    // scope, so `__module_id__` is correct); the trigger then requires it directly.
+    const env = active_global_env;
+    const canonical = if (env) |e| (resolveModuleName(arena, e, spec) catch spec) else spec;
+    return getOrMakeDeferredNamespace(arena, canonical);
+}
+
+/// Dynamic deferred import: `import.defer(spec)` returns a promise that fulfils
+/// with the module's deferred namespace exotic object WITHOUT evaluating it (the
+/// module body runs lazily on first triggering access). Loading is synchronous in
+/// the bundler model, so the promise resolves immediately with the (cached)
+/// deferred namespace — identical to the static `import defer` object.
+pub fn nativeImportDeferDynamic(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
+        return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{
+            try val_mod.makeString(arena, "TypeError: import.defer() requires a string specifier"),
+        });
+    }
+    const spec = args[0].toPtr().string;
+    const env = active_global_env;
+    const canonical = if (env) |e| (resolveModuleName(arena, e, spec) catch spec) else spec;
+    const ns = try getOrMakeDeferredNamespace(arena, canonical);
+    return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{ns});
+}
+
+/// GetModuleNamespace for the deferred phase: return the *single* deferred
+/// namespace exotic object for a given canonical module id, creating it on first
+/// request and caching it so static `import defer`, re-exported deferred
+/// namespaces, and dynamic `import.defer()` of the same module all observe the
+/// SAME object (identity per the proposal). The object is distinct from the
+/// module's eager namespace (`__makeNamespace__`).
+pub fn getOrMakeDeferredNamespace(arena: std.mem.Allocator, canonical: []const u8) anyerror!Value {
+    // Identity cache, keyed by canonical id.
+    if (active_deferred_ns_registry) |reg_val| {
+        if (reg_val.bits != 0 and reg_val.unbox() == .object) {
+            if (reg_val.toPtr().object.get(canonical)) |cached| return cached;
+        }
+    }
+    const ns = if (active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    ns.internal_kind = .module_namespace;
+    ns.internal_slot = null; // not yet evaluated
+    // A deferred namespace's @@toStringTag is "Deferred Module" (not "Module"),
+    // distinguishing it from an eager namespace; it persists after evaluation.
+    if (active_sym_to_string_tag) |tag| {
+        try ns.setSymAttr(tag, try val_mod.makeString(arena, "Deferred Module"), .{
+            .writable = false,
+            .enumerable = false,
+            .configurable = false,
+        });
+    }
+    if (active_sym_deferred_id) |sym|
+        try ns.setSym(sym, try val_mod.makeString(arena, canonical));
+    ns.extensible = false;
+    const ns_val = try val_mod.makeObject(arena, ns);
+    if (active_deferred_ns_registry) |reg_val| {
+        if (reg_val.bits != 0 and reg_val.unbox() == .object) {
+            try reg_val.toPtr().object.set(canonical, ns_val);
+        }
+    }
+    return ns_val;
+}
+
+/// True when `o` is a deferred (not-yet-evaluated) module namespace.
+pub fn isDeferredNamespace(o: *JsObject) bool {
+    if (o.internal_kind != .module_namespace) return false;
+    const sym = active_sym_deferred_id orelse return false;
+    return o.getOwnSym(sym) != null;
+}
+
+/// True when module `id` is currently mid-evaluation: its record exists in
+/// `__modules__` (cache-before-invoke) as a module object whose `loaded` flag is
+/// still false (the factory is on the stack and has not returned). Used to detect
+/// a deferred-namespace access of a self/cyclic module that is not yet finished.
+fn moduleIsEvaluating(arena: std.mem.Allocator, id: []const u8) bool {
+    const env = active_global_env orelse return false;
+    const registry = env.lookup("__modules__") catch return false;
+    if (registry.bits == 0 or registry.unbox() != .object) return false;
+    const modules_obj = registry.toPtr().object;
+    const resolved = resolveModuleName(arena, env, id) catch id;
+    const entry = modules_obj.get(resolved) orelse modules_obj.get(id) orelse return false;
+    if (entry.bits == 0 or entry.unbox() != .object) return false; // still a factory → not started
+    const mod_obj = entry.toPtr().object;
+    // A module record with exports but loaded===false is executing right now.
+    if (mod_obj.get("exports") == null) return false;
+    const loaded = mod_obj.get("loaded") orelse return false;
+    return loaded.bits != 0 and loaded.unbox() == .boolean and loaded.unbox().boolean == false;
+}
+
+/// Evaluate a deferred namespace's module (EvaluateSync) and wire its live
+/// exports as the backing, clearing the deferred marker so subsequent operations
+/// see an ordinary, evaluated namespace. Idempotent / no-op for non-deferred.
+pub fn triggerDeferredNamespace(arena: std.mem.Allocator, o: *JsObject) anyerror!void {
+    const sym = active_sym_deferred_id orelse return;
+    const id_val = o.getOwnSym(sym) orelse return;
+    if (id_val.bits == 0 or id_val.unbox() != .string) return;
+    // EvaluateSync / ReadyForSyncExecution: a deferred namespace whose module is
+    // currently mid-evaluation (on the stack — a cyclic/self access before the
+    // module body has finished) is NOT ready for synchronous execution, so the
+    // trigger throws a TypeError instead of evaluating. A module record exists
+    // (cache-before-invoke) with `loaded === false` exactly during its own body.
+    if (moduleIsEvaluating(arena, id_val.toPtr().string))
+        return throwTypeError(arena, "Cannot access a deferred module namespace while the module is being evaluated");
+    // We do NOT delete the marker before evaluating: the deferred namespace is
+    // non-extensible, so we could not re-add it if evaluation throws. Instead the
+    // marker is cleared only on SUCCESS (deleteOwnSym works on a non-extensible
+    // object). A re-entrant access during the module body is safe — require()
+    // caches the module before invoking its factory, so the nested trigger gets
+    // the partial exports and returns without re-invoking. If evaluation throws,
+    // the marker stays, so a later access re-triggers and require() re-throws the
+    // SAME cached module error.
+    const exports_val = try nativeRequire(arena, Value{}, &[_]Value{id_val});
+    if (exports_val.bits != 0 and exports_val.unbox() == .object) {
+        // Wire the live exports as the backing. We do NOT register this object as
+        // the module's eager namespace (active_sym_module_ns): a deferred namespace
+        // is a distinct exotic object from the eager `import * as` namespace.
+        o.internal_slot = @ptrCast(exports_val.toPtr().object);
+        _ = o.deleteOwnSym(sym); // success: no longer deferred
+    }
+}
+
+/// Trigger gate for a string-keyed operation: a deferred namespace evaluates for
+/// any string key except the deferred-`then` (treated symbol-like by spec).
+pub fn maybeTriggerDeferredStr(arena: std.mem.Allocator, o: *JsObject, key: []const u8) anyerror!void {
+    if (!isDeferredNamespace(o)) return;
+    if (std.mem.eql(u8, key, "then")) return;
+    try triggerDeferredNamespace(arena, o);
 }
 
 /// M16 Phase 5: define a live re-export getter on the exports object.
@@ -535,16 +694,20 @@ pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) any
             try val_mod.makeString(arena, "TypeError: import() requires a string specifier"),
         });
     }
-    const raw_name = args[0].toPtr().string;
+    // A second argument `{ with: { type: '...' } }` selects a typed (JSON/text)
+    // module: fold the type into the specifier so it keys the same synthetic
+    // module record the static-import desugar registers (`spec\x00type`).
+    const args2 = importApplyTypeAttr(arena, args) catch args;
+    const raw_name = args2[0].toPtr().string;
     // Resolve the specifier to the canonical id used in __modules__.
     const env = active_global_env orelse {
         // No environment — fall through to synchronous load.
-        return nativeImportSync(arena, args);
+        return nativeImportSync(arena, args2);
     };
     const registry = env.lookup("__modules__") catch {
-        return nativeImportSync(arena, args);
+        return nativeImportSync(arena, args2);
     };
-    if (registry.bits == 0 or registry.unbox() != .object) return nativeImportSync(arena, args);
+    if (registry.bits == 0 or registry.unbox() != .object) return nativeImportSync(arena, args2);
     const modules_obj = registry.toPtr().object;
     const resolved = resolveModuleName(arena, env, raw_name) catch raw_name;
     const lookup_name = if (modules_obj.get(resolved) != null) resolved else raw_name;
@@ -554,7 +717,7 @@ pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) any
             const mod_obj = entry.toPtr().object;
             if (mod_obj.get("exports") != null) {
                 // Already evaluated (module object cached) — resolve immediately.
-                return nativeImportSync(arena, args);
+                return nativeImportSync(arena, args2);
             }
         }
         if (isCallableValue(entry)) {
@@ -576,7 +739,26 @@ pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) any
         }
     }
     // Module not in registry (bare specifier, external, etc.) — synchronous load.
-    return nativeImportSync(arena, args);
+    return nativeImportSync(arena, args2);
+}
+
+/// If `import(spec, options)` carries an import-attributes `with: { type: '...' }`
+/// (or legacy `assert: { ... }`) second argument, return a new args slice whose
+/// specifier is `spec\x00type`; otherwise return `args` unchanged. The folded
+/// specifier matches the typed-module key the static-import desugar registers.
+fn importApplyTypeAttr(arena: std.mem.Allocator, args: []const Value) anyerror![]const Value {
+    if (args.len < 2 or args[1].bits == 0 or args[1].unbox() != .object) return args;
+    const opts = args[1].toPtr().object;
+    const attrs_val = opts.get("with") orelse opts.get("assert") orelse return args;
+    if (attrs_val.bits == 0 or attrs_val.unbox() != .object) return args;
+    const type_val = attrs_val.toPtr().object.get("type") orelse return args;
+    if (type_val.bits == 0 or type_val.unbox() != .string) return args;
+    const ty = type_val.toPtr().string;
+    if (ty.len == 0) return args;
+    const typed = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ args[0].toPtr().string, ty });
+    const out = try arena.alloc(Value, 1);
+    out[0] = try val_mod.makeString(arena, typed);
+    return out;
 }
 
 /// Synchronous path for `nativeImport`: evaluate the module immediately and
@@ -867,6 +1049,15 @@ pub var active_sym_proxy_handler: ?Value = null;
 /// exports object, so GetModuleNamespace returns the *same* object each time
 /// (`import * as a` and `import * as b` of one module compare ===).
 pub var active_sym_module_ns: ?Value = null;
+/// Deferred import: private symbol storing the canonical module id of a not-yet-
+/// evaluated `import defer * as ns` namespace, on the namespace object itself.
+/// Its presence marks the namespace as deferred; a triggering operation reads it,
+/// evaluates the module via `require`, wires the backing exports, and removes it.
+pub var active_sym_deferred_id: ?Value = null;
+/// Deferred import: a null-prototype object mapping canonical module id → its
+/// single deferred namespace exotic object, so repeated `import defer` (and
+/// dynamic `import.defer()`) of one module observe the same object (identity).
+pub var active_deferred_ns_registry: ?Value = null;
 /// M16 Phase 4: private symbol storing a module's export names array on its
 /// live exports object, so the namespace exotic can check TDZ for uninitialized
 /// exports even before the module body runs (self-imports).
@@ -2214,6 +2405,8 @@ pub const Realm = struct {
         active_sym_proxy_target = try val_mod.makeSymbol(arena, "[[ProxyTarget]]");
         active_sym_proxy_handler = try val_mod.makeSymbol(arena, "[[ProxyHandler]]");
         active_sym_module_ns = try val_mod.makeSymbol(arena, "[[Module.Namespace]]");
+        active_sym_deferred_id = try val_mod.makeSymbol(arena, "[[Module.DeferredId]]");
+        active_deferred_ns_registry = try val_mod.makeObject(arena, try JsObject.create(arena, null));
         active_sym_export_names = try val_mod.makeSymbol(arena, "[[Module.ExportNames]]");
         active_sym_tdz_export_names = try val_mod.makeSymbol(arena, "[[Module.TdzNames]]");
         tdz_marker = try val_mod.makeSymbol(arena, "[[TDZ]]");
@@ -2365,6 +2558,24 @@ pub const Realm = struct {
             }
         }
 
+        // Likewise update the Array constructor's "prototype" so identity checks
+        // (`Object.getPrototypeOf(arr) === Array.prototype`) hold: array literals
+        // and JSON.parse build arrays off the migrated hp_array_proto, so the
+        // ctor's "prototype" must reference the same heap object, not the stale
+        // arena proto. (Matches the Object ctor fix above.)
+        if (self.global_env.bindings.getPtr("Array")) |arr_binding| {
+            const arr_val_ptr = &arr_binding.value;
+            if (arr_val_ptr.bits != 0) {
+                switch (arr_val_ptr.unbox()) {
+                    .object => |ctor_obj| {
+                        const new_proto_val = try val_mod.makeObject(self.arena, hp_array_proto);
+                        try ctor_obj.set("prototype", new_proto_val);
+                    },
+                    else => {},
+                }
+            }
+        }
+
         // Phase 4b: update thread-locals to point to heap-migrated protos.
         active_array_proto = hp_array_proto;
         active_object_proto = hp_proto;
@@ -2409,6 +2620,8 @@ pub const Realm = struct {
         active_sym_to_string_tag = null;
         active_sym_species = null;
         active_sym_module_ns = null;
+        active_sym_deferred_id = null;
+        active_deferred_ns_registry = null;
         active_sym_export_names = null;
         active_sym_tdz_export_names = null;
         tdz_marker = null;

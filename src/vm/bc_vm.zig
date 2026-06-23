@@ -1234,6 +1234,8 @@ pub const BcVm = struct {
         // M16: Module Namespace exotic [[HasProperty]] — string keys are exactly
         // the exported names (null prototype, so no inherited keys).
         if (root_obj.internal_kind == .module_namespace) {
+            // import-defer: `key in ns` (key ≠ "then") evaluates the deferred module.
+            try @import("../runtime/realm.zig").maybeTriggerDeferredStr(self.arena, root_obj, key);
             return namespace_mod.hasExport(root_obj, key);
         }
         var cur: ?*JsObject = root_obj;
@@ -1244,6 +1246,12 @@ pub const BcVm = struct {
             // A Proxy in the prototype chain has its own [[HasProperty]];
             // recurse so the `has` trap (or target walk) is dispatched.
             if (o != root_obj and o.internal_kind == .proxy) {
+                return try self.hasProperty(try val_mod.makeObject(self.arena, o), key_v);
+            }
+            // A Module Namespace exotic in the prototype chain dispatches its own
+            // [[HasProperty]] (import-defer: a string key — except "then" —
+            // triggers module evaluation).
+            if (o != root_obj and o.internal_kind == .module_namespace) {
                 return try self.hasProperty(try val_mod.makeObject(self.arena, o), key_v);
             }
             if (o.is_array and std.mem.eql(u8, key, "length")) return true;
@@ -1298,6 +1306,8 @@ pub const BcVm = struct {
         // M16: Module Namespace exotic [[Delete]] — an exported name cannot be
         // deleted (false → strict caller throws); a non-export "succeeds".
         if (obj.internal_kind == .module_namespace) {
+            // import-defer: `delete ns[key]` (key ≠ "then") evaluates the deferred module.
+            try @import("../runtime/realm.zig").maybeTriggerDeferredStr(self.arena, obj, key);
             return !namespace_mod.hasExport(obj, key);
         }
         return obj.deleteOwn(key);
@@ -1426,6 +1436,9 @@ pub const BcVm = struct {
                         const bk = namespace_mod.backing(obj) orelse return val_mod.makeUndefined(self.arena);
                         return try val_mod.makeObject(self.arena, bk);
                     }
+                    // import-defer: a string [[Get]] (except "then") evaluates the
+                    // deferred module now and wires the live exports as the backing.
+                    try @import("../runtime/realm.zig").maybeTriggerDeferredStr(self.arena, obj, key);
                     const b = namespace_mod.backing(obj) orelse return val_mod.makeUndefined(self.arena);
                     if (namespace_mod.isTDZ(obj, key)) {
                         const realm_m = @import("../runtime/realm.zig");
@@ -1455,6 +1468,19 @@ pub const BcVm = struct {
                     }
                     if (raw.bits != 0) return raw;
                     return val_mod.makeUndefined(self.arena);
+                }
+                // Not an ordinary own/inherited slot: a Module Namespace exotic in
+                // the prototype chain dispatches its own [[Get]] (import-defer:
+                // a string key — except "then" — triggers module evaluation).
+                {
+                    var p: ?*JsObject = obj.proto;
+                    var pd: usize = 0;
+                    while (p) |pp| : (pd += 1) {
+                        if (pd >= 64) break;
+                        if (pp.internal_kind == .module_namespace)
+                            return try self.getProp(try val_mod.makeObject(self.arena, pp), key);
+                        p = pp.proto;
+                    }
                 }
                 return val_mod.makeUndefined(self.arena);
             },

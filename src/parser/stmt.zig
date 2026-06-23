@@ -13,35 +13,65 @@ const expr_mod = @import("./expr.zig");
 
 // ---------------------------------------------------------------- statements ---
 
-/// M16 Phase 5: skip an import-attributes `with { ... }` or `assert { ... }`
+/// M16 Phase 5: parse an import-attributes `with { ... }` or `assert { ... }`
 /// clause that may follow a module specifier in import/export declarations.
-/// The clause is parsed and discarded (JSZ does not enforce attributes).
-fn skipImportAttributes(p: *Parser) void {
+/// The clause is consumed; the value of a `type` attribute (e.g. `'json'`,
+/// `'text'`) is returned so the loader can route the dependency to the right
+/// synthetic-module factory (JSON / text). All other attributes are ignored.
+fn skipImportAttributes(p: *Parser) ?[]const u8 {
     // `with` is a reserved-word token (kw_with); `assert` is a contextual kw.
     const is_with = p.current.kind == .kw_with;
     const is_assert = p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "assert");
-    if (!is_with and !is_assert) return;
+    if (!is_with and !is_assert) return null;
     _ = p.advance(); // consume `with` / `assert`
-    // Expect `{ ... }` — skip the braced block, tolerating nested braces and
+    // Expect `{ ... }` — consume the braced block, tolerating nested braces and
     // string literals (attribute values are string literals).
     if (!p.match(.left_brace)) {
-        // Not a braces block — nothing to skip (allow `with` as a no-op).
-        return;
+        // Not a braces block — nothing to consume (allow `with` as a no-op).
+        return null;
     }
+    var type_value: ?[]const u8 = null;
+    // State machine to capture `type : <string>` at the top brace level.
+    const St = enum { none, key, colon };
+    var st: St = .none;
     var depth: u32 = 1;
     while (depth > 0 and !p.check(.eof) and !p.had_error) {
         if (p.check(.left_brace)) {
             depth += 1;
+            st = .none;
             _ = p.advance();
         } else if (p.check(.right_brace)) {
             depth -= 1;
             _ = p.advance();
-        } else if (p.check(.string)) {
-            _ = p.advance(); // skip string literal (attribute value)
+        } else if (depth == 1 and st == .colon and p.check(.string)) {
+            type_value = p.current.value_str;
+            st = .none;
+            _ = p.advance();
+        } else if (depth == 1 and st == .key and p.check(.colon)) {
+            st = .colon;
+            _ = p.advance();
+        } else if (depth == 1 and st == .none and
+            ((p.current.kind == .identifier or p.current.kind == .string) and
+                std.mem.eql(u8, p.current.value_str, "type")))
+        {
+            st = .key;
+            _ = p.advance();
         } else {
+            if (p.check(.comma)) st = .none;
             _ = p.advance(); // skip any other token (keys, colons, commas)
         }
     }
+    return type_value;
+}
+
+/// Append the module-type attribute to a specifier as `<spec>\x00<type>` so the
+/// loader keys typed (JSON/text) modules distinctly from a JS import of the same
+/// path (module records are keyed by (specifier, type) per spec). Returns the
+/// bare specifier when there is no type attribute.
+fn typedSpecifier(p: *Parser, modname: []const u8, type_attr: ?[]const u8) []const u8 {
+    const ty = type_attr orelse return modname;
+    if (ty.len == 0) return modname;
+    return std.fmt.allocPrint(p.arena, "{s}\x00{s}", .{ modname, ty }) catch modname;
 }
 
 pub fn parseImportDecl(p: *Parser) ?*Node {
@@ -58,9 +88,9 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     if (p.current.kind == .string) {
         const modname = p.current.value_str;
         _ = p.advance();
-        skipImportAttributes(p); // `with { ... }` / `assert { ... }`
+        const type_attr = skipImportAttributes(p); // `with { ... }` / `assert { ... }`
         p.consumeSemicolon();
-        const req = p.mkRequire(modname) orelse return null;
+        const req = p.mkRequire(typedSpecifier(p, modname, type_attr)) orelse return null;
         const stmt = p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = req }) orelse return null;
         // M16 Phase 5: hoist side-effect imports to the bundle hoist point so
         // require() runs after __modules__ is initialised but before entry assertions.
@@ -88,7 +118,7 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
             const bind_tok = p.expect(.identifier) orelse return null;
             if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
             const spec_tok = p.expect(.string) orelse return null;
-            skipImportAttributes(p);
+            _ = skipImportAttributes(p);
             p.consumeSemicolon();
             const arg = p.makeNode(.string_literal, start, p.current.start, .{ .string_literal = spec_tok.value_str }) orelse return null;
             const call = p.mkCall1("__moduleSource__", arg) orelse return null;
@@ -99,6 +129,42 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
             }
             return stmt;
         }
+    }
+
+    // `import defer * as ns from 'm'` — deferred namespace import (ES import-defer
+    // proposal). `defer` is the keyword ONLY when immediately followed by `*`;
+    // `import defer from 'm'` instead imports a default binding literally named
+    // `defer`, so it falls through to ordinary import-clause parsing.
+    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "defer")) {
+        const nn = p.peekNext();
+        if (nn.kind == .star) {
+            _ = p.advance(); // consume `defer`
+            _ = p.advance(); // consume `*`
+            if (!p.matchContextual("as")) return p.fail("expected 'as' after import defer *");
+            const t = p.expect(.identifier) orelse return null;
+            const dns_name = t.value_str;
+            if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
+            const dmodtok = p.expect(.string) orelse return null;
+            const dtype = skipImportAttributes(p); // `with { ... }` / `assert { ... }`
+            p.consumeSemicolon();
+            const arg = p.makeNode(.string_literal, start, p.current.start, .{
+                .string_literal = typedSpecifier(p, dmodtok.value_str, dtype),
+            }) orelse return null;
+            const call = p.mkCall1("__importDefer__", arg) orelse return null;
+            const stmt = p.mkVar(dns_name, call) orelse return null;
+            // Hoist like ordinary imports so the deferred namespace binding exists
+            // before the entry's assertions run (it does not evaluate the module).
+            if (p.hoist_point_seen) {
+                p.hoisted_import_stmts.append(p.arena, stmt) catch {};
+                return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
+            }
+            return stmt;
+        } else if (!(nn.kind == .identifier and std.mem.eql(u8, nn.value_str, "from"))) {
+            // `import defer x`, `import defer { … }`, `import defer as ns`, etc.
+            // are all SyntaxErrors: `defer` may only precede a `* as` namespace.
+            return p.fail("`import defer` must be `import defer * as <name> from`");
+        }
+        // else: `import defer from 'm'` — `defer` is an ordinary default binding.
     }
 
     var default_name: ?[]const u8 = null;
@@ -132,12 +198,23 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
     const modtok = p.expect(.string) orelse return null;
     const modname = modtok.value_str;
-    skipImportAttributes(p); // `with { ... }` / `assert { ... }`
+    const type_attr = skipImportAttributes(p); // `with { ... }` / `assert { ... }`
     p.consumeSemicolon();
+
+    // A JSON module exposes only a `default` export (ES "json-modules"): an
+    // `import { name }` of any other binding is a resolution-phase SyntaxError.
+    if (type_attr) |ty| {
+        if (std.mem.eql(u8, ty, "json")) {
+            for (named.items) |nb| {
+                if (!std.mem.eql(u8, nb.imp, "default"))
+                    return p.fail("JSON module has no export named other than 'default'");
+            }
+        }
+    }
 
     const tmp = std.fmt.allocPrint(p.arena, "__esm_{d}", .{start}) catch return null;
     var out = std.ArrayList(*Node){};
-    const req = p.mkRequire(modname) orelse return null;
+    const req = p.mkRequire(typedSpecifier(p, modname, type_attr)) orelse return null;
     // M16 Phase 5: wrap in namespace so named/default imports get live binding,
     // TDZ detection, and assignment-rejection semantics.
     const ns_req = p.mkCall1("__makeNamespace__", req) orelse return null;
@@ -273,7 +350,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             const ns_tok = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
             if (!p.matchContextual("from")) return p.fail("expected 'from' after export * as");
             const mod_tok = p.expect(.string) orelse return null;
-            skipImportAttributes(p);
+            _ = skipImportAttributes(p);
             p.consumeSemicolon();
             const req = p.mkRequire(mod_tok.value_str) orelse return null;
             const ns_val = p.mkCall1("__makeNamespace__", req) orelse return null;
@@ -290,7 +367,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             // __exportStar__ copies all properties except 'default' (ES spec §2.2.2.3).
             if (!p.matchContextual("from")) return p.fail("expected 'from' after export *");
             const mod_tok = p.expect(.string) orelse return null;
-            skipImportAttributes(p);
+            _ = skipImportAttributes(p);
             p.consumeSemicolon();
             const req = p.mkRequire(mod_tok.value_str) orelse return null;
             const callee = p.mkIdent("__exportStar__") orelse return null;
@@ -332,7 +409,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
         var out = std.ArrayList(*Node){};
         if (p.matchContextual("from")) {
             const modtok = p.expect(.string) orelse return null;
-            skipImportAttributes(p);
+            _ = skipImportAttributes(p);
             tmp = std.fmt.allocPrint(p.arena, "__esm_{d}", .{start}) catch return null;
             const req = p.mkRequire(modtok.value_str) orelse return null;
             out.append(p.arena, p.mkVar(tmp.?, req) orelse return null) catch return null;
