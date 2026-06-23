@@ -9,6 +9,7 @@ const Parser = parser_file.Parser;
 const ast = @import("./ast.zig");
 const Node = ast.Node;
 const NodeKind = ast.NodeKind;
+const expr_mod = @import("./expr.zig");
 
 // ---------------------------------------------------------------- statements ---
 
@@ -69,6 +70,32 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
             return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
         }
         return stmt;
+    }
+
+    // import source X from "spec";  (source-phase import — ES proposal).
+    // Grammar: `import source ImportedBinding FromClause`. We detect it as
+    // `source <ident> ...` where the next token is an identifier that is not the
+    // `from` keyword (which would make this an ordinary default import of a
+    // binding literally named `source`). The binding is bound to the host's
+    // module-source object (`__moduleSource__(spec)`), an immutable binding.
+    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "source")) {
+        const nn = p.peekNext();
+        if (nn.kind == .identifier and !std.mem.eql(u8, nn.value_str, "from")) {
+            _ = p.advance(); // consume `source`
+            const bind_tok = p.expect(.identifier) orelse return null;
+            if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
+            const spec_tok = p.expect(.string) orelse return null;
+            skipImportAttributes(p);
+            p.consumeSemicolon();
+            const arg = p.makeNode(.string_literal, start, p.current.start, .{ .string_literal = spec_tok.value_str }) orelse return null;
+            const call = p.mkCall1("__moduleSource__", arg) orelse return null;
+            const stmt = p.mkVar(bind_tok.value_str, call) orelse return null;
+            if (p.hoist_point_seen) {
+                p.hoisted_import_stmts.append(p.arena, stmt) catch {};
+                return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
+            }
+            return stmt;
+        }
     }
 
     var default_name: ?[]const u8 = null;
@@ -183,7 +210,10 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
                         .is_strict = is_strict,
                     },
                 }) orelse return null;
-                const assign = p.mkExportAssign("default", p.mkIdent(fn_name) orelse return null) orelse return null;
+                const assign = if (p.hoist_point_seen or p.fn_nesting_depth > 0)
+                    p.mkLiveLocalExport("default", fn_name) orelse return null
+                else
+                    p.mkExportAssign("default", p.mkIdent(fn_name) orelse return null) orelse return null;
                 var out2 = std.ArrayList(*Node){};
                 out2.append(p.arena, fn_decl) catch return null;
                 out2.append(p.arena, assign) catch return null;
@@ -372,7 +402,10 @@ pub fn parseStatement(p: *Parser) ?*Node {
     if (p.had_error) return null;
     // Phase 8: a statement starting with `await` is an await-expression statement,
     // not a label/identifier — route to expression parsing (which desugars await).
-    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await")) {
+    // In module mode, `await` is always a keyword. In script mode, `await` is an
+    // identifier unless followed by a valid operand (for top-level await support).
+    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await") and
+        (p.is_module or expr_mod.isAwaitOperandStart(p.peekNext().kind))) {
         return p.parseExprStmt();
     }
     // W2-async: `async function foo() {}` declaration. `async` is contextual

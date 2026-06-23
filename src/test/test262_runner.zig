@@ -256,8 +256,18 @@ const DOLLAR262_PRELUDE =
     \\      createRealm: $262.createRealm
     \\    };
     \\  },
-    \\  evalScript: function(s) { return eval(s); }
+    \\  evalScript: function(s) { return eval(s); },
+    \\  AbstractModuleSource: function AbstractModuleSource() {}
     \\};
+    \\var __moduleSourceCache__ = Object.create(null);
+    \\function __moduleSource__(spec) {
+    \\  var o = __moduleSourceCache__[spec];
+    \\  if (o) return o;
+    \\  o = Object.create($262.AbstractModuleSource.prototype);
+    \\  o[Symbol.for("jsz.moduleSource")] = true;
+    \\  __moduleSourceCache__[spec] = o;
+    \\  return o;
+    \\}
     \\
 ;
 
@@ -429,10 +439,15 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
         "function $DONE(err) { if (err) throw err; }\n"
     else
         "";
+    // The `/*__JSZ_PRELUDE_END__*/` sentinel marks where the harness prelude ends
+    // and the actual test source begins. For module tests, buildBundle emits the
+    // prelude at bundle (module) scope so dependency modules can see harness
+    // globals (`assert`, `$262`); the test body is wrapped in the entry IIFE.
+    const SENTINEL = "/*__JSZ_PRELUDE_END__*/";
     const full_source = if (needs_dollar262)
-        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ strict_prefix, DOLLAR262_PRELUDE, prelude, done_prefix, source }) catch return .fail
+        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}{s}", .{ strict_prefix, DOLLAR262_PRELUDE, prelude, done_prefix, SENTINEL, source }) catch return .fail
     else
-        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ strict_prefix, prelude, done_prefix, source }) catch return .fail;
+        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ strict_prefix, prelude, done_prefix, SENTINEL, source }) catch return .fail;
     defer allocator.free(full_source);
 
     // `flags: [module]` tests must run as ES-module code (strict; import/export).

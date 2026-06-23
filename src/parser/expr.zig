@@ -203,9 +203,13 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
         const right = p.parseAssignmentExpr() orelse return null;
-        left = p.makeNode(.assignment_expr, left.start, p.current.start, .{
-            .assignment_expr = .{ .op = op, .target = left, .value = right },
-        }) orelse return null;
+        if (p.rewriteSuperPropAssign(op, left, right, left.start, p.current.start)) |sp| {
+            left = sp;
+        } else {
+            left = p.makeNode(.assignment_expr, left.start, p.current.start, .{
+                .assignment_expr = .{ .op = op, .target = left, .value = right },
+            }) orelse return null;
+        }
     }
     // Comma sequence: `expr, expr2, ...` at statement level (parseExprStmt goes through
     // parseExpression which handles comma, but parseExprFromIdent does not — fix here).
@@ -318,6 +322,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
         const right = p.parseAssignmentExpr() orelse return null; // right-assoc
+        if (p.rewriteSuperPropAssign(op, left, right, start, p.current.start)) |sp| return sp;
         return p.makeNode(.assignment_expr, start, p.current.start, .{
             .assignment_expr = .{ .op = op, .target = left, .value = right },
         });
@@ -469,11 +474,32 @@ pub fn parseBinaryExpr(p: *Parser, min_prec: u8) ?*Node {
     return left;
 }
 
+/// True when the token kind can start a unary expression operand for `await`.
+/// Used to distinguish `await expr` (await keyword) from `await` as an identifier
+/// in script mode (e.g. `x instanceof await` where `await` is a class name).
+pub fn isAwaitOperandStart(kind: anytype) bool {
+    return switch (kind) {
+        .identifier, .number, .string, .left_paren, .left_bracket, .left_brace,
+        .bang, .tilde, .minus, .plus, .kw_typeof, .kw_void, .kw_delete,
+        .kw_new, .kw_function, .kw_class, .kw_this, .kw_true, .kw_false,
+        .kw_null, .plus_plus, .minus_minus,
+        => true,
+        else => false,
+    };
+}
+
 pub fn parseUnaryExpr(p: *Parser) ?*Node {
     const start = p.current.start;
     // Phase 8: `await X` desugars to a call __await__(X) (synchronous-drain await).
     // Works at module top level and inside any function; no VM changes needed.
-    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await")) {
+    // In module mode, `await` is always a keyword. In script mode, `await` is an
+    // identifier — but JSZ treats it as a keyword when followed by a valid operand
+    // (for top-level await in script tests). When followed by a non-operand token
+    // (comma, semicolon, closing bracket, binary operator, etc.), `await` is an
+    // identifier (e.g. `instanceof await` in `new await instanceof await`).
+    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await") and
+        (p.is_module or isAwaitOperandStart(p.peekNext().kind)))
+    {
         // `await` is a prefix operator; the next token may be a regex literal.
         // Patch prev_kind so the lexer treats '/' as regex, not division.
         p.lexer.prev_kind = .kw_typeof;
@@ -683,6 +709,45 @@ pub fn rewriteSuperCall(p: *Parser, call_node: *Node) ?*Node {
         }
     }
     return call_node;
+}
+
+/// Rewrite `super.PROP = V` / `super[expr] = V` into a proper super-property
+/// SET. JSZ desugars the `super` binding to either `Super.prototype` (methods)
+/// or the super-call helper (derived constructors), so a plain member-set on the
+/// `super` binding has the wrong base AND the wrong Receiver. The spec's super
+/// reference does `Set(homeProto, key, V, thisValue)` — exactly `Reflect.set`
+/// with a distinct receiver. We emit `Reflect.set(__sproto__, key, V, __superthis)`
+/// where `__sproto__` (parent prototype) and `__superthis` (the receiver) are
+/// bound by the class desugar in derived constructors/methods. Returns null when
+/// `target` is not a super member access or `op` is a compound assignment (left
+/// to the ordinary path, which is rare for super and not exercised here).
+pub fn rewriteSuperPropAssign(p: *Parser, op: ast.AssignOp, target: *Node, value: *Node, start: u32, end: u32) ?*Node {
+    if (op != .assign) return null;
+    if (target.kind != .member_expr) return null;
+    const me = target.data.member_expr;
+    if (!(me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super"))) return null;
+    // Property key: the computed expression, or a string literal of the name.
+    const key = if (me.computed)
+        me.property
+    else if (me.property.kind == .identifier)
+        (p.makeNode(.string_literal, start, end, .{ .string_literal = me.property.data.identifier }) orelse return null)
+    else
+        return null;
+    const id_reflect = p.makeNode(.identifier, start, end, .{ .identifier = "Reflect" }) orelse return null;
+    const id_set = p.makeNode(.identifier, start, end, .{ .identifier = "set" }) orelse return null;
+    const callee = p.makeNode(.member_expr, start, end, .{
+        .member_expr = .{ .object = id_reflect, .property = id_set, .computed = false },
+    }) orelse return null;
+    const id_proto = p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
+    const id_recv = p.makeNode(.identifier, start, end, .{ .identifier = "__superthis" }) orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, id_proto) catch return null;
+    args.append(p.arena, key) catch return null;
+    args.append(p.arena, value) catch return null;
+    args.append(p.arena, id_recv) catch return null;
+    return p.makeNode(.call_expr, start, end, .{
+        .call_expr = .{ .callee = callee, .args = args.items },
+    });
 }
 
 /// Parse a member expression without call expressions (for `new` callee).

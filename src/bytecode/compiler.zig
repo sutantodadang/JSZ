@@ -1654,6 +1654,7 @@ pub fn compileFunctionStrict(
     for (instanceof_ic_table) |*entry| entry.* = ic_mod.InstanceofCache{};
     f.* = BcFunction{
         .name = name,
+        .nfe_name = nfe_name,
         .arity = @intCast(params.len),
         .chunk = chunk,
         .num_regs = num_regs,

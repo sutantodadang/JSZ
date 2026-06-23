@@ -7,6 +7,12 @@ const ic_mod = @import("../vm/ic.zig");
 /// A compiled bytecode function. Owned by the compile arena.
 pub const BcFunction = struct {
     name: ?[]const u8,
+    /// Named function EXPRESSION self-name: bound (immutably, per spec) inside
+    /// the function's own scope so the body can refer to itself. Null for
+    /// function DECLARATIONS — their name lives in the enclosing scope and is a
+    /// normal mutable binding, so `function f(){ f = 2 }` reassigns the outer
+    /// binding rather than shadowing it.
+    nfe_name: ?[]const u8 = null,
     arity: u16,
     chunk: Chunk,
     num_regs: u16,

@@ -398,6 +398,40 @@ pub fn nativeInitExports(arena: std.mem.Allocator, _: Value, args: []const Value
             }
         }
         has_tdz_list = true;
+        // Also set non-TDZ export names to undefined so they appear as own
+        // properties on the exports object immediately.  This is critical for
+        // circular `export * from` — __exportStar__ uses Object.keys(s) to
+        // discover names, and var exports (hoisted to undefined) must be
+        // visible before the module body runs.  Function exports are overwritten
+        // by the pre-hoist (exports.NAME = NAME) that follows __initExports__.
+        const undef = try val_mod.makeUndefined(arena);
+        const nn = names_arr.getArrayLength();
+        var ii: u32 = 0;
+        var buf2: [32]u8 = undefined;
+        // Build a set of TDZ names for quick lookup.
+        var tdz_set = std.StringHashMap(void).init(arena);
+        const tdz_n = tdz_arr.getArrayLength();
+        var ti: u32 = 0;
+        var tbuf: [32]u8 = undefined;
+        while (ti < tdz_n) : (ti += 1) {
+            const tkey = std.fmt.bufPrint(&tbuf, "{d}", .{ti}) catch break;
+            if (tdz_arr.get(tkey)) |tv| {
+                if (tv.bits != 0 and tv.unbox() == .string) {
+                    tdz_set.put(tv.toPtr().string, {}) catch {};
+                }
+            }
+        }
+        while (ii < nn) : (ii += 1) {
+            const idx_key = std.fmt.bufPrint(&buf2, "{d}", .{ii}) catch break;
+            if (names_arr.get(idx_key)) |name_val| {
+                if (name_val.bits != 0 and name_val.unbox() == .string) {
+                    const name_str = name_val.toPtr().string;
+                    if (!tdz_set.contains(name_str)) {
+                        exports_obj.set(name_str, undef) catch {};
+                    }
+                }
+            }
+        }
     }
     // Backwards compat (no TDZ list): mark ALL names as TDZ
     if (!has_tdz_list) {

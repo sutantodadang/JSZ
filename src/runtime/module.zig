@@ -701,9 +701,23 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     var sb = std.ArrayList(u8){};
     errdefer sb.deinit(gpa);
     try sb.appendSlice(gpa, "var __modules__ = {};\n");
-    try sb.appendSlice(gpa, "function __exportStarGetter__(s,k){return function(){return s[k];};}\n");
-    try sb.appendSlice(gpa, "function __exportStar__(t,s){var ks=Object.keys(s);for(var i=0;i<ks.length;i++){var k=ks[i];if(k===\"default\")continue;var sd=Object.getOwnPropertyDescriptor(s,k);if(sd&&sd.get&&Object.prototype.hasOwnProperty.call(t,k))continue;Object.defineProperty(t,k,{get:__exportStarGetter__(s,k),enumerable:true,configurable:true});}}\n");
-    try sb.appendSlice(gpa, "function __liveReexport__(e,n,s,p){Object.defineProperty(e,n,{get:function(){return s[p];},enumerable:true,configurable:true});}\n");
+    try sb.appendSlice(gpa, "function __exportStarGetter__(s,k){var f=function(){return s[k];};f.__s=s;f.__k=k;return f;}\n");
+    // Follow a chain of forwarding getters (star re-exports, live re-exports) down
+    // to the root (source object, key) that ultimately backs the binding. Used to
+    // decide whether two star-exported names refer to the SAME binding (diamond,
+    // unambiguous) or DIFFERENT bindings (ambiguous → must be omitted, ES §16.2.1.6.3).
+    // Returns null when the chain is circular (ResolveExport cycle detection: a
+    // cyclic re-export path provides no binding and is skipped by the star loop).
+    // A module-namespace terminal (`export * as ns from`) canonicalizes to the
+    // namespace object itself, so two re-exports of the same namespace compare equal.
+    try sb.appendSlice(gpa, "function __starRoot__(s,k){var __ms=Symbol.for('jsz.moduleSource');var seen=[];for(var g=0;g<1000;g++){if(s&&typeof s==='object'&&s[Symbol.toStringTag]==='Module'){var bk=s.__backing__;if(bk)s=bk;}for(var i=0;i<seen.length;i++){if(seen[i][0]===s&&seen[i][1]===k)return null;}seen.push([s,k]);var d=Object.getOwnPropertyDescriptor(s,k);if(d&&d.get&&d.get.__s){s=d.get.__s;k=d.get.__k;continue;}if(d&&('value' in d)&&d.value!=null&&typeof d.value==='object'&&d.value[Symbol.toStringTag]==='Module')return [d.value,'\\u0000ns'];if(d&&d.get&&!d.get.__s){try{var sv=d.get();if(sv!=null&&typeof sv==='object'&&sv[__ms])return [sv,'\\u0000src'];}catch(e){}}if(d&&('value' in d)&&d.value!=null&&typeof d.value==='object'&&d.value[__ms])return [d.value,'\\u0000src'];return [s,k];}return [s,k];}\n");
+    try sb.appendSlice(gpa, "var __ambMap__=new WeakMap();\n");
+    // When a star-exported name already exists in the target, compare the binding
+    // each path resolves to. A null (cyclic) existing path is replaced by a live
+    // path; a null incoming path is skipped; differing non-null roots are ambiguous.
+    try sb.appendSlice(gpa, "function __exportStar__(t,s){var amb=__ambMap__.get(t);var ks=Object.keys(s);for(var i=0;i<ks.length;i++){var k=ks[i];if(k===\"default\")continue;if(amb&&amb[k])continue;if(Object.prototype.hasOwnProperty.call(t,k)){var ex=Object.getOwnPropertyDescriptor(t,k);if(ex&&ex.get&&ex.get.__star){var r1=__starRoot__(ex.get.__s,ex.get.__k);var r2=__starRoot__(s,k);if(r1===null){if(r2!==null){var g2=__exportStarGetter__(s,k);g2.__star=true;Object.defineProperty(t,k,{get:g2,enumerable:true,configurable:true});}continue;}if(r2===null)continue;if(r1[0]!==r2[0]||r1[1]!==r2[1]){delete t[k];if(!amb){amb={};__ambMap__.set(t,amb);}amb[k]=true;}}continue;}var gg=__exportStarGetter__(s,k);gg.__star=true;Object.defineProperty(t,k,{get:gg,enumerable:true,configurable:true});}}\n");
+    try sb.appendSlice(gpa, "function __liveReexport__(e,n,s,p){var g=function(){return s[p];};g.__s=s;g.__k=p;Object.defineProperty(e,n,{get:g,enumerable:true,configurable:true});}\n");
+    try sb.appendSlice(gpa, "function __liveLocalExport__(e,n,g){var w={};Object.defineProperty(w,\"v\",{get:g,enumerable:true,configurable:true});__liveReexport__(e,n,w,\"v\");}\n");
     var it = registry.iterator();
     while (it.next()) |e| {
         try sb.appendSlice(gpa, "__modules__[\"");
@@ -773,12 +787,25 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         try sb.appendSlice(gpa, self_id);
         try sb.appendSlice(gpa, "\"] = module;\n");
     }
+    // M16: the host (test262 runner) may prepend a harness prelude (assert/sta/
+    // $262) to the entry, separated by this sentinel.  The prelude must live at
+    // bundle (module) scope — NOT inside the entry IIFE — so that *dependency*
+    // modules (e.g. a re-export fixture that is itself a harness-using test file)
+    // see `assert` etc. via the scope chain when their factory runs.  Only the
+    // actual entry body (after the sentinel) is wrapped in the IIFE.
+    const PRELUDE_SENTINEL = "/*__JSZ_PRELUDE_END__*/";
+    var prelude_part: []const u8 = "";
+    var body_part: []const u8 = entry_src;
+    if (std.mem.indexOf(u8, entry_src, PRELUDE_SENTINEL)) |pi| {
+        prelude_part = entry_src[0..pi];
+        body_part = entry_src[pi + PRELUDE_SENTINEL.len ..];
+    }
     // M16 Phase 4: inject export name setup for the entry module too.
     var entry_names = std.ArrayList([]const u8){};
     var entry_tdz = std.ArrayList([]const u8){};
     var entry_fn = std.ArrayList([]const u8){};
     var entry_default_fn = std.ArrayList([]const u8){};
-    findExportNames(entry_src, &entry_names, &entry_tdz, &entry_fn, &entry_default_fn, arena);
+    findExportNames(body_part, &entry_names, &entry_tdz, &entry_fn, &entry_default_fn, arena);
     if (entry_names.items.len > 0) {
         try sb.appendSlice(gpa, "__initExports__(exports,[");
         for (entry_names.items, 0..) |nm, eni| {
@@ -801,29 +828,48 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
             try sb.appendSlice(gpa, "\"");
         }
         try sb.appendSlice(gpa, "]);\n");
-        // Hoisted function/generator exports for the entry module too.
-        for (entry_fn.items) |nm| {
-            try sb.appendSlice(gpa, "exports.");
-            try sb.appendSlice(gpa, nm);
-            try sb.appendSlice(gpa, " = ");
-            try sb.appendSlice(gpa, nm);
-            try sb.appendSlice(gpa, ";\n");
-        }
-        // Named default function/generator pre-hoist for entry module.
-        for (entry_default_fn.items) |bn| {
-            try sb.appendSlice(gpa, "exports[\"default\"] = ");
-            try sb.appendSlice(gpa, bn);
-            try sb.appendSlice(gpa, ";\n");
-        }
+    }
+    // Emit the harness prelude at module scope, BEFORE the hoist point — the
+    // entry's own hoisted imports run at the hoist marker and may require()
+    // dependency modules that need the harness globals already defined.
+    if (prelude_part.len > 0) {
+        try sb.appendSlice(gpa, prelude_part);
+        try sb.appendSlice(gpa, "\n");
     }
     // M16 Phase 5: marker for the parser to identify where entry body starts,
     // so hoisted import require() calls land AFTER the bundle header (which sets
     // up __modules__ / __initExports__ / pre-registered self-module) BUT BEFORE
     // entry body assertions that appear before `import` in source order.
     try sb.appendSlice(gpa, "var __esm_hoist_point__=1;\n");
-    try sb.appendSlice(gpa, entry_src);
+    // M16 Phase 5: wrap the entry body in an IIFE so its function/class/var
+    // declarations are scoped to the IIFE, NOT the module scope.  Without this,
+    // hoisted function declarations from the entry body (e.g. `export function A()`)
+    // would be visible inside dependency factory function bodies via the scope
+    // chain, causing tests that expect ReferenceError for re-export import names
+    // to incorrectly find the hoisted function.  The IIFE receives require/module/
+    // exports from the module scope so imports/exports still work; hoisted import
+    // vars (inserted at the hoist point above) are also in the module scope and
+    // accessible from the IIFE.
+    try sb.appendSlice(gpa, "(function(require,module,exports){\"use strict\";\n");
+    // Pre-hoist function/generator exports INSIDE the IIFE so the function
+    // declaration (hoisted within the IIFE) is available for exports.NAME = NAME.
+    for (entry_fn.items) |nm| {
+        try sb.appendSlice(gpa, "exports.");
+        try sb.appendSlice(gpa, nm);
+        try sb.appendSlice(gpa, " = ");
+        try sb.appendSlice(gpa, nm);
+        try sb.appendSlice(gpa, ";\n");
+    }
+    // Named default function/generator pre-hoist for entry module.
+    for (entry_default_fn.items) |bn| {
+        try sb.appendSlice(gpa, "exports[\"default\"] = ");
+        try sb.appendSlice(gpa, bn);
+        try sb.appendSlice(gpa, ";\n");
+    }
+    try sb.appendSlice(gpa, body_part);
+    try sb.appendSlice(gpa, "\n})(require,module,exports);\n");
     const result = try sb.toOwnedSlice(gpa);
-    if (self_id.len > 20 and std.mem.indexOf(u8, self_id, "export-star-as-from-and-import-star-as-and-export") != null) {
+    if (std.posix.getenv("JSZ_DUMP_BUNDLE") != null) {
         const f = std.fs.cwd().createFile("/tmp/bundle_dump.js", .{}) catch return result;
         defer f.close();
         _ = f.writeAll(result) catch {};

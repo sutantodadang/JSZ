@@ -457,6 +457,48 @@ pub const Parser = struct {
         return self.makeNode(.expr_stmt, self.current.start, self.current.start, .{ .expr_stmt = call });
     }
 
+    /// Build `__liveLocalExport__(exports, 'name', function() { return localName; })`
+    /// for live local exports (e.g. `export default function fn()` where fn may
+    /// be reassigned).  The getter reads the local binding at access time, so
+    /// reassignments are reflected through the export.
+    pub fn mkLiveLocalExport(self: *Parser, exported: []const u8, local_name: []const u8) ?*Node {
+        const callee = self.mkIdent("__liveLocalExport__") orelse return null;
+        const exports_arg = self.mkIdent("exports") orelse return null;
+        const name_arg = self.makeNode(.string_literal, self.current.start, self.current.start, .{ .string_literal = exported }) orelse return null;
+        // Build: function() { return localName; }
+        const ret_ident = self.mkIdent(local_name) orelse return null;
+        const ret_stmt = self.makeNode(.return_stmt, self.current.start, self.current.start, .{ .return_stmt = ret_ident }) orelse return null;
+        const body_nodes = self.arena.alloc(*Node, 1) catch return null;
+        body_nodes[0] = ret_stmt;
+        const getter = self.makeNode(.function_expr, self.current.start, self.current.start, .{
+            .function_expr = .{
+                .name = null,
+                .params = &.{},
+                .param_defaults = &.{},
+                .rest_param = null,
+                .body = body_nodes,
+                .is_generator = false,
+                .is_async = false,
+                .is_strict = false,
+            },
+        }) orelse return null;
+
+        const args = self.arena.alloc(*Node, 3) catch return null;
+        args[0] = exports_arg;
+        args[1] = name_arg;
+        args[2] = getter;
+        const call = self.makeNode(.call_expr, self.current.start, self.current.start, .{
+            .call_expr = .{ .callee = callee, .args = args },
+        }) orelse return null;
+        // Track the exported name for the namespace exotic.
+        var dup = false;
+        for (self.all_export_names.items) |n| {
+            if (std.mem.eql(u8, n, exported)) { dup = true; break; }
+        }
+        if (!dup) self.all_export_names.append(self.arena, exported) catch {};
+        return self.makeNode(.expr_stmt, self.current.start, self.current.start, .{ .expr_stmt = call });
+    }
+
     pub fn mkExportAssign(self: *Parser, exported: []const u8, value: *Node) ?*Node {
         const exports_id = self.mkIdent("exports") orelse return null;
         const target = self.mkMember(exports_id, exported) orelse return null;
@@ -496,7 +538,12 @@ pub const Parser = struct {
     // names keep CJS-snapshot semantics.
     pub fn applyLiveBindings(self: *Parser, stmts: []*Node, li_start: usize, le_start: usize, la_start: usize) void {
         if (self.had_error) {
-            self.live_imports.shrinkRetainingCapacity(li_start);
+            // When inside a function body in bundle mode (IIFE wrapping the entry
+            // body), don't shrink live_imports — the top-level applyLiveBindings
+            // needs them to remove hoisted import var declarations.
+            if (!(self.hoist_point_seen and self.fn_nesting_depth > 0)) {
+                self.live_imports.shrinkRetainingCapacity(li_start);
+            }
             self.live_exports.shrinkRetainingCapacity(le_start);
             self.live_export_aliases.shrinkRetainingCapacity(la_start);
             return;
@@ -507,6 +554,38 @@ pub const Parser = struct {
         if (n <= li_start and ne <= le_start and na <= la_start) return;
         var counts = std.StringHashMap(u32).init(self.arena);
         for (stmts) |s| self.countDecls(s, &counts);
+        // M16: re-exports of named imports (`import {x} from 'm'; export {x}`) must
+        // forward to m's binding (live re-export), not snapshot a fresh local — so
+        // the star-export ambiguity check resolves them to the same root as
+        // `export {x} from 'm'`.  Run before the import-rewrite pass (which would
+        // otherwise rewrite the snapshot's RHS and defeat the matcher).
+        var reexported_imports = std.StringHashMap(void).init(self.arena);
+        {
+            var ei = le_start;
+            while (ei < ne) : (ei += 1) {
+                const ename = self.live_exports.items[ei];
+                for (self.live_imports.items[li_start..n]) |imp| {
+                    if (std.mem.eql(u8, imp.name, ename) and !std.mem.eql(u8, imp.prop, "__ns__")) {
+                        if (self.rewriteSnapshotToReexport(stmts, ename, ename, imp.ns, imp.prop)) {
+                            reexported_imports.put(ename, {}) catch {};
+                        }
+                        break;
+                    }
+                }
+            }
+            var ai = la_start;
+            while (ai < na) : (ai += 1) {
+                const al = self.live_export_aliases.items[ai];
+                for (self.live_imports.items[li_start..n]) |imp| {
+                    if (std.mem.eql(u8, imp.name, al.local) and !std.mem.eql(u8, imp.prop, "__ns__")) {
+                        if (self.rewriteSnapshotToReexport(stmts, al.local, al.exported, imp.ns, imp.prop)) {
+                            reexported_imports.put(al.local, {}) catch {};
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         var i = li_start;
         while (i < n) : (i += 1) {
             const imp = self.live_imports.items[i];
@@ -537,16 +616,24 @@ pub const Parser = struct {
         var j = le_start;
         while (j < ne) : (j += 1) {
             const name = self.live_exports.items[j];
+            if (reexported_imports.contains(name)) continue;
             if ((counts.get(name) orelse 0) <= 1) self.makeExportLive(stmts, name);
         }
         var k = la_start;
         while (k < na) : (k += 1) {
             const alias = self.live_export_aliases.items[k];
+            if (reexported_imports.contains(alias.local)) continue;
             if ((counts.get(alias.local) orelse 0) <= 1) {
                 self.makeExportLiveAlias(stmts, alias.local, alias.exported);
             }
         }
-        self.live_imports.shrinkRetainingCapacity(li_start);
+        // When inside a function body in bundle mode (IIFE wrapping the entry
+        // body), don't shrink live_imports — the top-level applyLiveBindings
+        // needs them to remove hoisted import var declarations from the
+        // hoisted_import_stmts array (which is separate from the function body).
+        if (!(self.hoist_point_seen and self.fn_nesting_depth > 0)) {
+            self.live_imports.shrinkRetainingCapacity(li_start);
+        }
         self.live_exports.shrinkRetainingCapacity(le_start);
         self.live_export_aliases.shrinkRetainingCapacity(la_start);
     }
@@ -664,6 +751,36 @@ pub const Parser = struct {
             }
         }
         for (stmts) |s| self.rewriteName(s, local, "exports", exported);
+    }
+
+    /// M16: `export { local as exported }` where `local` is a *named* import
+    /// (`import { local } from 'm'`) is — per spec §16.2.1.7.1 step 10.1.ii.3 — an
+    /// indirect re-export of m's binding, identical to `export { local as exported }
+    /// from 'm'`.  Rewrite the generated snapshot `exports.exported = local` into a
+    /// live re-export getter that forwards to the import's namespace (`__esm_X.prop`),
+    /// so the star-export ambiguity check (__starRoot__) traces both forms to the
+    /// SAME (module, name) root.  Returns true when the snapshot was found+rewritten.
+    pub fn rewriteSnapshotToReexport(self: *Parser, stmts: []*Node, local: []const u8, exported: []const u8, ns_name: []const u8, prop: []const u8) bool {
+        for (stmts) |s| {
+            if (s.kind != .expr_stmt) continue;
+            const e = s.data.expr_stmt;
+            if (e.kind != .assignment_expr) continue;
+            const a = e.data.assignment_expr;
+            if (a.op != .assign) continue;
+            if (a.value.kind != .identifier or !std.mem.eql(u8, a.value.data.identifier, local)) continue;
+            const t = a.target;
+            if (t.kind != .member_expr or t.data.member_expr.computed) continue;
+            const obj = t.data.member_expr.object;
+            const propn = t.data.member_expr.property;
+            if (obj.kind != .identifier or !std.mem.eql(u8, obj.data.identifier, "exports")) continue;
+            if (propn.kind != .identifier or !std.mem.eql(u8, propn.data.identifier, exported)) continue;
+            const ns_id = self.mkIdent(ns_name) orelse return false;
+            const member = self.mkMember(ns_id, prop) orelse return false;
+            const getter_stmt = self.mkExportGetter(exported, member) orelse return false;
+            s.* = getter_stmt.*;
+            return true;
+        }
+        return false;
     }
 
     pub fn incCount(self: *Parser, counts: *std.StringHashMap(u32), name: []const u8) void {
@@ -1134,6 +1251,10 @@ pub const Parser = struct {
     /// - super.m(a)  -> super.m.call(this, a)
     pub fn rewriteSuperCall(self: *Parser, call_node: *Node) ?*Node {
         return expr_mod.rewriteSuperCall(self, call_node);
+    }
+
+    pub fn rewriteSuperPropAssign(self: *Parser, op: ast.AssignOp, target: *Node, value: *Node, start: u32, end: u32) ?*Node {
+        return expr_mod.rewriteSuperPropAssign(self, op, target, value, start, end);
     }
 
     /// Parse a member expression without call expressions (for `new` callee).

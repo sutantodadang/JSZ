@@ -249,7 +249,10 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
                     const hobj = holder_val.toPtr().object;
                     const setter = hobj.getOwn("set") orelse return val_mod.makeBool(arena, false);
                     if (isCallable(setter)) {
-                        _ = try fp.invokeCallback(arena, target, setter, &[_]Value{value});
+                        // OrdinarySetWithOwnDescriptor calls the setter with the
+                        // Receiver as thisArg (not the holder), so `super.x = v`
+                        // invokes the inherited setter bound to the instance.
+                        _ = try fp.invokeCallback(arena, receiver, setter, &[_]Value{value});
                         return val_mod.makeBool(arena, true);
                     }
                 }
@@ -258,6 +261,35 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
         }
         // Non-writable data property → OrdinarySet fails (return false).
         if (!attr.writable) return val_mod.makeBool(arena, false);
+    }
+
+    // OrdinarySetWithOwnDescriptor final step: a data binding (or a fresh one)
+    // is created/updated on the *Receiver*, not on the target. When the receiver
+    // differs from the target (e.g. `super.x = v`, where target is the home
+    // prototype and receiver is the instance), consult the receiver's own
+    // descriptor. A Module Namespace receiver runs its exotic [[GetOwnProperty]],
+    // which throws ReferenceError for an uninitialized (TDZ) export.
+    if (receiver.bits != target.bits and isObj(receiver)) {
+        const robj = receiver.toPtr().object;
+        if (robj.internal_kind == .module_namespace) {
+            // Receiver.[[GetOwnProperty]](P): throws for a TDZ export.
+            if (namespace_mod.isTDZ(robj, k)) {
+                return throwReferenceErrorReflect(arena, k);
+            }
+            // An export's [[DefineOwnProperty]] (writable:false redefinition) and
+            // a non-export create on the non-extensible namespace both fail.
+            return val_mod.makeBool(arena, false);
+        }
+        if (robj.resolveOwnSlot(k)) |slot| {
+            const rattr = robj.attrAt(slot);
+            if (rattr.is_accessor) return val_mod.makeBool(arena, false);
+            if (!rattr.writable) return val_mod.makeBool(arena, false);
+            try robj.set(k, value);
+            return val_mod.makeBool(arena, true);
+        }
+        if (!robj.extensible) return val_mod.makeBool(arena, false);
+        try robj.set(k, value);
+        return val_mod.makeBool(arena, true);
     }
 
     try target_obj.set(k, value);

@@ -591,6 +591,25 @@ pub const Lexer = struct {
             }
         }
 
+        // Private name (`#x`): a class private field/method name or a private
+        // member access `obj.#x`. Tokenize `#` + identifier as a single
+        // `.identifier` token whose value INCLUDES the leading `#`, so member
+        // access and field declarations resolve it as the property key "#x".
+        // (We do not implement private brand checks; `#x` is a plain key.)
+        if (c == '#' and self.pos + 1 < self.source.len and isIdentStart(self.source[self.pos + 1])) {
+            self.pos += 1; // consume '#'
+            self.column += 1;
+            while (self.pos < self.source.len and isIdentChar(self.source[self.pos])) {
+                self.pos += 1;
+                self.column += 1;
+            }
+            const slice = self.source[start..self.pos];
+            var t = Token.initSimple(.identifier, @intCast(start), @intCast(self.pos), start_line, start_col, lt_before);
+            t.value_str = slice;
+            self.prev_kind = .identifier;
+            return t;
+        }
+
         // Number
         if (isDecDigit(c) or (c == '.' and self.pos + 1 < self.source.len and isDecDigit(self.source[self.pos + 1]))) {
             if (c == '.') {

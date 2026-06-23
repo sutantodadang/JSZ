@@ -1372,6 +1372,14 @@ pub const BcVm = struct {
                     // object itself while writes (`ns = x`) invoke namespace [[Set]]
                     // and throw TypeError in strict mode.
                     if (std.mem.eql(u8, key, "__ns__")) return obj_val;
+                    // M16: "__backing__" is a synthetic key the bundle's __starRoot__
+                    // helper uses to canonicalize a namespace to its underlying live
+                    // exports object, so a re-export forwarding through a namespace and
+                    // a direct `export {x} from 'm'` resolve to the same binding root.
+                    if (std.mem.eql(u8, key, "__backing__")) {
+                        const bk = namespace_mod.backing(obj) orelse return val_mod.makeUndefined(self.arena);
+                        return try val_mod.makeObject(self.arena, bk);
+                    }
                     const b = namespace_mod.backing(obj) orelse return val_mod.makeUndefined(self.arena);
                     if (namespace_mod.isTDZ(obj, key)) {
                         const realm_m = @import("../runtime/realm.zig");
@@ -2044,7 +2052,7 @@ pub const BcVm = struct {
                 try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
-                if (fn_ptr.name) |fname| {
+                if (fn_ptr.nfe_name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
                         if (std.mem.eql(u8, p, fname)) {
@@ -2074,7 +2082,7 @@ pub const BcVm = struct {
                 }
 
                 // NFE slot.
-                if (fn_ptr.name) |fname| {
+                if (fn_ptr.nfe_name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
                         if (std.mem.eql(u8, p, fname)) {
@@ -2301,7 +2309,7 @@ pub const BcVm = struct {
                 try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
-                if (fn_ptr.name) |fname| {
+                if (fn_ptr.nfe_name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
                         if (std.mem.eql(u8, p, fname)) {
@@ -2329,7 +2337,7 @@ pub const BcVm = struct {
                     }
                 }
 
-                if (fn_ptr.name) |fname| {
+                if (fn_ptr.nfe_name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
                         if (std.mem.eql(u8, p, fname)) {
