@@ -206,6 +206,149 @@ pub fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayL
     }
 }
 
+/// Append the canonical ids of *static* import/export specifiers in `src`
+/// (resolved against `importer_id`) — those introduced by an import/export
+/// declaration (`import ... from "spec"`, bare `import "spec"`, `export ... from
+/// "spec"`), but NOT dynamic `import("spec")`. Static edges are the ones a
+/// module's load depends on, so they (and not dynamic imports) propagate eager
+/// resolution-error taint. A specifier qualifies when the immediately preceding
+/// significant word is `from`, or `import`/`export` directly followed by the
+/// string (bare side-effect import). Comment/string/template aware.
+fn scanStaticSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
+    var i: usize = 0;
+    // The last significant identifier word seen ("from"/"import"/"export"/other).
+    var prev_word: []const u8 = "";
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '/' and i + 1 < src.len and (src[i + 1] == '/' or src[i + 1] == '*')) {
+            i = skipWsComments(src, i);
+            continue;
+        }
+        if (c == '`') {
+            i += 1;
+            while (i < src.len and src[i] != '`') : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            prev_word = "";
+            continue;
+        }
+        if (c == '"' or c == '\'') {
+            const start = i + 1;
+            var j = start;
+            while (j < src.len and src[j] != c) : (j += 1) {
+                if (src[j] == '\\') j += 1;
+            }
+            const lit = src[start..@min(j, src.len)];
+            const is_static = std.mem.eql(u8, prev_word, "from") or
+                std.mem.eql(u8, prev_word, "import") or std.mem.eql(u8, prev_word, "export");
+            if (is_static and (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../"))) {
+                var id = resolveSpec(allocator, importer_id, lit) catch "";
+                if (id.len > 0) {
+                    if (attrTypeAfter(src, j + 1)) |ty| {
+                        id = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ id, ty }) catch id;
+                    }
+                    out.append(allocator, id) catch {};
+                }
+            }
+            i = j + 1;
+            prev_word = "";
+            continue;
+        }
+        if (isIdentChar(c) and !std.ascii.isDigit(c)) {
+            const ws = i;
+            while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
+            prev_word = src[ws..i];
+            continue;
+        }
+        // A `(` right after `import` makes it a dynamic import — clear the marker
+        // so the specifier inside is not treated as a static edge.
+        if (c == '(') prev_word = "";
+        // Any non-identifier token other than skipped whitespace ends the word.
+        if (c != ' ' and c != '\t' and c != '\r' and c != '\n') {
+            if (c != '(') prev_word = "";
+        }
+        i += 1;
+    }
+}
+
+/// Match the keyword `word` as a standalone token at `*i` (after skipping ws/
+/// comments). On success advance `*i` past the word and return true.
+fn matchKeyword(src: []const u8, i: *usize, word: []const u8) bool {
+    const start = skipWsComments(src, i.*);
+    if (start + word.len > src.len) return false;
+    if (!std.mem.eql(u8, src[start .. start + word.len], word)) return false;
+    if (start + word.len < src.len and isIdentChar(src[start + word.len])) return false;
+    i.* = start + word.len;
+    return true;
+}
+
+/// Append the canonical ids of `import defer * as <name> from '<spec>'` static
+/// deferred imports found in `src` (resolved against `importer_id`). Used by the
+/// bundler to distinguish deferred dependency edges from ordinary ones: per the
+/// import-defer × TLA spec (InnerModuleEvaluation), a deferred dependency does
+/// not make the importer wait for the module itself — instead its asynchronous
+/// transitive dependencies (TLA frontier) are evaluated eagerly. Comment/string/
+/// template aware so a deferred-import-shaped string/comment is not matched.
+pub fn scanDeferredSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        // Comments.
+        if (c == '/' and i + 1 < src.len and (src[i + 1] == '/' or src[i + 1] == '*')) {
+            i = skipWsComments(src, i);
+            continue;
+        }
+        // Strings / templates: opaque.
+        if (c == '"' or c == '\'' or c == '`') {
+            i += 1;
+            while (i < src.len and src[i] != c) : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // Identifier / keyword.
+        if (isIdentChar(c) and !std.ascii.isDigit(c)) {
+            const ws = i;
+            while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
+            if (!std.mem.eql(u8, src[ws..i], "import")) continue;
+            // Match the exact `defer * as <ident> from "<spec>"` shape.
+            var j = i;
+            if (!matchKeyword(src, &j, "defer")) continue;
+            j = skipWsComments(src, j);
+            if (j >= src.len or src[j] != '*') continue;
+            j += 1;
+            if (!matchKeyword(src, &j, "as")) continue;
+            j = skipWsComments(src, j);
+            if (j >= src.len or !(isIdentChar(src[j]) and !std.ascii.isDigit(src[j]))) continue;
+            while (j < src.len and isIdentChar(src[j])) : (j += 1) {}
+            if (!matchKeyword(src, &j, "from")) continue;
+            j = skipWsComments(src, j);
+            if (j >= src.len or !(src[j] == '"' or src[j] == '\'')) continue;
+            const q = src[j];
+            const s = j + 1;
+            var k = s;
+            while (k < src.len and src[k] != q) : (k += 1) {
+                if (src[k] == '\\') k += 1;
+            }
+            const lit = src[s..@min(k, src.len)];
+            if (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../")) {
+                var id = resolveSpec(allocator, importer_id, lit) catch "";
+                if (id.len > 0) {
+                    if (attrTypeAfter(src, k + 1)) |ty| {
+                        id = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ id, ty }) catch id;
+                    }
+                    out.append(allocator, id) catch {};
+                }
+            }
+            i = k + 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
 /// Strip the `\x00<type>` attribute suffix from a canonical id, leaving the
 /// bare on-disk path (typed modules — JSON/text — encode their type into the id
 /// so they key distinctly from a plain JS import of the same path).
@@ -678,11 +821,61 @@ fn findSccRoot(
 ///  - If D is in a **different SCC** from M, use D's SCC root (CycleRoot) as
 ///    the actual dep — this matches spec step 11.c.iv which redirects to the
 ///    cycle root when the dep's status is evaluating-async.
+/// Recursive worker for `gatherAsyncTransitive`: walk `id`'s dependency graph,
+/// appending each top-level-await module reached through non-TLA modules to
+/// `out` (deduplicated). Stops descending at a TLA module (its own async deps
+/// are reached when it itself evaluates) and at typed (data) modules.
+fn gatherInto(
+    arena: std.mem.Allocator,
+    tla_set: *std.StringHashMap(void),
+    dep_of: *std.StringHashMap([]const []const u8),
+    id: []const u8,
+    seen: *std.StringHashMap(void),
+    out: *std.ArrayList([]const u8),
+) void {
+    if (seen.contains(id)) return;
+    seen.put(id, {}) catch {};
+    if (idType(id) != null) return; // typed (data) module: not a Cyclic Module Record
+    if (tla_set.contains(id)) {
+        for (out.items) |x| if (std.mem.eql(u8, x, id)) return;
+        out.append(arena, id) catch {};
+        return;
+    }
+    const ds = dep_of.get(id) orelse return;
+    for (ds) |d| gatherInto(arena, tla_set, dep_of, d, seen, out);
+}
+
+/// GatherAsynchronousTransitiveDependencies (import-defer × TLA spec op,
+/// sec-innermoduleevaluation): the frontier of top-level-await modules reachable
+/// from `id` through non-TLA modules. When `id` is deferred-imported, these
+/// frontier modules must be evaluated *eagerly* (async evaluation cannot be done
+/// lazily on a synchronous namespace access), while `id` itself stays deferred.
+fn gatherAsyncTransitive(
+    arena: std.mem.Allocator,
+    tla_set: *std.StringHashMap(void),
+    dep_of: *std.StringHashMap([]const []const u8),
+    id: []const u8,
+) []const []const u8 {
+    var out = std.ArrayList([]const u8){};
+    var seen = std.StringHashMap(void).init(arena);
+    gatherInto(arena, tla_set, dep_of, id, &seen, &out);
+    return out.items;
+}
+
+/// True when `dep` is a deferred-import dependency of `id`.
+fn isDeferredEdge(deferred_of: *std.StringHashMap([]const []const u8), id: []const u8, dep: []const u8) bool {
+    const list = deferred_of.get(id) orelse return false;
+    for (list) |d| if (std.mem.eql(u8, d, dep)) return true;
+    return false;
+}
+
 fn asyncDepsList(
     arena: std.mem.Allocator,
     async_set: *std.StringHashMap(void),
     dep_of: *std.StringHashMap([]const []const u8),
     dfs_order: *std.StringHashMap(usize),
+    deferred_of: *std.StringHashMap([]const []const u8),
+    tla_set: *std.StringHashMap(void),
     id: []const u8,
 ) []const []const u8 {
     const deps = dep_of.get(id) orelse return &[_][]const u8{};
@@ -690,6 +883,16 @@ fn asyncDepsList(
     var seen = std.StringHashMap(void).init(arena);
     const my_order = dfs_order.get(id) orelse std.math.maxInt(usize);
     for (deps) |d| {
+        // Deferred edge: the importer does not wait for the deferred module, but
+        // for its eagerly-evaluated async transitive dependencies (TLA frontier).
+        if (isDeferredEdge(deferred_of, id, d)) {
+            for (gatherAsyncTransitive(arena, tla_set, dep_of, d)) |g| {
+                if (seen.contains(g)) continue;
+                seen.put(g, {}) catch {};
+                out.append(arena, g) catch {};
+            }
+            continue;
+        }
         if (!async_set.contains(d)) continue;
         const d_order = dfs_order.get(d) orelse std.math.maxInt(usize);
         const in_same_scc = canReach(arena, dep_of, d, id);
@@ -1137,40 +1340,20 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), out_tdz
                 }
                 continue;
             }
-            // export let <name> (TDZ)
+            // export let/const <names...> (TDZ) and export var <names...> (hoisted):
+            // scan the WHOLE comma-separated declarator list, not just the first
+            // name, so `export let a, b, c;` registers every binding.
             if (std.mem.startsWith(u8, rest, "let ")) {
-                var j: usize = 4;
-                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
-                const name_start = j;
-                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
-                if (j > name_start) {
-                    out.append(allocator, rest[name_start..j]) catch {};
-                    out_tdz.append(allocator, rest[name_start..j]) catch {}; // let is TDZ
-                }
+                scanDeclaratorNames(rest[4..], out, out_tdz, true, allocator);
                 continue;
             }
-            // export var <name> (hoisted, NOT TDZ)
             if (std.mem.startsWith(u8, rest, "var ")) {
-                var j: usize = 4;
-                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
-                const name_start = j;
-                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
-                if (j > name_start) {
-                    out.append(allocator, rest[name_start..j]) catch {};
-                    // var is NOT added to out_tdz — hoisted, initialized to undefined
-                }
+                // var is hoisted (initialized to undefined), so not TDZ.
+                scanDeclaratorNames(rest[4..], out, out_tdz, false, allocator);
                 continue;
             }
-            // export const <name> (TDZ)
             if (std.mem.startsWith(u8, rest, "const ")) {
-                var j: usize = 6;
-                while (j < rest.len and rest[j] == ' ') : (j += 1) {}
-                const name_start = j;
-                while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '$')) : (j += 1) {}
-                if (j > name_start) {
-                    out.append(allocator, rest[name_start..j]) catch {};
-                    out_tdz.append(allocator, rest[name_start..j]) catch {}; // const is TDZ
-                }
+                scanDeclaratorNames(rest[6..], out, out_tdz, true, allocator);
                 continue;
             }
             continue;
@@ -1178,6 +1361,87 @@ pub fn findExportNames(src: []const u8, out: *std.ArrayList([]const u8), out_tdz
         i += 1;
     }
 }
+
+/// Scan a `let`/`var`/`const` declarator list (the text right after the keyword)
+/// and append every top-level binding identifier to `out` (and to `out_tdz` when
+/// `is_tdz`). Initializers are skipped while tracking bracket/paren/brace depth
+/// and string literals so a comma inside an initializer (e.g.
+/// `new Promise((r, j) => …)`) is not mistaken for a declarator separator. Only
+/// plain identifier bindings are collected; a destructuring pattern (`{`/`[`)
+/// ends the scan (matching the previous behaviour of not registering those).
+fn scanDeclaratorNames(
+    rest: []const u8,
+    out: *std.ArrayList([]const u8),
+    out_tdz: *std.ArrayList([]const u8),
+    is_tdz: bool,
+    allocator: std.mem.Allocator,
+) void {
+    const ch = struct {
+        fn identStart(c: u8) bool {
+            return std.ascii.isAlphabetic(c) or c == '_' or c == '$' or c >= 0x80;
+        }
+        fn identPart(c: u8) bool {
+            return std.ascii.isAlphanumeric(c) or c == '_' or c == '$' or c >= 0x80;
+        }
+        fn space(c: u8) bool {
+            return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+        }
+    };
+
+    var j: usize = 0;
+    while (j < rest.len) {
+        while (j < rest.len and ch.space(rest[j])) : (j += 1) {}
+        if (j >= rest.len or !ch.identStart(rest[j])) break;
+        const name_start = j;
+        while (j < rest.len and ch.identPart(rest[j])) : (j += 1) {}
+        out.append(allocator, rest[name_start..j]) catch {};
+        if (is_tdz) out_tdz.append(allocator, rest[name_start..j]) catch {};
+        while (j < rest.len and ch.space(rest[j])) : (j += 1) {}
+        if (j >= rest.len) break;
+        if (rest[j] == ',') {
+            j += 1;
+            continue;
+        }
+        if (rest[j] != '=') break; // ';', or end of declaration
+        // Skip the initializer up to a top-level ',' or ';'.
+        j += 1;
+        var depth: i32 = 0;
+        var done = false;
+        while (j < rest.len) {
+            const c = rest[j];
+            if (c == '"' or c == '\'' or c == '`') {
+                const q = c;
+                j += 1;
+                while (j < rest.len) : (j += 1) {
+                    if (rest[j] == '\\') {
+                        j += 1;
+                        continue;
+                    }
+                    if (rest[j] == q) break;
+                }
+                if (j < rest.len) j += 1;
+                continue;
+            }
+            if (c == '(' or c == '[' or c == '{') {
+                depth += 1;
+            } else if (c == ')' or c == ']' or c == '}') {
+                if (depth == 0) {
+                    done = true;
+                    break;
+                }
+                depth -= 1;
+            } else if (depth == 0 and (c == ',' or c == ';')) {
+                break;
+            }
+            j += 1;
+        }
+        if (done or j >= rest.len) break;
+        if (rest[j] == ';') break;
+        // rest[j] == ',' — advance to the next declarator.
+        j += 1;
+    }
+}
+
 /// Build a self-contained script: a `__modules__` registry of every relative
 /// `base_dir`), each wrapped as a `function(require, module, exports)` factory
 /// keyed by its canonical id, followed by the entry body. This realises the
@@ -1203,6 +1467,11 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
 
     const self_id = entry_id orelse ENTRY_ID;
     var registry = std.StringArrayHashMap([]const u8).init(arena);
+    // Relative specifiers that could not be read from disk: per spec, module
+    // resolution errors are reported eagerly at load (LoadRequestedModules walks
+    // the whole graph, deferred deps included), so a module that transitively
+    // imports one of these must fail to load rather than evaluate lazily.
+    var missing_ids = std.StringHashMap(void).init(arena);
     var queue = std.ArrayList([]const u8){};
     scanSpecifiers(entry_src, self_id, &queue, arena);
     var qi: usize = 0;
@@ -1212,12 +1481,59 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         // not a disk re-read, so skip its own id here.
         if (std.mem.eql(u8, id, self_id)) continue;
         if (registry.contains(id)) continue;
-        const src = readModuleFile(arena, base_dir, id) orelse continue;
+        const src = readModuleFile(arena, base_dir, id) orelse {
+            try missing_ids.put(id, {});
+            continue;
+        };
         try registry.put(id, src);
         // Typed (JSON/text) modules are opaque data, not JS — don't scan their
         // contents for nested specifiers (a JSON string value could look like a
         // relative path).
         if (idType(id) == null) scanSpecifiers(src, id, &queue, arena);
+    }
+
+    // Eager resolution-error taint (sec-LoadRequestedModules): a module is
+    // "unresolvable" if it transitively — via *static* import edges only, so
+    // dynamic `import()` does not taint its importer — imports a module missing
+    // from disk. `import()`/`require()` of such a module must reject/throw at load
+    // rather than evaluate lazily, even when the missing module sits behind an
+    // `import defer` (deferred-ness affects evaluation, not loading).
+    var tainted = std.StringHashMap(void).init(arena);
+    if (missing_ids.count() > 0) {
+        var static_dep_of = std.StringHashMap([]const []const u8).init(arena);
+        {
+            var rit = registry.iterator();
+            while (rit.next()) |e| {
+                const id = e.key_ptr.*;
+                if (idType(id) != null) {
+                    try static_dep_of.put(id, &[_][]const u8{});
+                    continue;
+                }
+                var ds = std.ArrayList([]const u8){};
+                scanStaticSpecifiers(e.value_ptr.*, id, &ds, arena);
+                try static_dep_of.put(id, ds.items);
+            }
+            var eds = std.ArrayList([]const u8){};
+            scanStaticSpecifiers(entry_src, self_id, &eds, arena);
+            try static_dep_of.put(self_id, eds.items);
+        }
+        // Fixpoint: a module is tainted if a static dep is missing or tainted.
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var sit = static_dep_of.iterator();
+            while (sit.next()) |e| {
+                const id = e.key_ptr.*;
+                if (tainted.contains(id)) continue;
+                for (e.value_ptr.*) |d| {
+                    if (missing_ids.contains(d) or tainted.contains(d)) {
+                        try tainted.put(id, {});
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // M16 TLA: classify which modules (and the entry) must evaluate as async
@@ -1227,6 +1543,30 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     // DFS pre-order discovery times from entry — used by asyncDepsList to detect
     // back-edge (cycle-ancestor) deps and redirect cross-SCC deps to their SCC root.
     var dfs_order = computeDfsOrder(arena, &dep_of, self_id);
+
+    // Import-defer × TLA: the set of modules with *direct* top-level await
+    // (spec [[HasTLA]]) and, per importer, the set of deferred-imported deps.
+    // A deferred dependency does not make the importer wait for the module
+    // itself — instead its TLA frontier (GatherAsynchronousTransitiveDependencies)
+    // is evaluated eagerly. `deferred_of` keys the importing module to that frontier.
+    var tla_set = std.StringHashMap(void).init(arena);
+    var deferred_of = std.StringHashMap([]const []const u8).init(arena);
+    {
+        var rit = registry.iterator();
+        while (rit.next()) |e| {
+            const id = e.key_ptr.*;
+            if (idType(id) != null) continue;
+            const src = e.value_ptr.*;
+            if (hasTopLevelAwait(src)) try tla_set.put(id, {});
+            var ds = std.ArrayList([]const u8){};
+            scanDeferredSpecifiers(src, id, &ds, arena);
+            try deferred_of.put(id, ds.items);
+        }
+        if (hasTopLevelAwait(entry_src)) try tla_set.put(self_id, {});
+        var eds = std.ArrayList([]const u8){};
+        scanDeferredSpecifiers(entry_src, self_id, &eds, arena);
+        try deferred_of.put(self_id, eds.items);
+    }
 
     var sb = std.ArrayList(u8){};
     errdefer sb.deinit(gpa);
@@ -1248,6 +1588,77 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     try sb.appendSlice(gpa, "function __exportStar__(t,s){var amb=__ambMap__.get(t);var ks=Object.keys(s);for(var i=0;i<ks.length;i++){var k=ks[i];if(k===\"default\")continue;if(amb&&amb[k])continue;if(Object.prototype.hasOwnProperty.call(t,k)){var ex=Object.getOwnPropertyDescriptor(t,k);if(ex&&ex.get&&ex.get.__star){var r1=__starRoot__(ex.get.__s,ex.get.__k);var r2=__starRoot__(s,k);if(r1===null){if(r2!==null){var g2=__exportStarGetter__(s,k);g2.__star=true;Object.defineProperty(t,k,{get:g2,enumerable:true,configurable:true});}continue;}if(r2===null)continue;if(r1[0]!==r2[0]||r1[1]!==r2[1]){delete t[k];if(!amb){amb={};__ambMap__.set(t,amb);}amb[k]=true;}}continue;}var gg=__exportStarGetter__(s,k);gg.__star=true;Object.defineProperty(t,k,{get:gg,enumerable:true,configurable:true});}}\n");
     try sb.appendSlice(gpa, "function __liveReexport__(e,n,s,p){var g=function(){return s[p];};g.__s=s;g.__k=p;Object.defineProperty(e,n,{get:g,enumerable:true,configurable:true});}\n");
     try sb.appendSlice(gpa, "function __liveLocalExport__(e,n,g){var w={};Object.defineProperty(w,\"v\",{get:g,enumerable:true,configurable:true});__liveReexport__(e,n,w,\"v\");}\n");
+    // Import-defer × TLA: `__deferGather__[id]` is the eager-evaluation frontier
+    // (GatherAsynchronousTransitiveDependencies) for a deferred-imported module.
+    // `__importDefer__(id)` requires each listed module so its async (top-level
+    // await) dependencies are evaluated eagerly, in source order, even though the
+    // deferred module itself stays unevaluated until first access.
+    try sb.appendSlice(gpa, "var __deferGather__ = {};\n");
+    {
+        var emitted = std.StringHashMap(void).init(arena);
+        var dit = deferred_of.iterator();
+        while (dit.next()) |e| {
+            for (e.value_ptr.*) |target| {
+                if (emitted.contains(target)) continue;
+                try emitted.put(target, {});
+                const frontier = gatherAsyncTransitive(arena, &tla_set, &dep_of, target);
+                if (frontier.len == 0) continue;
+                try sb.appendSlice(gpa, "__deferGather__[");
+                try appendJsString(gpa, &sb, target);
+                try sb.appendSlice(gpa, "]=[");
+                for (frontier, 0..) |f, fi| {
+                    if (fi > 0) try sb.appendSlice(gpa, ",");
+                    try appendJsString(gpa, &sb, f);
+                }
+                try sb.appendSlice(gpa, "];\n");
+            }
+        }
+    }
+    // Import-defer ReadyForSyncExecution (sec-EnsureDeferredNamespaceEvaluation):
+    // accessing a deferred namespace throws a TypeError unless the module's whole
+    // synchronous frontier is ready — no module in it is still ~evaluating~/
+    // ~evaluating-async~, and none has top-level await. The runtime needs each
+    // module's resolved dependency id list and its [[HasTLA]] flag to walk that
+    // frontier without evaluating anything, so emit them as `__moduleGraph__`.
+    // Eager resolution-error set: `require`/`import()` of a listed id throws a
+    // module-not-found error at load (before any evaluation).
+    try sb.appendSlice(gpa, "var __moduleUnresolved__ = {};\n");
+    {
+        var tit = tainted.iterator();
+        while (tit.next()) |e| {
+            try sb.appendSlice(gpa, "__moduleUnresolved__[");
+            try appendJsString(gpa, &sb, e.key_ptr.*);
+            try sb.appendSlice(gpa, "]=true;\n");
+        }
+    }
+    try sb.appendSlice(gpa, "var __moduleGraph__ = {};\n");
+    {
+        var git = dep_of.iterator();
+        while (git.next()) |e| {
+            const id = e.key_ptr.*;
+            try sb.appendSlice(gpa, "__moduleGraph__[");
+            try appendJsString(gpa, &sb, id);
+            try sb.appendSlice(gpa, "]={tla:");
+            try sb.appendSlice(gpa, if (tla_set.contains(id)) "true" else "false");
+            try sb.appendSlice(gpa, ",deps:[");
+            for (e.value_ptr.*, 0..) |d, di| {
+                if (di > 0) try sb.appendSlice(gpa, ",");
+                try appendJsString(gpa, &sb, d);
+            }
+            try sb.appendSlice(gpa, "]};\n");
+        }
+    }
+    // ReadyForSyncExecution(module, seen): walk the module's synchronous frontier
+    // and report whether it can be evaluated synchronously right now. A module is
+    // not ready if it (or any transitive dependency) is currently ~evaluating~ or
+    // has top-level await. `__moduleStatus__` derives the spec [[Status]] from the
+    // runtime record: a still-a-function entry is ~linked~ (factory not invoked);
+    // an object with `loaded===false` is ~evaluating~; otherwise ~evaluated~.
+    try sb.appendSlice(gpa,
+        \\function __moduleStatus__(id){var m=__modules__[id];if(m===undefined)return "linked";if(typeof m==="function")return "linked";if(m.__evalError__!==undefined)return "evaluated";if(m.loaded===false)return "evaluating";return "evaluated";}
+        \\function __readyForSync__(id,seen){if(!seen)seen=[];if(seen.indexOf(id)!==-1)return true;seen.push(id);var st=__moduleStatus__(id);if(st==="evaluated")return true;if(st==="evaluating")return false;var g=__moduleGraph__[id];if(!g)return true;if(g.tla)return false;var deps=g.deps;for(var i=0;i<deps.length;i++){if(!__readyForSync__(deps[i],seen))return false;}return true;}
+        \\
+    );
     var it = registry.iterator();
     while (it.next()) |e| {
         const mod_id = e.key_ptr.*;
@@ -1344,7 +1755,7 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         // barrier after the import prologue so the body runs only once every
         // async dependency has finished evaluating (spec PendingAsyncDependencies).
         const mod_src = e.value_ptr.*;
-        const async_deps = asyncDepsList(arena, &async_set, &dep_of, &dfs_order, mod_id);
+        const async_deps = asyncDepsList(arena, &async_set, &dep_of, &dfs_order, &deferred_of, &tla_set, mod_id);
         if (mod_is_async and async_deps.len > 0) {
             const split = findImportPrologueEnd(mod_src);
             try sb.appendSlice(gpa, mod_src[0..split]);
@@ -1362,9 +1773,12 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     if (entry_id != null) {
         // Pre-register the entry so a self-/cyclic `require` returns this exact
         // (partial) exports object — cache-before-invoke for the entry itself.
+        // `loaded === false` marks the entry as ~evaluating~ for the duration of
+        // its body, so a deferred-namespace ReadyForSyncExecution check that
+        // reaches the entry (a self/cyclic `import defer`) sees it as not-ready.
         try sb.appendSlice(gpa, "__modules__[\"");
         try sb.appendSlice(gpa, self_id);
-        try sb.appendSlice(gpa, "\"] = module;\n");
+        try sb.appendSlice(gpa, "\"] = module; module.loaded = false;\n");
     }
     // M16: the host (test262 runner) may prepend a harness prelude (assert/sta/
     // $262) to the entry, separated by this sentinel.  The prelude must live at
@@ -1467,7 +1881,7 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     // IIFE runs), so all dependency `require()`s have completed; barrier here
     // awaits any async dependency's evaluation-completion promise before the body.
     if (entry_is_async) {
-        const entry_async_deps = asyncDepsList(arena, &async_set, &dep_of, &dfs_order, self_id);
+        const entry_async_deps = asyncDepsList(arena, &async_set, &dep_of, &dfs_order, &deferred_of, &tla_set, self_id);
         if (entry_async_deps.len > 0) try emitAwaitDeps(gpa, &sb, entry_async_deps);
     }
     try sb.appendSlice(gpa, body_part);
@@ -1478,6 +1892,8 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         try sb.appendSlice(gpa, "\n})(require,module,exports).then(void 0,__jszModuleReject__);\n")
     else
         try sb.appendSlice(gpa, "\n})(require,module,exports);\n");
+    // The entry body has returned: it is now ~evaluated~ (see loaded=false above).
+    if (entry_id != null) try sb.appendSlice(gpa, "module.loaded = true;\n");
     const result = try sb.toOwnedSlice(gpa);
     if (std.posix.getenv("JSZ_DUMP_BUNDLE") != null) {
         const f = std.fs.cwd().createFile("/tmp/bundle_dump.js", .{}) catch return result;

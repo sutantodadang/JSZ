@@ -99,6 +99,14 @@ pub const Parser = struct {
     /// nesting depth 0). The module then has top-level await and its top-level
     /// program is compiled/driven as an async body (real per-await suspension).
     saw_top_level_await: bool,
+    /// Set by parsePrimary when a `super` token is parsed. parseObjectLiteral
+    /// saves/clears it around each method body to detect object-method `super`
+    /// usage so it can bind `super`/`__sproto__`/`__superthis` to the home
+    /// object's prototype (object literals have no Super class binding).
+    super_used: bool,
+    /// Monotonic counter for the hidden `__home_N` capture var injected by
+    /// parseObjectLiteral for object literals whose methods use `super`.
+    home_obj_counter: u32,
 
     pub fn init(source: []const u8, arena: std.mem.Allocator) Parser {
         var p = Parser{
@@ -121,6 +129,8 @@ pub const Parser = struct {
             .hoist_point_idx = 0,
             .export_default_name_hint = null,
             .saw_top_level_await = false,
+            .super_used = false,
+            .home_obj_counter = 0,
         };
         // Prime the lookahead.
         p.current = p.lexNext();
@@ -559,6 +569,24 @@ pub const Parser = struct {
             .var_decl => list.append(self.arena, node.data.var_decl.name) catch {},
             .function_decl => list.append(self.arena, node.data.function_decl.name) catch {},
             .block_stmt => for (node.data.block_stmt.body) |c| self.collectDeclNames(c, list),
+            else => {},
+        }
+    }
+
+    /// Register every `var`/`let`/`const` declarator name in an `export <decl>`
+    /// as a live export, recursing into the `block_stmt` that a multi-declarator
+    /// statement (`export let a, b, c;`) lowers to. Without walking the block,
+    /// only the first declarator of a multi-name export would get a live binding,
+    /// leaving later names (and assignments to them) invisible to importers.
+    pub fn registerDeclLiveExports(self: *Parser, node: *Node) void {
+        switch (node.kind) {
+            .var_decl => {
+                const vkind = node.data.var_decl.kind;
+                if (vkind == .var_ or !self.is_module or self.fn_nesting_depth > 0 or self.hoist_point_seen) {
+                    self.live_exports.append(self.arena, node.data.var_decl.name) catch {};
+                }
+            },
+            .block_stmt => for (node.data.block_stmt.body) |c| self.registerDeclLiveExports(c),
             else => {},
         }
     }

@@ -456,6 +456,26 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
     const decl = p.parseStatement() orelse return null;
     var names = std.ArrayList([]const u8){};
     p.collectDeclNames(decl, &names);
+    // A multi-declarator `export let a, b, c;` lowers to a `block_stmt` wrapping
+    // the individual var_decls. Left as a block it would (1) block-scope the
+    // bindings away from the rest of the module body and (2) hide the var_decls
+    // from `makeExportLive`, which only scans top-level statements — so neither
+    // the live-binding rewrite nor importers would observe later assignments.
+    // Flatten it: keep the first declarator as the returned statement and splice
+    // the rest into the module's statement stream (before the export snapshots).
+    var result_decl = decl;
+    if (decl.kind == .block_stmt) {
+        const body = decl.data.block_stmt.body;
+        if (body.len > 0) {
+            result_decl = body[0];
+            for (body[1..]) |d| {
+                p.extra_stmts.append(p.arena, d) catch {
+                    p.had_error = true;
+                    return null;
+                };
+            }
+        }
+    }
     for (names.items) |nm| {
         const a = p.mkExportAssign(nm, p.mkIdent(nm) orelse return null) orelse return null;
         p.extra_stmts.append(p.arena, a) catch {
@@ -469,13 +489,10 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
     // bundle entry (hoist_point_seen), or script mode (unit tests, !is_module).
     // Standalone evalModule (no bundle) keeps env-level TDZ for let/const — the
     // GET_GLOBAL_OPT handler already throws for TemporalDeadZone.
-    if (decl.kind == .var_decl) {
-        const vkind = decl.data.var_decl.kind;
-        if (vkind == .var_ or !p.is_module or p.fn_nesting_depth > 0 or p.hoist_point_seen) {
-            p.live_exports.append(p.arena, decl.data.var_decl.name) catch {};
-        }
-    }
-    return decl;
+    // Register live exports for every declarator name, including each name of a
+    // multi-declarator `export let a, b, c;` (which lowers to a block_stmt).
+    p.registerDeclLiveExports(decl);
+    return result_decl;
 }
 
 pub fn parseStatement(p: *Parser) ?*Node {
@@ -1169,17 +1186,22 @@ pub fn parseTryStmt(p: *Parser) ?*Node {
 
     if (p.check(.kw_catch)) {
         _ = p.advance(); // consume 'catch'
-        _ = p.expect(.left_paren) orelse return null;
-        const catch_param_name: []const u8 = if (p.check(.left_brace) or p.check(.left_bracket)) blk: {
-            // Destructuring catch param: skip balanced pattern, bind exc to temp.
-            const tmp = std.fmt.allocPrint(p.arena, "__catch_{d}", .{start}) catch return null;
-            skipDestructuringPattern(p);
-            break :blk tmp;
-        } else blk: {
-            const tok = p.expect(.identifier) orelse return null;
-            break :blk tok.value_str;
-        };
-        _ = p.expect(.right_paren) orelse return null;
+        // Optional catch binding (ES2019): `catch { ... }` with no `(param)`.
+        // An empty param_name signals "no binding" to the lowering pass.
+        var catch_param_name: []const u8 = "";
+        if (p.check(.left_paren)) {
+            _ = p.advance(); // consume '('
+            catch_param_name = if (p.check(.left_brace) or p.check(.left_bracket)) blk: {
+                // Destructuring catch param: skip balanced pattern, bind exc to temp.
+                const tmp = std.fmt.allocPrint(p.arena, "__catch_{d}", .{start}) catch return null;
+                skipDestructuringPattern(p);
+                break :blk tmp;
+            } else blk: {
+                const tok = p.expect(.identifier) orelse return null;
+                break :blk tok.value_str;
+            };
+            _ = p.expect(.right_paren) orelse return null;
+        }
         const catch_body = p.parseBlock() orelse return null;
         handler = ast.CatchClause{
             .param_name = catch_param_name,

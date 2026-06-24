@@ -165,6 +165,66 @@ fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
 }
 
+/// Build a derived-class instance-field initializer targeting `__superthis`
+/// (the object returned by `super()`), which is the `this` of a derived class
+/// once the parent constructor has run. Unlike a base class — where fields are
+/// prepended to the constructor body and assigned via `this.<f> = init` — a
+/// derived class has no usable `this` until after `super()`, so the field must
+/// be installed on `__superthis`.
+///
+/// Public fields use [[DefineOwnProperty]] (CreateDataProperty semantics:
+/// `Object.defineProperty(__superthis, key, {value, writable, enumerable,
+/// configurable})`), not [[Set]] — class fields define own data properties and
+/// must not invoke inherited setters or be intercepted by an exotic [[Set]]
+/// (e.g. a module namespace returned from the base ctor, where the define is the
+/// operation that triggers deferred evaluation). Private fields keep the
+/// member-assignment form (`__superthis.#name = init`), which is PrivateFieldAdd.
+fn makeDerivedInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
+    const s = p.current.start;
+    const superthis = nodeIdent(p, "__superthis") orelse return null;
+    const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+
+    // Private fields: `__superthis.#name = init` (member assignment → PrivateFieldAdd).
+    if (f.computed_key == null and f.name.len > 0 and f.name[0] == '#') {
+        const lhs = nodeMember(p, superthis, f.name) orelse return null;
+        const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
+        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+    }
+
+    // Public fields: Object.defineProperty(__superthis, key,
+    //   { value: init, writable: true, enumerable: true, configurable: true }).
+    const key_val = if (f.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = f.name }) orelse return null);
+    const t1 = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
+    const t2 = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
+    const t3 = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
+    var props = std.ArrayList(ast.ObjectProp){};
+    props.append(p.arena, .{ .key = "value", .value = val }) catch return null;
+    props.append(p.arena, .{ .key = "writable", .value = t1 }) catch return null;
+    props.append(p.arena, .{ .key = "enumerable", .value = t2 }) catch return null;
+    props.append(p.arena, .{ .key = "configurable", .value = t3 }) catch return null;
+    const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
+
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, superthis) catch return null;
+    args.append(p.arena, key_val) catch return null;
+    args.append(p.arena, desc) catch return null;
+    const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
+    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
+}
+
+/// Append derived-class instance-field initializers (skipping static fields) to
+/// `list`. Returns false on allocation failure.
+fn appendDerivedInstanceFields(p: *Parser, list: *std.ArrayList(*Node), fields: []const ClassField) bool {
+    for (fields) |f| {
+        if (f.is_static) continue;
+        const st = makeDerivedInstanceFieldInit(p, f) orelse return false;
+        list.append(p.arena, st) catch return false;
+    }
+    return true;
+}
+
 /// Build a static-field initializer statement: `ClassName.<name> = <init>`.
 fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node {
     const s = p.current.start;
@@ -332,9 +392,26 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
             const rc_call = p.makeNode(.call_expr, start, start, .{
                 .call_expr = .{ .callee = callee, .args = rc_args.items },
             }) orelse return null;
-            const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = rc_call }) orelse return null;
+            var has_instance_field = false;
+            for (fields) |f| {
+                if (!f.is_static) has_instance_field = true;
+            }
             var body = std.ArrayList(*Node){};
-            body.append(p.arena, ret_stmt) catch return null;
+            if (has_instance_field) {
+                // Derived class with instance fields: capture the parent result in
+                // `__superthis`, install the fields on it (DefineOwnProperty), and
+                // let the constructor wrapper below emit `return __superthis;`.
+                const id_st = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+                const assign = p.makeNode(.assignment_expr, start, start, .{
+                    .assignment_expr = .{ .op = .assign, .target = id_st, .value = rc_call },
+                }) orelse return null;
+                const assign_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign }) orelse return null;
+                body.append(p.arena, assign_stmt) catch return null;
+                if (!appendDerivedInstanceFields(p, &body, fields)) return null;
+            } else {
+                const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = rc_call }) orelse return null;
+                body.append(p.arena, ret_stmt) catch return null;
+            }
             ctor_body = body.items;
         } else {
             ctor_body = &[_]*Node{};
@@ -407,6 +484,9 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         const helper_ret = p.makeNode(.return_stmt, start, start, .{ .return_stmt = id_st_r }) orelse return null;
         var helper_body = std.ArrayList(*Node){};
         helper_body.append(p.arena, assign_stmt) catch return null;
+        // Install instance fields on `__superthis` right after the parent ctor
+        // returns — the spec point where a derived class initializes its fields.
+        if (!appendDerivedInstanceFields(p, &helper_body, fields)) return null;
         helper_body.append(p.arena, helper_ret) catch return null;
         const helper_fn = p.makeNode(.function_expr, start, start, .{
             .function_expr = .{

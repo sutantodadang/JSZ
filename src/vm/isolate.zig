@@ -550,7 +550,12 @@ pub fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]
                 if (emitted_any) try out.appendSlice(arena, " + ");
                 try out.appendSlice(arena, "(");
                 if (expr_end >= expr_start and expr_end <= source.len) {
-                    try out.appendSlice(arena, source[expr_start..expr_end]);
+                    // The substitution expression may itself contain template
+                    // literals (e.g. `a${cond ? `x${y}` : ""}b`), so rewrite it
+                    // recursively rather than copying it through verbatim — an
+                    // un-rewritten nested backtick would reach the lexer and fail.
+                    const inner = try rewriteTemplateLiterals(arena, source[expr_start..expr_end]);
+                    try out.appendSlice(arena, inner);
                 }
                 try out.appendSlice(arena, ")");
                 emitted_any = true;

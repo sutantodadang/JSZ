@@ -135,6 +135,16 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
             }
         }
         const start = left.start;
+        // Private-in brand check: `#name in obj`. `#name` lexes as an identifier
+        // whose value includes the leading '#'; as a bare reference it would be an
+        // undefined-variable error. Private elements are own-only and JSZ stores
+        // them under the property key "#name", so rewrite the LHS to that string
+        // literal — `in` then performs the HasProperty(obj, "#name") brand check.
+        if (op_kind == .kw_in and left.kind == .identifier and
+            left.data.identifier.len > 0 and left.data.identifier[0] == '#')
+        {
+            left = p.makeNode(.string_literal, left.start, left.start, .{ .string_literal = left.data.identifier }) orelse return null;
+        }
         left = switch (op_kind) {
             .amp_amp, .pipe_pipe, .question_question => p.makeNode(.logical_expr, start, p.current.start, .{
                 .logical_expr = .{
@@ -450,6 +460,16 @@ pub fn parseBinaryExpr(p: *Parser, min_prec: u8) ?*Node {
             }
         }
         const start = left.start;
+        // Private-in brand check: `#name in obj`. `#name` lexes as an identifier
+        // whose value includes the leading '#'; as a bare reference it would be an
+        // undefined-variable error. Private elements are own-only and JSZ stores
+        // them under the property key "#name", so rewrite the LHS to that string
+        // literal — `in` then performs the HasProperty(obj, "#name") brand check.
+        if (op_kind == .kw_in and left.kind == .identifier and
+            left.data.identifier.len > 0 and left.data.identifier[0] == '#')
+        {
+            left = p.makeNode(.string_literal, left.start, left.start, .{ .string_literal = left.data.identifier }) orelse return null;
+        }
         left = switch (op_kind) {
             .amp_amp, .pipe_pipe, .question_question => p.makeNode(.logical_expr, start, p.current.start, .{
                 .logical_expr = .{
@@ -836,6 +856,7 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
         },
         .kw_super => {
             _ = p.advance();
+            p.super_used = true;
             return p.makeNode(.identifier, start, end, .{ .identifier = "super" });
         },
         .kw_import => {
@@ -997,6 +1018,12 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
     const start = p.current.start;
     _ = p.expect(.left_brace) orelse return null;
     var props = std.ArrayList(ast.ObjectProp){};
+    // Object-method `super`: collect the method/accessor function nodes whose
+    // bodies referenced `super` (detected via p.super_used). `saved_super`
+    // preserves any pending super flag from the enclosing scope so it is not
+    // swallowed by this object's method-body parses.
+    const saved_super = p.super_used;
+    var super_methods = std.ArrayList(*Node){};
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const prop_start = p.current.start;
         // ES6 computed key: `{ [expr]: value }`. The key expression is
@@ -1009,6 +1036,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             // property with a runtime-evaluated key.
             if (p.check(.left_paren)) {
                 const cm_params = p.parseFunctionParams() orelse return null;
+                p.super_used = false;
                 const cm_body = p.parseFunctionBody() orelse return null;
                 const cm_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                     .function_expr = .{
@@ -1023,6 +1051,10 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                         .is_strict = parser_file.hasUseStrict(cm_body),
                     },
                 }) orelse return null;
+                if (p.super_used) super_methods.append(p.arena, cm_fn) catch {
+                    p.had_error = true;
+                    return null;
+                };
                 props.append(p.arena, ast.ObjectProp{ .key = "", .value = cm_fn, .kind = .init, .computed_key = key_expr }) catch {
                     p.had_error = true;
                     return null;
@@ -1108,6 +1140,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 return null;
             }
             const acc_params = p.parseFunctionParams() orelse return null;
+            p.super_used = false;
             const acc_body = p.parseFunctionBody() orelse return null;
             const acc_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
@@ -1122,6 +1155,10 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_strict = parser_file.hasUseStrict(acc_body),
                 },
             }) orelse return null;
+            if (p.super_used) super_methods.append(p.arena, acc_fn) catch {
+                p.had_error = true;
+                return null;
+            };
             props.append(p.arena, ast.ObjectProp{ .key = aname, .value = acc_fn, .kind = acc_kind }) catch {
                 p.had_error = true;
                 return null;
@@ -1132,6 +1169,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
         // ES6 method shorthand: `name(params) { body }` ≡ `name: function(params){body}`.
         if (p.check(.left_paren)) {
             const m_params = p.parseFunctionParams() orelse return null;
+            p.super_used = false;
             const m_body = p.parseFunctionBody() orelse return null;
             const m_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
@@ -1146,6 +1184,10 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_strict = parser_file.hasUseStrict(m_body),
                 },
             }) orelse return null;
+            if (p.super_used) super_methods.append(p.arena, m_fn) catch {
+                p.had_error = true;
+                return null;
+            };
             props.append(p.arena, ast.ObjectProp{ .key = key, .value = m_fn, .kind = .init }) catch {
                 p.had_error = true;
                 return null;
@@ -1175,9 +1217,103 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
     }
     _ = p.expect(.right_brace) orelse return null;
     const obj_end = p.current.start;
-    return p.makeNode(.object_literal, start, obj_end, .{
+    // Restore the enclosing scope's super flag; this object's methods consumed
+    // their own super references into `super_methods`.
+    p.super_used = saved_super;
+    const obj_lit = p.makeNode(.object_literal, start, obj_end, .{
         .object_literal = .{ .properties = props.items },
-    });
+    }) orelse return null;
+    if (super_methods.items.len == 0) return obj_lit;
+    return wrapObjectSuper(p, obj_lit, super_methods.items, start, obj_end);
+}
+
+/// Bind `super` for object-literal methods. JS object methods have a
+/// `[[HomeObject]]` whose prototype `super` resolves to dynamically at call
+/// time — but the prototype may change after the literal is built (e.g.
+/// `Object.setPrototypeOf(obj, x)`), so we capture the object itself in a hidden
+/// `__home_N` var and resolve `Object.getPrototypeOf(__home_N)` on each method
+/// entry. The object literal is wrapped in an arrow IIFE that declares and
+/// assigns `__home_N`:
+///
+///   (() => { var __home_N; return __home_N = { m() { ...super bindings...; <body> } }; })()
+///
+/// Each super-using method gets, prepended to its body:
+///   var super       = Object.getPrototypeOf(__home_N);  // base for `super.x` get
+///   var __sproto__   = Object.getPrototypeOf(__home_N);  // Set base (rewriteSuperPropAssign)
+///   var __superthis  = this;                             // Receiver
+fn wrapObjectSuper(p: *Parser, obj_lit: *Node, methods: []*Node, s: u32, e: u32) ?*Node {
+    const hid = std.fmt.allocPrint(p.arena, "__home_{d}", .{p.home_obj_counter}) catch {
+        p.had_error = true;
+        return null;
+    };
+    p.home_obj_counter += 1;
+
+    // Build `Object.getPrototypeOf(<hid>)` afresh each time (AST nodes are not
+    // shared between distinct use sites).
+    const makeProtoOfHome = struct {
+        fn call(pp: *Parser, name: []const u8, st: u32, en: u32) ?*Node {
+            const obj_id = pp.makeNode(.identifier, st, en, .{ .identifier = "Object" }) orelse return null;
+            const gp_id = pp.makeNode(.identifier, st, en, .{ .identifier = "getPrototypeOf" }) orelse return null;
+            const callee = pp.makeNode(.member_expr, st, en, .{ .member_expr = .{ .object = obj_id, .property = gp_id, .computed = false } }) orelse return null;
+            const home_id = pp.makeNode(.identifier, st, en, .{ .identifier = name }) orelse return null;
+            var args = std.ArrayList(*Node){};
+            args.append(pp.arena, home_id) catch {
+                pp.had_error = true;
+                return null;
+            };
+            return pp.makeNode(.call_expr, st, en, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+        }
+    }.call;
+
+    for (methods) |fn_node| {
+        const sup_proto = makeProtoOfHome(p, hid, s, e) orelse return null;
+        const sup_decl = p.makeNode(.var_decl, s, e, .{ .var_decl = .{ .kind = .var_, .name = "super", .init = sup_proto } }) orelse return null;
+        const sproto_init = makeProtoOfHome(p, hid, s, e) orelse return null;
+        const sproto_decl = p.makeNode(.var_decl, s, e, .{ .var_decl = .{ .kind = .var_, .name = "__sproto__", .init = sproto_init } }) orelse return null;
+        const this_node = p.makeNode(.this_expr, s, e, .{ .this_expr = {} }) orelse return null;
+        const sthis_decl = p.makeNode(.var_decl, s, e, .{ .var_decl = .{ .kind = .var_, .name = "__superthis", .init = this_node } }) orelse return null;
+
+        var wb = std.ArrayList(*Node){};
+        wb.append(p.arena, sup_decl) catch {
+            p.had_error = true;
+            return null;
+        };
+        wb.append(p.arena, sproto_decl) catch {
+            p.had_error = true;
+            return null;
+        };
+        wb.append(p.arena, sthis_decl) catch {
+            p.had_error = true;
+            return null;
+        };
+        for (fn_node.data.function_expr.body) |st| wb.append(p.arena, st) catch {
+            p.had_error = true;
+            return null;
+        };
+        fn_node.data.function_expr.body = wb.items;
+    }
+
+    // Arrow IIFE body: `var __home_N; return __home_N = <obj_lit>;`
+    const home_decl = p.makeNode(.var_decl, s, e, .{ .var_decl = .{ .kind = .var_, .name = hid, .init = null } }) orelse return null;
+    const home_target = p.makeNode(.identifier, s, e, .{ .identifier = hid }) orelse return null;
+    const assign = p.makeNode(.assignment_expr, s, e, .{ .assignment_expr = .{ .op = .assign, .target = home_target, .value = obj_lit } }) orelse return null;
+    const ret = p.makeNode(.return_stmt, s, e, .{ .return_stmt = assign }) orelse return null;
+    var body = std.ArrayList(*Node){};
+    body.append(p.arena, home_decl) catch {
+        p.had_error = true;
+        return null;
+    };
+    body.append(p.arena, ret) catch {
+        p.had_error = true;
+        return null;
+    };
+    const arrow = p.makeNode(.function_expr, s, e, .{ .function_expr = .{
+        .name = null,
+        .params = &[_][]const u8{},
+        .body = body.items,
+        .is_arrow = true,
+    } }) orelse return null;
+    return p.makeNode(.call_expr, s, e, .{ .call_expr = .{ .callee = arrow, .args = &[_]*Node{} } });
 }
 
 pub fn parseArrayLiteral(p: *Parser) ?*Node {

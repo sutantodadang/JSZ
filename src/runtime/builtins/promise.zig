@@ -129,6 +129,14 @@ fn getData(this_val: Value) ?*PromiseData {
     return null;
 }
 
+/// True when `v` is a Promise still in the pending state. Used by the module
+/// loader to decide whether an async factory's evaluation has actually finished
+/// (so its record may be marked `loaded`) or is still suspended at an `await`.
+pub fn isPending(v: Value) bool {
+    const d = getData(v) orelse return false;
+    return d.state == .pending;
+}
+
 fn enqueueReactionJob(arena: std.mem.Allocator, r: Reaction, state: PromiseState, value: Value) !void {
     try microtasks.append(arena, .{
         .reaction = r,
@@ -840,7 +848,7 @@ fn nativeFinallyThrowThunk(arena: std.mem.Allocator, _: Value, args: []const Val
 }
 
 /// Build a simple bound function with one prefix value and no carrier `this`.
-fn bindValueAsPrefix(arena: std.mem.Allocator, native_fn: Value, prefix_val: Value) !Value {
+pub fn bindValueAsPrefix(arena: std.mem.Allocator, native_fn: Value, prefix_val: Value) !Value {
     const pfx = try arena.alloc(Value, 1);
     pfx[0] = prefix_val;
     const bd = try arena.create(fn_proto.BoundData);
@@ -977,21 +985,41 @@ fn runReactionJob(arena: std.mem.Allocator, job: Job) void {
     }
 }
 
+// A monotonic cursor into `microtasks` shared across (possibly re-entrant)
+// `runMicrotasks` calls, plus a flag marking whether a drain is already active.
+// Re-entrancy happens when a job's JS callback synchronously drains the queue
+// itself — e.g. an import-defer trigger evaluating an async module from within a
+// property access that is itself running inside a microtask. The cursor is
+// advanced *before* a job runs, so a nested drain resumes only at the not-yet-run
+// jobs and never re-runs the in-flight one (which would resume an already-running
+// coroutine). Only the outermost drain clears the (fully consumed) queue.
+var drain_cursor: usize = 0;
+var draining: bool = false;
+
 pub fn runMicrotasks(arena: std.mem.Allocator) void {
-    // Index by position: reactions may enqueue more jobs (growing the list). A
-    // job's fields are snapshotted inside runReactionJob, so a reallocation here
-    // can't dangle a reference (see runReactionJob).
-    var idx: usize = 0;
-    while (idx < microtasks.items.len) : (idx += 1) {
-        runReactionJob(arena, microtasks.items[idx]);
+    // Reactions may enqueue more jobs (growing the list). A job's fields are
+    // snapshotted inside runReactionJob, so a reallocation here can't dangle a
+    // reference (see runReactionJob); `microtasks.items` is re-read each step.
+    const outermost = !draining;
+    draining = true;
+    while (drain_cursor < microtasks.items.len) {
+        const job = microtasks.items[drain_cursor];
+        drain_cursor += 1;
+        runReactionJob(arena, job);
     }
-    microtasks.clearRetainingCapacity();
+    if (outermost) {
+        microtasks.clearRetainingCapacity();
+        drain_cursor = 0;
+        draining = false;
+    }
 }
 
 pub fn clearMicrotasks() void {
     // Drop the backing slice (do NOT free — its arena was already reset by the caller).
     // Retaining capacity would dangle into the freed eval arena and crash the next append.
     microtasks = .empty;
+    drain_cursor = 0;
+    draining = false;
 }
 
 /// Top-level-await for a single-threaded engine: drain the microtask queue until

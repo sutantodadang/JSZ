@@ -438,8 +438,12 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     // M16 TLA: with true async module evaluation $DONE may be called from a
     // microtask after the synchronous run; route it through host completion
     // signals so a late failure/never-completion is observable (see runMainBc).
+    // Define $DONE both as a module-scoped binding (so a bare `$DONE()` call
+    // resolves) and as an own property of globalThis: asyncHelpers.js's asyncTest
+    // gates on `hasOwnProperty.call(globalThis,"$DONE")`, and a top-level
+    // `function $DONE` in module scope is lexical, not a global object property.
     const done_prefix: []const u8 = if (is_tla_module)
-        "function $DONE(err) { if (err) { __jszAsyncFail__(err); } else { __jszAsyncDone__(); } }\n"
+        "function $DONE(err) { if (err) { __jszAsyncFail__(err); } else { __jszAsyncDone__(); } }\nglobalThis.$DONE = $DONE;\n"
     else
         "";
     // The `/*__JSZ_PRELUDE_END__*/` sentinel marks where the harness prelude ends

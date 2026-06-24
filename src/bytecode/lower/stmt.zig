@@ -346,8 +346,10 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     self.patchJump(push_try_patch, catch_offset);
 
     if (ts.handler) |handler| {
-        // Bind catch param: DEFINE_GLOBAL "name", Rexc (always defines, never strict-throws)
-        try self.emitDefine(handler.param_name, rexc, line);
+        // Bind catch param: DEFINE_GLOBAL "name", Rexc (always defines, never strict-throws).
+        // An empty param_name is an optional catch binding (`catch { ... }`) — no binding.
+        if (handler.param_name.len > 0)
+            try self.emitDefine(handler.param_name, rexc, line);
         // Compile catch body.
         self.sp = saved_sp;
         try self.compileStmt(handler.body, last_expr_reg);
