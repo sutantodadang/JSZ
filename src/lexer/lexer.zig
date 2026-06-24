@@ -549,6 +549,36 @@ pub const Lexer = struct {
                 self.pos += 1;
                 self.column += 1;
             }
+            // A `\u` escape in continuation position (e.g. `await`) — switch to
+            // buffer mode, seeding it with the raw prefix already scanned, and decode
+            // the rest like the escape-leading identifier path below.
+            if (self.pos < self.source.len and self.source[self.pos] == '\\' and
+                self.pos + 1 < self.source.len and self.source[self.pos + 1] == 'u')
+            {
+                var buf = std.ArrayList(u8){};
+                defer buf.deinit(self.allocator);
+                try buf.appendSlice(self.allocator, self.source[start..self.pos]);
+                while (self.pos < self.source.len) {
+                    const nc = self.source[self.pos];
+                    if (isIdentChar(nc)) {
+                        try buf.append(self.allocator, nc);
+                        self.pos += 1;
+                        self.column += 1;
+                    } else if (nc == '\\' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == 'u') {
+                        if (parseUnicodeEscape(self.source, self.pos + 2)) |r2| {
+                            try appendWtf8(&buf, self.allocator, r2.cp);
+                            self.column += @intCast(r2.end - self.pos);
+                            self.pos = r2.end;
+                        } else break;
+                    } else break;
+                }
+                const owned = self.allocator.dupe(u8, buf.items) catch return LexError.OutOfMemory;
+                const kind = lookupKeyword(owned) orelse .identifier;
+                var t = Token.initSimple(kind, @intCast(start), @intCast(self.pos), start_line, start_col, lt_before);
+                t.value_str = owned;
+                self.prev_kind = kind;
+                return t;
+            }
             const slice = self.source[start..self.pos];
             const kind = lookupKeyword(slice) orelse .identifier;
             var t = Token.initSimple(kind, @intCast(start), @intCast(self.pos), start_line, start_col, lt_before);

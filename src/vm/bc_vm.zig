@@ -322,6 +322,13 @@ pub const BcVm = struct {
                         return bcInvokeJs(ptr, self.arena, bd.this_val, bd.target, combined);
                     }
                 }
+                // A callable Proxy: dispatch through its `apply` trap (forwarding to
+                // the target when absent). Without this, calling a proxied function
+                // via the native re-entry path (e.g. a ShadowRealm wrapped function)
+                // would fall through to the "not a function" error below.
+                if (obj.internal_kind == .proxy) {
+                    return try self.proxyApply(obj, this_val, args);
+                }
                 // Built-in callable objects (Array, %TypedArray%, Error, …) carry a
                 // `__call__` native slot. Dispatch to it and propagate its real
                 // exception. A derived class doing `super(a,b,c)` to such a native
@@ -562,6 +569,54 @@ pub const BcVm = struct {
         return bcInvokeJs(self, self.arena, undef, closure_val, &[_]Value{});
     }
 
+    /// ShadowRealm host hook: compile + run `source` as Script code in the given
+    /// global `Environment` (a shadow realm's own global scope), returning the
+    /// completion value. A parse failure of `source` itself surfaces as
+    /// `error.ShadowParseError` (pending_exception = SyntaxError) so the caller
+    /// (ShadowRealm.prototype.evaluate) can map it to a SyntaxError, while a
+    /// runtime throw stays `error.JsException` (mapped to a TypeError).
+    fn bcEvalInEnv(ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8, global_env: *anyopaque) anyerror!Value {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        const realm_mod = @import("../runtime/realm.zig");
+        const parser_mod = @import("../parser/parser.zig");
+        const compiler_mod = @import("../bytecode/compiler.zig");
+        const ast_mod = @import("../parser/ast.zig");
+        const isolate_mod = @import("./isolate.zig");
+
+        const env: *Environment = @ptrCast(@alignCast(global_env));
+        // Native builtins (require, a nested `new ShadowRealm()`, …) read
+        // `active_global_env` to find the running realm's globals; point it at the
+        // shadow realm for the duration of this evaluation, then restore.
+        const saved_global_env = realm_mod.active_global_env;
+        realm_mod.active_global_env = env;
+        defer realm_mod.active_global_env = saved_global_env;
+
+        const transformed = isolate_mod.rewriteTemplateLiterals(self.arena, source) catch source;
+        var p = parser_mod.Parser.init(transformed, self.arena);
+        p.eval_code = true;
+        const parse_result = p.parseScript();
+        const stmts = switch (parse_result) {
+            .ok => |s| s,
+            .err => |e| {
+                realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", e.message);
+                return error.ShadowParseError;
+            },
+        };
+        const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(stmts) };
+        const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<ShadowRealm>");
+        if (compiler_mod.last_label_error) |msg| {
+            compiler_mod.last_label_error = null;
+            realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", msg);
+            return error.ShadowParseError;
+        }
+        const closure = try self.arena.create(BcClosure);
+        closure.* = .{ .func = main_func, .env = @ptrCast(env) };
+        const closure_val = try val_mod.makeBcFunction(self.arena, closure);
+        const undef = try val_mod.makeUndefined(self.arena);
+        return bcInvokeJs(self, self.arena, undef, closure_val, &[_]Value{});
+    }
+
     fn activateContext(self: *BcVm) void {
         const realm_mod = @import("../runtime/realm.zig");
         self.context = realm_mod.Context{
@@ -575,6 +630,7 @@ pub const BcVm = struct {
             .set_fn = bcSetProp,
             .set_proto_fn = bcSetProto,
             .backing_obj_fn = bcBackingObj,
+            .shadow_eval_fn = bcEvalInEnv,
         };
         realm_mod.active_context = &self.context;
     }
@@ -623,6 +679,14 @@ pub const BcVm = struct {
         const regs = try self.arena.alloc(Value, if (main_func.num_regs > 0) main_func.num_regs else 1);
         for (regs) |*r| r.* = Value{};
 
+        // Script top-level `this` is the global object (`globalThis`); module
+        // top-level `this` is undefined (ES §9.4.1 / §16.2.1.6). Strictness does
+        // not affect the global `this` binding, so a "use strict" Script still
+        // sees globalThis here.
+        const top_this: Value = if (!main_func.is_module) blk: {
+            break :blk global_env.lookup("globalThis") catch Value{};
+        } else Value{};
+
         try self.frames.append(self.arena, BcCallFrame{
             .func = main_func,
             .pc = 0,
@@ -630,7 +694,7 @@ pub const BcVm = struct {
             .env = global_env,
             .return_dst = 0,
             .caller_idx = null,
-            .this_val = Value{}, // global this = undefined
+            .this_val = top_this,
         });
 
         return self.runLoop();
@@ -1517,7 +1581,22 @@ pub const BcVm = struct {
                 }
                 if (closure.obj) |op| {
                     const o: *JsObject = @ptrCast(@alignCast(op));
-                    if (o.get(key)) |v| return v;
+                    // An own property on the backing object (e.g. a `name`/`length`
+                    // redefined via Object.defineProperty) takes precedence over the
+                    // computed arity/name below, and an accessor must fire its getter
+                    // rather than surfacing the raw descriptor.
+                    if (o.hasOwn(key)) {
+                        const slot = o.shape.key_to_slot.get(key).?;
+                        const a = o.attrAt(slot);
+                        const raw = if (slot < o.slots.items.len) o.slots.items[slot] else Value{};
+                        if (a.is_accessor) {
+                            const getter = accessorMember(raw, "get");
+                            if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                            return try self.callAccessor(getter, obj_val, &[_]Value{});
+                        }
+                        if (raw.bits != 0) return raw;
+                        return val_mod.makeUndefined(self.arena);
+                    }
                 }
                 // Own `name`/`length` for user functions (spec: non-writable,
                 // configurable). `length` = declared arity; `name` = the bound

@@ -578,11 +578,29 @@ fn emitTemplateLiteralSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8),
     if (segment.len == 0 and emitted_any) return;
     if (emitted_any) try out.appendSlice(arena, " + ");
     try out.append(arena, '"');
-    for (segment) |ch| {
-        if (ch == '"' or ch == '\\') {
+    // The segment preserves the template's backslash escapes verbatim (see the
+    // scan loop in rewriteTemplateLiterals). Re-emit it as the body of a
+    // double-quoted string literal: escape sequences pass through unchanged (the
+    // string lexer cooks them, and template/string escape semantics coincide),
+    // while raw characters that a `"..."` literal cannot contain — line
+    // terminators and an unescaped quote — are escaped here. This is what lets a
+    // multi-line template (whose segment holds raw newline bytes) round-trip.
+    var i: usize = 0;
+    while (i < segment.len) : (i += 1) {
+        const ch = segment[i];
+        if (ch == '\\' and i + 1 < segment.len) {
             try out.append(arena, '\\');
+            try out.append(arena, segment[i + 1]);
+            i += 1;
+            continue;
         }
-        try out.append(arena, ch);
+        switch (ch) {
+            '"' => try out.appendSlice(arena, "\\\""),
+            '\n' => try out.appendSlice(arena, "\\n"),
+            '\r' => try out.appendSlice(arena, "\\r"),
+            '\\' => try out.appendSlice(arena, "\\\\"), // a lone trailing backslash
+            else => try out.append(arena, ch),
+        }
     }
     try out.append(arena, '"');
 }

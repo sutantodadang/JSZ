@@ -39,6 +39,10 @@ pub const BcFunction = struct {
     /// called it runs as a reaction-driven coroutine and returns a Promise;
     /// each `await` suspends via a YIELD opcode.
     is_async: bool = false,
+    /// M16: this top-level function compiles ES-module code. Used so the VM binds
+    /// the module's top-level `this` to undefined (a Script binds it to the global
+    /// object). Only meaningful on a program/module top-level function.
+    is_module: bool = false,
     /// Phase 6: per-bytecode-site IC table, indexed by instruction PC.
     ic_table: []ic_mod.InlineCache,
     /// Phase 6: arithmetic fast-path feedback per instruction PC.

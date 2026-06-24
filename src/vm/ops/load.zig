@@ -11,6 +11,22 @@ const BcVm = bcv.BcVm;
 const BcCallFrame = bcv.BcCallFrame;
 const RunOutcome = bcv.RunOutcome;
 const val_mod = @import("../../value/value.zig");
+const Value = val_mod.Value;
+
+/// Resolve `name` as an own property of the running scope's global object
+/// (`globalThis`). This backs the global-environment-record semantics: a binding
+/// installed via `globalThis.x = v` (or otherwise added to the global object) is
+/// visible as a bare identifier even though it was never declared as an
+/// environment binding — and a ShadowRealm's evaluate runs against its own
+/// `globalThis`, so the lookup is taken from the running frame's scope chain.
+/// Only own data properties are consulted: inherited names (e.g. Object.prototype
+/// members) must not leak in as globals, and accessors are skipped to keep the
+/// failed-lookup path free of user code (and frame reallocation).
+fn globalObjectOwn(frame: *BcCallFrame, name: []const u8) ?Value {
+    const gt = frame.env.lookup("globalThis") catch return null;
+    if (gt.bits == 0 or gt.unbox() != .object) return null;
+    return gt.toPtr().object.getOwn(name);
+}
 
 pub inline fn opLoadK(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     _ = self;
@@ -98,7 +114,9 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         error.NotDefined => {
             if (self.realm.global_env.lookup(name)) |v| {
                 frame.registers[rdst] = v;
-            } else |_| {
+            } else |_| if (globalObjectOwn(frame, name)) |v| {
+                frame.registers[rdst] = v;
+            } else {
                 const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{name});
                 const exc_val = try self.makeErrorObjectBc("ReferenceError", msg);
                 self.last_exception_value = exc_val;
@@ -139,6 +157,7 @@ pub inline fn opGetGlobalOpt(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         error.ConstAssignment => unreachable,
         error.NotDefined => {
             frame.registers[rdst] = self.realm.global_env.lookup(name) catch
+                globalObjectOwn(frame, name) orelse
                 try val_mod.makeUndefined(self.arena);
         },
         error.OutOfMemory => return error.OutOfMemory,

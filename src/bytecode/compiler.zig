@@ -1798,6 +1798,7 @@ pub fn compileModule(
         false, // program is not an arrow
         null, // program has no rest parameter
     );
+    f.is_module = true;
     return f;
 }
 

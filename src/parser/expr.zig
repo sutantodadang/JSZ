@@ -867,6 +867,11 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
             if (p.match(.dot)) {
                 const meta = p.expectIdentifierName() orelse return null;
                 if (std.mem.eql(u8, meta.value_str, "meta")) {
+                    // `import.meta` is an early SyntaxError unless the syntactic goal
+                    // is Module (sec-meta-properties Early Errors). Eval code and the
+                    // dynamic Function/AsyncFunction/Generator constructors are Script /
+                    // FunctionBody goals (both routed through `eval_code`), so reject here.
+                    if (p.eval_code) return p.fail("import.meta is only valid in module code");
                     // `import.meta` → the hidden, module-scoped meta object binding.
                     return p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__import_meta__" });
                 }

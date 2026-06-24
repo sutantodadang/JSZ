@@ -39,6 +39,8 @@ const reflect_mod = @import("./builtins/reflect.zig");
 const coercion_mod = @import("./builtins/coercion.zig");
 // Phase 13 Proxy
 const proxy_mod = @import("./builtins/proxy.zig");
+// M16 Phase 4 ShadowRealm
+const shadow_realm_mod = @import("./builtins/shadow_realm.zig");
 // Phase 13 Intl
 const intl_mod = @import("./builtins/intl.zig");
 
@@ -80,6 +82,12 @@ pub const Context = struct {
     /// Lets generic object ops (defineProperty, getOwnPropertyDescriptor) treat
     /// functions as the objects they are.
     backing_obj_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, val: Value) anyerror!?*JsObject,
+    /// ShadowRealm: compile + run `source` as Script code in the supplied global
+    /// `Environment` (a shadow realm's global env, passed as an opaque pointer),
+    /// returning its completion value. A parse failure of `source` sets
+    /// pending_exception (a SyntaxError) and returns `error.ShadowParseError` so
+    /// the caller can distinguish it from a runtime throw (`error.JsException`).
+    shadow_eval_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8, global_env: *anyopaque) anyerror!Value,
 
     pub fn backingObject(self: *Context, arena: std.mem.Allocator, val: Value) anyerror!?*JsObject {
         return self.backing_obj_fn(self.ptr, arena, val);
@@ -115,6 +123,10 @@ pub const Context = struct {
 
     pub fn setProto(self: *Context, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void {
         return self.set_proto_fn(self.ptr, arena, obj_val, proto);
+    }
+
+    pub fn shadowEval(self: *Context, arena: std.mem.Allocator, source: []const u8, global_env: *anyopaque) anyerror!Value {
+        return self.shadow_eval_fn(self.ptr, arena, source, global_env);
     }
 };
 
@@ -2567,6 +2579,10 @@ pub const Realm = struct {
             try env.define("Intl", try val_mod.makeObject(arena, intl_obj));
         }
 
+        // ---- M16 Phase 4: ShadowRealm (defined before globalThis so the host
+        // global object mirrors the `ShadowRealm` binding) ----
+        try shadow_realm_mod.register(arena, env, object_proto, function_proto);
+
         // ---- ES2020 globalThis (+ Node-compatible `global`) ----
         try installGlobalThis(arena, env, object_proto);
 
@@ -2643,6 +2659,13 @@ pub const Realm = struct {
         // SIMPLEST SAFE APPROACH: Make Realm.object_prototype and array_prototype
         // also be GC-allocated when a heap is active. Do that here.
 
+        // The arena-allocated %Object.prototype% that every built-in prototype was
+        // parented to during Realm.init. After migration below it is replaced by a
+        // heap copy; any built-in prototype still pointing here must be reparented so
+        // identity checks like `Object.getPrototypeOf(X.prototype) === Object.prototype`
+        // continue to hold.
+        const old_object_proto = self.object_prototype;
+
         // Reallocate intrinsics on the heap so they have proper GcHeaders and
         // will be visited during mark. Register them as roots so they survive collect.
         const hp_proto = try heap.allocateObject(null);
@@ -2699,6 +2722,25 @@ pub const Realm = struct {
                     },
                     else => {},
                 }
+            }
+        }
+
+        // Reparent every built-in prototype that was directly parented to the old
+        // arena %Object.prototype% so its [[Prototype]] now resolves to the heap copy
+        // exposed as `Object.prototype`. Each global constructor binding (Object,
+        // Symbol, Promise, Map, ShadowRealm, …) carries a `prototype` whose proto is
+        // the old object proto; fix those in one pass. (Array.prototype is already
+        // remapped above; reparenting it again is a harmless no-op.)
+        {
+            var it = self.global_env.bindings.iterator();
+            while (it.next()) |entry| {
+                const v = entry.value_ptr.value;
+                if (v.bits == 0 or v.unbox() != .object) continue;
+                const ctor = v.toPtr().object;
+                const proto_v = ctor.getOwn("prototype") orelse continue;
+                if (proto_v.bits == 0 or proto_v.unbox() != .object) continue;
+                const child = proto_v.toPtr().object;
+                if (child.proto == old_object_proto) child.proto = hp_proto;
             }
         }
 

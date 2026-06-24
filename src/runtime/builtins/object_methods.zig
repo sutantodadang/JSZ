@@ -387,6 +387,14 @@ fn makeAccessorHolder(arena: std.mem.Allocator, getter: ?Value, setter: ?Value) 
 /// Object.getPrototypeOf(o): return proto of o, or null for primitives.
 pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeNull(arena);
+    // A built-in (native) function's [[Prototype]] is %Function.prototype% (ES
+    // §20.2.3). The property-get path already walks Function.prototype for these
+    // values; mirror that here so `Object.getPrototypeOf(fn)` is consistent (and
+    // so ShadowRealm.prototype.evaluate/importValue report Function.prototype).
+    if (args[0].unbox() == .native_function) {
+        if (@import("../realm.zig").active_function_proto) |fp| return val_mod.makeObject(arena, fp);
+        return val_mod.makeNull(arena);
+    }
     if (args[0].unbox() != .object) return val_mod.makeNull(arena);
     const obj = args[0].toPtr().object;
     if (obj.proto) |p| return val_mod.makeObject(arena, p);
