@@ -1295,8 +1295,13 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
         {
             const acc_kind: ast.PropKind = if (key[0] == 'g') .get else .set;
             var aname: []const u8 = undefined;
+            const akn = @tagName(p.current.kind);
             if (p.check(.identifier) or p.check(.string)) {
                 aname = p.current.value_str;
+                _ = p.advance();
+            } else if (akn.len > 3 and std.mem.eql(u8, akn[0..3], "kw_")) {
+                // Reserved words are valid IdentifierNames as accessor keys (ES5+).
+                aname = akn[3..];
                 _ = p.advance();
             } else if (p.check(.number)) {
                 const n = p.current.value_num;
