@@ -655,6 +655,19 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     }
     const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
     const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
+    // Strict-mode early error: a future-reserved word (or `eval`/`arguments`)
+    // may not be a binding identifier in strict code (ES §13.1.1, §12.7.2).
+    if (p.strict and parser_file.isStrictReservedWord(name)) {
+        if (!p.had_error) {
+            p.had_error = true;
+            p.error_info = parser_file.ParseError{
+                .message = "unexpected strict-mode reserved word as binding name",
+                .line = name_tok.line,
+                .column = name_tok.column,
+            };
+        }
+        return null;
+    }
     var init_node: ?*Node = null;
     if (p.match(.eq)) {
         init_node = p.parseAssignmentExpr();
@@ -674,8 +687,14 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     return p.makeNode(.var_decl, start, end, .{ .var_decl = .{ .kind = kind, .name = name, .init = init_node } });
 }
 
+/// One destructuring target: `bind` is the variable name introduced; `key` is
+/// the source property name (object patterns only — for an `{ a: x }` renaming
+/// `key` = "a" and `bind` = "x"; for shorthand `{ a }` both are "a"). Array
+/// patterns leave `key` empty and read by positional index.
+const DestructTarget = struct { key: []const u8, bind: []const u8 };
+
 pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?*Node {
-    var names = std.ArrayList([]const u8){};
+    var targets = std.ArrayList(DestructTarget){};
     const is_array = p.match(.left_bracket);
     if (is_array) {
         while (!p.check(.right_bracket) and !p.check(.eof) and !p.had_error) {
@@ -684,7 +703,7 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
                 continue;
             }
             const t = p.expect(.identifier) orelse return null;
-            names.append(p.arena, t.value_str) catch return null;
+            targets.append(p.arena, .{ .key = "", .bind = t.value_str }) catch return null;
             // Skip optional default value (= expr) — runtime falls back to undefined.
             if (p.match(.eq)) {
                 _ = p.parseAssignmentExpr();
@@ -701,7 +720,9 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
                 const alias = p.expect(.identifier) orelse return null;
                 bind_name = alias.value_str;
             }
-            names.append(p.arena, bind_name) catch return null;
+            // Read source property `key`, bind to `bind_name` (they differ when
+            // the pattern renames, e.g. `{ get: description }`).
+            targets.append(p.arena, .{ .key = key.value_str, .bind = bind_name }) catch return null;
             // Skip optional default value (= expr) — runtime falls back to undefined.
             if (p.match(.eq)) {
                 _ = p.parseAssignmentExpr();
@@ -720,7 +741,7 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
     }) orelse return null;
     body.append(p.arena, tmp_decl) catch return null;
 
-    for (names.items, 0..) |n, i| {
+    for (targets.items, 0..) |tgt, i| {
         const tmp_id = p.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
         const access = if (is_array) blk: {
             const idx = p.makeNode(.number_literal, start, start, .{ .number_literal = @floatFromInt(i) }) orelse return null;
@@ -728,13 +749,13 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
                 .member_expr = .{ .object = tmp_id, .property = idx, .computed = true },
             }) orelse return null;
         } else blk: {
-            const prop = p.makeNode(.identifier, start, start, .{ .identifier = n }) orelse return null;
+            const prop = p.makeNode(.identifier, start, start, .{ .identifier = tgt.key }) orelse return null;
             break :blk p.makeNode(.member_expr, start, start, .{
                 .member_expr = .{ .object = tmp_id, .property = prop, .computed = false },
             }) orelse return null;
         };
         const vd = p.makeNode(.var_decl, start, p.current.start, .{
-            .var_decl = .{ .kind = kind, .name = n, .init = access },
+            .var_decl = .{ .kind = kind, .name = tgt.bind, .init = access },
         }) orelse return null;
         body.append(p.arena, vd) catch return null;
     }

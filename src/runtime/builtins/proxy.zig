@@ -117,3 +117,48 @@ pub fn nativeProxyCtor(arena: std.mem.Allocator, _: Value, args: []const Value) 
     if (realm_mod.active_sym_proxy_handler) |s| try obj.setSym(s, args[1]);
     return val_mod.makeObject(arena, obj);
 }
+
+/// True if `proxy_obj` is a revoked Proxy (its `[[ProxyHandler]]`/`[[ProxyTarget]]`
+/// have been cleared by the revoke function). Accessing a revoked proxy throws.
+pub fn isRevoked(proxy_obj: *JsObject) bool {
+    if (proxy_obj.internal_kind != .proxy) return false;
+    return proxyHandler(proxy_obj) == null or proxyTarget(proxy_obj) == null;
+}
+
+/// `Proxy.revocable(target, handler)` — returns `{ proxy, revoke }` where calling
+/// `revoke()` clears the proxy's target/handler so all further operations throw.
+pub fn nativeProxyRevocable(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const proxy_val = try nativeProxyCtor(arena, Value{}, args);
+    const proxy_obj = proxy_val.toPtr().object;
+
+    // The revoke function: a callable object (no `prototype`, so the call paths
+    // pass it as `this`) whose internal_slot back-references the proxy.
+    const revoke = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_function_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_function_proto);
+    revoke.internal_slot = @ptrCast(proxy_obj);
+    try revoke.set("__call__", try val_mod.makeNativeFunction(arena, nativeProxyRevoke));
+    _ = try revoke.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try revoke.defineOwnData("name", try val_mod.makeString(arena, ""), .{ .writable = false, .enumerable = false, .configurable = true });
+
+    const result = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+    try result.set("proxy", proxy_val);
+    try result.set("revoke", try val_mod.makeObject(arena, revoke));
+    return val_mod.makeObject(arena, result);
+}
+
+/// The revoke function's [[Call]]: clear the associated proxy's internal slots.
+fn nativeProxyRevoke(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
+        if (this_val.toPtr().object.internal_slot) |slot| {
+            const proxy_obj: *JsObject = @ptrCast(@alignCast(slot));
+            if (realm_mod.active_sym_proxy_target) |s| _ = proxy_obj.deleteOwnSym(s);
+            if (realm_mod.active_sym_proxy_handler) |s| _ = proxy_obj.deleteOwnSym(s);
+        }
+    }
+    return val_mod.makeUndefined(arena);
+}

@@ -21,6 +21,39 @@ const ast = @import("../parser/ast.zig");
 const val_mod = @import("../value/value.zig");
 const Value = val_mod.Value;
 const BcFunction = @import("../bytecode/function.zig").BcFunction;
+const parser_mod = @import("../parser/parser.zig");
+
+/// True when `src` is parseable as the body of a bundle module factory. A module
+/// whose source has a syntax error must NOT be inlined verbatim into the bundle:
+/// doing so makes the *whole* bundle fail to parse, which surfaces as a spurious
+/// parse error for the entry test rather than a runtime rejection. Instead such a
+/// module gets a factory that throws a SyntaxError when first required (matching
+/// the spec: a module with a parse error rejects/throws at evaluation, e.g.
+/// `ShadowRealm.prototype.importValue` rejects with a TypeError).
+///
+/// The check mirrors exactly how a module body is embedded: wrapped in an
+/// `async function(require, module, exports){ ... }` (async covers top-level
+/// await; the function wrapper covers any construct legal inside the factory),
+/// with template literals rewritten the same way the runtime does before
+/// evaluating the bundle. If even that wrapped form fails to parse, the module is
+/// genuinely unparseable and would otherwise break the bundle.
+fn moduleSourceParses(gpa: std.mem.Allocator, src: []const u8) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const wrapped = std.fmt.allocPrint(
+        arena,
+        "(async function(require, module, exports){{\n{s}\n}});\n",
+        .{src},
+    ) catch return true; // OOM: don't misclassify as a syntax error.
+    const isolate_mod = @import("../vm/isolate.zig");
+    const rewritten = isolate_mod.rewriteTemplateLiterals(arena, wrapped) catch return true;
+    var p = parser_mod.Parser.init(rewritten, arena);
+    return switch (p.parseScript()) {
+        .ok => true,
+        .err => false,
+    };
+}
 
 /// Lifecycle of a module record, mirroring the spec [[Status]] field. Phase 1
 /// uses these to dedup work and to expose a partially-initialised record to a
@@ -1693,6 +1726,19 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
             try sb.appendSlice(gpa, " };\n};\n");
             continue;
         }
+        // A dependency whose source has a syntax error must not be inlined into
+        // the bundle (it would break the whole bundle's parse). Emit a factory
+        // that throws a SyntaxError when first required, so the parse error
+        // surfaces lazily at evaluation — `import()` rejects and
+        // `ShadowRealm.prototype.importValue` rejects with a TypeError.
+        if (!moduleSourceParses(gpa, e.value_ptr.*)) {
+            try sb.appendSlice(gpa, "__modules__[");
+            try appendJsString(gpa, &sb, mod_id);
+            try sb.appendSlice(gpa, "] = function(require, module, exports){\nthrow new SyntaxError(\"Unexpected end of input in module \"+");
+            try appendJsString(gpa, &sb, mod_id);
+            try sb.appendSlice(gpa, ");\n};\n");
+            continue;
+        }
         const mod_is_async = async_set.contains(mod_id);
         try sb.appendSlice(gpa, "__modules__[\"");
         try sb.appendSlice(gpa, mod_id);
@@ -1702,6 +1748,15 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
             try sb.appendSlice(gpa, "\"] = function(require, module, exports){\nvar __module_id__ = \"");
         try sb.appendSlice(gpa, mod_id);
         try sb.appendSlice(gpa, "\";\n");
+        // sec-meta-properties-runtime-semantics-evaluation: a module's
+        // [[ImportMeta]] is created per module and is NOT shared across modules.
+        // Shadow the realm-global `__import_meta__` with a per-factory binding
+        // (null-prototype, extensible) keyed by this module's id, so `import.meta`
+        // in distinct modules yields distinct objects while every reference within
+        // a module observes the same one.
+        if (std.mem.indexOf(u8, e.value_ptr.*, "import.meta") != null) {
+            try sb.appendSlice(gpa, "var __import_meta__=Object.create(null);__import_meta__.url=__module_id__;\n");
+        }
         // M16 Phase 4: inject export name setup so the module namespace exotic
         // can detect TDZ (known exports missing from the backing). Scan the
         // source for export names and call __initModuleExports__(exports, [...]).
@@ -1770,6 +1825,11 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     try sb.appendSlice(gpa, "var module = { exports: {} }; var exports = module.exports;\nvar __module_id__ = \"");
     try sb.appendSlice(gpa, self_id);
     try sb.appendSlice(gpa, "\";\n");
+    // The entry module gets its own per-module `import.meta` too (distinct from
+    // any dependency's), defined at bundle scope so the entry IIFE captures it.
+    if (std.mem.indexOf(u8, entry_src, "import.meta") != null) {
+        try sb.appendSlice(gpa, "var __import_meta__=Object.create(null);__import_meta__.url=__module_id__;\n");
+    }
     if (entry_id != null) {
         // Pre-register the entry so a self-/cyclic `require` returns this exact
         // (partial) exports object — cache-before-invoke for the entry itself.

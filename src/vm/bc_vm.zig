@@ -545,6 +545,11 @@ pub const BcVm = struct {
         // declarations are early SyntaxErrors here, unlike CJS-desugar bundle
         // source (run through the separate isolate-level parseScript path).
         p.eval_code = true;
+        // Direct eval inherits the calling context's strict mode (the eval'd code
+        // is strict if the caller is strict, even without its own directive). Use
+        // the currently-executing frame's function as the calling context.
+        if (self.frames.items.len > 0 and self.frames.items[self.frames.items.len - 1].func.is_strict)
+            p.strict = true;
         const parse_result = p.parseScript();
         const stmts = switch (parse_result) {
             .ok => |s| s,
@@ -610,11 +615,52 @@ pub const BcVm = struct {
             realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", msg);
             return error.ShadowParseError;
         }
-        const closure = try self.arena.create(BcClosure);
-        closure.* = .{ .func = main_func, .env = @ptrCast(env) };
-        const closure_val = try val_mod.makeBcFunction(self.arena, closure);
-        const undef = try val_mod.makeUndefined(self.arena);
-        return bcInvokeJs(self, self.arena, undef, closure_val, &[_]Value{});
+        // Run the program frame with the shadow realm's global env as its *own*
+        // frame env (not a fresh child scope, as a function call would create).
+        // This is what makes top-level `var`/function declarations persist into
+        // the shadow realm's globals across successive `evaluate` calls, matching
+        // global Script semantics (and `run()` for the host realm).
+        const num_regs = if (main_func.num_regs > 0) main_func.num_regs else 1;
+        const new_regs = try self.arena.alloc(Value, num_regs);
+        for (new_regs) |*r| r.* = Value{};
+        const top_this = env.lookup("globalThis") catch Value{};
+
+        const frames_before = self.frames.items.len;
+        try self.frames.append(self.arena, BcCallFrame{
+            .func = main_func,
+            .pc = 0,
+            .registers = new_regs,
+            .env = env,
+            .return_dst = 0xFF,
+            .caller_idx = if (self.frames.items.len > 0) self.frames.items.len - 1 else null,
+            .this_val = top_this,
+        });
+        // Re-entrancy boundary: an uncaught throw inside this nested run must not
+        // unwind into the native caller's outer frames.
+        const saved_floor = self.frame_floor;
+        self.frame_floor = frames_before;
+        defer self.frame_floor = saved_floor;
+        while (self.frames.items.len > frames_before) {
+            const outcome = try self.runLoop();
+            switch (outcome) {
+                .ok => |v| return v,
+                .exception => |msg| {
+                    while (self.frames.items.len > frames_before) _ = self.frames.pop();
+                    if (std.mem.startsWith(u8, msg, "interrupted:")) {
+                        self.interrupt_pending = msg;
+                        return error.JsException;
+                    }
+                    realm_mod.pending_exception = self.last_exception_value;
+                    return error.JsException;
+                },
+                .exception_value => |ev| {
+                    while (self.frames.items.len > frames_before) _ = self.frames.pop();
+                    realm_mod.pending_exception = ev.value;
+                    return error.JsException;
+                },
+            }
+        }
+        return self.result;
     }
 
     fn activateContext(self: *BcVm) void {
@@ -1437,9 +1483,17 @@ pub const BcVm = struct {
 
     /// Proxy `apply` trap: `handler.apply(target, thisArg, argsArray)`, forwarding
     /// to a plain call on the target when no trap is defined.
+    /// Raise a TypeError for an operation on a revoked Proxy (whose [[ProxyHandler]]
+    /// / [[ProxyTarget]] are null).
+    fn throwRevokedProxy(self: *BcVm) anyerror {
+        const realm_m = @import("../runtime/realm.zig");
+        realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot perform operation on a revoked proxy");
+        return error.JsException;
+    }
+
     fn proxyApply(self: *BcVm, proxy_obj: *JsObject, this_val: Value, args: []const Value) anyerror!Value {
-        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return error.JsException;
-        const target = proxy_mod.proxyTarget(proxy_obj) orelse return error.JsException;
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return self.throwRevokedProxy();
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return self.throwRevokedProxy();
         if (proxy_mod.trap(handler, "apply")) |trap_fn| {
             const args_arr = try self.arrayFromSlice(args);
             return try self.callAccessor(trap_fn, handler, &[_]Value{ target, this_val, args_arr });
@@ -1452,8 +1506,8 @@ pub const BcVm = struct {
     /// forwarding to a plain construct on the target when no trap is defined.
     /// A present trap must return an object (else TypeError).
     fn proxyConstruct(self: *BcVm, proxy_obj: *JsObject, args: []const Value, new_target: Value) anyerror!Value {
-        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return error.JsException;
-        const target = proxy_mod.proxyTarget(proxy_obj) orelse return error.JsException;
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return self.throwRevokedProxy();
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return self.throwRevokedProxy();
         if (proxy_mod.trap(handler, "construct")) |trap_fn| {
             const args_arr = try self.arrayFromSlice(args);
             const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, args_arr, new_target });

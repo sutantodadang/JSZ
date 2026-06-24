@@ -178,6 +178,10 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
     // Arrow function? (base must be a parenthesized sequence — handled via the normal parseAssignmentExprCore path).
     if (p.match(.arrow)) {
         const params = p.extractArrowParams(left) orelse return null;
+        // Snapshot + detach the destructuring-param prelude before parsing the
+        // body (a nested arrow would otherwise overwrite p.arrow_prelude).
+        const prelude = p.arrow_prelude.items;
+        p.arrow_prelude = .{};
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
@@ -194,6 +198,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
             };
             body_nodes = one.items;
         }
+        body_nodes = prependPrelude(p, prelude, body_nodes) orelse return null;
         const is_strict = parser_file.hasUseStrict(body_nodes);
         return p.makeNode(.function_expr, left.start, p.current.start, .{
             .function_expr = .{
@@ -210,6 +215,22 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
     }
     // Assignment?
     if (isAssignOp(p.current.kind)) {
+        // Strict-mode early error: `eval`/`arguments` may not be an assignment
+        // target in strict code (ES §13.15.1).
+        if (p.strict and left.kind == .identifier and
+            (std.mem.eql(u8, left.data.identifier, "eval") or
+                std.mem.eql(u8, left.data.identifier, "arguments")))
+        {
+            if (!p.had_error) {
+                p.had_error = true;
+                p.error_info = parser_file.ParseError{
+                    .message = "invalid assignment to eval or arguments in strict mode",
+                    .line = p.current.line,
+                    .column = p.current.column,
+                };
+            }
+            return null;
+        }
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
         const right = p.parseAssignmentExpr() orelse return null;
@@ -297,6 +318,10 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
     // ES2015 arrow function: params => body
     if (p.match(.arrow)) {
         const params = p.extractArrowParams(left) orelse return null;
+        // Snapshot + detach the destructuring-param prelude before parsing the
+        // body (a nested arrow would otherwise overwrite p.arrow_prelude).
+        const prelude = p.arrow_prelude.items;
+        p.arrow_prelude = .{};
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
@@ -313,6 +338,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
             };
             body_nodes = one.items;
         }
+        body_nodes = prependPrelude(p, prelude, body_nodes) orelse return null;
         const is_strict = parser_file.hasUseStrict(body_nodes);
         return p.makeNode(.function_expr, start, p.current.start, .{
             .function_expr = .{
@@ -329,6 +355,22 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
     }
     // Check for assignment operator.
     if (isAssignOp(p.current.kind)) {
+        // Strict-mode early error: `eval`/`arguments` may not be the target of
+        // an assignment in strict code (ES §13.15.1).
+        if (p.strict and left.kind == .identifier and
+            (std.mem.eql(u8, left.data.identifier, "eval") or
+                std.mem.eql(u8, left.data.identifier, "arguments")))
+        {
+            if (!p.had_error) {
+                p.had_error = true;
+                p.error_info = parser_file.ParseError{
+                    .message = "invalid assignment to eval or arguments in strict mode",
+                    .line = p.current.line,
+                    .column = p.current.column,
+                };
+            }
+            return null;
+        }
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
         const right = p.parseAssignmentExpr() orelse return null; // right-assoc
@@ -341,6 +383,8 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
 }
 
 pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
+    // Fresh prelude per extraction (snapshotted by the caller right after).
+    p.arrow_prelude = .{};
     var params = std.ArrayList([]const u8){};
     switch (lhs.kind) {
         .identifier => {
@@ -349,38 +393,160 @@ pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
                 return null;
             };
         },
+        // A single destructuring param: `([a]) => …` / `({x}) => …`. The
+        // parenthesized pattern parsed as an array/object literal.
+        .array_literal, .object_literal => {
+            if (!extractOneArrowParam(p, lhs, &params)) return null;
+        },
         .sequence_expr => {
             for (lhs.data.sequence_expr.exprs) |e| {
-                if (e.kind != .identifier) {
-                    if (!p.had_error) {
-                        p.had_error = true;
-                        p.error_info = parser_file.ParseError{
-                            .message = "invalid arrow parameter list",
-                            .line = p.current.line,
-                            .column = p.current.column,
-                        };
-                    }
-                    return null;
-                }
-                params.append(p.arena, e.data.identifier) catch {
-                    p.had_error = true;
-                    return null;
-                };
+                if (!extractOneArrowParam(p, e, &params)) return null;
             }
         },
         else => {
-            if (!p.had_error) {
-                p.had_error = true;
-                p.error_info = parser_file.ParseError{
-                    .message = "invalid arrow parameter list",
-                    .line = p.current.line,
-                    .column = p.current.column,
-                };
-            }
+            arrowParamError(p);
             return null;
         },
     }
     return params.items;
+}
+
+/// Prepend the destructuring-param prelude (`let` decls) to an arrow body.
+/// Returns `body` unchanged when there is no prelude.
+fn prependPrelude(p: *Parser, prelude: []*Node, body: []*Node) ?[]*Node {
+    if (prelude.len == 0) return body;
+    var combined = std.ArrayList(*Node){};
+    combined.appendSlice(p.arena, prelude) catch {
+        p.had_error = true;
+        return null;
+    };
+    combined.appendSlice(p.arena, body) catch {
+        p.had_error = true;
+        return null;
+    };
+    return combined.items;
+}
+
+fn arrowParamError(p: *Parser) void {
+    if (!p.had_error) {
+        p.had_error = true;
+        p.error_info = parser_file.ParseError{
+            .message = "invalid arrow parameter list",
+            .line = p.current.line,
+            .column = p.current.column,
+        };
+    }
+}
+
+/// Add one arrow parameter from `e` to `params`. A plain identifier binds
+/// directly; an array/object literal is a destructuring pattern, given a
+/// synthetic `__param_N` name whose `const` destructuring decls are pushed onto
+/// `p.arrow_prelude` (prepended to the body by the caller).
+fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)) bool {
+    switch (e.kind) {
+        .identifier => {
+            params.append(p.arena, e.data.identifier) catch {
+                p.had_error = true;
+                return false;
+            };
+        },
+        .array_literal, .object_literal => {
+            const tmp_name = std.fmt.allocPrint(p.arena, "__param_{d}", .{p.param_destruct_counter}) catch {
+                p.had_error = true;
+                return false;
+            };
+            p.param_destruct_counter += 1;
+            params.append(p.arena, tmp_name) catch {
+                p.had_error = true;
+                return false;
+            };
+            const src = p.makeNode(.identifier, e.start, e.start, .{ .identifier = tmp_name }) orelse return false;
+            if (!desugarParamPattern(p, e, src)) return false;
+        },
+        else => {
+            arrowParamError(p);
+            return false;
+        },
+    }
+    return true;
+}
+
+/// Emit `let`-binding decls into `p.arrow_prelude` that destructure `src` (an
+/// expression node) according to `pattern` (an array/object literal acting as a
+/// binding pattern). Recurses for nested patterns. Defaults (`[a = d]`,
+/// `{x = d}`) substitute `d` when the read is `undefined`.
+fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
+    switch (pattern.kind) {
+        .array_literal => {
+            for (pattern.data.array_literal.elements, 0..) |el, i| {
+                const idx = p.makeNode(.number_literal, el.start, el.start, .{ .number_literal = @floatFromInt(i) }) orelse return false;
+                const access = p.makeNode(.member_expr, el.start, el.start, .{
+                    .member_expr = .{ .object = src, .property = idx, .computed = true },
+                }) orelse return false;
+                if (!bindPatternElement(p, el, access)) return false;
+            }
+        },
+        .object_literal => {
+            for (pattern.data.object_literal.properties) |prop| {
+                const key = p.makeNode(.identifier, prop.value.start, prop.value.start, .{ .identifier = prop.key }) orelse return false;
+                const access = p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
+                    .member_expr = .{ .object = src, .property = key, .computed = false },
+                }) orelse return false;
+                if (!bindPatternElement(p, prop.value, access)) return false;
+            }
+        },
+        else => {
+            arrowParamError(p);
+            return false;
+        },
+    }
+    return true;
+}
+
+/// Bind one element of a destructuring pattern: an identifier becomes a `let`
+/// decl reading `access`; an `ident = default` applies the default; a nested
+/// array/object pattern recurses.
+fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
+    switch (target.kind) {
+        .identifier => {
+            const vd = p.makeNode(.var_decl, target.start, target.start, .{
+                .var_decl = .{ .kind = .let, .name = target.data.identifier, .init = access },
+            }) orelse return false;
+            p.arrow_prelude.append(p.arena, vd) catch {
+                p.had_error = true;
+                return false;
+            };
+        },
+        .array_literal, .object_literal => return desugarParamPattern(p, target, access),
+        // `[a = default]` / `{x = default}`: parsed as an assignment expression.
+        .assignment_expr => {
+            const ae = target.data.assignment_expr;
+            if (ae.target.kind != .identifier) {
+                arrowParamError(p);
+                return false;
+            }
+            // init = (access !== undefined) ? access : default
+            const undef = p.makeNode(.identifier, target.start, target.start, .{ .identifier = "undefined" }) orelse return false;
+            const test_ = p.makeNode(.binary_expr, target.start, target.start, .{
+                .binary_expr = .{ .op = .strict_neq, .left = access, .right = undef },
+            }) orelse return false;
+            const cond = p.makeNode(.conditional_expr, target.start, target.start, .{
+                .conditional_expr = .{ .test_ = test_, .consequent = access, .alternate = ae.value },
+            }) orelse return false;
+            const vd = p.makeNode(.var_decl, target.start, target.start, .{
+                .var_decl = .{ .kind = .let, .name = ae.target.data.identifier, .init = cond },
+            }) orelse return false;
+            p.arrow_prelude.append(p.arena, vd) catch {
+                p.had_error = true;
+                return false;
+            };
+        },
+        else => {
+            arrowParamError(p);
+            return false;
+        },
+    }
+    return true;
 }
 
 pub fn parseConditionalExpr(p: *Parser) ?*Node {

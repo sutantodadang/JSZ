@@ -948,19 +948,30 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
 pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     _ = p.expect(.left_brace) orelse return null;
     p.fn_nesting_depth += 1;
+    // A function body is strict if it inherits strictness from the enclosing
+    // code or carries its own "use strict" directive prologue. Restored on exit
+    // so a strict function nested in sloppy code doesn't leak strictness back.
+    const saved_strict = p.strict;
     var body = std.ArrayList(*Node){};
     const li_start = p.live_imports.items.len;
     const le_start = p.live_exports.items.len;
     const la_start = p.live_export_aliases.items.len;
+    var in_prologue = true;
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const s = p.parseStatement() orelse break;
         body.append(p.arena, s) catch {
             p.had_error = true;
             break;
         };
+        if (in_prologue) {
+            if (parser_file.directiveOf(s)) |dir| {
+                if (std.mem.eql(u8, dir, "use strict")) p.strict = true;
+            } else in_prologue = false;
+        }
         p.drainExtraStmts(&body);
     }
     p.applyLiveBindings(body.items, li_start, le_start, la_start);
+    p.strict = saved_strict;
     p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
     return body.items;

@@ -130,8 +130,13 @@ When all pass, commit: fix(esm): $name — remaining failures fixed
 PROMPT
             
             log "Launching Claude for $name..."
-            # Use script to capture pty output
-            if script -q -c "claude -p --model opus --dangerously-skip-permissions < '$prompt_file'" "$log_file" 2>&1; then
+            # Write prompt to fixed file, use static proxy to avoid ALL quoting issues
+            mkdir -p /tmp/m16_work
+            cp "$prompt_file" /tmp/m16_work/current_prompt.md
+            # The proxy reads the prompt file — no shell quoting ever touches prompt text
+            script -q -c "bash /tmp/claude_proxy.sh" "$log_file" 2>&1
+            claude_ok=$?
+            if [ $claude_ok -eq 0 ]; then
                 # Check if work was done
                 if ! git diff --quiet HEAD 2>/dev/null; then
                     log "$name: Claude made changes, building..."

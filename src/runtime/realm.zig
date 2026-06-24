@@ -2510,6 +2510,15 @@ pub const Realm = struct {
             const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
             try symbol_ctor.set(name, try val_mod.makeSymbol(arena, desc));
         }
+        // Symbol.prototype.constructor === Symbol, and the `description` accessor
+        // (a getter holder `{ get: nativeFn }`, matching the live-reexport pattern).
+        try symbol_proto.set("constructor", try val_mod.makeObject(arena, symbol_ctor));
+        const sym_desc_holder = try JsObject.create(arena, null);
+        try sym_desc_holder.set("get", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolDescriptionGet));
+        _ = try symbol_proto.defineOwnAccessor("description", try val_mod.makeObject(arena, sym_desc_holder), .{
+            .enumerable = false,
+            .configurable = true,
+        });
         try env.define("Symbol", try val_mod.makeObject(arena, symbol_ctor));
         // Capture Symbol.iterator and register Array.prototype[Symbol.iterator].
         active_sym_iterator = symbol_ctor.getOwn("iterator");
@@ -2550,6 +2559,7 @@ pub const Realm = struct {
         tdz_marker = try val_mod.makeSymbol(arena, "[[TDZ]]");
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
+        _ = try proxy_ctor.defineOwnData("revocable", try val_mod.makeNativeFunctionNamed(arena, proxy_mod.nativeProxyRevocable, "revocable", 2), .{ .writable = true, .enumerable = false, .configurable = true });
         try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
 
         // ---- Intl (en-US, dependency-free) ----

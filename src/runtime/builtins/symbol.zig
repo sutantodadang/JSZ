@@ -29,6 +29,17 @@ pub fn nativeSymbolToString(arena: std.mem.Allocator, this_val: Value, _: []cons
     return val_mod.makeString(arena, "Symbol()");
 }
 
+/// get Symbol.prototype.description — returns the symbol's description string,
+/// or undefined when it was created without one. `this` is the symbol primitive
+/// (or a boxed Symbol object, though autoboxing passes the primitive here).
+pub fn nativeSymbolDescriptionGet(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits != 0 and this_val.unbox() == .symbol) {
+        const sd = this_val.toPtr().symbol;
+        if (sd.description) |d| return val_mod.makeString(arena, d);
+    }
+    return val_mod.makeUndefined(arena);
+}
+
 /// Global symbol registry for Symbol.for / Symbol.keyFor (single-threaded).
 /// Its backing buffers + stored values live in the per-realm arena (see the
 /// `append(arena, ...)` calls below). The registry is per-agent, so a fresh

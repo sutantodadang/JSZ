@@ -261,6 +261,20 @@ fn wrappedFunctionCreate(arena: std.mem.Allocator, target: Value) anyerror!Value
     const ctx = realm_mod.active_context orelse
         return throwTypeError(arena, "ShadowRealm: no active context");
 
+    // CopyNameAndLength step 3: HasOwnProperty(Target, "length") then "name" —
+    // both invoke the target's [[GetOwnProperty]]. For a callable Proxy this fires
+    // its `getOwnPropertyDescriptor` trap, whose abrupt completion maps to a
+    // TypeError. (For ordinary objects [[Get]] below already covers the lookup.)
+    if (target.bits != 0 and target.unbox() == .object and target.toPtr().object.internal_kind == .proxy) {
+        const pobj = target.toPtr().object;
+        const len_key = try val_mod.makeString(arena, "length");
+        _ = proxy_mod.proxyGetOwnPropertyDescriptor(arena, pobj, len_key) catch
+            return throwTypeError(arena, "ShadowRealm: wrapped function length descriptor threw");
+        const name_key = try val_mod.makeString(arena, "name");
+        _ = proxy_mod.proxyGetOwnPropertyDescriptor(arena, pobj, name_key) catch
+            return throwTypeError(arena, "ShadowRealm: wrapped function name descriptor threw");
+    }
+
     // CopyNameAndLength: read name/length via [[Get]] (fires getters/proxy traps).
     const name_v = ctx.getProp(arena, target, "name") catch
         return throwTypeError(arena, "ShadowRealm: wrapped function name getter threw");

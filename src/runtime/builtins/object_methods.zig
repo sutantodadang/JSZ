@@ -395,6 +395,12 @@ pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
         if (@import("../realm.zig").active_function_proto) |fp| return val_mod.makeObject(arena, fp);
         return val_mod.makeNull(arena);
     }
+    // A symbol primitive boxes to %Symbol.prototype% (ToObject then
+    // [[GetPrototypeOf]]), so `Object.getPrototypeOf(sym) === Symbol.prototype`.
+    if (args[0].unbox() == .symbol) {
+        if (@import("../realm.zig").active_symbol_proto) |sp| return val_mod.makeObject(arena, sp);
+        return val_mod.makeNull(arena);
+    }
     if (args[0].unbox() != .object) return val_mod.makeNull(arena);
     const obj = args[0].toPtr().object;
     if (obj.proto) |p| return val_mod.makeObject(arena, p);

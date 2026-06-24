@@ -39,6 +39,32 @@ pub fn hasUseStrict(body: []*Node) bool {
     return std.mem.eql(u8, inner.data.string_literal, "use strict");
 }
 
+/// If `node` is a string-literal expression statement (a member of a directive
+/// prologue), return its raw string value; otherwise null (the prologue ends at
+/// the first non-string-literal statement).
+pub fn directiveOf(node: *Node) ?[]const u8 {
+    if (node.kind != .expr_stmt) return null;
+    const inner = node.data.expr_stmt;
+    if (inner.kind != .string_literal) return null;
+    return inner.data.string_literal;
+}
+
+/// Future reserved words that are valid identifiers in sloppy mode but early
+/// SyntaxErrors when used as a binding identifier in strict-mode code
+/// (ES §12.7.2 + the `eval`/`arguments` binding restriction §13.1.1). `yield`
+/// and `await` are handled separately (generator/module context).
+pub fn isStrictReservedWord(name: []const u8) bool {
+    const words = [_][]const u8{
+        "implements", "interface", "let",       "package", "private",
+        "protected",  "public",    "static",    "yield",   "eval",
+        "arguments",
+    };
+    for (words) |w| {
+        if (std.mem.eql(u8, name, w)) return true;
+    }
+    return false;
+}
+
 pub const ParseResult = union(enum) {
     ok: []*Node,
     err: ParseError,
@@ -107,11 +133,27 @@ pub const Parser = struct {
     /// Monotonic counter for the hidden `__home_N` capture var injected by
     /// parseObjectLiteral for object literals whose methods use `super`.
     home_obj_counter: u32,
+    /// Arrow destructuring params: when an arrow parameter is an array/object
+    /// pattern (`([a]) => …`, `({x}) => …`), extractArrowParams gives it a
+    /// synthetic name and stashes the destructuring `const` decls here. The arrow
+    /// builder snapshots+clears this immediately after extractArrowParams and
+    /// prepends the decls to the body. Cleared per extraction so nested arrows
+    /// don't cross-contaminate.
+    arrow_prelude: std.ArrayList(*Node),
+    /// Monotonic counter for synthetic destructuring-param names (`__param_N`).
+    param_destruct_counter: u32,
     /// True when parsing direct/indirect `eval()` code. Eval code is a Script
     /// (sec-scripts §A.5), so `import`/`export` *declarations* are early
     /// SyntaxErrors — unlike the CJS-desugar bundle source run via parseScript,
     /// which legitimately carries them. Set only by the `eval()` builtin.
     eval_code: bool,
+    /// True when the code currently being parsed is strict-mode code (a "use
+    /// strict" directive prologue at script/eval/function scope, or module code).
+    /// Drives the strict-only early SyntaxErrors: future-reserved words used as
+    /// binding identifiers (`public`, `interface`, …) and assignment to
+    /// `eval`/`arguments`. May be set by a host caller (e.g. direct `eval` in a
+    /// strict caller) before parsing begins.
+    strict: bool,
 
     pub fn init(source: []const u8, arena: std.mem.Allocator) Parser {
         var p = Parser{
@@ -136,7 +178,10 @@ pub const Parser = struct {
             .saw_top_level_await = false,
             .super_used = false,
             .home_obj_counter = 0,
+            .arrow_prelude = .{},
+            .param_destruct_counter = 0,
             .eval_code = false,
+            .strict = false,
         };
         // Prime the lookahead.
         p.current = p.lexNext();
@@ -303,12 +348,22 @@ pub const Parser = struct {
         const li_start = self.live_imports.items.len;
         const le_start = self.live_exports.items.len;
         const la_start = self.live_export_aliases.items.len;
+        // Directive prologue: leading string-literal statements may carry a
+        // "use strict" directive that makes the rest of the script strict code.
+        // Detected before parsing any later statement, so the strict early-error
+        // checks (reserved-word bindings, eval/arguments assignment) see it.
+        var in_prologue = true;
         while (!self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
             stmts.append(self.arena, s) catch {
                 self.had_error = true;
                 break;
             };
+            if (in_prologue) {
+                if (directiveOf(s)) |dir| {
+                    if (std.mem.eql(u8, dir, "use strict")) self.strict = true;
+                } else in_prologue = false;
+            }
             self.drainExtraStmts(&stmts);
             // M16 Phase 5: detect the bundle hoist-point marker. A buildBundle
             // output is CJS-desugared script source (run via parseScript), but it
@@ -369,6 +424,7 @@ pub const Parser = struct {
     /// the same `ParseResult.err` channel as scripts.
     pub fn parseModule(self: *Parser) ParseResult {
         self.is_module = true;
+        self.strict = true; // §11.2.2: module code is always strict.
         var stmts = std.ArrayList(*Node){};
         const li_start = self.live_imports.items.len;
         const le_start = self.live_exports.items.len;
