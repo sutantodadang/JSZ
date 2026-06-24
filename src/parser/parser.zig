@@ -209,6 +209,17 @@ pub const Parser = struct {
         return self.expect(.identifier);
     }
 
+    /// True when the current token is an IdentifierName: a plain identifier or a
+    /// reserved word (`export`, `in`, `if`, …). Reserved words are valid in
+    /// IdentifierName positions — property keys, method names — even though they
+    /// cannot be used as bare Identifiers. Its spelling is in `current.value_str`.
+    pub fn currentIsIdentifierName(self: *const Parser) bool {
+        const k = self.current.kind;
+        if (k == .identifier) return true;
+        const i = @intFromEnum(k);
+        return i >= @intFromEnum(TokenKind.kw_break) and i <= @intFromEnum(TokenKind.kw_null);
+    }
+
     pub fn expect(self: *Parser, kind: TokenKind) ?Token {
         if (self.check(kind)) return self.advance();
         if (!self.had_error) {

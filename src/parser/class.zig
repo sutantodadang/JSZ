@@ -99,6 +99,12 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
         } else if (p.check(.identifier) or p.check(.string) or p.check(.number)) {
             name = p.current.value_str;
             _ = p.advance();
+        } else if (p.currentIsIdentifierName()) {
+            // A reserved word (`export`, `in`, …) is a valid IdentifierName as a
+            // member name — also the form produced by an escaped keyword like
+            // `export`, which the lexer decodes to the keyword token.
+            name = p.current.value_str;
+            _ = p.advance();
         } else {
             // Unsupported member start (e.g. a generator `*`): skip one token so
             // the loop can't spin, matching the prior lenient behaviour.
