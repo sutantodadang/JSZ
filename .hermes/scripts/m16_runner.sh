@@ -7,11 +7,8 @@ cd ~/JSZ || { echo "ERROR: JSZ directory not found"; exit 1; }
 
 BRANCH="feature/mi16-phase4"
 TARGETS=(
-  "ShadowRealm:ShadowRealm"
-  "import.meta:import.meta"
   "reserved-words:language/reserved-words"
   "await-using:await-using"
-  "expressions/import:language/expressions/import"
 )
 BUILD_CMD="rm -f zig-out/bin/test262-runner && zig build -Doptimize=ReleaseFast"
 RUNNER="./zig-out/bin/test262-runner --full --filter"
