@@ -20,9 +20,17 @@ const expr_mod = @import("./expr.zig");
 /// synthetic-module factory (JSON / text). All other attributes are ignored.
 fn skipImportAttributes(p: *Parser) ?[]const u8 {
     // `with` is a reserved-word token (kw_with); `assert` is a contextual kw.
+    // Only treat it as an attributes clause when a `{` immediately follows. An
+    // import without a trailing `;` (ASI) may be followed by a statement whose
+    // leading token happens to be `assert`/`with` — e.g.
+    //   import {"*" as y} from "./m.js"
+    //   assert.sameValue(y, "ok");
+    // Consuming the bare `assert` here would swallow the next statement's leading
+    // identifier and leave the parser stranded on its `.` (`unexpected token`).
     const is_with = p.current.kind == .kw_with;
     const is_assert = p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "assert");
     if (!is_with and !is_assert) return null;
+    if (p.peekNext().kind != .left_brace) return null;
     _ = p.advance(); // consume `with` / `assert`
     // Expect `{ ... }` — consume the braced block, tolerating nested braces and
     // string literals (attribute values are string literals).

@@ -127,6 +127,27 @@ fn frontmatter(source: []const u8) []const u8 {
     return rest[0..end];
 }
 
+/// Return the text of the `flags:` frontmatter entry, covering both the inline
+/// array form (`flags: [module, async]`) and the YAML block-list form
+/// (`flags:\n  - module\n  - async`). The returned slice spans the `flags:` line
+/// plus any following indented continuation lines, so a block-list value is not
+/// truncated to the bare `flags:` line (which carries no flag tokens). Returns
+/// "" when there is no `flags:` entry.
+fn flagsText(yaml: []const u8) []const u8 {
+    const fi = std.mem.indexOf(u8, yaml, "flags:") orelse return "";
+    var end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse return yaml[fi..];
+    // Extend across following block-list continuation lines, which are indented
+    // (start with a space/tab). A new top-level key (e.g. `negative:`) is not
+    // indented and ends the flags block.
+    while (end < yaml.len) {
+        const next_nl = std.mem.indexOfScalarPos(u8, yaml, end + 1, '\n') orelse yaml.len;
+        const line = yaml[end + 1 .. next_nl];
+        if (line.len == 0 or (line[0] != ' ' and line[0] != '\t')) break;
+        end = next_nl;
+    }
+    return yaml[fi..end];
+}
+
 /// Eligibility for auto-expansion: pure ES5 (has es5id), no unsupported
 /// harness includes, and no module/raw/async flags. Keeps the auto-grown
 /// set to tests our engine + minimal prelude (assert.js/sta.js) can run.
@@ -138,9 +159,8 @@ fn isEligibleEs5(source: []const u8, allow_es6: bool, allow_module: bool) bool {
     const has_esid = std.mem.indexOf(u8, yaml, "esid:") != null;
     if (!has_es5 and !(allow_es6 and has_esid)) return false;
     // Unsupported flags.
-    if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
-        const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
-        const flags = yaml[fi..line_end];
+    {
+        const flags = flagsText(yaml);
         if (std.mem.indexOf(u8, flags, "module") != null and !allow_module) return false;
         if (std.mem.indexOf(u8, flags, "raw") != null) return false;
         if (std.mem.indexOf(u8, flags, "async") != null) return false;
@@ -293,9 +313,8 @@ fn includesRegion(yaml: []const u8) []const u8 {
 /// flags need features the single-file harness can't satisfy.
 fn isRunnableFull(source: []const u8) bool {
     const yaml = frontmatter(source);
-    if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
-        const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
-        const flags = yaml[fi..line_end];
+    {
+        const flags = flagsText(yaml);
         // `module` is now runnable: M16 routes these through `ctx.evalModule`
         // (strict, import/export desugared). `raw`/`CanBlockIsFalse` still need
         // harness features the single-file runner can't provide.
@@ -315,11 +334,7 @@ fn isRunnableFull(source: []const u8) bool {
 /// the source must be evaluated as ES-module code rather than a script.
 fn hasModuleFlag(source: []const u8) bool {
     const yaml = frontmatter(source);
-    if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
-        const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
-        return std.mem.indexOf(u8, yaml[fi..line_end], "module") != null;
-    }
-    return false;
+    return std.mem.indexOf(u8, flagsText(yaml), "module") != null;
 }
 
 /// True when the source references at least one relative module specifier
@@ -427,13 +442,9 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     // always called synchronously before evalModule returns.
     const is_tla_module = blk: {
         const yaml = frontmatter(source);
-        if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
-            const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
-            const flags_line = yaml[fi..line_end];
-            break :blk std.mem.indexOf(u8, flags_line, "module") != null and
-                std.mem.indexOf(u8, flags_line, "async") != null;
-        }
-        break :blk false;
+        const flags = flagsText(yaml);
+        break :blk std.mem.indexOf(u8, flags, "module") != null and
+            std.mem.indexOf(u8, flags, "async") != null;
     };
     // M16 TLA: with true async module evaluation $DONE may be called from a
     // microtask after the synchronous run; route it through host completion
