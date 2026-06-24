@@ -226,6 +226,13 @@ fn appendDerivedInstanceFields(p: *Parser, list: *std.ArrayList(*Node), fields: 
 }
 
 /// Build a static-field initializer statement: `ClassName.<name> = <init>`.
+///
+/// Per spec (ClassFieldDefinitionEvaluation / static field initializer), the
+/// initializer is evaluated with `this` bound to the class constructor — so
+/// `static f = this.name` must see the class, not the surrounding `this`. The
+/// initializer is therefore wrapped in `(function(){ return <init>; }).call(C)`
+/// rather than assigned directly. A bare `static f = 1` (no `this`) gets the
+/// same wrapper; the result is identical.
 fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node {
     const s = p.current.start;
     const cls = nodeIdent(p, class_name) orelse return null;
@@ -233,7 +240,24 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
         (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = cls, .property = k, .computed = true } }) orelse return null)
     else
         (nodeMember(p, cls, f.name) orelse return null);
-    const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const raw_init = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+
+    // Wrap: (function () { return <init>; }).call(ClassName)
+    const ret_stmt = p.makeNode(.return_stmt, s, s, .{ .return_stmt = raw_init }) orelse return null;
+    const body = p.arena.alloc(*Node, 1) catch return null;
+    body[0] = ret_stmt;
+    const init_fn = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
+        .name = null,
+        .params = &[_][]const u8{},
+        .body = body,
+        .is_arrow = false,
+    } }) orelse return null;
+    const call_member = nodeMember(p, init_fn, "call") orelse return null;
+    const this_arg = nodeIdent(p, class_name) orelse return null;
+    const call_args = p.arena.alloc(*Node, 1) catch return null;
+    call_args[0] = this_arg;
+    const val = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = call_member, .args = call_args } }) orelse return null;
+
     const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
 }
