@@ -861,6 +861,12 @@ pub const FnCompiler = struct {
                 try self.emitStore(a.target.data.identifier, rhs, line);
             } else if (a.target.kind == .member_expr) {
                 try self.compileMemberWrite(a.target.data.member_expr, rhs, line);
+            } else if (a.target.kind == .object_literal) {
+                // Object destructuring assignment: `{ a: x, b } = rhs`. The
+                // object literal node doubles as the assignment pattern. The
+                // whole expression still evaluates to `rhs`, so keep it live.
+                try self.compileDestructure(a.target, rhs, line);
+                self.sp = rhs + 1;
             }
             return rhs;
         }
@@ -902,6 +908,64 @@ pub const FnCompiler = struct {
             try self.compileMemberWrite(a.target.data.member_expr, rdst, line);
         }
         return rdst;
+    }
+
+    /// Assign the value held in register `rsrc` to a destructuring pattern
+    /// `target` (an object literal reused as an ObjectAssignmentPattern), or to a
+    /// nested simple target (identifier / member / `pattern = default`). `rsrc`
+    /// is read-only and must stay live for the caller; helpers only allocate
+    /// registers above it. Array patterns are left unhandled (no-op) for now.
+    fn compileDestructure(self: *Self, target: *Node, rsrc: u8, line: u32) error{OutOfMemory}!void {
+        switch (target.kind) {
+            .identifier => try self.emitStore(target.data.identifier, rsrc, line),
+            .member_expr => try self.compileMemberWrite(target.data.member_expr, rsrc, line),
+            .assignment_expr => {
+                // `pattern = default`: substitute `default` when `rsrc` is nullish.
+                const ae = target.data.assignment_expr;
+                if (ae.op != .assign) return; // only plain `=` is a valid default
+                const rt = self.allocReg();
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(rt);
+                try self.emitU8(rsrc);
+                // Skip the default-load when `rt` is not nullish.
+                try self.emitOp(.JMP_IF_NOT_NULLISH, line);
+                try self.emitU8(rt);
+                const patch = self.currentOffset();
+                try self.emitI16(0);
+                const rd = try self.compileExpr(ae.value);
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(rt);
+                try self.emitU8(rd);
+                self.sp = rt + 1; // free any regs the default expr used
+                self.patchJump(patch, self.currentOffset());
+                try self.compileDestructure(ae.target, rt, line);
+                self.sp = rt; // free rt
+            },
+            .object_literal => {
+                for (target.data.object_literal.properties) |prop| {
+                    if (prop.kind != .init) continue; // patterns carry only data props
+                    const rval = self.allocReg();
+                    if (prop.computed_key) |key_node| {
+                        const rkey = try self.compileExpr(key_node);
+                        try self.emitOp(.GET_PROP_DYN, line);
+                        try self.emitU8(rval);
+                        try self.emitU8(rsrc);
+                        try self.emitU8(rkey);
+                        self.sp = rval + 1; // free rkey
+                    } else {
+                        const sv = try val_mod.makeString(self.arena, prop.key);
+                        const kidx = try self.addConstant(sv);
+                        try self.emitOp(.GET_PROP, line);
+                        try self.emitU8(rval);
+                        try self.emitU8(rsrc);
+                        try self.emitU16(kidx);
+                    }
+                    try self.compileDestructure(prop.value, rval, line);
+                    self.sp = rval; // free rval
+                }
+            },
+            else => {}, // unsupported pattern element: leave unassigned
+        }
     }
 
     /// ES2021 logical assignment (`&&=`, `||=`, `??=`). Short-circuits: reads the
