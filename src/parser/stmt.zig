@@ -90,6 +90,9 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     if (nxt == .left_paren or nxt == .dot) {
         return p.parseExprStmt();
     }
+    // An `import` *declaration* is only valid in module code; in eval/script
+    // code it is an early SyntaxError (dynamic `import(...)` above is allowed).
+    if (p.eval_code) return p.fail("import declarations may only appear at the top level of a module");
     _ = p.advance(); // import
 
     // import "mod";  (side-effect only)
@@ -261,6 +264,9 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
 
 pub fn parseExportDecl(p: *Parser) ?*Node {
     const start = p.current.start;
+    // An `export` declaration is only valid in module code; in eval/script code
+    // it is an early SyntaxError (sec-scripts §A.5).
+    if (p.eval_code) return p.fail("export declarations may only appear at the top level of a module");
     _ = p.advance(); // export
 
     // export default <assignmentExpr>;

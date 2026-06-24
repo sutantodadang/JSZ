@@ -107,6 +107,11 @@ pub const Parser = struct {
     /// Monotonic counter for the hidden `__home_N` capture var injected by
     /// parseObjectLiteral for object literals whose methods use `super`.
     home_obj_counter: u32,
+    /// True when parsing direct/indirect `eval()` code. Eval code is a Script
+    /// (sec-scripts §A.5), so `import`/`export` *declarations* are early
+    /// SyntaxErrors — unlike the CJS-desugar bundle source run via parseScript,
+    /// which legitimately carries them. Set only by the `eval()` builtin.
+    eval_code: bool,
 
     pub fn init(source: []const u8, arena: std.mem.Allocator) Parser {
         var p = Parser{
@@ -131,6 +136,7 @@ pub const Parser = struct {
             .saw_top_level_await = false,
             .super_used = false,
             .home_obj_counter = 0,
+            .eval_code = false,
         };
         // Prime the lookahead.
         p.current = p.lexNext();

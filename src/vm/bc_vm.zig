@@ -534,6 +534,10 @@ pub const BcVm = struct {
 
         const transformed = isolate_mod.rewriteTemplateLiterals(self.arena, source) catch source;
         var p = parser_mod.Parser.init(transformed, self.arena);
+        // Eval code is a Script (sec-scripts §A.5): `import`/`export`
+        // declarations are early SyntaxErrors here, unlike CJS-desugar bundle
+        // source (run through the separate isolate-level parseScript path).
+        p.eval_code = true;
         const parse_result = p.parseScript();
         const stmts = switch (parse_result) {
             .ok => |s| s,
