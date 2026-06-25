@@ -394,8 +394,9 @@ pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
             };
         },
         // A single destructuring param: `([a]) => …` / `({x}) => …`. The
-        // parenthesized pattern parsed as an array/object literal.
-        .array_literal, .object_literal => {
+        // parenthesized pattern parsed as an array/object literal. A single
+        // defaulted param `(x = d) => …` parses as an assignment expression.
+        .array_literal, .object_literal, .assignment_expr => {
             if (!extractOneArrowParam(p, lhs, &params)) return null;
         },
         .sequence_expr => {
@@ -462,6 +463,26 @@ fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)
             };
             const src = p.makeNode(.identifier, e.start, e.start, .{ .identifier = tmp_name }) orelse return false;
             if (!desugarParamPattern(p, e, src)) return false;
+        },
+        // A defaulted parameter `(x = d)` (or `([a] = d)` / `({x} = d)`) parses
+        // as an assignment expression. Give it a synthetic param name and let
+        // bindPatternElement emit `let x = (__param_N !== undefined) ? … : d`.
+        .assignment_expr => {
+            if (e.data.assignment_expr.op != .assign) {
+                arrowParamError(p);
+                return false;
+            }
+            const tmp_name = std.fmt.allocPrint(p.arena, "__param_{d}", .{p.param_destruct_counter}) catch {
+                p.had_error = true;
+                return false;
+            };
+            p.param_destruct_counter += 1;
+            params.append(p.arena, tmp_name) catch {
+                p.had_error = true;
+                return false;
+            };
+            const src = p.makeNode(.identifier, e.start, e.start, .{ .identifier = tmp_name }) orelse return false;
+            if (!bindPatternElement(p, e, src)) return false;
         },
         else => {
             arrowParamError(p);

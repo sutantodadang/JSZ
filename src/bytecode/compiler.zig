@@ -1556,6 +1556,7 @@ pub const FnCompiler = struct {
             false, // function body: no implicit last-expr return
             fe.is_arrow,
             fe.rest_param,
+            fe.param_defaults,
         );
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
@@ -1700,14 +1701,57 @@ fn compileFunction(
     body: []*Node,
     nfe_name: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null);
+    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null, &[_]?*Node{});
+}
+
+/// Allocate an AST node from `data` (synthetic — no source span).
+fn mkSynthNode(arena: std.mem.Allocator, data: ast.Data) error{OutOfMemory}!*Node {
+    const n = try arena.create(Node);
+    n.* = .{ .kind = std.meta.activeTag(data), .start = 0, .end = 0, .data = data };
+    return n;
+}
+
+/// Synthesize a prologue applying default parameter values: for each parameter
+/// `p` with a default `d`, prepend `if (p === undefined) p = d;`. An absent
+/// argument is bound to undefined at call setup, so this also covers the
+/// "fewer arguments than parameters" case. Returns `body` unchanged when no
+/// parameter has a default.
+fn applyParamDefaults(
+    arena: std.mem.Allocator,
+    params: [][]const u8,
+    param_defaults: []const ?*Node,
+    body: []*Node,
+) error{OutOfMemory}![]*Node {
+    var any = false;
+    for (param_defaults) |d| {
+        if (d != null) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return body;
+    var list: std.ArrayList(*Node) = .empty;
+    for (params, 0..) |pname, i| {
+        if (i >= param_defaults.len) break;
+        const dexpr = param_defaults[i] orelse continue;
+        const id_test = try mkSynthNode(arena, .{ .identifier = pname });
+        const undef = try mkSynthNode(arena, .{ .undefined_literal = {} });
+        const test_expr = try mkSynthNode(arena, .{ .binary_expr = .{ .op = .strict_eq, .left = id_test, .right = undef } });
+        const id_target = try mkSynthNode(arena, .{ .identifier = pname });
+        const assign = try mkSynthNode(arena, .{ .assignment_expr = .{ .op = .assign, .target = id_target, .value = dexpr } });
+        const estmt = try mkSynthNode(arena, .{ .expr_stmt = assign });
+        const ifs = try mkSynthNode(arena, .{ .if_stmt = .{ .test_ = test_expr, .consequent = estmt, .alternate = null } });
+        try list.append(arena, ifs);
+    }
+    try list.appendSlice(arena, body);
+    return list.toOwnedSlice(arena);
 }
 
 pub fn compileFunctionStrict(
     arena: std.mem.Allocator,
     name: ?[]const u8,
     params: [][]const u8,
-    body: []*Node,
+    body_in: []*Node,
     nfe_name: ?[]const u8,
     is_strict: bool,
     is_generator: bool,
@@ -1715,6 +1759,7 @@ pub fn compileFunctionStrict(
     implicit_return: bool,
     is_arrow: bool,
     rest_param: ?[]const u8,
+    param_defaults: []const ?*Node,
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
@@ -1727,6 +1772,7 @@ pub fn compileFunctionStrict(
     // Register slots are used only for compiler temporaries.
     // sp starts at 0; max_regs tracks highest allocated temporary register.
 
+    const body = try applyParamDefaults(arena, params, param_defaults, body_in);
     try fc.compileBody(body, implicit_return);
 
     const chunk = try fc.builder.finalize(name orelse "<anonymous>", 0);
@@ -1795,6 +1841,7 @@ pub fn compileProgram(
         true, // top-level program: yield last expression-statement value (eval result)
         false, // program is not an arrow
         null, // program has no rest parameter
+        &[_]?*ast.Node{}, // no parameters → no defaults
     );
     return f;
 }
@@ -1826,6 +1873,7 @@ pub fn compileModule(
         true, // top-level program: yield last expression-statement value
         false, // program is not an arrow
         null, // program has no rest parameter
+        &[_]?*ast.Node{}, // no parameters → no defaults
     );
     f.is_module = true;
     return f;

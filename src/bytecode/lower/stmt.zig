@@ -112,6 +112,7 @@ pub fn lowerFunctionDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
         false, // function body: no implicit last-expr return
         false, // function declarations are never arrows
         fd.rest_param,
+        fd.param_defaults,
     );
     const child_idx: u16 = @intCast(self.child_functions.items.len);
     try self.child_functions.append(self.arena, child_fn);
