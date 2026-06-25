@@ -330,7 +330,12 @@ pub const FnCompiler = struct {
             .while_stmt => try self.collectLexicalNames(node.data.while_stmt.body, list),
             .do_while_stmt => try self.collectLexicalNames(node.data.do_while_stmt.body, list),
             .for_stmt => {
-                if (node.data.for_stmt.init) |i| try self.collectLexicalNames(i, list);
+                // Do NOT recurse into for_stmt.init — a `let`/`const` in the
+                // C-style for header is scoped to the loop (per-iteration), not
+                // the enclosing block, and is set up by the for-loop lowering.
+                // Hoisting it here would let an enclosing-scope read (e.g. an
+                // outer `let n = i` before a shadowing inner `for (let i ...)`)
+                // resolve to the loop binding in TDZ. Mirrors for_in_stmt.
                 try self.collectLexicalNames(node.data.for_stmt.body, list);
             },
             .for_in_stmt => {

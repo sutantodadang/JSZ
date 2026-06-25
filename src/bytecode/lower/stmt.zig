@@ -253,6 +253,23 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     const fs = node.data.for_stmt;
     const loop_lbl = self.pending_label;
     self.pending_label = null;
+
+    // A `let`/`const` in the C-style header (`for (let i = 0; ...)`) is scoped
+    // to the loop, not the enclosing block. Wrap init + test + body + update in
+    // a dedicated scope so the bindings shadow same-named outer bindings without
+    // leaking, and so a read in the enclosing scope before the loop does not
+    // resolve to the loop binding in TDZ. The EXIT_SCOPE is emitted AFTER the
+    // break/normal-exit target, so break and continue both unwind to the same
+    // (inner) depth and the single EXIT_SCOPE pops the loop scope on every exit.
+    var for_lex = std.ArrayList([]const u8){};
+    if (fs.init) |init_node| try self.collectLexicalNames(init_node, &for_lex);
+    const has_for_scope = for_lex.items.len > 0;
+    if (has_for_scope) {
+        try self.emitOp(.ENTER_SCOPE, line);
+        self.block_scope_depth += 1;
+        for (for_lex.items) |nm| try self.emitHoistLexical(nm, line);
+    }
+
     if (fs.init) |init_node| {
         var dummy: ?u8 = null;
         try self.compileStmt(init_node, &dummy);
@@ -295,6 +312,11 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         self.patchJump(pe, exit_offset);
     }
     self.resolveLoop(update_offset, exit_offset);
+
+    if (has_for_scope) {
+        try self.emitOp(.EXIT_SCOPE, line);
+        self.block_scope_depth -= 1;
+    }
 }
 
 pub fn lowerReturnStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
