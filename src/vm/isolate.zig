@@ -514,6 +514,12 @@ pub fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]
             i += 1;
             continue;
         }
+        // Tagged template `tag`...`` desugars to a call passing the template
+        // strings object (cooked + raw) followed by the substitution values.
+        if (isTaggedTemplate(source, i)) {
+            i = try rewriteTaggedTemplate(arena, &out, source, i);
+            continue;
+        }
         i += 1; // consume opening backtick
         try out.appendSlice(arena, "(");
         var emitted_any = false;
@@ -603,6 +609,131 @@ fn emitTemplateLiteralSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8),
         }
     }
     try out.append(arena, '"');
+}
+
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '$';
+}
+
+/// A backtick at `btick` begins a TAGGED template when the immediately preceding
+/// significant token is a value-producing expression (an identifier that is not
+/// a reserved word, or a `)` / `]` closing a call/member expression). After an
+/// operator, `(`, `,`, `=`, `return`, `typeof`, etc., the template is untagged.
+fn isTaggedTemplate(source: []const u8, btick: usize) bool {
+    if (btick == 0) return false;
+    var j: isize = @as(isize, @intCast(btick)) - 1;
+    while (j >= 0) : (j -= 1) {
+        const ch = source[@intCast(j)];
+        if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n') continue;
+        break;
+    }
+    if (j < 0) return false;
+    const ch = source[@intCast(j)];
+    if (ch == ')' or ch == ']') return true;
+    if (!isIdentChar(ch)) return false;
+    // Extract the identifier word ending at j.
+    var start: isize = j;
+    while (start >= 0 and isIdentChar(source[@intCast(start)])) : (start -= 1) {}
+    const word = source[@intCast(start + 1) .. @intCast(j + 1)];
+    // Keywords/operators that introduce an (untagged) template expression.
+    const non_tag_words = [_][]const u8{
+        "return", "typeof", "void", "delete", "instanceof", "in", "of", "new",
+        "do", "else", "yield", "await", "case", "throw", "default", "extends",
+    };
+    for (non_tag_words) |w| {
+        if (std.mem.eql(u8, word, w)) return false;
+    }
+    return true;
+}
+
+/// Emit `segment` (raw template text with backslash escapes preserved verbatim)
+/// as the body of a `"..."` literal whose VALUE is the raw text — every
+/// backslash is doubled so escape sequences survive uncooked (for `.raw`).
+fn emitRawSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8), segment: []const u8) !void {
+    try out.append(arena, '"');
+    for (segment) |ch| {
+        switch (ch) {
+            '\\' => try out.appendSlice(arena, "\\\\"),
+            '"' => try out.appendSlice(arena, "\\\""),
+            '\n' => try out.appendSlice(arena, "\\n"),
+            '\r' => try out.appendSlice(arena, "\\r"),
+            else => try out.append(arena, ch),
+        }
+    }
+    try out.append(arena, '"');
+}
+
+/// Rewrite a tagged template starting at the opening backtick `btick` (the tag
+/// expression has already been emitted to `out`). Appends
+/// `(__jsztag([cooked…],[raw…]), (sub1), (sub2)…)` after the tag and returns the
+/// source index just past the closing backtick.
+fn rewriteTaggedTemplate(arena: std.mem.Allocator, out: *std.ArrayList(u8), source: []const u8, btick: usize) error{OutOfMemory}!usize {
+    var i = btick + 1; // consume opening backtick
+    var cooked = std.ArrayList([]const u8){};
+    var raw = std.ArrayList([]const u8){};
+    var subs = std.ArrayList([]const u8){};
+    var literal_buf = std.ArrayList(u8){};
+    while (i < source.len) {
+        if (source[i] == '\\' and i + 1 < source.len) {
+            try literal_buf.append(arena, source[i]);
+            try literal_buf.append(arena, source[i + 1]);
+            i += 2;
+            continue;
+        }
+        if (source[i] == '$' and i + 1 < source.len and source[i + 1] == '{') {
+            try cooked.append(arena, try arena.dupe(u8, literal_buf.items));
+            try raw.append(arena, try arena.dupe(u8, literal_buf.items));
+            literal_buf.clearRetainingCapacity();
+            i += 2; // skip ${
+            var depth: usize = 1;
+            const expr_start = i;
+            var expr_end = expr_start;
+            while (i < source.len and depth > 0) {
+                const ch = source[i];
+                if (ch == '{') {
+                    depth += 1;
+                } else if (ch == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        expr_end = i;
+                        i += 1;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            const inner = try rewriteTemplateLiterals(arena, source[expr_start..expr_end]);
+            try subs.append(arena, inner);
+            continue;
+        }
+        if (source[i] == '`') {
+            i += 1; // consume closing backtick
+            break;
+        }
+        try literal_buf.append(arena, source[i]);
+        i += 1;
+    }
+    try cooked.append(arena, try arena.dupe(u8, literal_buf.items));
+    try raw.append(arena, try arena.dupe(u8, literal_buf.items));
+
+    try out.appendSlice(arena, "(__jsztag([");
+    for (cooked.items, 0..) |seg, k| {
+        if (k > 0) try out.appendSlice(arena, ",");
+        try emitTemplateLiteralSegment(arena, out, seg, false);
+    }
+    try out.appendSlice(arena, "],[");
+    for (raw.items, 0..) |seg, k| {
+        if (k > 0) try out.appendSlice(arena, ",");
+        try emitRawSegment(arena, out, seg);
+    }
+    try out.appendSlice(arena, "])");
+    for (subs.items) |s| {
+        try out.appendSlice(arena, ",(");
+        try out.appendSlice(arena, s);
+        try out.appendSlice(arena, ")");
+    }
+    try out.appendSlice(arena, ")");
+    return i;
 }
 
 /// Native function exposed as __gc__() in JS. Triggers a manual collect.

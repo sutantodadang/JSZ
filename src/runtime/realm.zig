@@ -2106,6 +2106,20 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
 }
 
 /// Build a plain object mirroring global env bindings and expose as globalThis/global.
+/// Runtime helper for tagged template literals: given the `cooked` strings
+/// array and the `raw` strings array (produced by the template-literal source
+/// rewrite), attach `raw` to `cooked` as a non-writable/non-configurable
+/// property and return `cooked` as the template object. Exposed globally as
+/// `__jsztag`.
+fn nativeTemplateObject(_: std.mem.Allocator, _: val_mod.Value, args: []const val_mod.Value) anyerror!val_mod.Value {
+    const cooked = if (args.len > 0) args[0] else val_mod.Value{};
+    const raw = if (args.len > 1) args[1] else val_mod.Value{};
+    if (cooked.bits != 0 and cooked.unbox() == .object) {
+        _ = try cooked.toPtr().object.defineOwnData("raw", raw, .{ .writable = false, .enumerable = false, .configurable = false });
+    }
+    return cooked;
+}
+
 fn installGlobalThis(arena: std.mem.Allocator, env: *Environment, object_proto: *JsObject) !void {
     const global_obj = try JsObject.create(arena, object_proto);
     var it = env.bindings.iterator();
@@ -2617,6 +2631,10 @@ pub const Realm = struct {
         // undefined` instead of a ReferenceError. (installGlobalThis skips `__`
         // names, so this is not exposed as a globalThis property.)
         try env.define("__new_target__", try val_mod.makeUndefined(arena));
+
+        // Tagged-template runtime helper (see rewriteTemplateLiterals): builds the
+        // template strings object from its cooked + raw arrays.
+        try env.define("__jsztag", try val_mod.makeNativeFunction(arena, nativeTemplateObject));
 
         // Set thread-locals for builtins that need them.
         active_array_proto = array_proto;
