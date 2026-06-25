@@ -1105,15 +1105,14 @@ fn relativeIndex(idx: f64, len: usize) usize {
 }
 
 fn elemToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
+    // §23.1.3.18 join: undefined/null elements → empty string; everything else
+    // is ToString(element), which for objects fires toString/valueOf (so a
+    // nested array stringifies via its own join, not "[object Object]").
     if (v.bits == 0) return "";
-    return switch (v.unbox()) {
-        .undefined_ => "",
-        .null_ => "",
-        .boolean => |b| if (b) "true" else "false",
-        .number => |n| try formatNumber(arena, n),
-        .string => |s| s,
-        else => "[object Object]",
-    };
+    switch (v.unbox()) {
+        .undefined_, .null_ => return "",
+        else => return valueToJsString(arena, v),
+    }
 }
 
 fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
