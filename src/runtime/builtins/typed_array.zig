@@ -2293,6 +2293,11 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const map_present = args.len > 1 and !(args[1].bits == 0 or args[1].unbox() == .undefined_);
     if (map_present and !function_proto_isCallable(args[1]))
         return throwTypeError(arena, "TypedArray.from: mapfn is not a function");
+    // GetMethod(source, @@iterator) performs GetV(source, ...) which does
+    // ToObject(source); a null/undefined (or absent) source throws TypeError.
+    // This happens AFTER the mapfn-callable check above.
+    if (args.len < 1 or args[0].bits == 0 or args[0].unbox() == .undefined_ or args[0].unbox() == .null_)
+        return throwTypeError(arena, "TypedArray.from: source is null or undefined");
     const this_arg: Value = if (args.len > 2) args[2] else Value{};
 
     // Collect source: iterable → pre-materialized list; array-like → object + len.
