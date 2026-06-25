@@ -2330,6 +2330,15 @@ pub const Realm = struct {
             try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoValueOf, "valueOf", 0), meth_attr);
         _ = try object_proto.defineOwnData("toLocaleString",
             try val_mod.makeNativeFunctionNamed(arena, array_proto_mod.nativeObjectToLocaleString, "toLocaleString", 0), meth_attr);
+        // Annex B §B.2.2.1: Object.prototype.__proto__ accessor (get/set the
+        // receiver's [[Prototype]]). Enumerable:false, configurable:true.
+        const proto_acc_holder = try JsObject.create(arena, null);
+        try proto_acc_holder.set("get", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectProtoGetProto, "get __proto__", 0));
+        try proto_acc_holder.set("set", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectProtoSetProto, "set __proto__", 1));
+        _ = try object_proto.defineOwnAccessor("__proto__", try val_mod.makeObject(arena, proto_acc_holder), .{
+            .enumerable = false,
+            .configurable = true,
+        });
 
         // ---- Phase 4d: Function.prototype (call, apply, bind) ----
         const function_proto = try JsObject.create(arena, object_proto);
@@ -2680,9 +2689,18 @@ pub const Realm = struct {
         // will be visited during mark. Register them as roots so they survive collect.
         const hp_proto = try heap.allocateObject(null);
         // Copy properties from arena object to heap object, preserving attrs.
+        // Accessor slots (e.g. the `__proto__` get/set pair) must be re-installed
+        // as accessors — `getOwn` returns null for them, so a plain defineOwnData
+        // copy would silently turn them into a broken data property.
         for (self.object_prototype.ownKeys()) |k| {
-            const v = self.object_prototype.getOwn(k).?;
             const a = self.object_prototype.ownAttr(k) orelse obj_mod.PropAttr{};
+            if (a.is_accessor) {
+                if (self.object_prototype.ownAccessorHolder(k)) |holder| {
+                    _ = try hp_proto.defineOwnAccessor(k, holder, a);
+                    continue;
+                }
+            }
+            const v = self.object_prototype.getOwn(k) orelse val_mod.Value{};
             _ = try hp_proto.defineOwnData(k, v, a);
         }
         for (self.object_prototype.sym_props.items) |sp| {
@@ -2691,8 +2709,14 @@ pub const Realm = struct {
 
         const hp_array_proto = try heap.allocateObject(hp_proto);
         for (self.array_prototype.ownKeys()) |k| {
-            const v = self.array_prototype.getOwn(k).?;
             const a = self.array_prototype.ownAttr(k) orelse obj_mod.PropAttr{};
+            if (a.is_accessor) {
+                if (self.array_prototype.ownAccessorHolder(k)) |holder| {
+                    _ = try hp_array_proto.defineOwnAccessor(k, holder, a);
+                    continue;
+                }
+            }
+            const v = self.array_prototype.getOwn(k) orelse val_mod.Value{};
             _ = try hp_array_proto.defineOwnData(k, v, a);
         }
         for (self.array_prototype.sym_props.items) |sp| {

@@ -460,6 +460,37 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
     return target;
 }
 
+/// get Object.prototype.__proto__ (Annex B §B.2.2.1): ? ToObject(this) then
+/// [[GetPrototypeOf]]. RequireObjectCoercible — null/undefined throw.
+pub fn nativeObjectProtoGetProto(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() == .undefined_ or this_val.unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
+    return nativeObjectGetPrototypeOf(arena, Value{}, &[_]Value{this_val});
+}
+
+/// set Object.prototype.__proto__ (Annex B §B.2.2.1): RequireObjectCoercible(this);
+/// if the value is neither Object nor Null, or `this` is not an Object, it is a
+/// silent no-op (returns undefined). Otherwise sets `this`'s [[Prototype]].
+pub fn nativeObjectProtoSetProto(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() == .undefined_ or this_val.unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
+    const v = if (args.len > 0) args[0] else Value{};
+    // The new value must be an Object or Null; anything else is a no-op.
+    const v_ok = v.bits != 0 and switch (v.unbox()) {
+        .object, .null_, .bc_function, .function => true,
+        else => false,
+    };
+    if (!v_ok) return val_mod.makeUndefined(arena);
+    // Only ordinary objects / function objects have a settable [[Prototype]] here.
+    const this_settable = this_val.bits != 0 and switch (this_val.unbox()) {
+        .object, .bc_function, .function => true,
+        else => false,
+    };
+    if (!this_settable) return val_mod.makeUndefined(arena);
+    _ = try nativeObjectSetPrototypeOf(arena, Value{}, &[_]Value{ this_val, v });
+    return val_mod.makeUndefined(arena);
+}
+
 /// Object.getOwnPropertyNames(o): all own keys including non-enumerable.
 /// True if `key` is a canonical array-index string (a base-10 integer in
 /// [0, 2^32-2], no leading zeros). Used to place the synthetic "length" key
