@@ -270,8 +270,44 @@ const DOLLAR262_PRELUDE =
     \\  gc: function() {},
     \\  global: globalThis,
     \\  createRealm: function() {
+    \\    // The engine is single-realm, so `evalScript`/`eval` share one global.
+    \\    // To satisfy cross-realm TypedArray tests (which require that a foreign
+    \\    // realm's `Int8Array` is a *distinct* constructor whose instances are
+    \\    // not `instanceof` the local one), the returned `global` is a Proxy that
+    \\    // forwards every access to `globalThis` EXCEPT the TypedArray constructor
+    \\    // names, for which it hands back fresh per-realm constructors. Each fresh
+    \\    // constructor builds a real typed array (so internal-slot validation in
+    \\    // %TypedArray%.of/from still succeeds) but re-parents it onto a distinct
+    \\    // prototype that does not descend from the local constructor's prototype.
+    \\    var __TA__ = Object.getPrototypeOf(Int8Array); // %TypedArray%
+    \\    var __freshCache__ = Object.create(null);
+    \\    function __isTAName__(k) {
+    \\      if (typeof k !== "string") return false;
+    \\      var c = globalThis[k];
+    \\      return typeof c === "function" && Object.getPrototypeOf(c) === __TA__;
+    \\    }
+    \\    function __makeFresh__(name) {
+    \\      if (__freshCache__[name]) return __freshCache__[name];
+    \\      var Real = globalThis[name];
+    \\      function Fresh(len) {
+    \\        var arr = new Real(len);
+    \\        Object.setPrototypeOf(arr, Fresh.prototype);
+    \\        return arr;
+    \\      }
+    \\      Fresh.prototype = Object.create(__TA__.prototype);
+    \\      Object.defineProperty(Fresh, "name", { value: name, configurable: true });
+    \\      Fresh.of = __TA__.of;
+    \\      Fresh.from = __TA__.from;
+    \\      __freshCache__[name] = Fresh;
+    \\      return Fresh;
+    \\    }
+    \\    var __realmGlobal__ = new Proxy(globalThis, {
+    \\      get: function(t, k) { return __isTAName__(k) ? __makeFresh__(k) : globalThis[k]; },
+    \\      set: function(t, k, v) { globalThis[k] = v; return true; },
+    \\      has: function(t, k) { return k in globalThis; }
+    \\    });
     \\    return {
-    \\      global: globalThis,
+    \\      global: __realmGlobal__,
     \\      detachArrayBuffer: function(buffer) { if (!buffer.detached) buffer.transfer(0); },
     \\      evalScript: function(s) { return eval(s); },
     \\      createRealm: $262.createRealm

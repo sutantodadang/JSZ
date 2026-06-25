@@ -23,6 +23,7 @@ const function_proto = @import("function_proto.zig");
 const intrinsics = @import("intrinsics.zig");
 const coercion = @import("coercion.zig");
 const coll = @import("es2015_collections.zig");
+const string_proto_mod = @import("string_proto.zig");
 
 /// R1: install ArrayBuffer / %TypedArray% / per-kind ctors / DataView and bind globals.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -673,6 +674,17 @@ fn arrayLikeLen(o: *JsObject) usize {
 /// Full [[Get]] of a string-keyed property via the VM bridge: fires accessor
 /// getters, Proxy traps, and array-index/length reads, walking the proto chain.
 /// Falls back to a raw own-property read when no Context is active.
+/// Encode a single UTF-16 code unit (0..0xFFFF, possibly a lone surrogate) into
+/// WTF-8, matching how this engine stores `\uXXXX` escapes.
+fn encodeWtf8Cu(arena: std.mem.Allocator, cu: u21) ![]const u8 {
+    if (cu < 0x80) {
+        return arena.dupe(u8, &[_]u8{@intCast(cu)});
+    } else if (cu < 0x800) {
+        return arena.dupe(u8, &[_]u8{ @intCast(0xC0 | (cu >> 6)), @intCast(0x80 | (cu & 0x3F)) });
+    }
+    return arena.dupe(u8, &[_]u8{ @intCast(0xE0 | (cu >> 12)), @intCast(0x80 | ((cu >> 6) & 0x3F)), @intCast(0x80 | (cu & 0x3F)) });
+}
+
 fn vmGet(arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!Value {
     if (realm_mod.active_context) |ctx| return ctx.getProp(arena, obj_val, key);
     if (obj_val.bits != 0 and obj_val.unbox() == .object)
@@ -2505,16 +2517,43 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var arr_src: ?*JsObject = null;
     var length: usize = 0;
     if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .string) {
-        // A String source is iterable (String.prototype[@@iterator] yields code
-        // points): materialize one single-code-point string per element.
         const s = args[0].unbox().string;
-        var chars = std.ArrayList(Value){};
-        var it = (std.unicode.Utf8View.init(s) catch std.unicode.Utf8View.initUnchecked(s)).iterator();
-        while (it.nextCodepointSlice()) |slice| {
-            try chars.append(arena, try val_mod.makeString(arena, slice));
+        // GetMethod(source, @@iterator): a String is normally iterable via
+        // String.prototype[@@iterator] (by code point), but the method is
+        // observable and user-overridable/deletable — honor its current value.
+        var iter_method: Value = .{};
+        if (realm_mod.active_sym_iterator) |sym| {
+            const m = try vmGetSym(arena, args[0], sym);
+            if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+                if (!function_proto_isCallable(m))
+                    return throwTypeError(arena, "Symbol.iterator is not a function");
+                iter_method = m;
+            }
         }
-        list_items = chars.items;
-        length = chars.items.len;
+        if (iter_method.bits != 0) {
+            const list = try iterableToList(arena, args[0], iter_method);
+            list_items = list.items;
+            length = list.items.len;
+        } else {
+            // No @@iterator: ToObject(string) exposes a length + indexed UTF-16
+            // code units, so iterate code units (astral chars split into a
+            // surrogate pair).
+            var units = std.ArrayList(Value){};
+            var i: usize = 0;
+            while (i < s.len) {
+                const dec = string_proto_mod.decodeWtf8At(s, i);
+                if (dec.cp <= 0xFFFF) {
+                    try units.append(arena, try val_mod.makeString(arena, try arena.dupe(u8, s[i .. i + dec.len])));
+                } else {
+                    const v: u21 = dec.cp - 0x10000;
+                    try units.append(arena, try val_mod.makeString(arena, try encodeWtf8Cu(arena, 0xD800 + (v >> 10))));
+                    try units.append(arena, try val_mod.makeString(arena, try encodeWtf8Cu(arena, 0xDC00 + (v & 0x3FF))));
+                }
+                i += dec.len;
+            }
+            list_items = units.items;
+            length = units.items.len;
+        }
     } else if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object) {
         const src = args[0].toPtr().object;
         const probe = try detectIterable(arena, src);

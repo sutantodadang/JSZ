@@ -107,6 +107,16 @@ pub const Environment = struct {
         return EnvError.NotDefined;
     }
 
+    /// Mirror a `globalThis.name = value` write into an existing top-level `var`
+    /// binding of the same name, keeping the global environment record and the
+    /// global object in sync. No-op unless an initialized `var` binding exists
+    /// (lexical/const globals are not aliased to global-object properties).
+    pub fn mirrorGlobalVar(self: *Environment, name: []const u8, value: Value) void {
+        if (self.bindings.getPtr(name)) |b| {
+            if (b.kind == .var_ and b.initialized) b.value = value;
+        }
+    }
+
     /// Define or create in the global frame (walk to root).
     pub fn defineGlobal(self: *Environment, name: []const u8, value: Value) !void {
         if (self.parent == null) {

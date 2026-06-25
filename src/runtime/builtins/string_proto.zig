@@ -61,6 +61,47 @@ pub fn nativeCharCodeAt(arena: std.mem.Allocator, this_val: Value, args: []const
     return val_mod.makeNumber(arena, @floatFromInt(s[i]));
 }
 
+/// Decode one WTF-8 code point starting at byte offset `i` in `s`.
+/// WTF-8 admits lone surrogates (U+D800..U+DFFF) encoded as 3 bytes, matching
+/// how this engine stores `\uD834`-style escapes. Returns the code point and the
+/// number of bytes consumed. `i` must be < s.len.
+pub fn decodeWtf8At(s: []const u8, i: usize) struct { cp: u21, len: usize } {
+    const b0 = s[i];
+    if (b0 < 0x80) return .{ .cp = b0, .len = 1 };
+    if (b0 >= 0xF0 and i + 3 < s.len) {
+        const cp: u21 = (@as(u21, b0 & 0x07) << 18) | (@as(u21, s[i + 1] & 0x3F) << 12) | (@as(u21, s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F);
+        return .{ .cp = cp, .len = 4 };
+    }
+    if (b0 >= 0xE0 and i + 2 < s.len) {
+        const cp: u21 = (@as(u21, b0 & 0x0F) << 12) | (@as(u21, s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F);
+        return .{ .cp = cp, .len = 3 };
+    }
+    if (b0 >= 0xC0 and i + 1 < s.len) {
+        const cp: u21 = (@as(u21, b0 & 0x1F) << 6) | (s[i + 1] & 0x3F);
+        return .{ .cp = cp, .len = 2 };
+    }
+    return .{ .cp = b0, .len = 1 };
+}
+
+/// String.prototype.codePointAt(pos): the code point whose WTF-8 encoding begins
+/// at byte offset `pos` (this engine indexes strings by byte, consistent with
+/// charCodeAt). Returns undefined when `pos` is out of range.
+pub fn nativeCodePointAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const idx: f64 = if (args.len > 0 and args[0].bits != 0)
+        switch (args[0].unbox()) {
+            .number => |n| n,
+            else => 0.0,
+        }
+    else
+        0.0;
+    if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeUndefined(arena);
+    const i: usize = @intCast(val_mod.f64ToI64Sat(idx));
+    if (i >= s.len) return val_mod.makeUndefined(arena);
+    const dec = decodeWtf8At(s, i);
+    return val_mod.makeNumber(arena, @floatFromInt(dec.cp));
+}
+
 pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = getThis(this_val);
     if (args.len == 0) return val_mod.makeNumber(arena, -1.0);

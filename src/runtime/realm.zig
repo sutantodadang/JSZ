@@ -1140,6 +1140,11 @@ fn normalizePath(arena: std.mem.Allocator, p: []const u8) ![]const u8 {
 /// Set by Realm.activateHeap(), cleared on deinit.
 pub var active_heap: ?*Heap = null;
 pub var active_global_env: ?*Environment = null;
+/// The `globalThis` object for the running realm. A top-level `var` binding lives
+/// in `active_global_env`, but per the global environment record it must alias an
+/// own property of this object — so writes through `globalThis.x = …` mirror back
+/// into the env binding (see BcVm.setPropR).
+pub var active_global_object: ?*JsObject = null;
 
 /// Phase 4b: thread-locals for prototype access from builtin fns.
 pub var active_array_proto: ?*JsObject = null;
@@ -2023,6 +2028,7 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
     const fns = .{
         .{ "charAt", string_proto_mod.nativeCharAt },
         .{ "charCodeAt", string_proto_mod.nativeCharCodeAt },
+        .{ "codePointAt", string_proto_mod.nativeCodePointAt },
         .{ "indexOf", string_proto_mod.nativeIndexOf },
         .{ "slice", string_proto_mod.nativeSlice },
         .{ "toUpperCase", string_proto_mod.nativeToUpperCase },
@@ -2129,6 +2135,7 @@ fn installGlobalThis(arena: std.mem.Allocator, env: *Environment, object_proto: 
     const global_val = try val_mod.makeObject(arena, global_obj);
     try env.define("globalThis", global_val);
     try env.define("global", global_val);
+    active_global_object = global_obj;
 }
 
 pub const Realm = struct {
@@ -2552,6 +2559,9 @@ pub const Realm = struct {
         active_sym_iterator = symbol_ctor.getOwn("iterator");
         if (active_sym_iterator) |symv| {
             try array_proto.setSym(symv, try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeArrayValues));
+            // String.prototype[@@iterator] — by-code-point iteration (overridable
+            // and deletable, so it is a writable/configurable own property).
+            try string_proto.setSymAttr(symv, try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeStringValues, "[Symbol.iterator]", 0), .{ .writable = true, .enumerable = false, .configurable = true });
         }
         // Capture Symbol.toPrimitive and give Date the spec-correct hook so
         // `date + x` coerces to a string (default hint) rather than a number.

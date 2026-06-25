@@ -1249,9 +1249,17 @@ pub const BcVm = struct {
     /// Read a symbol-keyed property, walking the prototype chain (own first).
     pub fn getPropSym(self: *BcVm, obj_val: Value, sym_key: Value) !Value {
         if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);
+        const realm_m = @import("../runtime/realm.zig");
         const root_obj = switch (obj_val.unbox()) {
             .object => |o| o,
             .bc_function => |c| try self.closureBackingObj(c),
+            // Symbol-keyed [[Get]] on a primitive resolves through its wrapper
+            // prototype (e.g. "x"[Symbol.iterator] walks String.prototype).
+            .string => realm_m.active_string_proto orelse return val_mod.makeUndefined(self.arena),
+            .number => realm_m.active_number_proto orelse return val_mod.makeUndefined(self.arena),
+            .boolean => realm_m.active_boolean_proto orelse return val_mod.makeUndefined(self.arena),
+            .symbol => realm_m.active_symbol_proto orelse return val_mod.makeUndefined(self.arena),
+            .bigint => realm_m.active_bigint_proto orelse return val_mod.makeUndefined(self.arena),
             else => return val_mod.makeUndefined(self.arena),
         };
         if (root_obj.internal_kind == .proxy) {
@@ -1844,6 +1852,18 @@ pub const BcVm = struct {
         _ = try self.setPropR(obj_val, key, value, obj_val);
     }
 
+    /// Keep a top-level `var` binding in sync when its aliased property is written
+    /// through the global object (`globalThis.x = …`): the global environment
+    /// record and the global object share one binding (ES §9.1.1.4).
+    fn mirrorGlobalObjectWrite(obj: *JsObject, key: []const u8, value: Value) void {
+        const realm_mod = @import("../runtime/realm.zig");
+        if (realm_mod.active_global_object) |g| {
+            if (g == obj) {
+                if (realm_mod.active_global_env) |genv| genv.mirrorGlobalVar(key, value);
+            }
+        }
+    }
+
     /// SameValue between a Value and a raw JsObject pointer (object identity).
     fn sameObject(v: Value, ptr: *JsObject) bool {
         return v.bits != 0 and v.unbox() == .object and v.toPtr().object == ptr;
@@ -1926,6 +1946,7 @@ pub const BcVm = struct {
                     if (loc.holder == obj) {
                         if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return true;
                         _ = obj.setOwnBySlot(obj.shapePtr(), loc.slot, value);
+                        mirrorGlobalObjectWrite(obj, key, value);
                         return true;
                     }
                     // inherited data property: fall through to create an own (shadow).
@@ -1935,6 +1956,7 @@ pub const BcVm = struct {
                 // fails (sloppy: silent no-op; strict: caller throws TypeError).
                 if (!obj.extensible and obj.resolveOwnSlot(key) == null) return false;
                 try obj.set(key, value);
+                mirrorGlobalObjectWrite(obj, key, value);
                 return true;
             },
             // W2 unification: bc functions store own properties (incl.
