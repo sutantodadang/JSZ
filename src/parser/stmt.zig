@@ -763,43 +763,28 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
 const DestructTarget = struct { key: []const u8, bind: []const u8 };
 
 pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?*Node {
-    var targets = std.ArrayList(DestructTarget){};
     const is_array = p.match(.left_bracket);
-    if (is_array) {
-        while (!p.check(.right_bracket) and !p.check(.eof) and !p.had_error) {
-            if (p.check(.comma)) {
-                _ = p.advance();
-                continue;
-            }
-            const t = p.expect(.identifier) orelse return null;
-            targets.append(p.arena, .{ .key = "", .bind = t.value_str }) catch return null;
-            // Skip optional default value (= expr) — runtime falls back to undefined.
-            if (p.match(.eq)) {
-                _ = p.parseAssignmentExpr();
-            }
-            if (!p.match(.comma)) break;
+    if (is_array) return parseArrayDestructuringDeclarator(p, kind, start);
+
+    var targets = std.ArrayList(DestructTarget){};
+    _ = p.expect(.left_brace) orelse return null;
+    while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
+        const key = p.expect(.identifier) orelse return null;
+        var bind_name = key.value_str;
+        if (p.match(.colon)) {
+            const alias = p.expect(.identifier) orelse return null;
+            bind_name = alias.value_str;
         }
-        _ = p.expect(.right_bracket) orelse return null;
-    } else {
-        _ = p.expect(.left_brace) orelse return null;
-        while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
-            const key = p.expect(.identifier) orelse return null;
-            var bind_name = key.value_str;
-            if (p.match(.colon)) {
-                const alias = p.expect(.identifier) orelse return null;
-                bind_name = alias.value_str;
-            }
-            // Read source property `key`, bind to `bind_name` (they differ when
-            // the pattern renames, e.g. `{ get: description }`).
-            targets.append(p.arena, .{ .key = key.value_str, .bind = bind_name }) catch return null;
-            // Skip optional default value (= expr) — runtime falls back to undefined.
-            if (p.match(.eq)) {
-                _ = p.parseAssignmentExpr();
-            }
-            if (!p.match(.comma)) break;
+        // Read source property `key`, bind to `bind_name` (they differ when
+        // the pattern renames, e.g. `{ get: description }`).
+        targets.append(p.arena, .{ .key = key.value_str, .bind = bind_name }) catch return null;
+        // Skip optional default value (= expr) — runtime falls back to undefined.
+        if (p.match(.eq)) {
+            _ = p.parseAssignmentExpr();
         }
-        _ = p.expect(.right_brace) orelse return null;
+        if (!p.match(.comma)) break;
     }
+    _ = p.expect(.right_brace) orelse return null;
     _ = p.expect(.eq) orelse return null;
     const rhs = p.parseAssignmentExpr() orelse return null;
     const tmp_name = std.fmt.allocPrint(p.arena, "__destruct_{d}", .{start}) catch return null;
@@ -810,23 +795,91 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
     }) orelse return null;
     body.append(p.arena, tmp_decl) catch return null;
 
-    for (targets.items, 0..) |tgt, i| {
+    for (targets.items) |tgt| {
         const tmp_id = p.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
-        const access = if (is_array) blk: {
-            const idx = p.makeNode(.number_literal, start, start, .{ .number_literal = @floatFromInt(i) }) orelse return null;
-            break :blk p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = tmp_id, .property = idx, .computed = true },
-            }) orelse return null;
-        } else blk: {
-            const prop = p.makeNode(.identifier, start, start, .{ .identifier = tgt.key }) orelse return null;
-            break :blk p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = tmp_id, .property = prop, .computed = false },
-            }) orelse return null;
-        };
+        const prop = p.makeNode(.identifier, start, start, .{ .identifier = tgt.key }) orelse return null;
+        const access = p.makeNode(.member_expr, start, start, .{
+            .member_expr = .{ .object = tmp_id, .property = prop, .computed = false },
+        }) orelse return null;
         const vd = p.makeNode(.var_decl, start, p.current.start, .{
             .var_decl = .{ .kind = kind, .name = tgt.bind, .init = access },
         }) orelse return null;
         body.append(p.arena, vd) catch return null;
+    }
+    return p.makeNode(.block_stmt, start, p.current.start, .{
+        .block_stmt = .{ .body = body.items, .lexical_scope = false },
+    });
+}
+
+/// Build a single-argument call node `callee_name(arg)`.
+fn makeCall1(p: *Parser, callee_name: []const u8, arg: *Node, start: u32) ?*Node {
+    const callee = p.makeNode(.identifier, start, start, .{ .identifier = callee_name }) orelse return null;
+    const args = p.arena.alloc(*Node, 1) catch return null;
+    args[0] = arg;
+    return p.makeNode(.call_expr, start, start, .{
+        .call_expr = .{ .callee = callee, .args = args },
+    });
+}
+
+/// Array binding pattern `let [a, , b] = rhs`. Per spec, array destructuring
+/// uses the iterator protocol — `GetIterator(rhs)` then one `IteratorStep` per
+/// element (holes still step, discarding the value). Desugars to:
+///   let __destruct_it_N = __getIterator__(rhs);
+///   let a = __iterStep__(__destruct_it_N).value;   // bind
+///   __iterStep__(__destruct_it_N);                  // elision hole
+///   let b = __iterStep__(__destruct_it_N).value;
+/// Going through the iterator (rather than positional `rhs[i]`) matters for
+/// iterables whose `next()` has observable behavior — e.g. a TypedArray backed
+/// by a resized buffer throws a TypeError when out of bounds.
+fn parseArrayDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?*Node {
+    // Each element is a binding name, or `null` for an elision hole.
+    var items = std.ArrayList(?[]const u8){};
+    while (!p.check(.right_bracket) and !p.check(.eof) and !p.had_error) {
+        if (p.check(.comma)) {
+            // A bare comma at element position is an elision hole.
+            _ = p.advance();
+            items.append(p.arena, null) catch return null;
+            continue;
+        }
+        const t = p.expect(.identifier) orelse return null;
+        items.append(p.arena, t.value_str) catch return null;
+        // Skip optional default value (= expr) — runtime falls back to undefined.
+        if (p.match(.eq)) {
+            _ = p.parseAssignmentExpr();
+        }
+        if (!p.match(.comma)) break;
+    }
+    _ = p.expect(.right_bracket) orelse return null;
+    _ = p.expect(.eq) orelse return null;
+    const rhs = p.parseAssignmentExpr() orelse return null;
+    const it_name = std.fmt.allocPrint(p.arena, "__destruct_it_{d}", .{start}) catch return null;
+
+    var body = std.ArrayList(*Node){};
+    // let __destruct_it_N = __getIterator__(rhs);
+    const get_it = makeCall1(p, "__getIterator__", rhs, start) orelse return null;
+    const it_decl = p.makeNode(.var_decl, start, p.current.start, .{
+        .var_decl = .{ .kind = kind, .name = it_name, .init = get_it },
+    }) orelse return null;
+    body.append(p.arena, it_decl) catch return null;
+
+    for (items.items) |maybe_name| {
+        const it_id = p.makeNode(.identifier, start, start, .{ .identifier = it_name }) orelse return null;
+        const step = makeCall1(p, "__iterStep__", it_id, start) orelse return null;
+        if (maybe_name) |name| {
+            // let name = __iterStep__(it).value;
+            const value_prop = p.makeNode(.identifier, start, start, .{ .identifier = "value" }) orelse return null;
+            const access = p.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = step, .property = value_prop, .computed = false },
+            }) orelse return null;
+            const vd = p.makeNode(.var_decl, start, p.current.start, .{
+                .var_decl = .{ .kind = kind, .name = name, .init = access },
+            }) orelse return null;
+            body.append(p.arena, vd) catch return null;
+        } else {
+            // Elision hole: advance the iterator, discard the value.
+            const es = p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = step }) orelse return null;
+            body.append(p.arena, es) catch return null;
+        }
     }
     return p.makeNode(.block_stmt, start, p.current.start, .{
         .block_stmt = .{ .body = body.items, .lexical_scope = false },
