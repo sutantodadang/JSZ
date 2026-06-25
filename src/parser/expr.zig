@@ -1320,6 +1320,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             const am_body = p.parseFunctionBody() orelse return null;
             const am_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
+                    .is_method = true,
                     .name = if (ckey == null) mkey else null,
                     .params = am_params.params,
                     .param_defaults = am_params.param_defaults,
@@ -1494,6 +1495,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             const m_body = p.parseFunctionBody() orelse return null;
             const m_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
+                    .is_method = true,
                     .name = key,
                     .params = m_params.params,
                     .param_defaults = m_params.param_defaults,

@@ -257,6 +257,10 @@ pub const FuncExpr = struct {
     is_async: bool = false,
     is_strict: bool = false,
     requires_super: bool = false,
+    /// True for object/class method shorthand. A method's name (for the `.name`
+    /// property) is NOT bound inside its own body — unlike a named function
+    /// expression — so this suppresses the inner self-binding at compile time.
+    is_method: bool = false,
 };
 
 /// Phase 3a: a single property in an object literal.

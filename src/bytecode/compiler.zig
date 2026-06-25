@@ -1549,7 +1549,7 @@ pub const FnCompiler = struct {
             fe.name,
             fe.params,
             fe.body,
-            fe.name, // nfe_name: if named, bind inside
+            if (fe.is_method) null else fe.name, // nfe_name: named fn exprs self-bind; methods do not
             fe.is_strict or self.is_strict, // strictness is inherited by nested functions
             fe.is_generator,
             fe.is_async,
