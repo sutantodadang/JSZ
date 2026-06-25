@@ -245,6 +245,25 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ .writable = true, .enumerable = false, .configurable = true });
 
     try ctx.env.define("DataView", try val_mod.makeObject(arena, dv_ctor));
+
+    // Atomics — single-agent runtime. Only the operations whose argument
+    // validation is observable are provided; the read-modify-write ops are not
+    // yet implemented. @@toStringTag is wired in registerSymbols.
+    const atomics = try JsObject.create(arena, object_proto);
+    {
+        const am: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+        const atomics_methods = .{
+            .{ "notify", nativeAtomicsNotify, 3 },
+            .{ "wait", nativeAtomicsWait, 4 },
+            .{ "waitAsync", nativeAtomicsWaitAsync, 4 },
+            .{ "isLockFree", nativeAtomicsIsLockFree, 1 },
+        };
+        inline for (atomics_methods) |e| {
+            _ = try atomics.defineOwnData(e[0], try val_mod.makeNativeFunctionNamed(arena, e[1], e[0], e[2]), am);
+        }
+    }
+    active_atomics = atomics;
+    try ctx.env.define("Atomics", try val_mod.makeObject(arena, atomics));
 }
 
 /// Called after Symbol well-known values are captured, wires @@toStringTag and
@@ -256,6 +275,7 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
         if (active_arraybuffer_proto) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "ArrayBuffer"), tag_attr);
         if (active_sharedarraybuffer_proto) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "SharedArrayBuffer"), tag_attr);
         if (active_dataview_proto) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "DataView"), tag_attr);
+        if (active_atomics) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "Atomics"), tag_attr);
         // %TypedArray%.prototype[@@toStringTag] is an accessor getter returning the
         // constructor name (or undefined when `this` has no [[TypedArrayName]]).
         // Per-kind prototypes inherit it (no own @@toStringTag).
@@ -369,6 +389,7 @@ pub var active_arraybuffer_ctor: ?*JsObject = null;
 pub var active_sharedarraybuffer_proto: ?*JsObject = null;
 pub var active_sharedarraybuffer_ctor: ?*JsObject = null;
 pub var active_dataview_proto: ?*JsObject = null;
+pub var active_atomics: ?*JsObject = null;
 pub var active_typedarray_proto: ?*JsObject = null; // %TypedArray%.prototype
 pub var active_typedarray_ctor: ?*JsObject = null; // %TypedArray% (abstract ctor)
 pub var active_ta_protos: [all_kinds.len]?*JsObject = .{null} ** all_kinds.len;
@@ -889,30 +910,37 @@ fn getSabData(v: Value) ?*ArrayBufferData {
 }
 
 pub fn nativeSharedArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
+    // [[Construct]]-only: `SharedArrayBuffer()` as a plain call (NewTarget
+    // undefined) must throw. A plain call receives globalThis (an object) as
+    // `this`, so the object check alone is insufficient — gate on the native
+    // construct path's flag, mirroring ArrayBuffer.
+    if (!realm_mod.active_constructing or this_val.bits == 0 or this_val.unbox() != .object) {
         return throwTypeError(arena, "Constructor SharedArrayBuffer requires 'new'");
     }
     const len: usize = if (args.len > 0) try toIndexThrowing(arena, args[0]) else 0;
-    // GetArrayBufferMaxByteLengthOption → growable.
+    // GetArrayBufferMaxByteLengthOption → growable. Read it OBSERVABLY (vmGet
+    // fires an accessor getter + propagates a throw) — a poisoned
+    // `get maxByteLength()` must be surfaced.
     var max_bl: ?usize = null;
     if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) {
-        const opts = args[1].toPtr().object;
-        if (opts.get("maxByteLength")) |mv| {
-            if (mv.bits != 0 and mv.unbox() != .undefined_)
-                max_bl = try toIndexThrowing(arena, mv);
-        }
+        const mv = try vmGet(arena, args[1], "maxByteLength");
+        if (mv.bits != 0 and mv.unbox() != .undefined_)
+            max_bl = try toIndexThrowing(arena, mv);
     }
     if (max_bl) |m| {
         if (len > m) return throwRangeError(arena, "SharedArrayBuffer length exceeds maxByteLength");
     }
+    const obj = this_val.toPtr().object;
+    // AllocateSharedArrayBuffer: OrdinaryCreateFromConstructor reads
+    // NewTarget.prototype BEFORE the backing-store allocation, so a throwing
+    // NewTarget.prototype getter throws before any allocation (RangeError).
+    try applyNewTargetProto(arena, obj);
     if ((max_bl orelse len) > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     const cap = max_bl orelse len;
     const bytes = try arena.alloc(u8, cap);
     @memset(bytes, 0);
     const data = try arena.create(ArrayBufferData);
     data.* = .{ .bytes = bytes, .byte_length = len, .max_byte_length = max_bl, .shared = true };
-    const obj = this_val.toPtr().object;
-    try applyNewTargetProto(arena, obj);
     obj.internal_kind = .array_buffer;
     obj.internal_slot = data;
     return this_val;
@@ -981,6 +1009,77 @@ pub fn nativeSabSlice(arena: std.mem.Allocator, this_val: Value, args: []const V
     if (res_ab.byte_length < new_len) return throwTypeError(arena, "SharedArrayBuffer[@@species] result is too small");
     @memcpy(res_ab.bytes[0..new_len], ab.bytes[start .. start + new_len]);
     return result;
+}
+
+// -------------------------------------------------------------------- Atomics ---
+// Single-agent runtime: there is never another agent to wake or to be woken by,
+// so wait/notify/waitAsync only need spec-exact *argument validation* and the
+// degenerate single-agent result. The validation order matters: the TypedArray
+// brand/type check (ValidateIntegerTypedArray) runs BEFORE any index/value
+// coercion, so a poisoned index/count whose valueOf throws must never be
+// evaluated when the array is the wrong type.
+
+/// ValidateIntegerTypedArray(typedArray, waitable): the receiver must be a
+/// non-detached, in-bounds TypedArray; when `waitable` it must additionally be
+/// an Int32Array or BigInt64Array; otherwise it must be any integer (non-float)
+/// element type. Throws TypeError on any mismatch.
+fn validateIntegerTA(arena: std.mem.Allocator, val: Value, waitable: bool) anyerror!*TypedArrayData {
+    const td = getTd(val) orelse return throwTypeError(arena, "Atomics operation called on a non-TypedArray");
+    try validateTypedArray(arena, td);
+    if (waitable) {
+        if (td.kind != .i32 and td.kind != .i64big)
+            return throwTypeError(arena, "Atomics.wait/notify requires an Int32Array or BigInt64Array");
+    } else switch (td.kind) {
+        .f16, .f32, .f64 => return throwTypeError(arena, "Atomics operation requires an integer TypedArray"),
+        else => {},
+    }
+    return td;
+}
+
+/// Atomics.notify(typedArray, index, count) → number of agents woken. With no
+/// other agents this is always 0; validation still runs first.
+pub fn nativeAtomicsNotify(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateIntegerTA(arena, a0, true);
+    // ValidateAtomicAccess: ToIndex(index), bound against the live length.
+    const idx = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
+    if (idx >= taCurrentLen(td)) return throwRangeError(arena, "Atomics.notify index out of range");
+    // count: undefined → +∞ (all), else max(ToInteger, 0). Observed for coercion side effects.
+    if (args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_)
+        _ = try toIntegerThrowing(arena, args[2]);
+    return val_mod.makeNumber(arena, 0);
+}
+
+/// Atomics.wait(typedArray, index, value, timeout). No agent can ever signal
+/// this single agent, so after spec-exact validation the only reachable result
+/// would be a block; `[[CanBlock]]` is false for the runner agent → TypeError.
+pub fn nativeAtomicsWait(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateIntegerTA(arena, a0, true);
+    if (!td.ab.shared) return throwTypeError(arena, "Atomics.wait requires a shared buffer");
+    return throwTypeError(arena, "Atomics.wait: the current agent cannot be suspended");
+}
+
+/// Atomics.waitAsync(typedArray, index, value, timeout) → { async, value }.
+/// With no possible signaller and a value mismatch unknowable without blocking,
+/// the single-agent degenerate result is a synchronous "not-equal".
+pub fn nativeAtomicsWaitAsync(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateIntegerTA(arena, a0, true);
+    if (!td.ab.shared) return throwTypeError(arena, "Atomics.waitAsync requires a shared buffer");
+    const res = try JsObject.create(arena, realm_mod.active_object_proto);
+    _ = try res.defineOwnData("async", try val_mod.makeBool(arena, false),
+        .{ .writable = true, .enumerable = true, .configurable = true });
+    _ = try res.defineOwnData("value", try val_mod.makeString(arena, "not-equal"),
+        .{ .writable = true, .enumerable = true, .configurable = true });
+    return val_mod.makeObject(arena, res);
+}
+
+/// Atomics.isLockFree(size) → true for the natively lock-free element widths.
+pub fn nativeAtomicsIsLockFree(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const n = try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{});
+    const lockfree = n == 1 or n == 2 or n == 4 or n == 8;
+    return val_mod.makeBool(arena, lockfree);
 }
 
 pub fn nativeArrayBufferSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
