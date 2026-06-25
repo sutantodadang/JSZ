@@ -537,6 +537,43 @@ pub const FnCompiler = struct {
                 // R[base] = constructor, R[base+1..base+nargs] = args
                 const ne = node.data.new_expr;
                 const base = self.sp;
+                // `new C(...xs)`: an argument spread needs a runtime args array and
+                // the spread-construct opcode (the static-nargs ABI can't expand it).
+                var has_spread = false;
+                for (ne.args) |a| {
+                    if (a.kind == .spread_expr) {
+                        has_spread = true;
+                        break;
+                    }
+                }
+                if (has_spread) {
+                    const rcallee = try self.compileExpr(ne.callee);
+                    const rargs = self.allocReg();
+                    try self.emitOp(.NEW_ARRAY, line);
+                    try self.emitU8(rargs);
+                    try self.emitU8(0);
+                    for (ne.args) |a| {
+                        if (a.kind == .spread_expr) {
+                            const riter = try self.compileExpr(a.data.spread_expr);
+                            try self.emitOp(.ARRAY_SPREAD, line);
+                            try self.emitU8(rargs);
+                            try self.emitU8(riter);
+                            self.freeReg();
+                        } else {
+                            const rval = try self.compileExpr(a);
+                            try self.emitOp(.ARRAY_APPEND, line);
+                            try self.emitU8(rargs);
+                            try self.emitU8(rval);
+                            self.freeReg();
+                        }
+                    }
+                    try self.emitOp(.NEW_INSTANCE_SPREAD, line);
+                    try self.emitU8(rcallee); // Rdst = rcallee (lowest slot)
+                    try self.emitU8(rcallee);
+                    try self.emitU8(rargs);
+                    self.sp = rcallee + 1;
+                    return rcallee;
+                }
                 // Compile constructor into R[base].
                 _ = self.allocReg();
                 self.sp = base;

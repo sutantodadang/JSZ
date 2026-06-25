@@ -493,6 +493,15 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d} ctor=R{d} nargs={d}", .{ rdst, base, nargs });
         },
+        .NEW_INSTANCE_SPREAD => {
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const rcallee = code[new_pc];
+            new_pc += 1;
+            const rargs = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} ctor=R{d} args=R{d}", .{ rdst, rcallee, rargs });
+        },
         .INSTANCEOF => {
             const rdst = code[new_pc];
             new_pc += 1;

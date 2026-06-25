@@ -142,6 +142,10 @@ pub const Op = enum(u8) {
     PUSH_TRY,
     POP_TRY,
     NEW_INSTANCE,
+    /// NEW_INSTANCE_SPREAD: op, Rdst u8, Rcallee u8, Rargs u8 (4 bytes). Constructs
+    /// R[Rcallee] with the elements of the array R[Rargs] as arguments — used for
+    /// `new C(...xs)` where the argument list contains a spread.
+    NEW_INSTANCE_SPREAD,
     INSTANCEOF,
     // Phase 4d opcodes
     /// GET_KEYS: op, Rdst u8, Robj u8
@@ -295,6 +299,7 @@ pub fn instrSize(op: Op) usize {
         .PUSH_TRY => 4,
         .POP_TRY => 1,
         .NEW_INSTANCE => 4,
+        .NEW_INSTANCE_SPREAD => 4,
         .INSTANCEOF => 4,
         // Phase 4d
         .GET_KEYS => 3,

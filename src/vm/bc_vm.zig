@@ -897,6 +897,7 @@ pub const BcVm = struct {
                 .POP_TRY => if (try exception_ops.opPopTry(self, frame)) |o| return o,
                 .INSTANCEOF => if (try exception_ops.opInstanceof(self, frame)) |o| return o,
                 .NEW_INSTANCE => if (try exception_ops.opNewInstance(self, frame)) |o| return o,
+                .NEW_INSTANCE_SPREAD => if (try exception_ops.opNewInstanceSpread(self, frame)) |o| return o,
             }
         }
         return RunOutcome{ .ok = try val_mod.makeUndefined(self.arena) };
