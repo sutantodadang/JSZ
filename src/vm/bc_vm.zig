@@ -1679,6 +1679,26 @@ pub const BcVm = struct {
                 if (std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity));
                 }
+                // Walk the backing object's prototype chain. For a subclass
+                // constructor (`class C extends Base`), `bcSetProto` set the
+                // backing object's proto to the superclass constructor, so static
+                // members (e.g. `Uint8Array.BYTES_PER_ELEMENT`) resolve here. The
+                // chain ends at %Function.prototype% for ordinary functions, so
+                // inherited methods (call/apply/bind) are covered too.
+                if (closure.obj) |op| {
+                    const o: *JsObject = @ptrCast(@alignCast(op));
+                    if (o.findProperty(key)) |loc| {
+                        const a = loc.holder.attrAt(loc.slot);
+                        const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+                        if (a.is_accessor) {
+                            const getter = accessorMember(raw, "get");
+                            if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                            return try self.callAccessor(getter, obj_val, &[_]Value{});
+                        }
+                        if (raw.bits != 0) return raw;
+                        return val_mod.makeUndefined(self.arena);
+                    }
+                }
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
                     if (proto.get(key)) |v| return v;
