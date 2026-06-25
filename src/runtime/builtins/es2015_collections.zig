@@ -129,6 +129,18 @@ fn makeObj(arena: std.mem.Allocator, proto: ?*JsObject, kind: InternalKind) !Val
     return val_mod.makeObject(arena, obj);
 }
 
+/// A WeakMap/WeakSet key must be held weakly, which the spec restricts to
+/// objects (incl. callable objects: ordinary functions and class constructors)
+/// and non-registered symbols. Reject primitives. We treat all function value
+/// representations as valid keys; a plain primitive is not.
+fn canBeWeakKey(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .object, .function, .bc_function, .native_function => true,
+        else => false,
+    };
+}
+
 fn getMapData(this_val: Value, expected: InternalKind) ?*MapData {
     if (this_val.bits == 0 or this_val.unbox() != .object) return null;
     const obj = this_val.toPtr().object;
@@ -229,7 +241,7 @@ pub fn nativeMapSet(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const data = getMapData(this_val, .map) orelse getMapData(this_val, .weakmap) orelse return this_val;
     if (args.len < 2) return this_val;
     const weak = this_val.toPtr().object.internal_kind == .weakmap;
-    if (weak and (args[0].bits == 0 or args[0].unbox() != .object)) return this_val;
+    if (weak and !canBeWeakKey(args[0])) return this_val;
     for (data.keys.items, 0..) |k, i| {
         if (strictEq(k, args[0])) {
             data.values.items[i] = args[1];
@@ -288,7 +300,7 @@ pub fn nativeSetAdd(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const data = getSetData(this_val, .set) orelse getSetData(this_val, .weakset) orelse return this_val;
     if (args.len == 0) return this_val;
     const weak = this_val.toPtr().object.internal_kind == .weakset;
-    if (weak and (args[0].bits == 0 or args[0].unbox() != .object)) return this_val;
+    if (weak and !canBeWeakKey(args[0])) return this_val;
     for (data.values.items) |v| if (strictEq(v, args[0])) return this_val;
     try data.values.append(arena, args[0]);
     return this_val;
