@@ -9,6 +9,38 @@ const PropAttr = obj_mod.PropAttr;
 const proxy_mod = @import("proxy.zig");
 const namespace_mod = @import("namespace.zig");
 
+/// Object.is(x, y): the SameValue algorithm — like === except NaN equals NaN
+/// and +0 is distinct from -0.
+pub fn nativeObjectIs(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const x = if (args.len > 0) args[0] else Value{};
+    const y = if (args.len > 1) args[1] else Value{};
+    return val_mod.makeBool(arena, sameValue(x, y));
+}
+
+fn sameValue(x: Value, y: Value) bool {
+    if (x.bits == 0 and y.bits == 0) return true;
+    if (x.bits == 0 or y.bits == 0) return false;
+    const xi = x.unbox();
+    const yi = y.unbox();
+    const Tag = std.meta.Tag(val_mod.JsValue);
+    if (@as(Tag, xi) != @as(Tag, yi)) return false;
+    return switch (xi) {
+        .undefined_, .null_ => true,
+        .boolean => |b| b == yi.boolean,
+        .number => |n| blk: {
+            const m = yi.number;
+            if (std.math.isNan(n) and std.math.isNan(m)) break :blk true;
+            // +0 and -0 are NOT the same value: distinguish by sign bit.
+            if (n == 0 and m == 0) break :blk std.math.signbit(n) == std.math.signbit(m);
+            break :blk n == m;
+        },
+        .string => |s| std.mem.eql(u8, s, yi.string),
+        .bigint => val_mod.bigIntEql(x, y),
+        .symbol => x.toPtr().symbol == y.toPtr().symbol,
+        .object, .function, .bc_function, .native_function => x.bits == y.bits,
+    };
+}
+
 /// Object.keys(o): returns array of own enumerable string property names.
 pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");

@@ -2316,6 +2316,7 @@ pub const Realm = struct {
                 try ctor_obj.set("isSealed", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsSealed));
                 try ctor_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsExtensible));
                 try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols));
+                try ctor_obj.set("is", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIs, "is", 2));
             }
         }
         // hasOwnProperty on Object.prototype (non-enumerable, writable, configurable)
