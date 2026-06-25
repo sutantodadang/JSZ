@@ -126,7 +126,21 @@ pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Valu
     }
     const obj = args[0].toPtr().object;
 
+    // M15: TypedArray integer-indexed element values come first (all enumerable).
     var i: u32 = 0;
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+        if (!td.ab.detached and !ta_mod.taIsOob(td)) {
+            const ta_len: u32 = @intCast(ta_mod.taCurrentLen(td));
+            var ti: u32 = 0;
+            while (ti < ta_len) : (ti += 1) {
+                const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+                try arr.set(idx_key, try ta_mod.taLoad(arena, td, ti));
+                i += 1;
+            }
+        }
+    }
     for (obj.ownKeys()) |k| {
         if (!obj.isEnumerable(k)) continue;
         const v = obj.getOwn(k) orelse continue;
@@ -168,6 +182,24 @@ pub fn nativeObjectEntries(arena: std.mem.Allocator, _: Value, args: []const Val
     const obj = args[0].toPtr().object;
 
     var i: u32 = 0;
+    // M15: TypedArray integer-indexed [index, value] pairs come first.
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+        if (!td.ab.detached and !ta_mod.taIsOob(td)) {
+            const ta_len: u32 = @intCast(ta_mod.taCurrentLen(td));
+            var ti: u32 = 0;
+            while (ti < ta_len) : (ti += 1) {
+                const pair = try JsObject.createArray(arena, arr_proto);
+                try pair.set("0", try val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}", .{ti})));
+                try pair.set("1", try ta_mod.taLoad(arena, td, ti));
+                pair.array_length = 2;
+                const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+                try arr.set(idx_key, try val_mod.makeObject(arena, pair));
+                i += 1;
+            }
+        }
+    }
     for (obj.ownKeys()) |k| {
         if (!obj.isEnumerable(k)) continue;
         const v = obj.getOwn(k) orelse continue;
@@ -988,40 +1020,21 @@ pub fn nativeObjectDefineProperties(arena: std.mem.Allocator, _: Value, args: []
     if (args.len < 1 or args[0].bits == 0 or args[0].unbox() != .object) {
         return throwTypeError(arena, "Object.defineProperties called on non-object");
     }
-    const obj = args[0].toPtr().object;
 
     if (args.len < 2 or args[1].bits == 0 or args[1].unbox() != .object) {
         return args[0];
     }
     const props = args[1].toPtr().object;
 
+    // Delegate each property to Object.defineProperty so exotic [[DefineOwnProperty]]
+    // (TypedArray integer-indexed elements, Proxy, module namespace) is honored
+    // instead of writing straight to ordinary property storage.
     for (props.ownKeys()) |k| {
         if (!props.isEnumerable(k)) continue;
         const desc_val = props.getOwn(k) orelse continue;
         if (desc_val.bits == 0 or desc_val.unbox() != .object) continue;
-        const desc = desc_val.toPtr().object;
-
-        if (desc.hasOwn("get") or desc.hasOwn("set")) {
-            const getter: ?Value = if (desc.hasOwn("get")) desc.getOwn("get") else null;
-            const setter: ?Value = if (desc.hasOwn("set")) desc.getOwn("set") else null;
-            const holder = try makeAccessorHolder(arena, getter, setter);
-            const attr = PropAttr{
-                .enumerable = descTruthy(desc.getOwn("enumerable")),
-                .configurable = descTruthy(desc.getOwn("configurable")),
-            };
-            const ok = try obj.defineOwnAccessor(k, holder, attr);
-            if (!ok) return throwTypeError(arena, "cannot redefine property");
-            continue;
-        }
-
-        const value = desc.getOwn("value") orelse try val_mod.makeUndefined(arena);
-        const attr = PropAttr{
-            .writable = descTruthy(desc.getOwn("writable")),
-            .enumerable = descTruthy(desc.getOwn("enumerable")),
-            .configurable = descTruthy(desc.getOwn("configurable")),
-        };
-        const ok = try obj.defineOwnData(k, value, attr);
-        if (!ok) return throwTypeError(arena, "cannot redefine property");
+        const key_val = try val_mod.makeString(arena, k);
+        _ = try nativeObjectDefineProperty(arena, args[0], &[_]Value{ args[0], key_val, desc_val });
     }
     return args[0];
 }
@@ -1036,6 +1049,19 @@ pub fn nativeObjectFreeze(arena: std.mem.Allocator, _: Value, args: []const Valu
     if (obj.internal_kind == .module_namespace) {
         const names = try namespace_mod.sortedNames(arena, obj);
         if (names.len > 0) return throwTypeError(arena, "Cannot define property on module namespace");
+    }
+    // TypedArray SetIntegrityLevel(frozen) throws TypeError when either:
+    //  - [[PreventExtensions]] fails, which it does for any TA on a non-shared
+    //    resizable buffer (IsTypedArrayFixedLength is false), or
+    //  - a non-empty fixed-length TA must make its integer indices non-writable,
+    //    which [[DefineOwnProperty]] rejects.
+    // An empty fixed-length TA has no integer keys, so freezing it succeeds.
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+        const resizable = td.ab.max_byte_length != null and !td.ab.shared;
+        const len = if (ta_mod.taIsOob(td)) 0 else ta_mod.taCurrentLen(td);
+        if (resizable or len > 0) return throwTypeError(arena, "Cannot freeze this TypedArray");
     }
     obj.freezeSelf();
     return args[0];
