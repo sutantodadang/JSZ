@@ -278,7 +278,8 @@ const DOLLAR262_PRELUDE =
     \\    };
     \\  },
     \\  evalScript: function(s) { return eval(s); },
-    \\  AbstractModuleSource: function AbstractModuleSource() {}
+    \\  AbstractModuleSource: function AbstractModuleSource() {},
+    \\  IsHTMLDDA: function IsHTMLDDA() {}
     \\};
     \\var __moduleSourceCache__ = Object.create(null);
     \\function __moduleSource__(spec) {
