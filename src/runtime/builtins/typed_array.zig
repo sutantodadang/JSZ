@@ -1752,7 +1752,15 @@ fn isConstructor(v: Value) bool {
     return switch (v.unbox()) {
         .function, .bc_function => true,
         .native_function => true,
-        .object => |o| o.get("__call__") != null or o.internal_kind == .bound_function,
+        .object => |o| {
+            // A Proxy is a constructor iff its [[ProxyTarget]] is a constructor.
+            if (o.internal_kind == .proxy) {
+                const proxy_mod = @import("proxy.zig");
+                if (proxy_mod.proxyTarget(o)) |t| return isConstructor(t);
+                return false;
+            }
+            return o.get("__call__") != null or o.internal_kind == .bound_function;
+        },
         else => false,
     };
 }

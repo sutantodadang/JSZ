@@ -1553,7 +1553,10 @@ pub const BcVm = struct {
             realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "proxy [[Construct]] must return an object");
             return error.JsException;
         }
-        return try self.constructFromArgs(target, args);
+        // No construct trap: forward to the target's [[Construct]] preserving the
+        // original NewTarget (the proxy), so GetPrototypeFromConstructor reads
+        // NewTarget.prototype through the proxy (its `get` trap fires).
+        return try self.constructImpl(target, args, new_target);
     }
 
     pub fn getProp(self: *BcVm, obj_val: Value, key: []const u8) !Value {
