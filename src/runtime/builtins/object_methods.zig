@@ -1083,7 +1083,15 @@ pub fn nativeObjectFreeze(arena: std.mem.Allocator, _: Value, args: []const Valu
         const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
         const resizable = td.ab.max_byte_length != null and !td.ab.shared;
         const len = if (ta_mod.taIsOob(td)) 0 else ta_mod.taCurrentLen(td);
-        if (resizable or len > 0) return throwTypeError(arena, "Cannot freeze this TypedArray");
+        // SetIntegrityLevel runs PreventExtensions first; for a resizable TA that
+        // itself fails (object stays extensible), but for a non-empty fixed-length
+        // TA it succeeds (object becomes non-extensible) before the per-index
+        // DefineOwnProperty throws.
+        if (resizable) return throwTypeError(arena, "Cannot freeze this TypedArray");
+        if (len > 0) {
+            obj.preventExtensionsSelf();
+            return throwTypeError(arena, "Cannot freeze this TypedArray");
+        }
     }
     obj.freezeSelf();
     return args[0];
@@ -1093,7 +1101,26 @@ pub fn nativeObjectFreeze(arena: std.mem.Allocator, _: Value, args: []const Valu
 pub fn nativeObjectSeal(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
     if (args[0].unbox() != .object) return args[0];
-    args[0].toPtr().object.sealSelf();
+    const obj = args[0].toPtr().object;
+    // TypedArray SetIntegrityLevel(sealed) throws TypeError when either the
+    // backing buffer is resizable (PreventExtensions fails) or the TA is
+    // non-empty (its integer indices cannot be made non-configurable). An empty
+    // fixed-length TA has no integer keys, so sealing it succeeds.
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+        const resizable = td.ab.max_byte_length != null and !td.ab.shared;
+        const len = if (ta_mod.taIsOob(td)) 0 else ta_mod.taCurrentLen(td);
+        // PreventExtensions succeeds for a non-empty fixed-length TA (becomes
+        // non-extensible) before the per-index DefineOwnProperty throws; it fails
+        // outright for a resizable TA (stays extensible).
+        if (resizable) return throwTypeError(arena, "Cannot seal this TypedArray");
+        if (len > 0) {
+            obj.preventExtensionsSelf();
+            return throwTypeError(arena, "Cannot seal this TypedArray");
+        }
+    }
+    obj.sealSelf();
     return args[0];
 }
 
@@ -1115,6 +1142,14 @@ pub fn nativeObjectIsFrozen(arena: std.mem.Allocator, _: Value, args: []const Va
         const names = try namespace_mod.sortedNames(arena, obj);
         if (names.len > 0) return val_mod.makeBool(arena, false);
     }
+    // A non-empty TypedArray is never frozen: its integer indices stay writable
+    // and configurable (they are exotic, not in the property table).
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+        const len = if (ta_mod.taIsOob(td)) 0 else ta_mod.taCurrentLen(td);
+        if (len > 0) return val_mod.makeBool(arena, false);
+    }
     return val_mod.makeBool(arena, obj.isFrozenSelf());
 }
 
@@ -1122,7 +1157,16 @@ pub fn nativeObjectIsFrozen(arena: std.mem.Allocator, _: Value, args: []const Va
 pub fn nativeObjectIsSealed(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeBool(arena, true);
     if (args[0].unbox() != .object) return val_mod.makeBool(arena, true);
-    return val_mod.makeBool(arena, args[0].toPtr().object.isSealedSelf());
+    const obj = args[0].toPtr().object;
+    // A non-empty TypedArray is never sealed: its integer indices stay
+    // configurable (they are exotic, not in the property table).
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+        const len = if (ta_mod.taIsOob(td)) 0 else ta_mod.taCurrentLen(td);
+        if (len > 0) return val_mod.makeBool(arena, false);
+    }
+    return val_mod.makeBool(arena, obj.isSealedSelf());
 }
 
 /// Object.isExtensible(o): primitives → false; objects → extensible flag.

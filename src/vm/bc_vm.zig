@@ -1915,6 +1915,10 @@ pub const BcVm = struct {
                     }
                     // inherited data property: fall through to create an own (shadow).
                 }
+                // Creating a new own property (no own data/accessor reached above)
+                // requires the receiver to be extensible; otherwise the assignment
+                // fails (sloppy: silent no-op; strict: caller throws TypeError).
+                if (!obj.extensible and obj.resolveOwnSlot(key) == null) return false;
                 try obj.set(key, value);
                 return true;
             },
