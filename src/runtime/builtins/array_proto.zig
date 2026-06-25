@@ -51,20 +51,16 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
 
-    const start_raw: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
+    // §23.1.3.27: relativeStart = ToIntegerOrInfinity(start); relativeEnd is the
+    // length only when `end` is undefined (absent) — every other value (null,
+    // boolean, string, …) is coerced via ToIntegerOrInfinity (e.g. null → 0).
+    const start_raw: f64 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_)
+        toNumArg(args[0])
     else
         0.0;
 
-    const end_raw: f64 = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].unbox()) {
-            .number => |n| n,
-            .undefined_ => @floatFromInt(len),
-            else => @floatFromInt(len),
-        }
+    const end_raw: f64 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        toNumArg(args[1])
     else
         @floatFromInt(len);
 

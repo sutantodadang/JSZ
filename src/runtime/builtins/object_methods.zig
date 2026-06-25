@@ -272,6 +272,18 @@ pub fn nativeObjectGetOwnPropertyDescriptors(arena: std.mem.Allocator, _: Value,
     return val_mod.makeObject(arena, out);
 }
 
+/// Object.hasOwn(O, P) (ES2022 §20.1.2.13): ToObject(O), then HasOwnProperty.
+/// Equivalent to `Object.prototype.hasOwnProperty.call(O, P)` but a static method
+/// that ToObject-coerces its argument (throwing for null/undefined).
+pub fn nativeObjectHasOwn(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const target = if (args.len > 0) args[0] else Value{};
+    if (target.bits == 0 or target.unbox() == .undefined_ or target.unbox() == .null_) {
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
+    }
+    const key = if (args.len > 1) args[1] else Value{};
+    return nativeHasOwnProperty(arena, target, &[_]Value{key});
+}
+
 /// hasOwnProperty(key): checks if own prop exists (not in proto chain).
 pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if (args.len == 0) return val_mod.makeBool(arena, false);

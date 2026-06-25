@@ -52,6 +52,10 @@ const ClassBodyParse = struct {
     ctor_params: [][]const u8 = &[_][]const u8{},
     ctor_rest: ?[]const u8 = null,
     ctor_body: []*Node = &[_]*Node{},
+    // Distinguishes an explicit `constructor() {}` (empty body, but present —
+    // must NOT auto-call super) from a class with no constructor at all (which
+    // synthesizes the default `return Reflect.construct(Super, ...)`).
+    has_ctor: bool = false,
     members: []ClassMember = &[_]ClassMember{},
     fields: []ClassField = &[_]ClassField{},
 };
@@ -138,6 +142,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             res.ctor_params = mparams.params;
             res.ctor_rest = mparams.rest_param;
             res.ctor_body = mbody;
+            res.has_ctor = true;
         } else {
             members.append(p.arena, .{
                 .is_static = is_static,
@@ -401,7 +406,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     const members = parsed.members;
     const fields = parsed.fields;
 
-    if (ctor_body.len == 0) {
+    if (!parsed.has_ctor) {
         if (super_name) |sname| {
             // Derived default constructor: `return Reflect.construct(Super,
             // arguments, ClassName)`. Constructs the parent (incl. built-in
@@ -536,6 +541,32 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         }) orelse return null;
         ctor_stmts.append(p.arena, super_decl) catch return null;
         for (ctor_body) |st| ctor_stmts.append(p.arena, st) catch return null;
+        // `this` TDZ: a derived constructor that returns without having called
+        // super() leaves `__superthis` unassigned (undefined). Reading `this`
+        // (the implicit `return this`) must throw a ReferenceError. Emit:
+        //   if (__superthis === undefined)
+        //     throw new ReferenceError("must call super constructor ...");
+        {
+            const guard_lhs = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+            const guard_rhs = p.makeNode(.identifier, start, start, .{ .identifier = "undefined" }) orelse return null;
+            const guard_test = p.makeNode(.binary_expr, start, start, .{
+                .binary_expr = .{ .op = .strict_eq, .left = guard_lhs, .right = guard_rhs },
+            }) orelse return null;
+            const id_re = p.makeNode(.identifier, start, start, .{ .identifier = "ReferenceError" }) orelse return null;
+            const re_msg = p.makeNode(.string_literal, start, start, .{
+                .string_literal = "must call super constructor before accessing 'this'",
+            }) orelse return null;
+            var re_args = std.ArrayList(*Node){};
+            re_args.append(p.arena, re_msg) catch return null;
+            const re_new = p.makeNode(.new_expr, start, start, .{
+                .new_expr = .{ .callee = id_re, .args = re_args.items },
+            }) orelse return null;
+            const throw_st = p.makeNode(.throw_stmt, start, start, .{ .throw_stmt = re_new }) orelse return null;
+            const guard_if = p.makeNode(.if_stmt, start, start, .{
+                .if_stmt = .{ .test_ = guard_test, .consequent = throw_st, .alternate = null },
+            }) orelse return null;
+            ctor_stmts.append(p.arena, guard_if) catch return null;
+        }
         // return __superthis;
         const id_st_final = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
         const final_ret = p.makeNode(.return_stmt, start, start, .{ .return_stmt = id_st_final }) orelse return null;
@@ -696,7 +727,7 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
         const fields = parsed.fields;
 
         // If no constructor and derives from something, generate default
-        if (ctor_body.len == 0 and super_name != null) {
+        if (!parsed.has_ctor and super_name != null) {
             const sname = super_name.?;
             const id_reflect = p.makeNode(.identifier, start, start, .{ .identifier = "Reflect" }) orelse return null;
             const id_construct = p.makeNode(.identifier, start, start, .{ .identifier = "construct" }) orelse return null;
@@ -763,6 +794,30 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
 
             for (ctor_body) |stmt| {
                 out.append(p.arena, stmt) catch return null;
+            }
+
+            // `this` TDZ: returning without calling super() leaves __superthis
+            // undefined; reading `this` must throw a ReferenceError.
+            {
+                const guard_lhs = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+                const guard_rhs = p.makeNode(.identifier, start, start, .{ .identifier = "undefined" }) orelse return null;
+                const guard_test = p.makeNode(.binary_expr, start, start, .{
+                    .binary_expr = .{ .op = .strict_eq, .left = guard_lhs, .right = guard_rhs },
+                }) orelse return null;
+                const id_re = p.makeNode(.identifier, start, start, .{ .identifier = "ReferenceError" }) orelse return null;
+                const re_msg = p.makeNode(.string_literal, start, start, .{
+                    .string_literal = "must call super constructor before accessing 'this'",
+                }) orelse return null;
+                var re_args = std.ArrayList(*Node){};
+                re_args.append(p.arena, re_msg) catch return null;
+                const re_new = p.makeNode(.new_expr, start, start, .{
+                    .new_expr = .{ .callee = id_re, .args = re_args.items },
+                }) orelse return null;
+                const throw_st = p.makeNode(.throw_stmt, start, start, .{ .throw_stmt = re_new }) orelse return null;
+                const guard_if = p.makeNode(.if_stmt, start, start, .{
+                    .if_stmt = .{ .test_ = guard_test, .consequent = throw_st, .alternate = null },
+                }) orelse return null;
+                out.append(p.arena, guard_if) catch return null;
             }
 
             const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;

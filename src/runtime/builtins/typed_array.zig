@@ -831,6 +831,9 @@ pub fn nativeArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []
     if (!realm_mod.active_constructing or this_val.bits == 0 or this_val.unbox() != .object) {
         return throwTypeError(arena, "Constructor ArrayBuffer requires 'new'");
     }
+    // Capture NewTarget before any user-observable coercion (length / the
+    // maxByteLength getter) clears `pending_new_target` via a nested VM call.
+    const saved_nt = realm_mod.pending_new_target;
     const len: usize = if (args.len > 0) try toIndexThrowing(arena, args[0]) else 0;
     // GetArrayBufferMaxByteLengthOption: options.maxByteLength (ToIndex) marks
     // resizable. Read it OBSERVABLY (vmGet fires an accessor getter + propagates
@@ -848,6 +851,7 @@ pub fn nativeArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []
     // AllocateArrayBuffer: GetPrototypeFromConstructor(newTarget) runs BEFORE the
     // backing-store allocation (after ToIndex(length) + the maxByteLength option),
     // so a throwing NewTarget.prototype getter throws before any allocation.
+    realm_mod.pending_new_target = saved_nt;
     try applyNewTargetProto(arena, obj);
     if ((max_bl orelse len) > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     const cap = max_bl orelse len;
@@ -2880,6 +2884,10 @@ pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     }
     const buf_obj = args[0].toPtr().object;
     const ab: *ArrayBufferData = @ptrCast(@alignCast(buf_obj.internal_slot.?));
+    // Capture NewTarget now: coercing an object byteOffset/length below runs user
+    // valueOf through the VM, which clears `pending_new_target`. Restore it before
+    // the GetPrototypeFromConstructor read so the prototype getter still fires.
+    const saved_nt = realm_mod.pending_new_target;
     // Spec: ToNumber(byteOffset) runs before the detached check.
     const byte_offset: usize = if (args.len > 1) try toIndexThrowing(arena, args[1]) else 0;
     const has_len = args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_;
@@ -2892,6 +2900,7 @@ pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     if (has_len and byte_offset + byte_length > ab.byte_length) return throwRangeError(arena, "Invalid DataView length");
     const obj = this_val.toPtr().object;
     // GetPrototypeFromConstructor runs after offset/length coercion + bounds checks.
+    realm_mod.pending_new_target = saved_nt;
     try applyNewTargetProto(arena, obj);
     // OrdinaryCreateFromConstructor may have run user code (a `prototype` getter)
     // that detached or resized the buffer; re-validate against the current length.

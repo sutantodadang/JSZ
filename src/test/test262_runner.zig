@@ -267,6 +267,7 @@ const HARDCODED_PRELUDE =
 const DOLLAR262_PRELUDE =
     \\var $262 = {
     \\  detachArrayBuffer: function(buffer) { if (!buffer.detached) buffer.transfer(0); },
+    \\  gc: function() {},
     \\  global: globalThis,
     \\  createRealm: function() {
     \\    return {
