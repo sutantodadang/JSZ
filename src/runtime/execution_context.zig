@@ -68,6 +68,12 @@ pub const Environment = struct {
         });
     }
 
+    /// Upgrade a binding to const_ so subsequent assignments throw TypeError.
+    pub fn upgradeToConst(self: *Environment, name: []const u8) void {
+        if (self.bindings.getPtr(name)) |b| { b.kind = .const_; return; }
+        if (self.parent) |p| p.upgradeToConst(name);
+    }
+
     /// Initialize an existing lexical binding in this frame or any parent frame.
     pub fn initialize(self: *Environment, name: []const u8, value: Value) EnvError!void {
         if (self.bindings.getPtr(name)) |b| {

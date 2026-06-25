@@ -9,20 +9,173 @@ const Parser = parser_file.Parser;
 const ast = @import("./ast.zig");
 const Node = ast.Node;
 const NodeKind = ast.NodeKind;
+const expr_mod = @import("./expr.zig");
 
 // ---------------------------------------------------------------- statements ---
 
+/// M16 Phase 5: parse an import-attributes `with { ... }` or `assert { ... }`
+/// clause that may follow a module specifier in import/export declarations.
+/// The clause is consumed; the value of a `type` attribute (e.g. `'json'`,
+/// `'text'`) is returned so the loader can route the dependency to the right
+/// synthetic-module factory (JSON / text). All other attributes are ignored.
+fn skipImportAttributes(p: *Parser) ?[]const u8 {
+    // `with` is a reserved-word token (kw_with); `assert` is a contextual kw.
+    // Only treat it as an attributes clause when a `{` immediately follows. An
+    // import without a trailing `;` (ASI) may be followed by a statement whose
+    // leading token happens to be `assert`/`with` — e.g.
+    //   import {"*" as y} from "./m.js"
+    //   assert.sameValue(y, "ok");
+    // Consuming the bare `assert` here would swallow the next statement's leading
+    // identifier and leave the parser stranded on its `.` (`unexpected token`).
+    const is_with = p.current.kind == .kw_with;
+    const is_assert = p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "assert");
+    if (!is_with and !is_assert) return null;
+    if (p.peekNext().kind != .left_brace) return null;
+    _ = p.advance(); // consume `with` / `assert`
+    // Expect `{ ... }` — consume the braced block, tolerating nested braces and
+    // string literals (attribute values are string literals).
+    if (!p.match(.left_brace)) {
+        // Not a braces block — nothing to consume (allow `with` as a no-op).
+        return null;
+    }
+    var type_value: ?[]const u8 = null;
+    // State machine to capture `type : <string>` at the top brace level.
+    const St = enum { none, key, colon };
+    var st: St = .none;
+    var depth: u32 = 1;
+    while (depth > 0 and !p.check(.eof) and !p.had_error) {
+        if (p.check(.left_brace)) {
+            depth += 1;
+            st = .none;
+            _ = p.advance();
+        } else if (p.check(.right_brace)) {
+            depth -= 1;
+            _ = p.advance();
+        } else if (depth == 1 and st == .colon and p.check(.string)) {
+            type_value = p.current.value_str;
+            st = .none;
+            _ = p.advance();
+        } else if (depth == 1 and st == .key and p.check(.colon)) {
+            st = .colon;
+            _ = p.advance();
+        } else if (depth == 1 and st == .none and
+            ((p.current.kind == .identifier or p.current.kind == .string) and
+                std.mem.eql(u8, p.current.value_str, "type")))
+        {
+            st = .key;
+            _ = p.advance();
+        } else {
+            if (p.check(.comma)) st = .none;
+            _ = p.advance(); // skip any other token (keys, colons, commas)
+        }
+    }
+    return type_value;
+}
+
+/// Append the module-type attribute to a specifier as `<spec>\x00<type>` so the
+/// loader keys typed (JSON/text) modules distinctly from a JS import of the same
+/// path (module records are keyed by (specifier, type) per spec). Returns the
+/// bare specifier when there is no type attribute.
+fn typedSpecifier(p: *Parser, modname: []const u8, type_attr: ?[]const u8) []const u8 {
+    const ty = type_attr orelse return modname;
+    if (ty.len == 0) return modname;
+    return std.fmt.allocPrint(p.arena, "{s}\x00{s}", .{ modname, ty }) catch modname;
+}
+
 pub fn parseImportDecl(p: *Parser) ?*Node {
     const start = p.current.start;
+    // M16 Phase 3: `import(` (dynamic import) and `import.meta` are expressions,
+    // not import declarations — route them through expression-statement parsing.
+    const nxt = p.peekNext().kind;
+    if (nxt == .left_paren or nxt == .dot) {
+        return p.parseExprStmt();
+    }
+    // An `import` *declaration* is only valid in module code; in eval/script
+    // code it is an early SyntaxError (dynamic `import(...)` above is allowed).
+    if (p.eval_code) return p.fail("import declarations may only appear at the top level of a module");
     _ = p.advance(); // import
 
     // import "mod";  (side-effect only)
     if (p.current.kind == .string) {
         const modname = p.current.value_str;
         _ = p.advance();
+        const type_attr = skipImportAttributes(p); // `with { ... }` / `assert { ... }`
         p.consumeSemicolon();
-        const req = p.mkRequire(modname) orelse return null;
-        return p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = req });
+        const req = p.mkRequire(typedSpecifier(p, modname, type_attr)) orelse return null;
+        const stmt = p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = req }) orelse return null;
+        // M16 Phase 5: hoist side-effect imports to the bundle hoist point so
+        // require() runs after __modules__ is initialised but before entry assertions.
+        // When hoist_no_se is set (sync entries with function exports), side-effect
+        // imports are NOT hoisted — they stay in the IIFE body and execute AFTER the
+        // pre-hoist `exports.fn = fn` assignments at the top of the IIFE.  This lets
+        // circular deps that import the entry's function exports find them callable.
+        if (p.hoist_point_seen and !p.hoist_no_se) {
+            p.hoisted_import_stmts.append(p.arena, stmt) catch {};
+            return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
+        }
+        return stmt;
+    }
+
+    // import source X from "spec";  (source-phase import — ES proposal).
+    // Grammar: `import source ImportedBinding FromClause`. We detect it as
+    // `source <ident> ...` where the next token is an identifier that is not the
+    // `from` keyword (which would make this an ordinary default import of a
+    // binding literally named `source`). The binding is bound to the host's
+    // module-source object (`__moduleSource__(spec)`), an immutable binding.
+    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "source")) {
+        const nn = p.peekNext();
+        if (nn.kind == .identifier and !std.mem.eql(u8, nn.value_str, "from")) {
+            _ = p.advance(); // consume `source`
+            const bind_tok = p.expect(.identifier) orelse return null;
+            if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
+            const spec_tok = p.expect(.string) orelse return null;
+            _ = skipImportAttributes(p);
+            p.consumeSemicolon();
+            const arg = p.makeNode(.string_literal, start, p.current.start, .{ .string_literal = spec_tok.value_str }) orelse return null;
+            const call = p.mkCall1("__moduleSource__", arg) orelse return null;
+            const stmt = p.mkVar(bind_tok.value_str, call) orelse return null;
+            if (p.hoist_point_seen) {
+                p.hoisted_import_stmts.append(p.arena, stmt) catch {};
+                return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
+            }
+            return stmt;
+        }
+    }
+
+    // `import defer * as ns from 'm'` — deferred namespace import (ES import-defer
+    // proposal). `defer` is the keyword ONLY when immediately followed by `*`;
+    // `import defer from 'm'` instead imports a default binding literally named
+    // `defer`, so it falls through to ordinary import-clause parsing.
+    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "defer")) {
+        const nn = p.peekNext();
+        if (nn.kind == .star) {
+            _ = p.advance(); // consume `defer`
+            _ = p.advance(); // consume `*`
+            if (!p.matchContextual("as")) return p.fail("expected 'as' after import defer *");
+            const t = p.expect(.identifier) orelse return null;
+            const dns_name = t.value_str;
+            if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
+            const dmodtok = p.expect(.string) orelse return null;
+            const dtype = skipImportAttributes(p); // `with { ... }` / `assert { ... }`
+            p.consumeSemicolon();
+            const arg = p.makeNode(.string_literal, start, p.current.start, .{
+                .string_literal = typedSpecifier(p, dmodtok.value_str, dtype),
+            }) orelse return null;
+            const call = p.mkCall1("__importDefer__", arg) orelse return null;
+            const stmt = p.mkVar(dns_name, call) orelse return null;
+            // Hoist like ordinary imports so the deferred namespace binding exists
+            // before the entry's assertions run (it does not evaluate the module).
+            if (p.hoist_point_seen) {
+                p.hoisted_import_stmts.append(p.arena, stmt) catch {};
+                return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
+            }
+            return stmt;
+        } else if (!(nn.kind == .identifier and std.mem.eql(u8, nn.value_str, "from"))) {
+            // `import defer x`, `import defer { … }`, `import defer as ns`, etc.
+            // are all SyntaxErrors: `defer` may only precede a `* as` namespace.
+            return p.fail("`import defer` must be `import defer * as <name> from`");
+        }
+        // else: `import defer from 'm'` — `defer` is an ordinary default binding.
     }
 
     var default_name: ?[]const u8 = null;
@@ -41,7 +194,8 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
         ns_name = t.value_str;
     } else if (p.match(.left_brace)) {
         while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
-            const imp = p.expect(.identifier) orelse return null;
+            // Import name may be identifier, keyword, or string literal (ES2022).
+            const imp = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
             var local = imp.value_str;
             if (p.matchContextual("as")) {
                 const lt = p.expect(.identifier) orelse return null;
@@ -55,48 +209,209 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
     const modtok = p.expect(.string) orelse return null;
     const modname = modtok.value_str;
+    const type_attr = skipImportAttributes(p); // `with { ... }` / `assert { ... }`
     p.consumeSemicolon();
+
+    // A JSON module exposes only a `default` export (ES "json-modules"): an
+    // `import { name }` of any other binding is a resolution-phase SyntaxError.
+    if (type_attr) |ty| {
+        if (std.mem.eql(u8, ty, "json")) {
+            for (named.items) |nb| {
+                if (!std.mem.eql(u8, nb.imp, "default"))
+                    return p.fail("JSON module has no export named other than 'default'");
+            }
+        }
+    }
 
     const tmp = std.fmt.allocPrint(p.arena, "__esm_{d}", .{start}) catch return null;
     var out = std.ArrayList(*Node){};
-    const req = p.mkRequire(modname) orelse return null;
-    out.append(p.arena, p.mkVar(tmp, req) orelse return null) catch return null;
+    const req = p.mkRequire(typedSpecifier(p, modname, type_attr)) orelse return null;
+    // M16 Phase 5: wrap in namespace so named/default imports get live binding,
+    // TDZ detection, and assignment-rejection semantics.
+    const ns_req = p.mkCall1("__makeNamespace__", req) orelse return null;
+    out.append(p.arena, p.mkVar(tmp, ns_req) orelse return null) catch return null;
     if (default_name) |d| {
         const m = p.mkMember(p.mkIdent(tmp) orelse return null, "default") orelse return null;
         out.append(p.arena, p.mkVar(d, m) orelse return null) catch return null;
         p.live_imports.append(p.arena, .{ .name = d, .ns = tmp, .prop = "default" }) catch return null;
     }
     if (ns_name) |n| {
-        out.append(p.arena, p.mkVar(n, p.mkIdent(tmp) orelse return null) orelse return null) catch return null;
+        // `import * as n` → n is a Module Namespace exotic object wrapping the
+        // imported module's live exports (ES §10.4.6), not the exports itself.
+        const ns_val = p.mkCall1("__makeNamespace__", p.mkIdent(tmp) orelse return null) orelse return null;
+        out.append(p.arena, p.mkVar(n, ns_val) orelse return null) catch return null;
+        // Treat n as a live import pointing to the namespace's "__ns__" property:
+        // reads of `n` return the namespace itself (via __ns__ [[Get]]) and
+        // writes (`n = x`) call namespace [[Set]] which throws TypeError in strict mode.
+        p.live_imports.append(p.arena, .{ .name = n, .ns = tmp, .prop = "__ns__" }) catch return null;
     }
     for (named.items) |nb| {
         const m = p.mkMember(p.mkIdent(tmp) orelse return null, nb.imp) orelse return null;
         out.append(p.arena, p.mkVar(nb.local, m) orelse return null) catch return null;
         p.live_imports.append(p.arena, .{ .name = nb.local, .ns = tmp, .prop = nb.imp }) catch return null;
     }
+    // M16 Phase 5: hoist import stmts to the bundle hoist point so require() runs
+    // after __modules__ / __initExports__ are set up but before entry assertions.
+    // Guard on hoist_point_seen so unit tests (no bundle marker) keep source order.
+    if (p.hoist_point_seen) {
+        for (out.items) |s| {
+            p.hoisted_import_stmts.append(p.arena, s) catch {};
+        }
+        return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
+    }
     return p.finishMulti(out.items);
 }
 
 pub fn parseExportDecl(p: *Parser) ?*Node {
     const start = p.current.start;
+    // An `export` declaration is only valid in module code; in eval/script code
+    // it is an early SyntaxError (sec-scripts §A.5).
+    if (p.eval_code) return p.fail("export declarations may only appear at the top level of a module");
     _ = p.advance(); // export
 
     // export default <assignmentExpr>;
     if (p.match(.kw_default)) {
+        // export default function [*] [Name]() {} — detect as function declaration.
+        const is_async_kw = p.currentIsAsyncKw() and p.peekNext().kind == .kw_function and !p.peekNext().line_terminator_before;
+        if (p.current.kind == .kw_function or is_async_kw) {
+            const fn_start = p.current.start;
+            const is_async = is_async_kw;
+            if (is_async) _ = p.advance(); // consume 'async'
+            _ = p.advance(); // consume 'function'
+            const is_gen = p.match(.star);
+            if (p.current.kind == .identifier) {
+                // Named: export default function F(){} → function_decl F + exports.default = F
+                const fn_name = p.current.value_str;
+                _ = p.advance();
+                const parsed_params = p.parseFunctionParams() orelse return null;
+                const prev_gen = p.in_generator_function;
+                p.in_generator_function = is_gen;
+                const body = p.parseFunctionBody() orelse {
+                    p.in_generator_function = prev_gen;
+                    return null;
+                };
+                p.in_generator_function = prev_gen;
+                const is_strict = parser_file.hasUseStrict(body);
+                const fn_decl = p.makeNode(.function_decl, fn_start, p.current.start, .{
+                    .function_decl = .{
+                        .name = fn_name,
+                        .params = parsed_params.params,
+                        .param_defaults = parsed_params.param_defaults,
+                        .rest_param = parsed_params.rest_param,
+                        .body = body,
+                        .is_generator = is_gen,
+                        .is_async = is_async,
+                        .is_strict = is_strict,
+                    },
+                }) orelse return null;
+                const assign = if (p.hoist_point_seen or p.fn_nesting_depth > 0)
+                    p.mkLiveLocalExport("default", fn_name) orelse return null
+                else
+                    p.mkExportAssign("default", p.mkIdent(fn_name) orelse return null) orelse return null;
+                var out2 = std.ArrayList(*Node){};
+                out2.append(p.arena, fn_decl) catch return null;
+                out2.append(p.arena, assign) catch return null;
+                return p.finishMulti(out2.items);
+            } else {
+                // Anonymous: export default function(){} or function*(){}
+                // Use a hoistable function declaration with an internal sentinel name so
+                // self-importing cycles see the default export before the body runs.
+                // The sentinel is translated to "default" by the fn.name getter at runtime.
+                const parsed_params = p.parseFunctionParams() orelse return null;
+                const prev_gen = p.in_generator_function;
+                p.in_generator_function = is_gen;
+                const body = p.parseFunctionBody() orelse {
+                    p.in_generator_function = prev_gen;
+                    return null;
+                };
+                p.in_generator_function = prev_gen;
+                const is_strict = parser_file.hasUseStrict(body);
+                const internal_name = if (is_gen) "__esm_dflt_gen__" else "__esm_dflt_fn__";
+                const fn_decl = p.makeNode(.function_decl, fn_start, p.current.start, .{
+                    .function_decl = .{
+                        .name = internal_name,
+                        .params = parsed_params.params,
+                        .param_defaults = parsed_params.param_defaults,
+                        .rest_param = parsed_params.rest_param,
+                        .body = body,
+                        .is_generator = is_gen,
+                        .is_async = is_async,
+                        .is_strict = is_strict,
+                    },
+                }) orelse return null;
+                p.consumeSemicolon();
+                const ident = p.mkIdent(internal_name) orelse return null;
+                const assign = p.mkExportAssign("default", ident) orelse return null;
+                var out = std.ArrayList(*Node){};
+                out.append(p.arena, fn_decl) catch return null;
+                out.append(p.arena, assign) catch return null;
+                return p.finishMulti(out.items);
+            }
+        }
+        // Set name hint for anonymous class / other anonymous expression.
+        p.export_default_name_hint = "default";
         const expr = p.parseAssignmentExpr() orelse return null;
+        p.export_default_name_hint = null;
         p.consumeSemicolon();
         return p.mkExportAssign("default", expr);
     }
 
+    // export * [as ns] from "mod"  — re-export all (or as namespace).
+    if (p.match(.star)) {
+        if (p.matchContextual("as")) {
+            // export * as ns from "mod" → exports.ns = __makeNamespace__(require("mod"))
+            // ns may be an identifier, keyword, or string literal (ES2022).
+            const ns_tok = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
+            if (!p.matchContextual("from")) return p.fail("expected 'from' after export * as");
+            const mod_tok = p.expect(.string) orelse return null;
+            _ = skipImportAttributes(p);
+            p.consumeSemicolon();
+            const req = p.mkRequire(mod_tok.value_str) orelse return null;
+            const ns_val = p.mkCall1("__makeNamespace__", req) orelse return null;
+            const stmt = p.mkExportAssign(ns_tok.value_str, ns_val);
+            // Hoist in bundle mode so source-order eval matches spec (import and
+            // export-from declarations all run before the module body).
+            if (p.hoist_point_seen) {
+                if (stmt) |s| p.hoisted_import_stmts.append(p.arena, s) catch {};
+                return p.makeNode(.empty_stmt, start, start, .{ .empty_stmt = {} });
+            }
+            return stmt;
+        } else {
+            // export * from "mod" → __exportStar__(exports, require("mod"))
+            // __exportStar__ copies all properties except 'default' (ES spec §2.2.2.3).
+            if (!p.matchContextual("from")) return p.fail("expected 'from' after export *");
+            const mod_tok = p.expect(.string) orelse return null;
+            _ = skipImportAttributes(p);
+            p.consumeSemicolon();
+            const req = p.mkRequire(mod_tok.value_str) orelse return null;
+            const callee = p.mkIdent("__exportStar__") orelse return null;
+            const exports_id = p.mkIdent("exports") orelse return null;
+            var aa = std.ArrayList(*Node){};
+            aa.append(p.arena, exports_id) catch return null;
+            aa.append(p.arena, req) catch return null;
+            const call = p.makeNode(.call_expr, start, start, .{
+                .call_expr = .{ .callee = callee, .args = aa.items },
+            }) orelse return null;
+            const stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = call });
+            // Hoist in bundle mode.
+            if (p.hoist_point_seen) {
+                if (stmt) |s| p.hoisted_import_stmts.append(p.arena, s) catch {};
+                return p.makeNode(.empty_stmt, start, start, .{ .empty_stmt = {} });
+            }
+            return stmt;
+        }
+    }
+
     // export { a, b as c } [from "mod"];
+    // Specifier names may be identifiers, keywords, or string literals (ES2022).
     if (p.match(.left_brace)) {
         const Spec = struct { local: []const u8, exported: []const u8 };
         var specs = std.ArrayList(Spec){};
         while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
-            const l = p.expect(.identifier) orelse return null;
+            const l = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
             var exported = l.value_str;
             if (p.matchContextual("as")) {
-                const e = p.expect(.identifier) orelse return null;
+                const e = if (p.check(.string)) p.advance() else (p.expectIdentifierName() orelse return null);
                 exported = e.value_str;
             }
             specs.append(p.arena, .{ .local = l.value_str, .exported = exported }) catch return null;
@@ -108,24 +423,45 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
         var out = std.ArrayList(*Node){};
         if (p.matchContextual("from")) {
             const modtok = p.expect(.string) orelse return null;
+            _ = skipImportAttributes(p);
             tmp = std.fmt.allocPrint(p.arena, "__esm_{d}", .{start}) catch return null;
             const req = p.mkRequire(modtok.value_str) orelse return null;
             out.append(p.arena, p.mkVar(tmp.?, req) orelse return null) catch return null;
         }
         p.consumeSemicolon();
         for (specs.items) |sp| {
-            const value = if (tmp) |t|
-                (p.mkMember(p.mkIdent(t) orelse return null, sp.local) orelse return null)
-            else
-                (p.mkIdent(sp.local) orelse return null);
-            out.append(p.arena, p.mkExportAssign(sp.exported, value) orelse return null) catch return null;
-            // A non-aliased local export (`export { a }`, not `a as c`, not a
-            // re-export `from`) is made live so later reassignments to `a` are
-            // seen by importers. `makeExportLive` keys on the shared name, so it
-            // only applies when local == exported and there is a local binding.
-            if (tmp == null and std.mem.eql(u8, sp.local, sp.exported)) {
-                p.live_exports.append(p.arena, sp.local) catch {};
+            if (tmp) |t| {
+                // Re-export (`export { X as Y } from './mod'`):
+                // Use a live getter (via __liveReexport__) both in bundle entry
+                // mode (hoist_point_seen) AND in dep factory bodies
+                // (fn_nesting_depth > 0) — live getters fix circular dependency
+                // cycles where the source module hasn't fully evaluated yet.
+                // Standalone mode (no bundle marker, no nesting) uses a snapshot.
+                if (p.hoist_point_seen or p.fn_nesting_depth > 0) {
+                    const src = p.mkMember(p.mkIdent(t) orelse return null, sp.local) orelse return null;
+                    out.append(p.arena, p.mkExportGetter(sp.exported, src) orelse return null) catch return null;
+                } else {
+                    const value = (p.mkMember(p.mkIdent(t) orelse return null, sp.local) orelse return null);
+                    out.append(p.arena, p.mkExportAssign(sp.exported, value) orelse return null) catch return null;
+                }
+            } else {
+                // Local export (`export { X }` or `export { X as Y }`): snapshot
+                const value = (p.mkIdent(sp.local) orelse return null);
+                out.append(p.arena, p.mkExportAssign(sp.exported, value) orelse return null) catch return null;
+                if (std.mem.eql(u8, sp.local, sp.exported)) {
+                    p.live_exports.append(p.arena, sp.local) catch {};
+                } else {
+                    p.live_export_aliases.append(p.arena, .{ .local = sp.local, .exported = sp.exported }) catch {};
+                }
             }
+        }
+        // Hoist ONLY empty-binding re-exports (`export {} from 'mod'`) in bundle mode:
+        // these are pure side-effect imports and must run before the module body to
+        // match spec evaluation order. Non-empty re-exports (`export { a } from`) are
+        // left in place because they snapshot live values that may not be initialized yet.
+        if (p.hoist_point_seen and tmp != null and specs.items.len == 0) {
+            for (out.items) |s| p.hoisted_import_stmts.append(p.arena, s) catch {};
+            return p.makeNode(.empty_stmt, start, p.current.start, .{ .empty_stmt = {} });
         }
         return p.finishMulti(out.items);
     }
@@ -134,6 +470,26 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
     const decl = p.parseStatement() orelse return null;
     var names = std.ArrayList([]const u8){};
     p.collectDeclNames(decl, &names);
+    // A multi-declarator `export let a, b, c;` lowers to a `block_stmt` wrapping
+    // the individual var_decls. Left as a block it would (1) block-scope the
+    // bindings away from the rest of the module body and (2) hide the var_decls
+    // from `makeExportLive`, which only scans top-level statements — so neither
+    // the live-binding rewrite nor importers would observe later assignments.
+    // Flatten it: keep the first declarator as the returned statement and splice
+    // the rest into the module's statement stream (before the export snapshots).
+    var result_decl = decl;
+    if (decl.kind == .block_stmt) {
+        const body = decl.data.block_stmt.body;
+        if (body.len > 0) {
+            result_decl = body[0];
+            for (body[1..]) |d| {
+                p.extra_stmts.append(p.arena, d) catch {
+                    p.had_error = true;
+                    return null;
+                };
+            }
+        }
+    }
     for (names.items) |nm| {
         const a = p.mkExportAssign(nm, p.mkIdent(nm) orelse return null) orelse return null;
         p.extra_stmts.append(p.arena, a) catch {
@@ -141,19 +497,93 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             return null;
         };
     }
-    // A single reassignable declarator (`export let`/`export var x = E`) is made live:
-    // its use-sites are rewritten to `exports.x` so reassignments are seen by importers.
-    if (decl.kind == .var_decl and (decl.data.var_decl.kind == .let or decl.data.var_decl.kind == .var_)) {
-        p.live_exports.append(p.arena, decl.data.var_decl.name) catch {};
+    // var exports are always made live (no TDZ, fine in all modes).
+    // let/const exports are made live only when __initExports__ will pre-set TDZ
+    // markers on the exports object: bundle dep factories (fn_nesting_depth > 0),
+    // bundle entry (hoist_point_seen), or script mode (unit tests, !is_module).
+    // Standalone evalModule (no bundle) keeps env-level TDZ for let/const — the
+    // GET_GLOBAL_OPT handler already throws for TemporalDeadZone.
+    // Register live exports for every declarator name, including each name of a
+    // multi-declarator `export let a, b, c;` (which lowers to a block_stmt).
+    p.registerDeclLiveExports(decl);
+    return result_decl;
+}
+
+/// Detect a `using <BindingIdentifier>` declaration at the current position.
+/// `using` is contextual: it is only a declaration when an identifier follows on
+/// the same line (no ASI break). `using\nx` is two statements; `using = 1`,
+/// `using.x`, `using(...)` are ordinary expressions.
+pub fn atUsingDecl(p: *Parser) bool {
+    if (p.current.kind != .identifier or !std.mem.eql(u8, p.current.value_str, "using")) return false;
+    const nx = p.peekNext();
+    if (nx.line_terminator_before) return false;
+    return nx.kind == .identifier or nx.kind == .kw_of;
+}
+
+/// Detect an `await using <BindingIdentifier>` declaration. Only valid in an
+/// async context — module top level or inside a function body (at script top
+/// level `await` is an ordinary identifier, so this stays an expression).
+pub fn atAwaitUsingDecl(p: *Parser) bool {
+    if (p.current.kind != .identifier or !std.mem.eql(u8, p.current.value_str, "await")) return false;
+    if (!(p.is_module or p.fn_nesting_depth > 0)) return false;
+    const nx = p.peekNext();
+    if (nx.line_terminator_before or nx.kind != .identifier or
+        !std.mem.eql(u8, nx.value_str, "using")) return false;
+    const nx2 = p.peekNext2();
+    if (nx2.line_terminator_before) return false;
+    return nx2.kind == .identifier or nx2.kind == .kw_of;
+}
+
+/// Parse a `using` / `await using` declaration statement (explicit resource
+/// management). Lowered to `let` bindings: scoping, TDZ and per-iteration
+/// freshness match `let`. Each declarator must be a BindingIdentifier with a
+/// required initializer (UsingDeclaration grammar §13.x).
+pub fn parseUsingDeclStmt(p: *Parser, is_await: bool) ?*Node {
+    const start = p.current.start;
+    if (is_await) _ = p.advance(); // consume `await`
+    _ = p.advance(); // consume `using`
+    var decls = std.ArrayList(*Node){};
+    while (true) {
+        const d_start = p.current.start;
+        if (p.check(.left_bracket) or p.check(.left_brace)) {
+            return p.fail("using declaration requires a binding identifier");
+        }
+        const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
+        const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
+        var init_node: ?*Node = null;
+        if (p.match(.eq)) {
+            init_node = p.parseAssignmentExpr();
+        } else {
+            return p.fail("using declaration requires an initializer");
+        }
+        const d = p.makeNode(.var_decl, d_start, p.current.start, .{
+            .var_decl = .{ .kind = .let, .name = name, .init = init_node },
+        }) orelse return null;
+        decls.append(p.arena, d) catch {
+            p.had_error = true;
+            return null;
+        };
+        if (!p.match(.comma)) break;
     }
-    return decl;
+    p.consumeSemicolon();
+    if (decls.items.len == 1) return decls.items[0];
+    // Transparent container: these using bindings belong to the enclosing scope.
+    return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = decls.items, .lexical_scope = false } });
 }
 
 pub fn parseStatement(p: *Parser) ?*Node {
     if (p.had_error) return null;
+    // Explicit resource management: `using x = ...` / `await using x = ...`
+    // declarations. Only recognized when a binding identifier follows (see
+    // atUsingDecl/atAwaitUsingDecl); otherwise `using`/`await` stay ordinary.
+    if (atAwaitUsingDecl(p)) return parseUsingDeclStmt(p, true);
+    if (atUsingDecl(p)) return parseUsingDeclStmt(p, false);
     // Phase 8: a statement starting with `await` is an await-expression statement,
     // not a label/identifier — route to expression parsing (which desugars await).
-    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await")) {
+    // In module mode, `await` is always a keyword. In script mode, `await` is an
+    // identifier unless followed by a valid operand (for top-level await support).
+    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await") and
+        (p.is_module or expr_mod.isAwaitOperandStart(p.peekNext().kind))) {
         return p.parseExprStmt();
     }
     // W2-async: `async function foo() {}` declaration. `async` is contextual
@@ -253,7 +683,17 @@ pub fn parseVarDeclStmt(p: *Parser) ?*Node {
 
 pub fn parseLexicalDeclStmt(p: *Parser, kind: ast.VarKind) ?*Node {
     const start = p.current.start;
+    const kw_line = p.current.line;
     _ = p.advance(); // consume let/const
+    // ASI: `let` followed by `{` or `[` on a DIFFERENT line is an expression
+    // statement `let;` in non-strict mode (let is a valid identifier).
+    // `const` has no such ASI case (it is always a declaration).
+    if (kind == .let and p.current.line > kw_line and
+        (p.current.kind == .left_brace or p.current.kind == .left_bracket))
+    {
+        const id = p.makeNode(.identifier, start, start, .{ .identifier = "let" }) orelse return null;
+        return p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = id });
+    }
     return p.parseVarDeclarators(start, kind, true);
 }
 
@@ -271,8 +711,9 @@ pub fn parseVarDeclarators(p: *Parser, start: u32, kind: ast.VarKind, consume_se
     }
     if (consume_semicolon) p.consumeSemicolon();
     if (decls.items.len == 1) return decls.items[0];
-    // Multiple declarators: wrap in a block_stmt (not ideal, but works for eval)
-    return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = decls.items } });
+    // Multiple declarators: wrap in a transparent block_stmt (bindings belong to
+    // the enclosing scope, not a fresh block scope).
+    return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = decls.items, .lexical_scope = false } });
 }
 
 pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
@@ -282,6 +723,19 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     }
     const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
     const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
+    // Strict-mode early error: a future-reserved word (or `eval`/`arguments`)
+    // may not be a binding identifier in strict code (ES §13.1.1, §12.7.2).
+    if (p.strict and parser_file.isStrictReservedWord(name)) {
+        if (!p.had_error) {
+            p.had_error = true;
+            p.error_info = parser_file.ParseError{
+                .message = "unexpected strict-mode reserved word as binding name",
+                .line = name_tok.line,
+                .column = name_tok.column,
+            };
+        }
+        return null;
+    }
     var init_node: ?*Node = null;
     if (p.match(.eq)) {
         init_node = p.parseAssignmentExpr();
@@ -301,8 +755,14 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     return p.makeNode(.var_decl, start, end, .{ .var_decl = .{ .kind = kind, .name = name, .init = init_node } });
 }
 
+/// One destructuring target: `bind` is the variable name introduced; `key` is
+/// the source property name (object patterns only — for an `{ a: x }` renaming
+/// `key` = "a" and `bind` = "x"; for shorthand `{ a }` both are "a"). Array
+/// patterns leave `key` empty and read by positional index.
+const DestructTarget = struct { key: []const u8, bind: []const u8 };
+
 pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?*Node {
-    var names = std.ArrayList([]const u8){};
+    var targets = std.ArrayList(DestructTarget){};
     const is_array = p.match(.left_bracket);
     if (is_array) {
         while (!p.check(.right_bracket) and !p.check(.eof) and !p.had_error) {
@@ -311,7 +771,11 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
                 continue;
             }
             const t = p.expect(.identifier) orelse return null;
-            names.append(p.arena, t.value_str) catch return null;
+            targets.append(p.arena, .{ .key = "", .bind = t.value_str }) catch return null;
+            // Skip optional default value (= expr) — runtime falls back to undefined.
+            if (p.match(.eq)) {
+                _ = p.parseAssignmentExpr();
+            }
             if (!p.match(.comma)) break;
         }
         _ = p.expect(.right_bracket) orelse return null;
@@ -324,7 +788,13 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
                 const alias = p.expect(.identifier) orelse return null;
                 bind_name = alias.value_str;
             }
-            names.append(p.arena, bind_name) catch return null;
+            // Read source property `key`, bind to `bind_name` (they differ when
+            // the pattern renames, e.g. `{ get: description }`).
+            targets.append(p.arena, .{ .key = key.value_str, .bind = bind_name }) catch return null;
+            // Skip optional default value (= expr) — runtime falls back to undefined.
+            if (p.match(.eq)) {
+                _ = p.parseAssignmentExpr();
+            }
             if (!p.match(.comma)) break;
         }
         _ = p.expect(.right_brace) orelse return null;
@@ -339,7 +809,7 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
     }) orelse return null;
     body.append(p.arena, tmp_decl) catch return null;
 
-    for (names.items, 0..) |n, i| {
+    for (targets.items, 0..) |tgt, i| {
         const tmp_id = p.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
         const access = if (is_array) blk: {
             const idx = p.makeNode(.number_literal, start, start, .{ .number_literal = @floatFromInt(i) }) orelse return null;
@@ -347,18 +817,18 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
                 .member_expr = .{ .object = tmp_id, .property = idx, .computed = true },
             }) orelse return null;
         } else blk: {
-            const prop = p.makeNode(.identifier, start, start, .{ .identifier = n }) orelse return null;
+            const prop = p.makeNode(.identifier, start, start, .{ .identifier = tgt.key }) orelse return null;
             break :blk p.makeNode(.member_expr, start, start, .{
                 .member_expr = .{ .object = tmp_id, .property = prop, .computed = false },
             }) orelse return null;
         };
         const vd = p.makeNode(.var_decl, start, p.current.start, .{
-            .var_decl = .{ .kind = kind, .name = n, .init = access },
+            .var_decl = .{ .kind = kind, .name = tgt.bind, .init = access },
         }) orelse return null;
         body.append(p.arena, vd) catch return null;
     }
     return p.makeNode(.block_stmt, start, p.current.start, .{
-        .block_stmt = .{ .body = body.items },
+        .block_stmt = .{ .body = body.items, .lexical_scope = false },
     });
 }
 
@@ -436,7 +906,39 @@ pub fn parseDoWhileStmt(p: *Parser) ?*Node {
 pub fn parseForStmt(p: *Parser) ?*Node {
     const start = p.current.start;
     _ = p.advance(); // consume 'for'
+    // `for await (... of ...)`: consume 'await', treat as regular for-of.
+    if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await")) {
+        _ = p.advance();
+    }
     _ = p.expect(.left_paren) orelse return null;
+
+    // Explicit resource management head: `for (using x of it)` /
+    // `for (await using x of it)`. Lowered to a `let` for-of binding (fresh per
+    // iteration). Only for-of is valid — for-in / C-style for with a using
+    // declaration is a SyntaxError.
+    if (atAwaitUsingDecl(p) or atUsingDecl(p)) {
+        const is_await = atAwaitUsingDecl(p);
+        if (is_await) _ = p.advance(); // consume `await`
+        _ = p.advance(); // consume `using`
+        if (p.check(.left_bracket) or p.check(.left_brace)) {
+            return p.fail("using declaration requires a binding identifier");
+        }
+        const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
+        const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
+        if (!p.check(.kw_of)) {
+            return p.fail("using declaration is only valid in a for-of head");
+        }
+        _ = p.advance(); // consume `of`
+        const right = p.parseAssignmentExpr() orelse return null;
+        _ = p.expect(.right_paren) orelse return null;
+        const body = p.parseStatement() orelse return null;
+        const left = p.makeNode(.var_decl, name_tok.start, name_tok.end, .{
+            .var_decl = .{ .kind = .let, .name = name, .init = null },
+        }) orelse return null;
+        return p.makeNode(.for_in_stmt, start, p.current.start, .{
+            .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = true },
+        });
+    }
 
     // Detect for-in: for (var/let/const x in obj) or for (x in obj)
     if (p.check(.kw_var) or p.check(.kw_let) or p.check(.kw_const)) {
@@ -508,7 +1010,7 @@ pub fn parseForStmt(p: *Parser) ?*Node {
                 }
                 _ = p.expect(.semicolon) orelse return null;
                 const init_node: ?*Node = if (decls.items.len == 1) decls.items[0] else p.makeNode(.block_stmt, start, p.current.start, .{
-                    .block_stmt = .{ .body = decls.items },
+                    .block_stmt = .{ .body = decls.items, .lexical_scope = false },
                 });
                 return p.parseForTail(start, init_node);
             } else {
@@ -528,6 +1030,23 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         // for (expr in ...) or for (expr; ...)
         // Parse the expression
         const expr = p.parseAssignmentExpr() orelse return null;
+        // `for (lhs in rhs)`: parseAssignmentExpr eagerly consumed `in` as a
+        // binary operator. Detect this and split it back into a for-in.
+        if (expr.kind == .binary_expr and
+            expr.data.binary_expr.op == .in and
+            p.check(.right_paren))
+        {
+            _ = p.expect(.right_paren) orelse return null;
+            const body = p.parseStatement() orelse return null;
+            return p.makeNode(.for_in_stmt, start, p.current.start, .{
+                .for_in_stmt = .{
+                    .left = expr.data.binary_expr.left,
+                    .right = expr.data.binary_expr.right,
+                    .body = body,
+                    .iterate_values = false,
+                },
+            });
+        }
         if (p.check(.kw_in)) {
             // for-in with assignment expression left side
             _ = p.advance(); // consume 'in'
@@ -636,7 +1155,7 @@ pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind) ?*Node {
         body_stmts.append(p.arena, d) catch return null;
     }
     body_stmts.append(p.arena, orig_body) catch return null;
-    const new_body = p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = body_stmts.items } }) orelse return null;
+    const new_body = p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = body_stmts.items, .lexical_scope = false } }) orelse return null;
     const left = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = kind, .name = tmp_name, .init = null } }) orelse return null;
     return p.makeNode(.for_in_stmt, start, p.current.start, .{
         .for_in_stmt = .{ .left = left, .right = right, .body = new_body, .iterate_values = iterate_values },
@@ -768,6 +1287,26 @@ pub fn parseThrowStmt(p: *Parser) ?*Node {
     return p.makeNode(.throw_stmt, start, p.current.start, .{ .throw_stmt = argument });
 }
 
+/// Skip a balanced `{...}` or `[...]` destructuring pattern at current position.
+fn skipDestructuringPattern(p: *Parser) void {
+    const open = p.current.kind;
+    const close: @TypeOf(open) = if (open == .left_brace) .right_brace else .right_bracket;
+    var depth: u32 = 1;
+    _ = p.advance(); // consume opening bracket
+    while (!p.check(.eof)) {
+        if (p.current.kind == open) {
+            depth += 1;
+        } else if (p.current.kind == close) {
+            depth -= 1;
+            if (depth == 0) {
+                _ = p.advance(); // consume closing bracket
+                return;
+            }
+        }
+        _ = p.advance();
+    }
+}
+
 pub fn parseTryStmt(p: *Parser) ?*Node {
     const start = p.current.start;
     _ = p.advance(); // consume 'try'
@@ -778,12 +1317,25 @@ pub fn parseTryStmt(p: *Parser) ?*Node {
 
     if (p.check(.kw_catch)) {
         _ = p.advance(); // consume 'catch'
-        _ = p.expect(.left_paren) orelse return null;
-        const param_tok = p.expect(.identifier) orelse return null;
-        _ = p.expect(.right_paren) orelse return null;
+        // Optional catch binding (ES2019): `catch { ... }` with no `(param)`.
+        // An empty param_name signals "no binding" to the lowering pass.
+        var catch_param_name: []const u8 = "";
+        if (p.check(.left_paren)) {
+            _ = p.advance(); // consume '('
+            catch_param_name = if (p.check(.left_brace) or p.check(.left_bracket)) blk: {
+                // Destructuring catch param: skip balanced pattern, bind exc to temp.
+                const tmp = std.fmt.allocPrint(p.arena, "__catch_{d}", .{start}) catch return null;
+                skipDestructuringPattern(p);
+                break :blk tmp;
+            } else blk: {
+                const tok = p.expect(.identifier) orelse return null;
+                break :blk tok.value_str;
+            };
+            _ = p.expect(.right_paren) orelse return null;
+        }
         const catch_body = p.parseBlock() orelse return null;
         handler = ast.CatchClause{
-            .param_name = param_tok.value_str,
+            .param_name = catch_param_name,
             .body = catch_body,
         };
     }

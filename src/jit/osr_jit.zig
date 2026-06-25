@@ -185,6 +185,8 @@ pub fn analyze(
                 written.items[slot] = true;
             },
             .HOIST_VAR => {},
+            .HOIST_LEX => {},
+            .INIT_LEX => {},
             .ADD, .SUB, .MUL => {
                 if (!regsRead(code, pc, op, &reg_written)) return null;
                 reg_written[code[pc + 1]] = true;

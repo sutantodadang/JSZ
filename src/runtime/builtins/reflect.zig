@@ -11,6 +11,7 @@ const fp = @import("function_proto.zig");
 const intrinsics = @import("intrinsics.zig");
 const typed_array = @import("typed_array.zig");
 const proxy_mod = @import("proxy.zig");
+const namespace_mod = @import("namespace.zig");
 
 /// R1: create the Reflect namespace object and bind the `Reflect` global.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -22,6 +23,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try reflect_obj.set("deleteProperty", try val_mod.makeNativeFunction(arena, nativeReflectDeleteProperty));
     try reflect_obj.set("ownKeys", try val_mod.makeNativeFunction(arena, nativeReflectOwnKeys));
     try reflect_obj.set("getPrototypeOf", try val_mod.makeNativeFunction(arena, nativeReflectGetPrototypeOf));
+    try reflect_obj.set("setPrototypeOf", try val_mod.makeNativeFunction(arena, nativeReflectSetPrototypeOf));
     try reflect_obj.set("defineProperty", try val_mod.makeNativeFunction(arena, nativeReflectDefineProperty));
     try reflect_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunction(arena, nativeReflectGetOwnPropertyDescriptor));
     try reflect_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, nativeReflectIsExtensible));
@@ -127,6 +129,17 @@ pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value)
         }
     }
 
+    // M16: Module Namespace exotic [[Get]] — reads current value from backing exports.
+    // Throws ReferenceError for uninitialized (TDZ) bindings.
+    if (target_obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerForStringKey(arena, target_obj, k); // import-defer: [[Get]]
+        if (namespace_mod.isTDZ(target_obj, k)) {
+            return throwReferenceErrorReflect(arena, k);
+        }
+        const b = namespace_mod.backing(target_obj) orelse return val_mod.makeUndefined(arena);
+        return b.get(k) orelse val_mod.makeUndefined(arena);
+    }
+
     if (target_obj.findProperty(k)) |found| {
         const attr = found.holder.attrAt(found.slot);
         if (attr.is_accessor) {
@@ -162,6 +175,8 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
     const target_obj = target.toPtr().object;
 
     if (isSym(key)) {
+        // M16: Module Namespace exotic [[Set]] always fails for symbol keys too.
+        if (target_obj.internal_kind == .module_namespace) return val_mod.makeBool(arena, false);
         // OrdinarySet for a symbol key: honor accessor setters and the
         // [[Writable]] attribute (a non-writable own data prop → false).
         if (target_obj.getOwnSymEntry(key)) |sp| {
@@ -184,6 +199,9 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
     }
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
+
+    // M16: Module Namespace exotic [[Set]] always fails.
+    if (target_obj.internal_kind == .module_namespace) return val_mod.makeBool(arena, false);
 
     // M15: TypedArray integer-indexed exotic [[Set]](P, V, Receiver).
     const receiver = if (args.len > 3) args[3] else target;
@@ -233,7 +251,10 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
                     const hobj = holder_val.toPtr().object;
                     const setter = hobj.getOwn("set") orelse return val_mod.makeBool(arena, false);
                     if (isCallable(setter)) {
-                        _ = try fp.invokeCallback(arena, target, setter, &[_]Value{value});
+                        // OrdinarySetWithOwnDescriptor calls the setter with the
+                        // Receiver as thisArg (not the holder), so `super.x = v`
+                        // invokes the inherited setter bound to the instance.
+                        _ = try fp.invokeCallback(arena, receiver, setter, &[_]Value{value});
                         return val_mod.makeBool(arena, true);
                     }
                 }
@@ -242,6 +263,38 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
         }
         // Non-writable data property → OrdinarySet fails (return false).
         if (!attr.writable) return val_mod.makeBool(arena, false);
+    }
+
+    // OrdinarySetWithOwnDescriptor final step: a data binding (or a fresh one)
+    // is created/updated on the *Receiver*, not on the target. When the receiver
+    // differs from the target (e.g. `super.x = v`, where target is the home
+    // prototype and receiver is the instance), consult the receiver's own
+    // descriptor. A Module Namespace receiver runs its exotic [[GetOwnProperty]],
+    // which throws ReferenceError for an uninitialized (TDZ) export.
+    if (receiver.bits != target.bits and isObj(receiver)) {
+        const robj = receiver.toPtr().object;
+        if (robj.internal_kind == .module_namespace) {
+            // Receiver.[[GetOwnProperty]](P) (e.g. `super[k] = v` with a namespace
+            // receiver) triggers import-defer evaluation before the TDZ check.
+            try namespace_mod.triggerForStringKey(arena, robj, k);
+            // Receiver.[[GetOwnProperty]](P): throws for a TDZ export.
+            if (namespace_mod.isTDZ(robj, k)) {
+                return throwReferenceErrorReflect(arena, k);
+            }
+            // An export's [[DefineOwnProperty]] (writable:false redefinition) and
+            // a non-export create on the non-extensible namespace both fail.
+            return val_mod.makeBool(arena, false);
+        }
+        if (robj.resolveOwnSlot(k)) |slot| {
+            const rattr = robj.attrAt(slot);
+            if (rattr.is_accessor) return val_mod.makeBool(arena, false);
+            if (!rattr.writable) return val_mod.makeBool(arena, false);
+            try robj.set(k, value);
+            return val_mod.makeBool(arena, true);
+        }
+        if (!robj.extensible) return val_mod.makeBool(arena, false);
+        try robj.set(k, value);
+        return val_mod.makeBool(arena, true);
     }
 
     try target_obj.set(k, value);
@@ -268,6 +321,13 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
     }
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
+
+    // M16: Module Namespace exotic [[HasProperty]] — string keys are exactly the
+    // exported names (null prototype, no inherited keys).
+    if (target_obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerForStringKey(arena, target_obj, k); // import-defer: [[HasProperty]]
+        return val_mod.makeBool(arena, @import("namespace.zig").hasExport(target_obj, k));
+    }
 
     // M15: TypedArray [[HasProperty]] — integer-indexed exotic.
     if (target_obj.internal_kind == .typed_array) {
@@ -324,6 +384,12 @@ pub fn nativeReflectDeleteProperty(arena: std.mem.Allocator, _: Value, args: []c
         // Non-canonical key: fall through to ordinary deleteOwn.
     }
 
+    // M16: Module Namespace exotic [[Delete]] — export names are non-configurable.
+    if (target_obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerForStringKey(arena, target_obj, k); // import-defer: [[Delete]]
+        return val_mod.makeBool(arena, !namespace_mod.hasExport(target_obj, k));
+    }
+
     return val_mod.makeBool(arena, try target_obj.deleteOwn(k));
 }
 
@@ -356,6 +422,25 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
         return val_mod.makeObject(arena, arr);
     }
     const obj = args[0].toPtr().object;
+
+    // M16: Module Namespace exotic [[OwnPropertyKeys]] — sorted export names then symbol keys.
+    if (obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerAll(arena, obj); // import-defer: [[OwnPropertyKeys]]
+        const names = try namespace_mod.sortedNames(arena, obj);
+        var ni: u32 = 0;
+        for (names) |name| {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
+            try arr.set(idx_key, try val_mod.makeString(arena, name));
+            ni += 1;
+        }
+        for (obj.symKeys()) |sp| {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
+            try arr.set(idx_key, sp.key);
+            ni += 1;
+        }
+        arr.array_length = ni;
+        return val_mod.makeObject(arena, arr);
+    }
 
     // M15: TypedArray [[OwnPropertyKeys]] — integer indices first, then ordinary, then symbols.
     var ta_count: u32 = 0;
@@ -400,6 +485,29 @@ pub fn nativeReflectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
     return val_mod.makeNull(arena);
 }
 
+// ---------------------------------------------------------------- Reflect.setPrototypeOf ---
+
+pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or !isObj(args[0]))
+        return throwTypeErrorReflect(arena, "Reflect.setPrototypeOf called on non-object");
+    const obj = args[0].toPtr().object;
+    const new_proto: ?*JsObject = blk: {
+        if (args.len < 2 or args[1].bits == 0) break :blk null;
+        break :blk switch (args[1].unbox()) {
+            .object => |o| o,
+            .null_ => null,
+            else => return throwTypeErrorReflect(arena, "Reflect.setPrototypeOf proto must be an object or null"),
+        };
+    };
+    // Module Namespace [[SetPrototypeOf]] is SetImmutablePrototype: succeeds (true)
+    // only when the requested prototype equals the current one (null); any other
+    // target fails (false). It does NOT trigger import-defer evaluation.
+    if (obj.internal_kind == .module_namespace)
+        return val_mod.makeBool(arena, new_proto == null);
+    obj.proto = new_proto;
+    return val_mod.makeBool(arena, true);
+}
+
 // ---------------------------------------------------------------- Reflect.defineProperty ---
 
 pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
@@ -422,17 +530,57 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
             });
             return val_mod.makeBool(arena, sok);
         }
-        const sval = sdesc.getOwn("value") orelse Value{};
+        // ES §10.1.6.3 ValidateAndApplyPropertyDescriptor step 4: a generic
+        // descriptor (no fields at all) on an existing property is a no-op → true.
+        // A generic descriptor on a non-existing property on a non-extensible
+        // object → false (handled below via defineOwnDataSym).
+        const is_generic = !sdesc.hasOwn("value") and !sdesc.hasOwn("writable") and
+            !sdesc.hasOwn("enumerable") and !sdesc.hasOwn("configurable");
+        if (is_generic and target_obj.hasOwnSym(key_arg)) return val_mod.makeBool(arena, true);
+        // Preserve existing own symbol property's value when the descriptor omits
+        // "value" (ES §9.1.6.3 OrdinaryDefineOwnProperty step 4 / §10.4.6.7).
+        // Without this, a bare {} descriptor overwrites e.g. Symbol.toStringTag's
+        // "Module" value with undefined.
+        const sval = if (sdesc.hasOwn("value"))
+            (sdesc.getOwn("value") orelse Value{})
+        else if (target_obj.getOwnSym(key_arg)) |existing|
+            existing
+        else
+            Value{};
         const sok = try target_obj.defineOwnDataSym(key_arg, sval, .{
-            .writable = descTruthy(sdesc.getOwn("writable")),
-            .enumerable = descTruthy(sdesc.getOwn("enumerable")),
-            .configurable = descTruthy(sdesc.getOwn("configurable")),
+            .writable = if (sdesc.hasOwn("writable")) descTruthy(sdesc.getOwn("writable")) else if (target_obj.getOwnSymEntry(key_arg)) |e| e.attr.writable else false,
+            .enumerable = if (sdesc.hasOwn("enumerable")) descTruthy(sdesc.getOwn("enumerable")) else if (target_obj.getOwnSymEntry(key_arg)) |e| e.attr.enumerable else false,
+            .configurable = if (sdesc.hasOwn("configurable")) descTruthy(sdesc.getOwn("configurable")) else if (target_obj.getOwnSymEntry(key_arg)) |e| e.attr.configurable else false,
         });
         return val_mod.makeBool(arena, sok);
     }
 
     const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeBool(arena, false);
     const desc = args[2].toPtr().object;
+
+    // M16: Module Namespace exotic [[DefineOwnProperty]] for string keys (§10.4.6.7).
+    if (target_obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerForStringKey(arena, target_obj, k); // import-defer: [[DefineOwnProperty]]
+        if (!namespace_mod.hasExport(target_obj, k)) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("get") or desc.hasOwn("set")) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("configurable") and descTruthy(desc.getOwn("configurable"))) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("enumerable") and !descTruthy(desc.getOwn("enumerable"))) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("writable") and !descTruthy(desc.getOwn("writable"))) return val_mod.makeBool(arena, false);
+        if (desc.hasOwn("value")) {
+            const new_val = desc.getOwn("value") orelse Value{};
+            const b = namespace_mod.backing(target_obj).?;
+            const cur_val = b.get(k) orelse Value{};
+            const same = if (new_val.bits == cur_val.bits)
+                true
+            else if (new_val.bits != 0 and cur_val.bits != 0 and
+                new_val.unbox() == .number and cur_val.unbox() == .number)
+                new_val.unbox().number == cur_val.unbox().number
+            else
+                false;
+            if (!same) return val_mod.makeBool(arena, false);
+        }
+        return val_mod.makeBool(arena, true);
+    }
 
     // M15: TypedArray [[DefineOwnProperty]] — integer-indexed exotic (ES2023
     // §10.4.5.3). Reflect returns false (no throw) on rejection.
@@ -524,10 +672,27 @@ pub fn nativeReflectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value,
 
     const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeUndefined(arena);
 
-    const a = obj.ownAttr(k) orelse return val_mod.makeUndefined(arena);
-
     const realm_mod = @import("../realm.zig");
     const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+
+    // M16: Module Namespace exotic [[GetOwnProperty]] for a string key — an export
+    // yields { value, writable:true, enumerable:true, configurable:false }; a
+    // non-export yields undefined. import-defer: triggers evaluation first.
+    if (obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerForStringKey(arena, obj, k);
+        if (!namespace_mod.hasExport(obj, k)) return val_mod.makeUndefined(arena);
+        if (namespace_mod.isTDZ(obj, k)) return throwReferenceErrorReflect(arena, k);
+        const b = namespace_mod.backing(obj).?;
+        const value = b.get(k) orelse try val_mod.makeUndefined(arena);
+        const ndesc = try JsObject.create(arena, obj_proto);
+        try ndesc.set("value", value);
+        try ndesc.set("writable", try val_mod.makeBool(arena, true));
+        try ndesc.set("enumerable", try val_mod.makeBool(arena, true));
+        try ndesc.set("configurable", try val_mod.makeBool(arena, false));
+        return val_mod.makeObject(arena, ndesc);
+    }
+
+    const a = obj.ownAttr(k) orelse return val_mod.makeUndefined(arena);
 
     if (obj.ownAccessorHolder(k)) |holder_val| {
         const desc = try JsObject.create(arena, obj_proto);
@@ -630,6 +795,20 @@ fn throwTypeErrorReflect(arena: std.mem.Allocator, msg: []const u8) anyerror {
         try JsObject.create(arena, realm_mod.error_proto_TypeError);
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
+}
+
+/// Throw a ReferenceError with a descriptive message (used by namespace TDZ).
+fn throwReferenceErrorReflect(arena: std.mem.Allocator, name: []const u8) anyerror {
+    const realm_mod = @import("../realm.zig");
+    const msg = try std.fmt.allocPrint(arena, "{s} is not defined", .{name});
+    const obj = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, realm_mod.error_proto_ReferenceError)
+    else
+        try JsObject.create(arena, realm_mod.error_proto_ReferenceError);
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "ReferenceError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
     return error.JsException;
 }

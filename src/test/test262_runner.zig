@@ -127,10 +127,31 @@ fn frontmatter(source: []const u8) []const u8 {
     return rest[0..end];
 }
 
+/// Return the text of the `flags:` frontmatter entry, covering both the inline
+/// array form (`flags: [module, async]`) and the YAML block-list form
+/// (`flags:\n  - module\n  - async`). The returned slice spans the `flags:` line
+/// plus any following indented continuation lines, so a block-list value is not
+/// truncated to the bare `flags:` line (which carries no flag tokens). Returns
+/// "" when there is no `flags:` entry.
+fn flagsText(yaml: []const u8) []const u8 {
+    const fi = std.mem.indexOf(u8, yaml, "flags:") orelse return "";
+    var end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse return yaml[fi..];
+    // Extend across following block-list continuation lines, which are indented
+    // (start with a space/tab). A new top-level key (e.g. `negative:`) is not
+    // indented and ends the flags block.
+    while (end < yaml.len) {
+        const next_nl = std.mem.indexOfScalarPos(u8, yaml, end + 1, '\n') orelse yaml.len;
+        const line = yaml[end + 1 .. next_nl];
+        if (line.len == 0 or (line[0] != ' ' and line[0] != '\t')) break;
+        end = next_nl;
+    }
+    return yaml[fi..end];
+}
+
 /// Eligibility for auto-expansion: pure ES5 (has es5id), no unsupported
 /// harness includes, and no module/raw/async flags. Keeps the auto-grown
 /// set to tests our engine + minimal prelude (assert.js/sta.js) can run.
-fn isEligibleEs5(source: []const u8, allow_es6: bool) bool {
+fn isEligibleEs5(source: []const u8, allow_es6: bool, allow_module: bool) bool {
     const yaml = frontmatter(source);
     if (yaml.len == 0) return false;
     // ES5 (es5id) always; later-spec (esid) only for directories opted in via "es6:".
@@ -138,10 +159,9 @@ fn isEligibleEs5(source: []const u8, allow_es6: bool) bool {
     const has_esid = std.mem.indexOf(u8, yaml, "esid:") != null;
     if (!has_es5 and !(allow_es6 and has_esid)) return false;
     // Unsupported flags.
-    if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
-        const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
-        const flags = yaml[fi..line_end];
-        if (std.mem.indexOf(u8, flags, "module") != null) return false;
+    {
+        const flags = flagsText(yaml);
+        if (std.mem.indexOf(u8, flags, "module") != null and !allow_module) return false;
         if (std.mem.indexOf(u8, flags, "raw") != null) return false;
         if (std.mem.indexOf(u8, flags, "async") != null) return false;
         if (std.mem.indexOf(u8, flags, "CanBlockIsFalse") != null) return false;
@@ -164,7 +184,7 @@ fn isEligibleEs5(source: []const u8, allow_es6: bool) bool {
 
 /// Append all eligible ES5 .js tests under `rel_dir` (relative to TEST262_PATH)
 /// to `out`, with paths allocated from `arena`. Skips _FIXTURE files.
-fn expandDir(arena: std.mem.Allocator, rel_dir: []const u8, allow_es6: bool, out: *std.ArrayList([]const u8)) !void {
+fn expandDir(arena: std.mem.Allocator, rel_dir: []const u8, allow_es6: bool, allow_module: bool, out: *std.ArrayList([]const u8)) !void {
     var path_buf: [512]u8 = undefined;
     const abs_dir = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ TEST262_PATH, rel_dir }) catch return;
     var dir = std.fs.cwd().openDir(abs_dir, .{ .iterate = true }) catch return;
@@ -178,7 +198,7 @@ fn expandDir(arena: std.mem.Allocator, rel_dir: []const u8, allow_es6: bool, out
         var full_buf: [768]u8 = undefined;
         const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ abs_dir, entry.path }) catch continue;
         const src = std.fs.cwd().readFileAlloc(arena, full, 512 * 1024) catch continue;
-        if (!isEligibleEs5(src, allow_es6)) continue;
+        if (!isEligibleEs5(src, allow_es6, allow_module)) continue;
         // Normalize Windows backslashes in entry.path to forward slashes.
         const norm = try arena.dupe(u8, entry.path);
         for (norm) |*c| {
@@ -191,15 +211,19 @@ fn expandDir(arena: std.mem.Allocator, rel_dir: []const u8, allow_es6: bool, out
 
 /// Expand whitelist entries: entries ending in '/' are directory globs
 /// (recursively expanded, ES5-filtered). A leading "es6:" opts the directory
-/// into also accepting esid (ES2015+) tests. Other entries are kept as-is.
+/// into also accepting esid (ES2015+) tests. A leading "module:" further opts
+/// the directory into including tests with flags: [module] (runs as modules).
+/// Other entries are kept as-is.
 fn expandWhitelist(arena: std.mem.Allocator, raw: []const []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (raw) |entry| {
         if (std.mem.endsWith(u8, entry, "/")) {
-            const allow_es6 = std.mem.startsWith(u8, entry, "es6:");
-            const dir_full = if (allow_es6) entry[4..] else entry;
+            const allow_module = std.mem.startsWith(u8, entry, "module:");
+            const allow_es6 = allow_module or std.mem.startsWith(u8, entry, "es6:");
+            const prefix_len: usize = if (allow_module) "module:".len else if (allow_es6) "es6:".len else 0;
+            const dir_full = entry[prefix_len..];
             const dir = dir_full[0 .. dir_full.len - 1];
-            try expandDir(arena, dir, allow_es6, &out);
+            try expandDir(arena, dir, allow_es6, allow_module, &out);
         } else {
             try out.append(arena, entry);
         }
@@ -252,8 +276,18 @@ const DOLLAR262_PRELUDE =
     \\      createRealm: $262.createRealm
     \\    };
     \\  },
-    \\  evalScript: function(s) { return eval(s); }
+    \\  evalScript: function(s) { return eval(s); },
+    \\  AbstractModuleSource: function AbstractModuleSource() {}
     \\};
+    \\var __moduleSourceCache__ = Object.create(null);
+    \\function __moduleSource__(spec) {
+    \\  var o = __moduleSourceCache__[spec];
+    \\  if (o) return o;
+    \\  o = Object.create($262.AbstractModuleSource.prototype);
+    \\  o[Symbol.for("jsz.moduleSource")] = true;
+    \\  __moduleSourceCache__[spec] = o;
+    \\  return o;
+    \\}
     \\
 ;
 
@@ -279,15 +313,40 @@ fn includesRegion(yaml: []const u8) []const u8 {
 /// flags need features the single-file harness can't satisfy.
 fn isRunnableFull(source: []const u8) bool {
     const yaml = frontmatter(source);
-    if (std.mem.indexOf(u8, yaml, "flags:")) |fi| {
-        const line_end = std.mem.indexOfScalarPos(u8, yaml, fi, '\n') orelse yaml.len;
-        const flags = yaml[fi..line_end];
-        if (std.mem.indexOf(u8, flags, "module") != null) return false;
+    {
+        const flags = flagsText(yaml);
+        // `module` is now runnable: M16 routes these through `ctx.evalModule`
+        // (strict, import/export desugared). `raw`/`CanBlockIsFalse` still need
+        // harness features the single-file runner can't provide.
+        // M16 Phase 4: `[module, async]` (TLA tests) are now runnable — the
+        // `await` desugaring handles synchronous draining; plain `[async]`
+        // (non-module async scripts) are still skipped.
         if (std.mem.indexOf(u8, flags, "raw") != null) return false;
-        if (std.mem.indexOf(u8, flags, "async") != null) return false;
+        if (std.mem.indexOf(u8, flags, "async") != null) {
+            if (std.mem.indexOf(u8, flags, "module") == null) return false;
+        }
         if (std.mem.indexOf(u8, flags, "CanBlockIsFalse") != null) return false;
     }
     return true;
+}
+
+/// True when the test's `flags:` line carries the `module` goal symbol, meaning
+/// the source must be evaluated as ES-module code rather than a script.
+fn hasModuleFlag(source: []const u8) bool {
+    const yaml = frontmatter(source);
+    return std.mem.indexOf(u8, flagsText(yaml), "module") != null;
+}
+
+/// True when the source references at least one relative module specifier
+/// ("./…" or "../…"), discovered with the host loader's comment/string-aware
+/// scan. Used to decide whether a module test needs disk-fixture bundling.
+fn hasRelativeImport(source: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var found: std.ArrayList([]const u8) = .empty;
+    jsz.module_loader.scanSpecifiers(source, jsz.module_loader.ENTRY_ID, &found, a);
+    return found.items.len > 0;
 }
 
 /// Collect every non-fixture `.js` test under TEST262_PATH (paths relative to it,
@@ -335,7 +394,7 @@ fn buildHarnessPrelude(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
-fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool, harness_present: bool) !Outcome {
+fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool, harness_present: bool, test_path: []const u8) !Outcome {
     if (full_mode and !isRunnableFull(source)) return .skip;
     const meta = try parseMeta(allocator, source);
 
@@ -377,13 +436,59 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
         "\"use strict\";\n"
     else
         "";
-    const full_source = if (needs_dollar262)
-        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ strict_prefix, DOLLAR262_PRELUDE, prelude, source }) catch return .fail
+    // M16 Phase 4: [module, async] tests (TLA) use $DONE() as the async
+    // completion signal. Define it as a synchronous throw-on-error wrapper;
+    // since our `await` desugaring drains microtasks inline, $DONE() is
+    // always called synchronously before evalModule returns.
+    const is_tla_module = blk: {
+        const yaml = frontmatter(source);
+        const flags = flagsText(yaml);
+        break :blk std.mem.indexOf(u8, flags, "module") != null and
+            std.mem.indexOf(u8, flags, "async") != null;
+    };
+    // M16 TLA: with true async module evaluation $DONE may be called from a
+    // microtask after the synchronous run; route it through host completion
+    // signals so a late failure/never-completion is observable (see runMainBc).
+    // Define $DONE both as a module-scoped binding (so a bare `$DONE()` call
+    // resolves) and as an own property of globalThis: asyncHelpers.js's asyncTest
+    // gates on `hasOwnProperty.call(globalThis,"$DONE")`, and a top-level
+    // `function $DONE` in module scope is lexical, not a global object property.
+    const done_prefix: []const u8 = if (is_tla_module)
+        "function $DONE(err) { if (err) { __jszAsyncFail__(err); } else { __jszAsyncDone__(); } }\nglobalThis.$DONE = $DONE;\n"
     else
-        std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ strict_prefix, prelude, source }) catch return .fail;
+        "";
+    // The `/*__JSZ_PRELUDE_END__*/` sentinel marks where the harness prelude ends
+    // and the actual test source begins. For module tests, buildBundle emits the
+    // prelude at bundle (module) scope so dependency modules can see harness
+    // globals (`assert`, `$262`); the test body is wrapped in the entry IIFE.
+    const SENTINEL = "/*__JSZ_PRELUDE_END__*/";
+    const full_source = if (needs_dollar262)
+        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}{s}", .{ strict_prefix, DOLLAR262_PRELUDE, prelude, done_prefix, SENTINEL, source }) catch return .fail
+    else
+        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ strict_prefix, prelude, done_prefix, SENTINEL, source }) catch return .fail;
     defer allocator.free(full_source);
 
-    const result = ctx.eval(full_source, "<test262>");
+    // `flags: [module]` tests must run as ES-module code (strict; import/export).
+    // When the test has relative imports, link its dependency graph from disk:
+    // the host loader reads every reachable fixture (relative to the test file's
+    // directory) and bundles them as a `__modules__` registry the runtime
+    // `require()` resolver evaluates. Tests with no relative imports run the
+    // source directly (no prelude injected) to avoid perturbing scope.
+    const is_module = hasModuleFlag(source);
+    var module_bundle: ?[]const u8 = null;
+    defer if (module_bundle) |b| allocator.free(b);
+    if (is_module and hasRelativeImport(full_source)) {
+        const base_dir = std.fs.path.dirname(test_path) orelse ".";
+        // Register the entry under its own filename so self-/cyclic imports
+        // (`import * as ns from './<thisfile>.js'`) resolve to the same record.
+        const entry_id = std.fs.path.basename(test_path);
+        module_bundle = jsz.module_loader.buildBundle(allocator, base_dir, entry_id, full_source) catch null;
+    }
+    const module_src = module_bundle orelse full_source;
+    const result = if (is_module)
+        ctx.evalModule(module_src, "<test262>")
+    else
+        ctx.eval(full_source, "<test262>");
 
     // A resource-limit interrupt is neither a pass nor a fail — skip it so a
     // looping test cannot masquerade as a passing negative test.
@@ -395,6 +500,17 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
         {
             return .skip;
         }
+    }
+
+    // M16 TLA: a `[module, async]` test must call $DONE to pass. With true async
+    // module evaluation a completion can be deferred to a microtask; if the run
+    // ended `.ok` but $DONE never fired (e.g. a deadlocked async dependency), the
+    // test never actually completed and must not count as a pass.
+    if (is_tla_module and result == .ok and !jsz.asyncDoneSignaled()) {
+        const msg = "async test did not complete ($DONE not called)";
+        @memcpy(g_fail_msg_buf[0..msg.len], msg);
+        g_fail_msg_len = msg.len;
+        return .fail;
     }
 
     if (meta.negative) {
@@ -826,7 +942,7 @@ pub fn main() !void {
             } else |_| {}
         }
 
-        const outcome = try runOneTest(allocator, source, full_mode, harness_present);
+        const outcome = try runOneTest(allocator, source, full_mode, harness_present, full);
 
         // Append the per-test outcome (survives across resumed runs).
         if (results_file) |f| {
@@ -943,11 +1059,19 @@ test "includesRegion extracts inline and block forms" {
     try std.testing.expect(std.mem.indexOf(u8, r2, "features") == null);
 }
 
-test "isRunnableFull rejects module/raw/async flags" {
+test "isRunnableFull rejects raw/async but allows module" {
     try std.testing.expect(isRunnableFull("/*---\nes5id: 1\n---*/\nvar x=1;"));
-    try std.testing.expect(!isRunnableFull("/*---\nflags: [module]\n---*/\n"));
+    // M16: module-flagged tests are now runnable (routed via evalModule).
+    try std.testing.expect(isRunnableFull("/*---\nflags: [module]\n---*/\n"));
     try std.testing.expect(!isRunnableFull("/*---\nflags: [async]\n---*/\n"));
     try std.testing.expect(!isRunnableFull("/*---\nflags: [raw]\n---*/\n"));
+}
+
+test "hasModuleFlag detects the module goal symbol" {
+    try std.testing.expect(hasModuleFlag("/*---\nflags: [module]\n---*/\n"));
+    try std.testing.expect(hasModuleFlag("/*---\nflags: [onlyStrict, module]\n---*/\n"));
+    try std.testing.expect(!hasModuleFlag("/*---\nflags: [onlyStrict]\n---*/\n"));
+    try std.testing.expect(!hasModuleFlag("/*---\nes5id: 1\n---*/\nvar x=1;"));
 }
 
 test "test262_runner compiles" {

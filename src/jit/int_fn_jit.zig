@@ -297,7 +297,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
             if (pc + size > code.len) return .never;
             const next = pc + size;
             switch (op) {
-                .DEFINE_GLOBAL, .HOIST_VAR => {
+                .DEFINE_GLOBAL, .HOIST_VAR, .HOIST_LEX, .INIT_LEX => {
                     const kidx = readU16(code, pc + 1);
                     if (kidx < constants.len) {
                         if (constString(constants[kidx])) |nm| {
@@ -425,6 +425,8 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
                 if (!boxed) return .never;
             },
             .HOIST_VAR => {},
+            .HOIST_LEX => {},
+            .INIT_LEX => {},
             .ADD, .SUB, .MUL, .INC, .DEC => {},
             .MOVE, .RETURN, .JMP, .JMP_IF_TRUE, .JMP_IF_FALSE => {},
             .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE, .NOT => {

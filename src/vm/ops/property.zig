@@ -16,6 +16,7 @@ const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
 const ic_mod = @import("../ic.zig");
 const proxy_mod = @import("../../runtime/builtins/proxy.zig");
+const namespace_mod = @import("../../runtime/builtins/namespace.zig");
 
 /// Raise the strict-mode TypeError for a failed property assignment ([[Set]]
 /// returned false). Returns a non-null RunOutcome only when the throw escapes
@@ -454,12 +455,39 @@ pub inline fn opGetKeys(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 }
             }
         } else if (iv == .object) {
-            for (iv.object.ownKeys()) |k| {
-                if (!iv.object.isEnumerable(k)) continue;
-                const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
-                const key_val2 = try val_mod.makeString(self.arena, k);
-                arr_obj.set(idx_str, key_val2) catch {};
-                count += 1;
+            // M16: Module Namespace — enumerable own string keys are the exported
+            // names, sorted by code unit. [[Get]] is called for each export to
+            // check TDZ (per [[GetOwnProperty]] step 4), which throws ReferenceError
+            // for uninitialized bindings.
+            if (iv.object.internal_kind == .module_namespace) {
+                const names = try namespace_mod.sortedNames(self.arena, iv.object);
+                for (names) |k| {
+                    if (namespace_mod.isTDZ(iv.object, k)) {
+                        // Per [[GetOwnProperty]] step 4, enumerating a namespace
+                        // calls [[Get]] for each export; an uninitialized (TDZ)
+                        // binding throws ReferenceError. Route through
+                        // `throwException` (frame unwinding) so a JS try/catch
+                        // around the for-in actually catches it — returning
+                        // `error.JsException` raw bypasses the handler and the
+                        // caller spins re-raising it (observed as OOM).
+                        const realm_m = @import("../../runtime/realm.zig");
+                        const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{k});
+                        realm_m.pending_exception = try self.makeErrorObjectBc("ReferenceError", msg);
+                        return try self.raisePendingException(msg);
+                    }
+                    const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
+                    const key_val2 = try val_mod.makeString(self.arena, k);
+                    arr_obj.set(idx_str, key_val2) catch {};
+                    count += 1;
+                }
+            } else {
+                for (iv.object.ownKeys()) |k| {
+                    if (!iv.object.isEnumerable(k)) continue;
+                    const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
+                    const key_val2 = try val_mod.makeString(self.arena, k);
+                    arr_obj.set(idx_str, key_val2) catch {};
+                    count += 1;
+                }
             }
         }
     }

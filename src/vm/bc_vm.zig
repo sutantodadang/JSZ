@@ -25,6 +25,7 @@ const coercion = @import("../runtime/builtins/coercion.zig");
 const function_proto = @import("../runtime/builtins/function_proto.zig");
 const proxy_mod = @import("../runtime/builtins/proxy.zig");
 const typed_array = @import("../runtime/builtins/typed_array.zig");
+const namespace_mod = @import("../runtime/builtins/namespace.zig");
 // R2: opcode handlers extracted from runLoop, grouped by category.
 const load_ops = @import("ops/load.zig");
 const jump_ops = @import("ops/jump.zig");
@@ -321,6 +322,13 @@ pub const BcVm = struct {
                         return bcInvokeJs(ptr, self.arena, bd.this_val, bd.target, combined);
                     }
                 }
+                // A callable Proxy: dispatch through its `apply` trap (forwarding to
+                // the target when absent). Without this, calling a proxied function
+                // via the native re-entry path (e.g. a ShadowRealm wrapped function)
+                // would fall through to the "not a function" error below.
+                if (obj.internal_kind == .proxy) {
+                    return try self.proxyApply(obj, this_val, args);
+                }
                 // Built-in callable objects (Array, %TypedArray%, Error, …) carry a
                 // `__call__` native slot. Dispatch to it and propagate its real
                 // exception. A derived class doing `super(a,b,c)` to such a native
@@ -329,7 +337,13 @@ pub const BcVm = struct {
                 // from a TypedArray ctor when a resizable buffer shrank mid-call).
                 if (obj.get("__call__")) |cv| {
                     if (cv.bits != 0 and cv.unbox() == .native_function) {
-                        return cv.toPtr().native_function.invoke(self.arena, this_val, args) catch |e| {
+                        // A non-constructor callable object (no `prototype`, e.g. a
+                        // Promise resolve/reject function) needs the callable object
+                        // itself as `this` so its native can read its internal slot —
+                        // matching `doCall`. Constructor-like callables (Error, Array,
+                        // …) keep the externally supplied `this`.
+                        const call_this = if (obj.get("prototype") == null) fn_val else this_val;
+                        return cv.toPtr().native_function.invoke(self.arena, call_this, args) catch |e| {
                             if (e == error.JsException) return error.JsException;
                             return error.OutOfMemory;
                         };
@@ -527,6 +541,15 @@ pub const BcVm = struct {
 
         const transformed = isolate_mod.rewriteTemplateLiterals(self.arena, source) catch source;
         var p = parser_mod.Parser.init(transformed, self.arena);
+        // Eval code is a Script (sec-scripts §A.5): `import`/`export`
+        // declarations are early SyntaxErrors here, unlike CJS-desugar bundle
+        // source (run through the separate isolate-level parseScript path).
+        p.eval_code = true;
+        // Direct eval inherits the calling context's strict mode (the eval'd code
+        // is strict if the caller is strict, even without its own directive). Use
+        // the currently-executing frame's function as the calling context.
+        if (self.frames.items.len > 0 and self.frames.items[self.frames.items.len - 1].func.is_strict)
+            p.strict = true;
         const parse_result = p.parseScript();
         const stmts = switch (parse_result) {
             .ok => |s| s,
@@ -551,6 +574,95 @@ pub const BcVm = struct {
         return bcInvokeJs(self, self.arena, undef, closure_val, &[_]Value{});
     }
 
+    /// ShadowRealm host hook: compile + run `source` as Script code in the given
+    /// global `Environment` (a shadow realm's own global scope), returning the
+    /// completion value. A parse failure of `source` itself surfaces as
+    /// `error.ShadowParseError` (pending_exception = SyntaxError) so the caller
+    /// (ShadowRealm.prototype.evaluate) can map it to a SyntaxError, while a
+    /// runtime throw stays `error.JsException` (mapped to a TypeError).
+    fn bcEvalInEnv(ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8, global_env: *anyopaque) anyerror!Value {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        const realm_mod = @import("../runtime/realm.zig");
+        const parser_mod = @import("../parser/parser.zig");
+        const compiler_mod = @import("../bytecode/compiler.zig");
+        const ast_mod = @import("../parser/ast.zig");
+        const isolate_mod = @import("./isolate.zig");
+
+        const env: *Environment = @ptrCast(@alignCast(global_env));
+        // Native builtins (require, a nested `new ShadowRealm()`, …) read
+        // `active_global_env` to find the running realm's globals; point it at the
+        // shadow realm for the duration of this evaluation, then restore.
+        const saved_global_env = realm_mod.active_global_env;
+        realm_mod.active_global_env = env;
+        defer realm_mod.active_global_env = saved_global_env;
+
+        const transformed = isolate_mod.rewriteTemplateLiterals(self.arena, source) catch source;
+        var p = parser_mod.Parser.init(transformed, self.arena);
+        p.eval_code = true;
+        const parse_result = p.parseScript();
+        const stmts = switch (parse_result) {
+            .ok => |s| s,
+            .err => |e| {
+                realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", e.message);
+                return error.ShadowParseError;
+            },
+        };
+        const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(stmts) };
+        const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<ShadowRealm>");
+        if (compiler_mod.last_label_error) |msg| {
+            compiler_mod.last_label_error = null;
+            realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", msg);
+            return error.ShadowParseError;
+        }
+        // Run the program frame with the shadow realm's global env as its *own*
+        // frame env (not a fresh child scope, as a function call would create).
+        // This is what makes top-level `var`/function declarations persist into
+        // the shadow realm's globals across successive `evaluate` calls, matching
+        // global Script semantics (and `run()` for the host realm).
+        const num_regs = if (main_func.num_regs > 0) main_func.num_regs else 1;
+        const new_regs = try self.arena.alloc(Value, num_regs);
+        for (new_regs) |*r| r.* = Value{};
+        const top_this = env.lookup("globalThis") catch Value{};
+
+        const frames_before = self.frames.items.len;
+        try self.frames.append(self.arena, BcCallFrame{
+            .func = main_func,
+            .pc = 0,
+            .registers = new_regs,
+            .env = env,
+            .return_dst = 0xFF,
+            .caller_idx = if (self.frames.items.len > 0) self.frames.items.len - 1 else null,
+            .this_val = top_this,
+        });
+        // Re-entrancy boundary: an uncaught throw inside this nested run must not
+        // unwind into the native caller's outer frames.
+        const saved_floor = self.frame_floor;
+        self.frame_floor = frames_before;
+        defer self.frame_floor = saved_floor;
+        while (self.frames.items.len > frames_before) {
+            const outcome = try self.runLoop();
+            switch (outcome) {
+                .ok => |v| return v,
+                .exception => |msg| {
+                    while (self.frames.items.len > frames_before) _ = self.frames.pop();
+                    if (std.mem.startsWith(u8, msg, "interrupted:")) {
+                        self.interrupt_pending = msg;
+                        return error.JsException;
+                    }
+                    realm_mod.pending_exception = self.last_exception_value;
+                    return error.JsException;
+                },
+                .exception_value => |ev| {
+                    while (self.frames.items.len > frames_before) _ = self.frames.pop();
+                    realm_mod.pending_exception = ev.value;
+                    return error.JsException;
+                },
+            }
+        }
+        return self.result;
+    }
+
     fn activateContext(self: *BcVm) void {
         const realm_mod = @import("../runtime/realm.zig");
         self.context = realm_mod.Context{
@@ -564,12 +676,25 @@ pub const BcVm = struct {
             .set_fn = bcSetProp,
             .set_proto_fn = bcSetProto,
             .backing_obj_fn = bcBackingObj,
+            .shadow_eval_fn = bcEvalInEnv,
         };
         realm_mod.active_context = &self.context;
     }
 
     fn deactivateContext(_: *BcVm) void {
         @import("../runtime/realm.zig").active_context = null;
+    }
+
+    /// Drain the microtask (promise reaction) queue with this VM's context
+    /// active, so plain promise reactions can invoke their JS callbacks (which
+    /// re-enter through the active context). Used for the end-of-run drain after
+    /// the top-level `run`/`runLoop` returned and deactivated the context — async
+    /// coroutine resumes carry their own VM pointer, but ordinary `.then`
+    /// reactions need the active context to call back into JS.
+    pub fn drainMicrotasks(self: *BcVm) void {
+        self.activateContext();
+        defer self.deactivateContext();
+        @import("../runtime/builtins/promise.zig").runMicrotasks(self.arena);
     }
 
     /// Phase 9: record a loop back-edge as a hot-site signal. Returns true when
@@ -600,6 +725,14 @@ pub const BcVm = struct {
         const regs = try self.arena.alloc(Value, if (main_func.num_regs > 0) main_func.num_regs else 1);
         for (regs) |*r| r.* = Value{};
 
+        // Script top-level `this` is the global object (`globalThis`); module
+        // top-level `this` is undefined (ES §9.4.1 / §16.2.1.6). Strictness does
+        // not affect the global `this` binding, so a "use strict" Script still
+        // sees globalThis here.
+        const top_this: Value = if (!main_func.is_module) blk: {
+            break :blk global_env.lookup("globalThis") catch Value{};
+        } else Value{};
+
         try self.frames.append(self.arena, BcCallFrame{
             .func = main_func,
             .pc = 0,
@@ -607,10 +740,38 @@ pub const BcVm = struct {
             .env = global_env,
             .return_dst = 0,
             .caller_idx = null,
-            .this_val = Value{}, // global this = undefined
+            .this_val = top_this,
         });
 
         return self.runLoop();
+    }
+
+    /// M16 TLA: run a module whose top-level body is async (top-level await) as a
+    /// coroutine. Builds the async invocation (driving it to the first `await`),
+    /// and subscribes a rejection recorder so an uncaught top-level-await
+    /// rejection surfaces as the module's evaluation error. Completion happens
+    /// later as microtasks drain (in the caller). Returns `.ok` synchronously.
+    pub fn runMainAsync(
+        self: *BcVm,
+        main_func: *const BcFunction,
+        captured_env: *anyopaque,
+    ) !RunOutcome {
+        self.activateContext();
+        defer self.deactivateContext();
+        const realm_mod = @import("../runtime/realm.zig");
+        const promise_mod = @import("../runtime/builtins/promise.zig");
+        const global_env: *Environment = @ptrCast(@alignCast(captured_env));
+        const result = self.buildAsyncFunction(main_func, global_env, Value{}, &[_]Value{}) catch |e| {
+            if (e == error.JsException) {
+                return RunOutcome{ .exception_value = .{ .msg = "module evaluation failed", .value = realm_mod.pending_exception } };
+            }
+            return e;
+        };
+        // Record an uncaught rejection of the top-level async body as the module
+        // evaluation error (so negative module tests / uncaught errors surface).
+        const rec_fn = try val_mod.makeNativeFunction(self.arena, realm_mod.nativeModuleReject);
+        try promise_mod.subscribeAwait(self.arena, result, Value{}, rec_fn);
+        return RunOutcome{ .ok = try val_mod.makeUndefined(self.arena) };
     }
 
     fn runLoop(self: *BcVm) !RunOutcome {
@@ -649,6 +810,10 @@ pub const BcVm = struct {
                 .GET_GLOBAL => if (try load_ops.opGetGlobal(self, frame)) |o| return o,
                 .GET_GLOBAL_OPT => if (try load_ops.opGetGlobalOpt(self, frame)) |o| return o,
                 .HOIST_VAR => if (try load_ops.opHoistVar(self, frame)) |o| return o,
+                .HOIST_LEX => if (try load_ops.opHoistLexical(self, frame)) |o| return o,
+                .INIT_LEX => if (try load_ops.opInitLexical(self, frame)) |o| return o,
+                .ENTER_SCOPE => if (try load_ops.opEnterScope(self, frame)) |o| return o,
+                .EXIT_SCOPE => if (try load_ops.opExitScope(self, frame)) |o| return o,
                 .SET_GLOBAL => if (try load_ops.opSetGlobal(self, frame)) |o| return o,
                 .DEFINE_GLOBAL => if (try load_ops.opDefineGlobal(self, frame)) |o| return o,
                 .GET_LOCAL => if (try load_ops.opGetLocal(self, frame)) |o| return o,
@@ -1077,6 +1242,12 @@ pub const BcVm = struct {
             _ = try self.proxySet(obj_val, obj, sym_key, value, obj_val);
             return;
         }
+        // M16: Module Namespace exotic [[Set]] always fails.
+        if (obj.internal_kind == .module_namespace) {
+            const realm_m = @import("../runtime/realm.zig");
+            realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot set property on module namespace object");
+            return error.JsException;
+        }
         try obj.setSym(sym_key, value);
     }
 
@@ -1176,6 +1347,13 @@ pub const BcVm = struct {
         }
         // String key.
         const key = try valueToStringArena(self.arena, key_v);
+        // M16: Module Namespace exotic [[HasProperty]] — string keys are exactly
+        // the exported names (null prototype, so no inherited keys).
+        if (root_obj.internal_kind == .module_namespace) {
+            // import-defer: `key in ns` (key ≠ "then") evaluates the deferred module.
+            try @import("../runtime/realm.zig").maybeTriggerDeferredStr(self.arena, root_obj, key);
+            return namespace_mod.hasExport(root_obj, key);
+        }
         var cur: ?*JsObject = root_obj;
         var depth: usize = 0;
         while (cur) |o| {
@@ -1184,6 +1362,12 @@ pub const BcVm = struct {
             // A Proxy in the prototype chain has its own [[HasProperty]];
             // recurse so the `has` trap (or target walk) is dispatched.
             if (o != root_obj and o.internal_kind == .proxy) {
+                return try self.hasProperty(try val_mod.makeObject(self.arena, o), key_v);
+            }
+            // A Module Namespace exotic in the prototype chain dispatches its own
+            // [[HasProperty]] (import-defer: a string key — except "then" —
+            // triggers module evaluation).
+            if (o != root_obj and o.internal_kind == .module_namespace) {
                 return try self.hasProperty(try val_mod.makeObject(self.arena, o), key_v);
             }
             if (o.is_array and std.mem.eql(u8, key, "length")) return true;
@@ -1235,6 +1419,13 @@ pub const BcVm = struct {
             return obj.deleteOwnSym(key_v);
         }
         const key = try valueToStringArena(self.arena, key_v);
+        // M16: Module Namespace exotic [[Delete]] — an exported name cannot be
+        // deleted (false → strict caller throws); a non-export "succeeds".
+        if (obj.internal_kind == .module_namespace) {
+            // import-defer: `delete ns[key]` (key ≠ "then") evaluates the deferred module.
+            try @import("../runtime/realm.zig").maybeTriggerDeferredStr(self.arena, obj, key);
+            return !namespace_mod.hasExport(obj, key);
+        }
         return obj.deleteOwn(key);
     }
 
@@ -1294,9 +1485,17 @@ pub const BcVm = struct {
 
     /// Proxy `apply` trap: `handler.apply(target, thisArg, argsArray)`, forwarding
     /// to a plain call on the target when no trap is defined.
+    /// Raise a TypeError for an operation on a revoked Proxy (whose [[ProxyHandler]]
+    /// / [[ProxyTarget]] are null).
+    fn throwRevokedProxy(self: *BcVm) anyerror {
+        const realm_m = @import("../runtime/realm.zig");
+        realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot perform operation on a revoked proxy");
+        return error.JsException;
+    }
+
     fn proxyApply(self: *BcVm, proxy_obj: *JsObject, this_val: Value, args: []const Value) anyerror!Value {
-        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return error.JsException;
-        const target = proxy_mod.proxyTarget(proxy_obj) orelse return error.JsException;
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return self.throwRevokedProxy();
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return self.throwRevokedProxy();
         if (proxy_mod.trap(handler, "apply")) |trap_fn| {
             const args_arr = try self.arrayFromSlice(args);
             return try self.callAccessor(trap_fn, handler, &[_]Value{ target, this_val, args_arr });
@@ -1309,8 +1508,8 @@ pub const BcVm = struct {
     /// forwarding to a plain construct on the target when no trap is defined.
     /// A present trap must return an object (else TypeError).
     fn proxyConstruct(self: *BcVm, proxy_obj: *JsObject, args: []const Value, new_target: Value) anyerror!Value {
-        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return error.JsException;
-        const target = proxy_mod.proxyTarget(proxy_obj) orelse return error.JsException;
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return self.throwRevokedProxy();
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return self.throwRevokedProxy();
         if (proxy_mod.trap(handler, "construct")) |trap_fn| {
             const args_arr = try self.arrayFromSlice(args);
             const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, args_arr, new_target });
@@ -1344,6 +1543,36 @@ pub const BcVm = struct {
                         return typed_array.taLoad(self.arena, td, @intFromFloat(idx_f));
                     }
                 }
+                // M16: Module Namespace exotic [[Get]] — a string key resolves to
+                // the named export's *current* value (live), throwing ReferenceError
+                // for uninitialized (TDZ) bindings.
+                if (obj.internal_kind == .module_namespace) {
+                    // M16 Phase 5: "__ns__" is a synthetic key used by `import * as ns`
+                    // live binding rewriting so that reads of `ns` return the namespace
+                    // object itself while writes (`ns = x`) invoke namespace [[Set]]
+                    // and throw TypeError in strict mode.
+                    if (std.mem.eql(u8, key, "__ns__")) return obj_val;
+                    // M16: "__backing__" is a synthetic key the bundle's __starRoot__
+                    // helper uses to canonicalize a namespace to its underlying live
+                    // exports object, so a re-export forwarding through a namespace and
+                    // a direct `export {x} from 'm'` resolve to the same binding root.
+                    if (std.mem.eql(u8, key, "__backing__")) {
+                        const bk = namespace_mod.backing(obj) orelse return val_mod.makeUndefined(self.arena);
+                        return try val_mod.makeObject(self.arena, bk);
+                    }
+                    // import-defer: a string [[Get]] (except "then") evaluates the
+                    // deferred module now and wires the live exports as the backing.
+                    try @import("../runtime/realm.zig").maybeTriggerDeferredStr(self.arena, obj, key);
+                    const b = namespace_mod.backing(obj) orelse return val_mod.makeUndefined(self.arena);
+                    if (namespace_mod.isTDZ(obj, key)) {
+                        const realm_m = @import("../runtime/realm.zig");
+                        const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{key});
+                        realm_m.pending_exception = try self.makeErrorObjectBc("ReferenceError", msg);
+                        return error.JsException;
+                    }
+                    if (!b.hasOwn(key)) return val_mod.makeUndefined(self.arena);
+                    return try self.getProp(try val_mod.makeObject(self.arena, b), key);
+                }
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength()));
                 }
@@ -1363,6 +1592,19 @@ pub const BcVm = struct {
                     }
                     if (raw.bits != 0) return raw;
                     return val_mod.makeUndefined(self.arena);
+                }
+                // Not an ordinary own/inherited slot: a Module Namespace exotic in
+                // the prototype chain dispatches its own [[Get]] (import-defer:
+                // a string key — except "then" — triggers module evaluation).
+                {
+                    var p: ?*JsObject = obj.proto;
+                    var pd: usize = 0;
+                    while (p) |pp| : (pd += 1) {
+                        if (pd >= 64) break;
+                        if (pp.internal_kind == .module_namespace)
+                            return try self.getProp(try val_mod.makeObject(self.arena, pp), key);
+                        p = pp.proto;
+                    }
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -1395,13 +1637,32 @@ pub const BcVm = struct {
                 }
                 if (closure.obj) |op| {
                     const o: *JsObject = @ptrCast(@alignCast(op));
-                    if (o.get(key)) |v| return v;
+                    // An own property on the backing object (e.g. a `name`/`length`
+                    // redefined via Object.defineProperty) takes precedence over the
+                    // computed arity/name below, and an accessor must fire its getter
+                    // rather than surfacing the raw descriptor.
+                    if (o.hasOwn(key)) {
+                        const slot = o.shape.key_to_slot.get(key).?;
+                        const a = o.attrAt(slot);
+                        const raw = if (slot < o.slots.items.len) o.slots.items[slot] else Value{};
+                        if (a.is_accessor) {
+                            const getter = accessorMember(raw, "get");
+                            if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                            return try self.callAccessor(getter, obj_val, &[_]Value{});
+                        }
+                        if (raw.bits != 0) return raw;
+                        return val_mod.makeUndefined(self.arena);
+                    }
                 }
                 // Own `name`/`length` for user functions (spec: non-writable,
                 // configurable). `length` = declared arity; `name` = the bound
                 // function name ("" when anonymous and not named-evaluated).
                 if (std.mem.eql(u8, key, "name")) {
-                    return val_mod.makeString(self.arena, closure.func.name orelse "");
+                    const raw = closure.func.name orelse "";
+                    // Translate internal sentinels for anonymous default exports to "default".
+                    const display = if (std.mem.eql(u8, raw, "__esm_dflt_fn__") or
+                        std.mem.eql(u8, raw, "__esm_dflt_gen__")) "default" else raw;
+                    return val_mod.makeString(self.arena, display);
                 }
                 if (std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity));
@@ -1535,6 +1796,9 @@ pub const BcVm = struct {
                     const key_v = try val_mod.makeString(self.arena, key);
                     return try self.proxySet(obj_val, obj, key_v, value, receiver);
                 }
+                // M16: Module Namespace exotic [[Set]] always fails (the strict
+                // module caller turns the false return into a TypeError).
+                if (obj.internal_kind == .module_namespace) return false;
                 // M15: integer-indexed TypedArray element write (exotic). Coerce the
                 // value (ToNumber/ToBigInt) then store; out-of-bounds is a silent
                 // no-op and indexed keys never create ordinary properties.
@@ -1999,7 +2263,7 @@ pub const BcVm = struct {
                 try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
-                if (fn_ptr.name) |fname| {
+                if (fn_ptr.nfe_name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
                         if (std.mem.eql(u8, p, fname)) {
@@ -2029,7 +2293,7 @@ pub const BcVm = struct {
                 }
 
                 // NFE slot.
-                if (fn_ptr.name) |fname| {
+                if (fn_ptr.nfe_name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
                         if (std.mem.eql(u8, p, fname)) {
@@ -2045,6 +2309,16 @@ pub const BcVm = struct {
                     }
                 }
 
+                // Sloppy-mode this correction (ES §10.2.1.1 step 2): non-strict
+                // function called with undefined/null this → substitute global object.
+                const frame_this: Value = if (!fn_ptr.is_strict and (this_val.isUndefined() or this_val.isNull())) blk: {
+                    const realm_m = @import("../runtime/realm.zig");
+                    if (realm_m.active_global_env) |genv| {
+                        break :blk genv.lookup("globalThis") catch this_val;
+                    }
+                    break :blk this_val;
+                } else this_val;
+
                 const caller_idx = self.frames.items.len - 1;
                 try self.frames.append(self.arena, BcCallFrame{
                     .func = fn_ptr,
@@ -2053,7 +2327,7 @@ pub const BcVm = struct {
                     .env = call_env,
                     .return_dst = ret_dst,
                     .caller_idx = caller_idx,
-                    .this_val = this_val,
+                    .this_val = frame_this,
                 });
                 return null;
             },
@@ -2246,7 +2520,7 @@ pub const BcVm = struct {
                 try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
-                if (fn_ptr.name) |fname| {
+                if (fn_ptr.nfe_name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
                         if (std.mem.eql(u8, p, fname)) {
@@ -2274,7 +2548,7 @@ pub const BcVm = struct {
                     }
                 }
 
-                if (fn_ptr.name) |fname| {
+                if (fn_ptr.nfe_name) |fname| {
                     var is_param = false;
                     for (fn_ptr.param_names) |p| {
                         if (std.mem.eql(u8, p, fname)) {
@@ -2357,6 +2631,36 @@ pub const BcVm = struct {
                             self.frames.items[self.frames.items.len - 1].registers[ret_dst] = res;
                         } else {
                             self.result = res;
+                        }
+                        return null;
+                    }
+                }
+                // Callable object with a `__call__` native slot (e.g. a Promise
+                // resolve/reject function) reached via a member call
+                // `obj.method(...)`. Mirror `doCall`: the native receives the
+                // callable object itself as `this` so it can read its internal slot.
+                if (obj.get("__call__")) |call_val| {
+                    if (call_val.bits != 0 and call_val.unbox() == .native_function) {
+                        const fn_ptr = call_val.toPtr().native_function;
+                        var args = try self.arena.alloc(Value, nargs);
+                        for (0..nargs) |i| {
+                            args[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
+                        }
+                        const result = fn_ptr.invoke(self.arena, callee_val, args) catch |e| {
+                            if (e == error.JsException) {
+                                const realm_mod = @import("../runtime/realm.zig");
+                                if (realm_mod.pending_exception.bits != 0) {
+                                    self.last_exception_value = realm_mod.pending_exception;
+                                    realm_mod.pending_exception = Value{};
+                                }
+                                return "__js_exception__";
+                            }
+                            return "TypeError: object call threw";
+                        };
+                        if (self.frames.items.len > 0) {
+                            self.frames.items[self.frames.items.len - 1].registers[ret_dst] = result;
+                        } else {
+                            self.result = result;
                         }
                         return null;
                     }

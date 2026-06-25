@@ -111,6 +111,10 @@ pub const IsolateImpl = struct {
     /// W6: the persistent Realm (global scope + intrinsics), built once on the
     /// first eval and reused across evals so top-level declarations persist.
     realm: ?*@import("../runtime/realm.zig").Realm = null,
+    /// Milestone 16 (ESM) — Phase 1: cache of evaluated module records, keyed by
+    /// canonical specifier. Lazily created on the first `evalModule`; lives in
+    /// the (persistent) eval arena alongside the realm.
+    module_registry: ?@import("../runtime/module.zig").ModuleRegistry = null,
 
     pub fn init(backing: std.mem.Allocator) !*IsolateImpl {
         const impl = try backing.create(IsolateImpl);
@@ -179,6 +183,7 @@ pub const IsolateImpl = struct {
     pub fn evalWithMode(self: *IsolateImpl, source: []const u8, mode: InterpMode, native_bindings: []const val_mod.NativeBinding) !EvalOutcome {
         _ = native_bindings;
         promise_mod.clearMicrotasks();
+        @import("../runtime/realm.zig").resetAsyncDone();
         const arena = self.eval_arena.allocator();
         const transformed_source = try rewriteTemplateLiterals(arena, source);
 
@@ -209,6 +214,73 @@ pub const IsolateImpl = struct {
         }
     }
 
+    /// Milestone 16 (ESM) — Phase 1: evaluate `source` as ES-module code.
+    /// Mirrors `evalWithMode(.bc)` but parses via `Parser.parseModule` and
+    /// compiles via `compiler.compileModule` so module code runs strict
+    /// (§11.2.2); the import/export → CommonJS desugar already happened in the
+    /// parser. The run is tracked on a `ModuleRecord` in `self.module_registry`
+    /// keyed by `module_id`, transitioning its status across the evaluation.
+
+    pub fn evalModule(self: *IsolateImpl, source: []const u8, module_id: []const u8) !EvalOutcome {
+        promise_mod.clearMicrotasks();
+        @import("../runtime/realm.zig").resetAsyncDone();
+        const arena = self.eval_arena.allocator();
+        const transformed_source = try rewriteTemplateLiterals(arena, source);
+
+        const module_mod = @import("../runtime/module.zig");
+        if (self.module_registry == null) self.module_registry = module_mod.ModuleRegistry.init(arena);
+        const rec = try self.module_registry.?.getOrCreate(try arena.dupe(u8, module_id), transformed_source);
+        rec.status = .evaluating;
+
+        const parser_mod = @import("../parser/parser.zig");
+        var p = parser_mod.Parser.init(transformed_source, arena);
+        const parse_result = p.parseModule();
+        const stmts = switch (parse_result) {
+            .ok => |s| s,
+            .err => |e| {
+                rec.status = .errored;
+                return EvalOutcome{ .parse_error = .{
+                    .message = e.message,
+                    .line = e.line,
+                    .column = e.column,
+                } };
+            },
+        };
+        rec.body = stmts;
+
+        const ast_mod = @import("../parser/ast.zig");
+        // M16 TLA: a module with top-level await compiles its top-level body as
+        // async so `await` truly suspends (runMainBc drives it as a coroutine).
+        const prog = ast_mod.Program{ .body = stmts, .is_strict = true, .is_module = true, .has_tla = p.saw_top_level_await };
+        const main_func = compiler_mod.compileModule(arena, &prog, module_id) catch |e| {
+            rec.status = .errored;
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+            };
+        };
+        rec.func = main_func;
+        rec.status = .linked;
+
+        // M16 Phase 3: point the module-scoped `import.meta` binding at this
+        // module's specifier before evaluation (HostGetImportMetaProperties → url).
+        const realm = try self.ensureRealm(arena);
+        if (realm.global_env.lookup("__import_meta__")) |meta_val| {
+            if (meta_val.bits != 0 and meta_val.unbox() == .object) {
+                try meta_val.toPtr().object.set("url", try val_mod.makeString(arena, module_id));
+            }
+        } else |_| {}
+
+        const outcome = try self.runMainBc(arena, main_func);
+        switch (outcome) {
+            .ok => |v| {
+                rec.namespace = v;
+                rec.status = .evaluated;
+            },
+            else => rec.status = .errored,
+        }
+        return outcome;
+    }
+
     /// W6: build the persistent Realm on first use; reuse it thereafter so
     /// global declarations survive across eval calls. Realm + globals live in
     /// the (now non-reset) eval arena.
@@ -230,7 +302,22 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__await__", try val_mod.makeNativeFunction(arena, promise_mod.nativeAwait));
         const es2015 = @import("../runtime/builtins/es2015_collections.zig");
         try realm.global_env.define("__getIterator__", try val_mod.makeNativeFunction(arena, es2015.nativeGetIterator));
+        try realm.global_env.define("__makeNamespace__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeNamespace));
+        // import-defer: `import defer * as ns` desugars to `__importDefer__(spec)`;
+        // dynamic `import.defer(spec)` routes through `__importDeferDyn__`.
+        try realm.global_env.define("__importDefer__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImportDefer));
+        try realm.global_env.define("__importDeferDyn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImportDeferDynamic));
+        try realm.global_env.define("__initExports__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeInitExports));
         try realm.global_env.define("__iterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeIterStep));
+        // M16 Phase 3: dynamic import() native + the import.meta object binding.
+        try realm.global_env.define("__import__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImport));
+        try realm.global_env.define("__import_meta__", try @import("../runtime/realm.zig").makeImportMeta(arena, ""));
+        // M16 TLA: async-dependency evaluation barrier used by async-module factories.
+        try realm.global_env.define("__awaitDeps__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAwaitDeps));
+        // M16 TLA: `[module, async]` completion signals wired to the harness $DONE.
+        try realm.global_env.define("__jszAsyncDone__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncDone));
+        try realm.global_env.define("__jszAsyncFail__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncFail));
+        try realm.global_env.define("__jszModuleReject__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeModuleReject));
 
         try realm.registerRoots();
         self.realm = realm;
@@ -257,7 +344,13 @@ pub const IsolateImpl = struct {
         // Register roots AFTER bc_vm/realm are in final stack location.
         try bc_vm.registerHeapCallback(&self.heap);
         defer bc_vm.unregisterHeapCallback(&self.heap);
-        const outcome = try bc_vm.run(main_func, @ptrCast(realm.global_env));
+        // M16 TLA: a module top-level compiled as async (top-level await) is
+        // driven as a coroutine so its awaits truly suspend and interleave with
+        // the microtask queue, rather than synchronously draining at each await.
+        const outcome = if (main_func.is_async)
+            try bc_vm.runMainAsync(main_func, @ptrCast(realm.global_env))
+        else
+            try bc_vm.run(main_func, @ptrCast(realm.global_env));
         self.last_frame_high_water = bc_vm.frame_high_water;
         // Phase 9: capture JIT profile snapshot.
         if (self.jit_mode != .off) {
@@ -279,7 +372,20 @@ pub const IsolateImpl = struct {
         } else {
             self.last_ic_profile = .{};
         }
-        promise_mod.runMicrotasks(arena);
+        // M16 TLA: drain microtasks with the VM context active so ordinary
+        // promise reactions (`.then` callbacks, e.g. `.then($DONE)`) can re-enter
+        // JS — the top-level run already deactivated the context on return.
+        bc_vm.drainMicrotasks();
+        const realm_mod = @import("../runtime/realm.zig");
+        // M16 TLA: surface the entry module's async evaluation rejection (spec
+        // Evaluate() promise rejection), then a failure signalled by $DONE from a
+        // microtask. Only when the synchronous run itself completed `.ok`.
+        if (outcome == .ok and realm_mod.module_eval_error.bits != 0) {
+            return EvalOutcome{ .exception = realm_mod.errorValueMessage(arena, realm_mod.module_eval_error) };
+        }
+        if (outcome == .ok and realm_mod.async_done_error.bits != 0) {
+            return EvalOutcome{ .exception = realm_mod.errorValueMessage(arena, realm_mod.async_done_error) };
+        }
         return switch (outcome) {
             .ok => |v| EvalOutcome{ .ok = v },
             .exception => |msg| EvalOutcome{ .exception = msg },
@@ -444,7 +550,12 @@ pub fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]
                 if (emitted_any) try out.appendSlice(arena, " + ");
                 try out.appendSlice(arena, "(");
                 if (expr_end >= expr_start and expr_end <= source.len) {
-                    try out.appendSlice(arena, source[expr_start..expr_end]);
+                    // The substitution expression may itself contain template
+                    // literals (e.g. `a${cond ? `x${y}` : ""}b`), so rewrite it
+                    // recursively rather than copying it through verbatim — an
+                    // un-rewritten nested backtick would reach the lexer and fail.
+                    const inner = try rewriteTemplateLiterals(arena, source[expr_start..expr_end]);
+                    try out.appendSlice(arena, inner);
                 }
                 try out.appendSlice(arena, ")");
                 emitted_any = true;
@@ -467,11 +578,29 @@ fn emitTemplateLiteralSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8),
     if (segment.len == 0 and emitted_any) return;
     if (emitted_any) try out.appendSlice(arena, " + ");
     try out.append(arena, '"');
-    for (segment) |ch| {
-        if (ch == '"' or ch == '\\') {
+    // The segment preserves the template's backslash escapes verbatim (see the
+    // scan loop in rewriteTemplateLiterals). Re-emit it as the body of a
+    // double-quoted string literal: escape sequences pass through unchanged (the
+    // string lexer cooks them, and template/string escape semantics coincide),
+    // while raw characters that a `"..."` literal cannot contain — line
+    // terminators and an unescaped quote — are escaped here. This is what lets a
+    // multi-line template (whose segment holds raw newline bytes) round-trip.
+    var i: usize = 0;
+    while (i < segment.len) : (i += 1) {
+        const ch = segment[i];
+        if (ch == '\\' and i + 1 < segment.len) {
             try out.append(arena, '\\');
+            try out.append(arena, segment[i + 1]);
+            i += 1;
+            continue;
         }
-        try out.append(arena, ch);
+        switch (ch) {
+            '"' => try out.appendSlice(arena, "\\\""),
+            '\n' => try out.appendSlice(arena, "\\n"),
+            '\r' => try out.appendSlice(arena, "\\r"),
+            '\\' => try out.appendSlice(arena, "\\\\"), // a lone trailing backslash
+            else => try out.append(arena, ch),
+        }
     }
     try out.append(arena, '"');
 }

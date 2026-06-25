@@ -57,11 +57,135 @@ test "esm: import namespace" {
 }
 
 
+test "esm: import * as ns is a Module Namespace exotic object" {
+    // Null [[Prototype]], non-extensible, @@toStringTag "Module".
+    const v = try evalToBool(std.testing.allocator,
+        "var __modules__={m:({exports:({k:3})})}; import * as ns from 'm';" ++
+        " Object.getPrototypeOf(ns)===null && Object.isExtensible(ns)===false && ns[Symbol.toStringTag]==='Module'");
+    try std.testing.expect(v);
+}
+
+
+test "esm: namespace own keys are the exports, sorted" {
+    const v = try evalToString(std.testing.allocator,
+        "var __modules__={m:({exports:({b:1,a:2,c:3})})}; import * as ns from 'm';" ++
+        " Object.getOwnPropertyNames(ns).join(',')");
+    defer std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("a,b,c", v);
+}
+
+
+test "esm: namespace property descriptor is writable data, non-configurable" {
+    const v = try evalToString(std.testing.allocator,
+        "var __modules__={m:({exports:({k:3})})}; import * as ns from 'm';" ++
+        " var d=Object.getOwnPropertyDescriptor(ns,'k'); d.value+'/'+d.writable+'/'+d.enumerable+'/'+d.configurable");
+    defer std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("3/true/true/false", v);
+}
+
+
+test "esm: two namespaces of the same module are identical (GetModuleNamespace)" {
+    const v = try evalToBool(std.testing.allocator,
+        "var __modules__={m:({exports:({k:3})})}; import * as a from 'm'; import * as b from 'm'; a===b");
+    try std.testing.expect(v);
+}
+
+
 test "esm: re-export from module" {
     const v = try evalToF64(std.testing.allocator, "var exports={}; var __modules__={m:({exports:({a:4})})}; export {a as z} from 'm'; exports.z");
     try std.testing.expectEqual(@as(f64, 4), v);
 }
 
+
+// ---- M16 Phase 4: TLA (top-level await desugaring) ----
+
+test "tla: await on a plain value returns the value" {
+    const v = try evalToF64(std.testing.allocator, "__await__(42)");
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+test "tla: await on an already-fulfilled Promise returns its value" {
+    const v = try evalToF64(std.testing.allocator,
+        "var p = Promise.resolve(99); __await__(p)");
+    try std.testing.expectEqual(@as(f64, 99), v);
+}
+
+test "tla: await on a thenable resolves via then()" {
+    const v = try evalToF64(std.testing.allocator,
+        "__await__({ then: function(resolve) { resolve(7); } })");
+    try std.testing.expectEqual(@as(f64, 7), v);
+}
+
+test "tla: await on a rejecting thenable propagates the rejection" {
+    const err = std.testing.expectError(error.JsException,
+        evalToF64(std.testing.allocator,
+            "__await__({ then: function(_, reject) { reject(new Error('boom')); } })"));
+    try err;
+}
+
+test "tla: new await is a SyntaxError in module context" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    switch (ctx.evalModule("new await Promise.resolve(1)", "<test>")) {
+        .parse_error => {},
+        else => return error.ExpectedParseError,
+    }
+}
+
+// ---- M16 Phase 3: dynamic import() + import.meta ----
+
+test "esm: dynamic import() resolves to the module namespace" {
+    const v = try evalToF64(std.testing.allocator,
+        "var __modules__={m:({exports:({k:42})})}; var r=0;" ++
+        " import('m').then(function(ns){ r = ns.k; }); __runMicrotasks__(); r");
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+test "esm: dynamic import() result is a Module Namespace exotic object" {
+    const v = try evalToBool(std.testing.allocator,
+        "var __modules__={m:({exports:({k:3})})}; var ok=false;" ++
+        " import('m').then(function(ns){ ok = Object.getPrototypeOf(ns)===null" ++
+        " && ns[Symbol.toStringTag]==='Module' && ns.k===3; }); __runMicrotasks__(); ok");
+    try std.testing.expect(v);
+}
+
+test "esm: dynamic import() returns a fresh Promise each call" {
+    const v = try evalToBool(std.testing.allocator,
+        "var __modules__={m:({exports:({k:1})})}; var p1=import('m'); var p2=import('m');" ++
+        " p1!==p2 && Object.getPrototypeOf(p1)===Promise.prototype");
+    try std.testing.expect(v);
+}
+
+test "esm: dynamic import() of a missing module rejects (no synchronous throw)" {
+    const v = try evalToString(std.testing.allocator,
+        "var __modules__={}; var s='pending';" ++
+        " import('nope').then(function(){ s='fulfilled'; }, function(){ s='rejected'; });" ++
+        " __runMicrotasks__(); s");
+    defer std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("rejected", v);
+}
+
+test "esm: dynamic import() specifier is evaluated synchronously (abrupt propagates)" {
+    // A throwing specifier expression must throw at the call site, not reject.
+    try std.testing.expectError(error.JsException, evalToF64(std.testing.allocator,
+        "var __modules__={}; var o={get s(){ throw 1; }}; import(o.s)"));
+}
+
+test "esm: import.meta is an ordinary object with a url" {
+    const v = try evalToBool(std.testing.allocator,
+        "typeof import.meta==='object' && import.meta!==null" ++
+        " && Object.getPrototypeOf(import.meta)===null" ++
+        " && typeof import.meta.url==='string' && Object.isExtensible(import.meta)");
+    try std.testing.expect(v);
+}
+
+test "esm: import.meta is the same object across references" {
+    const v = try evalToBool(std.testing.allocator,
+        "var a=import.meta; var b=(function(){ return import.meta; })(); a===b && a===import.meta");
+    try std.testing.expect(v);
+}
 
 // ---- Phase 8: factory-form modules (both VMs) + cyclic require safety ----
 

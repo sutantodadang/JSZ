@@ -35,6 +35,8 @@ const Args = struct {
     jit_mode: jsz.JitMode = .off,
     limits: jsz.Limits = .{},
     ic_stats: bool = false,
+    /// M16: run the entry as an ES module (strict; import/export desugar).
+    module: bool = false,
 };
 
 fn parseArgs(argv: []const []const u8) Args {
@@ -105,6 +107,11 @@ fn parseArgs(argv: []const []const u8) Args {
             args.interp = .bc;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--module")) {
+            args.module = true;
+            args.interp = .bc; // module eval runs in the bytecode VM
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--jit=off")) {
             args.jit_mode = .off;
             continue;
@@ -168,6 +175,7 @@ fn printHelp(writer: anytype) !void {
         \\  --mem-limit=<bytes>    Cap live memory; over-budget eval throws instead of crashing
         \\  --gas-limit=<n>        Cap executed bytecode instructions (implies --interp=bc)
         \\  --time-limit=<ms>      Cap wall-clock execution time (implies --interp=bc)
+        \\  --module               Run the entry as an ES module (strict; import/export)
         \\
         \\Examples:
         \\  jsz --version
@@ -194,7 +202,7 @@ fn debugHook(_: ?*anyopaque, stop: jsz.debug.DebugStop) void {
     e.flush() catch {};
 }
 
-fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode, limits: jsz.Limits, ic_stats: bool) !void {
+fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode, limits: jsz.Limits, ic_stats: bool, is_module: bool) !void {
     if (dump_bc or source_map) {
         // Compile-only modes: delegate to the jsz public API and exit.
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -251,7 +259,8 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
     defer arena.deinit();
 
     var uncaught = false;
-    switch (ctx.eval(source, source_name)) {
+    const result = if (is_module) ctx.evalModule(source, source_name) else ctx.eval(source, source_name);
+    switch (result) {
         .ok => |v| {
             const s = jsz.valueToDisplayString(arena.allocator(), v) catch "?";
             try out.print("{s}\n", .{s});
@@ -423,7 +432,7 @@ pub fn main() !void {
             }
         },
         .eval => {
-            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats);
+            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats, args.module);
         },
         .interactive => {
             try runRepl(allocator, args.interp);
@@ -444,7 +453,7 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer allocator.free(cjs_wrapped);
-            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats);
+            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats, args.module);
         },
     }
 }
@@ -458,108 +467,19 @@ pub fn main() !void {
 // nested relative imports resolve against the module's own directory.
 // ---------------------------------------------------------------------------
 
-const entry_id = "__entry__";
-
-fn dirnameSlash(id: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, id, '/')) |idx| return id[0..idx];
-    return "";
-}
-
-/// Normalize a '/'-or-'\\'-separated path: drop "."/empty segments, resolve "..".
-fn normalizeRel(allocator: std.mem.Allocator, p: []const u8) ![]const u8 {
-    var parts = std.ArrayList([]const u8){};
-    defer parts.deinit(allocator);
-    var it = std.mem.splitAny(u8, p, "/\\");
-    while (it.next()) |seg| {
-        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
-        if (std.mem.eql(u8, seg, "..")) {
-            if (parts.items.len > 0) _ = parts.pop();
-            continue;
-        }
-        try parts.append(allocator, seg);
-    }
-    return std.mem.join(allocator, "/", parts.items);
-}
-
-/// Resolve a relative specifier against the importer's canonical id.
-fn resolveSpec(allocator: std.mem.Allocator, importer_id: []const u8, spec: []const u8) ![]const u8 {
-    const base = dirnameSlash(importer_id);
-    const joined = if (base.len == 0)
-        try allocator.dupe(u8, spec)
-    else
-        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, spec });
-    return normalizeRel(allocator, joined);
-}
-
-/// Append canonical ids of relative module specifiers found in `src` (resolved
-/// against `importer_id`) to `out`.
-fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
-    var i: usize = 0;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (c == '"' or c == '\'') {
-            const start = i + 1;
-            var j = start;
-            while (j < src.len and src[j] != c) : (j += 1) {}
-            if (j < src.len) {
-                const lit = src[start..j];
-                if (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../")) {
-                    const id = resolveSpec(allocator, importer_id, lit) catch "";
-                    if (id.len > 0) out.append(allocator, id) catch {};
-                }
-            }
-            i = j;
-        }
-    }
-}
-
-fn readModuleFile(allocator: std.mem.Allocator, base_dir: []const u8, id: []const u8) ?[]const u8 {
-    const max = 10 * 1024 * 1024;
-    const p1 = std.fs.path.join(allocator, &.{ base_dir, id }) catch return null;
-    if (std.fs.cwd().readFileAlloc(allocator, p1, max)) |s| return s else |_| {}
-    const p2 = std.fmt.allocPrint(allocator, "{s}.js", .{p1}) catch return null;
-    if (std.fs.cwd().readFileAlloc(allocator, p2, max)) |s| return s else |_| {}
-    return null;
-}
-
-/// Build the entry source wrapped with a `__modules__` registry of all transitively
-/// reachable relative modules. Modules absent on disk are skipped (resolved at runtime).
+/// Build the entry source wrapped with a `__modules__` registry of all
+/// transitively reachable relative modules (delegates to the shared host
+/// loader in `runtime/module.zig`). Modules absent on disk are skipped
+/// (resolved at runtime). Appends a trailing `module.exports;` so the script's
+/// completion value is the entry module's exports.
 fn buildWrappedScript(gpa: std.mem.Allocator, script_path: []const u8, entry_src: []const u8) ![]const u8 {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
     const base_dir = std.fs.path.dirname(script_path) orelse ".";
-    var registry = std.StringArrayHashMap([]const u8).init(arena);
-    var queue = std.ArrayList([]const u8){};
-    scanSpecifiers(entry_src, entry_id, &queue, arena);
-    var qi: usize = 0;
-    while (qi < queue.items.len) : (qi += 1) {
-        const id = queue.items[qi];
-        if (registry.contains(id)) continue;
-        const src = readModuleFile(arena, base_dir, id) orelse continue;
-        try registry.put(id, src);
-        scanSpecifiers(src, id, &queue, arena);
-    }
-
-    var sb = std.ArrayList(u8){};
-    try sb.appendSlice(gpa, "var __modules__ = {};\n");
-    var it = registry.iterator();
-    while (it.next()) |e| {
-        try sb.appendSlice(gpa, "__modules__[\"");
-        try sb.appendSlice(gpa, e.key_ptr.*);
-        try sb.appendSlice(gpa, "\"] = function(require, module, exports){\nvar __module_id__ = \"");
-        try sb.appendSlice(gpa, e.key_ptr.*);
-        try sb.appendSlice(gpa, "\";\n");
-        try sb.appendSlice(gpa, e.value_ptr.*);
-        try sb.appendSlice(gpa, "\n};\n");
-    }
-    try sb.appendSlice(gpa, "var module = { exports: {} }; var exports = module.exports;\nvar __module_id__ = \"");
-    try sb.appendSlice(gpa, entry_id);
-    try sb.appendSlice(gpa, "\";\n");
-    try sb.appendSlice(gpa, entry_src);
-    try sb.appendSlice(gpa, "\nmodule.exports;");
-    return sb.toOwnedSlice(gpa);
+    const wrapped_src = try std.fmt.allocPrint(gpa, "{s}\nmodule.exports;", .{entry_src});
+    defer gpa.free(wrapped_src);
+    const entry_id = std.fs.path.basename(script_path);
+    const __b = try jsz.module_loader.buildBundle(gpa, base_dir, entry_id, wrapped_src);
+    if (std.posix.getenv("JSZ_DUMP_BUNDLE") != null) std.debug.print("===BUNDLE===\n{s}\n===END===\n", .{__b});
+    return __b;
 }
 
 test "parseArgs --version" {
@@ -610,6 +530,14 @@ test "parseArgs --run-bytecode" {
     const a = parseArgs(&argv);
     try std.testing.expectEqual(Mode.run_bytecode, a.mode);
     try std.testing.expectEqualStrings("out.jbc", a.run_bc_path);
+}
+
+test "parseArgs --module implies bc" {
+    const argv = [_][]const u8{ "mod.js", "--module" };
+    const a = parseArgs(&argv);
+    try std.testing.expect(a.module);
+    try std.testing.expectEqual(Mode.script, a.mode);
+    try std.testing.expectEqual(jsz.InterpMode.bc, a.interp);
 }
 
 test "parseArgs --jit=count implies bc" {

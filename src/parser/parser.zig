@@ -39,6 +39,32 @@ pub fn hasUseStrict(body: []*Node) bool {
     return std.mem.eql(u8, inner.data.string_literal, "use strict");
 }
 
+/// If `node` is a string-literal expression statement (a member of a directive
+/// prologue), return its raw string value; otherwise null (the prologue ends at
+/// the first non-string-literal statement).
+pub fn directiveOf(node: *Node) ?[]const u8 {
+    if (node.kind != .expr_stmt) return null;
+    const inner = node.data.expr_stmt;
+    if (inner.kind != .string_literal) return null;
+    return inner.data.string_literal;
+}
+
+/// Future reserved words that are valid identifiers in sloppy mode but early
+/// SyntaxErrors when used as a binding identifier in strict-mode code
+/// (ES §12.7.2 + the `eval`/`arguments` binding restriction §13.1.1). `yield`
+/// and `await` are handled separately (generator/module context).
+pub fn isStrictReservedWord(name: []const u8) bool {
+    const words = [_][]const u8{
+        "implements", "interface", "let",       "package", "private",
+        "protected",  "public",    "static",    "yield",   "eval",
+        "arguments",
+    };
+    for (words) |w| {
+        if (std.mem.eql(u8, name, w)) return true;
+    }
+    return false;
+}
+
 pub const ParseResult = union(enum) {
     ok: []*Node,
     err: ParseError,
@@ -56,6 +82,9 @@ pub const Parser = struct {
     had_error: bool,
     error_info: ?ParseError,
     in_generator_function: bool,
+    /// M16 Phase 4: true when parsing a module (not a script), so `await` is a
+    /// reserved word and `new await` / `(await x) = y` are early SyntaxErrors.
+    is_module: bool,
     /// Phase 8: statements produced by desugaring ES-module import/export that must be
     /// spliced into the program body after the primary statement (kept at module scope).
     extra_stmts: std.ArrayList(*Node),
@@ -65,6 +94,66 @@ pub const Parser = struct {
     /// Phase 8: `export let`/`export var` names collected per module unit, used to rewrite
     /// their use-sites to `exports.name` so reassignments are observed live by importers.
     live_exports: std.ArrayList([]const u8),
+    /// M16 Phase 5: aliased live exports, e.g. `export { local2 as renamed }` where
+    /// local != exported. All uses of `local` are rewritten to `exports.exported`.
+    live_export_aliases: std.ArrayList(struct { local: []const u8, exported: []const u8 }),
+    /// M16 Phase 4: all exported names (deduplicated), collected so the module namespace
+    /// exotic object can distinguish "uninitialized export" (TDZ → ReferenceError) from
+    /// "not an export" (→ undefined), even on self-import before the export assignments run.
+    all_export_names: std.ArrayList([]const u8),
+    /// M16 Phase 5: nesting depth inside function bodies. 0 = top-level module code;
+    /// incremented by parseFunctionBody so import hoisting only applies at top level.
+    fn_nesting_depth: u32,
+    /// M16 Phase 5: import statements collected at top level (fn_nesting_depth == 0)
+    /// to be inserted before entry body stmts, so require() runs before any assertions.
+    hoisted_import_stmts: std.ArrayList(*Node),
+    /// M16 Phase 5: set when `var __esm_hoist_point__=1;` is seen in the bundle header.
+    /// Only then do we hoist imports — unit tests have no marker so they keep source order.
+    hoist_point_seen: bool,
+    /// M16 Phase 5: set when `var __esm_hoist_point_no_se__=1;` is emitted by buildBundle
+    /// for sync entries with function exports.  Named imports are still hoisted (so their
+    /// `var __esm_N__` lives at module scope before the IIFE), but bare side-effect imports
+    /// (`import './dep'`) are NOT hoisted — they stay in the IIFE body and run AFTER the
+    /// pre-hoist `exports.fn = fn` assignments, so circular deps can call the function.
+    hoist_no_se: bool,
+    /// M16 Phase 5: index into the stmt list after which hoisted imports are inserted.
+    hoist_point_idx: usize,
+    /// M16 Phase 5: name hint set by parseExportDecl for `export default class/function`
+    /// anonymous expressions, consumed by parseClassExpr / parseFunctionExpr.
+    export_default_name_hint: ?[]const u8,
+    /// M16 TLA: set when an `await` is parsed at module top level (function
+    /// nesting depth 0). The module then has top-level await and its top-level
+    /// program is compiled/driven as an async body (real per-await suspension).
+    saw_top_level_await: bool,
+    /// Set by parsePrimary when a `super` token is parsed. parseObjectLiteral
+    /// saves/clears it around each method body to detect object-method `super`
+    /// usage so it can bind `super`/`__sproto__`/`__superthis` to the home
+    /// object's prototype (object literals have no Super class binding).
+    super_used: bool,
+    /// Monotonic counter for the hidden `__home_N` capture var injected by
+    /// parseObjectLiteral for object literals whose methods use `super`.
+    home_obj_counter: u32,
+    /// Arrow destructuring params: when an arrow parameter is an array/object
+    /// pattern (`([a]) => …`, `({x}) => …`), extractArrowParams gives it a
+    /// synthetic name and stashes the destructuring `const` decls here. The arrow
+    /// builder snapshots+clears this immediately after extractArrowParams and
+    /// prepends the decls to the body. Cleared per extraction so nested arrows
+    /// don't cross-contaminate.
+    arrow_prelude: std.ArrayList(*Node),
+    /// Monotonic counter for synthetic destructuring-param names (`__param_N`).
+    param_destruct_counter: u32,
+    /// True when parsing direct/indirect `eval()` code. Eval code is a Script
+    /// (sec-scripts §A.5), so `import`/`export` *declarations* are early
+    /// SyntaxErrors — unlike the CJS-desugar bundle source run via parseScript,
+    /// which legitimately carries them. Set only by the `eval()` builtin.
+    eval_code: bool,
+    /// True when the code currently being parsed is strict-mode code (a "use
+    /// strict" directive prologue at script/eval/function scope, or module code).
+    /// Drives the strict-only early SyntaxErrors: future-reserved words used as
+    /// binding identifiers (`public`, `interface`, …) and assignment to
+    /// `eval`/`arguments`. May be set by a host caller (e.g. direct `eval` in a
+    /// strict caller) before parsing begins.
+    strict: bool,
 
     pub fn init(source: []const u8, arena: std.mem.Allocator) Parser {
         var p = Parser{
@@ -74,9 +163,25 @@ pub const Parser = struct {
             .had_error = false,
             .error_info = null,
             .in_generator_function = false,
+            .is_module = false,
             .extra_stmts = .{},
             .live_imports = .{},
             .live_exports = .{},
+            .live_export_aliases = .{},
+            .all_export_names = .{},
+            .fn_nesting_depth = 0,
+            .hoisted_import_stmts = .{},
+            .hoist_point_seen = false,
+            .hoist_no_se = false,
+            .hoist_point_idx = 0,
+            .export_default_name_hint = null,
+            .saw_top_level_await = false,
+            .super_used = false,
+            .home_obj_counter = 0,
+            .arrow_prelude = .{},
+            .param_destruct_counter = 0,
+            .eval_code = false,
+            .strict = false,
         };
         // Prime the lookahead.
         p.current = p.lexNext();
@@ -123,6 +228,14 @@ pub const Parser = struct {
         return lx.next() catch Token.initSimple(.eof, 0, 0, 1, 1, false);
     }
 
+    /// Peek the second token after `current` (i.e. token after `peekNext`).
+    /// Used for `await using <ident>` lookahead.
+    pub fn peekNext2(self: *Parser) Token {
+        var lx = self.lexer;
+        _ = lx.next() catch return Token.initSimple(.eof, 0, 0, 1, 1, false);
+        return lx.next() catch Token.initSimple(.eof, 0, 0, 1, 1, false);
+    }
+
     /// True if `current` is the contextual keyword `async` (a plain identifier).
     pub fn currentIsAsyncKw(self: *const Parser) bool {
         return self.current.kind == .identifier and std.mem.eql(u8, self.current.value_str, "async");
@@ -147,6 +260,17 @@ pub const Parser = struct {
         }
         // Fall through to normal error reporting via expect(.identifier).
         return self.expect(.identifier);
+    }
+
+    /// True when the current token is an IdentifierName: a plain identifier or a
+    /// reserved word (`export`, `in`, `if`, …). Reserved words are valid in
+    /// IdentifierName positions — property keys, method names — even though they
+    /// cannot be used as bare Identifiers. Its spelling is in `current.value_str`.
+    pub fn currentIsIdentifierName(self: *const Parser) bool {
+        const k = self.current.kind;
+        if (k == .identifier) return true;
+        const i = @intFromEnum(k);
+        return i >= @intFromEnum(TokenKind.kw_break) and i <= @intFromEnum(TokenKind.kw_null);
     }
 
     pub fn expect(self: *Parser, kind: TokenKind) ?Token {
@@ -183,6 +307,25 @@ pub const Parser = struct {
         return n;
     }
 
+    /// Build a string-literal AST node (e.g. for export-name array elements).
+    pub fn mkStringLiteral(self: *Parser, value: []const u8) ?*Node {
+        return self.makeNode(.string_literal, self.current.start, self.current.start, .{ .string_literal = value });
+    }
+
+    /// Build a two-argument call `callee_name(arg1, arg2)`.
+    pub fn mkCall2(self: *Parser, callee_name: []const u8, arg1: *Node, arg2: *Node) ?*Node {
+        const callee = self.mkIdent(callee_name) orelse return null;
+        var args = std.ArrayList(*Node){};
+        args.append(self.arena, arg1) catch return null;
+        args.append(self.arena, arg2) catch return null;
+        return self.makeNode(.call_expr, self.current.start, self.current.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+    }
+
+    /// Build an array-literal AST node `[elem1, elem2, ...]`.
+    pub fn mkArrayLiteral(self: *Parser, elements: []*Node) ?*Node {
+        return self.makeNode(.array_literal, self.current.start, self.current.start, .{ .array_literal = .{ .elements = elements } });
+    }
+
     // ----------------------------------------------------------------- ASI ---
 
     /// Check if a semicolon can be auto-inserted:
@@ -212,6 +355,88 @@ pub const Parser = struct {
         var stmts = std.ArrayList(*Node){};
         const li_start = self.live_imports.items.len;
         const le_start = self.live_exports.items.len;
+        const la_start = self.live_export_aliases.items.len;
+        // Directive prologue: leading string-literal statements may carry a
+        // "use strict" directive that makes the rest of the script strict code.
+        // Detected before parsing any later statement, so the strict early-error
+        // checks (reserved-word bindings, eval/arguments assignment) see it.
+        var in_prologue = true;
+        while (!self.check(.eof) and !self.had_error) {
+            const s = self.parseStatement() orelse break;
+            stmts.append(self.arena, s) catch {
+                self.had_error = true;
+                break;
+            };
+            if (in_prologue) {
+                if (directiveOf(s)) |dir| {
+                    if (std.mem.eql(u8, dir, "use strict")) self.strict = true;
+                } else in_prologue = false;
+            }
+            self.drainExtraStmts(&stmts);
+            // M16 Phase 5: detect the bundle hoist-point marker. A buildBundle
+            // output is CJS-desugared script source (run via parseScript), but it
+            // still carries ES `import`/`export` statements and the
+            // `__esm_hoist_point__` marker emitted right before the entry body.
+            // Mirror parseModule so the entry's import bindings are hoisted and
+            // their leaked `var local` declarations removed (so dependency factory
+            // bodies don't see entry imports via the shared top-level scope).
+            // Plain scripts have no marker, so this is a no-op for them.
+            if (s.kind == .var_decl and
+                std.mem.eql(u8, s.data.var_decl.name, "__esm_hoist_point__"))
+            {
+                self.hoist_point_seen = true;
+                self.hoist_point_idx = stmts.items.len;
+            }
+            // M16 Phase 5: variant for sync entries with function exports — hoist
+            // named imports but NOT bare side-effect imports (which must stay in the
+            // IIFE body so they run after the pre-hoist `exports.fn = fn` assignments).
+            if (s.kind == .var_decl and
+                std.mem.eql(u8, s.data.var_decl.name, "__esm_hoist_point_no_se__"))
+            {
+                self.hoist_point_seen = true;
+                self.hoist_no_se = true;
+                self.hoist_point_idx = stmts.items.len;
+            }
+        }
+        if (self.hoisted_import_stmts.items.len > 0) {
+            var final_stmts = std.ArrayList(*Node){};
+            final_stmts.appendSlice(self.arena, stmts.items[0..self.hoist_point_idx]) catch {
+                self.had_error = true;
+            };
+            final_stmts.appendSlice(self.arena, self.hoisted_import_stmts.items) catch {
+                self.had_error = true;
+            };
+            final_stmts.appendSlice(self.arena, stmts.items[self.hoist_point_idx..]) catch {
+                self.had_error = true;
+            };
+            self.hoisted_import_stmts.clearRetainingCapacity();
+            stmts = final_stmts;
+        }
+        self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
+        if (self.had_error) {
+            return ParseResult{ .err = self.error_info orelse ParseError{
+                .message = "parse error",
+                .line = self.current.line,
+                .column = self.current.column,
+            } };
+        }
+        return ParseResult{ .ok = stmts.items };
+    }
+
+    /// Milestone 16 — Phase 1: parse a unit of ES-module code.
+    ///
+    /// Identical statement grammar to `parseScript` (the import/export desugar
+    /// onto CommonJS `require`/`exports` already runs inside `parseStatement`),
+    /// but the result is module code: always strict (§11.2.2). Callers build a
+    /// `Program{ .is_module = true, .is_strict = true }` from `.ok`. Errors use
+    /// the same `ParseResult.err` channel as scripts.
+    pub fn parseModule(self: *Parser) ParseResult {
+        self.is_module = true;
+        self.strict = true; // §11.2.2: module code is always strict.
+        var stmts = std.ArrayList(*Node){};
+        const li_start = self.live_imports.items.len;
+        const le_start = self.live_exports.items.len;
+        const la_start = self.live_export_aliases.items.len;
         while (!self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
             stmts.append(self.arena, s) catch {
@@ -219,8 +444,44 @@ pub const Parser = struct {
                 break;
             };
             self.drainExtraStmts(&stmts);
+            // M16 Phase 5: detect the hoist-point marker emitted by buildBundle right
+            // before entry_src. Imports hoisted after this marker land after the full
+            // bundle header (which initialises __modules__ / __initExports__) but before
+            // entry body assertions that precede `import` declarations in source order.
+            if (s.kind == .var_decl and
+                std.mem.eql(u8, s.data.var_decl.name, "__esm_hoist_point__"))
+            {
+                self.hoist_point_seen = true;
+                self.hoist_point_idx = stmts.items.len;
+            }
+            // M16 Phase 5: variant emitted for sync entries with function exports — hoist
+            // named imports but NOT bare side-effect imports.
+            if (s.kind == .var_decl and
+                std.mem.eql(u8, s.data.var_decl.name, "__esm_hoist_point_no_se__"))
+            {
+                self.hoist_point_seen = true;
+                self.hoist_no_se = true;
+                self.hoist_point_idx = stmts.items.len;
+            }
         }
-        self.applyLiveBindings(stmts.items, li_start, le_start);
+        // M16 Phase 5: insert hoisted imports at the hoist point (after bundle header,
+        // before entry body). Only active when the bundle marker was seen; unit tests
+        // have no marker so hoisted_import_stmts is always empty for them.
+        if (self.hoisted_import_stmts.items.len > 0) {
+            var final_stmts = std.ArrayList(*Node){};
+            final_stmts.appendSlice(self.arena, stmts.items[0..self.hoist_point_idx]) catch {
+                self.had_error = true;
+            };
+            final_stmts.appendSlice(self.arena, self.hoisted_import_stmts.items) catch {
+                self.had_error = true;
+            };
+            final_stmts.appendSlice(self.arena, stmts.items[self.hoist_point_idx..]) catch {
+                self.had_error = true;
+            };
+            self.hoisted_import_stmts.clearRetainingCapacity();
+            stmts = final_stmts;
+        }
+        self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
         if (self.had_error) {
             return ParseResult{ .err = self.error_info orelse ParseError{
                 .message = "parse error",
@@ -274,13 +535,103 @@ pub const Parser = struct {
         args.append(self.arena, arg) catch return null;
         return self.makeNode(.call_expr, self.current.start, self.current.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
     }
+    /// Build a one-argument call `callee_name(arg)` (e.g. `__makeNamespace__(x)`).
+    pub fn mkCall1(self: *Parser, callee_name: []const u8, arg: *Node) ?*Node {
+        const callee = self.mkIdent(callee_name) orelse return null;
+        var args = std.ArrayList(*Node){};
+        args.append(self.arena, arg) catch return null;
+        return self.makeNode(.call_expr, self.current.start, self.current.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+    }
     pub fn mkVar(self: *Parser, name: []const u8, init_node: *Node) ?*Node {
         return self.makeNode(.var_decl, self.current.start, self.current.start, .{ .var_decl = .{ .kind = .var_, .name = name, .init = init_node } });
     }
+    /// M16 Phase 5: Build `__liveReexport__(exports, 'name', source, 'prop')`
+    /// for live re-exports (`export { X as Y } from './mod'`).  The getter makes
+    /// the re-export a live binding to the source module's export, so circular
+    /// dependencies resolve correctly — the value is read at access time, not
+    /// at re-export time.
+    pub fn mkExportGetter(self: *Parser, exported: []const u8, source: *Node) ?*Node {
+        // source is already a member expression like __esm_X.A
+        // We need to decompose it: source = __esm_X.A → source_obj=__esm_X, prop="A"
+        if (source.kind != .member_expr or source.data.member_expr.computed) return null;
+        const src_obj = source.data.member_expr.object;
+        const src_prop = source.data.member_expr.property;
+        if (src_obj.kind != .identifier or src_prop.kind != .identifier) return null;
+        const src_obj_name = src_obj.data.identifier;
+        const src_prop_name = src_prop.data.identifier;
+
+        // __liveReexport__(exports, 'exported', __esm_X, 'A')
+        const callee = self.mkIdent("__liveReexport__") orelse return null;
+        const exports_arg = self.mkIdent("exports") orelse return null;
+        const name_arg = self.makeNode(.string_literal, self.current.start, self.current.start, .{ .string_literal = exported }) orelse return null;
+        const source_arg = self.mkIdent(src_obj_name) orelse return null;
+        const prop_arg = self.makeNode(.string_literal, self.current.start, self.current.start, .{ .string_literal = src_prop_name }) orelse return null;
+
+        const args = self.arena.alloc(*Node, 4) catch return null;
+        args[0] = exports_arg;
+        args[1] = name_arg;
+        args[2] = source_arg;
+        args[3] = prop_arg;
+        const call = self.makeNode(.call_expr, self.current.start, self.current.start, .{
+            .call_expr = .{ .callee = callee, .args = args },
+        }) orelse return null;
+
+        return self.makeNode(.expr_stmt, self.current.start, self.current.start, .{ .expr_stmt = call });
+    }
+
+    /// Build `__liveLocalExport__(exports, 'name', function() { return localName; })`
+    /// for live local exports (e.g. `export default function fn()` where fn may
+    /// be reassigned).  The getter reads the local binding at access time, so
+    /// reassignments are reflected through the export.
+    pub fn mkLiveLocalExport(self: *Parser, exported: []const u8, local_name: []const u8) ?*Node {
+        const callee = self.mkIdent("__liveLocalExport__") orelse return null;
+        const exports_arg = self.mkIdent("exports") orelse return null;
+        const name_arg = self.makeNode(.string_literal, self.current.start, self.current.start, .{ .string_literal = exported }) orelse return null;
+        // Build: function() { return localName; }
+        const ret_ident = self.mkIdent(local_name) orelse return null;
+        const ret_stmt = self.makeNode(.return_stmt, self.current.start, self.current.start, .{ .return_stmt = ret_ident }) orelse return null;
+        const body_nodes = self.arena.alloc(*Node, 1) catch return null;
+        body_nodes[0] = ret_stmt;
+        const getter = self.makeNode(.function_expr, self.current.start, self.current.start, .{
+            .function_expr = .{
+                .name = null,
+                .params = &.{},
+                .param_defaults = &.{},
+                .rest_param = null,
+                .body = body_nodes,
+                .is_generator = false,
+                .is_async = false,
+                .is_strict = false,
+            },
+        }) orelse return null;
+
+        const args = self.arena.alloc(*Node, 3) catch return null;
+        args[0] = exports_arg;
+        args[1] = name_arg;
+        args[2] = getter;
+        const call = self.makeNode(.call_expr, self.current.start, self.current.start, .{
+            .call_expr = .{ .callee = callee, .args = args },
+        }) orelse return null;
+        // Track the exported name for the namespace exotic.
+        var dup = false;
+        for (self.all_export_names.items) |n| {
+            if (std.mem.eql(u8, n, exported)) { dup = true; break; }
+        }
+        if (!dup) self.all_export_names.append(self.arena, exported) catch {};
+        return self.makeNode(.expr_stmt, self.current.start, self.current.start, .{ .expr_stmt = call });
+    }
+
     pub fn mkExportAssign(self: *Parser, exported: []const u8, value: *Node) ?*Node {
         const exports_id = self.mkIdent("exports") orelse return null;
         const target = self.mkMember(exports_id, exported) orelse return null;
         const assign = self.makeNode(.assignment_expr, self.current.start, self.current.start, .{ .assignment_expr = .{ .op = .assign, .target = target, .value = value } }) orelse return null;
+        // Track every exported name so the namespace exotic can distinguish
+        // "uninitialized export" from "not an export" during self-/cyclic imports.
+        var dup = false;
+        for (self.all_export_names.items) |n| {
+            if (std.mem.eql(u8, n, exported)) { dup = true; break; }
+        }
+        if (!dup) self.all_export_names.append(self.arena, exported) catch {};
         return self.makeNode(.expr_stmt, self.current.start, self.current.start, .{ .expr_stmt = assign });
     }
 
@@ -303,35 +654,128 @@ pub const Parser = struct {
         }
     }
 
+    /// Register every `var`/`let`/`const` declarator name in an `export <decl>`
+    /// as a live export, recursing into the `block_stmt` that a multi-declarator
+    /// statement (`export let a, b, c;`) lowers to. Without walking the block,
+    /// only the first declarator of a multi-name export would get a live binding,
+    /// leaving later names (and assignments to them) invisible to importers.
+    pub fn registerDeclLiveExports(self: *Parser, node: *Node) void {
+        switch (node.kind) {
+            .var_decl => {
+                const vkind = node.data.var_decl.kind;
+                if (vkind == .var_ or !self.is_module or self.fn_nesting_depth > 0 or self.hoist_point_seen) {
+                    self.live_exports.append(self.arena, node.data.var_decl.name) catch {};
+                }
+            },
+            .block_stmt => for (node.data.block_stmt.body) |c| self.registerDeclLiveExports(c),
+            else => {},
+        }
+    }
+
     // Live bindings: rewrite each named/default import use-site to `ns.prop`, and each
     // `export let/var` use-site to `exports.name`, when the local name has no declaration
     // other than its own binding (count <= 1) — sound (no shadowing possible). Shadowed
     // names keep CJS-snapshot semantics.
-    pub fn applyLiveBindings(self: *Parser, stmts: []*Node, li_start: usize, le_start: usize) void {
+    pub fn applyLiveBindings(self: *Parser, stmts: []*Node, li_start: usize, le_start: usize, la_start: usize) void {
         if (self.had_error) {
-            self.live_imports.shrinkRetainingCapacity(li_start);
+            // When inside a function body in bundle mode (IIFE wrapping the entry
+            // body), don't shrink live_imports — the top-level applyLiveBindings
+            // needs them to remove hoisted import var declarations.
+            if (!(self.hoist_point_seen and self.fn_nesting_depth > 0)) {
+                self.live_imports.shrinkRetainingCapacity(li_start);
+            }
             self.live_exports.shrinkRetainingCapacity(le_start);
+            self.live_export_aliases.shrinkRetainingCapacity(la_start);
             return;
         }
         const n = self.live_imports.items.len;
         const ne = self.live_exports.items.len;
-        if (n <= li_start and ne <= le_start) return;
+        const na = self.live_export_aliases.items.len;
+        if (n <= li_start and ne <= le_start and na <= la_start) return;
         var counts = std.StringHashMap(u32).init(self.arena);
         for (stmts) |s| self.countDecls(s, &counts);
+        // M16: re-exports of named imports (`import {x} from 'm'; export {x}`) must
+        // forward to m's binding (live re-export), not snapshot a fresh local — so
+        // the star-export ambiguity check resolves them to the same root as
+        // `export {x} from 'm'`.  Run before the import-rewrite pass (which would
+        // otherwise rewrite the snapshot's RHS and defeat the matcher).
+        var reexported_imports = std.StringHashMap(void).init(self.arena);
+        {
+            var ei = le_start;
+            while (ei < ne) : (ei += 1) {
+                const ename = self.live_exports.items[ei];
+                for (self.live_imports.items[li_start..n]) |imp| {
+                    if (std.mem.eql(u8, imp.name, ename) and !std.mem.eql(u8, imp.prop, "__ns__")) {
+                        if (self.rewriteSnapshotToReexport(stmts, ename, ename, imp.ns, imp.prop)) {
+                            reexported_imports.put(ename, {}) catch {};
+                        }
+                        break;
+                    }
+                }
+            }
+            var ai = la_start;
+            while (ai < na) : (ai += 1) {
+                const al = self.live_export_aliases.items[ai];
+                for (self.live_imports.items[li_start..n]) |imp| {
+                    if (std.mem.eql(u8, imp.name, al.local) and !std.mem.eql(u8, imp.prop, "__ns__")) {
+                        if (self.rewriteSnapshotToReexport(stmts, al.local, al.exported, imp.ns, imp.prop)) {
+                            reexported_imports.put(al.local, {}) catch {};
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         var i = li_start;
         while (i < n) : (i += 1) {
             const imp = self.live_imports.items[i];
             if ((counts.get(imp.name) orelse 0) <= 1) {
                 for (stmts) |s| self.rewriteName(s, imp.name, imp.ns, imp.prop);
+                // In bundle mode (hoist_point_seen), clear the snapshot init
+                // `var local = ns.prop` so TDZ exports don't throw — all uses
+                // are already rewritten to `ns.prop` above. Not needed for unit
+                // tests (no hoist) since imports run after their module is ready.
+                if (self.hoist_point_seen) {
+                    for (stmts) |s| {
+                        if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, imp.name)) {
+                            // M16 Phase 5: remove the import binding declaration
+                            // entirely.  All uses of `imp.name` have been rewritten
+                            // to `ns.prop` above, so the `var local = ns.prop`
+                            // declaration is dead code.  Removing it prevents the
+                            // entry module's import bindings (e.g. `var B` from
+                            // `import { B }`) from leaking to the top-level scope
+                            // and being visible inside dependency factory functions
+                            // via the scope chain — which would cause tests expecting
+                            // ReferenceError for re-export names to see `undefined`.
+                            s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
+                        }
+                    }
+                }
             }
         }
         var j = le_start;
         while (j < ne) : (j += 1) {
             const name = self.live_exports.items[j];
+            if (reexported_imports.contains(name)) continue;
             if ((counts.get(name) orelse 0) <= 1) self.makeExportLive(stmts, name);
         }
-        self.live_imports.shrinkRetainingCapacity(li_start);
+        var k = la_start;
+        while (k < na) : (k += 1) {
+            const alias = self.live_export_aliases.items[k];
+            if (reexported_imports.contains(alias.local)) continue;
+            if ((counts.get(alias.local) orelse 0) <= 1) {
+                self.makeExportLiveAlias(stmts, alias.local, alias.exported);
+            }
+        }
+        // When inside a function body in bundle mode (IIFE wrapping the entry
+        // body), don't shrink live_imports — the top-level applyLiveBindings
+        // needs them to remove hoisted import var declarations from the
+        // hoisted_import_stmts array (which is separate from the function body).
+        if (!(self.hoist_point_seen and self.fn_nesting_depth > 0)) {
+            self.live_imports.shrinkRetainingCapacity(li_start);
+        }
         self.live_exports.shrinkRetainingCapacity(le_start);
+        self.live_export_aliases.shrinkRetainingCapacity(la_start);
     }
 
     /// Is `s` the generated snapshot `exports.name = name;`?
@@ -352,6 +796,27 @@ pub const Parser = struct {
     /// Turn a `export let/var name = E` into the live form: seed `exports.name = E`,
     /// drop the snapshot assignment, and rewrite all `name` use-sites to `exports.name`.
     pub fn makeExportLive(self: *Parser, stmts: []*Node, name: []const u8) void {
+        // If the only binding for `name` is a function declaration (not a var/let/const),
+        // the snapshot `exports.name = name` is sufficient — function declarations are
+        // hoisted so the snapshot always captures the correct value. Skip live rewriting
+        // to avoid `exports.name = exports.name` circularity.
+        //
+        // If NO binding is found at the top level (has_var_decl=false AND
+        // has_func_decl=false), the export lives inside a bundle dependency factory
+        // function body (fn_nesting_depth > 0 during parse). `makeExportLive` operates
+        // on top-level stmts only — it can't find the var_decl inside the function_expr
+        // to rewrite it, but `rewriteName` DOES recurse into function bodies, which
+        // would break references (e.g. rewriting `results.push(...)` to
+        // `exports.results.push(...)` while `exports.results` is still a TDZ marker).
+        // Return early to preserve the CJS snapshot for factory-body and class exports.
+        var has_var_decl = false;
+        var has_func_decl = false;
+        for (stmts) |s| {
+            if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, name)) has_var_decl = true;
+            if (s.kind == .function_decl and std.mem.eql(u8, s.data.function_decl.name, name)) has_func_decl = true;
+        }
+        if (has_func_decl and !has_var_decl) return;
+        if (!has_var_decl and !has_func_decl) return;
         for (stmts) |s| {
             if (isSnapshotAssign(s, name)) {
                 s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
@@ -363,11 +828,99 @@ pub const Parser = struct {
                     const asn = self.makeNode(.assignment_expr, s.start, s.start, .{ .assignment_expr = .{ .op = .assign, .target = tgt, .value = init_node } }) orelse continue;
                     s.* = Node{ .kind = .expr_stmt, .start = s.start, .end = s.end, .data = .{ .expr_stmt = asn } };
                 } else {
-                    s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
+                    // `export var/let x;` with no initializer still creates the
+                    // exported binding (value undefined) so it appears in the
+                    // module namespace's keys: rewrite to `exports.x = undefined`.
+                    const obj = self.makeNode(.identifier, s.start, s.start, .{ .identifier = "exports" }) orelse continue;
+                    const p = self.makeNode(.identifier, s.start, s.start, .{ .identifier = name }) orelse continue;
+                    const tgt = self.makeNode(.member_expr, s.start, s.start, .{ .member_expr = .{ .object = obj, .property = p, .computed = false } }) orelse continue;
+                    const undef = self.makeNode(.identifier, s.start, s.start, .{ .identifier = "undefined" }) orelse continue;
+                    const asn = self.makeNode(.assignment_expr, s.start, s.start, .{ .assignment_expr = .{ .op = .assign, .target = tgt, .value = undef } }) orelse continue;
+                    s.* = Node{ .kind = .expr_stmt, .start = s.start, .end = s.end, .data = .{ .expr_stmt = asn } };
                 }
             }
         }
         for (stmts) |s| self.rewriteName(s, name, "exports", name);
+    }
+
+    /// Like `makeExportLive` but for `export { local as exported }` where local != exported.
+    /// Rewrites all uses of `local` to `exports.exported` and seeds the initializer.
+    pub fn makeExportLiveAlias(self: *Parser, stmts: []*Node, local: []const u8, exported: []const u8) void {
+        var has_var_decl = false;
+        var has_func_decl = false;
+        for (stmts) |s| {
+            if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, local)) has_var_decl = true;
+            if (s.kind == .function_decl and std.mem.eql(u8, s.data.function_decl.name, local)) has_func_decl = true;
+        }
+        if (has_func_decl and !has_var_decl) return;
+        if (!has_var_decl and !has_func_decl) return; // factory-body/class export: preserve snapshot
+        for (stmts) |s| {
+            // Remove snapshot `exports.exported = local`
+            if (s.kind == .expr_stmt) {
+                const e = s.data.expr_stmt;
+                if (e.kind == .assignment_expr) {
+                    const a = e.data.assignment_expr;
+                    if (a.value.kind == .identifier and std.mem.eql(u8, a.value.data.identifier, local)) {
+                        const t = a.target;
+                        if (t.kind == .member_expr and !t.data.member_expr.computed) {
+                            const obj = t.data.member_expr.object;
+                            const prop = t.data.member_expr.property;
+                            if (obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "exports") and
+                                prop.kind == .identifier and std.mem.eql(u8, prop.data.identifier, exported))
+                            {
+                                s.* = Node{ .kind = .empty_stmt, .start = s.start, .end = s.end, .data = .{ .empty_stmt = {} } };
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // Convert `var local = init` → `exports.exported = init`
+            if (s.kind == .var_decl and std.mem.eql(u8, s.data.var_decl.name, local)) {
+                const obj = self.makeNode(.identifier, s.start, s.start, .{ .identifier = "exports" }) orelse continue;
+                const ep = self.makeNode(.identifier, s.start, s.start, .{ .identifier = exported }) orelse continue;
+                const tgt = self.makeNode(.member_expr, s.start, s.start, .{ .member_expr = .{ .object = obj, .property = ep, .computed = false } }) orelse continue;
+                if (s.data.var_decl.init) |init_node| {
+                    const asn = self.makeNode(.assignment_expr, s.start, s.start, .{ .assignment_expr = .{ .op = .assign, .target = tgt, .value = init_node } }) orelse continue;
+                    s.* = Node{ .kind = .expr_stmt, .start = s.start, .end = s.end, .data = .{ .expr_stmt = asn } };
+                } else {
+                    const undef = self.makeNode(.identifier, s.start, s.start, .{ .identifier = "undefined" }) orelse continue;
+                    const asn = self.makeNode(.assignment_expr, s.start, s.start, .{ .assignment_expr = .{ .op = .assign, .target = tgt, .value = undef } }) orelse continue;
+                    s.* = Node{ .kind = .expr_stmt, .start = s.start, .end = s.end, .data = .{ .expr_stmt = asn } };
+                }
+            }
+        }
+        for (stmts) |s| self.rewriteName(s, local, "exports", exported);
+    }
+
+    /// M16: `export { local as exported }` where `local` is a *named* import
+    /// (`import { local } from 'm'`) is — per spec §16.2.1.7.1 step 10.1.ii.3 — an
+    /// indirect re-export of m's binding, identical to `export { local as exported }
+    /// from 'm'`.  Rewrite the generated snapshot `exports.exported = local` into a
+    /// live re-export getter that forwards to the import's namespace (`__esm_X.prop`),
+    /// so the star-export ambiguity check (__starRoot__) traces both forms to the
+    /// SAME (module, name) root.  Returns true when the snapshot was found+rewritten.
+    pub fn rewriteSnapshotToReexport(self: *Parser, stmts: []*Node, local: []const u8, exported: []const u8, ns_name: []const u8, prop: []const u8) bool {
+        for (stmts) |s| {
+            if (s.kind != .expr_stmt) continue;
+            const e = s.data.expr_stmt;
+            if (e.kind != .assignment_expr) continue;
+            const a = e.data.assignment_expr;
+            if (a.op != .assign) continue;
+            if (a.value.kind != .identifier or !std.mem.eql(u8, a.value.data.identifier, local)) continue;
+            const t = a.target;
+            if (t.kind != .member_expr or t.data.member_expr.computed) continue;
+            const obj = t.data.member_expr.object;
+            const propn = t.data.member_expr.property;
+            if (obj.kind != .identifier or !std.mem.eql(u8, obj.data.identifier, "exports")) continue;
+            if (propn.kind != .identifier or !std.mem.eql(u8, propn.data.identifier, exported)) continue;
+            const ns_id = self.mkIdent(ns_name) orelse return false;
+            const member = self.mkMember(ns_id, prop) orelse return false;
+            const getter_stmt = self.mkExportGetter(exported, member) orelse return false;
+            s.* = getter_stmt.*;
+            return true;
+        }
+        return false;
     }
 
     pub fn incCount(self: *Parser, counts: *std.StringHashMap(u32), name: []const u8) void {
@@ -385,17 +938,16 @@ pub const Parser = struct {
             },
             .function_decl => {
                 const f = n.data.function_decl;
+                // Only count the function's own name (it creates an outer-scope
+                // binding). Params and body vars are function-scoped — counting
+                // them would inflate counts and block live-binding rewrites for
+                // same-named identifiers in the outer (entry) scope.
                 self.incCount(counts, f.name);
-                for (f.params) |p| self.incCount(counts, p);
-                if (f.rest_param) |r| self.incCount(counts, r);
-                for (f.body) |s| self.countDecls(s, counts);
             },
             .function_expr => {
-                const f = n.data.function_expr;
-                if (f.name) |nm| self.incCount(counts, nm);
-                for (f.params) |p| self.incCount(counts, p);
-                if (f.rest_param) |r| self.incCount(counts, r);
-                for (f.body) |s| self.countDecls(s, counts);
+                // Function expressions create no outer-scope bindings. Skip all
+                // (dep-factory or user function): their params and body vars are
+                // function-scoped and must not inflate entry-module counts.
             },
             .program => for (n.data.program.body) |s| self.countDecls(s, counts),
             .block_stmt => for (n.data.block_stmt.body) |s| self.countDecls(s, counts),
@@ -488,6 +1040,63 @@ pub const Parser = struct {
         }
     }
 
+    /// Returns true if any `var <name>` declaration appears anywhere in `stmts`,
+    /// recursing through blocks/if/for/etc. but NOT into nested function bodies
+    /// (those create their own scope). Used by `rewriteName` to avoid rewriting
+    /// identifiers inside functions that shadow the module-level binding with a
+    /// local `var`.
+    fn fnBodyHasVar(stmts: []*Node, name: []const u8) bool {
+        for (stmts) |s| {
+            if (fnNodeHasVar(s, name)) return true;
+        }
+        return false;
+    }
+
+    fn fnNodeHasVar(n: *Node, name: []const u8) bool {
+        switch (n.kind) {
+            .var_decl => return std.mem.eql(u8, n.data.var_decl.name, name),
+            .block_stmt => return fnBodyHasVar(n.data.block_stmt.body, name),
+            .if_stmt => {
+                const i = n.data.if_stmt;
+                if (fnNodeHasVar(i.consequent, name)) return true;
+                if (i.alternate) |a| return fnNodeHasVar(a, name);
+                return false;
+            },
+            .while_stmt => return fnNodeHasVar(n.data.while_stmt.body, name),
+            .do_while_stmt => return fnNodeHasVar(n.data.do_while_stmt.body, name),
+            .for_stmt => {
+                const f = n.data.for_stmt;
+                if (f.init) |x| if (fnNodeHasVar(x, name)) return true;
+                return fnNodeHasVar(f.body, name);
+            },
+            .for_in_stmt => {
+                const f = n.data.for_in_stmt;
+                if (fnNodeHasVar(f.left, name)) return true;
+                return fnNodeHasVar(f.body, name);
+            },
+            .try_stmt => {
+                const t = n.data.try_stmt;
+                if (fnNodeHasVar(t.block, name)) return true;
+                if (t.handler) |h| {
+                    if (std.mem.eql(u8, h.param_name, name)) return true;
+                    if (fnNodeHasVar(h.body, name)) return true;
+                }
+                if (t.finalizer) |fz| return fnNodeHasVar(fz, name);
+                return false;
+            },
+            .switch_stmt => {
+                for (n.data.switch_stmt.cases) |c| {
+                    for (c.body) |st| if (fnNodeHasVar(st, name)) return true;
+                }
+                return false;
+            },
+            .labeled_stmt => return fnNodeHasVar(n.data.labeled_stmt.body, name),
+            // function_decl / function_expr: separate scope — stop here
+            .function_decl, .function_expr => return false,
+            else => return false,
+        }
+    }
+
     pub fn rewriteName(self: *Parser, n: *Node, name: []const u8, ns: []const u8, prop: []const u8) void {
         switch (n.kind) {
             .identifier => {
@@ -497,8 +1106,36 @@ pub const Parser = struct {
                     n.* = Node{ .kind = .member_expr, .start = n.start, .end = n.end, .data = .{ .member_expr = .{ .object = obj, .property = p, .computed = false } } };
                 }
             },
-            .function_decl => for (n.data.function_decl.body) |s| self.rewriteName(s, name, ns, prop),
-            .function_expr => for (n.data.function_expr.body) |s| self.rewriteName(s, name, ns, prop),
+            .function_decl => {
+                const fd = n.data.function_decl;
+                // Skip if a param or local var shadows the name (inner scope).
+                for (fd.params) |p| if (std.mem.eql(u8, p, name)) return;
+                if (fd.rest_param) |r| if (std.mem.eql(u8, r, name)) return;
+                if (fnBodyHasVar(fd.body, name)) return;
+                for (fd.body) |s| self.rewriteName(s, name, ns, prop);
+            },
+            .function_expr => {
+                // M16 Phase 5: skip bundle dependency factory functions — they
+                // have params (require, module, exports) and represent separate
+                // module scopes. Rewriting inside them conflates the entry
+                // module's import/export names with the dependency's own free
+                // variables (e.g. the fixture's `A` in `try { A; }` is NOT the
+                // entry's export `A`). User nested functions (no such params)
+                // are still recursed into so closures see live bindings, but
+                // we skip if a param shadows the name being rewritten.
+                const fe = n.data.function_expr;
+                if (fe.params.len == 3 and
+                    std.mem.eql(u8, fe.params[0], "require") and
+                    std.mem.eql(u8, fe.params[1], "module") and
+                    std.mem.eql(u8, fe.params[2], "exports"))
+                {
+                    return;
+                }
+                for (fe.params) |p| if (std.mem.eql(u8, p, name)) return;
+                if (fe.rest_param) |r| if (std.mem.eql(u8, r, name)) return;
+                if (fnBodyHasVar(fe.body, name)) return;
+                for (fe.body) |s| self.rewriteName(s, name, ns, prop);
+            },
             .program => for (n.data.program.body) |s| self.rewriteName(s, name, ns, prop),
             .block_stmt => for (n.data.block_stmt.body) |s| self.rewriteName(s, name, ns, prop),
             .var_decl => if (n.data.var_decl.init) |x| self.rewriteName(x, name, ns, prop),
@@ -756,6 +1393,10 @@ pub const Parser = struct {
         return expr_mod.rewriteSuperCall(self, call_node);
     }
 
+    pub fn rewriteSuperPropAssign(self: *Parser, op: ast.AssignOp, target: *Node, value: *Node, start: u32, end: u32) ?*Node {
+        return expr_mod.rewriteSuperPropAssign(self, op, target, value, start, end);
+    }
+
     /// Parse a member expression without call expressions (for `new` callee).
     /// Handles dot and bracket access but NOT `(` argument lists.
     pub fn parseNewCallee(self: *Parser) ?*Node {
@@ -787,6 +1428,7 @@ pub const Parser = struct {
         var stmts = std.ArrayList(*Node){};
         const li_start = self.live_imports.items.len;
         const le_start = self.live_exports.items.len;
+        const la_start = self.live_export_aliases.items.len;
         while (!self.check(.eof) and !self.had_error) {
             const s = self.parseStatement() orelse break;
             stmts.append(self.arena, s) catch {
@@ -795,7 +1437,7 @@ pub const Parser = struct {
             };
             self.drainExtraStmts(&stmts);
         }
-        self.applyLiveBindings(stmts.items, li_start, le_start);
+        self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
         const is_strict = hasUseStrict(stmts.items);
         return .{ .stmts = stmts.items, .is_strict = is_strict };
     }
@@ -886,6 +1528,20 @@ test "Parser: for loop" {
     const result = p.parseScript();
     switch (result) {
         .ok => |stmts| try std.testing.expectEqual(@as(usize, 1), stmts.len),
+        .err => |e| {
+            std.debug.print("parse error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    }
+}
+
+test "Parser: parseModule desugars export var" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var p = Parser.init("export var x = 42;", arena.allocator());
+    const result = p.parseModule();
+    switch (result) {
+        .ok => |stmts| try std.testing.expect(stmts.len >= 1),
         .err => |e| {
             std.debug.print("parse error: {s}\n", .{e.message});
             return error.ParseFailed;

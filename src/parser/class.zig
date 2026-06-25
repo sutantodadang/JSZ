@@ -38,11 +38,21 @@ const ClassMember = struct {
     body: []*Node = &[_]*Node{},
 };
 
+/// A parsed class field (`name = init;`, `#name = init;`, `[expr] = init;`,
+/// or `static name = init;`). Methods are kept separately in ClassMember.
+const ClassField = struct {
+    is_static: bool = false,
+    name: []const u8 = "",
+    computed_key: ?*Node = null,
+    init: ?*Node = null,
+};
+
 const ClassBodyParse = struct {
     ctor_params: [][]const u8 = &[_][]const u8{},
     ctor_rest: ?[]const u8 = null,
     ctor_body: []*Node = &[_]*Node{},
     members: []ClassMember = &[_]ClassMember{},
+    fields: []ClassField = &[_]ClassField{},
 };
 
 /// True when the token after `current` means `current` (a contextual keyword like
@@ -58,6 +68,7 @@ fn nextTokenEndsName(p: *Parser) bool {
 fn parseClassMembers(p: *Parser) ?ClassBodyParse {
     var res = ClassBodyParse{};
     var members = std.ArrayList(ClassMember){};
+    var fields = std.ArrayList(ClassField){};
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         if (p.match(.semicolon)) continue;
 
@@ -88,10 +99,34 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
         } else if (p.check(.identifier) or p.check(.string) or p.check(.number)) {
             name = p.current.value_str;
             _ = p.advance();
+        } else if (p.currentIsIdentifierName()) {
+            // A reserved word (`export`, `in`, …) is a valid IdentifierName as a
+            // member name — also the form produced by an escaped keyword like
+            // `export`, which the lexer decodes to the keyword token.
+            name = p.current.value_str;
+            _ = p.advance();
         } else {
             // Unsupported member start (e.g. a generator `*`): skip one token so
             // the loop can't spin, matching the prior lenient behaviour.
             _ = p.advance();
+            continue;
+        }
+
+        // Field vs method: a method is followed by a parameter list `(...)`.
+        // Anything else (`= init`, `;`, `}`, or the next member) is a class
+        // field. Accessors (`get`/`set`) are always methods.
+        if (accessor == .none and !p.check(.left_paren)) {
+            var init_expr: ?*Node = null;
+            if (p.match(.eq)) {
+                init_expr = p.parseAssignmentExpr() orelse return null;
+            }
+            _ = p.match(.semicolon); // optional ASI
+            fields.append(p.arena, .{
+                .is_static = is_static,
+                .name = name,
+                .computed_key = computed_key,
+                .init = init_expr,
+            }) catch return null;
             continue;
         }
 
@@ -116,7 +151,140 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
     }
     _ = p.expect(.right_brace) orelse return null;
     res.members = members.items;
+    res.fields = fields.items;
     return res;
+}
+
+/// Build an instance-field initializer statement: `this.<name> = <init>` (or
+/// `this[<computed>] = <init>`), with `undefined` when there is no initializer.
+/// A private name (`#x`) is emitted as a non-computed member, so it resolves to
+/// the property key "#x" — matching how `obj.#x` reads are parsed.
+fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
+    const s = p.current.start;
+    const this_node = p.makeNode(.this_expr, s, s, .{ .this_expr = {} }) orelse return null;
+    const lhs = if (f.computed_key) |k|
+        (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = this_node, .property = k, .computed = true } }) orelse return null)
+    else
+        (nodeMember(p, this_node, f.name) orelse return null);
+    const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
+    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+}
+
+/// Build a derived-class instance-field initializer targeting `__superthis`
+/// (the object returned by `super()`), which is the `this` of a derived class
+/// once the parent constructor has run. Unlike a base class — where fields are
+/// prepended to the constructor body and assigned via `this.<f> = init` — a
+/// derived class has no usable `this` until after `super()`, so the field must
+/// be installed on `__superthis`.
+///
+/// Public fields use [[DefineOwnProperty]] (CreateDataProperty semantics:
+/// `Object.defineProperty(__superthis, key, {value, writable, enumerable,
+/// configurable})`), not [[Set]] — class fields define own data properties and
+/// must not invoke inherited setters or be intercepted by an exotic [[Set]]
+/// (e.g. a module namespace returned from the base ctor, where the define is the
+/// operation that triggers deferred evaluation). Private fields keep the
+/// member-assignment form (`__superthis.#name = init`), which is PrivateFieldAdd.
+fn makeDerivedInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
+    const s = p.current.start;
+    const superthis = nodeIdent(p, "__superthis") orelse return null;
+    const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+
+    // Private fields: `__superthis.#name = init` (member assignment → PrivateFieldAdd).
+    if (f.computed_key == null and f.name.len > 0 and f.name[0] == '#') {
+        const lhs = nodeMember(p, superthis, f.name) orelse return null;
+        const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
+        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+    }
+
+    // Public fields: Object.defineProperty(__superthis, key,
+    //   { value: init, writable: true, enumerable: true, configurable: true }).
+    const key_val = if (f.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = f.name }) orelse return null);
+    const t1 = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
+    const t2 = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
+    const t3 = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
+    var props = std.ArrayList(ast.ObjectProp){};
+    props.append(p.arena, .{ .key = "value", .value = val }) catch return null;
+    props.append(p.arena, .{ .key = "writable", .value = t1 }) catch return null;
+    props.append(p.arena, .{ .key = "enumerable", .value = t2 }) catch return null;
+    props.append(p.arena, .{ .key = "configurable", .value = t3 }) catch return null;
+    const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
+
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, superthis) catch return null;
+    args.append(p.arena, key_val) catch return null;
+    args.append(p.arena, desc) catch return null;
+    const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
+    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
+}
+
+/// Append derived-class instance-field initializers (skipping static fields) to
+/// `list`. Returns false on allocation failure.
+fn appendDerivedInstanceFields(p: *Parser, list: *std.ArrayList(*Node), fields: []const ClassField) bool {
+    for (fields) |f| {
+        if (f.is_static) continue;
+        const st = makeDerivedInstanceFieldInit(p, f) orelse return false;
+        list.append(p.arena, st) catch return false;
+    }
+    return true;
+}
+
+/// Build a static-field initializer statement: `ClassName.<name> = <init>`.
+///
+/// Per spec (ClassFieldDefinitionEvaluation / static field initializer), the
+/// initializer is evaluated with `this` bound to the class constructor — so
+/// `static f = this.name` must see the class, not the surrounding `this`. The
+/// initializer is therefore wrapped in `(function(){ return <init>; }).call(C)`
+/// rather than assigned directly. A bare `static f = 1` (no `this`) gets the
+/// same wrapper; the result is identical.
+fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node {
+    const s = p.current.start;
+    const cls = nodeIdent(p, class_name) orelse return null;
+    const lhs = if (f.computed_key) |k|
+        (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = cls, .property = k, .computed = true } }) orelse return null)
+    else
+        (nodeMember(p, cls, f.name) orelse return null);
+    const raw_init = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+
+    // Wrap: (function () { return <init>; }).call(ClassName)
+    const ret_stmt = p.makeNode(.return_stmt, s, s, .{ .return_stmt = raw_init }) orelse return null;
+    const body = p.arena.alloc(*Node, 1) catch return null;
+    body[0] = ret_stmt;
+    const init_fn = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
+        .name = null,
+        .params = &[_][]const u8{},
+        .body = body,
+        .is_arrow = false,
+    } }) orelse return null;
+    const call_member = nodeMember(p, init_fn, "call") orelse return null;
+    const this_arg = nodeIdent(p, class_name) orelse return null;
+    const call_args = p.arena.alloc(*Node, 1) catch return null;
+    call_args[0] = this_arg;
+    const val = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = call_member, .args = call_args } }) orelse return null;
+
+    const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
+    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+}
+
+/// Prepend instance-field initializers to a base-class constructor body. Returns
+/// the new body. Only used for base classes (no `extends`); for derived classes
+/// `this` is not available until after `super()` so field init is skipped.
+fn prependInstanceFields(p: *Parser, ctor_body: []*Node, fields: []const ClassField) ?[]*Node {
+    var any = false;
+    for (fields) |f| {
+        if (!f.is_static) any = true;
+    }
+    if (!any) return ctor_body;
+    var stmts = std.ArrayList(*Node){};
+    for (fields) |f| {
+        if (f.is_static) continue;
+        const st = makeInstanceFieldInit(p, f) orelse return null;
+        stmts.append(p.arena, st) catch return null;
+    }
+    for (ctor_body) |st| stmts.append(p.arena, st) catch return null;
+    return stmts.items;
 }
 
 fn nodeIdent(p: *Parser, name: []const u8) ?*Node {
@@ -145,8 +313,18 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
             const sup_cls = nodeIdent(p, sname) orelse return null;
             const sup_proto = nodeMember(p, sup_cls, "prototype") orelse return null;
             const sup_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "super", .init = sup_proto } }) orelse return null;
+            // Bindings used by `super.PROP = V` desugar (rewriteSuperPropAssign):
+            // `__sproto__` is the parent prototype (Set base) and `__superthis`
+            // the Receiver — here `this`, the method's receiver.
+            const sup_cls2 = nodeIdent(p, sname) orelse return null;
+            const sup_proto2 = nodeMember(p, sup_cls2, "prototype") orelse return null;
+            const sproto_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__sproto__", .init = sup_proto2 } }) orelse return null;
+            const this_node = p.makeNode(.this_expr, s, s, .{ .this_expr = {} }) orelse return null;
+            const sthis_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__superthis", .init = this_node } }) orelse return null;
             var wb = std.ArrayList(*Node){};
             wb.append(p.arena, sup_decl) catch return null;
+            wb.append(p.arena, sproto_decl) catch return null;
+            wb.append(p.arena, sthis_decl) catch return null;
             for (m.body) |st| wb.append(p.arena, st) catch return null;
             body = wb.items;
         }
@@ -201,9 +379,17 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     const class_name = name_tok.value_str;
 
     var super_name: ?[]const u8 = null;
+    // When the heritage is a non-identifier expression (e.g. `extends fn(await x)`),
+    // store it here and emit `var __super__ = <expr>;` before the class body.
+    var heritage_expr: ?*Node = null;
     if (p.match(.kw_extends)) {
-        const s = p.expect(.identifier) orelse return null;
-        super_name = s.value_str;
+        const heritage = p.parseCallMemberExpr() orelse return null;
+        if (heritage.kind == .identifier) {
+            super_name = heritage.data.identifier;
+        } else {
+            super_name = "__super__";
+            heritage_expr = heritage;
+        }
     }
 
     _ = p.expect(.left_brace) orelse return null;
@@ -212,6 +398,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     const ctor_rest: ?[]const u8 = parsed.ctor_rest;
     var ctor_body: []*Node = parsed.ctor_body;
     const members = parsed.members;
+    const fields = parsed.fields;
 
     if (ctor_body.len == 0) {
         if (super_name) |sname| {
@@ -235,9 +422,26 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
             const rc_call = p.makeNode(.call_expr, start, start, .{
                 .call_expr = .{ .callee = callee, .args = rc_args.items },
             }) orelse return null;
-            const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = rc_call }) orelse return null;
+            var has_instance_field = false;
+            for (fields) |f| {
+                if (!f.is_static) has_instance_field = true;
+            }
             var body = std.ArrayList(*Node){};
-            body.append(p.arena, ret_stmt) catch return null;
+            if (has_instance_field) {
+                // Derived class with instance fields: capture the parent result in
+                // `__superthis`, install the fields on it (DefineOwnProperty), and
+                // let the constructor wrapper below emit `return __superthis;`.
+                const id_st = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+                const assign = p.makeNode(.assignment_expr, start, start, .{
+                    .assignment_expr = .{ .op = .assign, .target = id_st, .value = rc_call },
+                }) orelse return null;
+                const assign_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign }) orelse return null;
+                body.append(p.arena, assign_stmt) catch return null;
+                if (!appendDerivedInstanceFields(p, &body, fields)) return null;
+            } else {
+                const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = rc_call }) orelse return null;
+                body.append(p.arena, ret_stmt) catch return null;
+            }
             ctor_body = body.items;
         } else {
             ctor_body = &[_]*Node{};
@@ -245,6 +449,12 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     }
 
     var out = std.ArrayList(*Node){};
+    if (heritage_expr) |he| {
+        const hv = p.makeNode(.var_decl, start, start, .{
+            .var_decl = .{ .kind = .var_, .name = "__super__", .init = he },
+        }) orelse return null;
+        out.append(p.arena, hv) catch return null;
+    }
 
     var ctor_body_effective = ctor_body;
     if (super_name) |sname| {
@@ -265,6 +475,19 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
             .var_decl = .{ .kind = .var_, .name = "__superthis", .init = null },
         }) orelse return null;
         ctor_stmts.append(p.arena, st_decl) catch return null;
+        // `var __sproto__ = Super.prototype;` — the Set base for `super.PROP = V`
+        // inside the constructor (rewriteSuperPropAssign). The Receiver is
+        // `__superthis`, the object returned by the super() call above.
+        {
+            const sp_cls = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
+            const sp_proto = p.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = sp_cls, .property = (p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null), .computed = false },
+            }) orelse return null;
+            const sproto_decl = p.makeNode(.var_decl, start, start, .{
+                .var_decl = .{ .kind = .var_, .name = "__sproto__", .init = sp_proto },
+            }) orelse return null;
+            ctor_stmts.append(p.arena, sproto_decl) catch return null;
+        }
         // Reflect.construct(Super, arguments, ClassName)
         const id_reflect = p.makeNode(.identifier, start, start, .{ .identifier = "Reflect" }) orelse return null;
         const id_construct = p.makeNode(.identifier, start, start, .{ .identifier = "construct" }) orelse return null;
@@ -291,6 +514,9 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         const helper_ret = p.makeNode(.return_stmt, start, start, .{ .return_stmt = id_st_r }) orelse return null;
         var helper_body = std.ArrayList(*Node){};
         helper_body.append(p.arena, assign_stmt) catch return null;
+        // Install instance fields on `__superthis` right after the parent ctor
+        // returns — the spec point where a derived class initializes its fields.
+        if (!appendDerivedInstanceFields(p, &helper_body, fields)) return null;
         helper_body.append(p.arena, helper_ret) catch return null;
         const helper_fn = p.makeNode(.function_expr, start, start, .{
             .function_expr = .{
@@ -314,6 +540,9 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         const final_ret = p.makeNode(.return_stmt, start, start, .{ .return_stmt = id_st_final }) orelse return null;
         ctor_stmts.append(p.arena, final_ret) catch return null;
         ctor_body_effective = ctor_stmts.items;
+    } else {
+        // Base class: instance fields initialize at the start of the constructor.
+        ctor_body_effective = prependInstanceFields(p, ctor_body_effective, fields) orelse return null;
     }
 
     // var ClassName = function ClassName(...) { ... }
@@ -330,7 +559,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         },
     }) orelse return null;
     const ctor_decl = p.makeNode(.var_decl, start, p.current.start, .{
-        .var_decl = .{ .kind = .var_, .name = class_name, .init = ctor_fn },
+        .var_decl = .{ .kind = .let, .name = class_name, .init = ctor_fn },
     }) orelse return null;
     out.append(p.arena, ctor_decl) catch return null;
 
@@ -409,9 +638,19 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         out.append(p.arena, stmt) catch return null;
     }
 
+    // static fields: `ClassName.<name> = <init>` after the class is defined.
+    for (fields) |f| {
+        if (!f.is_static) continue;
+        const stmt = makeStaticFieldInit(p, class_name, f) orelse return null;
+        out.append(p.arena, stmt) catch return null;
+    }
+
     if (out.items.len == 1) return out.items[0];
+    // Transparent container: the `let <ClassName>` binding (and helpers) belong
+    // to the enclosing scope, not a fresh block scope, so a following
+    // `class B extends A` can resolve `A`.
     return p.makeNode(.block_stmt, start, p.current.start, .{
-        .block_stmt = .{ .body = out.items },
+        .block_stmt = .{ .body = out.items, .lexical_scope = false },
     });
 }
 
@@ -437,9 +676,15 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
     } else synthetic_name;
 
     var super_name: ?[]const u8 = null;
+    var heritage_expr: ?*Node = null;
     if (p.match(.kw_extends)) {
-        const s = p.expect(.identifier) orelse return null;
-        super_name = s.value_str;
+        const heritage = p.parseCallMemberExpr() orelse return null;
+        if (heritage.kind == .identifier) {
+            super_name = heritage.data.identifier;
+        } else {
+            super_name = "__super__";
+            heritage_expr = heritage;
+        }
     }
 
     _ = p.expect(.left_brace) orelse return null;
@@ -447,6 +692,7 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
         const ctor_params: [][]const u8 = parsed.ctor_params;
         var ctor_body: []*Node = parsed.ctor_body;
         const members = parsed.members;
+        const fields = parsed.fields;
 
         // If no constructor and derives from something, generate default
         if (ctor_body.len == 0 and super_name != null) {
@@ -522,15 +768,30 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             const ret_stmt2 = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
             out.append(p.arena, ret_stmt2) catch return null;
             ctor_body_effective = out.items;
+        } else {
+            // Base class: instance fields initialize at the start of the ctor.
+            ctor_body_effective = prependInstanceFields(p, ctor_body_effective, fields) orelse return null;
         }
 
         // Emit IIFE wrapper
         const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
         const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
         var fn_body = std.ArrayList(*Node){};
+        if (heritage_expr) |he| {
+            const hv = p.makeNode(.var_decl, start, start, .{
+                .var_decl = .{ .kind = .var_, .name = "__super__", .init = he },
+            }) orelse return null;
+            fn_body.append(p.arena, hv) catch return null;
+        }
 
+        // Named class → ctor name = class_name; anonymous with export-default hint → "default"; else null.
+        const ctor_fn_name: ?[]const u8 = if (has_name) class_name else blk: {
+            const hint = p.export_default_name_hint;
+            p.export_default_name_hint = null;
+            break :blk hint;
+        };
         const ctor_fn = p.makeNode(.function_expr, start, start, .{
-            .function_expr = .{ .name = null, .params = ctor_params, .body = ctor_body_effective, .is_arrow = false },
+            .function_expr = .{ .name = ctor_fn_name, .params = ctor_params, .body = ctor_body_effective, .is_arrow = false },
         }) orelse return null;
         const ctor_var = p.makeNode(.var_decl, start, start, .{
             .var_decl = .{ .kind = .var_, .name = class_name, .init = ctor_fn },
@@ -613,6 +874,13 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             fn_body.append(p.arena, stmt) catch return null;
         }
 
+        // static fields: `ClassName.<name> = <init>` after the class is defined.
+        for (fields) |f| {
+            if (!f.is_static) continue;
+            const stmt = makeStaticFieldInit(p, class_name, f) orelse return null;
+            fn_body.append(p.arena, stmt) catch return null;
+        }
+
         fn_body.append(p.arena, ret_stmt) catch return null;
 
         const fn_expr = p.makeNode(.function_expr, start, p.current.start, .{
@@ -682,18 +950,32 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
 
 pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     _ = p.expect(.left_brace) orelse return null;
+    p.fn_nesting_depth += 1;
+    // A function body is strict if it inherits strictness from the enclosing
+    // code or carries its own "use strict" directive prologue. Restored on exit
+    // so a strict function nested in sloppy code doesn't leak strictness back.
+    const saved_strict = p.strict;
     var body = std.ArrayList(*Node){};
     const li_start = p.live_imports.items.len;
     const le_start = p.live_exports.items.len;
+    const la_start = p.live_export_aliases.items.len;
+    var in_prologue = true;
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const s = p.parseStatement() orelse break;
         body.append(p.arena, s) catch {
             p.had_error = true;
             break;
         };
+        if (in_prologue) {
+            if (parser_file.directiveOf(s)) |dir| {
+                if (std.mem.eql(u8, dir, "use strict")) p.strict = true;
+            } else in_prologue = false;
+        }
         p.drainExtraStmts(&body);
     }
-    p.applyLiveBindings(body.items, li_start, le_start);
+    p.applyLiveBindings(body.items, li_start, le_start, la_start);
+    p.strict = saved_strict;
+    p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
     return body.items;
 }

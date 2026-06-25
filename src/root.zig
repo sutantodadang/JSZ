@@ -267,6 +267,20 @@ pub const _regex = @import("./runtime/builtins/regexp.zig");
 /// embedding surface; most users go through `Context.compileSnapshot`/`evalSnapshot`.
 pub const snapshot = @import("./bytecode/snapshot.zig");
 
+/// Milestone 16 (ESM): host filesystem module loader. `buildBundle` discovers
+/// the relative-import dependency graph from disk and wraps it as a `__modules__`
+/// registry the runtime `require()` resolver links/evaluates. Used by the CLI
+/// script loader and the Test262 module-test path.
+pub const module_loader = @import("./runtime/module.zig");
+
+/// M16 TLA: whether the most recent eval signalled async-test completion via
+/// `$DONE` (wired to `__jszAsyncDone__`/`__jszAsyncFail__`). A `[module, async]`
+/// test that finished `.ok` without signalling never completed (e.g. a hung
+/// promise / deadlocked async dependency) and should be treated as a failure.
+pub fn asyncDoneSignaled() bool {
+    return realm_mod.async_done_signaled;
+}
+
 /// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 8: compile `source` and write a bytecode→source JSON source map to
 /// `writer`. Maps each opcode (and nested function literals) back to a
@@ -363,6 +377,38 @@ pub const Context = struct {
         impl.setIcStats(self.ic_stats);
         impl.setLimits(self.limits.mem_bytes, self.limits.gas, self.limits.time_ms);
         const outcome = impl.evalWithMode(source, self.interp_mode, &[_]val_mod.NativeBinding{}) catch {
+            return EvalResult{ .exception = Exception{
+                .value = Value{},
+                .message = "out of memory",
+                .stack = &[_]StackFrame{},
+            } };
+        };
+        return switch (outcome) {
+            .ok => |v| EvalResult{ .ok = Value{ .bits = v.bits } },
+            .exception => |msg| EvalResult{ .exception = Exception{
+                .value = Value{},
+                .message = msg,
+                .stack = &[_]StackFrame{},
+            } },
+            .parse_error => |pe| EvalResult{ .parse_error = ParseError{
+                .message = pe.message,
+                .line = pe.line,
+                .column = pe.column,
+            } },
+        };
+    }
+
+    /// EXPERIMENTAL (unstable, may change before 1.0).
+    /// Milestone 16 (ESM) — Phase 1: evaluate `source` as ES-module code.
+    /// Module code runs strict (§11.2.2); import/export is desugared onto the
+    /// CommonJS `require`/`exports` model. `source_name` is the module's
+    /// canonical specifier (used as the `ModuleRecord` id and source name).
+    pub fn evalModule(self: *Context, source: []const u8, source_name: []const u8) EvalResult {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        impl.setJitMode(self.jit_mode);
+        impl.setIcStats(self.ic_stats);
+        impl.setLimits(self.limits.mem_bytes, self.limits.gas, self.limits.time_ms);
+        const outcome = impl.evalModule(source, source_name) catch {
             return EvalResult{ .exception = Exception{
                 .value = Value{},
                 .message = "out of memory",

@@ -9,6 +9,11 @@ const Value = val_mod.Value;
 const obj_mod = @import("../object/object.zig");
 const JsObject = @import("../object/object.zig").JsObject;
 const Heap = @import("../gc/heap.zig").Heap;
+// Milestone 16 (ESM) — Phase 1 module records.
+const module_mod = @import("./module.zig");
+pub const ModuleRecord = module_mod.ModuleRecord;
+pub const ModuleRegistry = module_mod.ModuleRegistry;
+pub const ModuleStatus = module_mod.ModuleStatus;
 
 // Phase 4b builtin modules
 const string_proto_mod = @import("./builtins/string_proto.zig");
@@ -34,6 +39,8 @@ const reflect_mod = @import("./builtins/reflect.zig");
 const coercion_mod = @import("./builtins/coercion.zig");
 // Phase 13 Proxy
 const proxy_mod = @import("./builtins/proxy.zig");
+// M16 Phase 4 ShadowRealm
+const shadow_realm_mod = @import("./builtins/shadow_realm.zig");
 // Phase 13 Intl
 const intl_mod = @import("./builtins/intl.zig");
 
@@ -75,6 +82,12 @@ pub const Context = struct {
     /// Lets generic object ops (defineProperty, getOwnPropertyDescriptor) treat
     /// functions as the objects they are.
     backing_obj_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, val: Value) anyerror!?*JsObject,
+    /// ShadowRealm: compile + run `source` as Script code in the supplied global
+    /// `Environment` (a shadow realm's global env, passed as an opaque pointer),
+    /// returning its completion value. A parse failure of `source` sets
+    /// pending_exception (a SyntaxError) and returns `error.ShadowParseError` so
+    /// the caller can distinguish it from a runtime throw (`error.JsException`).
+    shadow_eval_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8, global_env: *anyopaque) anyerror!Value,
 
     pub fn backingObject(self: *Context, arena: std.mem.Allocator, val: Value) anyerror!?*JsObject {
         return self.backing_obj_fn(self.ptr, arena, val);
@@ -111,7 +124,51 @@ pub const Context = struct {
     pub fn setProto(self: *Context, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void {
         return self.set_proto_fn(self.ptr, arena, obj_val, proto);
     }
+
+    pub fn shadowEval(self: *Context, arena: std.mem.Allocator, source: []const u8, global_env: *anyopaque) anyerror!Value {
+        return self.shadow_eval_fn(self.ptr, arena, source, global_env);
+    }
 };
+
+/// Milestone 16 (ESM) — Phase 1: evaluate a registered module through the
+/// active VM `Context`, driving the spec resolve→link→evaluate lifecycle on its
+/// `ModuleRecord`.
+///
+/// Phase 1 reuses the import/export → CommonJS `require`/`exports` desugaring
+/// already produced by `Parser.parseModule`, so "linking" is whatever the
+/// `__modules__` registry + `require()` resolver perform at runtime; this
+/// function owns the record's status transitions, dedup (an already-`evaluated`
+/// record returns its cached namespace), cyclic-import guarding (a re-entered
+/// `.evaluating` record returns its partial namespace rather than re-running),
+/// and error capture. `rec.source` is evaluated as module code via the host
+/// `Context.evalSource` re-entry point.
+pub fn evalModule(
+    ctx: *Context,
+    arena: std.mem.Allocator,
+    registry: *ModuleRegistry,
+    entry_id: []const u8,
+) anyerror!Value {
+    const rec = registry.get(entry_id) orelse return error.ModuleNotFound;
+    switch (rec.status) {
+        .evaluated => return rec.namespace,
+        // Cyclic re-entry: hand back the in-progress namespace (partial exports).
+        .evaluating => return rec.namespace,
+        .errored => {
+            pending_exception = rec.eval_error;
+            return error.JsException;
+        },
+        else => {},
+    }
+    rec.status = .evaluating;
+    const result = ctx.evalSource(arena, rec.source) catch |err| {
+        rec.status = .errored;
+        rec.eval_error = pending_exception;
+        return err;
+    };
+    rec.namespace = result;
+    rec.status = .evaluated;
+    return result;
+}
 
 /// Thread-local pointer to the currently active Context (set by VMs at eval entry).
 pub var active_context: ?*Context = null;
@@ -157,6 +214,7 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
         return val_mod.makeUndefined(arena);
     }
     const name = args[0].toPtr().string;
+    if (std.posix.getenv("JSZ_DBG") != null) std.debug.print("REQUIRE {s}\n", .{name});
     const env = active_global_env orelse return val_mod.makeUndefined(arena);
     if (std.mem.eql(u8, name, "module")) {
         return env.lookup("module") catch return val_mod.makeUndefined(arena);
@@ -174,10 +232,23 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
     const modules_obj = registry.toPtr().object;
     const resolved_name = resolveModuleName(arena, env, name) catch name;
     const lookup_name = if (modules_obj.get(resolved_name) != null) resolved_name else name;
+    // Eager resolution error: a module whose static-import closure reaches a
+    // missing file fails to load before it is ever evaluated.
+    if (moduleIsUnresolvable(env, lookup_name) or moduleIsUnresolvable(env, resolved_name))
+        return throwModuleNotFound(arena, name);
     if (modules_obj.get(lookup_name)) |entry| {
         if (entry.bits != 0 and entry.unbox() == .object) {
             const mod_obj = entry.toPtr().object;
             if (mod_obj.get("exports")) |exports_val| {
+                // A module that threw during evaluation stays errored: re-require
+                // re-throws the SAME error value (so an import-defer trigger, a
+                // dynamic import(), and an eager import all observe one error).
+                if (mod_obj.get("__evalError__")) |ev| {
+                    if (ev.bits != 0) {
+                        pending_exception = ev;
+                        return error.JsException;
+                    }
+                }
                 try syncRequireCache(env, lookup_name, entry);
                 return exports_val;
             }
@@ -198,20 +269,794 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
             }
             try syncRequireCache(env, lookup_name, module_val);
             const require_fn = env.lookup("require") catch try val_mod.makeUndefined(arena);
-            _ = function_proto_mod.invokeCallback(
+            const factory_ret = function_proto_mod.invokeCallback(
                 arena,
                 exports_val,
                 entry,
                 &[_]Value{ require_fn, module_val, exports_val },
-            ) catch return val_mod.makeUndefined(arena);
+            ) catch |err| {
+                // Module evaluation threw: record the error on the module record so
+                // a later require() (eager re-import or import-defer trigger)
+                // re-throws the same value, and propagate it to this importer.
+                if (err == error.JsException and pending_exception.bits != 0)
+                    module_obj.set("__evalError__", pending_exception) catch {};
+                return err;
+            };
+            // M16 TLA: an async-module factory returns its evaluation-completion
+            // Promise (resolves when the module body, including top-level await,
+            // finishes). Stash it so importers/`__awaitDeps__`/dynamic `import()`
+            // can wait for the module to fully evaluate.
+            const is_pending_async = factory_ret.bits != 0 and factory_ret.unbox() == .object and
+                factory_ret.toPtr().object.internal_kind == .promise and
+                promise_mod.isPending(factory_ret);
+            if (factory_ret.bits != 0 and factory_ret.unbox() == .object and
+                factory_ret.toPtr().object.internal_kind == .promise)
+            {
+                try module_obj.set("__evalPromise__", factory_ret);
+            }
             const final_exports = module_obj.get("exports") orelse exports_val;
-            try module_obj.set("loaded", try val_mod.makeBool(arena, true));
+            // An async factory that suspended at an `await` is still ~evaluating-
+            // async~: its body has not finished, so its record must NOT be marked
+            // `loaded` yet (a deferred-namespace access of this still-running module
+            // must throw — see EnsureDeferredNamespaceEvaluation / readyForSync).
+            // Defer the flag to when the evaluation promise settles. A factory whose
+            // promise is already settled (a fully synchronous-drained body) is done,
+            // so mark it loaded right away.
+            if (is_pending_async) {
+                const setter = try val_mod.makeNativeFunction(arena, nativeSetModuleLoaded);
+                const bound = try promise_mod.bindValueAsPrefix(arena, setter, module_val);
+                _ = try promise_mod.nativePromiseThen(arena, factory_ret, &[_]Value{ bound, bound });
+            } else {
+                try module_obj.set("loaded", try val_mod.makeBool(arena, true));
+            }
             return final_exports;
         }
         try syncRequireCache(env, lookup_name, entry);
         return entry;
     }
     return throwModuleNotFound(arena, name);
+}
+
+/// Mark a module record as `loaded` once its async evaluation promise settles.
+/// `args[0]` is the module record bound as the reaction prefix; the second arg
+/// (the settlement value/reason) is ignored — the record is `evaluated` whether
+/// the body fulfilled or rejected.
+fn nativeSetModuleLoaded(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object) {
+        try args[0].toPtr().object.set("loaded", try val_mod.makeBool(arena, true));
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+/// M16 Phase 2: wrap an imported module's live `exports` object in a Module
+/// Namespace exotic object (ES §10.4.6). Emitted by the `import * as ns`
+/// desugar as `var ns = __makeNamespace__(require('m'))`. A non-object argument
+/// (a malformed/absent module) is returned unchanged.
+pub fn nativeMakeNamespace(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) {
+        if (args.len == 0) return val_mod.makeUndefined(arena);
+        return args[0];
+    }
+    const exports_obj = args[0].toPtr().object;
+    // Idempotent: a namespace passed back in stays the same namespace.
+    if (exports_obj.internal_kind == .module_namespace) return args[0];
+    // GetModuleNamespace: return the cached namespace for this module if one was
+    // already created (stored under a private symbol on the live exports object,
+    // invisible to the namespace's own string keys).
+    if (active_sym_module_ns) |ns_sym| {
+        if (exports_obj.getOwnSym(ns_sym)) |cached| return cached;
+    }
+    const ns = if (active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    ns.internal_kind = .module_namespace;
+    ns.internal_slot = @ptrCast(exports_obj);
+    // @@toStringTag = "Module" (non-writable, non-enumerable, non-configurable),
+    // set before sealing so the append is permitted.
+    if (active_sym_to_string_tag) |tag| {
+        try ns.setSymAttr(tag, try val_mod.makeString(arena, "Module"), .{
+            .writable = false,
+            .enumerable = false,
+            .configurable = false,
+        });
+    }
+    ns.extensible = false;
+    const ns_val = try val_mod.makeObject(arena, ns);
+    // Cache on the exports object so subsequent imports observe the same object.
+    if (active_sym_module_ns) |ns_sym| try exports_obj.setSym(ns_sym, ns_val);
+    return ns_val;
+}
+
+/// Deferred import: `import defer * as ns from 'm'` desugars to
+/// `var ns = __importDefer__('m')`. Build a Module Namespace exotic object whose
+/// backing module is NOT yet evaluated: it carries the canonical module id under
+/// `active_sym_deferred_id` and an empty backing. A later triggering operation
+/// (`[[Get]]`/`[[HasProperty]]`/`[[Delete]]`/`[[DefineOwnProperty]]`/
+/// `[[GetOwnProperty]]`/`[[OwnPropertyKeys]]` on a non-symbol-like key) evaluates
+/// the module and wires the live exports in. Symbol keys (and the deferred `then`)
+/// never trigger evaluation.
+pub fn nativeImportDefer(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string)
+        return val_mod.makeUndefined(arena);
+    const spec = args[0].toPtr().string;
+    // Resolve to the canonical registry id NOW (we are in the importing module's
+    // scope, so `__module_id__` is correct); the trigger then requires it directly.
+    const env = active_global_env;
+    const canonical = if (env) |e| (resolveModuleName(arena, e, spec) catch spec) else spec;
+    // Import-defer × TLA: eagerly evaluate the deferred module's asynchronous
+    // transitive dependencies (its top-level-await frontier, precomputed by the
+    // bundler in `__deferGather__`). Per InnerModuleEvaluation these run eagerly,
+    // in source order, while the deferred module itself stays unevaluated. Each
+    // such module is an async factory, so requiring it kicks off (and suspends
+    // at) its top-level await; the importer's `__awaitDeps__` barrier awaits them.
+    if (env) |e| {
+        if (e.lookup("__deferGather__")) |gv| {
+            if (gv.bits != 0 and gv.unbox() == .object) {
+                if (gv.toPtr().object.get(canonical)) |list_val| {
+                    if (list_val.bits != 0 and list_val.unbox() == .object) {
+                        const arr = list_val.toPtr().object;
+                        const len = arr.getArrayLength();
+                        var i: u32 = 0;
+                        var buf: [16]u8 = undefined;
+                        while (i < len) : (i += 1) {
+                            const key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
+                            const id_val = arr.get(key) orelse continue;
+                            if (id_val.bits == 0 or id_val.unbox() != .string) continue;
+                            _ = try nativeRequire(arena, Value{}, &[_]Value{id_val});
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+    }
+    return getOrMakeDeferredNamespace(arena, canonical);
+}
+
+/// Dynamic deferred import: `import.defer(spec)` returns a promise that fulfils
+/// with the module's deferred namespace exotic object WITHOUT evaluating it (the
+/// module body runs lazily on first triggering access). Loading is synchronous in
+/// the bundler model, so the promise resolves immediately with the (cached)
+/// deferred namespace — identical to the static `import defer` object.
+pub fn nativeImportDeferDynamic(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
+        return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{
+            try val_mod.makeString(arena, "TypeError: import.defer() requires a string specifier"),
+        });
+    }
+    const spec = args[0].toPtr().string;
+    const env = active_global_env;
+    const canonical = if (env) |e| (resolveModuleName(arena, e, spec) catch spec) else spec;
+    const ns = try getOrMakeDeferredNamespace(arena, canonical);
+    return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{ns});
+}
+
+/// GetModuleNamespace for the deferred phase: return the *single* deferred
+/// namespace exotic object for a given canonical module id, creating it on first
+/// request and caching it so static `import defer`, re-exported deferred
+/// namespaces, and dynamic `import.defer()` of the same module all observe the
+/// SAME object (identity per the proposal). The object is distinct from the
+/// module's eager namespace (`__makeNamespace__`).
+pub fn getOrMakeDeferredNamespace(arena: std.mem.Allocator, canonical: []const u8) anyerror!Value {
+    // Identity cache, keyed by canonical id.
+    if (active_deferred_ns_registry) |reg_val| {
+        if (reg_val.bits != 0 and reg_val.unbox() == .object) {
+            if (reg_val.toPtr().object.get(canonical)) |cached| return cached;
+        }
+    }
+    const ns = if (active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    ns.internal_kind = .module_namespace;
+    ns.internal_slot = null; // not yet evaluated
+    // A deferred namespace's @@toStringTag is "Deferred Module" (not "Module"),
+    // distinguishing it from an eager namespace; it persists after evaluation.
+    if (active_sym_to_string_tag) |tag| {
+        try ns.setSymAttr(tag, try val_mod.makeString(arena, "Deferred Module"), .{
+            .writable = false,
+            .enumerable = false,
+            .configurable = false,
+        });
+    }
+    if (active_sym_deferred_id) |sym|
+        try ns.setSym(sym, try val_mod.makeString(arena, canonical));
+    ns.extensible = false;
+    const ns_val = try val_mod.makeObject(arena, ns);
+    if (active_deferred_ns_registry) |reg_val| {
+        if (reg_val.bits != 0 and reg_val.unbox() == .object) {
+            try reg_val.toPtr().object.set(canonical, ns_val);
+        }
+    }
+    return ns_val;
+}
+
+/// True when `o` is a deferred (not-yet-evaluated) module namespace.
+pub fn isDeferredNamespace(o: *JsObject) bool {
+    if (o.internal_kind != .module_namespace) return false;
+    const sym = active_sym_deferred_id orelse return false;
+    return o.getOwnSym(sym) != null;
+}
+
+/// True when module `id` is currently mid-evaluation: its record exists in
+/// `__modules__` (cache-before-invoke) as a module object whose `loaded` flag is
+/// still false (the factory is on the stack and has not returned). Used to detect
+/// a deferred-namespace access of a self/cyclic module that is not yet finished.
+fn moduleIsEvaluating(arena: std.mem.Allocator, id: []const u8) bool {
+    const env = active_global_env orelse return false;
+    const registry = env.lookup("__modules__") catch return false;
+    if (registry.bits == 0 or registry.unbox() != .object) return false;
+    const modules_obj = registry.toPtr().object;
+    const resolved = resolveModuleName(arena, env, id) catch id;
+    const entry = modules_obj.get(resolved) orelse modules_obj.get(id) orelse return false;
+    if (entry.bits == 0 or entry.unbox() != .object) return false; // still a factory → not started
+    const mod_obj = entry.toPtr().object;
+    // A module record with exports but loaded===false is executing right now.
+    if (mod_obj.get("exports") == null) return false;
+    const loaded = mod_obj.get("loaded") orelse return false;
+    return loaded.bits != 0 and loaded.unbox() == .boolean and loaded.unbox().boolean == false;
+}
+
+/// ReadyForSyncExecution (sec-EnsureDeferredNamespaceEvaluation): true when the
+/// module identified by `id` may be evaluated synchronously right now — no module
+/// in its transitive synchronous frontier is currently ~evaluating~ and none has
+/// top-level await. Implemented by the bundle-emitted `__readyForSync__` helper,
+/// which walks `__moduleGraph__` (resolved dep ids + [[HasTLA]]) and reads each
+/// module's [[Status]] from its `__modules__` record without evaluating anything.
+/// When the helper is absent (no relative-import bundle) we conservatively report
+/// ready so an ordinary deferred access still evaluates.
+fn readyForSyncExecution(arena: std.mem.Allocator, id: []const u8) bool {
+    const env = active_global_env orelse return true;
+    const helper = env.lookup("__readyForSync__") catch return true;
+    if (!isCallableValue(helper)) return true;
+    const id_val = val_mod.makeString(arena, id) catch return true;
+    const ret = function_proto_mod.invokeCallback(arena, Value{}, helper, &[_]Value{id_val}) catch return true;
+    return ret.bits != 0 and ret.unbox() == .boolean and ret.unbox().boolean;
+}
+
+/// True when module `id`'s record carries an `__evalPromise__` — i.e. it
+/// evaluated as an async factory (top-level await, or a transitive async dep).
+/// Used to decide whether a deferred trigger must drain microtasks to complete
+/// the module body synchronously.
+fn moduleHasEvalPromise(arena: std.mem.Allocator, id: []const u8) bool {
+    const env = active_global_env orelse return false;
+    const registry = env.lookup("__modules__") catch return false;
+    if (registry.bits == 0 or registry.unbox() != .object) return false;
+    const modules_obj = registry.toPtr().object;
+    const resolved = resolveModuleName(arena, env, id) catch id;
+    const entry = modules_obj.get(resolved) orelse modules_obj.get(id) orelse return false;
+    if (entry.bits == 0 or entry.unbox() != .object) return false;
+    const ep = entry.toPtr().object.get("__evalPromise__") orelse return false;
+    return ep.bits != 0;
+}
+
+/// Evaluate a deferred namespace's module (EvaluateSync) and wire its live
+/// exports as the backing, clearing the deferred marker so subsequent operations
+/// see an ordinary, evaluated namespace. Idempotent / no-op for non-deferred.
+pub fn triggerDeferredNamespace(arena: std.mem.Allocator, o: *JsObject) anyerror!void {
+    const sym = active_sym_deferred_id orelse return;
+    const id_val = o.getOwnSym(sym) orelse return;
+    if (id_val.bits == 0 or id_val.unbox() != .string) return;
+    // EvaluateSync / ReadyForSyncExecution: a deferred namespace whose module (or
+    // any module in its transitive synchronous frontier) is currently mid-
+    // evaluation — a cyclic/self access before the body has finished — or has
+    // top-level await is NOT ready for synchronous execution, so the trigger
+    // throws a TypeError instead of evaluating. The walk only inspects [[Status]]
+    // and never evaluates a dependency (so e.g. a not-yet-reached module stays
+    // unevaluated when the access throws). The stored id is already the canonical
+    // registry id (resolved at `__importDefer__` time), matching __moduleGraph__.
+    if (!readyForSyncExecution(arena, id_val.toPtr().string))
+        return throwTypeError(arena, "Cannot access a deferred module namespace while the module is being evaluated");
+    // We do NOT delete the marker before evaluating: the deferred namespace is
+    // non-extensible, so we could not re-add it if evaluation throws. Instead the
+    // marker is cleared only on SUCCESS (deleteOwnSym works on a non-extensible
+    // object). A re-entrant access during the module body is safe — require()
+    // caches the module before invoking its factory, so the nested trigger gets
+    // the partial exports and returns without re-invoking. If evaluation throws,
+    // the marker stays, so a later access re-triggers and require() re-throws the
+    // SAME cached module error.
+    const exports_val = try nativeRequire(arena, Value{}, &[_]Value{id_val});
+    // Import-defer × TLA: an async deferred module (one with top-level await, or
+    // that imports such a module) evaluates as an async factory whose body runs
+    // across microtasks. Its asynchronous transitive dependencies were already
+    // evaluated eagerly at `__importDefer__` time, so its remaining body has no
+    // truly-pending work — draining the microtask queue here completes it
+    // synchronously, so the triggering access observes a fully-evaluated module
+    // (spec EvaluateSync / ReadyForSyncExecution). For a synchronous module the
+    // require already ran the whole body and the queue holds nothing relevant.
+    if (moduleHasEvalPromise(arena, id_val.toPtr().string))
+        promise_mod.runMicrotasks(arena);
+    if (exports_val.bits != 0 and exports_val.unbox() == .object) {
+        // Wire the live exports as the backing. We do NOT register this object as
+        // the module's eager namespace (active_sym_module_ns): a deferred namespace
+        // is a distinct exotic object from the eager `import * as` namespace.
+        o.internal_slot = @ptrCast(exports_val.toPtr().object);
+        _ = o.deleteOwnSym(sym); // success: no longer deferred
+    }
+}
+
+/// Trigger gate for a string-keyed operation: a deferred namespace evaluates for
+/// any string key except the deferred-`then` (treated symbol-like by spec).
+pub fn maybeTriggerDeferredStr(arena: std.mem.Allocator, o: *JsObject, key: []const u8) anyerror!void {
+    if (!isDeferredNamespace(o)) return;
+    if (std.mem.eql(u8, key, "then")) return;
+    // Private names (`#x`) never trigger deferred evaluation: PrivateGet/PrivateSet
+    // and the `#x in obj` brand check operate on private elements via
+    // PrivateElementFind, which bypasses the namespace exotic [[Get]]/[[Has]]/etc.
+    // JSZ models a private element as the property key "#x", so guard it here.
+    if (key.len > 0 and key[0] == '#') return;
+    try triggerDeferredNamespace(arena, o);
+}
+
+/// M16 Phase 5: define a live re-export getter on the exports object.
+/// `__liveReexport__(exports, 'name', sourceObj, 'prop')` creates a getter
+/// that reads `sourceObj.prop` at access time, making the re-export a live
+/// binding to the source module's export. Used by `export { X as Y } from './mod'`.
+pub fn nativeLiveReexport(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len < 4) return val_mod.makeUndefined(arena);
+    if (args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeUndefined(arena);
+    if (args[1].bits == 0 or args[1].unbox() != .string) return val_mod.makeUndefined(arena);
+    if (args[2].bits == 0 or args[2].unbox() != .object) return val_mod.makeUndefined(arena);
+    if (args[3].bits == 0 or args[3].unbox() != .string) return val_mod.makeUndefined(arena);
+
+    const exports_obj = args[0].toPtr().object;
+    const name = args[1].toPtr().string;
+    const source_obj = args[2].toPtr().object;
+    const prop = args[3].toPtr().string;
+
+    // Create a getter holder object: { get: nativeFn, source: sourceObj, prop: propName }
+    // The getter reads source[prop] at access time.
+    const getter_holder = try JsObject.create(arena, null);
+    // Store the source and prop as hidden properties for the getter to use.
+    // We need a native getter function that reads source[prop].
+    // Since we can't create closures in native code, store source+prop on the holder
+    // and use a generic getter that reads them back.
+    try getter_holder.set("__source__", args[2]);
+    try getter_holder.set("__prop__", args[3]);
+    try getter_holder.set("get", try val_mod.makeNativeFunction(arena, liveReexportGetter));
+    const holder_val = try val_mod.makeObject(arena, getter_holder);
+
+    const ok = try exports_obj.defineOwnAccessor(name, holder_val, .{
+        .enumerable = true,
+        .configurable = true,
+    });
+    if (!ok) {
+        // If define fails (non-configurable), fall back to direct assignment
+        const val = source_obj.get(prop) orelse try val_mod.makeUndefined(arena);
+        try exports_obj.set(name, val);
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+/// Getter function for live re-exports: reads `this.__source__[this.__prop__]`.
+fn liveReexportGetter(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object) return val_mod.makeUndefined(arena);
+    const holder = this_val.toPtr().object;
+    const source = holder.get("__source__") orelse return val_mod.makeUndefined(arena);
+    const prop_val = holder.get("__prop__") orelse return val_mod.makeUndefined(arena);
+    if (source.bits == 0 or source.unbox() != .object) return val_mod.makeUndefined(arena);
+    if (prop_val.bits == 0 or prop_val.unbox() != .string) return val_mod.makeUndefined(arena);
+    const prop = prop_val.toPtr().string;
+    return source.toPtr().object.get(prop) orelse try val_mod.makeUndefined(arena);
+}
+
+/// M16 Phase 4: store a module's export names on its live exports object so the
+/// namespace exotic can detect TDZ (known exports missing from the backing).
+/// Called ONCE per module, immediately before the module body executes:
+/// `__initExports__(exports, ["name1", "name2", ...])`
+///   or: `__initExports__(exports, ["all", "names"], ["tdz", "names"])`
+///
+/// Stores the full export names list under a private symbol for hasExport and
+/// sortedNames. When a third argument (TDZ-only names) is provided, only those
+/// names get TDZ markers on the backing object (let/const/class are uninitialized
+/// during instantiation; var/function are hoisted and NOT in TDZ). When only
+/// two arguments are provided, all names get TDZ markers (backwards compat).
+pub fn nativeInitExports(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len < 2) return val_mod.makeUndefined(arena);
+    if (args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeUndefined(arena);
+    if (args[1].bits == 0 or args[1].unbox() != .object) return val_mod.makeUndefined(arena);
+    const exports_obj = args[0].toPtr().object;
+    const names_arr = args[1].toPtr().object;
+    // Store the export names array on the exports object as a symbol-keyed property
+    // so the namespace exotic can read it to distinguish "known but uninitialized"
+    // exports from non-exports.
+    if (active_sym_export_names) |sym| {
+        try exports_obj.setSym(sym, args[1]);
+    }
+    // When a third argument (TDZ-only names) is provided, store it separately
+    // and only set TDZ markers for those names. Otherwise (backwards compat),
+    // set markers for ALL names.
+    var has_tdz_list = false;
+    if (args.len >= 3 and args[2].bits != 0 and args[2].unbox() == .object) {
+        const tdz_arr = args[2].toPtr().object;
+        if (active_sym_tdz_export_names) |sym| {
+            try exports_obj.setSym(sym, args[2]);
+        }
+        // Set TDZ markers only for names in the TDZ list
+        const marker = tdz_marker orelse return val_mod.makeUndefined(arena);
+        const n = tdz_arr.getArrayLength();
+        var i: u32 = 0;
+        var buf: [32]u8 = undefined;
+        while (i < n) : (i += 1) {
+            const idx_key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
+            if (tdz_arr.get(idx_key)) |name_val| {
+                if (name_val.bits != 0 and name_val.unbox() == .string) {
+                    const name_str = name_val.toPtr().string;
+                    try exports_obj.set(name_str, marker);
+                }
+            }
+        }
+        has_tdz_list = true;
+        // Also set non-TDZ export names to undefined so they appear as own
+        // properties on the exports object immediately.  This is critical for
+        // circular `export * from` — __exportStar__ uses Object.keys(s) to
+        // discover names, and var exports (hoisted to undefined) must be
+        // visible before the module body runs.  Function exports are overwritten
+        // by the pre-hoist (exports.NAME = NAME) that follows __initExports__.
+        const undef = try val_mod.makeUndefined(arena);
+        const nn = names_arr.getArrayLength();
+        var ii: u32 = 0;
+        var buf2: [32]u8 = undefined;
+        // Build a set of TDZ names for quick lookup.
+        var tdz_set = std.StringHashMap(void).init(arena);
+        const tdz_n = tdz_arr.getArrayLength();
+        var ti: u32 = 0;
+        var tbuf: [32]u8 = undefined;
+        while (ti < tdz_n) : (ti += 1) {
+            const tkey = std.fmt.bufPrint(&tbuf, "{d}", .{ti}) catch break;
+            if (tdz_arr.get(tkey)) |tv| {
+                if (tv.bits != 0 and tv.unbox() == .string) {
+                    tdz_set.put(tv.toPtr().string, {}) catch {};
+                }
+            }
+        }
+        while (ii < nn) : (ii += 1) {
+            const idx_key = std.fmt.bufPrint(&buf2, "{d}", .{ii}) catch break;
+            if (names_arr.get(idx_key)) |name_val| {
+                if (name_val.bits != 0 and name_val.unbox() == .string) {
+                    const name_str = name_val.toPtr().string;
+                    if (!tdz_set.contains(name_str)) {
+                        exports_obj.set(name_str, undef) catch {};
+                    }
+                }
+            }
+        }
+    }
+    // Backwards compat (no TDZ list): mark ALL names as TDZ
+    if (!has_tdz_list) {
+        const marker = tdz_marker orelse return val_mod.makeUndefined(arena);
+        const n = names_arr.getArrayLength();
+        var i: u32 = 0;
+        var buf: [32]u8 = undefined;
+        while (i < n) : (i += 1) {
+            const idx_key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
+            if (names_arr.get(idx_key)) |name_val| {
+                if (name_val.bits != 0 and name_val.unbox() == .string) {
+                    const name_str = name_val.toPtr().string;
+                    try exports_obj.set(name_str, marker);
+                }
+            }
+        }
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+/// Context block for a deferred dynamic import: carries the module specifier
+/// and the pending result promise that the microtask will resolve/reject.
+const DeferredImportCtx = struct {
+    name: []const u8, // resolved module id (canonical specifier)
+    result: Value, // pending promise to settle once evaluated
+};
+
+/// Microtask body for a deferred dynamic `import()`. Runs after the current
+/// synchronous evaluation chain (static-import DFS) completes, so the module's
+/// factory will have already been invoked through the static-import hoist by
+/// the time this fires. Settles `result` with the module namespace (or rejects
+/// if require throws).
+fn deferredImportResolve(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const ctx: *DeferredImportCtx = @ptrCast(@alignCast(slot));
+    if (std.posix.getenv("JSZ_DBG") != null) std.debug.print("deferredImportResolve name={s} result_bits={x}\n", .{ ctx.name, ctx.result.bits });
+    const name_val = val_mod.makeString(arena, ctx.name) catch return val_mod.makeUndefined(arena);
+    const exports_val = nativeRequire(arena, Value{}, &[_]Value{name_val}) catch |err| {
+        if (err == error.JsException) {
+            const reason = pending_exception;
+            pending_exception = Value{};
+            promise_mod.settleResult(arena, ctx.result, reason, false);
+            return val_mod.makeUndefined(arena);
+        }
+        return err;
+    };
+    const ns = nativeMakeNamespace(arena, Value{}, &[_]Value{exports_val}) catch exports_val;
+    // Handle async modules: chain onto their eval promise so this import only
+    // fulfills once the module's top-level-await body finishes.
+    if (lookupEvalPromise(arena, ctx.name)) |eval_promise| {
+        const ns_box = arena.create(Value) catch {
+            promise_mod.settleResult(arena, ctx.result, ns, true);
+            return val_mod.makeUndefined(arena);
+        };
+        ns_box.* = ns;
+        const returner = val_mod.makeNativeFunctionData(arena, importNsReturner, ns_box) catch {
+            promise_mod.settleResult(arena, ctx.result, ns, true);
+            return val_mod.makeUndefined(arena);
+        };
+        // .then(returner) on the eval promise produces a chained promise whose
+        // value is the namespace; adopt it as the resolution of our result.
+        const chained = promise_mod.nativePromiseThen(arena, eval_promise, &[_]Value{ returner, Value{} }) catch {
+            promise_mod.settleResult(arena, ctx.result, ns, true);
+            return val_mod.makeUndefined(arena);
+        };
+        promise_mod.settleResult(arena, ctx.result, chained, true); // thenable adoption
+        return val_mod.makeUndefined(arena);
+    }
+    promise_mod.settleResult(arena, ctx.result, ns, true);
+    return val_mod.makeUndefined(arena);
+}
+
+/// M16 Phase 3: dynamic `import(specifier)`. Desugared by the parser to a call
+/// `__import__(specifier)`. Resolves and loads the module through the same
+/// `__modules__` registry + `require()` resolver used by static imports, wraps
+/// the resulting live `exports` in a Module Namespace exotic object, and hands
+/// back a Promise (ES §16.2.1.8 ImportCall): fulfilled with the namespace, or
+/// rejected with whatever the resolve/evaluation threw. The specifier argument
+/// is already evaluated by the VM before this native runs, so an abrupt
+/// specifier expression propagates synchronously (never as a rejection).
+///
+/// DFS-ordering guarantee: when the target module is a not-yet-evaluated
+/// factory (it will be invoked by the static-import hoist of the calling
+/// module's entry), evaluation is deferred to a microtask. This ensures that
+/// the static DFS chain (A's body → entry's B require) runs before the dynamic
+/// import's side-effects, matching the spec's InnerModuleEvaluation order.
+pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (std.posix.getenv("JSZ_DBG") != null and args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) std.debug.print("IMPORT {s}\n", .{args[0].toPtr().string});
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
+        return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{
+            try val_mod.makeString(arena, "TypeError: import() requires a string specifier"),
+        });
+    }
+    // A second argument `{ with: { type: '...' } }` selects a typed (JSON/text)
+    // module: fold the type into the specifier so it keys the same synthetic
+    // module record the static-import desugar registers (`spec\x00type`).
+    const args2 = importApplyTypeAttr(arena, args) catch args;
+    const raw_name = args2[0].toPtr().string;
+    // Resolve the specifier to the canonical id used in __modules__.
+    const env = active_global_env orelse {
+        // No environment — fall through to synchronous load.
+        return nativeImportSync(arena, args2);
+    };
+    const registry = env.lookup("__modules__") catch {
+        return nativeImportSync(arena, args2);
+    };
+    if (registry.bits == 0 or registry.unbox() != .object) return nativeImportSync(arena, args2);
+    const modules_obj = registry.toPtr().object;
+    const resolved = resolveModuleName(arena, env, raw_name) catch raw_name;
+    const lookup_name = if (modules_obj.get(resolved) != null) resolved else raw_name;
+    // Eager resolution error: a module whose static-import closure reaches a
+    // missing file fails to load, so import() rejects before any evaluation.
+    if (moduleIsUnresolvable(env, lookup_name) or moduleIsUnresolvable(env, resolved)) {
+        return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{
+            try val_mod.makeString(arena, try std.fmt.allocPrint(arena, "Error: Cannot find module '{s}'", .{raw_name})),
+        });
+    }
+    // Check the current state of the module in the registry.
+    if (modules_obj.get(lookup_name)) |entry| {
+        if (entry.bits != 0 and entry.unbox() == .object) {
+            const mod_obj = entry.toPtr().object;
+            if (mod_obj.get("exports") != null) {
+                // Already evaluated (module object cached) — resolve immediately.
+                return nativeImportSync(arena, args2);
+            }
+        }
+        if (isCallableValue(entry)) {
+            // Factory not yet invoked: defer evaluation to a microtask so the
+            // calling module's static-import DFS runs first (spec §16.2.1.5.1
+            // step 11.c.iv — pending-dependency ordering).
+            const result_p = try promise_mod.newPendingPromise(arena);
+            if (std.posix.getenv("JSZ_DBG") != null) std.debug.print("nativeImport deferred name={s} result_bits={x}\n", .{ lookup_name, result_p.bits });
+            const ctx = try arena.create(DeferredImportCtx);
+            ctx.* = .{ .name = lookup_name, .result = result_p };
+            const resolve_fn = try val_mod.makeNativeFunctionData(arena, deferredImportResolve, ctx);
+            // Enqueue via Promise.resolve(undefined).then(resolve_fn) so
+            // resolve_fn fires as the next microtask after the sync chain.
+            const trigger = try promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{
+                try val_mod.makeUndefined(arena),
+            });
+            _ = try promise_mod.nativePromiseThen(arena, trigger, &[_]Value{ resolve_fn, Value{} });
+            return result_p;
+        }
+    }
+    // Module not in registry (bare specifier, external, etc.) — synchronous load.
+    return nativeImportSync(arena, args2);
+}
+
+/// If `import(spec, options)` carries an import-attributes `with: { type: '...' }`
+/// (or legacy `assert: { ... }`) second argument, return a new args slice whose
+/// specifier is `spec\x00type`; otherwise return `args` unchanged. The folded
+/// specifier matches the typed-module key the static-import desugar registers.
+fn importApplyTypeAttr(arena: std.mem.Allocator, args: []const Value) anyerror![]const Value {
+    if (args.len < 2 or args[1].bits == 0 or args[1].unbox() != .object) return args;
+    const opts = args[1].toPtr().object;
+    const attrs_val = opts.get("with") orelse opts.get("assert") orelse return args;
+    if (attrs_val.bits == 0 or attrs_val.unbox() != .object) return args;
+    const type_val = attrs_val.toPtr().object.get("type") orelse return args;
+    if (type_val.bits == 0 or type_val.unbox() != .string) return args;
+    const ty = type_val.toPtr().string;
+    if (ty.len == 0) return args;
+    const typed = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ args[0].toPtr().string, ty });
+    const out = try arena.alloc(Value, 1);
+    out[0] = try val_mod.makeString(arena, typed);
+    return out;
+}
+
+/// Synchronous path for `nativeImport`: evaluate the module immediately and
+/// return a (possibly deferred) promise for its namespace. Used when the module
+/// is already evaluated (cached) or when the deferred path is unavailable.
+fn nativeImportSync(arena: std.mem.Allocator, args: []const Value) anyerror!Value {
+    // Load the module like `require()`. A resolution/evaluation throw is captured
+    // and turned into a rejected promise rather than propagated synchronously.
+    const exports_val = nativeRequire(arena, Value{}, args) catch |err| {
+        if (err == error.JsException) {
+            const reason = pending_exception;
+            pending_exception = Value{};
+            return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{reason});
+        }
+        return err;
+    };
+    const ns = try nativeMakeNamespace(arena, Value{}, &[_]Value{exports_val});
+    // M16 TLA: if the imported module is async (its factory returned an
+    // evaluation-completion promise), the dynamic import must fulfil only once
+    // the module has finished evaluating (including top-level await), and reject
+    // if its evaluation rejects. Chain the namespace onto the eval promise.
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) {
+        if (lookupEvalPromise(arena, args[0].toPtr().string)) |eval_promise| {
+            const ns_box = try arena.create(Value);
+            ns_box.* = ns;
+            const returner = try val_mod.makeNativeFunctionData(arena, importNsReturner, ns_box);
+            return promise_mod.nativePromiseThen(arena, eval_promise, &[_]Value{returner});
+        }
+    }
+    // A fresh promise per call (ImportCall NewPromiseCapability) fulfilled with
+    // the namespace. `nativePromiseResolve` only short-circuits for a promise
+    // argument; a namespace is an ordinary object, so a new promise is created.
+    return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{ns});
+}
+
+/// Promise `then` reaction (dynamic import): ignore the eval result, return the
+/// bound module namespace value (carried as native data).
+fn importNsReturner(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const ns_box: *Value = @ptrCast(@alignCast(slot));
+    return ns_box.*;
+}
+
+/// Look up a (resolved) module's evaluation-completion promise, if it is an
+/// async module that stashed one during `require()`. `name` is the raw specifier.
+fn lookupEvalPromise(arena: std.mem.Allocator, name: []const u8) ?Value {
+    const env = active_global_env orelse return null;
+    const registry = env.lookup("__modules__") catch return null;
+    if (registry.bits == 0 or registry.unbox() != .object) return null;
+    const modules_obj = registry.toPtr().object;
+    const resolved = resolveModuleName(arena, env, name) catch name;
+    const lookup_name = if (modules_obj.get(resolved) != null) resolved else name;
+    const mod_val = modules_obj.get(lookup_name) orelse return null;
+    if (mod_val.bits == 0 or mod_val.unbox() != .object) return null;
+    const ep = mod_val.toPtr().object.get("__evalPromise__") orelse return null;
+    if (ep.bits == 0 or ep.unbox() != .object) return null;
+    if (ep.toPtr().object.internal_kind != .promise) return null;
+    return ep;
+}
+
+/// M16 TLA: `__awaitDeps__([id, ...])` — the async-dependency barrier. Returns a
+/// Promise that settles when every listed module's evaluation-completion promise
+/// settles (Promise.all), so an async-module body resumes only after all of its
+/// async dependencies have finished evaluating. Ids whose module has no eval
+/// promise (already evaluated / synchronous) are treated as resolved.
+pub fn nativeAwaitDeps(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const undef = try val_mod.makeUndefined(arena);
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object)
+        return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    const env = active_global_env orelse return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    const registry = env.lookup("__modules__") catch return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    if (registry.bits == 0 or registry.unbox() != .object)
+        return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    const modules_obj = registry.toPtr().object;
+    const ids_arr = args[0].toPtr().object;
+    const promises = try JsObject.createArray(arena, active_array_proto);
+    var n: u32 = 0;
+    const len = ids_arr.getArrayLength();
+    var i: u32 = 0;
+    var buf: [32]u8 = undefined;
+    while (i < len) : (i += 1) {
+        const key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch break;
+        const id_val = ids_arr.get(key) orelse continue;
+        if (id_val.bits == 0 or id_val.unbox() != .string) continue;
+        const mod_val = modules_obj.get(id_val.toPtr().string) orelse continue;
+        if (mod_val.bits == 0 or mod_val.unbox() != .object) continue;
+        const ep = mod_val.toPtr().object.get("__evalPromise__") orelse continue;
+        const idx_key = try std.fmt.allocPrint(arena, "{d}", .{n});
+        try promises.set(idx_key, ep);
+        n += 1;
+    }
+    promises.array_length = n;
+    if (n == 0) return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{undef});
+    return promise_mod.nativePromiseAll(arena, Value{}, &[_]Value{try val_mod.makeObject(arena, promises)});
+}
+
+// M16 TLA: completion tracking for `[module, async]` tests. With true async
+// module evaluation, `$DONE` may be invoked from a microtask after the
+// synchronous run returns, and an assertion that throws inside a promise
+// reaction is otherwise swallowed. The harness `$DONE` is wired to these
+// natives so the host can detect success (signaled, no error) vs. failure (an
+// error value) vs. never-completed (not signaled) after draining microtasks.
+pub var async_done_signaled: bool = false;
+pub var async_done_error: Value = .{};
+/// Set when the entry module's async evaluation (the async IIFE / top-level
+/// async body) rejects — the spec's `Evaluate()` promise rejection. Surfaced as
+/// the eval outcome's exception so negative module tests and uncaught async
+/// module errors are observable even though the synchronous run returned `.ok`.
+pub var module_eval_error: Value = .{};
+
+/// Reset async-test completion state at the start of an evaluation.
+pub fn resetAsyncDone() void {
+    async_done_signaled = false;
+    async_done_error = Value{};
+    module_eval_error = Value{};
+}
+
+/// `__jszModuleReject__(err)` — records the entry module's evaluation rejection.
+pub fn nativeModuleReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (module_eval_error.bits == 0)
+        module_eval_error = if (args.len > 0 and args[0].bits != 0) args[0] else try val_mod.makeString(arena, "module evaluation failed");
+    return val_mod.makeUndefined(arena);
+}
+
+/// Best-effort message string for a thrown/rejected value (Error object's
+/// name+message, a raw string, else a generic). Used to report async failures.
+pub fn errorValueMessage(arena: std.mem.Allocator, v: Value) []const u8 {
+    if (v.bits == 0) return "async test failed";
+    switch (v.unbox()) {
+        .string => |s| return s,
+        .object => |obj| {
+            const name = if (obj.get("name")) |nv|
+                (if (nv.bits != 0 and nv.unbox() == .string) nv.toPtr().string else "Error")
+            else
+                "Error";
+            const msg = if (obj.get("message")) |mv|
+                (if (mv.bits != 0 and mv.unbox() == .string) mv.toPtr().string else "")
+            else
+                "";
+            return std.fmt.allocPrint(arena, "{s}: {s}", .{ name, msg }) catch "async test failed";
+        },
+        else => return "async test failed",
+    }
+}
+
+/// `__jszAsyncDone__()` — the test signalled successful async completion.
+pub fn nativeAsyncDone(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    async_done_signaled = true;
+    return val_mod.makeUndefined(arena);
+}
+
+/// `__jszAsyncFail__(err)` — the test signalled async failure with `err`.
+pub fn nativeAsyncFail(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    async_done_signaled = true;
+    async_done_error = if (args.len > 0 and args[0].bits != 0) args[0] else try val_mod.makeString(arena, "async test failed");
+    return val_mod.makeUndefined(arena);
+}
+
+/// M16 Phase 3: the `import.meta` object (ES §16.2.1.10). Created once per realm
+/// as an ordinary object with a null [[Prototype]] (extensible) carrying the
+/// host `url` property; the parser desugars every `import.meta` to a reference
+/// to the module-scoped `__import_meta__` binding holding this object, so all
+/// references within a module observe the same object. `evalModule` updates
+/// `url` to the active module's specifier before evaluation.
+pub fn makeImportMeta(arena: std.mem.Allocator, url: []const u8) !Value {
+    const obj = if (active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    try obj.set("url", try val_mod.makeString(arena, url));
+    return val_mod.makeObject(arena, obj);
 }
 
 fn throwModuleNotFound(arena: std.mem.Allocator, name: []const u8) !Value {
@@ -224,6 +1069,17 @@ fn throwModuleNotFound(arena: std.mem.Allocator, name: []const u8) !Value {
     try err_obj.set("name", try val_mod.makeString(arena, "Error"));
     pending_exception = try val_mod.makeObject(arena, err_obj);
     return error.JsException;
+}
+
+/// Eager resolution-error gate: true when `id` (a canonical registry id) is in
+/// the bundle's `__moduleUnresolved__` set — it transitively, via static import
+/// edges, imports a module missing from disk. Such a module fails to load (spec
+/// LoadRequestedModules), so `require`/`import()` of it throws/rejects before any
+/// evaluation, even when the missing module sits behind an `import defer`.
+fn moduleIsUnresolvable(env: *Environment, id: []const u8) bool {
+    const set = env.lookup("__moduleUnresolved__") catch return false;
+    if (set.bits == 0 or set.unbox() != .object) return false;
+    return set.toPtr().object.get(id) != null;
 }
 
 fn syncRequireCache(env: *Environment, id: []const u8, module_val: Value) !void {
@@ -327,6 +1183,35 @@ pub var active_sym_species: ?Value = null;
 /// as GC-traced symbol-keyed own properties.
 pub var active_sym_proxy_target: ?Value = null;
 pub var active_sym_proxy_handler: ?Value = null;
+/// M16: private symbol caching a module's namespace exotic object on its live
+/// exports object, so GetModuleNamespace returns the *same* object each time
+/// (`import * as a` and `import * as b` of one module compare ===).
+pub var active_sym_module_ns: ?Value = null;
+/// Deferred import: private symbol storing the canonical module id of a not-yet-
+/// evaluated `import defer * as ns` namespace, on the namespace object itself.
+/// Its presence marks the namespace as deferred; a triggering operation reads it,
+/// evaluates the module via `require`, wires the backing exports, and removes it.
+pub var active_sym_deferred_id: ?Value = null;
+/// Deferred import: a null-prototype object mapping canonical module id → its
+/// single deferred namespace exotic object, so repeated `import defer` (and
+/// dynamic `import.defer()`) of one module observe the same object (identity).
+pub var active_deferred_ns_registry: ?Value = null;
+/// M16 Phase 4: private symbol storing a module's export names array on its
+/// live exports object, so the namespace exotic can check TDZ for uninitialized
+/// exports even before the module body runs (self-imports).
+pub var active_sym_export_names: ?Value = null;
+
+/// M16 Phase 4: private symbol storing a module's TDZ-only export names array
+/// on its live exports object. This is a subset of export_names — only the
+/// names from `let`, `const`, and `class` declarations that are uninitialized
+/// during instantiation. Used by the namespace exotic to distinguish TDZ
+/// bindings from hoisted (var/function) bindings.
+pub var active_sym_tdz_export_names: ?Value = null;
+
+/// M16 Phase 4: shared TDZ marker — a symbol pre-populated on every export
+/// property before its module body runs. The namespace [[Get]] checks for this
+/// symbol and throws ReferenceError when found.
+pub var tdz_marker: ?Value = null;
 
 /// Phase 4b: pending JS exception Value (set by JSON.parse on error).
 /// VMs check this after catching error.JsException from a native call.
@@ -1411,6 +2296,7 @@ pub const Realm = struct {
                 const values_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectValues);
                 try ctor_obj.set("keys", keys_fn);
                 try ctor_obj.set("values", values_fn);
+                try ctor_obj.set("assign", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectAssign));
                 const entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectEntries);
                 try ctor_obj.set("entries", entries_fn);
                 const from_entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFromEntries);
@@ -1624,6 +2510,15 @@ pub const Realm = struct {
             const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
             try symbol_ctor.set(name, try val_mod.makeSymbol(arena, desc));
         }
+        // Symbol.prototype.constructor === Symbol, and the `description` accessor
+        // (a getter holder `{ get: nativeFn }`, matching the live-reexport pattern).
+        try symbol_proto.set("constructor", try val_mod.makeObject(arena, symbol_ctor));
+        const sym_desc_holder = try JsObject.create(arena, null);
+        try sym_desc_holder.set("get", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolDescriptionGet));
+        _ = try symbol_proto.defineOwnAccessor("description", try val_mod.makeObject(arena, sym_desc_holder), .{
+            .enumerable = false,
+            .configurable = true,
+        });
         try env.define("Symbol", try val_mod.makeObject(arena, symbol_ctor));
         // Capture Symbol.iterator and register Array.prototype[Symbol.iterator].
         active_sym_iterator = symbol_ctor.getOwn("iterator");
@@ -1656,8 +2551,15 @@ pub const Realm = struct {
         // ---- ES2015 Proxy ----
         active_sym_proxy_target = try val_mod.makeSymbol(arena, "[[ProxyTarget]]");
         active_sym_proxy_handler = try val_mod.makeSymbol(arena, "[[ProxyHandler]]");
+        active_sym_module_ns = try val_mod.makeSymbol(arena, "[[Module.Namespace]]");
+        active_sym_deferred_id = try val_mod.makeSymbol(arena, "[[Module.DeferredId]]");
+        active_deferred_ns_registry = try val_mod.makeObject(arena, try JsObject.create(arena, null));
+        active_sym_export_names = try val_mod.makeSymbol(arena, "[[Module.ExportNames]]");
+        active_sym_tdz_export_names = try val_mod.makeSymbol(arena, "[[Module.TdzNames]]");
+        tdz_marker = try val_mod.makeSymbol(arena, "[[TDZ]]");
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
+        _ = try proxy_ctor.defineOwnData("revocable", try val_mod.makeNativeFunctionNamed(arena, proxy_mod.nativeProxyRevocable, "revocable", 2), .{ .writable = true, .enumerable = false, .configurable = true });
         try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
 
         // ---- Intl (en-US, dependency-free) ----
@@ -1686,6 +2588,10 @@ pub const Realm = struct {
             try intl_obj.set("Collator", try val_mod.makeObject(arena, col_ctor));
             try env.define("Intl", try val_mod.makeObject(arena, intl_obj));
         }
+
+        // ---- M16 Phase 4: ShadowRealm (defined before globalThis so the host
+        // global object mirrors the `ShadowRealm` binding) ----
+        try shadow_realm_mod.register(arena, env, object_proto, function_proto);
 
         // ---- ES2020 globalThis (+ Node-compatible `global`) ----
         try installGlobalThis(arena, env, object_proto);
@@ -1763,6 +2669,13 @@ pub const Realm = struct {
         // SIMPLEST SAFE APPROACH: Make Realm.object_prototype and array_prototype
         // also be GC-allocated when a heap is active. Do that here.
 
+        // The arena-allocated %Object.prototype% that every built-in prototype was
+        // parented to during Realm.init. After migration below it is replaced by a
+        // heap copy; any built-in prototype still pointing here must be reparented so
+        // identity checks like `Object.getPrototypeOf(X.prototype) === Object.prototype`
+        // continue to hold.
+        const old_object_proto = self.object_prototype;
+
         // Reallocate intrinsics on the heap so they have proper GcHeaders and
         // will be visited during mark. Register them as roots so they survive collect.
         const hp_proto = try heap.allocateObject(null);
@@ -1801,6 +2714,43 @@ pub const Realm = struct {
                     },
                     else => {},
                 }
+            }
+        }
+
+        // Likewise update the Array constructor's "prototype" so identity checks
+        // (`Object.getPrototypeOf(arr) === Array.prototype`) hold: array literals
+        // and JSON.parse build arrays off the migrated hp_array_proto, so the
+        // ctor's "prototype" must reference the same heap object, not the stale
+        // arena proto. (Matches the Object ctor fix above.)
+        if (self.global_env.bindings.getPtr("Array")) |arr_binding| {
+            const arr_val_ptr = &arr_binding.value;
+            if (arr_val_ptr.bits != 0) {
+                switch (arr_val_ptr.unbox()) {
+                    .object => |ctor_obj| {
+                        const new_proto_val = try val_mod.makeObject(self.arena, hp_array_proto);
+                        try ctor_obj.set("prototype", new_proto_val);
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Reparent every built-in prototype that was directly parented to the old
+        // arena %Object.prototype% so its [[Prototype]] now resolves to the heap copy
+        // exposed as `Object.prototype`. Each global constructor binding (Object,
+        // Symbol, Promise, Map, ShadowRealm, …) carries a `prototype` whose proto is
+        // the old object proto; fix those in one pass. (Array.prototype is already
+        // remapped above; reparenting it again is a harmless no-op.)
+        {
+            var it = self.global_env.bindings.iterator();
+            while (it.next()) |entry| {
+                const v = entry.value_ptr.value;
+                if (v.bits == 0 or v.unbox() != .object) continue;
+                const ctor = v.toPtr().object;
+                const proto_v = ctor.getOwn("prototype") orelse continue;
+                if (proto_v.bits == 0 or proto_v.unbox() != .object) continue;
+                const child = proto_v.toPtr().object;
+                if (child.proto == old_object_proto) child.proto = hp_proto;
             }
         }
 
@@ -1847,6 +2797,12 @@ pub const Realm = struct {
         active_sym_to_primitive = null;
         active_sym_to_string_tag = null;
         active_sym_species = null;
+        active_sym_module_ns = null;
+        active_sym_deferred_id = null;
+        active_deferred_ns_registry = null;
+        active_sym_export_names = null;
+        active_sym_tdz_export_names = null;
+        tdz_marker = null;
         active_sym_proxy_target = null;
         active_sym_proxy_handler = null;
         typed_array_mod.active_arraybuffer_proto = null;
@@ -1887,6 +2843,42 @@ test "Realm: Object.create in env" {
     const obj_val = try realm.global_env.lookup("Object");
     try std.testing.expect(obj_val.bits != 0);
     try std.testing.expect(obj_val.unbox() == .object);
+}
+
+test "evalModule: cached/cyclic/errored records short-circuit without re-running" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A Context whose callbacks are never reached on these early-return paths;
+    // if evalModule wrongly called eval_fn the undefined pointer would trap.
+    var ctx: Context = undefined;
+    var reg = ModuleRegistry.init(arena);
+
+    // Unknown id → ModuleNotFound.
+    try std.testing.expectError(error.ModuleNotFound, evalModule(&ctx, arena, &reg, "missing"));
+
+    // Already-evaluated → returns the cached namespace.
+    const done = try reg.getOrCreate("done", "x");
+    done.status = .evaluated;
+    done.namespace = Value{ .bits = 42 };
+    const got = try evalModule(&ctx, arena, &reg, "done");
+    try std.testing.expectEqual(@as(u64, 42), got.bits);
+
+    // Cyclic re-entry (status == .evaluating) → returns the partial namespace.
+    const cyc = try reg.getOrCreate("cyc", "x");
+    cyc.status = .evaluating;
+    cyc.namespace = Value{ .bits = 7 };
+    const partial = try evalModule(&ctx, arena, &reg, "cyc");
+    try std.testing.expectEqual(@as(u64, 7), partial.bits);
+
+    // Errored → re-raises as a JS exception with the captured value.
+    const bad = try reg.getOrCreate("bad", "x");
+    bad.status = .errored;
+    bad.eval_error = Value{ .bits = 99 };
+    pending_exception = Value{};
+    try std.testing.expectError(error.JsException, evalModule(&ctx, arena, &reg, "bad"));
+    try std.testing.expectEqual(@as(u64, 99), pending_exception.bits);
 }
 
 test "Realm: activateHeap migrates protos to heap" {

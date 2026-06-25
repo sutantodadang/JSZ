@@ -26,6 +26,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !*JsObject {
     try promise_ctor_obj.set("all", try val_mod.makeNativeFunction(arena, nativePromiseAll));
     try promise_ctor_obj.set("race", try val_mod.makeNativeFunction(arena, nativePromiseRace));
     try promise_ctor_obj.set("any", try val_mod.makeNativeFunction(arena, nativePromiseAny));
+    try promise_ctor_obj.set("withResolvers", try val_mod.makeNativeFunction(arena, nativePromiseWithResolvers));
     try promise_proto.set("finally", try val_mod.makeNativeFunction(arena, nativePromiseFinally));
     try ctx.env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
     return promise_proto;
@@ -126,6 +127,14 @@ fn getData(this_val: Value) ?*PromiseData {
     if (o.internal_kind != .promise) return null;
     if (o.internal_slot) |slot| return @ptrCast(@alignCast(slot));
     return null;
+}
+
+/// True when `v` is a Promise still in the pending state. Used by the module
+/// loader to decide whether an async factory's evaluation has actually finished
+/// (so its record may be marked `loaded`) or is still suspended at an `await`.
+pub fn isPending(v: Value) bool {
+    const d = getData(v) orelse return false;
+    return d.state == .pending;
 }
 
 fn enqueueReactionJob(arena: std.mem.Allocator, r: Reaction, state: PromiseState, value: Value) !void {
@@ -252,6 +261,51 @@ pub fn nativePromiseCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
         return this_val;
     }
     return makePromise(arena, .pending, try val_mod.makeUndefined(arena));
+}
+
+/// True when `v` is a constructor (mirrors Reflect's IsConstructor check): the
+/// native-built Promise constructor is an ordinary object carrying `__call__`.
+fn isConstructorVal(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .bc_function => true,
+        .object => |o| o.get("__call__") != null or
+            o.internal_kind == .bound_function or
+            o.internal_kind == .proxy,
+        else => false,
+    };
+}
+
+/// Promise.withResolvers() (ES2024): returns `{ promise, resolve, reject }`
+/// where `resolve`/`reject` settle the new pending `promise`. The receiver `C`
+/// must be a constructor — `NewPromiseCapability(C)` throws a TypeError otherwise.
+pub fn nativePromiseWithResolvers(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (!isConstructorVal(this_val)) {
+        const err = if (realm_mod.active_heap) |h|
+            try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)
+        else
+            try JsObject.create(arena, realm_mod.error_proto_TypeError);
+        try err.set("name", try val_mod.makeString(arena, "TypeError"));
+        try err.set("message", try val_mod.makeString(arena, "Promise.withResolvers called on a non-constructor"));
+        realm_mod.pending_exception = try val_mod.makeObject(arena, err);
+        return error.JsException;
+    }
+    const p = try makePendingPromise(arena);
+    const data = getData(p) orelse return p;
+    const resolve_data = try arena.create(ResolverData);
+    const reject_data = try arena.create(ResolverData);
+    resolve_data.* = .{ .promise = data, .resolve_mode = true };
+    reject_data.* = .{ .promise = data, .resolve_mode = false };
+    const resolve_val = try makeResolverObject(arena, resolve_data);
+    const reject_val = try makeResolverObject(arena, reject_data);
+    const obj = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+    try obj.set("promise", p);
+    try obj.set("resolve", resolve_val);
+    try obj.set("reject", reject_val);
+    return val_mod.makeObject(arena, obj);
 }
 
 pub fn nativePromiseResolve(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
@@ -794,7 +848,7 @@ fn nativeFinallyThrowThunk(arena: std.mem.Allocator, _: Value, args: []const Val
 }
 
 /// Build a simple bound function with one prefix value and no carrier `this`.
-fn bindValueAsPrefix(arena: std.mem.Allocator, native_fn: Value, prefix_val: Value) !Value {
+pub fn bindValueAsPrefix(arena: std.mem.Allocator, native_fn: Value, prefix_val: Value) !Value {
     const pfx = try arena.alloc(Value, 1);
     pfx[0] = prefix_val;
     const bd = try arena.create(fn_proto.BoundData);
@@ -931,27 +985,52 @@ fn runReactionJob(arena: std.mem.Allocator, job: Job) void {
     }
 }
 
+// A monotonic cursor into `microtasks` shared across (possibly re-entrant)
+// `runMicrotasks` calls, plus a flag marking whether a drain is already active.
+// Re-entrancy happens when a job's JS callback synchronously drains the queue
+// itself — e.g. an import-defer trigger evaluating an async module from within a
+// property access that is itself running inside a microtask. The cursor is
+// advanced *before* a job runs, so a nested drain resumes only at the not-yet-run
+// jobs and never re-runs the in-flight one (which would resume an already-running
+// coroutine). Only the outermost drain clears the (fully consumed) queue.
+var drain_cursor: usize = 0;
+var draining: bool = false;
+
 pub fn runMicrotasks(arena: std.mem.Allocator) void {
-    // Index by position: reactions may enqueue more jobs (growing the list). A
-    // job's fields are snapshotted inside runReactionJob, so a reallocation here
-    // can't dangle a reference (see runReactionJob).
-    var idx: usize = 0;
-    while (idx < microtasks.items.len) : (idx += 1) {
-        runReactionJob(arena, microtasks.items[idx]);
+    // Reactions may enqueue more jobs (growing the list). A job's fields are
+    // snapshotted inside runReactionJob, so a reallocation here can't dangle a
+    // reference (see runReactionJob); `microtasks.items` is re-read each step.
+    const outermost = !draining;
+    draining = true;
+    while (drain_cursor < microtasks.items.len) {
+        const job = microtasks.items[drain_cursor];
+        drain_cursor += 1;
+        runReactionJob(arena, job);
     }
-    microtasks.clearRetainingCapacity();
+    if (outermost) {
+        microtasks.clearRetainingCapacity();
+        drain_cursor = 0;
+        draining = false;
+    }
 }
 
 pub fn clearMicrotasks() void {
     // Drop the backing slice (do NOT free — its arena was already reset by the caller).
     // Retaining capacity would dangle into the freed eval arena and crash the next append.
     microtasks = .empty;
+    drain_cursor = 0;
+    draining = false;
 }
 
 /// Top-level-await for a single-threaded engine: drain the microtask queue until
-/// the awaited promise settles. Non-promises (and unsettleable pendings) pass through.
+/// the awaited value settles. Plain values, thenables, and actual Promises are
+/// all routed through Promise.resolve() so thenables are assimilated and plain
+/// primitives surface immediately as fulfilled values.
 pub fn awaitValue(arena: std.mem.Allocator, v: Value) anyerror!Value {
-    const data = getData(v) orelse return v;
+    // Promise.resolve(promise) → identity; Promise.resolve(thenable) → calls
+    // then(resolve,reject) synchronously; Promise.resolve(primitive) → fulfilled.
+    const p = nativePromiseResolve(arena, Value{}, &[_]Value{v}) catch return v;
+    const data = getData(p) orelse return v;
     runMicrotasks(arena);
     return switch (data.state) {
         .fulfilled => data.value,

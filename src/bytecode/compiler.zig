@@ -25,6 +25,9 @@ pub const LabelEntry = struct {
     continue_patches: std.ArrayListUnmanaged(usize) = .empty,
     // Where the loop starts (for continue with label).
     loop_start: usize = 0,
+    /// Block-scope nesting depth at the point this label was entered, so a
+    /// `break L` can emit EXIT_SCOPE for every block scope it unwinds out of.
+    scope_depth: u32 = 0,
 };
 
 /// Set by `compileProgram` when a `break`/`continue` targets an undefined label
@@ -47,6 +50,10 @@ pub const LoopCtx = struct {
     /// to this (its iteration produced an empty completion). null outside the
     /// program's implicit-return (completion-value) compilation.
     prev_reg: ?u8 = null,
+    /// Block-scope nesting depth just outside this loop's per-iteration scope.
+    /// `break`/`continue` emit EXIT_SCOPE for each block scope between the
+    /// statement and this depth so the frame env is balanced on the jump.
+    scope_depth: u32 = 0,
 };
 
 pub const FnCompiler = struct {
@@ -91,6 +98,9 @@ pub const FnCompiler = struct {
     /// operand of `return` is only in tail position when try_depth == 0
     /// (a pending finally would run after the call returns, so it is not tail).
     try_depth: u32 = 0,
+    /// Number of block scopes (ENTER_SCOPE) currently open in the bytecode being
+    /// emitted. Used so `break`/`continue` emit matching EXIT_SCOPE ops.
+    block_scope_depth: u32 = 0,
     /// ES2020 optional chaining: while compiling an `optional_chain`, this points
     /// to the list of JMP_IF_NULLISH patch offsets emitted by optional links.
     /// They are all patched to the chain's short-circuit landing pad. null when
@@ -293,6 +303,58 @@ pub const FnCompiler = struct {
         }
     }
 
+    /// Collect `let`/`const` declaration names reachable at function/script scope
+    /// (recursing through nested statements but NOT into nested function bodies).
+    /// These need HOIST_LEX emitted at scope entry to put them in TDZ.
+    pub fn collectLexicalNames(self: *Self, node: *ast.Node, list: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        switch (node.kind) {
+            .var_decl => {
+                if (node.data.var_decl.kind == .let or node.data.var_decl.kind == .const_) {
+                    try self.addHoistName(list, node.data.var_decl.name);
+                }
+            },
+            .block_stmt => {
+                // A real nested block is its own lexical scope (handled by
+                // lowerBlockStmt via ENTER_SCOPE); its `let`/`const` must NOT be
+                // hoisted into this enclosing scope. A transparent block (class
+                // desugaring, multi-declarator lowering) belongs to this scope,
+                // so its lexical names ARE collected here.
+                if (!node.data.block_stmt.lexical_scope) {
+                    for (node.data.block_stmt.body) |c| try self.collectLexicalNames(c, list);
+                }
+            },
+            .if_stmt => {
+                try self.collectLexicalNames(node.data.if_stmt.consequent, list);
+                if (node.data.if_stmt.alternate) |a| try self.collectLexicalNames(a, list);
+            },
+            .while_stmt => try self.collectLexicalNames(node.data.while_stmt.body, list),
+            .do_while_stmt => try self.collectLexicalNames(node.data.do_while_stmt.body, list),
+            .for_stmt => {
+                if (node.data.for_stmt.init) |i| try self.collectLexicalNames(i, list);
+                try self.collectLexicalNames(node.data.for_stmt.body, list);
+            },
+            .for_in_stmt => {
+                // Do NOT recurse into for_in_stmt.left — loop-scoped let/const
+                // bindings are per-iteration and should NOT be hoisted to the
+                // enclosing function/module scope. They are initialized directly
+                // by the for-in/for-of lowering via INIT_LEX each iteration.
+                try self.collectLexicalNames(node.data.for_in_stmt.body, list);
+            },
+            .try_stmt => {
+                try self.collectLexicalNames(node.data.try_stmt.block, list);
+                if (node.data.try_stmt.handler) |h| try self.collectLexicalNames(h.body, list);
+                if (node.data.try_stmt.finalizer) |f| try self.collectLexicalNames(f, list);
+            },
+            .switch_stmt => {
+                for (node.data.switch_stmt.cases) |case| {
+                    for (case.body) |c| try self.collectLexicalNames(c, list);
+                }
+            },
+            .labeled_stmt => try self.collectLexicalNames(node.data.labeled_stmt.body, list),
+            else => {},
+        }
+    }
+
     // --------------------------------------------------------- emit name store ---
 
     pub fn emitStore(self: *Self, name: []const u8, rsrc: u8, line: u32) !void {
@@ -311,6 +373,39 @@ pub const FnCompiler = struct {
         try self.emitOp(.DEFINE_GLOBAL, line);
         try self.emitU16(kidx);
         try self.emitU8(rsrc);
+    }
+
+    /// Emit a HOIST_LEX for `name` (declares it as an uninitialized lexical
+    /// binding in TDZ at scope entry).
+    pub fn emitHoistLexical(self: *Self, name: []const u8, line: u32) !void {
+        const sv = try val_mod.makeString(self.arena, name);
+        const kidx = try self.addConstant(sv);
+        try self.emitOp(.HOIST_LEX, line);
+        try self.emitU16(kidx);
+    }
+
+    /// Emit an INIT_LEX for `name` (initializes an existing lexical binding
+    /// with R[rsrc], taking it out of TDZ). is_const=true marks the binding
+    /// as immutable so later assignments throw TypeError.
+    pub fn emitInitLexical(self: *Self, name: []const u8, rsrc: u8, line: u32, is_const: bool) !void {
+        const sv = try val_mod.makeString(self.arena, name);
+        const kidx = try self.addConstant(sv);
+        try self.emitOp(.INIT_LEX, line);
+        try self.emitU16(kidx);
+        try self.emitU8(rsrc);
+        try self.emitU8(if (is_const) 1 else 0);
+    }
+
+    /// Emit EXIT_SCOPE for every block scope between the current depth and
+    /// `target_depth` (exclusive). Used on `break`/`continue` jump paths so the
+    /// frame env is unwound to the loop's level. Does NOT mutate
+    /// `block_scope_depth` (textual nesting is unchanged; only the runtime jump
+    /// path pops envs).
+    pub fn emitExitScopesTo(self: *Self, target_depth: u32, line: u32) !void {
+        var d = self.block_scope_depth;
+        while (d > target_depth) : (d -= 1) {
+            try self.emitOp(.EXIT_SCOPE, line);
+        }
     }
 
     // -------------------------------------------------------- compile expr -> R ---
@@ -795,6 +890,12 @@ pub const FnCompiler = struct {
                 try self.emitStore(a.target.data.identifier, rhs, line);
             } else if (a.target.kind == .member_expr) {
                 try self.compileMemberWrite(a.target.data.member_expr, rhs, line);
+            } else if (a.target.kind == .object_literal) {
+                // Object destructuring assignment: `{ a: x, b } = rhs`. The
+                // object literal node doubles as the assignment pattern. The
+                // whole expression still evaluates to `rhs`, so keep it live.
+                try self.compileDestructure(a.target, rhs, line);
+                self.sp = rhs + 1;
             }
             return rhs;
         }
@@ -836,6 +937,64 @@ pub const FnCompiler = struct {
             try self.compileMemberWrite(a.target.data.member_expr, rdst, line);
         }
         return rdst;
+    }
+
+    /// Assign the value held in register `rsrc` to a destructuring pattern
+    /// `target` (an object literal reused as an ObjectAssignmentPattern), or to a
+    /// nested simple target (identifier / member / `pattern = default`). `rsrc`
+    /// is read-only and must stay live for the caller; helpers only allocate
+    /// registers above it. Array patterns are left unhandled (no-op) for now.
+    fn compileDestructure(self: *Self, target: *Node, rsrc: u8, line: u32) error{OutOfMemory}!void {
+        switch (target.kind) {
+            .identifier => try self.emitStore(target.data.identifier, rsrc, line),
+            .member_expr => try self.compileMemberWrite(target.data.member_expr, rsrc, line),
+            .assignment_expr => {
+                // `pattern = default`: substitute `default` when `rsrc` is nullish.
+                const ae = target.data.assignment_expr;
+                if (ae.op != .assign) return; // only plain `=` is a valid default
+                const rt = self.allocReg();
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(rt);
+                try self.emitU8(rsrc);
+                // Skip the default-load when `rt` is not nullish.
+                try self.emitOp(.JMP_IF_NOT_NULLISH, line);
+                try self.emitU8(rt);
+                const patch = self.currentOffset();
+                try self.emitI16(0);
+                const rd = try self.compileExpr(ae.value);
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(rt);
+                try self.emitU8(rd);
+                self.sp = rt + 1; // free any regs the default expr used
+                self.patchJump(patch, self.currentOffset());
+                try self.compileDestructure(ae.target, rt, line);
+                self.sp = rt; // free rt
+            },
+            .object_literal => {
+                for (target.data.object_literal.properties) |prop| {
+                    if (prop.kind != .init) continue; // patterns carry only data props
+                    const rval = self.allocReg();
+                    if (prop.computed_key) |key_node| {
+                        const rkey = try self.compileExpr(key_node);
+                        try self.emitOp(.GET_PROP_DYN, line);
+                        try self.emitU8(rval);
+                        try self.emitU8(rsrc);
+                        try self.emitU8(rkey);
+                        self.sp = rval + 1; // free rkey
+                    } else {
+                        const sv = try val_mod.makeString(self.arena, prop.key);
+                        const kidx = try self.addConstant(sv);
+                        try self.emitOp(.GET_PROP, line);
+                        try self.emitU8(rval);
+                        try self.emitU8(rsrc);
+                        try self.emitU16(kidx);
+                    }
+                    try self.compileDestructure(prop.value, rval, line);
+                    self.sp = rval; // free rval
+                }
+            },
+            else => {}, // unsupported pattern element: leave unassigned
+        }
     }
 
     /// ES2021 logical assignment (`&&=`, `||=`, `??=`). Short-circuits: reads the
@@ -1457,6 +1616,15 @@ pub const FnCompiler = struct {
             for (hoisted.items) |name| try self.emitHoist(name, 0);
         }
 
+        // Lexical hoisting pre-pass: declare every `let`/`const` name as an
+        // uninitialized lexical binding (TDZ) at scope entry, so reads before
+        // initialization throw ReferenceError instead of returning undefined.
+        {
+            var lexical: std.ArrayList([]const u8) = .empty;
+            for (body) |stmt| try self.collectLexicalNames(stmt, &lexical);
+            for (lexical.items) |name| try self.emitHoistLexical(name, 0);
+        }
+
         // Function declarations are fully instantiated (closure created AND
         // bound) at scope entry, before any statement executes — so forward
         // references resolve. Emit direct-child function declarations here and
@@ -1579,6 +1747,7 @@ pub fn compileFunctionStrict(
     for (instanceof_ic_table) |*entry| entry.* = ic_mod.InstanceofCache{};
     f.* = BcFunction{
         .name = name,
+        .nfe_name = nfe_name,
         .arity = @intCast(params.len),
         .chunk = chunk,
         .num_regs = num_regs,
@@ -1630,6 +1799,38 @@ pub fn compileProgram(
     return f;
 }
 
+/// Milestone 16 — Phase 1: compile an ES-module top level to a `BcFunction`.
+///
+/// Same lowering as `compileProgram` (top-level program that yields its last
+/// expression-statement value), but module code is strict by spec (§11.2.2):
+/// strictness is forced on regardless of a "use strict" directive, so nested
+/// functions inherit it. The import/export desugar has already happened in the
+/// parser, so the body is plain (strict) statements over `require`/`exports`.
+pub fn compileModule(
+    arena: std.mem.Allocator,
+    program: *const ast.Program,
+    source_name: []const u8,
+) !*BcFunction {
+    last_label_error = null;
+    const f = try compileFunctionStrict(
+        arena,
+        source_name,
+        &[_][]const u8{},
+        program.body,
+        null,
+        true, // module code is always strict
+        false,
+        program.has_tla, // M16 TLA: a module with top-level await compiles its
+        // body as async so `await` truly suspends (driven as a coroutine by
+        // runMainAsync); modules without TLA stay synchronous.
+        true, // top-level program: yield last expression-statement value
+        false, // program is not an arrow
+        null, // program has no rest parameter
+    );
+    f.is_module = true;
+    return f;
+}
+
 // ---------------------------------------------------------------- tests ---
 
 test "compiler: compile empty program" {
@@ -1639,6 +1840,23 @@ test "compiler: compile empty program" {
     const prog = ast.Program{ .body = &[_]*ast.Node{} };
     const f = try compileProgram(alloc, &prog, "<test>");
     try std.testing.expect(f.arity == 0);
+    try std.testing.expect(f.chunk.code.len > 0);
+}
+
+test "compiler: compileModule is always strict" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parser_mod = @import("../parser/parser.zig");
+    var p = parser_mod.Parser.init("export var x = 1;", alloc);
+    const stmts = switch (p.parseModule()) {
+        .ok => |s| s,
+        .err => return error.ParseFailed,
+    };
+    const prog = ast.Program{ .body = stmts, .is_strict = true, .is_module = true };
+    const f = try compileModule(alloc, &prog, "<module-test>");
+    try std.testing.expect(f.is_strict);
     try std.testing.expect(f.chunk.code.len > 0);
 }
 

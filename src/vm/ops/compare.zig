@@ -2,6 +2,7 @@
 //! R2: comparison/logical opcode handlers extracted from `bc_vm.runLoop`.
 //! Each handler is `pub inline fn` so the optimizer folds it back into the
 //! dispatch switch — behaviour and codegen are identical to the inline arms.
+const std = @import("std");
 const bcv = @import("../bc_vm.zig");
 const BcVm = bcv.BcVm;
 const BcCallFrame = bcv.BcCallFrame;
@@ -199,6 +200,21 @@ pub inline fn opTypeof(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const tv = frame.registers[rsrc];
+    // typeof respects TDZ: if the operand is the TDZ sentinel (a live-exported
+    // let/const binding not yet initialized), throw ReferenceError.
+    const realm_mod = @import("../../runtime/realm.zig");
+    if (realm_mod.tdz_marker) |marker| {
+        if (tv.bits != 0 and tv.unbox() == .symbol and
+            tv.toPtr().symbol == marker.toPtr().symbol)
+        {
+            const msg = try std.fmt.allocPrint(self.arena, "Cannot access binding before initialization", .{});
+            const exc_val = try self.makeErrorObjectBc("ReferenceError", msg);
+            self.last_exception_value = exc_val;
+            const found = try self.throwException(exc_val);
+            if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+            return null;
+        }
+    }
     const info = bcv.classifyTypeof(tv);
     const cache = &@constCast(frame.func.typeof_ic_table)[site_pc];
     const hit = cache.initialized and cache.tag == info.tag and
