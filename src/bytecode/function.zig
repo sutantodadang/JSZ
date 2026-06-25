@@ -39,6 +39,10 @@ pub const BcFunction = struct {
     /// called it runs as a reaction-driven coroutine and returns a Promise;
     /// each `await` suspends via a YIELD opcode.
     is_async: bool = false,
+    /// Whether this function literal is an arrow. Arrows have no own `this`
+    /// binding: the VM uses the `this` captured into the closure at NEW_CLOSURE
+    /// time instead of any caller-provided value.
+    is_arrow: bool = false,
     /// M16: this top-level function compiles ES-module code. Used so the VM binds
     /// the module's top-level `this` to undefined (a Script binds it to the global
     /// object). Only meaningful on a program/module top-level function.
@@ -58,6 +62,12 @@ pub const BcClosure = struct {
     func: *const BcFunction,
     /// *Environment at definition site. Opaque to avoid circular import.
     env: *anyopaque,
+    /// Arrow functions capture the `this` of their definition site (they have no
+    /// own `this` binding). Set at NEW_CLOSURE time when `func.is_arrow`; the call
+    /// dispatch uses it for the frame's `this` instead of any caller-provided
+    /// value (so `arrow.call(x)` / `[].map(()=>this, x)` keep the lexical this).
+    /// `bits == 0` (the empty Value) when not an arrow / nothing captured.
+    captured_this: @import("../value/value.zig").Value = .{},
     /// W2 unification: lazily-created backing object holding the function's own
     /// properties (incl. its `prototype` object, materialized on first access).
     /// Makes bc functions first-class objects so `C.prototype.m = ...`, `new C()`,

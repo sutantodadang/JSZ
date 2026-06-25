@@ -32,6 +32,12 @@ pub inline fn opNewClosure(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     closure.* = BcClosure{
         .func = child_fn,
         .env = @ptrCast(frame.env),
+        // Arrows have no own `this`: capture the definition site's `this` now so
+        // it's used regardless of how/with-what-this the arrow is later called.
+        .captured_this = if (child_fn.is_arrow)
+            (if (frame.this_val.bits != 0) frame.this_val else try val_mod.makeUndefined(self.arena))
+        else
+            Value{},
     };
     const jsv = try self.arena.create(@import("../../value/value.zig").JsValue);
     jsv.* = @import("../../value/value.zig").JsValue{ .bc_function = closure };
@@ -147,7 +153,8 @@ pub inline fn opTailCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         frame.env = call_env;
         frame.return_dst = inherited_ret;
         frame.caller_idx = inherited_caller;
-        frame.this_val = this_val;
+        // Arrows use their captured lexical `this`, not the call-site value.
+        frame.this_val = if (fn_ptr.is_arrow) closure.captured_this else this_val;
         frame.try_stack = .empty;
     } else {
         // Fallback: native/bound/object callee. Do a normal call,
@@ -295,7 +302,8 @@ pub inline fn opTailMethodCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         frame.env = call_env;
         frame.return_dst = inherited_ret;
         frame.caller_idx = inherited_caller;
-        frame.this_val = this_val;
+        // Arrows use their captured lexical `this`, not the receiver.
+        frame.this_val = if (fn_ptr.is_arrow) closure.captured_this else this_val;
         frame.try_stack = .empty;
     } else {
         // Fallback: native/bound/getter/generator/async callee. Do a

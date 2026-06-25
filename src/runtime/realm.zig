@@ -1948,16 +1948,16 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
         .function, .bc_function, .native_function => "Function",
         else => "Object",
     };
-    // ES 20.1.3.6 step 16: check @@toStringTag, override for non-Undefined/Null.
-    if (this_val.unbox() != .undefined_ and this_val.unbox() != .null_) {
+    // ES 20.1.3.6 step 15: `Let tag be ? Get(O, @@toStringTag)` — an ordinary
+    // Get that walks the prototype chain and invokes accessors (e.g.
+    // %TypedArray%.prototype[@@toStringTag] is an inherited getter). A string
+    // result overrides the builtin tag.
+    if (this_val.unbox() == .object) {
         if (active_sym_to_string_tag) |tag_sym| {
-            if (this_val.unbox() == .object) {
-                const obj = this_val.unbox().object;
-                if (obj.getSym(tag_sym)) |tv| {
-                    const s = tv.unbox();
-                    if (s == .string) {
-                        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{s.string}));
-                    }
+            if (active_context) |ctx| {
+                const tv = try ctx.getPropSym(arena, this_val, tag_sym);
+                if (tv.bits != 0 and tv.unbox() == .string) {
+                    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{tv.unbox().string}));
                 }
             }
         }

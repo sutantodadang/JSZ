@@ -1803,6 +1803,7 @@ pub fn compileFunctionStrict(
         .is_strict = is_strict,
         .is_generator = is_generator,
         .is_async = is_async,
+        .is_arrow = is_arrow,
         .uses_arguments = fc.saw_arguments and !is_arrow,
         .needs_parent_arguments = is_arrow and fc.saw_arguments,
         .ic_table = ic_table,

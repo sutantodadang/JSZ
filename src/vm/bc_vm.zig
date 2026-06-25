@@ -239,8 +239,10 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
-                if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, this_val, args);
-                if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, this_val, args);
+                // Arrows ignore the provided `this` and use their captured lexical one.
+                const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
+                if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, eff_this, args);
+                if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, eff_this, args);
                 const call_env = try Environment.init(self.arena, def_env);
                 try call_env.define("__new_target__", if (captured_nt.bits != 0) captured_nt else try val_mod.makeUndefined(self.arena));
                 for (fn_ptr.param_names, 0..) |pname, i| {
@@ -262,13 +264,15 @@ pub const BcVm = struct {
                 // object. The inline Call opcode does this; the native re-entry
                 // path (builtins invoking user callbacks, e.g. %TypedArray%
                 // .prototype.every) must do it too.
-                const frame_this: Value = if (!fn_ptr.is_strict and (this_val.isUndefined() or this_val.isNull())) blk: {
+                const frame_this: Value = if (fn_ptr.is_arrow)
+                    eff_this // arrow: exact captured lexical this, no coercion
+                else if (!fn_ptr.is_strict and (eff_this.isUndefined() or eff_this.isNull())) blk: {
                     const realm_m = @import("../runtime/realm.zig");
                     if (realm_m.active_global_env) |genv| {
-                        break :blk genv.lookup("globalThis") catch this_val;
+                        break :blk genv.lookup("globalThis") catch eff_this;
                     }
-                    break :blk this_val;
-                } else this_val;
+                    break :blk eff_this;
+                } else eff_this;
                 const caller_idx = if (self.frames.items.len > 0) self.frames.items.len - 1 else 0;
                 try self.frames.append(self.arena, BcCallFrame{
                     .func = fn_ptr,
@@ -1107,17 +1111,20 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                // An arrow ignores the caller-provided `this` and uses the `this`
+                // captured at its definition site.
+                const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val, aargs);
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, eff_this, aargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
                     return null;
                 }
                 if (fn_ptr.is_generator) {
                     var gargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| gargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const g = try self.buildGenerator(fn_ptr, def_env, this_val, gargs);
+                    const g = try self.buildGenerator(fn_ptr, def_env, eff_this, gargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
@@ -1142,7 +1149,7 @@ pub const BcVm = struct {
                     .env = call_env,
                     .return_dst = ret_dst,
                     .caller_idx = caller_idx,
-                    .this_val = this_val,
+                    .this_val = eff_this,
                 });
                 return null;
             },
@@ -2259,13 +2266,15 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                // An arrow ignores the caller-provided `this`, using its captured one.
+                const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else this_val;
 
                 // W2-async: an async function call runs as a coroutine and
                 // returns a pending Promise.
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val, aargs);
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val_eff, aargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
                     return null;
                 }
@@ -2273,14 +2282,14 @@ pub const BcVm = struct {
                 if (fn_ptr.is_generator) {
                     var gargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| gargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const g = try self.buildGenerator(fn_ptr, def_env, this_val, gargs);
+                    const g = try self.buildGenerator(fn_ptr, def_env, this_val_eff, gargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
 
                 // Phase 12: native fast path for hot leaf/boxed functions
                 // (comptime-elided unless built with -Djit=true).
-                switch (try self.tryJitCall(fn_ptr, def_env, this_val, base, nargs, ret_dst)) {
+                switch (try self.tryJitCall(fn_ptr, def_env, this_val_eff, base, nargs, ret_dst)) {
                     .completed => return null,
                     .threw => {
                         // A re-entrant CALL inside the JITed function threw; the
@@ -2357,13 +2366,16 @@ pub const BcVm = struct {
 
                 // Sloppy-mode this correction (ES §10.2.1.1 step 2): non-strict
                 // function called with undefined/null this → substitute global object.
-                const frame_this: Value = if (!fn_ptr.is_strict and (this_val.isUndefined() or this_val.isNull())) blk: {
+                // Arrows use their captured `this` verbatim (no coercion).
+                const frame_this: Value = if (fn_ptr.is_arrow)
+                    this_val_eff
+                else if (!fn_ptr.is_strict and (this_val_eff.isUndefined() or this_val_eff.isNull())) blk: {
                     const realm_m = @import("../runtime/realm.zig");
                     if (realm_m.active_global_env) |genv| {
-                        break :blk genv.lookup("globalThis") catch this_val;
+                        break :blk genv.lookup("globalThis") catch this_val_eff;
                     }
-                    break :blk this_val;
-                } else this_val;
+                    break :blk this_val_eff;
+                } else this_val_eff;
 
                 const caller_idx = self.frames.items.len - 1;
                 try self.frames.append(self.arena, BcCallFrame{
@@ -2536,18 +2548,20 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                // An arrow ignores the receiver, using its captured lexical `this`.
+                const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else this_val;
 
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
-                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val, aargs);
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val_eff, aargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
                     return null;
                 }
                 if (fn_ptr.is_generator) {
                     var gargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| gargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
-                    const g = try self.buildGenerator(fn_ptr, def_env, this_val, gargs);
+                    const g = try self.buildGenerator(fn_ptr, def_env, this_val_eff, gargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
@@ -2618,7 +2632,7 @@ pub const BcVm = struct {
                     .env = call_env,
                     .return_dst = ret_dst,
                     .caller_idx = caller_idx,
-                    .this_val = this_val,
+                    .this_val = this_val_eff,
                 });
                 return null;
             },
