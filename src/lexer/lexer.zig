@@ -405,7 +405,23 @@ pub const Lexer = struct {
                 'v' => try buf.append(self.allocator, 0x0B),
                 'b' => try buf.append(self.allocator, 0x08),
                 'f' => try buf.append(self.allocator, 0x0C),
-                '0' => try buf.append(self.allocator, 0),
+                '0' => {
+                    // `\0`: the NUL escape, OR the start of a legacy octal escape
+                    // (non-strict) when followed by octal digits. A leading 0 is in
+                    // the 0–3 range, so up to two further octal digits may follow
+                    // (`\000` is one NUL; `\0002` is NUL followed by a literal '2').
+                    var val: u32 = 0;
+                    var consumed: usize = 0;
+                    while (consumed < 2 and self.pos < self.source.len) {
+                        const d = self.source[self.pos];
+                        if (d < '0' or d > '7') break;
+                        val = val * 8 + (d - '0');
+                        self.pos += 1;
+                        self.column += 1;
+                        consumed += 1;
+                    }
+                    try appendWtf8(&buf, self.allocator, val);
+                },
                 '\'' => try buf.append(self.allocator, '\''),
                 '"' => try buf.append(self.allocator, '"'),
                 '\\' => try buf.append(self.allocator, '\\'),
