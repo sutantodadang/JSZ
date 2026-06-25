@@ -2180,7 +2180,18 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var list_items: []const Value = &[_]Value{};
     var arr_src: ?*JsObject = null;
     var length: usize = 0;
-    if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object) {
+    if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .string) {
+        // A String source is iterable (String.prototype[@@iterator] yields code
+        // points): materialize one single-code-point string per element.
+        const s = args[0].unbox().string;
+        var chars = std.ArrayList(Value){};
+        var it = (std.unicode.Utf8View.init(s) catch std.unicode.Utf8View.initUnchecked(s)).iterator();
+        while (it.nextCodepointSlice()) |slice| {
+            try chars.append(arena, try val_mod.makeString(arena, slice));
+        }
+        list_items = chars.items;
+        length = chars.items.len;
+    } else if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object) {
         const src = args[0].toPtr().object;
         const probe = try detectIterable(arena, src);
         if (probe.decision == .iterate) {

@@ -17,6 +17,7 @@ const JsObject = @import("../../object/object.zig").JsObject;
 const ic_mod = @import("../ic.zig");
 const proxy_mod = @import("../../runtime/builtins/proxy.zig");
 const namespace_mod = @import("../../runtime/builtins/namespace.zig");
+const typed_array = @import("../../runtime/builtins/typed_array.zig");
 
 /// Raise the strict-mode TypeError for a failed property assignment ([[Set]]
 /// returned false). Returns a non-null RunOutcome only when the throw escapes
@@ -481,6 +482,20 @@ pub inline fn opGetKeys(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                     count += 1;
                 }
             } else {
+                // TypedArray integer indices are enumerable own properties but are
+                // exotic (not in the shape), so enumerate [0, length) first.
+                if (iv.object.internal_kind == .typed_array) {
+                    if (typed_array.getTd(obj_val)) |td| {
+                        const len: usize = if (typed_array.taIsOob(td)) 0 else typed_array.taCurrentLen(td);
+                        var i: usize = 0;
+                        while (i < len) : (i += 1) {
+                            const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
+                            const key_val2 = try std.fmt.allocPrint(self.arena, "{d}", .{i});
+                            arr_obj.set(idx_str, try val_mod.makeString(self.arena, key_val2)) catch {};
+                            count += 1;
+                        }
+                    }
+                }
                 for (iv.object.ownKeys()) |k| {
                     if (!iv.object.isEnumerable(k)) continue;
                     const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
