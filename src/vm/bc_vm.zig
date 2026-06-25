@@ -246,7 +246,9 @@ pub const BcVm = struct {
                 const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
                 if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, eff_this, args);
                 if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, eff_this, args);
-                const call_env = try Environment.init(self.arena, def_env);
+                // Eval code shares the calling/global VariableEnvironment directly
+                // so its top-level declarations hoist there (not a discarded child).
+                const call_env = if (fn_ptr.is_eval) def_env else try Environment.init(self.arena, def_env);
                 try call_env.define("__new_target__", if (captured_nt.bits != 0) captured_nt else try val_mod.makeUndefined(self.arena));
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
@@ -579,6 +581,10 @@ pub const BcVm = struct {
         };
         const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(stmts) };
         const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<eval>");
+        // Eval's top-level `var`/function declarations belong to the calling
+        // VariableEnvironment (the global environment here), so run the body with
+        // that env directly rather than a fresh child — see BcFunction.is_eval.
+        main_func.is_eval = true;
         // An undefined `break`/`continue` label is an early SyntaxError; the
         // compiler records it (it can't unwind), and eval surfaces it as a throw.
         if (compiler_mod.last_label_error) |msg| {

@@ -143,6 +143,22 @@ pub const JsObject = struct {
     /// Set own property. Respects non-writable data props (sloppy: silent no-op)
     /// and non-extensibility (cannot add new keys). Keeps `attrs` in lockstep.
     pub fn set(self: *JsObject, key: []const u8, value: Value) !void {
+        // Array `length` write (ArraySetLength): adjust the cached length and, on
+        // a shrink, delete the now-out-of-range indexed own properties. A `length`
+        // assignment never creates an ordinary "length" data slot.
+        if (self.is_array and std.mem.eql(u8, key, "length")) {
+            const new_len = arrayLengthFromValue(value) orelse return;
+            if (new_len < self.array_length) {
+                var idx = new_len;
+                var key_buf: [10]u8 = undefined;
+                while (idx < self.array_length) : (idx += 1) {
+                    const k = std.fmt.bufPrint(&key_buf, "{d}", .{idx}) catch continue;
+                    if (self.shape.key_to_slot.contains(k)) _ = self.deleteOwn(k) catch {};
+                }
+            }
+            self.array_length = new_len;
+            return;
+        }
         if (self.shape.key_to_slot.get(key)) |slot| {
             if (slot < self.slots.items.len) {
                 if (slot < self.attrs.items.len and !self.attrs.items[slot].writable) return;
@@ -163,6 +179,22 @@ pub const JsObject = struct {
                 self.array_length = idx + 1;
             }
         }
+    }
+
+    /// ToUint32-style coercion of an array-`length` assignment value. Returns the
+    /// clamped length, or null when the value is not a number (the caller leaves
+    /// the array unchanged rather than synthesizing an ordinary property).
+    fn arrayLengthFromValue(v: Value) ?u32 {
+        if (v.bits == 0) return null;
+        return switch (v.unbox()) {
+            .number => |n| blk: {
+                if (std.math.isNan(n) or n <= 0) break :blk 0;
+                if (n >= 4294967295.0) break :blk 4294967295;
+                break :blk @intFromFloat(@trunc(n));
+            },
+            .boolean => |b| if (b) 1 else 0,
+            else => null,
+        };
     }
 
     /// Grow `slots` and `attrs` together to at least `n` entries, padding with

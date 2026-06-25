@@ -47,6 +47,10 @@ pub const BcFunction = struct {
     /// the module's top-level `this` to undefined (a Script binds it to the global
     /// object). Only meaningful on a program/module top-level function.
     is_module: bool = false,
+    /// Eval code: invoked with the calling/global VariableEnvironment directly
+    /// (no fresh child env), so top-level `var`/function declarations hoist into
+    /// that environment — and, at global scope, become global-object properties.
+    is_eval: bool = false,
     /// Phase 6: per-bytecode-site IC table, indexed by instruction PC.
     ic_table: []ic_mod.InlineCache,
     /// Phase 6: arithmetic fast-path feedback per instruction PC.
