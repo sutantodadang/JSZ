@@ -3404,29 +3404,9 @@ pub fn toUint32(v: Value) u32 {
 /// decimal float parse (NaN on failure). Diverges from a bare `parseFloat`, which
 /// maps "" to NaN and does not accept radix prefixes.
 pub fn jsStringToNumber(s: []const u8) f64 {
-    const t = std.mem.trim(u8, s, " \t\n\r\x0B\x0C");
-    if (t.len == 0) return 0;
-    if (std.mem.eql(u8, t, "Infinity") or std.mem.eql(u8, t, "+Infinity")) return std.math.inf(f64);
-    if (std.mem.eql(u8, t, "-Infinity")) return -std.math.inf(f64);
-    if (t.len > 2 and t[0] == '0') {
-        const radix: ?u8 = switch (t[1]) {
-            'x', 'X' => @as(u8, 16),
-            'o', 'O' => @as(u8, 8),
-            'b', 'B' => @as(u8, 2),
-            else => null,
-        };
-        if (radix) |r| {
-            const v = std.fmt.parseInt(u64, t[2..], r) catch return std.math.nan(f64);
-            return @floatFromInt(v);
-        }
-    }
-    // A valid decimal literal starts with a digit, sign, or dot. Reject letter
-    // leads up front so `std.fmt.parseFloat` does not accept "inf"/"infinity"/
-    // "nan" (ES ToNumber maps "INFINITY", "inf", etc. to NaN; only exact
-    // "Infinity"/"+Infinity"/"-Infinity", handled above, are special).
-    const c0 = t[0];
-    if (!(std.ascii.isDigit(c0) or c0 == '.' or c0 == '+' or c0 == '-')) return std.math.nan(f64);
-    return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
+    // Single shared implementation in value.zig so Number()/Array-index coercion
+    // (Value.toF64) and arithmetic agree on radix prefixes, Infinity, and "".
+    return val_mod.jsStringToNumber(s);
 }
 
 /// ES `Number::remainder` (the `%` operator): truncated remainder taking the sign

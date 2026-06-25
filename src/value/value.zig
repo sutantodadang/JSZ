@@ -488,7 +488,7 @@ pub const Value = extern struct {
             .boolean => |b| if (b) 1.0 else 0.0,
             .null_ => 0.0,
             .undefined_ => std.math.nan(f64),
-            .string => |s| std.fmt.parseFloat(f64, s) catch std.math.nan(f64),
+            .string => |s| jsStringToNumber(s),
             .function => std.math.nan(f64),
             .bc_function => std.math.nan(f64),
             .object => std.math.nan(f64),
@@ -522,6 +522,41 @@ pub const Value = extern struct {
         };
     }
 };
+
+/// ES ToNumber for a string (StringToNumber): trims leading/trailing whitespace,
+/// maps "" to 0, recognizes `Infinity`/`±Infinity` and `0x`/`0o`/`0b` radix
+/// prefixes, and otherwise parses a decimal float (NaN on failure). Diverges from
+/// a bare `parseFloat`, which maps "" to NaN and rejects radix prefixes. Shared by
+/// `Value.toF64` (Number(), Array index coercion) and the VM's arithmetic path so
+/// they agree (e.g. Number("0b1110") === +"0b1110" === 14).
+pub fn jsStringToNumber(s: []const u8) f64 {
+    const t = std.mem.trim(u8, s, " \t\n\r\x0B\x0C");
+    if (t.len == 0) return 0;
+    // ES StringNumericLiteral forbids numeric separators ('_'); Zig's parseFloat/
+    // parseInt accept them, so reject up front (ToNumber("1_0") is NaN).
+    if (std.mem.indexOfScalar(u8, t, '_') != null) return std.math.nan(f64);
+    if (std.mem.eql(u8, t, "Infinity") or std.mem.eql(u8, t, "+Infinity")) return std.math.inf(f64);
+    if (std.mem.eql(u8, t, "-Infinity")) return -std.math.inf(f64);
+    if (t.len > 2 and t[0] == '0') {
+        const radix: ?u8 = switch (t[1]) {
+            'x', 'X' => @as(u8, 16),
+            'o', 'O' => @as(u8, 8),
+            'b', 'B' => @as(u8, 2),
+            else => null,
+        };
+        if (radix) |r| {
+            const v = std.fmt.parseInt(u64, t[2..], r) catch return std.math.nan(f64);
+            return @floatFromInt(v);
+        }
+    }
+    // A valid decimal literal starts with a digit, sign, or dot. Reject letter
+    // leads up front so `std.fmt.parseFloat` does not accept "inf"/"infinity"/
+    // "nan" (ES ToNumber maps "INFINITY", "inf", etc. to NaN; only exact
+    // "Infinity"/"+Infinity"/"-Infinity", handled above, are special).
+    const c0 = t[0];
+    if (!(std.ascii.isDigit(c0) or c0 == '.' or c0 == '+' or c0 == '-')) return std.math.nan(f64);
+    return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
+}
 
 /// Allocate a new JsValue in the given arena.
 pub fn makeUndefined(arena: std.mem.Allocator) !Value {

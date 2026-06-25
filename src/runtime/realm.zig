@@ -1724,11 +1724,9 @@ fn numberPrimitive(arena: std.mem.Allocator, arg: Value) anyerror!f64 {
             const i = arg.toPtr().bigint.toConst().toInt(i128) catch break :blk std.math.nan(f64);
             break :blk @floatFromInt(i);
         },
-        .string => |s| blk: {
-            const trimmed = std.mem.trim(u8, s, &std.ascii.whitespace);
-            if (trimmed.len == 0) break :blk 0;
-            break :blk std.fmt.parseFloat(f64, trimmed) catch std.math.nan(f64);
-        },
+        // Full ES StringToNumber (radix prefixes 0x/0o/0b, Infinity, "" → 0) so
+        // Number("0b1110") === +"0b1110" === 14.
+        .string => |s| val_mod.jsStringToNumber(s),
         .null_ => 0,
         .undefined_ => std.math.nan(f64),
         .object => blk: {

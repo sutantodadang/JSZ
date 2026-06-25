@@ -1060,7 +1060,9 @@ fn toNumArg(v: Value) f64 {
     if (v.bits == 0) return 0;
     return switch (v.unbox()) {
         .number => |n| n,
-        .string => |s| std.fmt.parseFloat(f64, std.mem.trim(u8, s, " \t\r\n")) catch std.math.nan(f64),
+        // Full ES StringToNumber (radix prefixes, Infinity, "") so slice/indexOf
+        // index coercion agrees with unary `+` (e.g. "0b1110" → 14).
+        .string => |s| val_mod.jsStringToNumber(s),
         .boolean => |b| if (b) 1 else 0,
         .undefined_ => std.math.nan(f64),
         .null_ => 0,
