@@ -273,6 +273,17 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
     // which throws ReferenceError for an uninitialized (TDZ) export.
     if (receiver.bits != target.bits and isObj(receiver)) {
         const robj = receiver.toPtr().object;
+        // A TypedArray receiver routes a canonical numeric index through its
+        // exotic [[Set]] (TypedArraySetElement): ToNumber/ToBigInt(V) runs its
+        // valueOf side effects BEFORE the bounds check, and an out-of-bounds
+        // index is a silent no-op — never an ordinary property.
+        if (robj.internal_kind == .typed_array) {
+            if (typed_array.canonicalNumericIndexString(k)) |idx_f| {
+                const rtd = typed_array.getTd(receiver).?;
+                try typed_array.setElementThrowing(arena, rtd, idx_f, value);
+                return val_mod.makeBool(arena, true);
+            }
+        }
         if (robj.internal_kind == .module_namespace) {
             // Receiver.[[GetOwnProperty]](P) (e.g. `super[k] = v` with a namespace
             // receiver) triggers import-defer evaluation before the TDZ check.
