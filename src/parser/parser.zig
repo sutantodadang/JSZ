@@ -142,6 +142,11 @@ pub const Parser = struct {
     arrow_prelude: std.ArrayList(*Node),
     /// Monotonic counter for synthetic destructuring-param names (`__param_N`).
     param_destruct_counter: u32,
+    /// Destructuring-param `let` decls produced by `parseFunctionParams` for a
+    /// non-arrow function, awaiting prepend by the immediately-following
+    /// `parseFunctionBody`. Drained (set to empty) on consumption. Built into a
+    /// local list per param-list so nested function/arrow defaults can't clobber it.
+    pending_param_prelude: []const *Node = &.{},
     /// True when parsing direct/indirect `eval()` code. Eval code is a Script
     /// (sec-scripts §A.5), so `import`/`export` *declarations* are early
     /// SyntaxErrors — unlike the CJS-desugar bundle source run via parseScript,

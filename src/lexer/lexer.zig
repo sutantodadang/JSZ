@@ -261,6 +261,25 @@ pub const Lexer = struct {
         };
     }
 
+    /// Advance over a run of digits accepted by `isDigit`, permitting single
+    /// `_` numeric separators that sit strictly between two such digits (per
+    /// the NumericLiteralSeparator grammar). Misplaced separators (leading,
+    /// trailing, doubled, or abutting a non-digit) are a syntax error.
+    fn scanDigits(self: *Lexer, comptime isDigit: fn (u8) bool) LexError!void {
+        while (self.pos < self.source.len) {
+            const c = self.source[self.pos];
+            if (isDigit(c)) {
+                self.pos += 1;
+                self.column += 1;
+            } else if (c == '_') {
+                if (self.pos == 0 or !isDigit(self.source[self.pos - 1])) return LexError.InvalidNumericLiteral;
+                if (self.pos + 1 >= self.source.len or !isDigit(self.source[self.pos + 1])) return LexError.InvalidNumericLiteral;
+                self.pos += 1;
+                self.column += 1;
+            } else break;
+        }
+    }
+
     fn lexNumber(self: *Lexer, start: usize, start_col: u32, lt_before: bool) LexError!Token {
         // Hex literal: 0x... — caller has self.pos == start, so peek the char AFTER the '0'.
         if (self.source[start] == '0' and start + 1 < self.source.len) {
@@ -269,10 +288,7 @@ pub const Lexer = struct {
                 self.pos = start + 2;
                 self.column += 2;
                 const hex_start = self.pos;
-                while (self.pos < self.source.len and isHexDigit(self.source[self.pos])) {
-                    self.pos += 1;
-                    self.column += 1;
-                }
+                try self.scanDigits(isHexDigit);
                 if (self.pos == hex_start) return LexError.InvalidNumericLiteral;
                 // BigInt hex literal: 0x..n
                 if (self.pos < self.source.len and self.source[self.pos] == 'n') {
@@ -280,12 +296,13 @@ pub const Lexer = struct {
                     self.pos += 1;
                     self.column += 1;
                     var t = Token.initSimple(.bigint, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
-                    t.value_str = digits;
+                    t.value_str = try self.stripSeparators(digits);
                     self.prev_kind = .number;
                     return t;
                 }
                 const slice = self.source[start..self.pos];
-                const hex_val_int = std.fmt.parseUnsigned(u64, slice[2..], 16) catch return LexError.InvalidNumericLiteral;
+                const clean = try self.stripSeparators(slice[2..]);
+                const hex_val_int = std.fmt.parseUnsigned(u64, clean, 16) catch return LexError.InvalidNumericLiteral;
                 var t = Token.initSimple(.number, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
                 t.value_num = @floatFromInt(hex_val_int);
                 t.value_str = slice;
@@ -295,17 +312,14 @@ pub const Lexer = struct {
         }
 
         // Decimal/octal
-        while (self.pos < self.source.len and isDecDigit(self.source[self.pos])) {
-            self.pos += 1;
-            self.column += 1;
-        }
+        try self.scanDigits(isDecDigit);
         // BigInt decimal literal: 123n (integer only, no fraction/exponent)
         if (self.pos < self.source.len and self.source[self.pos] == 'n') {
             const digits = self.source[start..self.pos];
             self.pos += 1;
             self.column += 1;
             var t = Token.initSimple(.bigint, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
-            t.value_str = digits;
+            t.value_str = try self.stripSeparators(digits);
             self.prev_kind = .number;
             return t;
         }
@@ -313,10 +327,7 @@ pub const Lexer = struct {
         if (self.pos < self.source.len and self.source[self.pos] == '.') {
             self.pos += 1;
             self.column += 1;
-            while (self.pos < self.source.len and isDecDigit(self.source[self.pos])) {
-                self.pos += 1;
-                self.column += 1;
-            }
+            try self.scanDigits(isDecDigit);
         }
         // Exponent
         if (self.pos < self.source.len and (self.source[self.pos] == 'e' or self.source[self.pos] == 'E')) {
@@ -327,19 +338,32 @@ pub const Lexer = struct {
                 self.column += 1;
             }
             const exp_start = self.pos;
-            while (self.pos < self.source.len and isDecDigit(self.source[self.pos])) {
-                self.pos += 1;
-                self.column += 1;
-            }
+            try self.scanDigits(isDecDigit);
             if (self.pos == exp_start) return LexError.InvalidNumericLiteral;
         }
         const slice = self.source[start..self.pos];
-        const val = std.fmt.parseFloat(f64, slice) catch return LexError.InvalidNumericLiteral;
+        const clean = try self.stripSeparators(slice);
+        const val = std.fmt.parseFloat(f64, clean) catch return LexError.InvalidNumericLiteral;
         var t = Token.initSimple(.number, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
         t.value_num = val;
         t.value_str = slice;
         self.prev_kind = .number;
         return t;
+    }
+
+    /// Return `s` with any `_` numeric separators removed. When `s` has none
+    /// (the common case) the original slice is returned without allocating;
+    /// otherwise a separator-free copy is allocated from the lexer arena.
+    fn stripSeparators(self: *Lexer, s: []const u8) LexError![]const u8 {
+        if (std.mem.indexOfScalar(u8, s, '_') == null) return s;
+        var buf = self.allocator.alloc(u8, s.len) catch return LexError.OutOfMemory;
+        var n: usize = 0;
+        for (s) |c| {
+            if (c == '_') continue;
+            buf[n] = c;
+            n += 1;
+        }
+        return buf[0..n];
     }
 
     /// Lex a string literal (single or double quoted).

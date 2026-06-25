@@ -2292,6 +2292,26 @@ fn bigintSearch(v: Value) ?i128 {
     return v.toPtr().bigint.toConst().toInt(i128) catch null;
 }
 
+/// SortCompare predicate: returns true when `a` must sort *after* `b`
+/// (compare(a, b) > 0). With a user comparator, ToNumber of its result is
+/// observable (fires valueOf/Symbol.toPrimitive, propagates throws); NaN → +0.
+fn taSortGreater(
+    arena: std.mem.Allocator,
+    td: *const TypedArrayData,
+    cmp_fn: Value,
+    undef: Value,
+    a: Value,
+    b: Value,
+) anyerror!bool {
+    if (cmp_fn.bits != 0) {
+        const cr = try function_proto.invokeCallback(arena, undef, cmp_fn, &[_]Value{ a, b });
+        const rv = try toNumberThrowing(arena, cr);
+        return (if (std.math.isNan(rv)) @as(f64, 0) else rv) > 0;
+    }
+    if (td.kind.isBigInt()) return bigintSearch(a).? > bigintSearch(b).?;
+    return taNumCompare(toNum(a), toNum(b)) > 0;
+}
+
 /// Default TypedArray numeric SortCompare: ascending, NaN sorts last, -0 before +0.
 fn taNumCompare(x: f64, y: f64) f64 {
     const xn = std.math.isNan(x);
@@ -2327,29 +2347,47 @@ pub fn nativeTaSort(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const items = try arena.alloc(Value, n);
     var r: usize = 0;
     while (r < n) : (r += 1) items[r] = try taLoad(arena, td, r);
-    // Stable insertion sort over the snapshot.
-    var i: usize = 1;
-    while (i < n) : (i += 1) {
-        const key = items[i];
-        var j = i;
-        while (j > 0) : (j -= 1) {
-            const a = items[j - 1];
-            const should_swap = blk: {
-                if (cmp_fn.bits != 0) {
-                    const cr = try function_proto.invokeCallback(arena, undef, cmp_fn, &[_]Value{ a, key });
-                    // SortCompare: ToNumber(callResult) is observable (fires
-                    // valueOf / Symbol.toPrimitive, propagates throws); NaN → +0.
-                    const rv = try toNumberThrowing(arena, cr);
-                    break :blk (if (std.math.isNan(rv)) @as(f64, 0) else rv) > 0;
+    // Stable bottom-up merge sort over the snapshot (O(n log n) comparator
+    // calls — an insertion sort's O(n²) is unusably slow for large arrays).
+    // Stability: when merging, take from the left run unless it compares
+    // *strictly greater* than the right head, so equal elements keep order.
+    const buf = try arena.alloc(Value, n);
+    var src = items;
+    var dst = buf;
+    var width: usize = 1;
+    while (width < n) : (width *= 2) {
+        var lo: usize = 0;
+        while (lo < n) : (lo += 2 * width) {
+            const mid = @min(lo + width, n);
+            const hi = @min(lo + 2 * width, n);
+            var a: usize = lo;
+            var b: usize = mid;
+            var k: usize = lo;
+            while (a < mid and b < hi) {
+                if (try taSortGreater(arena, td, cmp_fn, undef, src[a], src[b])) {
+                    dst[k] = src[b];
+                    b += 1;
+                } else {
+                    dst[k] = src[a];
+                    a += 1;
                 }
-                if (td.kind.isBigInt()) break :blk bigintSearch(a).? > bigintSearch(key).?;
-                break :blk taNumCompare(toNum(a), toNum(key)) > 0;
-            };
-            if (!should_swap) break;
-            items[j] = a;
+                k += 1;
+            }
+            while (a < mid) : (a += 1) {
+                dst[k] = src[a];
+                k += 1;
+            }
+            while (b < hi) : (b += 1) {
+                dst[k] = src[b];
+                k += 1;
+            }
         }
-        items[j] = key;
+        const tmp = src;
+        src = dst;
+        dst = tmp;
     }
+    // Final sorted run lives in `src`; mirror it back into `items` if needed.
+    if (src.ptr != items.ptr) @memcpy(items, src);
     // Write back, guarding each index against the (possibly shrunk) live bounds.
     var w: usize = 0;
     while (w < n) : (w += 1) {

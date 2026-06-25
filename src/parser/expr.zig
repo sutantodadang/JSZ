@@ -496,7 +496,7 @@ fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)
 /// expression node) according to `pattern` (an array/object literal acting as a
 /// binding pattern). Recurses for nested patterns. Defaults (`[a = d]`,
 /// `{x = d}`) substitute `d` when the read is `undefined`.
-fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
+pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
     switch (pattern.kind) {
         .array_literal => {
             for (pattern.data.array_literal.elements, 0..) |el, i| {

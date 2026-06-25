@@ -897,6 +897,20 @@ pub const BcVm = struct {
         return RunOutcome{ .ok = try val_mod.makeUndefined(self.arena) };
     }
 
+    /// If a resource-limit interrupt fired inside a native callee's JS callback
+    /// (e.g. a comparator passed to TypedArray.prototype.sort), consume the
+    /// pending interrupt and surface it as an interrupt outcome. An interrupt is
+    /// *not* a catchable throw, so this must run before native `error.JsException`
+    /// results are routed through try/catch (otherwise the interrupt leaks out as
+    /// a bogus `throw undefined`). Returns null when no interrupt is pending.
+    pub fn takeInterruptOutcome(self: *BcVm) ?RunOutcome {
+        if (self.interrupt_pending) |m| {
+            self.interrupt_pending = null;
+            return RunOutcome{ .exception = m };
+        }
+        return null;
+    }
+
     /// Route a caught native `error.JsException` into the VM's try/catch
     /// machinery. Returns a `RunOutcome` the caller must return (no handler
     /// found), or null when a handler was found (caller continues dispatch).

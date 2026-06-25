@@ -53,6 +53,7 @@ pub inline fn opCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 
     const outcome = try self.doCall(callee_val, this_val, base, nargs, ret_dst);
     if (outcome) |msg| {
+        if (self.takeInterruptOutcome()) |oc| return oc;
         if (std.mem.eql(u8, msg, "__js_exception__")) {
             // Native threw a JS exception; last_exception_value already set.
             const exc_val = self.last_exception_value;
@@ -153,6 +154,7 @@ pub inline fn opTailCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         // then return its result to our caller (no frame reuse).
         const outcome = try self.doCall(callee_val, this_val, base, nargs, ret_dst);
         if (outcome) |msg| {
+            if (self.takeInterruptOutcome()) |oc| return oc;
             if (std.mem.eql(u8, msg, "__js_exception__")) {
                 const exc_val = self.last_exception_value;
                 const found = try self.throwException(exc_val);
@@ -199,6 +201,7 @@ pub inline fn opMethodCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 
     const outcome = try self.doMethodCall(callee_val, this_val, base, nargs, ret_dst);
     if (outcome) |msg| {
+        if (self.takeInterruptOutcome()) |oc| return oc;
         if (std.mem.eql(u8, msg, "__js_exception__")) {
             const exc_val = self.last_exception_value;
             const found = try self.throwException(exc_val);
@@ -299,6 +302,7 @@ pub inline fn opTailMethodCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         // normal method call, then return its result to our caller.
         const outcome = try self.doMethodCall(callee_val, this_val, base, nargs, ret_dst);
         if (outcome) |msg| {
+            if (self.takeInterruptOutcome()) |oc| return oc;
             if (std.mem.eql(u8, msg, "__js_exception__")) {
                 const exc_val = self.last_exception_value;
                 const found = try self.throwException(exc_val);

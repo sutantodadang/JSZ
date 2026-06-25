@@ -4,6 +4,7 @@
 const std = @import("std");
 const parser_file = @import("./parser.zig");
 const Parser = parser_file.Parser;
+const expr_mod = @import("./expr.zig");
 const ast = @import("./ast.zig");
 const Node = ast.Node;
 
@@ -895,11 +896,50 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
     _ = p.expect(.left_paren) orelse return null;
     var params = std.ArrayList([]const u8){};
     var defaults = std.ArrayList(?*Node){};
+    // Destructuring-param decls accumulated locally, then published to
+    // p.pending_param_prelude at the end so default exprs containing nested
+    // functions/arrows (which reuse p.arrow_prelude) can't clobber them.
+    var param_prelude = std.ArrayList(*Node){};
     var saw_rest = false;
     var rest_param: ?[]const u8 = null;
     while (!p.check(.right_paren) and !p.check(.eof) and !p.had_error) {
         var is_rest = false;
         if (p.match(.ellipsis)) is_rest = true;
+        // Destructuring parameter: `[...]` / `{...}` binding pattern (with an
+        // optional `= default`). Desugared to a synthetic `__param_N` name plus
+        // `let` decls prepended to the body, mirroring the arrow-param path.
+        if (!is_rest and (p.check(.left_bracket) or p.check(.left_brace))) {
+            const pat = p.parseAssignmentExpr() orelse return null;
+            const tmp_name = std.fmt.allocPrint(p.arena, "__param_{d}", .{p.param_destruct_counter}) catch {
+                p.had_error = true;
+                return null;
+            };
+            p.param_destruct_counter += 1;
+            params.append(p.arena, tmp_name) catch {
+                p.had_error = true;
+                return null;
+            };
+            var pattern_node = pat;
+            var default_expr: ?*Node = null;
+            if (pat.kind == .assignment_expr and pat.data.assignment_expr.op == .assign) {
+                pattern_node = pat.data.assignment_expr.target;
+                default_expr = pat.data.assignment_expr.value;
+            }
+            defaults.append(p.arena, default_expr) catch {
+                p.had_error = true;
+                return null;
+            };
+            const src = p.makeNode(.identifier, pat.start, pat.start, .{ .identifier = tmp_name }) orelse return null;
+            p.arrow_prelude = .{};
+            if (!expr_mod.desugarParamPattern(p, pattern_node, src)) return null;
+            param_prelude.appendSlice(p.arena, p.arrow_prelude.items) catch {
+                p.had_error = true;
+                return null;
+            };
+            p.arrow_prelude = .{};
+            if (!p.match(.comma)) break;
+            continue;
+        }
         const param_tok = p.expect(.identifier) orelse return null;
         if (is_rest) {
             saw_rest = true;
@@ -941,6 +981,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         if (!p.match(.comma)) break;
     }
     _ = p.expect(.right_paren) orelse return null;
+    p.pending_param_prelude = param_prelude.items;
     return parser_file.ParamParse{
         .params = params.items,
         .param_defaults = defaults.items,
@@ -949,6 +990,11 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
 }
 
 pub fn parseFunctionBody(p: *Parser) ?[]*Node {
+    // Capture (and clear) any destructuring-param prelude produced by the
+    // preceding parseFunctionParams before parsing the body, since nested
+    // functions/arrows inside the body reuse the same staging field.
+    const param_prelude = p.pending_param_prelude;
+    p.pending_param_prelude = &.{};
     _ = p.expect(.left_brace) orelse return null;
     p.fn_nesting_depth += 1;
     // A function body is strict if it inherits strictness from the enclosing
@@ -977,5 +1023,19 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     p.strict = saved_strict;
     p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
+    // Prepend destructuring-param decls (binding the synthetic `__param_N`
+    // names) so they run before the function body proper.
+    if (param_prelude.len > 0) {
+        var combined = std.ArrayList(*Node){};
+        combined.appendSlice(p.arena, param_prelude) catch {
+            p.had_error = true;
+            return null;
+        };
+        combined.appendSlice(p.arena, body.items) catch {
+            p.had_error = true;
+            return null;
+        };
+        return combined.items;
+    }
     return body.items;
 }
