@@ -1860,6 +1860,22 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
     // at their initialized 0 (NOT undefined→NaN); only in-bounds indices are read.
     const cur_len = taCurrentLen(td);
     const copy_end = if (start < cur_len) @min(new_len, cur_len - start) else 0;
+    // §23.2.3.27 step 14.d: when source and target have the same element type
+    // the bytes are copied directly, preserving exact bit patterns (notably NaN
+    // payloads, which a float→f64→float round-trip would canonicalize).
+    if (copy_end > 0 and a_td.kind == td.kind) {
+        const sz = td.kind.elemSize();
+        const src_start = td.byte_offset + start * sz;
+        const dst_start = a_td.byte_offset;
+        const nbytes = copy_end * sz;
+        const src_bytes = td.ab.bytes[src_start .. src_start + nbytes];
+        const dst_bytes = a_td.ab.bytes[dst_start .. dst_start + nbytes];
+        // Spec step 14.g.ix copies uint8-by-uint8 FORWARD. When a species ctor
+        // returns a view on the same buffer at a higher offset, this intentionally
+        // "smears" overlapping bytes (not a memmove) — copyForwards reproduces that.
+        std.mem.copyForwards(u8, dst_bytes, src_bytes);
+        return result;
+    }
     var i: usize = 0;
     while (i < copy_end) : (i += 1) {
         const ev = try taLoad(arena, td, start + i);
