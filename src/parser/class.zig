@@ -10,6 +10,113 @@ const Node = ast.Node;
 
 pub const ParamParse = parser_file.ParamParse;
 
+/// Rewrite every `this` in a derived-class constructor body to read the hidden
+/// `__superthis` binding (the object returned by `super()`), which is the real
+/// instance for a derived class. A derived constructor's lexical `this` is the
+/// super-constructed object — and for built-in exotics (TypedArray, Map, …) that
+/// object carries the internal slots, so `this.buffer` etc. must resolve to it,
+/// not to the constructor function's raw this-binding. Descends into arrow
+/// functions (they inherit `this`) but NOT into ordinary functions / methods /
+/// function declarations, which establish their own `this`.
+fn rewriteThisToSuperThis(node: *Node) void {
+    switch (node.data) {
+        .this_expr => {
+            node.kind = .identifier;
+            node.data = .{ .identifier = "__superthis" };
+        },
+        .unary_expr => |u| rewriteThisToSuperThis(u.operand),
+        .binary_expr => |b| {
+            rewriteThisToSuperThis(b.left);
+            rewriteThisToSuperThis(b.right);
+        },
+        .logical_expr => |b| {
+            rewriteThisToSuperThis(b.left);
+            rewriteThisToSuperThis(b.right);
+        },
+        .assignment_expr => |a| {
+            rewriteThisToSuperThis(a.target);
+            rewriteThisToSuperThis(a.value);
+        },
+        .update_expr => |u| rewriteThisToSuperThis(u.operand),
+        .conditional_expr => |c| {
+            rewriteThisToSuperThis(c.test_);
+            rewriteThisToSuperThis(c.consequent);
+            rewriteThisToSuperThis(c.alternate);
+        },
+        .sequence_expr => |s| for (s.exprs) |e| rewriteThisToSuperThis(e),
+        .spread_expr => |e| rewriteThisToSuperThis(e),
+        .yield_expr => |e| if (e) |ee| rewriteThisToSuperThis(ee),
+        .call_expr => |c| {
+            rewriteThisToSuperThis(c.callee);
+            for (c.args) |a| rewriteThisToSuperThis(a);
+        },
+        .new_expr => |n| {
+            rewriteThisToSuperThis(n.callee);
+            for (n.args) |a| rewriteThisToSuperThis(a);
+        },
+        .member_expr => |m| {
+            rewriteThisToSuperThis(m.object);
+            if (m.computed) rewriteThisToSuperThis(m.property);
+        },
+        .optional_chain => |e| rewriteThisToSuperThis(e),
+        .function_expr => |f| if (f.is_arrow) {
+            for (f.param_defaults) |d| if (d) |dd| rewriteThisToSuperThis(dd);
+            for (f.body) |s| rewriteThisToSuperThis(s);
+        },
+        .object_literal => |o| for (o.properties) |pr| {
+            rewriteThisToSuperThis(pr.value);
+            if (pr.computed_key) |k| rewriteThisToSuperThis(k);
+        },
+        .array_literal => |a| for (a.elements) |e| rewriteThisToSuperThis(e),
+        .expr_stmt => |e| rewriteThisToSuperThis(e),
+        .block_stmt => |b| for (b.body) |s| rewriteThisToSuperThis(s),
+        .var_decl => |v| if (v.init) |i| rewriteThisToSuperThis(i),
+        .if_stmt => |i| {
+            rewriteThisToSuperThis(i.test_);
+            rewriteThisToSuperThis(i.consequent);
+            if (i.alternate) |a| rewriteThisToSuperThis(a);
+        },
+        .while_stmt => |w| {
+            rewriteThisToSuperThis(w.test_);
+            rewriteThisToSuperThis(w.body);
+        },
+        .do_while_stmt => |w| {
+            rewriteThisToSuperThis(w.body);
+            rewriteThisToSuperThis(w.test_);
+        },
+        .for_stmt => |f| {
+            if (f.init) |i| rewriteThisToSuperThis(i);
+            if (f.test_) |t| rewriteThisToSuperThis(t);
+            if (f.update) |u| rewriteThisToSuperThis(u);
+            rewriteThisToSuperThis(f.body);
+        },
+        .return_stmt => |e| if (e) |ee| rewriteThisToSuperThis(ee),
+        .throw_stmt => |e| rewriteThisToSuperThis(e),
+        .try_stmt => |t| {
+            rewriteThisToSuperThis(t.block);
+            if (t.handler) |h| rewriteThisToSuperThis(h.body);
+            if (t.finalizer) |f| rewriteThisToSuperThis(f);
+        },
+        .for_in_stmt => |f| {
+            rewriteThisToSuperThis(f.left);
+            rewriteThisToSuperThis(f.right);
+            rewriteThisToSuperThis(f.body);
+        },
+        .switch_stmt => |s| {
+            rewriteThisToSuperThis(s.discriminant);
+            for (s.cases) |c| {
+                if (c.test_) |t| rewriteThisToSuperThis(t);
+                for (c.body) |st| rewriteThisToSuperThis(st);
+            }
+        },
+        .labeled_stmt => |l| rewriteThisToSuperThis(l.body),
+        .program => |pr| for (pr.body) |s| rewriteThisToSuperThis(s),
+        // Ordinary functions/declarations bind their own `this`; literals and
+        // identifiers have no children to rewrite.
+        else => {},
+    }
+}
+
 /// Build the NewTarget node for a derived constructor's `Reflect.construct(Super,
 /// arguments, <newTarget>)` desugaring: `__new_target__ || ClassName`. The hidden
 /// `__new_target__` binding (set by [[Construct]]) carries the ORIGINAL new.target
@@ -540,6 +647,8 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
             .var_decl = .{ .kind = .var_, .name = "super", .init = helper_fn },
         }) orelse return null;
         ctor_stmts.append(p.arena, super_decl) catch return null;
+        // Bind `this` to the super-constructed instance (`__superthis`).
+        for (ctor_body) |st| rewriteThisToSuperThis(st);
         for (ctor_body) |st| ctor_stmts.append(p.arena, st) catch return null;
         // `this` TDZ: a derived constructor that returns without having called
         // super() leaves `__superthis` unassigned (undefined). Reading `this`
@@ -792,6 +901,8 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             }) orelse return null;
             out.append(p.arena, super_binding) catch return null;
 
+            // Bind `this` to the super-constructed instance (`__superthis`).
+            for (ctor_body) |stmt| rewriteThisToSuperThis(stmt);
             for (ctor_body) |stmt| {
                 out.append(p.arena, stmt) catch return null;
             }
