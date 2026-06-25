@@ -206,6 +206,16 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         try ctx.env.define(kind.ctorName(), try val_mod.makeObject(arena, kctor));
     }
 
+    // Uint8Array base64/hex (ES2025 "Uint8Array to/from base64" proposal): four
+    // instance methods live as own properties of %Uint8Array.prototype% only.
+    {
+        const u8_proto = active_ta_protos[@intFromEnum(TAKind.u8)].?;
+        _ = try u8_proto.defineOwnData("toBase64", try val_mod.makeNativeFunctionNamed(arena, nativeU8ToBase64, "toBase64", 0), m_attr);
+        _ = try u8_proto.defineOwnData("toHex", try val_mod.makeNativeFunctionNamed(arena, nativeU8ToHex, "toHex", 0), m_attr);
+        _ = try u8_proto.defineOwnData("setFromBase64", try val_mod.makeNativeFunctionNamed(arena, nativeU8SetFromBase64, "setFromBase64", 1), m_attr);
+        _ = try u8_proto.defineOwnData("setFromHex", try val_mod.makeNativeFunctionNamed(arena, nativeU8SetFromHex, "setFromHex", 1), m_attr);
+    }
+
     // DataView
     const dv_proto = try JsObject.create(arena, object_proto);
     // DataView.prototype methods — non-enumerable via setMethods.
@@ -684,6 +694,183 @@ fn validateTypedArrayThis(arena: std.mem.Allocator, this_val: Value) anyerror!*T
     const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype method called on non-TypedArray");
     try validateTypedArray(arena, td);
     return td;
+}
+
+// ------------------------------------ Uint8Array base64/hex (ES2025 proposal) ---
+
+/// Validate `this` is a non-OOB Uint8Array and return its live byte slice.
+/// The base64/hex methods are Uint8Array-specific ([[TypedArrayName]] check).
+fn validateU8This(arena: std.mem.Allocator, this_val: Value) anyerror![]u8 {
+    const td = getTd(this_val) orelse return throwTypeError(arena, "method called on non-Uint8Array");
+    if (td.kind != .u8) return throwTypeError(arena, "method requires a Uint8Array");
+    if (td.ab.detached) return throwTypeError(arena, "Cannot operate on a detached ArrayBuffer");
+    if (taIsOob(td)) return throwTypeError(arena, "Cannot operate on an out-of-bounds TypedArray");
+    const len = taCurrentLen(td);
+    return td.ab.bytes[td.byte_offset..][0..len];
+}
+
+/// Extract a required String argument (throws TypeError on non-string, matching
+/// the proposal's `Type(string) is not String` step).
+fn requireStringArg(arena: std.mem.Allocator, args: []const Value) anyerror![]const u8 {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string)
+        return throwTypeError(arena, "argument must be a string");
+    return args[0].toPtr().string;
+}
+
+const b64_std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const b64_url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Read option `name` off an options object as a string (returns `null` when the
+/// options arg is absent/undefined or the property is undefined).
+fn optString(arena: std.mem.Allocator, args: []const Value, idx: usize, name: []const u8) !?[]const u8 {
+    if (args.len <= idx or args[idx].bits == 0 or args[idx].unbox() != .object) return null;
+    const v = try vmGet(arena, args[idx], name);
+    if (v.bits == 0 or v.unbox() != .string) return null;
+    return v.toPtr().string;
+}
+
+fn optBool(arena: std.mem.Allocator, args: []const Value, idx: usize, name: []const u8) !bool {
+    if (args.len <= idx or args[idx].bits == 0 or args[idx].unbox() != .object) return false;
+    const v = try vmGet(arena, args[idx], name);
+    if (v.bits == 0) return false;
+    return toBool(v);
+}
+
+fn base64Alphabet(arena: std.mem.Allocator, args: []const Value, idx: usize) anyerror![]const u8 {
+    const a = (try optString(arena, args, idx, "alphabet")) orelse "base64";
+    if (std.mem.eql(u8, a, "base64")) return b64_std;
+    if (std.mem.eql(u8, a, "base64url")) return b64_url;
+    return throwTypeError(arena, "alphabet must be \"base64\" or \"base64url\"");
+}
+
+pub fn nativeU8ToBase64(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const alpha = try base64Alphabet(arena, args, 0);
+    const omit_padding = try optBool(arena, args, 0, "omitPadding");
+    const src = try validateU8This(arena, this_val);
+    var out = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i + 3 <= src.len) : (i += 3) {
+        const n = (@as(u32, src[i]) << 16) | (@as(u32, src[i + 1]) << 8) | src[i + 2];
+        try out.append(arena, alpha[(n >> 18) & 63]);
+        try out.append(arena, alpha[(n >> 12) & 63]);
+        try out.append(arena, alpha[(n >> 6) & 63]);
+        try out.append(arena, alpha[n & 63]);
+    }
+    const rem = src.len - i;
+    if (rem == 1) {
+        const n = @as(u32, src[i]) << 16;
+        try out.append(arena, alpha[(n >> 18) & 63]);
+        try out.append(arena, alpha[(n >> 12) & 63]);
+        if (!omit_padding) try out.appendSlice(arena, "==");
+    } else if (rem == 2) {
+        const n = (@as(u32, src[i]) << 16) | (@as(u32, src[i + 1]) << 8);
+        try out.append(arena, alpha[(n >> 18) & 63]);
+        try out.append(arena, alpha[(n >> 12) & 63]);
+        try out.append(arena, alpha[(n >> 6) & 63]);
+        if (!omit_padding) try out.append(arena, '=');
+    }
+    return val_mod.makeString(arena, out.items);
+}
+
+pub fn nativeU8ToHex(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const src = try validateU8This(arena, this_val);
+    const hex = "0123456789abcdef";
+    const out = try arena.alloc(u8, src.len * 2);
+    for (src, 0..) |b, i| {
+        out[i * 2] = hex[b >> 4];
+        out[i * 2 + 1] = hex[b & 15];
+    }
+    return val_mod.makeString(arena, out);
+}
+
+/// Build the `{ read, written }` result object the set* methods return.
+fn setResult(arena: std.mem.Allocator, read: usize, written: usize) !Value {
+    const obj = try newObject(arena, realm_mod.active_object_proto);
+    try obj.set("read", try val_mod.makeNumber(arena, @floatFromInt(read)));
+    try obj.set("written", try val_mod.makeNumber(arena, @floatFromInt(written)));
+    return val_mod.makeObject(arena, obj);
+}
+
+fn b64Value(alpha: []const u8, c: u8) ?u6 {
+    for (alpha, 0..) |a, i| {
+        if (a == c) return @intCast(i);
+    }
+    return null;
+}
+
+pub fn nativeU8SetFromBase64(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const alpha = try base64Alphabet(arena, args, 1);
+    const str = try requireStringArg(arena, args);
+    const dst = try validateU8This(arena, this_val);
+    var written: usize = 0;
+    var read: usize = 0;
+    var quad: [4]u6 = undefined;
+    var qn: usize = 0;
+    var idx: usize = 0;
+    while (idx < str.len) : (idx += 1) {
+        const c = str[idx];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\x0c') continue;
+        if (c == '=') break;
+        const v = b64Value(alpha, c) orelse return throwSyntaxError(arena, "Invalid base64 character");
+        quad[qn] = v;
+        qn += 1;
+        if (qn == 4) {
+            const out_bytes = [_]u8{
+                (@as(u8, quad[0]) << 2) | (@as(u8, quad[1]) >> 4),
+                (@as(u8, quad[1]) << 4) | (@as(u8, quad[2]) >> 2),
+                (@as(u8, quad[2]) << 6) | @as(u8, quad[3]),
+            };
+            for (out_bytes) |b| {
+                if (written >= dst.len) return setResult(arena, read, written);
+                dst[written] = b;
+                written += 1;
+            }
+            qn = 0;
+            read = idx + 1;
+        }
+    }
+    // Trailing partial group (2 or 3 base64 chars => 1 or 2 bytes).
+    if (qn >= 2) {
+        const partial = [_]u8{
+            (@as(u8, quad[0]) << 2) | (@as(u8, quad[1]) >> 4),
+            (@as(u8, quad[1]) << 4) | (@as(u8, quad[2]) >> 2),
+        };
+        const nbytes: usize = qn - 1;
+        var k: usize = 0;
+        while (k < nbytes and written < dst.len) : (k += 1) {
+            dst[written] = partial[k];
+            written += 1;
+        }
+        read = str.len;
+    }
+    return setResult(arena, read, written);
+}
+
+pub fn nativeU8SetFromHex(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const str = try requireStringArg(arena, args);
+    const dst = try validateU8This(arena, this_val);
+    if (str.len % 2 != 0) return throwSyntaxError(arena, "Hex string must have an even number of characters");
+    var written: usize = 0;
+    var read: usize = 0;
+    var i: usize = 0;
+    while (i + 2 <= str.len) : (i += 2) {
+        if (written >= dst.len) break;
+        const hi = hexDigit(str[i]) orelse return throwSyntaxError(arena, "Invalid hex character");
+        const lo = hexDigit(str[i + 1]) orelse return throwSyntaxError(arena, "Invalid hex character");
+        dst[written] = (hi << 4) | lo;
+        written += 1;
+        read = i + 2;
+    }
+    return setResult(arena, read, written);
+}
+
+fn hexDigit(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
 }
 
 /// ValidateDataViewThis: extract DataView data and validate, or throw TypeError.
