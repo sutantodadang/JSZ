@@ -1887,7 +1887,10 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
 }
 
 pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = try validateTypedArrayThis(arena, this_val);
+    // §23.2.3.26 step 1: RequireInternalSlot only — NO detached/OOB check on
+    // entry. The detached/OOB validation happens after ToIntegerOrInfinity(offset)
+    // (below), so a throwing offset coercion surfaces its error first.
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.set called on non-TypedArray");
     if (td.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed TypedArray");
     // targetOffset = ToIntegerOrInfinity(offset) (runs valueOf, propagates throws);
     // negative → RangeError. May be +Inf (caught by the bounds check below).

@@ -396,6 +396,12 @@ pub const JsObject = struct {
         try self.growSlots(new_slot + 1);
         self.slots.items[new_slot] = holder;
         self.attrs.items[new_slot] = attr;
+        // Array exotic [[DefineOwnProperty]]: defining an own property at an array
+        // index >= length extends the array's length (matches defineOwnData).
+        if (self.is_array) {
+            const idx = std.fmt.parseUnsigned(u32, key, 10) catch return true;
+            if (idx != std.math.maxInt(u32) and idx >= self.array_length) self.array_length = idx + 1;
+        }
         return true;
     }
 
