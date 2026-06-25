@@ -536,6 +536,20 @@ pub const JsObject = struct {
 
     /// [[DefineOwnProperty]] for a symbol-keyed ACCESSOR property. `holder` is an
     /// object carrying `get`/`set` (same shape the VM reads via getPropSym).
+    /// Existing accessor holder for a symbol key, or null. Mirrors
+    /// `ownAccessorHolder` for the symbol-keyed property table.
+    pub fn ownAccessorHolderSym(self: *JsObject, sym_key: Value) ?Value {
+        if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return null;
+        const target = sym_key.toPtr().symbol;
+        for (self.sym_props.items) |sp| {
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
+                if (!sp.attr.is_accessor) return null;
+                return sp.value;
+            }
+        }
+        return null;
+    }
+
     pub fn defineOwnAccessorSym(self: *JsObject, sym_key: Value, holder: Value, attr: PropAttr) !bool {
         if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return false;
         const target = sym_key.toPtr().symbol;

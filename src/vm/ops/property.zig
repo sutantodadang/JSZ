@@ -357,6 +357,51 @@ pub inline fn opDefineAccessor(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+pub inline fn opDefineAccessorDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const robj = code[frame.pc];
+    frame.pc += 1;
+    const rkey = code[frame.pc];
+    frame.pc += 1;
+    const kind = code[frame.pc];
+    frame.pc += 1;
+    const rfn = code[frame.pc];
+    frame.pc += 1;
+    const obj_val = frame.registers[robj];
+    const key_val = frame.registers[rkey];
+    const fn_val = frame.registers[rfn];
+    if (obj_val.bits == 0 or obj_val.unbox() != .object) return null;
+    const obj = obj_val.toPtr().object;
+    const member: []const u8 = if (kind == 0) "get" else "set";
+    if (key_val.bits != 0 and key_val.unbox() == .symbol) {
+        if (obj.ownAccessorHolderSym(key_val)) |hv| {
+            try hv.toPtr().object.set(member, fn_val);
+        } else {
+            const holder_obj = if (self.heap) |heap|
+                try JsObject.createOnHeap(heap, self.realm.object_prototype)
+            else
+                try JsObject.create(self.arena, self.realm.object_prototype);
+            try holder_obj.set(member, fn_val);
+            const holder_val = try val_mod.makeObject(self.arena, holder_obj);
+            _ = try obj.defineOwnAccessorSym(key_val, holder_val, .{ .enumerable = true, .configurable = true });
+        }
+        return null;
+    }
+    const key = try bcv.valueToStringArena(self.arena, key_val);
+    if (obj.ownAccessorHolder(key)) |hv| {
+        try hv.toPtr().object.set(member, fn_val);
+    } else {
+        const holder_obj = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        try holder_obj.set(member, fn_val);
+        const holder_val = try val_mod.makeObject(self.arena, holder_obj);
+        _ = try obj.defineOwnAccessor(key, holder_val, .{ .enumerable = true, .configurable = true });
+    }
+    return null;
+}
+
 pub inline fn opGetThis(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const rdst = code[frame.pc];

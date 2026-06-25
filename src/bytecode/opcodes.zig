@@ -176,6 +176,10 @@ pub const Op = enum(u8) {
     /// Installs an accessor (getter if kind==0, setter if kind==1) named Kname on
     /// R[Robj], merging into an existing accessor holder for the same key.
     DEFINE_ACCESSOR,
+    /// DEFINE_ACCESSOR_DYN: op, Robj u8, Rkey u8, kind u8 (0=get,1=set), Rfn u8.
+    /// Like DEFINE_ACCESSOR but the key is a runtime value in R[Rkey] (string or
+    /// symbol) — used for computed accessor keys `{ get [expr]() {} }`.
+    DEFINE_ACCESSOR_DYN,
     /// ARRAY_APPEND: op, Rarr u8, Rval u8 (3 bytes). Appends R[Rval] to the array
     /// R[Rarr] at its current length (used for array-literal elements when the
     /// literal contains a spread, so indices are dynamic).
@@ -301,6 +305,7 @@ pub fn instrSize(op: Op) usize {
         .YIELD => 2,
         .TAIL_METHOD_CALL => 4,
         .DEFINE_ACCESSOR => 6,
+        .DEFINE_ACCESSOR_DYN => 5,
         .ARRAY_APPEND => 3,
         .ARRAY_SPREAD => 3,
         .IN => 4,

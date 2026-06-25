@@ -355,6 +355,18 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
                 try writer.print(" R{d}[K{d}] {s}= R{d}", .{ robj, kidx, knd, rfn });
             }
         },
+        .DEFINE_ACCESSOR_DYN => {
+            const robj = code[new_pc];
+            new_pc += 1;
+            const rkey = code[new_pc];
+            new_pc += 1;
+            const kind = code[new_pc];
+            new_pc += 1;
+            const rfn = code[new_pc];
+            new_pc += 1;
+            const knd: []const u8 = if (kind == 0) "get" else "set";
+            try writer.print(" R{d}[R{d}] {s}= R{d}", .{ robj, rkey, knd, rfn });
+        },
         .ARRAY_APPEND => {
             const rarr = code[new_pc];
             new_pc += 1;

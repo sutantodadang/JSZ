@@ -1181,10 +1181,19 @@ pub const FnCompiler = struct {
             if (prop.computed_key) |key_node| {
                 const rkey = try self.compileExpr(key_node);
                 const rval = try self.compileExpr(prop.value);
-                try self.emitOp(.SET_PROP_DYN, line);
-                try self.emitU8(robj);
-                try self.emitU8(rkey);
-                try self.emitU8(rval);
+                if (prop.kind == .init) {
+                    try self.emitOp(.SET_PROP_DYN, line);
+                    try self.emitU8(robj);
+                    try self.emitU8(rkey);
+                    try self.emitU8(rval);
+                } else {
+                    // Computed accessor key: `{ get [expr]() {} }`.
+                    try self.emitOp(.DEFINE_ACCESSOR_DYN, line);
+                    try self.emitU8(robj);
+                    try self.emitU8(rkey);
+                    try self.emitU8(if (prop.kind == .get) @as(u8, 0) else @as(u8, 1));
+                    try self.emitU8(rval);
+                }
                 self.freeReg(); // free rval
                 self.freeReg(); // free rkey
                 continue;

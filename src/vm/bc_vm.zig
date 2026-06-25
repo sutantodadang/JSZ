@@ -887,6 +887,7 @@ pub const BcVm = struct {
                 .SET_PROP => if (try property_ops.opSetProp(self, frame)) |o| return o,
                 .SET_PROP_DYN => if (try property_ops.opSetPropDyn(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR => if (try property_ops.opDefineAccessor(self, frame)) |o| return o,
+                .DEFINE_ACCESSOR_DYN => if (try property_ops.opDefineAccessorDyn(self, frame)) |o| return o,
                 .GET_THIS => if (try property_ops.opGetThis(self, frame)) |o| return o,
                 .IN => if (try property_ops.opIn(self, frame)) |o| return o,
                 .DELETE_PROP => if (try property_ops.opDeleteProp(self, frame)) |o| return o,

@@ -1441,8 +1441,15 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
         {
             const acc_kind: ast.PropKind = if (key[0] == 'g') .get else .set;
             var aname: []const u8 = undefined;
+            // Computed accessor key: `get [expr]() {}` / `set [expr](v) {}`.
+            var acc_computed_key: ?*Node = null;
             const akn = @tagName(p.current.kind);
-            if (p.check(.identifier) or p.check(.string)) {
+            if (p.check(.left_bracket)) {
+                _ = p.advance();
+                acc_computed_key = p.parseAssignmentExpr() orelse return null;
+                _ = p.expect(.right_bracket) orelse return null;
+                aname = "";
+            } else if (p.check(.identifier) or p.check(.string)) {
                 aname = p.current.value_str;
                 _ = p.advance();
             } else if (akn.len > 3 and std.mem.eql(u8, akn[0..3], "kw_")) {
@@ -1481,7 +1488,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 p.had_error = true;
                 return null;
             };
-            props.append(p.arena, ast.ObjectProp{ .key = aname, .value = acc_fn, .kind = acc_kind }) catch {
+            props.append(p.arena, ast.ObjectProp{ .key = aname, .value = acc_fn, .kind = acc_kind, .computed_key = acc_computed_key }) catch {
                 p.had_error = true;
                 return null;
             };
