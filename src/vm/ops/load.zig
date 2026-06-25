@@ -116,6 +116,14 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name_val = frame.func.chunk.constants[kidx];
     const name = name_val.toPtr().string;
+    // `with` scopes (if any) shadow the lexical/global scope: an object whose
+    // [[HasProperty]] is true provides the binding via [[Get]].
+    if (frame.with_stack.items.len > 0) {
+        if (try withLookup(self, frame, name)) |v| {
+            frame.registers[rdst] = v;
+            return null;
+        }
+    }
     // Look up in frame env (chains to global), then realm global.
     // An identifier that resolves nowhere is a ReferenceError
     // (env lookups run no user code, so no frame realloc here).
@@ -255,6 +263,39 @@ pub inline fn opExitScope(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+pub inline fn opPushWith(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const robj = code[frame.pc];
+    frame.pc += 1;
+    frame.with_stack.append(self.arena, frame.registers[robj]) catch return error.OutOfMemory;
+    return null;
+}
+
+pub inline fn opPopWith(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    if (frame.with_stack.items.len > 0) _ = frame.with_stack.pop();
+    return null;
+}
+
+/// `with`-scope resolution: search the frame's with-object stack (innermost
+/// last) for the first object that HasProperty(name); return its value via
+/// [[Get]]. Returns null when no with-object provides the binding (the caller
+/// then falls back to the lexical/global scope). Only the HasProperty/Get of a
+/// matching object runs user code.
+inline fn withLookup(self: *BcVm, frame: *BcCallFrame, name: []const u8) !?Value {
+    if (frame.with_stack.items.len == 0) return null;
+    const key = try val_mod.makeString(self.arena, name);
+    var i = frame.with_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        const wobj = frame.with_stack.items[i];
+        if (wobj.bits == 0 or wobj.unbox() != .object) continue;
+        if (try self.hasProperty(wobj, key)) {
+            return try self.getProp(wobj, name);
+        }
+    }
+    return null;
+}
+
 pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const lo = code[frame.pc];
@@ -268,6 +309,20 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const name = name_val.toPtr().string;
     const value = frame.registers[rsrc];
     const cur_is_strict = frame.func.is_strict;
+    // `with` scopes: assign through an object whose [[HasProperty]] is true.
+    if (frame.with_stack.items.len > 0) {
+        const key = try val_mod.makeString(self.arena, name);
+        var i = frame.with_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            const wobj = frame.with_stack.items[i];
+            if (wobj.bits == 0 or wobj.unbox() != .object) continue;
+            if (try self.hasProperty(wobj, key)) {
+                try self.setProp(wobj, name, value);
+                return null;
+            }
+        }
+    }
     // Try to assign in env chain (covers locals and upvalues).
     // TemporalDeadZone and ConstAssignment are real errors that must propagate.
     frame.env.assign(name, value) catch |err| {

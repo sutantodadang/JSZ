@@ -1307,6 +1307,10 @@ pub const Parser = struct {
         return stmt_mod.parseDoWhileStmt(self);
     }
 
+    pub fn parseWithStmt(self: *Parser) ?*Node {
+        return stmt_mod.parseWithStmt(self);
+    }
+
     pub fn parseForStmt(self: *Parser) ?*Node {
         return stmt_mod.parseForStmt(self);
     }

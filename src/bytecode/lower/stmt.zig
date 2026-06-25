@@ -887,6 +887,20 @@ pub fn lowerEmptyStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     _ = last_expr_reg;
 }
 
+pub fn lowerWithStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
+    const line: u32 = node.start;
+    const ws = node.data.with_stmt;
+    // Evaluate the object, push it as a with-scope, compile the body, then pop.
+    // The PUSH_WITH copies the value onto the frame's with-stack, so the source
+    // register is free immediately after.
+    const robj = try self.compileExpr(ws.object);
+    try self.emitOp(.PUSH_WITH, line);
+    try self.emitU8(robj);
+    self.sp = robj;
+    try self.compileStmt(ws.body, last_expr_reg);
+    try self.emitOp(.POP_WITH, line);
+}
+
 pub fn lowerDebuggerStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
     _ = last_expr_reg;
     const line: u32 = node.start;

@@ -70,6 +70,9 @@ pub const BcCallFrame = struct {
     this_val: Value = Value{},
     /// Phase 4a: try stack (pushed by PUSH_TRY, popped by POP_TRY/THROW).
     try_stack: std.ArrayListUnmanaged(TryEntry) = .empty,
+    /// `with` statement: object scopes consulted (innermost last) by unqualified
+    /// name lookups before the lexical/global scope. Pushed by PUSH_WITH.
+    with_stack: std.ArrayListUnmanaged(Value) = .empty,
     /// W2: when this frame belongs to a generator, links back to its state so
     /// YIELD can save the suspended frame. Null for ordinary frames.
     gen: ?*BcGeneratorState = null,
@@ -830,6 +833,8 @@ pub const BcVm = struct {
                 .INIT_LEX => if (try load_ops.opInitLexical(self, frame)) |o| return o,
                 .ENTER_SCOPE => if (try load_ops.opEnterScope(self, frame)) |o| return o,
                 .EXIT_SCOPE => if (try load_ops.opExitScope(self, frame)) |o| return o,
+                .PUSH_WITH => if (try load_ops.opPushWith(self, frame)) |o| return o,
+                .POP_WITH => if (try load_ops.opPopWith(self, frame)) |o| return o,
                 .SET_GLOBAL => if (try load_ops.opSetGlobal(self, frame)) |o| return o,
                 .DEFINE_GLOBAL => if (try load_ops.opDefineGlobal(self, frame)) |o| return o,
                 .GET_LOCAL => if (try load_ops.opGetLocal(self, frame)) |o| return o,
@@ -3242,6 +3247,8 @@ fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
         }
         // this_val
         gc_mod.traceValue(frame.this_val, mark_fn);
+        // `with` object scopes are live across the body of the statement.
+        for (frame.with_stack.items) |wobj| gc_mod.traceValue(wobj, mark_fn);
         // Environment chain
         gc_mod.traceEnvironment(frame.env, mark_fn);
     }
@@ -3250,6 +3257,7 @@ fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
         if (state.done) continue;
         for (state.frame.registers) |reg| gc_mod.traceValue(reg, mark_fn);
         gc_mod.traceValue(state.frame.this_val, mark_fn);
+        for (state.frame.with_stack.items) |wobj| gc_mod.traceValue(wobj, mark_fn);
         gc_mod.traceEnvironment(state.frame.env, mark_fn);
     }
     // W2-async: keep each in-flight async function's result promise alive while

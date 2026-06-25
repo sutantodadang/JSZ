@@ -280,6 +280,7 @@ pub const FnCompiler = struct {
             },
             .while_stmt => try self.collectHoistedNames(node.data.while_stmt.body, list),
             .do_while_stmt => try self.collectHoistedNames(node.data.do_while_stmt.body, list),
+            .with_stmt => try self.collectHoistedNames(node.data.with_stmt.body, list),
             .for_stmt => {
                 if (node.data.for_stmt.init) |i| try self.collectHoistedNames(i, list);
                 try self.collectHoistedNames(node.data.for_stmt.body, list);
@@ -329,6 +330,7 @@ pub const FnCompiler = struct {
             },
             .while_stmt => try self.collectLexicalNames(node.data.while_stmt.body, list),
             .do_while_stmt => try self.collectLexicalNames(node.data.do_while_stmt.body, list),
+            .with_stmt => try self.collectLexicalNames(node.data.with_stmt.body, list),
             .for_stmt => {
                 // Do NOT recurse into for_stmt.init — a `let`/`const` in the
                 // C-style for header is scoped to the loop (per-iteration), not
@@ -1689,6 +1691,7 @@ pub const FnCompiler = struct {
             .if_stmt => try lower.lowerIfStmt(self, node, last_expr_reg),
             .while_stmt => try lower.lowerWhileStmt(self, node, last_expr_reg),
             .do_while_stmt => try lower.lowerDoWhileStmt(self, node, last_expr_reg),
+            .with_stmt => try lower.lowerWithStmt(self, node, last_expr_reg),
             .for_stmt => try lower.lowerForStmt(self, node, last_expr_reg),
             .return_stmt => try lower.lowerReturnStmt(self, node, last_expr_reg),
             .throw_stmt => try lower.lowerThrowStmt(self, node, last_expr_reg),

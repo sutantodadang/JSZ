@@ -107,6 +107,7 @@ pub const NodeKind = enum {
     if_stmt,
     while_stmt,
     do_while_stmt,
+    with_stmt,
     for_stmt,
     return_stmt,
     break_stmt,
@@ -168,6 +169,7 @@ pub const Data = union(NodeKind) {
     if_stmt: IfStmt,
     while_stmt: WhileStmt,
     do_while_stmt: DoWhileStmt,
+    with_stmt: WithStmt,
     for_stmt: ForStmt,
     return_stmt: ?*Node,
     break_stmt: ?[]const u8,
@@ -362,6 +364,11 @@ pub const WhileStmt = struct {
 pub const DoWhileStmt = struct {
     body: *Node,
     test_: *Node,
+};
+
+pub const WithStmt = struct {
+    object: *Node,
+    body: *Node,
 };
 
 pub const ForStmt = struct {

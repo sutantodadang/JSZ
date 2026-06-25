@@ -226,6 +226,12 @@ pub const Op = enum(u8) {
     /// EXIT_SCOPE | 1 | op. Pop the current frame env back to its parent,
     /// discarding the most recent block scope's bindings.
     EXIT_SCOPE,
+    /// PUSH_WITH | 2 | op, Robj u8. Push R[obj] onto the frame's with-object
+    /// stack: subsequent unqualified name lookups consult it (via HasProperty)
+    /// before the lexical/global scope. Paired with POP_WITH.
+    PUSH_WITH,
+    /// POP_WITH | 1 | op. Pop the innermost with-object off the frame stack.
+    POP_WITH,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -244,6 +250,8 @@ pub fn instrSize(op: Op) usize {
         .INIT_LEX => 5,
         .ENTER_SCOPE => 1,
         .EXIT_SCOPE => 1,
+        .PUSH_WITH => 2,
+        .POP_WITH => 1,
         .SET_GLOBAL => 4,
         .GET_LOCAL => 3,
         .SET_LOCAL => 3,

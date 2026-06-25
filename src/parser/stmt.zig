@@ -636,6 +636,7 @@ pub fn parseStatement(p: *Parser) ?*Node {
         .kw_if => p.parseIfStmt(),
         .kw_while => p.parseWhileStmt(),
         .kw_do => p.parseDoWhileStmt(),
+        .kw_with => p.parseWithStmt(),
         .kw_for => p.parseForStmt(),
         .kw_return => p.parseReturnStmt(),
         .kw_break => p.parseBreakStmt(),
@@ -886,6 +887,18 @@ pub fn parseWhileStmt(p: *Parser) ?*Node {
     const body = p.parseStatement() orelse return null;
     return p.makeNode(.while_stmt, start, p.current.start, .{
         .while_stmt = .{ .test_ = test_, .body = body },
+    });
+}
+
+pub fn parseWithStmt(p: *Parser) ?*Node {
+    const start = p.current.start;
+    _ = p.advance(); // consume 'with'
+    _ = p.expect(.left_paren) orelse return null;
+    const object = p.parseExpression() orelse return null;
+    _ = p.expect(.right_paren) orelse return null;
+    const body = p.parseStatement() orelse return null;
+    return p.makeNode(.with_stmt, start, p.current.start, .{
+        .with_stmt = .{ .object = object, .body = body },
     });
 }
 
