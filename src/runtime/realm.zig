@@ -1327,7 +1327,12 @@ fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
         const proto: ?*JsObject = switch (args[0].unbox()) {
             .number => active_number_proto,
             .boolean => active_boolean_proto,
-            .string, .symbol, .bigint => active_object_proto,
+            // Box each primitive against its own wrapper prototype so
+            // `Object(s) instanceof String` (etc.) holds and the prototype's
+            // valueOf/toString unwrap [[PrimitiveValue]] correctly.
+            .string => active_string_proto orelse active_object_proto,
+            .symbol => active_symbol_proto orelse active_object_proto,
+            .bigint => active_bigint_proto orelse active_object_proto,
             else => null,
         };
         if (proto) |p| {
