@@ -579,7 +579,17 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
         };
     }
     const arr = d.seq.toPtr().object;
-    if (d.index >= arr.getArrayLength()) {
+    // Array iterator length: a true Array uses its [[ArrayLength]]; a generic
+    // array-like (e.g. the `arguments` object) reads its `length` property.
+    const arr_len: usize = if (arr.is_array) arr.getArrayLength() else blk: {
+        const lv = arr.get("length") orelse break :blk 0;
+        if (lv.bits == 0 or lv.unbox() != .number) break :blk 0;
+        const n = lv.unbox().number;
+        if (!(n > 0)) break :blk 0;
+        if (n > 9007199254740991.0) break :blk 9007199254740991;
+        break :blk @intFromFloat(n);
+    };
+    if (d.index >= arr_len) {
         d.done = true;
         return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     }
