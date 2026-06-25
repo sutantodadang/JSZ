@@ -395,6 +395,19 @@ pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
         if (@import("../realm.zig").active_function_proto) |fp| return val_mod.makeObject(arena, fp);
         return val_mod.makeNull(arena);
     }
+    // A bc_function (user closure / class constructor) keeps its [[Prototype]] on
+    // a lazily-created backing object. Resolve it so `Object.getPrototypeOf(fn)`
+    // is consistent with `Object.setPrototypeOf` (needed for class static
+    // inheritance: `class B extends A` links B's ctor proto to A).
+    if (args[0].unbox() == .bc_function or args[0].unbox() == .function) {
+        if (@import("../realm.zig").active_context) |ctx| {
+            if (try ctx.backingObject(arena, args[0])) |bo| {
+                if (bo.proto) |p| return val_mod.makeObject(arena, p);
+            }
+        }
+        if (@import("../realm.zig").active_function_proto) |fp| return val_mod.makeObject(arena, fp);
+        return val_mod.makeNull(arena);
+    }
     // A symbol primitive boxes to %Symbol.prototype% (ToObject then
     // [[GetPrototypeOf]]), so `Object.getPrototypeOf(sym) === Symbol.prototype`.
     if (args[0].unbox() == .symbol) {

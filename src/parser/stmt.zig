@@ -557,7 +557,7 @@ pub fn parseUsingDeclStmt(p: *Parser, is_await: bool) ?*Node {
             return p.fail("using declaration requires an initializer");
         }
         const d = p.makeNode(.var_decl, d_start, p.current.start, .{
-            .var_decl = .{ .kind = .let, .name = name, .init = init_node },
+            .var_decl = .{ .kind = .let, .name = name, .init = init_node, .using_kind = if (is_await) .await_using_ else .using_ },
         }) orelse return null;
         decls.append(p.arena, d) catch {
             p.had_error = true;

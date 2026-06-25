@@ -257,6 +257,18 @@ pub const BcVm = struct {
                         new_regs[i] = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
                     }
                 }
+                // Sloppy-mode this correction (ES §10.2.1.1 step 2): non-strict
+                // function called with undefined/null this → substitute global
+                // object. The inline Call opcode does this; the native re-entry
+                // path (builtins invoking user callbacks, e.g. %TypedArray%
+                // .prototype.every) must do it too.
+                const frame_this: Value = if (!fn_ptr.is_strict and (this_val.isUndefined() or this_val.isNull())) blk: {
+                    const realm_m = @import("../runtime/realm.zig");
+                    if (realm_m.active_global_env) |genv| {
+                        break :blk genv.lookup("globalThis") catch this_val;
+                    }
+                    break :blk this_val;
+                } else this_val;
                 const caller_idx = if (self.frames.items.len > 0) self.frames.items.len - 1 else 0;
                 try self.frames.append(self.arena, BcCallFrame{
                     .func = fn_ptr,
@@ -265,7 +277,7 @@ pub const BcVm = struct {
                     .env = call_env,
                     .return_dst = 255,
                     .caller_idx = if (self.frames.items.len > 0) caller_idx else null,
-                    .this_val = this_val,
+                    .this_val = frame_this,
                 });
                 // Run until this frame returns.
                 const frames_before = self.frames.items.len - 1;

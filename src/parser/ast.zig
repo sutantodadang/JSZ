@@ -317,10 +317,20 @@ pub const VarKind = enum {
     const_,
 };
 
+/// Explicit resource management: marks a `let`-lowered declaration that came from
+/// a `using` / `await using` declaration so the scope-wrapping desugar can find
+/// the resources to register on the disposable-resource stack.
+pub const UsingKind = enum {
+    none,
+    using_,
+    await_using_,
+};
+
 pub const VarDecl = struct {
     kind: VarKind = .var_,
     name: []const u8,
     init: ?*Node,
+    using_kind: UsingKind = .none,
 };
 
 pub const FuncDecl = struct {
