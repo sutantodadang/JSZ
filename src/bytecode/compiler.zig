@@ -25,6 +25,9 @@ pub const LabelEntry = struct {
     continue_patches: std.ArrayListUnmanaged(usize) = .empty,
     // Where the loop starts (for continue with label).
     loop_start: usize = 0,
+    /// Block-scope nesting depth at the point this label was entered, so a
+    /// `break L` can emit EXIT_SCOPE for every block scope it unwinds out of.
+    scope_depth: u32 = 0,
 };
 
 /// Set by `compileProgram` when a `break`/`continue` targets an undefined label
@@ -47,6 +50,10 @@ pub const LoopCtx = struct {
     /// to this (its iteration produced an empty completion). null outside the
     /// program's implicit-return (completion-value) compilation.
     prev_reg: ?u8 = null,
+    /// Block-scope nesting depth just outside this loop's per-iteration scope.
+    /// `break`/`continue` emit EXIT_SCOPE for each block scope between the
+    /// statement and this depth so the frame env is balanced on the jump.
+    scope_depth: u32 = 0,
 };
 
 pub const FnCompiler = struct {
@@ -91,6 +98,9 @@ pub const FnCompiler = struct {
     /// operand of `return` is only in tail position when try_depth == 0
     /// (a pending finally would run after the call returns, so it is not tail).
     try_depth: u32 = 0,
+    /// Number of block scopes (ENTER_SCOPE) currently open in the bytecode being
+    /// emitted. Used so `break`/`continue` emit matching EXIT_SCOPE ops.
+    block_scope_depth: u32 = 0,
     /// ES2020 optional chaining: while compiling an `optional_chain`, this points
     /// to the list of JMP_IF_NULLISH patch offsets emitted by optional links.
     /// They are all patched to the chain's short-circuit landing pad. null when
@@ -304,7 +314,14 @@ pub const FnCompiler = struct {
                 }
             },
             .block_stmt => {
-                for (node.data.block_stmt.body) |c| try self.collectLexicalNames(c, list);
+                // A real nested block is its own lexical scope (handled by
+                // lowerBlockStmt via ENTER_SCOPE); its `let`/`const` must NOT be
+                // hoisted into this enclosing scope. A transparent block (class
+                // desugaring, multi-declarator lowering) belongs to this scope,
+                // so its lexical names ARE collected here.
+                if (!node.data.block_stmt.lexical_scope) {
+                    for (node.data.block_stmt.body) |c| try self.collectLexicalNames(c, list);
+                }
             },
             .if_stmt => {
                 try self.collectLexicalNames(node.data.if_stmt.consequent, list);
@@ -377,6 +394,18 @@ pub const FnCompiler = struct {
         try self.emitU16(kidx);
         try self.emitU8(rsrc);
         try self.emitU8(if (is_const) 1 else 0);
+    }
+
+    /// Emit EXIT_SCOPE for every block scope between the current depth and
+    /// `target_depth` (exclusive). Used on `break`/`continue` jump paths so the
+    /// frame env is unwound to the loop's level. Does NOT mutate
+    /// `block_scope_depth` (textual nesting is unchanged; only the runtime jump
+    /// path pops envs).
+    pub fn emitExitScopesTo(self: *Self, target_depth: u32, line: u32) !void {
+        var d = self.block_scope_depth;
+        while (d > target_depth) : (d -= 1) {
+            try self.emitOp(.EXIT_SCOPE, line);
+        }
     }
 
     // -------------------------------------------------------- compile expr -> R ---

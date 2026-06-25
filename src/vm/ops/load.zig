@@ -12,6 +12,7 @@ const BcCallFrame = bcv.BcCallFrame;
 const RunOutcome = bcv.RunOutcome;
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
+const Environment = @import("../../runtime/execution_context.zig").Environment;
 
 /// Resolve `name` as an own property of the running scope's global object
 /// (`globalThis`). This backs the global-environment-record semantics: a binding
@@ -219,6 +220,19 @@ pub inline fn opInitLexical(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     };
     // Upgrade binding to const_ so subsequent assignments throw TypeError.
     if (is_const) frame.env.upgradeToConst(name);
+    return null;
+}
+
+pub inline fn opEnterScope(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    // Push a fresh child environment for a block scope. Lexical bindings
+    // declared inside the block live here and are discarded on EXIT_SCOPE,
+    // giving correct block scoping (shadowing) and per-iteration freshness.
+    frame.env = Environment.init(self.arena, frame.env) catch return error.OutOfMemory;
+    return null;
+}
+
+pub inline fn opExitScope(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    if (frame.env.parent) |p| frame.env = p;
     return null;
 }
 

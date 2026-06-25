@@ -471,6 +471,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             try writer.print(" exc=R{d} handler_off={d}", .{ rexc, offset });
         },
         .POP_TRY => {},
+        .ENTER_SCOPE, .EXIT_SCOPE => {},
         .NEW_INSTANCE => {
             const rdst = code[new_pc];
             new_pc += 1;

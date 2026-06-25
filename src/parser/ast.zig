@@ -304,6 +304,11 @@ pub const Program = struct {
 
 pub const BlockStmt = struct {
     body: []*Node,
+    /// True for a real `{ ... }` block (its own lexical scope). False for a
+    /// synthetic statement-sequence container (e.g. the class-declaration
+    /// desugaring, multi-declarator lowering) whose `let`/`const` bindings must
+    /// belong to the *enclosing* scope, not a fresh block scope.
+    lexical_scope: bool = true,
 };
 
 pub const VarKind = enum {

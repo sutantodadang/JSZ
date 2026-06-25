@@ -646,8 +646,11 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     }
 
     if (out.items.len == 1) return out.items[0];
+    // Transparent container: the `let <ClassName>` binding (and helpers) belong
+    // to the enclosing scope, not a fresh block scope, so a following
+    // `class B extends A` can resolve `A`.
     return p.makeNode(.block_stmt, start, p.current.start, .{
-        .block_stmt = .{ .body = out.items },
+        .block_stmt = .{ .body = out.items, .lexical_scope = false },
     });
 }
 

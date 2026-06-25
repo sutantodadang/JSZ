@@ -68,9 +68,30 @@ pub fn lowerVarDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
 
 pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
     const line: u32 = node.start;
-    _ = line;
+    // A real `{ ... }` block forms its own lexical scope. Synthetic
+    // statement-sequence blocks (class desugaring, multi-declarator lowering)
+    // are transparent: their bindings belong to the enclosing scope, so they
+    // emit no ENTER_SCOPE/EXIT_SCOPE. For a real block, collect its own
+    // `let`/`const` names; if any exist, push a child env, hoist them (TDZ),
+    // then pop the scope on exit.
+    var lex_names = std.ArrayList([]const u8){};
+    if (node.data.block_stmt.lexical_scope) {
+        for (node.data.block_stmt.body) |child| {
+            try self.collectLexicalNames(child, &lex_names);
+        }
+    }
+    const has_scope = lex_names.items.len > 0;
+    if (has_scope) {
+        try self.emitOp(.ENTER_SCOPE, line);
+        self.block_scope_depth += 1;
+        for (lex_names.items) |nm| try self.emitHoistLexical(nm, line);
+    }
     for (node.data.block_stmt.body) |child| {
         try self.compileStmt(child, last_expr_reg);
+    }
+    if (has_scope) {
+        try self.emitOp(.EXIT_SCOPE, line);
+        self.block_scope_depth -= 1;
     }
 }
 
@@ -184,7 +205,7 @@ pub fn lowerWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     // Save the completion value at the start of this iteration so a
     // `continue` (an empty completion) can revert to it.
     try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth });
     try self.compileStmt(ws.body, last_expr_reg);
 
     // Jump back to loop start (continue lands here too: re-eval cond).
@@ -208,7 +229,7 @@ pub fn lowerDoWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) err
     const loop_start = self.currentOffset();
 
     try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth });
     try self.compileStmt(dw.body, last_expr_reg);
 
     // continue in a do-while jumps to the condition test.
@@ -251,7 +272,7 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     }
 
     try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth });
     try self.compileStmt(fs.body, last_expr_reg);
 
     // continue in a for-loop runs the update expression, then re-tests.
@@ -370,9 +391,6 @@ pub fn lowerBreakStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     _ = last_expr_reg;
     const line: u32 = node.start;
     const label = node.data.break_stmt;
-    try self.emitOp(.JMP, line);
-    const patch = self.currentOffset();
-    try self.emitI16(0);
     if (label) |lname| {
         // Prefer a labeled loop (so `break L` exits the loop); fall back
         // to a labeled non-loop statement block.
@@ -381,6 +399,10 @@ pub fn lowerBreakStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             li -= 1;
             if (self.loop_stack.items[li].label) |l| {
                 if (std.mem.eql(u8, l, lname)) {
+                    try self.emitExitScopesTo(self.loop_stack.items[li].scope_depth, line);
+                    try self.emitOp(.JMP, line);
+                    const patch = self.currentOffset();
+                    try self.emitI16(0);
                     try self.loop_stack.items[li].break_patches.append(self.arena, patch);
                     return;
                 }
@@ -390,6 +412,10 @@ pub fn lowerBreakStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         while (i > 0) {
             i -= 1;
             if (std.mem.eql(u8, self.label_stack.items[i].name, lname)) {
+                try self.emitExitScopesTo(self.label_stack.items[i].scope_depth, line);
+                try self.emitOp(.JMP, line);
+                const patch = self.currentOffset();
+                try self.emitI16(0);
                 try self.label_stack.items[i].break_patches.append(self.arena, patch);
                 return;
             }
@@ -397,8 +423,22 @@ pub fn lowerBreakStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         // Label not found — undefined label is an early SyntaxError.
         if (last_label_error_ptr.* == null)
             last_label_error_ptr.* = std.fmt.allocPrint(self.arena, "undefined label '{s}'", .{lname}) catch "undefined label";
+        // Still emit a JMP placeholder to keep the instruction stream valid.
+        try self.emitOp(.JMP, line);
+        _ = self.currentOffset();
+        try self.emitI16(0);
     } else if (self.loop_stack.items.len > 0) {
-        try self.loop_stack.items[self.loop_stack.items.len - 1].break_patches.append(self.arena, patch);
+        const ti = self.loop_stack.items.len - 1;
+        try self.emitExitScopesTo(self.loop_stack.items[ti].scope_depth, line);
+        try self.emitOp(.JMP, line);
+        const patch = self.currentOffset();
+        try self.emitI16(0);
+        try self.loop_stack.items[ti].break_patches.append(self.arena, patch);
+    } else {
+        // `break` with no enclosing loop/label — emit a placeholder JMP.
+        try self.emitOp(.JMP, line);
+        _ = self.currentOffset();
+        try self.emitI16(0);
     }
 }
 
@@ -433,6 +473,11 @@ pub fn lowerContinueStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
                 try self.emitU8(pr);
             }
         }
+    }
+    // Unwind any block scopes opened inside the loop body before jumping to the
+    // loop's continue target.
+    if (target_idx) |ti| {
+        try self.emitExitScopesTo(self.loop_stack.items[ti].scope_depth, line);
     }
     try self.emitOp(.JMP, line);
     const patch = self.currentOffset();
@@ -528,9 +573,20 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             .identifier => fo.left.data.identifier,
             else => null,
         };
+        // A `let`/`const` for-of binding is fresh per iteration (closures created
+        // in the body capture a distinct binding each pass). Wrap each iteration's
+        // binding + body in its own block scope.
+        const is_lexical_loopvar = loop_name != null and loop_decl_kind != null and
+            (loop_decl_kind.? == .let or loop_decl_kind.? == .const_);
+        const outer_depth = self.block_scope_depth;
+        if (is_lexical_loopvar) {
+            try self.emitOp(.ENTER_SCOPE, line);
+            self.block_scope_depth += 1;
+            try self.emitHoistLexical(loop_name.?, line);
+        }
         if (loop_name) |nm| {
             const ni = try self.builder.addConstant(try val_mod.makeString(self.arena, nm));
-            if (loop_decl_kind != null and (loop_decl_kind.? == .let or loop_decl_kind.? == .const_)) {
+            if (is_lexical_loopvar) {
                 try self.emitInitLexical(nm, rval, line, loop_decl_kind.? == .const_);
             } else {
                 try self.emitOp(.SET_GLOBAL, line);
@@ -541,10 +597,15 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         self.sp = iter_sp;
         // Register the loop so `break`/`continue` (labeled or innermost) resolve to
         // it; `continue` jumps to loop_start, which advances the iterator (re-calls
-        // __iterStep__) before the next done-check.
+        // __iterStep__) before the next done-check. scope_depth is the depth
+        // *outside* the per-iteration scope so break/continue unwind it.
         try self.saveLoopPrev(prev_reg, line);
-        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg });
+        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = outer_depth });
         try self.compileStmt(fo.body, last_expr_reg);
+        if (is_lexical_loopvar) {
+            try self.emitOp(.EXIT_SCOPE, line);
+            self.block_scope_depth -= 1;
+        }
         try self.emitOp(.JMP, line);
         const back = self.currentOffset();
         try self.emitI16(0);
@@ -783,6 +844,7 @@ pub fn lowerLabeledStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) err
     try self.label_stack.append(self.arena, LabelEntry{
         .name = ls.name,
         .loop_start = self.currentOffset(),
+        .scope_depth = self.block_scope_depth,
     });
     try self.compileStmt(ls.body, last_expr_reg);
     self.pending_label = null;

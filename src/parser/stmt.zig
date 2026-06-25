@@ -509,8 +509,75 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
     return result_decl;
 }
 
+/// Detect a `using <BindingIdentifier>` declaration at the current position.
+/// `using` is contextual: it is only a declaration when an identifier follows on
+/// the same line (no ASI break). `using\nx` is two statements; `using = 1`,
+/// `using.x`, `using(...)` are ordinary expressions.
+pub fn atUsingDecl(p: *Parser) bool {
+    if (p.current.kind != .identifier or !std.mem.eql(u8, p.current.value_str, "using")) return false;
+    const nx = p.peekNext();
+    if (nx.line_terminator_before) return false;
+    return nx.kind == .identifier or nx.kind == .kw_of;
+}
+
+/// Detect an `await using <BindingIdentifier>` declaration. Only valid in an
+/// async context — module top level or inside a function body (at script top
+/// level `await` is an ordinary identifier, so this stays an expression).
+pub fn atAwaitUsingDecl(p: *Parser) bool {
+    if (p.current.kind != .identifier or !std.mem.eql(u8, p.current.value_str, "await")) return false;
+    if (!(p.is_module or p.fn_nesting_depth > 0)) return false;
+    const nx = p.peekNext();
+    if (nx.line_terminator_before or nx.kind != .identifier or
+        !std.mem.eql(u8, nx.value_str, "using")) return false;
+    const nx2 = p.peekNext2();
+    if (nx2.line_terminator_before) return false;
+    return nx2.kind == .identifier or nx2.kind == .kw_of;
+}
+
+/// Parse a `using` / `await using` declaration statement (explicit resource
+/// management). Lowered to `let` bindings: scoping, TDZ and per-iteration
+/// freshness match `let`. Each declarator must be a BindingIdentifier with a
+/// required initializer (UsingDeclaration grammar §13.x).
+pub fn parseUsingDeclStmt(p: *Parser, is_await: bool) ?*Node {
+    const start = p.current.start;
+    if (is_await) _ = p.advance(); // consume `await`
+    _ = p.advance(); // consume `using`
+    var decls = std.ArrayList(*Node){};
+    while (true) {
+        const d_start = p.current.start;
+        if (p.check(.left_bracket) or p.check(.left_brace)) {
+            return p.fail("using declaration requires a binding identifier");
+        }
+        const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
+        const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
+        var init_node: ?*Node = null;
+        if (p.match(.eq)) {
+            init_node = p.parseAssignmentExpr();
+        } else {
+            return p.fail("using declaration requires an initializer");
+        }
+        const d = p.makeNode(.var_decl, d_start, p.current.start, .{
+            .var_decl = .{ .kind = .let, .name = name, .init = init_node },
+        }) orelse return null;
+        decls.append(p.arena, d) catch {
+            p.had_error = true;
+            return null;
+        };
+        if (!p.match(.comma)) break;
+    }
+    p.consumeSemicolon();
+    if (decls.items.len == 1) return decls.items[0];
+    // Transparent container: these using bindings belong to the enclosing scope.
+    return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = decls.items, .lexical_scope = false } });
+}
+
 pub fn parseStatement(p: *Parser) ?*Node {
     if (p.had_error) return null;
+    // Explicit resource management: `using x = ...` / `await using x = ...`
+    // declarations. Only recognized when a binding identifier follows (see
+    // atUsingDecl/atAwaitUsingDecl); otherwise `using`/`await` stay ordinary.
+    if (atAwaitUsingDecl(p)) return parseUsingDeclStmt(p, true);
+    if (atUsingDecl(p)) return parseUsingDeclStmt(p, false);
     // Phase 8: a statement starting with `await` is an await-expression statement,
     // not a label/identifier — route to expression parsing (which desugars await).
     // In module mode, `await` is always a keyword. In script mode, `await` is an
@@ -644,8 +711,9 @@ pub fn parseVarDeclarators(p: *Parser, start: u32, kind: ast.VarKind, consume_se
     }
     if (consume_semicolon) p.consumeSemicolon();
     if (decls.items.len == 1) return decls.items[0];
-    // Multiple declarators: wrap in a block_stmt (not ideal, but works for eval)
-    return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = decls.items } });
+    // Multiple declarators: wrap in a transparent block_stmt (bindings belong to
+    // the enclosing scope, not a fresh block scope).
+    return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = decls.items, .lexical_scope = false } });
 }
 
 pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
@@ -760,7 +828,7 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
         body.append(p.arena, vd) catch return null;
     }
     return p.makeNode(.block_stmt, start, p.current.start, .{
-        .block_stmt = .{ .body = body.items },
+        .block_stmt = .{ .body = body.items, .lexical_scope = false },
     });
 }
 
@@ -844,6 +912,34 @@ pub fn parseForStmt(p: *Parser) ?*Node {
     }
     _ = p.expect(.left_paren) orelse return null;
 
+    // Explicit resource management head: `for (using x of it)` /
+    // `for (await using x of it)`. Lowered to a `let` for-of binding (fresh per
+    // iteration). Only for-of is valid — for-in / C-style for with a using
+    // declaration is a SyntaxError.
+    if (atAwaitUsingDecl(p) or atUsingDecl(p)) {
+        const is_await = atAwaitUsingDecl(p);
+        if (is_await) _ = p.advance(); // consume `await`
+        _ = p.advance(); // consume `using`
+        if (p.check(.left_bracket) or p.check(.left_brace)) {
+            return p.fail("using declaration requires a binding identifier");
+        }
+        const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
+        const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
+        if (!p.check(.kw_of)) {
+            return p.fail("using declaration is only valid in a for-of head");
+        }
+        _ = p.advance(); // consume `of`
+        const right = p.parseAssignmentExpr() orelse return null;
+        _ = p.expect(.right_paren) orelse return null;
+        const body = p.parseStatement() orelse return null;
+        const left = p.makeNode(.var_decl, name_tok.start, name_tok.end, .{
+            .var_decl = .{ .kind = .let, .name = name, .init = null },
+        }) orelse return null;
+        return p.makeNode(.for_in_stmt, start, p.current.start, .{
+            .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = true },
+        });
+    }
+
     // Detect for-in: for (var/let/const x in obj) or for (x in obj)
     if (p.check(.kw_var) or p.check(.kw_let) or p.check(.kw_const)) {
         // save position: for (var/let/const NAME in ...) is for-in
@@ -914,7 +1010,7 @@ pub fn parseForStmt(p: *Parser) ?*Node {
                 }
                 _ = p.expect(.semicolon) orelse return null;
                 const init_node: ?*Node = if (decls.items.len == 1) decls.items[0] else p.makeNode(.block_stmt, start, p.current.start, .{
-                    .block_stmt = .{ .body = decls.items },
+                    .block_stmt = .{ .body = decls.items, .lexical_scope = false },
                 });
                 return p.parseForTail(start, init_node);
             } else {
@@ -1059,7 +1155,7 @@ pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind) ?*Node {
         body_stmts.append(p.arena, d) catch return null;
     }
     body_stmts.append(p.arena, orig_body) catch return null;
-    const new_body = p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = body_stmts.items } }) orelse return null;
+    const new_body = p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = body_stmts.items, .lexical_scope = false } }) orelse return null;
     const left = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = kind, .name = tmp_name, .init = null } }) orelse return null;
     return p.makeNode(.for_in_stmt, start, p.current.start, .{
         .for_in_stmt = .{ .left = left, .right = right, .body = new_body, .iterate_values = iterate_values },

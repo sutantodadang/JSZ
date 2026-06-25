@@ -674,6 +674,20 @@ pub fn isAwaitOperandStart(kind: anytype) bool {
     };
 }
 
+/// True when `kind` can begin a method key (in an object literal / class body),
+/// i.e. what may follow an `async`/`*` method modifier: a property name
+/// (identifier, string, number, or reserved word), or a computed key `[`, or a
+/// generator `*`. Used to tell a method modifier from a property named `async`.
+pub fn isMethodKeyStart(kind: anytype) bool {
+    switch (kind) {
+        .identifier, .string, .number, .left_bracket, .star => return true,
+        else => {
+            const kn = @tagName(kind);
+            return kn.len > 3 and std.mem.eql(u8, kn[0..3], "kw_");
+        },
+    }
+}
+
 pub fn parseUnaryExpr(p: *Parser) ?*Node {
     const start = p.current.start;
     // Phase 8: `await X` desugars to a call __await__(X) (synchronous-drain await).
@@ -1197,6 +1211,86 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
     var super_methods = std.ArrayList(*Node){};
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const prop_start = p.current.start;
+        // ES2017 async / ES2015 generator method shorthand:
+        //   `async name(){}`, `async [expr](){}`, `async *name(){}`,
+        //   `*name(){}`, `*[expr](){}`. `async` is contextual, so only treat it
+        //   as a method modifier when a method-key (name/`[`/`*`) follows on the
+        //   same line — otherwise it is a data prop / shorthand named `async`.
+        var m_is_async = false;
+        if (p.currentIsAsyncKw() and !p.peekNext().line_terminator_before and
+            isMethodKeyStart(p.peekNext().kind))
+        {
+            _ = p.advance(); // consume `async`
+            m_is_async = true;
+        }
+        const m_is_gen = p.match(.star);
+        if (m_is_async or m_is_gen) {
+            var mkey: []const u8 = "";
+            var ckey: ?*Node = null;
+            if (p.check(.left_bracket)) {
+                _ = p.advance(); // consume '['
+                ckey = p.parseAssignmentExpr() orelse return null;
+                _ = p.expect(.right_bracket) orelse return null;
+            } else if (p.check(.string) or p.check(.identifier)) {
+                mkey = p.current.value_str;
+                _ = p.advance();
+            } else if (p.check(.number)) {
+                const n = p.current.value_num;
+                _ = p.advance();
+                mkey = if (n == @trunc(n) and n >= 0 and n < 1e15)
+                    std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch {
+                        p.had_error = true;
+                        return null;
+                    }
+                else
+                    std.fmt.allocPrint(p.arena, "{d}", .{n}) catch {
+                        p.had_error = true;
+                        return null;
+                    };
+            } else {
+                const kn = @tagName(p.current.kind);
+                if (kn.len > 3 and std.mem.eql(u8, kn[0..3], "kw_")) {
+                    mkey = kn[3..];
+                    _ = p.advance();
+                } else {
+                    if (!p.had_error) {
+                        p.had_error = true;
+                        p.error_info = parser_file.ParseError{
+                            .message = "expected method name",
+                            .line = p.current.line,
+                            .column = p.current.column,
+                        };
+                    }
+                    return null;
+                }
+            }
+            const am_params = p.parseFunctionParams() orelse return null;
+            p.super_used = false;
+            const am_body = p.parseFunctionBody() orelse return null;
+            const am_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
+                .function_expr = .{
+                    .name = if (ckey == null) mkey else null,
+                    .params = am_params.params,
+                    .param_defaults = am_params.param_defaults,
+                    .rest_param = am_params.rest_param,
+                    .body = am_body,
+                    .is_arrow = false,
+                    .is_generator = m_is_gen,
+                    .is_async = m_is_async,
+                    .is_strict = parser_file.hasUseStrict(am_body),
+                },
+            }) orelse return null;
+            if (p.super_used) super_methods.append(p.arena, am_fn) catch {
+                p.had_error = true;
+                return null;
+            };
+            props.append(p.arena, ast.ObjectProp{ .key = mkey, .value = am_fn, .kind = .init, .computed_key = ckey }) catch {
+                p.had_error = true;
+                return null;
+            };
+            if (!p.match(.comma)) break;
+            continue;
+        }
         // ES6 computed key: `{ [expr]: value }`. The key expression is
         // evaluated at runtime (may produce a symbol).
         if (p.check(.left_bracket)) {

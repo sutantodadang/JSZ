@@ -212,6 +212,12 @@ pub const Op = enum(u8) {
     /// existing lexical binding `name` in the current env with the value in
     /// R[Rsrc], taking it out of TDZ. IsConst=1 upgrades the binding to const_.
     INIT_LEX,
+    /// ENTER_SCOPE | 1 | op. Push a fresh child `Environment` onto the current
+    /// frame (block-scoped lexical bindings live here). Paired with EXIT_SCOPE.
+    ENTER_SCOPE,
+    /// EXIT_SCOPE | 1 | op. Pop the current frame env back to its parent,
+    /// discarding the most recent block scope's bindings.
+    EXIT_SCOPE,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -228,6 +234,8 @@ pub fn instrSize(op: Op) usize {
         .HOIST_VAR => 3,
         .HOIST_LEX => 3,
         .INIT_LEX => 5,
+        .ENTER_SCOPE => 1,
+        .EXIT_SCOPE => 1,
         .SET_GLOBAL => 4,
         .GET_LOCAL => 3,
         .SET_LOCAL => 3,

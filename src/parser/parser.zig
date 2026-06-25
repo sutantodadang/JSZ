@@ -228,6 +228,14 @@ pub const Parser = struct {
         return lx.next() catch Token.initSimple(.eof, 0, 0, 1, 1, false);
     }
 
+    /// Peek the second token after `current` (i.e. token after `peekNext`).
+    /// Used for `await using <ident>` lookahead.
+    pub fn peekNext2(self: *Parser) Token {
+        var lx = self.lexer;
+        _ = lx.next() catch return Token.initSimple(.eof, 0, 0, 1, 1, false);
+        return lx.next() catch Token.initSimple(.eof, 0, 0, 1, 1, false);
+    }
+
     /// True if `current` is the contextual keyword `async` (a plain identifier).
     pub fn currentIsAsyncKw(self: *const Parser) bool {
         return self.current.kind == .identifier and std.mem.eql(u8, self.current.value_str, "async");
