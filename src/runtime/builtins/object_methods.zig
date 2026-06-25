@@ -858,12 +858,22 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
             return throwTypeError(arena, "descriptor must be an object");
         const sdesc = args[2].toPtr().object;
         if (sdesc.hasOwn("get") or sdesc.hasOwn("set")) {
-            const getter: ?Value = if (sdesc.hasOwn("get")) sdesc.getOwn("get") else null;
-            const setter: ?Value = if (sdesc.hasOwn("set")) sdesc.getOwn("set") else null;
+            const existing_acc = obj.getOwnSymEntry(key_raw);
+            // Merge get/set with the existing accessor's handlers when the
+            // descriptor omits one (partial-descriptor semantics).
+            const existing_holder: ?Value = if (existing_acc) |ee|
+                (if (ee.attr.is_accessor) obj.getOwnSym(key_raw) else null)
+            else
+                null;
+            const cur_get: ?Value = if (existing_holder) |hv| hv.toPtr().object.getOwn("get") else null;
+            const cur_set: ?Value = if (existing_holder) |hv| hv.toPtr().object.getOwn("set") else null;
+            const getter: ?Value = if (sdesc.hasOwn("get")) sdesc.getOwn("get") else cur_get;
+            const setter: ?Value = if (sdesc.hasOwn("set")) sdesc.getOwn("set") else cur_set;
             const holder = try makeAccessorHolder(arena, getter, setter);
+            // Omitted enumerable/configurable inherit from the existing property.
             const sok = try obj.defineOwnAccessorSym(key_raw, holder, .{
-                .enumerable = descTruthy(sdesc.getOwn("enumerable")),
-                .configurable = descTruthy(sdesc.getOwn("configurable")),
+                .enumerable = if (sdesc.hasOwn("enumerable")) descTruthy(sdesc.getOwn("enumerable")) else if (existing_acc) |ee| ee.attr.enumerable else false,
+                .configurable = if (sdesc.hasOwn("configurable")) descTruthy(sdesc.getOwn("configurable")) else if (existing_acc) |ee| ee.attr.configurable else false,
             });
             if (!sok) return throwTypeError(arena, "cannot redefine property");
             return args[0];
