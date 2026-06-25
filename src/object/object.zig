@@ -354,12 +354,39 @@ pub const JsObject = struct {
     /// JsObject with own "get"/"set". Forces a shape transition so any stale
     /// data inline cache for the previous shape misses. Returns false if
     /// disallowed (non-configurable redefine, or add when non-extensible).
+    /// Identity of an accessor holder's `get`/`set` slot (absent / undefined → 0).
+    fn holderFnBits(o: *JsObject, k: []const u8) u64 {
+        const v = o.getOwn(k) orelse return 0;
+        if (v.bits == 0) return 0;
+        if (v.unbox() == .undefined_) return 0;
+        return v.bits;
+    }
+
+    /// SameValue on two accessor holders: identical get and identical set.
+    fn accessorHoldersEqual(a: Value, b: Value) bool {
+        if (a.bits == b.bits) return true;
+        if (!(a.bits != 0 and a.unbox() == .object)) return false;
+        if (!(b.bits != 0 and b.unbox() == .object)) return false;
+        const ao = a.toPtr().object;
+        const bo = b.toPtr().object;
+        return holderFnBits(ao, "get") == holderFnBits(bo, "get") and
+            holderFnBits(ao, "set") == holderFnBits(bo, "set");
+    }
+
     pub fn defineOwnAccessor(self: *JsObject, key: []const u8, holder: Value, attr_in: PropAttr) !bool {
         var attr = attr_in;
         attr.is_accessor = true;
         if (self.shape.key_to_slot.get(key)) |slot| {
             const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
-            if (!cur.configurable) return false;
+            if (!cur.configurable) {
+                // Non-configurable: a redefine is rejected unless it makes no
+                // observable change — same accessor with identical get/set and
+                // unchanged enumerable (ValidateAndApplyPropertyDescriptor).
+                if (!cur.is_accessor or cur.enumerable != attr.enumerable) return false;
+                const cur_holder = if (slot < self.slots.items.len) self.slots.items[slot] else Value{};
+                if (!accessorHoldersEqual(cur_holder, holder)) return false;
+                return true;
+            }
             _ = try self.deleteOwn(key);
         } else {
             if (!self.extensible) return false;

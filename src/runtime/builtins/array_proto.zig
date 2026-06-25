@@ -194,18 +194,20 @@ pub fn nativeFlat(arena: std.mem.Allocator, this_val: Value, args: []const Value
 
 /// ES2019 Array.prototype.flatMap — map then flatten one level.
 pub fn nativeFlatMap(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const arr = getArray(this_val) orelse return val_mod.makeUndefined(arena);
+    // Generic per §23.1.3.12: operates on any array-like (incl. TypedArrays via
+    // [].flatMap.call(ta)). Length/elements are read through the VM-routed
+    // helpers so exotic integer-indexed reads work, and the result is always a
+    // plain Array (no species lookup).
     if (args.len == 0) return val_mod.makeUndefined(arena);
     const cb = args[0];
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
-    const len = arr.array_length;
+    const len = try genLength(arena, this_val);
     const new_arr = try JsObject.createArray(arena, arr_proto);
     var ni: u32 = 0;
     var i: usize = 0;
     while (i < len) : (i += 1) {
-        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
+        const elem = try genGet(arena, this_val, i);
         const mapped = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
         if (mapped.bits != 0 and mapped.unbox() == .object and mapped.toPtr().object.is_array) {
             try flattenInto(arena, new_arr, mapped.toPtr().object, 1, &ni);
@@ -653,30 +655,13 @@ pub fn nativeFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []co
     return val_mod.makeNumber(arena, -1.0);
 }
 
-pub fn nativeSort(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const arr = getArray(this_val) orelse return this_val;
-    const len = arr.array_length;
-    if (len <= 1) return this_val;
-
-    // Extract elements.
-    var elems = try arena.alloc(Value, len);
+/// Stable insertion sort of `elems` in place per SortCompare (custom comparator
+/// or default ToString lexicographic order). Shared by the fast-array and the
+/// generic array-like paths.
+fn sortValues(arena: std.mem.Allocator, elems: []Value, cmp_fn: ?Value) !void {
     const undef = try val_mod.makeUndefined(arena);
-    for (0..len) |i| {
-        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        elems[i] = arr.getOwn(key) orelse undef;
-    }
-
-    // Comparator.
-    const cmp_fn: ?Value = if (args.len > 0 and args[0].bits != 0) blk: {
-        const v = args[0];
-        if (v.unbox() == .undefined_) break :blk null;
-        break :blk v;
-    } else null;
-
-    // Simple insertion sort (small arrays typical, avoids complex sort closure issue).
-    // For correctness with custom comparator.
     var i: usize = 1;
-    while (i < len) : (i += 1) {
+    while (i < elems.len) : (i += 1) {
         const cur = elems[i];
         var j: usize = i;
         while (j > 0) {
@@ -692,7 +677,6 @@ pub fn nativeSort(arena: std.mem.Allocator, this_val: Value, args: []const Value
                     };
                     break :blk n > 0.0;
                 } else {
-                    // Lexicographic string comparison.
                     const sa = try elemToString(arena, prev);
                     const sb = try elemToString(arena, cur);
                     break :blk std.mem.order(u8, sa, sb) == .gt;
@@ -704,12 +688,44 @@ pub fn nativeSort(arena: std.mem.Allocator, this_val: Value, args: []const Value
         }
         elems[j] = cur;
     }
+}
 
-    // Write back.
-    for (0..len) |k| {
-        const key = try std.fmt.allocPrint(arena, "{d}", .{k});
-        try arr.set(key, elems[k]);
+pub fn nativeSort(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Comparator (undefined → default order).
+    const cmp_fn: ?Value = if (args.len > 0 and args[0].bits != 0) blk: {
+        const v = args[0];
+        if (v.unbox() == .undefined_) break :blk null;
+        break :blk v;
+    } else null;
+    const undef = try val_mod.makeUndefined(arena);
+
+    if (getArray(this_val)) |arr| {
+        const len = arr.array_length;
+        if (len <= 1) return this_val;
+        var elems = try arena.alloc(Value, len);
+        for (0..len) |i| {
+            const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            elems[i] = arr.getOwn(key) orelse undef;
+        }
+        try sortValues(arena, elems, cmp_fn);
+        for (0..len) |k| {
+            const key = try std.fmt.allocPrint(arena, "{d}", .{k});
+            try arr.set(key, elems[k]);
+        }
+        return this_val;
     }
+
+    // Generic per §23.1.3.30: works on any array-like (incl. TypedArrays via
+    // Array.prototype.sort.call(ta)). Length/elements/writes route through the
+    // VM helpers, so `length` honors a shadowing own property and integer-indexed
+    // reads/writes hit the typed-array buffer.
+    if (this_val.bits == 0 or this_val.unbox() != .object) return this_val;
+    const len = try genLength(arena, this_val);
+    if (len <= 1) return this_val;
+    var elems = try arena.alloc(Value, len);
+    for (0..len) |i| elems[i] = try genGet(arena, this_val, i);
+    try sortValues(arena, elems, cmp_fn);
+    for (0..len) |k| try genSet(arena, this_val, k, elems[k]);
     return this_val;
 }
 

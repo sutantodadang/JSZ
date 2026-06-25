@@ -29,6 +29,25 @@ fn globalObjectOwn(frame: *BcCallFrame, name: []const u8) ?Value {
     return gt.toPtr().object.getOwn(name);
 }
 
+/// ES §9.1.1.4 (global environment record): a `var`/function declaration (or a
+/// sloppy implicit global assignment) at the top level of a Script becomes an
+/// own property of the global object, observable as `globalThis.name`. We keep a
+/// separate environment record for global bindings, so mirror the value onto the
+/// `globalThis` object here. Only runs at true global scope (`parent == null`),
+/// which naturally excludes block/catch/function-local bindings (those execute
+/// in a child environment). Internal `__`-prefixed names are never exposed.
+fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value) void {
+    if (frame.env.parent != null) return;
+    if (name.len >= 2 and name[0] == '_' and name[1] == '_') return;
+    const gt = frame.env.lookup("globalThis") catch return;
+    if (gt.bits == 0 or gt.unbox() != .object) return;
+    // Non-enumerable to match the built-in globals already installed on the
+    // object (and to avoid polluting `for-in`/`Object.keys(globalThis)`); read
+    // and `in` visibility — what the global-object semantics require — are
+    // unaffected by enumerability.
+    _ = gt.toPtr().object.defineOwnData(name, value, .{ .writable = true, .enumerable = false, .configurable = true }) catch {};
+}
+
 pub inline fn opLoadK(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     _ = self;
     const code = frame.func.chunk.code;
@@ -287,6 +306,10 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         error.OutOfMemory => return error.OutOfMemory,
     }
 };
+    // Keep the global object in sync when assigning a global binding (covers
+    // both reassignment of an existing global and sloppy implicit-global
+    // creation). The helper no-ops outside true global scope.
+    mirrorGlobalBinding(frame, name, value);
     return null;
 }
 
@@ -313,6 +336,9 @@ pub inline fn opDefineGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             frame.env.define(name, value) catch return error.OutOfMemory;
         }
     };
+    // Top-level `var`/function declarations are also own properties of the
+    // global object (observable as `globalThis.name`).
+    mirrorGlobalBinding(frame, name, value);
     return null;
 }
 
