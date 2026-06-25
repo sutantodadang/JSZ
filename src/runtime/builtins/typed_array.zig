@@ -1500,19 +1500,21 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
         // Form 2: new TA(buffer, byteOffset?, length?)  → view onto the buffer.
         if (src.internal_kind == .array_buffer) {
             const ab: *ArrayBufferData = @ptrCast(@alignCast(src.internal_slot.?));
-            // 1. byteOffset = ToIndex(args[1]) — side-effecting valueOf runs first.
+            // Spec §23.2.5.1 InitializeTypedArrayFromArrayBuffer, in order:
+            // 6. byteOffset = ToIndex(args[1]) — side-effecting valueOf runs first.
             const byte_offset = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
-            // 2. byteOffset % elementSize != 0 → RangeError.
+            // 7. byteOffset % elementSize != 0 → RangeError (BEFORE ToIndex(length)).
             if (byte_offset % esize != 0) return throwRangeError(arena, "start offset is not aligned");
-            // 3. Detached check (after coercing byteOffset).
-            if (ab.detached) return throwTypeError(arena, "Cannot construct a typed array from a detached ArrayBuffer");
+            // 8.a. If length is present, newLength = ToIndex(length) — another
+            // side-effecting coercion that runs BEFORE the IsDetachedBuffer check
+            // (its valueOf may itself detach the buffer).
+            const has_len = args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_;
             var length: usize = undefined;
+            if (has_len) length = try toIndexThrowing(arena, args[2]);
+            // 9. IsDetachedBuffer(buffer) → TypeError (after both coercions).
+            if (ab.detached) return throwTypeError(arena, "Cannot construct a typed array from a detached ArrayBuffer");
             var track_len = false;
-            if (args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_) {
-                // length = ToIndex(args[2]) — another side-effecting coercion.
-                length = try toIndexThrowing(arena, args[2]);
-                // Re-check detached: a valueOf may have detached mid-construction.
-                if (ab.detached) return throwTypeError(arena, "Cannot construct a typed array from a detached ArrayBuffer");
+            if (has_len) {
                 if (byte_offset > ab.byte_length) return throwRangeError(arena, "byteOffset out of bounds");
                 if (byte_offset + length * esize > ab.byte_length) return throwRangeError(arena, "length out of bounds");
             } else {
