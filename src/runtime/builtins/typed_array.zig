@@ -2354,7 +2354,15 @@ fn function_proto_isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .bc_function, .native_function => true,
-        .object => |o| o.get("__call__") != null or o.internal_kind == .bound_function,
+        .object => |o| {
+            // A Proxy is callable iff its [[ProxyTarget]] is callable.
+            if (o.internal_kind == .proxy) {
+                const proxy_mod = @import("proxy.zig");
+                if (proxy_mod.proxyTarget(o)) |t| return function_proto_isCallable(t);
+                return false;
+            }
+            return o.get("__call__") != null or o.internal_kind == .bound_function;
+        },
         else => false,
     };
 }
