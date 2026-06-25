@@ -2605,6 +2605,13 @@ pub const Realm = struct {
         // ---- ES2020 globalThis (+ Node-compatible `global`) ----
         try installGlobalThis(arena, env, object_proto);
 
+        // `new.target` desugars to a read of `__new_target__`, which the construct
+        // path binds in the constructor's call env. Provide a global fallback of
+        // undefined so an ordinary (non-construct) call observes `new.target ===
+        // undefined` instead of a ReferenceError. (installGlobalThis skips `__`
+        // names, so this is not exposed as a globalThis property.)
+        try env.define("__new_target__", try val_mod.makeUndefined(arena));
+
         // Set thread-locals for builtins that need them.
         active_array_proto = array_proto;
         active_object_proto = object_proto;

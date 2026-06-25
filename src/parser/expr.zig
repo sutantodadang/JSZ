@@ -741,6 +741,36 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
         },
         .kw_new => {
             _ = p.advance();
+            // `new.target` meta-property: evaluates to the active NewTarget (the
+            // call env binds `__new_target__`, defaulting to undefined). Allow
+            // trailing member/subscript access (e.g. `new.target.prototype`).
+            if (p.current.kind == .dot) {
+                _ = p.advance();
+                const mt = p.expectIdentifierName() orelse return null;
+                if (!std.mem.eql(u8, mt.value_str, "target"))
+                    return p.fail("SyntaxError: expected 'target' after 'new.'");
+                var nt_node = p.makeNode(.identifier, start, p.current.start, .{
+                    .identifier = "__new_target__",
+                }) orelse return null;
+                while (true) {
+                    if (p.match(.dot)) {
+                        const pt = p.expectIdentifierName() orelse return null;
+                        const pn = p.makeNode(.identifier, pt.start, pt.end, .{
+                            .identifier = pt.value_str,
+                        }) orelse return null;
+                        nt_node = p.makeNode(.member_expr, nt_node.start, p.current.start, .{
+                            .member_expr = .{ .object = nt_node, .property = pn, .computed = false },
+                        }) orelse return null;
+                    } else if (p.match(.left_bracket)) {
+                        const pe = p.parseExpression() orelse return null;
+                        _ = p.expect(.right_bracket) orelse return null;
+                        nt_node = p.makeNode(.member_expr, nt_node.start, p.current.start, .{
+                            .member_expr = .{ .object = nt_node, .property = pe, .computed = true },
+                        }) orelse return null;
+                    } else break;
+                }
+                return nt_node;
+            }
             // M16 Phase 4: `await` is reserved in module code; `new await …` is
             // a SyntaxError per spec (await is not a valid NewExpression callee).
             if (p.is_module and p.current.kind == .identifier and
