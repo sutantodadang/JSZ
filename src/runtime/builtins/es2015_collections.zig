@@ -21,6 +21,10 @@ pub var active_array_iter_proto: ?*JsObject = null;
 pub var active_weakmap_proto: ?*JsObject = null;
 /// WeakSet.prototype — stored so registerSymbols can attach @@toStringTag.
 pub var active_weakset_proto: ?*JsObject = null;
+/// WeakRef.prototype — stored so registerSymbols can attach @@toStringTag.
+pub var active_weakref_proto: ?*JsObject = null;
+/// FinalizationRegistry.prototype — stored so registerSymbols can attach @@toStringTag.
+pub var active_finreg_proto: ?*JsObject = null;
 
 /// R1: install Map/Set/WeakMap/WeakSet prototypes + constructors and bind globals.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -106,6 +110,37 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     _ = try ws_proto.defineOwnData("constructor", try val_mod.makeObject(arena, ws_ctor), ws_m);
     active_weakset_proto = ws_proto;
     try ctx.env.define("WeakSet", try val_mod.makeObject(arena, ws_ctor));
+
+    // ---- WeakRef ----
+    const wr_proto = try JsObject.create(arena, object_proto);
+    const wr_m: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+    _ = try wr_proto.defineOwnData("deref", try val_mod.makeNativeFunctionNamed(arena, nativeWeakRefDeref, "deref", 0), wr_m);
+
+    const wr_ctor = try JsObject.create(arena, ctx.function_proto);
+    const wr_nlen: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+    _ = try wr_ctor.defineOwnData("name", try val_mod.makeString(arena, "WeakRef"), wr_nlen);
+    _ = try wr_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), wr_nlen);
+    _ = try wr_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, wr_proto), .{ .writable = false, .enumerable = false, .configurable = false });
+    try wr_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakRefCtor));
+    _ = try wr_proto.defineOwnData("constructor", try val_mod.makeObject(arena, wr_ctor), wr_m);
+    active_weakref_proto = wr_proto;
+    try ctx.env.define("WeakRef", try val_mod.makeObject(arena, wr_ctor));
+
+    // ---- FinalizationRegistry ----
+    const fr_proto = try JsObject.create(arena, object_proto);
+    const fr_m: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+    _ = try fr_proto.defineOwnData("register", try val_mod.makeNativeFunctionNamed(arena, nativeFinRegRegister, "register", 2), fr_m);
+    _ = try fr_proto.defineOwnData("unregister", try val_mod.makeNativeFunctionNamed(arena, nativeFinRegUnregister, "unregister", 1), fr_m);
+
+    const fr_ctor = try JsObject.create(arena, ctx.function_proto);
+    const fr_nlen: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+    _ = try fr_ctor.defineOwnData("name", try val_mod.makeString(arena, "FinalizationRegistry"), fr_nlen);
+    _ = try fr_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), fr_nlen);
+    _ = try fr_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, fr_proto), .{ .writable = false, .enumerable = false, .configurable = false });
+    try fr_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeFinRegCtor));
+    _ = try fr_proto.defineOwnData("constructor", try val_mod.makeObject(arena, fr_ctor), fr_m);
+    active_finreg_proto = fr_proto;
+    try ctx.env.define("FinalizationRegistry", try val_mod.makeObject(arena, fr_ctor));
 }
 
 /// Wire @@toStringTag onto WeakMap.prototype and WeakSet.prototype.
@@ -118,6 +153,10 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
             try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "WeakMap"), tag_attr);
         if (active_weakset_proto) |p|
             try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "WeakSet"), tag_attr);
+        if (active_weakref_proto) |p|
+            try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "WeakRef"), tag_attr);
+        if (active_finreg_proto) |p|
+            try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "FinalizationRegistry"), tag_attr);
     }
 }
 
@@ -463,6 +502,154 @@ pub fn nativeWeakSetDelete(arena: std.mem.Allocator, this_val: Value, args: []co
         }
     }
     return val_mod.makeBool(arena, false);
+}
+
+// ---- WeakRef internal data ----
+
+const WeakRefData = struct {
+    target: Value,
+};
+
+fn getWeakRefData(arena: std.mem.Allocator, this_val: Value) anyerror!*WeakRefData {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        try setTypeError(arena, "WeakRef method called on non-object");
+        unreachable;
+    }
+    const obj = this_val.toPtr().object;
+    if (obj.internal_kind != .weakref or obj.internal_slot == null) {
+        try setTypeError(arena, "Method called on incompatible receiver (not a WeakRef)");
+        unreachable;
+    }
+    return @ptrCast(@alignCast(obj.internal_slot.?));
+}
+
+pub fn nativeWeakRefCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (!realm_mod.active_constructing) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "WeakRef constructor requires 'new'");
+        return error.JsException;
+    }
+    // CanBeHeldWeakly check on target (step 2)
+    const target = if (args.len > 0) args[0] else Value{};
+    if (!canBeWeakKey(target)) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "WeakRef target must be an object or unregistered symbol");
+        return error.JsException;
+    }
+    var out = this_val;
+    if (out.bits == 0 or out.unbox() != .object) out = try makeObj(arena, active_weakref_proto, .weakref);
+    const obj = out.toPtr().object;
+    const d = try arena.create(WeakRefData);
+    d.* = .{ .target = target };
+    obj.internal_kind = .weakref;
+    obj.internal_slot = d;
+    return out;
+}
+
+pub fn nativeWeakRefDeref(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const data = try getWeakRefData(arena, this_val);
+    if (data.target.bits == 0) return val_mod.makeUndefined(arena);
+    return data.target;
+}
+
+// ---- FinalizationRegistry internal data ----
+
+const FinRegCell = struct {
+    target: Value,
+    held_value: Value,
+    /// bits == 0 means "no token" (empty unregister slot)
+    unregister_token: Value,
+    has_token: bool,
+};
+
+const FinRegData = struct {
+    /// The cleanup callback (callable). Stored but never invoked (no GC).
+    callback: Value,
+    cells: std.ArrayListUnmanaged(FinRegCell) = .empty,
+};
+
+fn getFinRegData(arena: std.mem.Allocator, this_val: Value) anyerror!*FinRegData {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        try setTypeError(arena, "FinalizationRegistry method called on non-object");
+        unreachable;
+    }
+    const obj = this_val.toPtr().object;
+    if (obj.internal_kind != .finalization_registry or obj.internal_slot == null) {
+        try setTypeError(arena, "Method called on incompatible receiver (not a FinalizationRegistry)");
+        unreachable;
+    }
+    return @ptrCast(@alignCast(obj.internal_slot.?));
+}
+
+pub fn nativeFinRegCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (!realm_mod.active_constructing) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "FinalizationRegistry constructor requires 'new'");
+        return error.JsException;
+    }
+    // cleanupCallback must be callable (step 2)
+    const cb = if (args.len > 0) args[0] else Value{};
+    if (!isCallable(cb)) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "FinalizationRegistry cleanupCallback must be callable");
+        return error.JsException;
+    }
+    var out = this_val;
+    if (out.bits == 0 or out.unbox() != .object) out = try makeObj(arena, active_finreg_proto, .finalization_registry);
+    const obj = out.toPtr().object;
+    const d = try arena.create(FinRegData);
+    d.* = .{ .callback = cb };
+    obj.internal_kind = .finalization_registry;
+    obj.internal_slot = d;
+    return out;
+}
+
+pub fn nativeFinRegRegister(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getFinRegData(arena, this_val);
+    // Step 3: target must CanBeHeldWeakly
+    const target = if (args.len > 0) args[0] else Value{};
+    if (!canBeWeakKey(target)) {
+        try setTypeError(arena, "Invalid value used as WeakRef target");
+        unreachable;
+    }
+    const held_value = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    // Step 4: SameValue(target, heldValue) must be false
+    if (strictEq(target, held_value)) {
+        try setTypeError(arena, "target and heldValue must not be the same value");
+        unreachable;
+    }
+    // Step 5: unregisterToken validation
+    const token_raw = if (args.len > 2) args[2] else Value{};
+    const has_token = token_raw.bits != 0 and token_raw.unbox() != .undefined_;
+    if (has_token and !canBeWeakKey(token_raw)) {
+        try setTypeError(arena, "Invalid value used as unregisterToken");
+        unreachable;
+    }
+    try data.cells.append(arena, .{
+        .target = target,
+        .held_value = held_value,
+        .unregister_token = if (has_token) token_raw else Value{},
+        .has_token = has_token,
+    });
+    return val_mod.makeUndefined(arena);
+}
+
+pub fn nativeFinRegUnregister(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getFinRegData(arena, this_val);
+    const token = if (args.len > 0) args[0] else Value{};
+    if (!canBeWeakKey(token)) {
+        try setTypeError(arena, "Invalid value used as unregisterToken");
+        unreachable;
+    }
+    var removed = false;
+    var i: usize = 0;
+    while (i < data.cells.items.len) {
+        const cell = data.cells.items[i];
+        if (cell.has_token and strictEq(cell.unregister_token, token)) {
+            _ = data.cells.orderedRemove(i);
+            removed = true;
+            // do not advance i — element at i is now the next one
+        } else {
+            i += 1;
+        }
+    }
+    return val_mod.makeBool(arena, removed);
 }
 
 /// Shared iterable initialization for WeakMap (is_map=true, expects [key,val] pairs)
