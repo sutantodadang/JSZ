@@ -478,7 +478,7 @@ fn buildWrappedScript(gpa: std.mem.Allocator, script_path: []const u8, entry_src
     defer gpa.free(wrapped_src);
     const entry_id = std.fs.path.basename(script_path);
     const __b = try jsz.module_loader.buildBundle(gpa, base_dir, entry_id, wrapped_src);
-    if (std.posix.getenv("JSZ_DUMP_BUNDLE") != null) std.debug.print("===BUNDLE===\n{s}\n===END===\n", .{__b});
+    if (std.process.hasEnvVarConstant("JSZ_DUMP_BUNDLE")) std.debug.print("===BUNDLE===\n{s}\n===END===\n", .{__b});
     return __b;
 }
 

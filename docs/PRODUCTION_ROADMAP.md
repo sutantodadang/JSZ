@@ -61,9 +61,9 @@ pass-rate number. **This is the single biggest credibility gap.**
 | Gap | Severity | Notes |
 |---|---|---|
 | Full Test262 pass-rate unknown | 🔴 critical | infra ready; never measured at scale |
-| TypedArray / ArrayBuffer / DataView | 🔴 critical | **entirely absent**; blocks binary data, WASM, much real code |
-| Atomics / SharedArrayBuffer | 🔴 high | absent; needs threading model |
-| ESM loader / linker / evaluation | 🔴 high | only *parsing* exists; no resolution, linking, cyclic, TLA |
+| TypedArray / ArrayBuffer / DataView | ✅ done (M15) | 100% test262 (`TypedArray` 2181/2181, `ArrayBuffer` 340/340, `DataView` 570/570) |
+| Atomics / SharedArrayBuffer | 🔴 high | SAB ctor exists; Atomics op-set + threading model still M17 |
+| ESM loader / linker / evaluation | ✅ done (M16) | registry/live-bindings/cyclic/TLA/dynamic-import in `module.zig`; `module-code` 595/595 (100%) after fixing module-scope global leak |
 | WeakRef / FinalizationRegistry | 🟠 high | absent; needs GC weak-ref integration |
 | GC: generational / incremental | 🟠 high | mark-sweep only → pause times + throughput ceiling |
 | JIT: baseline tier + type feedback | 🟠 high | one optimizing tier; no fast baseline, no profile-guided specialization |
@@ -115,7 +115,25 @@ honest 1-dev estimates.
 - GC integration: backing store as a managed cell; off-heap option.
 - **Gate:** test262 `built-ins/TypedArray*` + `ArrayBuffer*` ≥99%.
 
-**Conformance (2026-06-17):**
+> **✅ COMPLETE — gate met (independently re-run 2026-06-26).** Fresh
+> Windows-native build against a clean tc39/test262 clone:
+> | suite | independently-verified result |
+> |---|---:|
+> | `built-ins/TypedArray` | **2181/2181 (100%)** |
+> | `built-ins/ArrayBuffer` | **220/220 (100%)** |
+> | `built-ins/DataView` | **561/561 (100%)** |
+> | `built-ins/SharedArrayBuffer` | **104/104 (100%)** |
+> | `staging/sm/ArrayBuffer` | **5/5 (100%)** |
+>
+> Gate (`TypedArray*` + `ArrayBuffer*` ≥99%) **solidly met — all 100%.**
+> The former last failure (`staging/sm/ArrayBuffer/slice-species.js`,
+> well-known-symbol identity across realms) is confirmed passing — fixed in
+> `88c8649`: secondary realm's Symbol well-knowns
+> (species/iterator/toStringTag/toPrimitive) + proto `@@species` getters re-keyed
+> to the primary realm's symbols; eval switches TA/buffer thread-locals to the
+> shadow realm's intrinsics.
+
+**Conformance (2026-06-17, superseded by COMPLETE block above):**
 | suite | start | now | change |
 |---|---:|---:|---|
 | TypedArray built-ins | 8.3% | **95.40%** (2076/2176) | +84 |
@@ -350,6 +368,36 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 
 ### Milestone 16 — ESM module system  *(~1.5 mo)*
 **Goal:** modules actually execute, not just parse.
+
+> **✅ COMPLETE — gate met (independently verified 2026-06-26).** A fresh
+> Windows-native build against a clean tc39/test262 clone:
+>
+> | category | independently-verified result |
+> |---|---:|
+> | `language/module-code` | **595/595 (100%, 0 fail)** |
+> | `instn-local-bndng-*` (the former fails) | **15/15 (100%)** |
+> | `SharedArrayBuffer` | 104/104 (100%) |
+>
+> Gate (`module-code ≥99%`) **met**. `zig build test` green.
+>
+> Backstory: commit `f77749a` claimed 596/596 but a fresh run reproduced only
+> **588/596 (98.65%)** — 8 real failures in one cluster
+> (`instn-local-bndng-{cls,let,var,fun,gen,for,export-fun,export-gen}`). Root
+> cause was NOT TDZ (that already worked) but **module top-level `var`/`function`
+> declarations leaking onto the global object**: the raw `evalModule` path
+> mirrored top-level bindings as own-properties of `globalThis`, so
+> `Object.getOwnPropertyDescriptor(global, name)` returned a descriptor where the
+> spec requires `undefined`. Fixed in `src/vm/ops/load.zig` — `mirrorGlobalBinding`
+> now returns early for module frames (`if (frame.func.is_module) return;`), so
+> module top-level declarations stay in the module environment record. 3 lines;
+> +5 regression tests in `src/test/integration/esm.zig`. No module-code regressions.
+>
+> Implementation: `src/runtime/module.zig` (~2034 LOC) — `ModuleRegistry` /
+> `ModuleRecord`, namespace exotic object, live bindings, TLA, dynamic `import()`,
+> `import.meta`, circular deps. (The abandoned `feature/mi16-phase4` `ModuleEnv`
+> rewrite never landed — `module_env.zig` absent; the leak was fixed in the
+> existing model instead.)
+
 - Module record + linking (resolve → instantiate → evaluate phases).
 - Cyclic dependency handling, live bindings, `import.meta`.
 - Top-level await integration with the microtask/job queue.
@@ -461,9 +509,9 @@ a value-representation change in the same milestone.
 
 ```
 M14 Conformance foundation   ██               1–2 mo   ← do first, unblocks measurement
-M15 TypedArrays              ███              1.5–2 mo
-M16 ESM modules              ██               1.5 mo
-M17 WeakRef/Atomics/builtins ██               1 mo
+M15 TypedArrays              ███              ✅ DONE (100% test262 TA/AB/DataView)
+M16 ESM modules              ██               ✅ DONE (module-code 595/595 = 100%)
+M17 WeakRef/Atomics/builtins ██               1 mo      ← NEXT
 M18 RegExp/Intl              ███              1.5–2 mo   ← Tier 1 conformant engine ✅ after here
 M19 GC modernization         ████             2–3 mo
 M20 JIT tier-up + NaN-box    ████             2–3 mo     ← Perf story ✅

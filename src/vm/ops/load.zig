@@ -38,6 +38,9 @@ fn globalObjectOwn(frame: *BcCallFrame, name: []const u8) ?Value {
 /// in a child environment). Internal `__`-prefixed names are never exposed.
 fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value) void {
     if (frame.env.parent != null) return;
+    // ES module top-level declarations live in the Module Environment Record
+    // and must NOT become own-properties of the global object (spec §16.2.1.6).
+    if (frame.func.is_module) return;
     if (name.len >= 2 and name[0] == '_' and name[1] == '_') return;
     const gt = frame.env.lookup("globalThis") catch return;
     if (gt.bits == 0 or gt.unbox() != .object) return;
