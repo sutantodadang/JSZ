@@ -3100,6 +3100,9 @@ pub const Realm = struct {
                 const v = entry.value_ptr.value;
                 if (v.bits == 0 or v.unbox() != .object) continue;
                 const ctor = v.toPtr().object;
+                // Reparent namespace objects (Math, JSON, Atomics, …) that are
+                // directly parented to old_object_proto (no "prototype" property).
+                if (ctor.proto == old_object_proto) ctor.proto = hp_proto;
                 const proto_v = ctor.getOwn("prototype") orelse continue;
                 if (proto_v.bits == 0 or proto_v.unbox() != .object) continue;
                 const child = proto_v.toPtr().object;

@@ -268,6 +268,16 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
             .{ "wait", nativeAtomicsWait, 4 },
             .{ "waitAsync", nativeAtomicsWaitAsync, 4 },
             .{ "isLockFree", nativeAtomicsIsLockFree, 1 },
+            .{ "load", nativeAtomicsLoad, 2 },
+            .{ "store", nativeAtomicsStore, 3 },
+            .{ "add", nativeAtomicsAdd, 3 },
+            .{ "sub", nativeAtomicsSub, 3 },
+            .{ "and", nativeAtomicsAnd, 3 },
+            .{ "or", nativeAtomicsOr, 3 },
+            .{ "xor", nativeAtomicsXor, 3 },
+            .{ "exchange", nativeAtomicsExchange, 3 },
+            .{ "compareExchange", nativeAtomicsCompareExchange, 4 },
+            .{ "pause", nativeAtomicsPause, 0 },
         };
         inline for (atomics_methods) |e| {
             _ = try atomics.defineOwnData(e[0], try val_mod.makeNativeFunctionNamed(arena, e[1], e[0], e[2]), am);
@@ -1268,9 +1278,9 @@ fn validateIntegerTA(arena: std.mem.Allocator, val: Value, waitable: bool) anyer
 pub fn nativeAtomicsNotify(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const a0 = if (args.len > 0) args[0] else Value{};
     const td = try validateIntegerTA(arena, a0, true);
-    // ValidateAtomicAccess: ToIndex(index), bound against the live length.
+    // ValidateAtomicAccess: length captured by validateTypedArray before ToIndex runs.
     const idx = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
-    if (idx >= taCurrentLen(td)) return throwRangeError(arena, "Atomics.notify index out of range");
+    if (idx >= td.length) return throwRangeError(arena, "Atomics.notify index out of range");
     // count: undefined → +∞ (all), else max(ToInteger, 0). Observed for coercion side effects.
     if (args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_)
         _ = try toIntegerThrowing(arena, args[2]);
@@ -1284,20 +1294,58 @@ pub fn nativeAtomicsWait(arena: std.mem.Allocator, _: Value, args: []const Value
     const a0 = if (args.len > 0) args[0] else Value{};
     const td = try validateIntegerTA(arena, a0, true);
     if (!td.ab.shared) return throwTypeError(arena, "Atomics.wait requires a shared buffer");
+    // ValidateAtomicAccess: td.length set before ToIndex by validateTypedArray.
+    const idx = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
+    if (idx >= td.length) return throwRangeError(arena, "Atomics.wait index out of range");
+    // Coerce value (ToBigInt64 for BigInt64Array, else ToInt32 via number coercion).
+    const val_arg = if (args.len > 2) args[2] else Value{};
+    if (td.kind == .i64big) {
+        _ = try toBigIntThrowing(arena, val_arg);
+    } else {
+        _ = try toIntegerThrowing(arena, val_arg);
+    }
+    // Coerce timeout (ToNumber — throws for Symbol, invokes valueOf on objects).
+    _ = try toNumberThrowing(arena, if (args.len > 3) args[3] else Value{});
+    // CanBlock is false for this single-agent runner.
     return throwTypeError(arena, "Atomics.wait: the current agent cannot be suspended");
 }
 
 /// Atomics.waitAsync(typedArray, index, value, timeout) → { async, value }.
-/// With no possible signaller and a value mismatch unknowable without blocking,
-/// the single-agent degenerate result is a synchronous "not-equal".
+/// Single-agent: compare stored value against expected; return "timed-out" when
+/// they match (would have blocked but timeout=0 fires immediately), "not-equal"
+/// otherwise. Full spec-exact argument validation runs before any read.
 pub fn nativeAtomicsWaitAsync(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const a0 = if (args.len > 0) args[0] else Value{};
     const td = try validateIntegerTA(arena, a0, true);
     if (!td.ab.shared) return throwTypeError(arena, "Atomics.waitAsync requires a shared buffer");
+    // ValidateAtomicAccess: td.length set before ToIndex by validateTypedArray.
+    const idx = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
+    if (idx >= td.length) return throwRangeError(arena, "Atomics.waitAsync index out of range");
+    // Coerce value then timeout (both observable; must run in order).
+    const val_arg = if (args.len > 2) args[2] else Value{};
+    var v_big: u64 = 0;
+    var v_num: f64 = 0;
+    if (td.kind == .i64big) {
+        const big = try toBigIntThrowing(arena, val_arg);
+        v_big = bigintValToRaw64(big);
+    } else {
+        v_num = try toIntegerThrowing(arena, val_arg);
+    }
+    _ = try toNumberThrowing(arena, if (args.len > 3) args[3] else Value{});
+    // Compare stored value: "timed-out" if match (would have waited), else "not-equal".
+    const result_str: []const u8 = if (!td.ab.detached) blk: {
+        const matched = if (td.kind == .i64big)
+            atomicReadRaw64(td, idx) == v_big
+        else inner: {
+            const old = try taLoad(arena, td, idx);
+            break :inner wrapUnsigned(u32, toNum(old)) == wrapUnsigned(u32, v_num);
+        };
+        break :blk if (matched) "timed-out" else "not-equal";
+    } else "not-equal";
     const res = try JsObject.create(arena, realm_mod.active_object_proto);
     _ = try res.defineOwnData("async", try val_mod.makeBool(arena, false),
         .{ .writable = true, .enumerable = true, .configurable = true });
-    _ = try res.defineOwnData("value", try val_mod.makeString(arena, "not-equal"),
+    _ = try res.defineOwnData("value", try val_mod.makeString(arena, result_str),
         .{ .writable = true, .enumerable = true, .configurable = true });
     return val_mod.makeObject(arena, res);
 }
@@ -1307,6 +1355,278 @@ pub fn nativeAtomicsIsLockFree(arena: std.mem.Allocator, _: Value, args: []const
     const n = try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{});
     const lockfree = n == 1 or n == 2 or n == 4 or n == 8;
     return val_mod.makeBool(arena, lockfree);
+}
+
+/// Atomics.pause([iterationNumber]) → undefined. Hint to the CPU to spin-wait.
+/// In a single-agent engine this is a no-op; validation still runs.
+/// Spec: iterationNumber must be undefined or an integral Number (not String,
+/// Boolean, null, Symbol, BigInt, non-integer Number, or any object).
+pub fn nativeAtomicsPause(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const arg = if (args.len > 0) args[0] else Value{};
+    if (arg.bits != 0 and arg.unbox() != .undefined_) { // not undefined
+        const tag = arg.unbox();
+        if (tag != .number)
+            return throwTypeError(arena, "Atomics.pause: iterationNumber must be an integral Number");
+        const n = toNum(arg);
+        if (std.math.isNan(n) or std.math.isInf(n) or @floor(n) != n)
+            return throwTypeError(arena, "Atomics.pause: iterationNumber must be an integral Number");
+    }
+    return Value{}; // undefined
+}
+
+// ---- Atomics RMW operations (Milestone 17 Lever 3) -------------------------
+//
+// ValidateIntegerTypedArray (non-waitable): accepts i8/u8/i16/u16/i32/u32/
+// i64big/u64big; rejects u8clamped and all float kinds → TypeError.
+// Works on both SharedArrayBuffer and normal ArrayBuffer (only wait/waitAsync
+// require a shared buffer). Single-agent: plain read-modify-write is atomic.
+
+/// ValidateIntegerTypedArray for RMW ops (waitable=false).
+fn validateAtomicIntegerTA(arena: std.mem.Allocator, val: Value) anyerror!*TypedArrayData {
+    const td = getTd(val) orelse
+        return throwTypeError(arena, "Atomics operation called on a non-TypedArray");
+    try validateTypedArray(arena, td);
+    switch (td.kind) {
+        .u8clamped, .f16, .f32, .f64 =>
+            return throwTypeError(arena, "Atomics operation requires an integer TypedArray"),
+        else => {},
+    }
+    return td;
+}
+
+/// Like validateAtomicIntegerTA but also rejects immutable buffers. Must be
+/// called for any Atomics write op so the TypeError fires before index coercion.
+fn validateAtomicWriteTA(arena: std.mem.Allocator, val: Value) anyerror!*TypedArrayData {
+    const td = try validateAtomicIntegerTA(arena, val);
+    if (td.ab.immutable)
+        return throwTypeError(arena, "Atomics: cannot write to immutable ArrayBuffer");
+    return td;
+}
+
+/// ValidateAtomicAccess: ToIndex(index) then RangeError if OOB.
+/// Uses td.length (captured by validateTypedArray before any user-code runs) so
+/// the pre-coercion length governs the bounds check per spec.
+/// Must run AFTER validateAtomicIntegerTA so TypeError fires before RangeError.
+fn atomicValidateAccess(arena: std.mem.Allocator, td: *const TypedArrayData, index_val: Value) anyerror!usize {
+    const idx = try toIndexThrowing(arena, index_val);
+    if (idx >= td.length) return throwRangeError(arena, "Atomics index out of range");
+    return idx;
+}
+
+/// Read the raw u64 bit-pattern of a BigInt typed-array element.
+fn atomicReadRaw64(td: *const TypedArrayData, i: usize) u64 {
+    const base = td.byte_offset + i * 8;
+    return std.mem.readInt(u64, td.ab.bytes[base..][0..8], native_endian);
+}
+
+/// Write a raw u64 bit-pattern to a BigInt typed-array element.
+fn atomicWriteRaw64(td: *const TypedArrayData, i: usize, v: u64) void {
+    const base = td.byte_offset + i * 8;
+    std.mem.writeInt(u64, td.ab.bytes[base..][0..8], v, native_endian);
+}
+
+/// Wrap a stored u64 back to a JS BigInt value matching the element kind.
+fn bigintFromRaw64(arena: std.mem.Allocator, kind: TAKind, raw: u64) !Value {
+    return if (kind == .i64big)
+        val_mod.makeBigIntFromI64(arena, @bitCast(raw))
+    else
+        makeBigU64(arena, raw);
+}
+
+/// Extract the low 64 bits from a BigInt Value for storage.
+fn bigintValToRaw64(v: Value) u64 {
+    if (v.bits == 0 or v.unbox() != .bigint) return 0;
+    return bigintLow64(v.toPtr().bigint.toConst());
+}
+
+/// Atomics.load(typedArray, index)
+pub fn nativeAtomicsLoad(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateAtomicIntegerTA(arena, a0);
+    const idx = try atomicValidateAccess(arena, td, if (args.len > 1) args[1] else Value{});
+    if (td.ab.detached) return throwTypeError(arena, "Atomics.load: buffer was detached");
+    return taLoad(arena, td, idx);
+}
+
+/// Atomics.store(typedArray, index, value) — returns the integer-coerced value.
+pub fn nativeAtomicsStore(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateAtomicWriteTA(arena, a0);
+    const idx = try atomicValidateAccess(arena, td, if (args.len > 1) args[1] else Value{});
+    const raw_val = if (args.len > 2) args[2] else Value{};
+    if (td.kind.isBigInt()) {
+        const v = try toBigIntThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.store: buffer was detached");
+        atomicWriteRaw64(td, idx, bigintValToRaw64(v));
+        return v;
+    } else {
+        const v = try toIntegerThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.store: buffer was detached");
+        taStoreNumber(td, idx, v);
+        return val_mod.makeNumber(arena, v);
+    }
+}
+
+/// Atomics.add(typedArray, index, value) — write old+value, return old.
+pub fn nativeAtomicsAdd(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateAtomicWriteTA(arena, a0);
+    const idx = try atomicValidateAccess(arena, td, if (args.len > 1) args[1] else Value{});
+    const raw_val = if (args.len > 2) args[2] else Value{};
+    if (td.kind.isBigInt()) {
+        const v_big = try toBigIntThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.add: buffer was detached");
+        const old_raw = atomicReadRaw64(td, idx);
+        atomicWriteRaw64(td, idx, old_raw +% bigintValToRaw64(v_big));
+        return bigintFromRaw64(arena, td.kind, old_raw);
+    } else {
+        const v = try toIntegerThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.add: buffer was detached");
+        const old = try taLoad(arena, td, idx);
+        taStoreNumber(td, idx, toNum(old) + v);
+        return old;
+    }
+}
+
+/// Atomics.sub(typedArray, index, value) — write old-value, return old.
+pub fn nativeAtomicsSub(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateAtomicWriteTA(arena, a0);
+    const idx = try atomicValidateAccess(arena, td, if (args.len > 1) args[1] else Value{});
+    const raw_val = if (args.len > 2) args[2] else Value{};
+    if (td.kind.isBigInt()) {
+        const v_big = try toBigIntThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.sub: buffer was detached");
+        const old_raw = atomicReadRaw64(td, idx);
+        atomicWriteRaw64(td, idx, old_raw -% bigintValToRaw64(v_big));
+        return bigintFromRaw64(arena, td.kind, old_raw);
+    } else {
+        const v = try toIntegerThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.sub: buffer was detached");
+        const old = try taLoad(arena, td, idx);
+        taStoreNumber(td, idx, toNum(old) - v);
+        return old;
+    }
+}
+
+/// Atomics.and(typedArray, index, value) — write old&value, return old.
+/// Uses wrapUnsigned(u32) for bitwise ops so negatives (two's complement) work.
+pub fn nativeAtomicsAnd(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateAtomicWriteTA(arena, a0);
+    const idx = try atomicValidateAccess(arena, td, if (args.len > 1) args[1] else Value{});
+    const raw_val = if (args.len > 2) args[2] else Value{};
+    if (td.kind.isBigInt()) {
+        const v_big = try toBigIntThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.and: buffer was detached");
+        const old_raw = atomicReadRaw64(td, idx);
+        atomicWriteRaw64(td, idx, old_raw & bigintValToRaw64(v_big));
+        return bigintFromRaw64(arena, td.kind, old_raw);
+    } else {
+        const v = try toIntegerThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.and: buffer was detached");
+        const old = try taLoad(arena, td, idx);
+        const result = wrapUnsigned(u32, toNum(old)) & wrapUnsigned(u32, v);
+        taStoreNumber(td, idx, @floatFromInt(result));
+        return old;
+    }
+}
+
+/// Atomics.or(typedArray, index, value) — write old|value, return old.
+pub fn nativeAtomicsOr(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateAtomicWriteTA(arena, a0);
+    const idx = try atomicValidateAccess(arena, td, if (args.len > 1) args[1] else Value{});
+    const raw_val = if (args.len > 2) args[2] else Value{};
+    if (td.kind.isBigInt()) {
+        const v_big = try toBigIntThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.or: buffer was detached");
+        const old_raw = atomicReadRaw64(td, idx);
+        atomicWriteRaw64(td, idx, old_raw | bigintValToRaw64(v_big));
+        return bigintFromRaw64(arena, td.kind, old_raw);
+    } else {
+        const v = try toIntegerThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.or: buffer was detached");
+        const old = try taLoad(arena, td, idx);
+        const result = wrapUnsigned(u32, toNum(old)) | wrapUnsigned(u32, v);
+        taStoreNumber(td, idx, @floatFromInt(result));
+        return old;
+    }
+}
+
+/// Atomics.xor(typedArray, index, value) — write old^value, return old.
+pub fn nativeAtomicsXor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateAtomicWriteTA(arena, a0);
+    const idx = try atomicValidateAccess(arena, td, if (args.len > 1) args[1] else Value{});
+    const raw_val = if (args.len > 2) args[2] else Value{};
+    if (td.kind.isBigInt()) {
+        const v_big = try toBigIntThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.xor: buffer was detached");
+        const old_raw = atomicReadRaw64(td, idx);
+        atomicWriteRaw64(td, idx, old_raw ^ bigintValToRaw64(v_big));
+        return bigintFromRaw64(arena, td.kind, old_raw);
+    } else {
+        const v = try toIntegerThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.xor: buffer was detached");
+        const old = try taLoad(arena, td, idx);
+        const result = wrapUnsigned(u32, toNum(old)) ^ wrapUnsigned(u32, v);
+        taStoreNumber(td, idx, @floatFromInt(result));
+        return old;
+    }
+}
+
+/// Atomics.exchange(typedArray, index, value) — write value, return old.
+pub fn nativeAtomicsExchange(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateAtomicWriteTA(arena, a0);
+    const idx = try atomicValidateAccess(arena, td, if (args.len > 1) args[1] else Value{});
+    const raw_val = if (args.len > 2) args[2] else Value{};
+    if (td.kind.isBigInt()) {
+        const v_big = try toBigIntThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.exchange: buffer was detached");
+        const old_raw = atomicReadRaw64(td, idx);
+        atomicWriteRaw64(td, idx, bigintValToRaw64(v_big));
+        return bigintFromRaw64(arena, td.kind, old_raw);
+    } else {
+        const v = try toIntegerThrowing(arena, raw_val);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.exchange: buffer was detached");
+        const old = try taLoad(arena, td, idx);
+        taStoreNumber(td, idx, v);
+        return old;
+    }
+}
+
+/// Atomics.compareExchange(typedArray, index, expected, replacement)
+/// If element === expected (at element width), write replacement. Always returns old.
+pub fn nativeAtomicsCompareExchange(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateAtomicWriteTA(arena, a0);
+    const idx = try atomicValidateAccess(arena, td, if (args.len > 1) args[1] else Value{});
+    const expected_arg = if (args.len > 2) args[2] else Value{};
+    const replacement_arg = if (args.len > 3) args[3] else Value{};
+    if (td.kind.isBigInt()) {
+        const exp_big = try toBigIntThrowing(arena, expected_arg);
+        const rep_big = try toBigIntThrowing(arena, replacement_arg);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.compareExchange: buffer was detached");
+        const old_raw = atomicReadRaw64(td, idx);
+        if (old_raw == bigintValToRaw64(exp_big)) atomicWriteRaw64(td, idx, bigintValToRaw64(rep_big));
+        return bigintFromRaw64(arena, td.kind, old_raw);
+    } else {
+        const exp = try toIntegerThrowing(arena, expected_arg);
+        const rep = try toIntegerThrowing(arena, replacement_arg);
+        if (td.ab.detached) return throwTypeError(arena, "Atomics.compareExchange: buffer was detached");
+        const old = try taLoad(arena, td, idx);
+        // Element-level comparison: both sides wrap to the element's unsigned width
+        // so that e.g. Int16Array[0]=-13035 matches expected=123456789 (same u16).
+        const matched = switch (td.kind) {
+            .i8, .u8   => wrapUnsigned(u8,  toNum(old)) == wrapUnsigned(u8,  exp),
+            .i16, .u16 => wrapUnsigned(u16, toNum(old)) == wrapUnsigned(u16, exp),
+            else       => wrapUnsigned(u32, toNum(old)) == wrapUnsigned(u32, exp),
+        };
+        if (matched) taStoreNumber(td, idx, rep);
+        return old;
+    }
 }
 
 pub fn nativeArrayBufferSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
