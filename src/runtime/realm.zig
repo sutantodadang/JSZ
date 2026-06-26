@@ -223,7 +223,7 @@ fn nativeRequire(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
         return val_mod.makeUndefined(arena);
     }
     const name = args[0].toPtr().string;
-    if (std.posix.getenv("JSZ_DBG") != null) std.debug.print("REQUIRE {s}\n", .{name});
+    if (std.process.hasEnvVarConstant("JSZ_DBG")) std.debug.print("REQUIRE {s}\n", .{name});
     const env = active_global_env orelse return val_mod.makeUndefined(arena);
     if (std.mem.eql(u8, name, "module")) {
         return env.lookup("module") catch return val_mod.makeUndefined(arena);
@@ -765,7 +765,7 @@ const DeferredImportCtx = struct {
 fn deferredImportResolve(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
     const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
     const ctx: *DeferredImportCtx = @ptrCast(@alignCast(slot));
-    if (std.posix.getenv("JSZ_DBG") != null) std.debug.print("deferredImportResolve name={s} result_bits={x}\n", .{ ctx.name, ctx.result.bits });
+    if (std.process.hasEnvVarConstant("JSZ_DBG")) std.debug.print("deferredImportResolve name={s} result_bits={x}\n", .{ ctx.name, ctx.result.bits });
     const name_val = val_mod.makeString(arena, ctx.name) catch return val_mod.makeUndefined(arena);
     const exports_val = nativeRequire(arena, Value{}, &[_]Value{name_val}) catch |err| {
         if (err == error.JsException) {
@@ -817,7 +817,7 @@ fn deferredImportResolve(arena: std.mem.Allocator, _: Value, _: []const Value) a
 /// the static DFS chain (A's body → entry's B require) runs before the dynamic
 /// import's side-effects, matching the spec's InnerModuleEvaluation order.
 pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (std.posix.getenv("JSZ_DBG") != null and args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) std.debug.print("IMPORT {s}\n", .{args[0].toPtr().string});
+    if (std.process.hasEnvVarConstant("JSZ_DBG") and args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) std.debug.print("IMPORT {s}\n", .{args[0].toPtr().string});
     if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
         return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{
             try val_mod.makeString(arena, "TypeError: import() requires a string specifier"),
@@ -861,7 +861,7 @@ pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) any
             // calling module's static-import DFS runs first (spec §16.2.1.5.1
             // step 11.c.iv — pending-dependency ordering).
             const result_p = try promise_mod.newPendingPromise(arena);
-            if (std.posix.getenv("JSZ_DBG") != null) std.debug.print("nativeImport deferred name={s} result_bits={x}\n", .{ lookup_name, result_p.bits });
+            if (std.process.hasEnvVarConstant("JSZ_DBG")) std.debug.print("nativeImport deferred name={s} result_bits={x}\n", .{ lookup_name, result_p.bits });
             const ctx = try arena.create(DeferredImportCtx);
             ctx.* = .{ .name = lookup_name, .result = result_p };
             const resolve_fn = try val_mod.makeNativeFunctionData(arena, deferredImportResolve, ctx);

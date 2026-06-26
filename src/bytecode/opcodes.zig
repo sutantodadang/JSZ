@@ -365,8 +365,8 @@ test "JIT contract: int-subset opcode ordinals are pinned" {
     try std.testing.expectEqual(@as(u8, 45), @intFromEnum(Op.RETURN));
     try std.testing.expectEqual(@as(u8, 46), @intFromEnum(Op.RETURN_UNDEF));
     try std.testing.expectEqual(@as(u8, 47), @intFromEnum(Op.HALT));
-    try std.testing.expectEqual(@as(u8, 62), @intFromEnum(Op.DEFINE_GLOBAL));
-    try std.testing.expectEqual(@as(u8, 74), @intFromEnum(Op.HOIST_VAR));
+    try std.testing.expectEqual(@as(u8, 63), @intFromEnum(Op.DEFINE_GLOBAL));
+    try std.testing.expectEqual(@as(u8, 76), @intFromEnum(Op.HOIST_VAR));
 }
 
 test "instrSize LOAD_K is 4" {

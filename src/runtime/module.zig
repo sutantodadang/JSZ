@@ -1955,7 +1955,7 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     // The entry body has returned: it is now ~evaluated~ (see loaded=false above).
     if (entry_id != null) try sb.appendSlice(gpa, "module.loaded = true;\n");
     const result = try sb.toOwnedSlice(gpa);
-    if (std.posix.getenv("JSZ_DUMP_BUNDLE") != null) {
+    if (std.process.hasEnvVarConstant("JSZ_DUMP_BUNDLE")) {
         const f = std.fs.cwd().createFile("/tmp/bundle_dump.js", .{}) catch return result;
         defer f.close();
         _ = f.writeAll(result) catch {};
