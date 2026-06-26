@@ -2589,6 +2589,7 @@ pub const Realm = struct {
                 try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols));
                 try ctor_obj.set("is", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIs, "is", 2));
                 try ctor_obj.set("hasOwn", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectHasOwn, "hasOwn", 2));
+                try ctor_obj.set("groupBy", try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeObjectGroupBy, "groupBy", 2));
             }
         }
         // hasOwnProperty on Object.prototype (non-enumerable, writable, configurable)

@@ -86,9 +86,22 @@ pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         self.block_scope_depth += 1;
         for (lex_names.items) |nm| try self.emitHoistLexical(nm, line);
     }
+    // Reclaim registers between statements — same discipline as compileBody so
+    // that deeply-nested or repeated blocks do not exhaust the u8 register space.
+    // We only free slots allocated *inside* this block (>= entry_sp) to avoid
+    // clobbering live values from the enclosing scope.
+    const entry_sp = self.sp;
+    var prev_reg: ?u8 = null;
     for (node.data.block_stmt.body) |child| {
-        try self.compileStmt(child, last_expr_reg);
+        if (prev_reg) |pr| {
+            if (pr >= entry_sp) self.sp = pr;
+            prev_reg = null;
+        }
+        var child_reg: ?u8 = null;
+        try self.compileStmt(child, &child_reg);
+        prev_reg = child_reg;
     }
+    last_expr_reg.* = prev_reg;
     if (has_scope) {
         try self.emitOp(.EXIT_SCOPE, line);
         self.block_scope_depth -= 1;

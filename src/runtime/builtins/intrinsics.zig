@@ -70,9 +70,11 @@ pub fn makeCtor(arena: std.mem.Allocator, proto: *JsObject, call_fn: val_mod.Nat
 
 /// Install a read-only accessor (getter only) on `proto` under `key`.
 /// Non-enumerable, configurable — the spec shape for prototype getters.
+/// The getter function's `.name` is set to `"get " + key` per spec §17.
 pub fn defineGetter(arena: std.mem.Allocator, proto: *JsObject, key: []const u8, getter: val_mod.NativeFnPtr) !void {
     const holder = try JsObject.create(arena, null);
-    try holder.set("get", try val_mod.makeNativeFunction(arena, getter));
+    const getter_name = try std.fmt.allocPrint(arena, "get {s}", .{key});
+    try holder.set("get", try val_mod.makeNativeFunctionNamed(arena, getter, getter_name, 0));
     const hv = try val_mod.makeObject(arena, holder);
     _ = try proto.defineOwnAccessor(key, hv, .{ .enumerable = false, .configurable = true, .writable = false });
 }
