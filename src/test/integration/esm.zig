@@ -303,3 +303,122 @@ test "snapshot: corrupt image yields an exception, not a crash" {
     }
 }
 
+// ---- instn-local-bndng: module declarations must NOT appear on globalThis ----
+
+test "esm: module var does not pollute globalThis (instn-local-bndng-var)" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    const result = ctx.evalModule(
+        \\var test262 = 1;
+        \\if (Object.getOwnPropertyDescriptor(globalThis, 'test262') !== undefined)
+        \\    throw new Error('var leaked to globalThis');
+    , "<mod>");
+    switch (result) {
+        .ok => {},
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    }
+}
+
+test "esm: module function decl does not pollute globalThis (instn-local-bndng-func)" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    const result = ctx.evalModule(
+        \\function test262() {}
+        \\if (Object.getOwnPropertyDescriptor(globalThis, 'test262') !== undefined)
+        \\    throw new Error('function decl leaked to globalThis');
+    , "<mod>");
+    switch (result) {
+        .ok => {},
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    }
+}
+
+test "esm: module let does not pollute globalThis (instn-local-bndng-let)" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    const result = ctx.evalModule(
+        \\let test262 = 1;
+        \\if (Object.getOwnPropertyDescriptor(globalThis, 'test262') !== undefined)
+        \\    throw new Error('let leaked to globalThis');
+    , "<mod>");
+    switch (result) {
+        .ok => {},
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    }
+}
+
+test "esm: module const does not pollute globalThis (instn-local-bndng-const)" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    const result = ctx.evalModule(
+        \\const test262 = 1;
+        \\if (Object.getOwnPropertyDescriptor(globalThis, 'test262') !== undefined)
+        \\    throw new Error('const leaked to globalThis');
+    , "<mod>");
+    switch (result) {
+        .ok => {},
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    }
+}
+
+test "esm: module var is accessible inside module but not on globalThis" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    // var is in global_env (accessible by name) but NOT on globalThis object
+    const result = ctx.evalModule(
+        \\var test262 = 42;
+        \\if (test262 !== 42) throw new Error('var not accessible');
+        \\if (Object.getOwnPropertyDescriptor(globalThis, 'test262') !== undefined)
+        \\    throw new Error('var leaked to globalThis');
+    , "<mod>");
+    switch (result) {
+        .ok => {},
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("parse error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    }
+}
+
