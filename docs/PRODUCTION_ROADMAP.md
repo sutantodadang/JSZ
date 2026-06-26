@@ -435,11 +435,26 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 > /octal (`0o`) numeric literals (were unparsed); `activateHeap` reparenting of
 > namespace objects (Atomics/Math/JSON) onto the migrated `Object.prototype`.
 >
-> **Deferred (not gate-blocking):** real GC weak-collection/finalization semantics
-> (entries held strongly; test262 cannot test collection — coordinate with M19
-> ephemerons); builtins audit `Array.fromAsync` / `Object.groupBy` /
-> `structuredClone` (still absent); `Map`/`Set` are ~30% (same descriptor/iterable
-> lever as WeakMap/WeakSet, pre-existing — a cheap follow-up).
+> **Cleanup landed (+2 commits 2026-06-26):**
+> - `built-ins/Map` → **198/204 (97.05%)**, `built-ins/Set` → **345/382 (90.31%)**
+>   (same descriptor/brand/iterable lever as WeakMap/WeakSet). + a required
+>   `lowerBlockStmt` per-statement register-reclamation fix (deeply-nested blocks
+>   were overflowing the u8 register space → compiler panic).
+> - `Object.groupBy` **13/14 (92.86%)** + `Map.groupBy` **14/14 (100%)**.
+> - `Array.fromAsync` **5/5 runnable** (array / sync iterable / async iterator /
+>   thenables / array-like / mapFn / rejection all smoke-verified).
+> - `structuredClone` implemented (deep clone + cycle/identity; Symbol/Function
+>   throw TypeError — no DOMException; not in test262, smoke-verified).
+>
+> **Still deferred (not gate-blocking):**
+> - Real GC weak-collection/finalization semantics (entries held strongly; test262
+>   cannot test collection — coordinate with M19 ephemerons).
+> - `async function*` generators don't drive (for-await throws) — a pre-existing
+>   incomplete language feature; makes an async-generator *source* to `fromAsync`
+>   yield `[]` (non-generator async sources work).
+> - Engine-wide **integer-key ascending enumeration** in `ownKeys` (the 1 remaining
+>   `Object.groupBy/groupLength` fail; also affects `Object.keys`/for-in/JSON —
+>   a deliberate broad change worth doing for many suites at once).
 
 ### Milestone 18 — RegExp & Intl completeness  *(~1.5–2 mo)*
 - RegExp: Unicode property escapes, lookbehind, named groups, `/v` set notation, sticky/dotAll edge cases. Consider a proven backtracking + bytecode design.
