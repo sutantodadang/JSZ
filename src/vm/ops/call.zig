@@ -32,6 +32,7 @@ pub inline fn opNewClosure(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     closure.* = BcClosure{
         .func = child_fn,
         .env = @ptrCast(frame.env),
+        .realm = self.realmAsOpaque(),
         // Arrows have no own `this`: capture the definition site's `this` now so
         // it's used regardless of how/with-what-this the arrow is later called.
         .captured_this = if (child_fn.is_arrow)

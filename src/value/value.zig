@@ -20,6 +20,13 @@ pub const NativeFnPtr = *const fn (arena: std.mem.Allocator, this_val: Value, ar
 /// shared trampoline can recover its per-registration userdata. Single-threaded.
 pub var g_active_native_data: ?*anyopaque = null;
 
+/// Side channel (cross-realm): set immediately before invoking a native_function
+/// entry to the Realm that created it (opaque *Realm). Lets a native constructor
+/// such as the dynamic `Function` ctor tag the function it creates with the realm
+/// of the constructor object that was invoked (its [[Realm]]), not the running
+/// VM's realm. Single-threaded; null when the entry has no realm.
+pub var g_active_native_realm: ?*anyopaque = null;
+
 /// A native function plus optional host userdata. Builtins use data == null.
 pub const NativeFnEntry = struct {
     call: NativeFnPtr,
@@ -34,9 +41,13 @@ pub const NativeFnEntry = struct {
     /// deleted (e.g. `delete fn.length`).  Both default to present (false = present).
     length_deleted: bool = false,
     name_deleted: bool = false,
+    /// Cross-realm: which Realm created this native function (opaque *Realm).
+    /// Null = primary realm / untagged. Used by GetFunctionRealm.
+    realm: ?*anyopaque = null,
 
     pub fn invoke(self: NativeFnEntry, arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
         g_active_native_data = self.data;
+        g_active_native_realm = self.realm;
         return self.call(arena, this_val, args);
     }
 };
@@ -614,6 +625,18 @@ pub fn makeSymbol(arena: std.mem.Allocator, description: ?[]const u8) !Value {
     const v = try arena.create(JsValue);
     v.* = .{ .symbol = sd };
     return Value.fromPtr(v);
+}
+
+/// Cross-realm: tag a function Value with its creating Realm (opaque *Realm) so
+/// GetFunctionRealm can recover it. No-op for non-function values.
+pub fn setValueRealm(v: Value, realm: ?*anyopaque) void {
+    if (!v.isHeapPtr()) return;
+    const jsv = v.toPtr();
+    switch (jsv.*) {
+        .native_function => |*e| e.realm = realm,
+        .bc_function => |c| c.realm = realm,
+        else => {},
+    }
 }
 
 /// Phase 3a: wrap a native function pointer as a Value.

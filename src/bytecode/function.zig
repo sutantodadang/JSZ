@@ -78,6 +78,10 @@ pub const BcClosure = struct {
     /// and class desugaring work. `?*JsObject` stored opaque to avoid an import
     /// cycle (function.zig must not depend on object.zig).
     obj: ?*anyopaque = null,
+    /// Cross-realm: which Realm created this closure (opaque *Realm, to avoid a
+    /// circular import with runtime/realm.zig). Null = primary realm / untagged.
+    /// Read by GetFunctionRealm for GetPrototypeFromConstructor's realm fallback.
+    realm: ?*anyopaque = null,
 };
 
 test "BcFunction fields exist" {

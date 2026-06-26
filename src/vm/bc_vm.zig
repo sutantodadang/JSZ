@@ -272,7 +272,14 @@ pub const BcVm = struct {
                 const frame_this: Value = if (fn_ptr.is_arrow)
                     eff_this // arrow: exact captured lexical this, no coercion
                 else if (!fn_ptr.is_strict and (eff_this.isUndefined() or eff_this.isNull())) blk: {
+                    // Cross-realm: use the FUNCTION's realm's globalThis, not
+                    // the current active realm's.
                     const realm_m = @import("../runtime/realm.zig");
+                    if (closure.realm) |r_opaque| {
+                        const fr = @as(*Realm, @ptrCast(@alignCast(r_opaque)));
+                        break :blk fr.global_env.lookup("globalThis") catch eff_this;
+                    }
+                    // Fallback: no realm tagged — use active global env.
                     if (realm_m.active_global_env) |genv| {
                         break :blk genv.lookup("globalThis") catch eff_this;
                     }
@@ -392,11 +399,68 @@ pub const BcVm = struct {
     /// GetPrototypeFromConstructor(newTarget, default): `? Get(newTarget,"prototype")`
     /// (fires accessor getters / proxy traps, abrupt throws propagate); falls back
     /// to `default` when the result is not an object.
-    fn protoFromNewTarget(self: *BcVm, new_target: Value, default_proto: ?*JsObject) anyerror!?*JsObject {
+    fn protoFromNewTarget(self: *BcVm, new_target: Value, ctor: Value, default_proto: ?*JsObject) anyerror!?*JsObject {
         if (new_target.bits == 0) return default_proto;
         const pv = try self.getProp(new_target, "prototype");
         if (pv.bits != 0 and pv.unbox() == .object) return pv.toPtr().object;
+        // GetPrototypeFromConstructor fallback (ES 9.1.14 step 4): NewTarget.prototype
+        // is not an object, so use the intrinsic default prototype from NewTarget's
+        // [[Realm]]. That intrinsic is the SAME-named constructor's `.prototype` in
+        // that realm, so for a cross-realm NewTarget it resolves to the foreign
+        // realm's prototype (e.g. `Reflect.construct(Array, …, otherFn)` →
+        // `other.Array.prototype`). Untagged / same-realm functions keep the
+        // running realm's default.
+        const realm_m = @import("../runtime/realm.zig");
+        if (realm_m.getFunctionRealm(new_target)) |fr| {
+            if (fr != self.realm) {
+                if (foreignIntrinsicProto(fr, ctor)) |p| return p;
+            }
+        }
         return default_proto;
+    }
+
+    /// The constructor's reported `.name`, used to find its counterpart in another
+    /// realm by GetPrototypeFromConstructor's fallback.
+    fn ctorNameOf(ctor: Value) ?[]const u8 {
+        if (ctor.bits == 0 or !ctor.isHeapPtr()) return null;
+        switch (ctor.toPtr().*) {
+            .bc_function => |c| return c.func.name,
+            .native_function => |e| return e.name,
+            .object => |o| {
+                if (o.getOwn("name")) |nv| {
+                    if (nv.bits != 0 and nv.unbox() == .string) return nv.toPtr().string;
+                }
+                // Constructor objects keep their callable behind `__call__`.
+                if (o.getOwn("__call__")) |cv| return ctorNameOf(cv);
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// `realm`'s intrinsic prototype for the same-named constructor as `ctor`:
+    /// `realm.global[name].prototype`, also probing the `Intl` namespace for
+    /// nested constructors (Intl.Collator, …).
+    fn foreignIntrinsicProto(realm: *Realm, ctor: Value) ?*JsObject {
+        const name = ctorNameOf(ctor) orelse return null;
+        if (name.len == 0) return null;
+        const g = realm.global_object orelse return null;
+        if (protoOfNamed(g, name)) |p| return p;
+        if (g.get("Intl")) |iv| {
+            if (iv.bits != 0 and iv.isHeapPtr() and iv.unbox() == .object) {
+                if (protoOfNamed(iv.toPtr().object, name)) |p| return p;
+            }
+        }
+        return null;
+    }
+
+    /// `container[name].prototype` when both are objects, else null.
+    fn protoOfNamed(container: *JsObject, name: []const u8) ?*JsObject {
+        const cv = container.get(name) orelse return null;
+        if (cv.bits == 0 or !cv.isHeapPtr() or cv.unbox() != .object) return null;
+        const pv = cv.toPtr().object.get("prototype") orelse return null;
+        if (pv.bits == 0 or !pv.isHeapPtr() or pv.unbox() != .object) return null;
+        return pv.toPtr().object;
     }
 
     /// Construct with an explicit NewTarget (Reflect.construct / subclassing).
@@ -409,7 +473,7 @@ pub const BcVm = struct {
         }
         switch (ctor.unbox()) {
             .bc_function => {
-                const proto = try self.protoFromNewTarget(new_target, self.realm.object_prototype);
+                const proto = try self.protoFromNewTarget(new_target, ctor, self.realm.object_prototype);
                 const new_obj = if (self.heap) |heap|
                     try JsObject.createOnHeap(heap, proto)
                 else
@@ -465,7 +529,7 @@ pub const BcVm = struct {
                         }) result else this_val;
                         // Ctor didn't consume the NewTarget → apply prototype now.
                         if (realm_m.pending_new_target.bits != 0) {
-                            const p = self.protoFromNewTarget(new_target, null) catch |e| {
+                            const p = self.protoFromNewTarget(new_target, ctor, null) catch |e| {
                                 realm_m.pending_new_target = saved_nt;
                                 return e;
                             };
@@ -593,7 +657,7 @@ pub const BcVm = struct {
             return error.JsException;
         }
         const closure = try self.arena.create(BcClosure);
-        closure.* = .{ .func = main_func, .env = @ptrCast(self.realm.global_env) };
+        closure.* = .{ .func = main_func, .env = @ptrCast(self.realm.global_env), .realm = self.realmAsOpaque() };
         const closure_val = try val_mod.makeBcFunction(self.arena, closure);
         const undef = try val_mod.makeUndefined(self.arena);
         return bcInvokeJs(self, self.arena, undef, closure_val, &[_]Value{});
@@ -621,6 +685,12 @@ pub const BcVm = struct {
         const saved_global_env = realm_mod.active_global_env;
         realm_mod.active_global_env = env;
         defer realm_mod.active_global_env = saved_global_env;
+
+        // Cross-realm: temporarily switch self.realm to the shadow realm so
+        // NEW_CLOSURE tags closures with the correct realm identity.
+        const saved_realm = self.realm;
+        if (realm_mod.active_shadow_realm) |sr| self.realm = sr;
+        defer self.realm = saved_realm;
 
         const transformed = isolate_mod.rewriteTemplateLiterals(self.arena, source) catch source;
         var p = parser_mod.Parser.init(transformed, self.arena);
@@ -688,6 +758,76 @@ pub const BcVm = struct {
         return self.result;
     }
 
+    /// Cross-realm host hook for `$262.createRealm`. Builds a fully independent
+    /// secondary Realm that shares this isolate's GC heap and lives in the
+    /// persistent eval arena, then returns a `{global, evalScript}` record built
+    /// in the PRIMARY realm. `Realm.init` clobbers the per-realm thread-local
+    /// intrinsic pointers, so we snapshot them first and restore afterward,
+    /// leaving the primary realm's continued execution untouched.
+    fn bcCreateRealm(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!Value {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        const realm_mod = @import("../runtime/realm.zig");
+
+        const snap = realm_mod.ThreadLocalSnapshot.capture();
+
+        const nr = try self.arena.create(Realm);
+        nr.* = Realm.init(self.arena) catch |e| {
+            snap.restore();
+            return e;
+        };
+        realm_mod.next_realm_id += 1;
+        nr.realm_id = realm_mod.next_realm_id - 1;
+        if (self.heap) |h| {
+            nr.activateHeap(h) catch |e| {
+                snap.restore();
+                return e;
+            };
+        }
+        // Snapshot this realm's intrinsics for GetFunctionRealm's fallback while
+        // its objects are still the active thread-locals, then restore the primary
+        // realm's thread-locals and tag the new realm's builtins (tagging reads no
+        // thread-local state).
+        nr.captureIntrinsics();
+        snap.restore();
+        nr.tagNativeFunctions();
+        // Cross-realm: re-register prototype well-known symbol properties using
+        // the PRIMARY realm's well-known symbols (which are now restored by the
+        // snapshot). The secondary realm's init created its own symbols, so
+        // prototype lookups from the primary realm would miss.
+        if (realm_mod.active_sym_iterator) |symv| {
+            nr.array_prototype.setSym(symv, try val_mod.makeNativeFunction(self.arena, @import("../runtime/builtins/es2015_collections.zig").nativeArrayValues)) catch {};
+        }
+
+        // Build the record object in the (now-restored) primary realm.
+        const rec = if (self.heap) |h|
+            try JsObject.createOnHeap(h, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        const global_obj = nr.global_object orelse self.realm.object_prototype;
+        try rec.set("global", try val_mod.makeObject(self.arena, global_obj));
+        // Store both the env and realm as native userdata so evalScript
+        // can set active_shadow_realm before running user code.
+        const EvalData = struct { env: *anyopaque, realm: *Realm };
+        const eval_data = try self.arena.create(EvalData);
+        eval_data.* = .{ .env = @ptrCast(nr.global_env), .realm = nr };
+        const eval_fn = try val_mod.makeNativeFunctionData(
+            self.arena,
+            realm_mod.nativeRealmEvalScript,
+            @ptrCast(eval_data),
+        );
+        try rec.set("evalScript", eval_fn);
+        // Replace the global env's `eval` binding so h.eval(...) runs in
+        // the secondary realm's env (tagging closures with the right realm).
+        nr.global_env.assign("eval", eval_fn) catch {};
+        return val_mod.makeObject(self.arena, rec);
+    }
+
+    /// Cross-realm: convenience wrapper to pass `self.realm` as *anyopaque.
+    pub fn realmAsOpaque(self: *const BcVm) *anyopaque {
+        return @ptrCast(self.realm);
+    }
+
     fn activateContext(self: *BcVm) void {
         const realm_mod = @import("../runtime/realm.zig");
         self.context = realm_mod.Context{
@@ -702,6 +842,7 @@ pub const BcVm = struct {
             .set_proto_fn = bcSetProto,
             .backing_obj_fn = bcBackingObj,
             .shadow_eval_fn = bcEvalInEnv,
+            .create_realm_fn = bcCreateRealm,
         };
         realm_mod.active_context = &self.context;
     }
@@ -2413,6 +2554,11 @@ pub const BcVm = struct {
                     this_val_eff
                 else if (!fn_ptr.is_strict and (this_val_eff.isUndefined() or this_val_eff.isNull())) blk: {
                     const realm_m = @import("../runtime/realm.zig");
+                    // Cross-realm: use the FUNCTION's realm's globalThis.
+                    if (closure.realm) |r_opaque| {
+                        const fr = @as(*Realm, @ptrCast(@alignCast(r_opaque)));
+                        break :blk fr.global_env.lookup("globalThis") catch this_val_eff;
+                    }
                     if (realm_m.active_global_env) |genv| {
                         break :blk genv.lookup("globalThis") catch this_val_eff;
                     }

@@ -290,6 +290,10 @@ pub const IsolateImpl = struct {
         const realm = try arena.create(Realm);
         realm.* = try Realm.init(arena);
         try realm.activateHeap(&self.heap);
+        // Cross-realm: record the primary realm's intrinsic prototypes so that a
+        // local NewTarget hitting GetPrototypeFromConstructor's GetFunctionRealm
+        // fallback resolves to the same (local) prototypes it would default to.
+        realm.captureIntrinsics();
 
         const nan_val = try val_mod.makeNumber(arena, std.math.nan(f64));
         const inf_val = try val_mod.makeNumber(arena, std.math.inf(f64));
@@ -315,6 +319,7 @@ pub const IsolateImpl = struct {
         // M16 TLA: async-dependency evaluation barrier used by async-module factories.
         try realm.global_env.define("__awaitDeps__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAwaitDeps));
         // M16 TLA: `[module, async]` completion signals wired to the harness $DONE.
+        try realm.global_env.define("__jszCreateRealm__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeCreateRealm));
         try realm.global_env.define("__jszAsyncDone__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncDone));
         try realm.global_env.define("__jszAsyncFail__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncFail));
         try realm.global_env.define("__jszModuleReject__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeModuleReject));

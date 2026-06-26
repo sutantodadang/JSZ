@@ -897,12 +897,36 @@ fn validateDataViewThis(arena: std.mem.Allocator, this_val: Value) anyerror!*Dat
 /// `? Get(pending_new_target,"prototype")` (fires getters, throws propagate),
 /// set `this_obj`'s prototype when it is an object, and CONSUME the pending
 /// NewTarget so the dispatcher does not re-apply it. No-op when none pending.
-fn applyNewTargetProto(arena: std.mem.Allocator, this_obj: *JsObject) anyerror!void {
+/// Selects which intrinsic %…Prototype% to use as the GetPrototypeFromConstructor
+/// fallback (ES 9.1.14 step 4b) when `newTarget.prototype` is not an object.
+pub const DefaultProtoKind = union(enum) {
+    array_buffer,
+    shared_array_buffer,
+    data_view,
+    typed_array: TAKind,
+};
+
+fn applyNewTargetProto(arena: std.mem.Allocator, this_obj: *JsObject, dpk: DefaultProtoKind) anyerror!void {
     const nt = realm_mod.pending_new_target;
     if (nt.bits == 0) return;
     realm_mod.pending_new_target = Value{}; // consume before the (throwing) Get
     const pv = try vmGet(arena, nt, "prototype");
-    if (pv.bits != 0 and pv.unbox() == .object) this_obj.proto = pv.toPtr().object;
+    if (pv.bits != 0 and pv.unbox() == .object) {
+        this_obj.proto = pv.toPtr().object;
+        return;
+    }
+    // GetPrototypeFromConstructor fallback: NewTarget.prototype is not an object,
+    // so use the intrinsic default prototype of NewTarget's [[Realm]] (which for a
+    // cross-realm NewTarget differs from the running realm's). Untagged functions
+    // yield null → keep this_obj's already-default (running-realm) prototype.
+    const fr = realm_mod.getFunctionRealm(nt) orelse return;
+    const fallback: ?*JsObject = switch (dpk) {
+        .array_buffer => fr.ab_prototype,
+        .shared_array_buffer => fr.sab_prototype,
+        .data_view => fr.dv_prototype,
+        .typed_array => |k| fr.ta_kind_prototypes[@intFromEnum(k)],
+    };
+    if (fallback) |p| this_obj.proto = p;
 }
 
 // ---------------------------------------------------------------- element IO ---
@@ -1051,7 +1075,7 @@ pub fn nativeArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []
     // backing-store allocation (after ToIndex(length) + the maxByteLength option),
     // so a throwing NewTarget.prototype getter throws before any allocation.
     realm_mod.pending_new_target = saved_nt;
-    try applyNewTargetProto(arena, obj);
+    try applyNewTargetProto(arena, obj, .array_buffer);
     if ((max_bl orelse len) > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     const cap = max_bl orelse len;
     const bytes = try arena.alloc(u8, cap);
@@ -1137,7 +1161,7 @@ pub fn nativeSharedArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, ar
     // AllocateSharedArrayBuffer: OrdinaryCreateFromConstructor reads
     // NewTarget.prototype BEFORE the backing-store allocation, so a throwing
     // NewTarget.prototype getter throws before any allocation (RangeError).
-    try applyNewTargetProto(arena, obj);
+    try applyNewTargetProto(arena, obj, .shared_array_buffer);
     if ((max_bl orelse len) > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     const cap = max_bl orelse len;
     const bytes = try arena.alloc(u8, cap);
@@ -1694,7 +1718,7 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
 
         // GetPrototypeFromConstructor runs first for object arguments (before any
         // byteOffset/length coercion); a throwing NewTarget.prototype getter throws here.
-        try applyNewTargetProto(arena, this_obj);
+        try applyNewTargetProto(arena, this_obj, .{ .typed_array = kind });
 
         // Form 2: new TA(buffer, byteOffset?, length?)  → view onto the buffer.
         if (src.internal_kind == .array_buffer) {
@@ -1803,7 +1827,7 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
     // ToIndex, which throws on negative / Symbol / out-of-range / throwing-valueOf
     // — this runs BEFORE GetPrototypeFromConstructor for the primitive path.
     const length = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
-    try applyNewTargetProto(arena, this_obj);
+    try applyNewTargetProto(arena, this_obj, .{ .typed_array = kind });
     const res = try makeArrayBuffer(arena, length * esize);
     _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
     return val_mod.makeObject(arena, this_obj);
@@ -3169,7 +3193,7 @@ pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     const obj = this_val.toPtr().object;
     // GetPrototypeFromConstructor runs after offset/length coercion + bounds checks.
     realm_mod.pending_new_target = saved_nt;
-    try applyNewTargetProto(arena, obj);
+    try applyNewTargetProto(arena, obj, .data_view);
     // OrdinaryCreateFromConstructor may have run user code (a `prototype` getter)
     // that detached or resized the buffer; re-validate against the current length.
     if (ab.detached) return throwTypeError(arena, "Cannot perform operation on a detached ArrayBuffer");

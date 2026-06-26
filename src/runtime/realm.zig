@@ -89,6 +89,15 @@ pub const Context = struct {
     /// the caller can distinguish it from a runtime throw (`error.JsException`).
     shadow_eval_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8, global_env: *anyopaque) anyerror!Value,
 
+    /// Cross-realm (`$262.createRealm`): build a fully independent secondary Realm
+    /// sharing the isolate's heap, and return a JS record `{global, evalScript}`
+    /// (a `*JsObject` Value). The host owns the realm lifetime (isolate arena).
+    create_realm_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator) anyerror!Value,
+
+    pub fn createRealm(self: *Context, arena: std.mem.Allocator) anyerror!Value {
+        return self.create_realm_fn(self.ptr, arena);
+    }
+
     pub fn backingObject(self: *Context, arena: std.mem.Allocator, val: Value) anyerror!?*JsObject {
         return self.backing_obj_fn(self.ptr, arena, val);
     }
@@ -1162,6 +1171,14 @@ pub var active_bigint_proto: ?*JsObject = null;
 /// primitive under a plain call — the synthesized `this` is identical in both
 /// paths, so prototype identity cannot distinguish them.
 pub var active_constructing: bool = false;
+/// Cross-realm: monotonic counter handing out Realm.realm_id values. 0 is
+/// reserved for the primary realm, so secondary realms start at 1.
+pub var next_realm_id: u32 = 1;
+/// Cross-realm: while a secondary realm's evalScript is running, this holds
+/// the secondary Realm pointer so bcEvalInEnv can temporarily switch self.realm
+/// and tag closures created in the eval'd code with the correct realm identity.
+pub var active_shadow_realm: ?*Realm = null;
+
 /// M15: pending NewTarget for an in-flight native construction. A ctor that must
 /// run GetPrototypeFromConstructor at a spec-precise point (e.g. %TypedArray%,
 /// ArrayBuffer, DataView — after ToIndex on a primitive length arg) reads this,
@@ -1983,6 +2000,10 @@ fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) a
     // and compile it through the eval bridge, returning the function value.
     // ponytail: string args only (ToString of non-strings skipped); covers
     // `new Function("a","return a")` and `new Function("return class … {}")`.
+    // Cross-realm: stamp the compiled function with the Realm of the `Function`
+    // ctor that was invoked (its [[Realm]], carried via the native side channel),
+    // captured up front because evalSource runs a nested VM that clears it.
+    const ctor_realm = val_mod.g_active_native_realm;
     if (active_context) |ctx| {
         var src = std.ArrayList(u8){};
         try src.appendSlice(arena, "(function anonymous(");
@@ -1998,7 +2019,9 @@ fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) a
             if (body.bits != 0 and body.unbox() == .string) try src.appendSlice(arena, body.toPtr().string);
         }
         try src.appendSlice(arena, "})");
-        return ctx.evalSource(arena, src.items);
+        const result = try ctx.evalSource(arena, src.items);
+        if (ctor_realm) |r| val_mod.setValueRealm(result, r);
+        return result;
     }
     // No active VM (shouldn't happen during eval): empty callable.
     const o = if (active_heap) |h|
@@ -2020,6 +2043,40 @@ fn nativeFunctionToString(arena: std.mem.Allocator, this_val: Value, _: []const 
     }
     const s = try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{name});
     return val_mod.makeString(arena, s);
+}
+
+// ---- Cross-realm: $262.createRealm ----
+/// Backing for `__jszCreateRealm__()` exposed to the test262 `$262` shim. Builds
+/// a real secondary Realm (own intrinsics + global object) via the VM host hook
+/// and returns `{global, evalScript}`; the JS `$262` shim layers
+/// detachArrayBuffer/createRealm/gc on top.
+pub fn nativeCreateRealm(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    const ctx = active_context orelse return val_mod.makeUndefined(arena);
+    return ctx.createRealm(arena);
+}
+
+/// Packed eval data for secondary realm evalScript native function.
+/// Stored as native userdata (opaque *anyopaque, cast back to *const EvalData).
+pub const EvalData = struct {
+    env: *anyopaque,
+    realm: *Realm,
+};
+
+/// `evalScript` of a secondary realm record: evaluates `args[0]` as Script code
+/// in that realm's global environment (carried as native userdata, an opaque
+/// `*Environment`). Mirrors global-script semantics via the ShadowRealm eval hook.
+pub fn nativeRealmEvalScript(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const data_ptr = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const data: *const EvalData = @ptrCast(@alignCast(data_ptr));
+    const ctx = active_context orelse return val_mod.makeUndefined(arena);
+    const s: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string)
+        args[0].toPtr().string
+    else
+        "";
+    // Set shadow realm so bcEvalInEnv tags closures with the correct realm.
+    active_shadow_realm = data.realm;
+    defer active_shadow_realm = null;
+    return ctx.shadowEval(arena, s, data.env);
 }
 
 // ---------------------------------------------------------------- Phase 4b registration helpers ---
@@ -2138,6 +2195,179 @@ fn installGlobalThis(arena: std.mem.Allocator, env: *Environment, object_proto: 
     active_global_object = global_obj;
 }
 
+/// ES 9.1.14 step 4a / GetFunctionRealm (10.2.x): recover the Realm that created
+/// a callable, used by GetPrototypeFromConstructor's fallback when
+/// `newTarget.prototype` is not an object. Returns null for untagged functions
+/// (treated as the running/primary realm by callers — they then keep the
+/// constructor's own default prototype). Follows constructor objects via their
+/// `__call__` slot and Proxies via [[ProxyTarget]].
+pub fn getFunctionRealm(v: val_mod.Value) ?*Realm {
+    if (v.bits == 0 or !v.isHeapPtr()) return null;
+    const jsv = v.toPtr();
+    switch (jsv.*) {
+        .native_function => |e| return if (e.realm) |r| @ptrCast(@alignCast(r)) else null,
+        .bc_function => |c| return if (c.realm) |r| @ptrCast(@alignCast(r)) else null,
+        .object => |o| {
+            // Proxy exotic: follow [[ProxyTarget]] (stored as a private-symbol
+            // own property on the proxy object).
+            if (o.internal_kind == .proxy) {
+                if (active_sym_proxy_target) |sym| {
+                    if (o.getOwnSym(sym)) |tv| {
+                        if (tv.bits != 0) return getFunctionRealm(tv);
+                    }
+                }
+                return null;
+            }
+            // Constructor object holding its callable behind `__call__`.
+            if (o.getOwn("__call__")) |cv| {
+                if (cv.bits != 0) return getFunctionRealm(cv);
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+/// Snapshot of all per-realm thread-local intrinsic pointers. `$262.createRealm`
+/// must build a fully independent secondary Realm via `Realm.init`, which
+/// overwrites these globals; we capture them first and restore afterward so the
+/// primary realm's execution is unaffected. Well-known symbols are included so
+/// the primary realm's symbol identities survive (the secondary realm mints its
+/// own during init).
+pub const ThreadLocalSnapshot = struct {
+    heap: ?*Heap,
+    global_env: ?*Environment,
+    global_object: ?*JsObject,
+    array_proto: ?*JsObject,
+    object_proto: ?*JsObject,
+    string_proto: ?*JsObject,
+    number_proto: ?*JsObject,
+    boolean_proto: ?*JsObject,
+    bigint_proto: ?*JsObject,
+    regexp_proto: ?*JsObject,
+    function_proto: ?*JsObject,
+    promise_proto: ?*JsObject,
+    symbol_proto: ?*JsObject,
+    sym_iterator: ?val_mod.Value,
+    sym_to_primitive: ?val_mod.Value,
+    sym_to_string_tag: ?val_mod.Value,
+    sym_species: ?val_mod.Value,
+    sym_proxy_target: ?val_mod.Value,
+    sym_proxy_handler: ?val_mod.Value,
+    sym_module_ns: ?val_mod.Value,
+    sym_deferred_id: ?val_mod.Value,
+    deferred_ns_registry: ?val_mod.Value,
+    sym_export_names: ?val_mod.Value,
+    sym_tdz_export_names: ?val_mod.Value,
+    err_Error: ?*JsObject,
+    err_TypeError: ?*JsObject,
+    err_SyntaxError: ?*JsObject,
+    err_RangeError: ?*JsObject,
+    err_ReferenceError: ?*JsObject,
+    err_AggregateError: ?*JsObject,
+    ab_proto: ?*JsObject,
+    ab_ctor: ?*JsObject,
+    sab_proto: ?*JsObject,
+    sab_ctor: ?*JsObject,
+    dv_proto: ?*JsObject,
+    atomics: ?*JsObject,
+    ta_proto: ?*JsObject,
+    ta_ctor: ?*JsObject,
+    ta_iter_proto: ?*JsObject,
+    ta_protos: [typed_array_mod.all_kinds.len]?*JsObject,
+    ta_ctors: [typed_array_mod.all_kinds.len]?*JsObject,
+
+    pub fn capture() ThreadLocalSnapshot {
+        return .{
+            .heap = active_heap,
+            .global_env = active_global_env,
+            .global_object = active_global_object,
+            .array_proto = active_array_proto,
+            .object_proto = active_object_proto,
+            .string_proto = active_string_proto,
+            .number_proto = active_number_proto,
+            .boolean_proto = active_boolean_proto,
+            .bigint_proto = active_bigint_proto,
+            .regexp_proto = active_regexp_proto,
+            .function_proto = active_function_proto,
+            .promise_proto = active_promise_proto,
+            .symbol_proto = active_symbol_proto,
+            .sym_iterator = active_sym_iterator,
+            .sym_to_primitive = active_sym_to_primitive,
+            .sym_to_string_tag = active_sym_to_string_tag,
+            .sym_species = active_sym_species,
+            .sym_proxy_target = active_sym_proxy_target,
+            .sym_proxy_handler = active_sym_proxy_handler,
+            .sym_module_ns = active_sym_module_ns,
+            .sym_deferred_id = active_sym_deferred_id,
+            .deferred_ns_registry = active_deferred_ns_registry,
+            .sym_export_names = active_sym_export_names,
+            .sym_tdz_export_names = active_sym_tdz_export_names,
+            .err_Error = error_proto_Error,
+            .err_TypeError = error_proto_TypeError,
+            .err_SyntaxError = error_proto_SyntaxError,
+            .err_RangeError = error_proto_RangeError,
+            .err_ReferenceError = error_proto_ReferenceError,
+            .err_AggregateError = error_proto_AggregateError,
+            .ab_proto = typed_array_mod.active_arraybuffer_proto,
+            .ab_ctor = typed_array_mod.active_arraybuffer_ctor,
+            .sab_proto = typed_array_mod.active_sharedarraybuffer_proto,
+            .sab_ctor = typed_array_mod.active_sharedarraybuffer_ctor,
+            .dv_proto = typed_array_mod.active_dataview_proto,
+            .atomics = typed_array_mod.active_atomics,
+            .ta_proto = typed_array_mod.active_typedarray_proto,
+            .ta_ctor = typed_array_mod.active_typedarray_ctor,
+            .ta_iter_proto = typed_array_mod.active_ta_iter_proto,
+            .ta_protos = typed_array_mod.active_ta_protos,
+            .ta_ctors = typed_array_mod.active_ta_ctors,
+        };
+    }
+
+    pub fn restore(self: ThreadLocalSnapshot) void {
+        active_heap = self.heap;
+        active_global_env = self.global_env;
+        active_global_object = self.global_object;
+        active_array_proto = self.array_proto;
+        active_object_proto = self.object_proto;
+        active_string_proto = self.string_proto;
+        active_number_proto = self.number_proto;
+        active_boolean_proto = self.boolean_proto;
+        active_bigint_proto = self.bigint_proto;
+        active_regexp_proto = self.regexp_proto;
+        active_function_proto = self.function_proto;
+        active_promise_proto = self.promise_proto;
+        active_symbol_proto = self.symbol_proto;
+        active_sym_iterator = self.sym_iterator;
+        active_sym_to_primitive = self.sym_to_primitive;
+        active_sym_to_string_tag = self.sym_to_string_tag;
+        active_sym_species = self.sym_species;
+        active_sym_proxy_target = self.sym_proxy_target;
+        active_sym_proxy_handler = self.sym_proxy_handler;
+        active_sym_module_ns = self.sym_module_ns;
+        active_sym_deferred_id = self.sym_deferred_id;
+        active_deferred_ns_registry = self.deferred_ns_registry;
+        active_sym_export_names = self.sym_export_names;
+        active_sym_tdz_export_names = self.sym_tdz_export_names;
+        error_proto_Error = self.err_Error;
+        error_proto_TypeError = self.err_TypeError;
+        error_proto_SyntaxError = self.err_SyntaxError;
+        error_proto_RangeError = self.err_RangeError;
+        error_proto_ReferenceError = self.err_ReferenceError;
+        error_proto_AggregateError = self.err_AggregateError;
+        typed_array_mod.active_arraybuffer_proto = self.ab_proto;
+        typed_array_mod.active_arraybuffer_ctor = self.ab_ctor;
+        typed_array_mod.active_sharedarraybuffer_proto = self.sab_proto;
+        typed_array_mod.active_sharedarraybuffer_ctor = self.sab_ctor;
+        typed_array_mod.active_dataview_proto = self.dv_proto;
+        typed_array_mod.active_atomics = self.atomics;
+        typed_array_mod.active_typedarray_proto = self.ta_proto;
+        typed_array_mod.active_typedarray_ctor = self.ta_ctor;
+        typed_array_mod.active_ta_iter_proto = self.ta_iter_proto;
+        typed_array_mod.active_ta_protos = self.ta_protos;
+        typed_array_mod.active_ta_ctors = self.ta_ctors;
+    }
+};
+
 pub const Realm = struct {
     global_env: *Environment,
     arena: std.mem.Allocator,
@@ -2170,6 +2400,23 @@ pub const Realm = struct {
     _range_error_proto_root: Value = Value{},
     _reference_error_proto_root: Value = Value{},
     _aggregate_error_proto_root: Value = Value{},
+
+    /// Cross-realm: identity of this realm. 0 = the primary realm.
+    realm_id: u32 = 0,
+    /// Cross-realm: this realm's `globalThis` object (mirror of `global_env`),
+    /// captured at init so `$262.createRealm().global` can expose it.
+    global_object: ?*JsObject = null,
+    /// Per-intrinsic prototypes for GetPrototypeFromConstructor's GetFunctionRealm
+    /// fallback (ES 9.1.14 step 4b). Populated for secondary realms by
+    /// createSecondaryRealm and for the primary realm by captureIntrinsics.
+    ab_prototype: ?*JsObject = null,
+    sab_prototype: ?*JsObject = null,
+    dv_prototype: ?*JsObject = null,
+    /// %TypedArray%.prototype (shared base of all per-kind TA prototype chains).
+    ta_shared_prototype: ?*JsObject = null,
+    /// Per-kind TypedArray prototypes, indexed by typed_array.TAKind.
+    ta_kind_prototypes: [typed_array_mod.all_kinds.len]?*JsObject =
+        .{null} ** typed_array_mod.all_kinds.len,
 
     pub fn init(arena: std.mem.Allocator) !Realm {
         const env = try Environment.init(arena, null);
@@ -2665,7 +2912,47 @@ pub const Realm = struct {
             .string_prototype = string_proto,
             .regexp_prototype = active_regexp_proto.?,
             .function_prototype = function_proto,
+            .global_object = active_global_object,
         };
+    }
+
+    /// Cross-realm: snapshot the per-intrinsic prototypes (ArrayBuffer, DataView,
+    /// %TypedArray% and per-kind TA prototypes) from the live thread-local builtin
+    /// state into this Realm. MUST be called while THIS realm is the active one
+    /// (i.e. right after Realm.init, before any other realm overwrites the
+    /// thread-locals). Used by GetPrototypeFromConstructor's realm fallback.
+    pub fn captureIntrinsics(self: *Realm) void {
+        self.ab_prototype = typed_array_mod.active_arraybuffer_proto;
+        self.sab_prototype = typed_array_mod.active_sharedarraybuffer_proto;
+        self.dv_prototype = typed_array_mod.active_dataview_proto;
+        self.ta_shared_prototype = typed_array_mod.active_typedarray_proto;
+        for (&self.ta_kind_prototypes, typed_array_mod.active_ta_protos) |*slot, p| {
+            slot.* = p;
+        }
+        if (self.global_object == null) self.global_object = active_global_object;
+    }
+
+    /// Cross-realm: tag every top-level builtin function in this realm's global
+    /// scope with this Realm (opaque) so GetFunctionRealm can recover it. Covers
+    /// the dynamic `Function` constructor (whose `__call__` entry is what stamps
+    /// the realm onto a `new other.Function()` result). Independent of the
+    /// thread-locals, so it may run after they have been restored.
+    pub fn tagNativeFunctions(self: *Realm) void {
+        const r_opaque: *anyopaque = @ptrCast(self);
+        var it = self.global_env.bindings.iterator();
+        while (it.next()) |entry| {
+            const v = entry.value_ptr.value;
+            if (v.bits == 0 or !v.isHeapPtr()) continue;
+            switch (v.toPtr().*) {
+                .native_function, .bc_function => val_mod.setValueRealm(v, r_opaque),
+                .object => |o| {
+                    if (o.getOwn("__call__")) |cv| {
+                        if (cv.bits != 0) val_mod.setValueRealm(cv, r_opaque);
+                    }
+                },
+                else => {},
+            }
+        }
     }
 
     /// Wire in a GC heap and register Realm intrinsics as roots.
