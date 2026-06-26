@@ -234,12 +234,12 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
     }
 }
 
-const MapData = struct {
+pub const MapData = struct {
     keys: std.ArrayListUnmanaged(Value) = .empty,
     values: std.ArrayListUnmanaged(Value) = .empty,
 };
 
-const SetData = struct {
+pub const SetData = struct {
     values: std.ArrayListUnmanaged(Value) = .empty,
 };
 
