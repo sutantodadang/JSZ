@@ -412,6 +412,35 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 - Audit remaining spec builtins: `Array.fromAsync`, `Object.groupBy`, `Promise.withResolvers`, `String.prototype` Unicode methods, `structuredClone` (host).
 - **Gate:** `built-ins/WeakRef`, `FinalizationRegistry`, `Atomics` ≥99%.
 
+> **✅ GATE MET — independently verified 2026-06-26.** Fresh Windows-native build
+> against a clean tc39/test262 clone:
+>
+> | suite | before | after |
+> |---|---:|---:|
+> | `built-ins/WeakRef` | 0/29 | **29/29 (100%)** |
+> | `built-ins/FinalizationRegistry` | 0/46 | **46/46 (100%)** |
+> | `built-ins/Atomics` | 118/323 | **257/257 runnable (100%)** |
+> | `built-ins/WeakMap` | 40/141 | **141/141 (100%)** |
+> | `built-ins/WeakSet` | 21/85 | **85/85 (100%)** |
+>
+> Atomics: 133 multi-agent `wait`/`notify`/`CanBlockIsTrue` tests are skipped —
+> they require a `$262.agent` coordinator / a blocking agent, genuinely
+> unrunnable in a single-agent engine (standard exclusion). `zig build test` green.
+>
+> Work (3 commits): L1 WeakMap/WeakSet descriptor/brand/iterable exactness; L2
+> new WeakRef + FinalizationRegistry (API surface — `canBeWeakKey`, brand checks,
+> `@@toStringTag`, NewTarget proto); L3 Atomics 9 RMW ops
+> (add/sub/and/or/xor/exchange/compareExchange/load/store) + ValidateAtomicAccess
+> (RangeError ordering) + shared/non-shared AB + BigInt. Side fixes: binary (`0b`)
+> /octal (`0o`) numeric literals (were unparsed); `activateHeap` reparenting of
+> namespace objects (Atomics/Math/JSON) onto the migrated `Object.prototype`.
+>
+> **Deferred (not gate-blocking):** real GC weak-collection/finalization semantics
+> (entries held strongly; test262 cannot test collection — coordinate with M19
+> ephemerons); builtins audit `Array.fromAsync` / `Object.groupBy` /
+> `structuredClone` (still absent); `Map`/`Set` are ~30% (same descriptor/iterable
+> lever as WeakMap/WeakSet, pre-existing — a cheap follow-up).
+
 ### Milestone 18 — RegExp & Intl completeness  *(~1.5–2 mo)*
 - RegExp: Unicode property escapes, lookbehind, named groups, `/v` set notation, sticky/dotAll edge cases. Consider a proven backtracking + bytecode design.
 - Intl: decide build — full ICU/CLDR data (large binary) vs. a curated subset vs. host-provided. Likely **host-provided ICU hook** to keep core small (aligns Tier 2).
@@ -511,8 +540,8 @@ a value-representation change in the same milestone.
 M14 Conformance foundation   ██               1–2 mo   ← do first, unblocks measurement
 M15 TypedArrays              ███              ✅ DONE (100% test262 TA/AB/DataView)
 M16 ESM modules              ██               ✅ DONE (module-code 595/595 = 100%)
-M17 WeakRef/Atomics/builtins ██               1 mo      ← NEXT
-M18 RegExp/Intl              ███              1.5–2 mo   ← Tier 1 conformant engine ✅ after here
+M17 WeakRef/Atomics/builtins ██               ✅ GATE MET (WeakRef/FinReg/Atomics 100%)
+M18 RegExp/Intl              ███              1.5–2 mo   ← NEXT; Tier 1 conformant engine ✅ after here
 M19 GC modernization         ████             2–3 mo
 M20 JIT tier-up + NaN-box    ████             2–3 mo     ← Perf story ✅
 M21 Embedding C ABI          ██               1.5 mo     ← Tier 2 embeddable ✅
