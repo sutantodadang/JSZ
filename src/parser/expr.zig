@@ -394,8 +394,9 @@ pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
             };
         },
         // A single destructuring param: `([a]) => …` / `({x}) => …`. The
-        // parenthesized pattern parsed as an array/object literal.
-        .array_literal, .object_literal => {
+        // parenthesized pattern parsed as an array/object literal. A single
+        // defaulted param `(x = d) => …` parses as an assignment expression.
+        .array_literal, .object_literal, .assignment_expr => {
             if (!extractOneArrowParam(p, lhs, &params)) return null;
         },
         .sequence_expr => {
@@ -463,6 +464,26 @@ fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)
             const src = p.makeNode(.identifier, e.start, e.start, .{ .identifier = tmp_name }) orelse return false;
             if (!desugarParamPattern(p, e, src)) return false;
         },
+        // A defaulted parameter `(x = d)` (or `([a] = d)` / `({x} = d)`) parses
+        // as an assignment expression. Give it a synthetic param name and let
+        // bindPatternElement emit `let x = (__param_N !== undefined) ? … : d`.
+        .assignment_expr => {
+            if (e.data.assignment_expr.op != .assign) {
+                arrowParamError(p);
+                return false;
+            }
+            const tmp_name = std.fmt.allocPrint(p.arena, "__param_{d}", .{p.param_destruct_counter}) catch {
+                p.had_error = true;
+                return false;
+            };
+            p.param_destruct_counter += 1;
+            params.append(p.arena, tmp_name) catch {
+                p.had_error = true;
+                return false;
+            };
+            const src = p.makeNode(.identifier, e.start, e.start, .{ .identifier = tmp_name }) orelse return false;
+            if (!bindPatternElement(p, e, src)) return false;
+        },
         else => {
             arrowParamError(p);
             return false;
@@ -475,7 +496,7 @@ fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)
 /// expression node) according to `pattern` (an array/object literal acting as a
 /// binding pattern). Recurses for nested patterns. Defaults (`[a = d]`,
 /// `{x = d}`) substitute `d` when the read is `undefined`.
-fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
+pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
     switch (pattern.kind) {
         .array_literal => {
             for (pattern.data.array_literal.elements, 0..) |el, i| {
@@ -741,6 +762,36 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
         },
         .kw_new => {
             _ = p.advance();
+            // `new.target` meta-property: evaluates to the active NewTarget (the
+            // call env binds `__new_target__`, defaulting to undefined). Allow
+            // trailing member/subscript access (e.g. `new.target.prototype`).
+            if (p.current.kind == .dot) {
+                _ = p.advance();
+                const mt = p.expectIdentifierName() orelse return null;
+                if (!std.mem.eql(u8, mt.value_str, "target"))
+                    return p.fail("SyntaxError: expected 'target' after 'new.'");
+                var nt_node = p.makeNode(.identifier, start, p.current.start, .{
+                    .identifier = "__new_target__",
+                }) orelse return null;
+                while (true) {
+                    if (p.match(.dot)) {
+                        const pt = p.expectIdentifierName() orelse return null;
+                        const pn = p.makeNode(.identifier, pt.start, pt.end, .{
+                            .identifier = pt.value_str,
+                        }) orelse return null;
+                        nt_node = p.makeNode(.member_expr, nt_node.start, p.current.start, .{
+                            .member_expr = .{ .object = nt_node, .property = pn, .computed = false },
+                        }) orelse return null;
+                    } else if (p.match(.left_bracket)) {
+                        const pe = p.parseExpression() orelse return null;
+                        _ = p.expect(.right_bracket) orelse return null;
+                        nt_node = p.makeNode(.member_expr, nt_node.start, p.current.start, .{
+                            .member_expr = .{ .object = nt_node, .property = pe, .computed = true },
+                        }) orelse return null;
+                    } else break;
+                }
+                return nt_node;
+            }
             // M16 Phase 4: `await` is reserved in module code; `new await …` is
             // a SyntaxError per spec (await is not a valid NewExpression callee).
             if (p.is_module and p.current.kind == .identifier and
@@ -1269,6 +1320,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             const am_body = p.parseFunctionBody() orelse return null;
             const am_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
+                    .is_method = true,
                     .name = if (ckey == null) mkey else null,
                     .params = am_params.params,
                     .param_defaults = am_params.param_defaults,
@@ -1389,8 +1441,15 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
         {
             const acc_kind: ast.PropKind = if (key[0] == 'g') .get else .set;
             var aname: []const u8 = undefined;
+            // Computed accessor key: `get [expr]() {}` / `set [expr](v) {}`.
+            var acc_computed_key: ?*Node = null;
             const akn = @tagName(p.current.kind);
-            if (p.check(.identifier) or p.check(.string)) {
+            if (p.check(.left_bracket)) {
+                _ = p.advance();
+                acc_computed_key = p.parseAssignmentExpr() orelse return null;
+                _ = p.expect(.right_bracket) orelse return null;
+                aname = "";
+            } else if (p.check(.identifier) or p.check(.string)) {
                 aname = p.current.value_str;
                 _ = p.advance();
             } else if (akn.len > 3 and std.mem.eql(u8, akn[0..3], "kw_")) {
@@ -1429,7 +1488,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 p.had_error = true;
                 return null;
             };
-            props.append(p.arena, ast.ObjectProp{ .key = aname, .value = acc_fn, .kind = acc_kind }) catch {
+            props.append(p.arena, ast.ObjectProp{ .key = aname, .value = acc_fn, .kind = acc_kind, .computed_key = acc_computed_key }) catch {
                 p.had_error = true;
                 return null;
             };
@@ -1443,6 +1502,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             const m_body = p.parseFunctionBody() orelse return null;
             const m_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
+                    .is_method = true,
                     .name = key,
                     .params = m_params.params,
                     .param_defaults = m_params.param_defaults,

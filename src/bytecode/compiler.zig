@@ -280,6 +280,7 @@ pub const FnCompiler = struct {
             },
             .while_stmt => try self.collectHoistedNames(node.data.while_stmt.body, list),
             .do_while_stmt => try self.collectHoistedNames(node.data.do_while_stmt.body, list),
+            .with_stmt => try self.collectHoistedNames(node.data.with_stmt.body, list),
             .for_stmt => {
                 if (node.data.for_stmt.init) |i| try self.collectHoistedNames(i, list);
                 try self.collectHoistedNames(node.data.for_stmt.body, list);
@@ -329,8 +330,14 @@ pub const FnCompiler = struct {
             },
             .while_stmt => try self.collectLexicalNames(node.data.while_stmt.body, list),
             .do_while_stmt => try self.collectLexicalNames(node.data.do_while_stmt.body, list),
+            .with_stmt => try self.collectLexicalNames(node.data.with_stmt.body, list),
             .for_stmt => {
-                if (node.data.for_stmt.init) |i| try self.collectLexicalNames(i, list);
+                // Do NOT recurse into for_stmt.init — a `let`/`const` in the
+                // C-style for header is scoped to the loop (per-iteration), not
+                // the enclosing block, and is set up by the for-loop lowering.
+                // Hoisting it here would let an enclosing-scope read (e.g. an
+                // outer `let n = i` before a shadowing inner `for (let i ...)`)
+                // resolve to the loop binding in TDZ. Mirrors for_in_stmt.
                 try self.collectLexicalNames(node.data.for_stmt.body, list);
             },
             .for_in_stmt => {
@@ -532,6 +539,43 @@ pub const FnCompiler = struct {
                 // R[base] = constructor, R[base+1..base+nargs] = args
                 const ne = node.data.new_expr;
                 const base = self.sp;
+                // `new C(...xs)`: an argument spread needs a runtime args array and
+                // the spread-construct opcode (the static-nargs ABI can't expand it).
+                var has_spread = false;
+                for (ne.args) |a| {
+                    if (a.kind == .spread_expr) {
+                        has_spread = true;
+                        break;
+                    }
+                }
+                if (has_spread) {
+                    const rcallee = try self.compileExpr(ne.callee);
+                    const rargs = self.allocReg();
+                    try self.emitOp(.NEW_ARRAY, line);
+                    try self.emitU8(rargs);
+                    try self.emitU8(0);
+                    for (ne.args) |a| {
+                        if (a.kind == .spread_expr) {
+                            const riter = try self.compileExpr(a.data.spread_expr);
+                            try self.emitOp(.ARRAY_SPREAD, line);
+                            try self.emitU8(rargs);
+                            try self.emitU8(riter);
+                            self.freeReg();
+                        } else {
+                            const rval = try self.compileExpr(a);
+                            try self.emitOp(.ARRAY_APPEND, line);
+                            try self.emitU8(rargs);
+                            try self.emitU8(rval);
+                            self.freeReg();
+                        }
+                    }
+                    try self.emitOp(.NEW_INSTANCE_SPREAD, line);
+                    try self.emitU8(rcallee); // Rdst = rcallee (lowest slot)
+                    try self.emitU8(rcallee);
+                    try self.emitU8(rargs);
+                    self.sp = rcallee + 1;
+                    return rcallee;
+                }
                 // Compile constructor into R[base].
                 _ = self.allocReg();
                 self.sp = base;
@@ -890,10 +934,10 @@ pub const FnCompiler = struct {
                 try self.emitStore(a.target.data.identifier, rhs, line);
             } else if (a.target.kind == .member_expr) {
                 try self.compileMemberWrite(a.target.data.member_expr, rhs, line);
-            } else if (a.target.kind == .object_literal) {
-                // Object destructuring assignment: `{ a: x, b } = rhs`. The
-                // object literal node doubles as the assignment pattern. The
-                // whole expression still evaluates to `rhs`, so keep it live.
+            } else if (a.target.kind == .object_literal or a.target.kind == .array_literal) {
+                // Destructuring assignment: `{ a: x, b } = rhs` / `[a, b] = rhs`.
+                // The object/array literal node doubles as the assignment pattern.
+                // The whole expression still evaluates to `rhs`, so keep it live.
                 try self.compileDestructure(a.target, rhs, line);
                 self.sp = rhs + 1;
             }
@@ -940,10 +984,11 @@ pub const FnCompiler = struct {
     }
 
     /// Assign the value held in register `rsrc` to a destructuring pattern
-    /// `target` (an object literal reused as an ObjectAssignmentPattern), or to a
+    /// `target` (an object/array literal reused as an AssignmentPattern), or to a
     /// nested simple target (identifier / member / `pattern = default`). `rsrc`
     /// is read-only and must stay live for the caller; helpers only allocate
-    /// registers above it. Array patterns are left unhandled (no-op) for now.
+    /// registers above it. Array patterns read positionally (`rsrc[i]`), matching
+    /// the index-based binding-declaration desugaring.
     fn compileDestructure(self: *Self, target: *Node, rsrc: u8, line: u32) error{OutOfMemory}!void {
         switch (target.kind) {
             .identifier => try self.emitStore(target.data.identifier, rsrc, line),
@@ -990,6 +1035,54 @@ pub const FnCompiler = struct {
                         try self.emitU16(kidx);
                     }
                     try self.compileDestructure(prop.value, rval, line);
+                    self.sp = rval; // free rval
+                }
+            },
+            .array_literal => {
+                const elems = target.data.array_literal.elements;
+                for (elems, 0..) |elem, i| {
+                    // Elision hole (`[, x] = rhs`): the parser models holes as
+                    // `undefined_literal` nodes — skip, advancing the index.
+                    if (elem.kind == .undefined_literal) continue;
+                    if (elem.kind == .spread_expr) {
+                        // Rest element `...t = rhs`: assign `rsrc.slice(i)` to `t`.
+                        // Must be the final element. Use a METHOD_CALL so `this`
+                        // is `rsrc` (R[base]=this, R[base+1]=fn, R[base+2]=arg).
+                        const base = self.allocReg();
+                        try self.emitOp(.MOVE, line);
+                        try self.emitU8(base);
+                        try self.emitU8(rsrc);
+                        const fslot = self.allocReg();
+                        const slice_sv = try val_mod.makeString(self.arena, "slice");
+                        const slice_k = try self.addConstant(slice_sv);
+                        try self.emitOp(.GET_PROP, line);
+                        try self.emitU8(fslot);
+                        try self.emitU8(base);
+                        try self.emitU16(slice_k);
+                        const argslot = self.allocReg();
+                        const idx_v = try val_mod.makeNumber(self.arena, @floatFromInt(i));
+                        const idx_k = try self.addConstant(idx_v);
+                        try self.emitOp(.LOAD_K, line);
+                        try self.emitU8(argslot);
+                        try self.emitU16(idx_k);
+                        try self.emitOp(.METHOD_CALL, line);
+                        try self.emitU8(base);
+                        try self.emitU8(1);
+                        try self.emitU8(base);
+                        self.sp = base + 1;
+                        try self.compileDestructure(elem.data.spread_expr, base, line);
+                        self.sp = base; // free base
+                        break;
+                    }
+                    const rval = self.allocReg();
+                    const key_str = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return error.OutOfMemory;
+                    const sv = try val_mod.makeString(self.arena, key_str);
+                    const kidx = try self.addConstant(sv);
+                    try self.emitOp(.GET_PROP, line);
+                    try self.emitU8(rval);
+                    try self.emitU8(rsrc);
+                    try self.emitU16(kidx);
+                    try self.compileDestructure(elem, rval, line);
                     self.sp = rval; // free rval
                 }
             },
@@ -1181,10 +1274,19 @@ pub const FnCompiler = struct {
             if (prop.computed_key) |key_node| {
                 const rkey = try self.compileExpr(key_node);
                 const rval = try self.compileExpr(prop.value);
-                try self.emitOp(.SET_PROP_DYN, line);
-                try self.emitU8(robj);
-                try self.emitU8(rkey);
-                try self.emitU8(rval);
+                if (prop.kind == .init) {
+                    try self.emitOp(.SET_PROP_DYN, line);
+                    try self.emitU8(robj);
+                    try self.emitU8(rkey);
+                    try self.emitU8(rval);
+                } else {
+                    // Computed accessor key: `{ get [expr]() {} }`.
+                    try self.emitOp(.DEFINE_ACCESSOR_DYN, line);
+                    try self.emitU8(robj);
+                    try self.emitU8(rkey);
+                    try self.emitU8(if (prop.kind == .get) @as(u8, 0) else @as(u8, 1));
+                    try self.emitU8(rval);
+                }
                 self.freeReg(); // free rval
                 self.freeReg(); // free rkey
                 continue;
@@ -1549,13 +1651,14 @@ pub const FnCompiler = struct {
             fe.name,
             fe.params,
             fe.body,
-            fe.name, // nfe_name: if named, bind inside
+            if (fe.is_method) null else fe.name, // nfe_name: named fn exprs self-bind; methods do not
             fe.is_strict or self.is_strict, // strictness is inherited by nested functions
             fe.is_generator,
             fe.is_async,
             false, // function body: no implicit last-expr return
             fe.is_arrow,
             fe.rest_param,
+            fe.param_defaults,
         );
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
@@ -1588,6 +1691,7 @@ pub const FnCompiler = struct {
             .if_stmt => try lower.lowerIfStmt(self, node, last_expr_reg),
             .while_stmt => try lower.lowerWhileStmt(self, node, last_expr_reg),
             .do_while_stmt => try lower.lowerDoWhileStmt(self, node, last_expr_reg),
+            .with_stmt => try lower.lowerWithStmt(self, node, last_expr_reg),
             .for_stmt => try lower.lowerForStmt(self, node, last_expr_reg),
             .return_stmt => try lower.lowerReturnStmt(self, node, last_expr_reg),
             .throw_stmt => try lower.lowerThrowStmt(self, node, last_expr_reg),
@@ -1700,14 +1804,57 @@ fn compileFunction(
     body: []*Node,
     nfe_name: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null);
+    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null, &[_]?*Node{});
+}
+
+/// Allocate an AST node from `data` (synthetic — no source span).
+fn mkSynthNode(arena: std.mem.Allocator, data: ast.Data) error{OutOfMemory}!*Node {
+    const n = try arena.create(Node);
+    n.* = .{ .kind = std.meta.activeTag(data), .start = 0, .end = 0, .data = data };
+    return n;
+}
+
+/// Synthesize a prologue applying default parameter values: for each parameter
+/// `p` with a default `d`, prepend `if (p === undefined) p = d;`. An absent
+/// argument is bound to undefined at call setup, so this also covers the
+/// "fewer arguments than parameters" case. Returns `body` unchanged when no
+/// parameter has a default.
+fn applyParamDefaults(
+    arena: std.mem.Allocator,
+    params: [][]const u8,
+    param_defaults: []const ?*Node,
+    body: []*Node,
+) error{OutOfMemory}![]*Node {
+    var any = false;
+    for (param_defaults) |d| {
+        if (d != null) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return body;
+    var list: std.ArrayList(*Node) = .empty;
+    for (params, 0..) |pname, i| {
+        if (i >= param_defaults.len) break;
+        const dexpr = param_defaults[i] orelse continue;
+        const id_test = try mkSynthNode(arena, .{ .identifier = pname });
+        const undef = try mkSynthNode(arena, .{ .undefined_literal = {} });
+        const test_expr = try mkSynthNode(arena, .{ .binary_expr = .{ .op = .strict_eq, .left = id_test, .right = undef } });
+        const id_target = try mkSynthNode(arena, .{ .identifier = pname });
+        const assign = try mkSynthNode(arena, .{ .assignment_expr = .{ .op = .assign, .target = id_target, .value = dexpr } });
+        const estmt = try mkSynthNode(arena, .{ .expr_stmt = assign });
+        const ifs = try mkSynthNode(arena, .{ .if_stmt = .{ .test_ = test_expr, .consequent = estmt, .alternate = null } });
+        try list.append(arena, ifs);
+    }
+    try list.appendSlice(arena, body);
+    return list.toOwnedSlice(arena);
 }
 
 pub fn compileFunctionStrict(
     arena: std.mem.Allocator,
     name: ?[]const u8,
     params: [][]const u8,
-    body: []*Node,
+    body_in: []*Node,
     nfe_name: ?[]const u8,
     is_strict: bool,
     is_generator: bool,
@@ -1715,6 +1862,7 @@ pub fn compileFunctionStrict(
     implicit_return: bool,
     is_arrow: bool,
     rest_param: ?[]const u8,
+    param_defaults: []const ?*Node,
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
@@ -1727,6 +1875,7 @@ pub fn compileFunctionStrict(
     // Register slots are used only for compiler temporaries.
     // sp starts at 0; max_regs tracks highest allocated temporary register.
 
+    const body = try applyParamDefaults(arena, params, param_defaults, body_in);
     try fc.compileBody(body, implicit_return);
 
     const chunk = try fc.builder.finalize(name orelse "<anonymous>", 0);
@@ -1757,6 +1906,7 @@ pub fn compileFunctionStrict(
         .is_strict = is_strict,
         .is_generator = is_generator,
         .is_async = is_async,
+        .is_arrow = is_arrow,
         .uses_arguments = fc.saw_arguments and !is_arrow,
         .needs_parent_arguments = is_arrow and fc.saw_arguments,
         .ic_table = ic_table,
@@ -1795,6 +1945,7 @@ pub fn compileProgram(
         true, // top-level program: yield last expression-statement value (eval result)
         false, // program is not an arrow
         null, // program has no rest parameter
+        &[_]?*ast.Node{}, // no parameters → no defaults
     );
     return f;
 }
@@ -1826,6 +1977,7 @@ pub fn compileModule(
         true, // top-level program: yield last expression-statement value
         false, // program is not an arrow
         null, // program has no rest parameter
+        &[_]?*ast.Node{}, // no parameters → no defaults
     );
     f.is_module = true;
     return f;

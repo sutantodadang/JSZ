@@ -23,6 +23,7 @@ const function_proto = @import("function_proto.zig");
 const intrinsics = @import("intrinsics.zig");
 const coercion = @import("coercion.zig");
 const coll = @import("es2015_collections.zig");
+const string_proto_mod = @import("string_proto.zig");
 
 /// R1: install ArrayBuffer / %TypedArray% / per-kind ctors / DataView and bind globals.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -206,6 +207,16 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         try ctx.env.define(kind.ctorName(), try val_mod.makeObject(arena, kctor));
     }
 
+    // Uint8Array base64/hex (ES2025 "Uint8Array to/from base64" proposal): four
+    // instance methods live as own properties of %Uint8Array.prototype% only.
+    {
+        const u8_proto = active_ta_protos[@intFromEnum(TAKind.u8)].?;
+        _ = try u8_proto.defineOwnData("toBase64", try val_mod.makeNativeFunctionNamed(arena, nativeU8ToBase64, "toBase64", 0), m_attr);
+        _ = try u8_proto.defineOwnData("toHex", try val_mod.makeNativeFunctionNamed(arena, nativeU8ToHex, "toHex", 0), m_attr);
+        _ = try u8_proto.defineOwnData("setFromBase64", try val_mod.makeNativeFunctionNamed(arena, nativeU8SetFromBase64, "setFromBase64", 1), m_attr);
+        _ = try u8_proto.defineOwnData("setFromHex", try val_mod.makeNativeFunctionNamed(arena, nativeU8SetFromHex, "setFromHex", 1), m_attr);
+    }
+
     // DataView
     const dv_proto = try JsObject.create(arena, object_proto);
     // DataView.prototype methods — non-enumerable via setMethods.
@@ -245,6 +256,25 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ .writable = true, .enumerable = false, .configurable = true });
 
     try ctx.env.define("DataView", try val_mod.makeObject(arena, dv_ctor));
+
+    // Atomics — single-agent runtime. Only the operations whose argument
+    // validation is observable are provided; the read-modify-write ops are not
+    // yet implemented. @@toStringTag is wired in registerSymbols.
+    const atomics = try JsObject.create(arena, object_proto);
+    {
+        const am: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+        const atomics_methods = .{
+            .{ "notify", nativeAtomicsNotify, 3 },
+            .{ "wait", nativeAtomicsWait, 4 },
+            .{ "waitAsync", nativeAtomicsWaitAsync, 4 },
+            .{ "isLockFree", nativeAtomicsIsLockFree, 1 },
+        };
+        inline for (atomics_methods) |e| {
+            _ = try atomics.defineOwnData(e[0], try val_mod.makeNativeFunctionNamed(arena, e[1], e[0], e[2]), am);
+        }
+    }
+    active_atomics = atomics;
+    try ctx.env.define("Atomics", try val_mod.makeObject(arena, atomics));
 }
 
 /// Called after Symbol well-known values are captured, wires @@toStringTag and
@@ -256,6 +286,7 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
         if (active_arraybuffer_proto) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "ArrayBuffer"), tag_attr);
         if (active_sharedarraybuffer_proto) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "SharedArrayBuffer"), tag_attr);
         if (active_dataview_proto) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "DataView"), tag_attr);
+        if (active_atomics) |p| try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "Atomics"), tag_attr);
         // %TypedArray%.prototype[@@toStringTag] is an accessor getter returning the
         // constructor name (or undefined when `this` has no [[TypedArrayName]]).
         // Per-kind prototypes inherit it (no own @@toStringTag).
@@ -369,6 +400,7 @@ pub var active_arraybuffer_ctor: ?*JsObject = null;
 pub var active_sharedarraybuffer_proto: ?*JsObject = null;
 pub var active_sharedarraybuffer_ctor: ?*JsObject = null;
 pub var active_dataview_proto: ?*JsObject = null;
+pub var active_atomics: ?*JsObject = null;
 pub var active_typedarray_proto: ?*JsObject = null; // %TypedArray%.prototype
 pub var active_typedarray_ctor: ?*JsObject = null; // %TypedArray% (abstract ctor)
 pub var active_ta_protos: [all_kinds.len]?*JsObject = .{null} ** all_kinds.len;
@@ -642,6 +674,17 @@ fn arrayLikeLen(o: *JsObject) usize {
 /// Full [[Get]] of a string-keyed property via the VM bridge: fires accessor
 /// getters, Proxy traps, and array-index/length reads, walking the proto chain.
 /// Falls back to a raw own-property read when no Context is active.
+/// Encode a single UTF-16 code unit (0..0xFFFF, possibly a lone surrogate) into
+/// WTF-8, matching how this engine stores `\uXXXX` escapes.
+fn encodeWtf8Cu(arena: std.mem.Allocator, cu: u21) ![]const u8 {
+    if (cu < 0x80) {
+        return arena.dupe(u8, &[_]u8{@intCast(cu)});
+    } else if (cu < 0x800) {
+        return arena.dupe(u8, &[_]u8{ @intCast(0xC0 | (cu >> 6)), @intCast(0x80 | (cu & 0x3F)) });
+    }
+    return arena.dupe(u8, &[_]u8{ @intCast(0xE0 | (cu >> 12)), @intCast(0x80 | ((cu >> 6) & 0x3F)), @intCast(0x80 | (cu & 0x3F)) });
+}
+
 fn vmGet(arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!Value {
     if (realm_mod.active_context) |ctx| return ctx.getProp(arena, obj_val, key);
     if (obj_val.bits != 0 and obj_val.unbox() == .object)
@@ -665,6 +708,183 @@ fn validateTypedArrayThis(arena: std.mem.Allocator, this_val: Value) anyerror!*T
     return td;
 }
 
+// ------------------------------------ Uint8Array base64/hex (ES2025 proposal) ---
+
+/// Validate `this` is a non-OOB Uint8Array and return its live byte slice.
+/// The base64/hex methods are Uint8Array-specific ([[TypedArrayName]] check).
+fn validateU8This(arena: std.mem.Allocator, this_val: Value) anyerror![]u8 {
+    const td = getTd(this_val) orelse return throwTypeError(arena, "method called on non-Uint8Array");
+    if (td.kind != .u8) return throwTypeError(arena, "method requires a Uint8Array");
+    if (td.ab.detached) return throwTypeError(arena, "Cannot operate on a detached ArrayBuffer");
+    if (taIsOob(td)) return throwTypeError(arena, "Cannot operate on an out-of-bounds TypedArray");
+    const len = taCurrentLen(td);
+    return td.ab.bytes[td.byte_offset..][0..len];
+}
+
+/// Extract a required String argument (throws TypeError on non-string, matching
+/// the proposal's `Type(string) is not String` step).
+fn requireStringArg(arena: std.mem.Allocator, args: []const Value) anyerror![]const u8 {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string)
+        return throwTypeError(arena, "argument must be a string");
+    return args[0].toPtr().string;
+}
+
+const b64_std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const b64_url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Read option `name` off an options object as a string (returns `null` when the
+/// options arg is absent/undefined or the property is undefined).
+fn optString(arena: std.mem.Allocator, args: []const Value, idx: usize, name: []const u8) !?[]const u8 {
+    if (args.len <= idx or args[idx].bits == 0 or args[idx].unbox() != .object) return null;
+    const v = try vmGet(arena, args[idx], name);
+    if (v.bits == 0 or v.unbox() != .string) return null;
+    return v.toPtr().string;
+}
+
+fn optBool(arena: std.mem.Allocator, args: []const Value, idx: usize, name: []const u8) !bool {
+    if (args.len <= idx or args[idx].bits == 0 or args[idx].unbox() != .object) return false;
+    const v = try vmGet(arena, args[idx], name);
+    if (v.bits == 0) return false;
+    return toBool(v);
+}
+
+fn base64Alphabet(arena: std.mem.Allocator, args: []const Value, idx: usize) anyerror![]const u8 {
+    const a = (try optString(arena, args, idx, "alphabet")) orelse "base64";
+    if (std.mem.eql(u8, a, "base64")) return b64_std;
+    if (std.mem.eql(u8, a, "base64url")) return b64_url;
+    return throwTypeError(arena, "alphabet must be \"base64\" or \"base64url\"");
+}
+
+pub fn nativeU8ToBase64(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const alpha = try base64Alphabet(arena, args, 0);
+    const omit_padding = try optBool(arena, args, 0, "omitPadding");
+    const src = try validateU8This(arena, this_val);
+    var out = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i + 3 <= src.len) : (i += 3) {
+        const n = (@as(u32, src[i]) << 16) | (@as(u32, src[i + 1]) << 8) | src[i + 2];
+        try out.append(arena, alpha[(n >> 18) & 63]);
+        try out.append(arena, alpha[(n >> 12) & 63]);
+        try out.append(arena, alpha[(n >> 6) & 63]);
+        try out.append(arena, alpha[n & 63]);
+    }
+    const rem = src.len - i;
+    if (rem == 1) {
+        const n = @as(u32, src[i]) << 16;
+        try out.append(arena, alpha[(n >> 18) & 63]);
+        try out.append(arena, alpha[(n >> 12) & 63]);
+        if (!omit_padding) try out.appendSlice(arena, "==");
+    } else if (rem == 2) {
+        const n = (@as(u32, src[i]) << 16) | (@as(u32, src[i + 1]) << 8);
+        try out.append(arena, alpha[(n >> 18) & 63]);
+        try out.append(arena, alpha[(n >> 12) & 63]);
+        try out.append(arena, alpha[(n >> 6) & 63]);
+        if (!omit_padding) try out.append(arena, '=');
+    }
+    return val_mod.makeString(arena, out.items);
+}
+
+pub fn nativeU8ToHex(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const src = try validateU8This(arena, this_val);
+    const hex = "0123456789abcdef";
+    const out = try arena.alloc(u8, src.len * 2);
+    for (src, 0..) |b, i| {
+        out[i * 2] = hex[b >> 4];
+        out[i * 2 + 1] = hex[b & 15];
+    }
+    return val_mod.makeString(arena, out);
+}
+
+/// Build the `{ read, written }` result object the set* methods return.
+fn setResult(arena: std.mem.Allocator, read: usize, written: usize) !Value {
+    const obj = try newObject(arena, realm_mod.active_object_proto);
+    try obj.set("read", try val_mod.makeNumber(arena, @floatFromInt(read)));
+    try obj.set("written", try val_mod.makeNumber(arena, @floatFromInt(written)));
+    return val_mod.makeObject(arena, obj);
+}
+
+fn b64Value(alpha: []const u8, c: u8) ?u6 {
+    for (alpha, 0..) |a, i| {
+        if (a == c) return @intCast(i);
+    }
+    return null;
+}
+
+pub fn nativeU8SetFromBase64(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const alpha = try base64Alphabet(arena, args, 1);
+    const str = try requireStringArg(arena, args);
+    const dst = try validateU8This(arena, this_val);
+    var written: usize = 0;
+    var read: usize = 0;
+    var quad: [4]u6 = undefined;
+    var qn: usize = 0;
+    var idx: usize = 0;
+    while (idx < str.len) : (idx += 1) {
+        const c = str[idx];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\x0c') continue;
+        if (c == '=') break;
+        const v = b64Value(alpha, c) orelse return throwSyntaxError(arena, "Invalid base64 character");
+        quad[qn] = v;
+        qn += 1;
+        if (qn == 4) {
+            const out_bytes = [_]u8{
+                (@as(u8, quad[0]) << 2) | (@as(u8, quad[1]) >> 4),
+                (@as(u8, quad[1]) << 4) | (@as(u8, quad[2]) >> 2),
+                (@as(u8, quad[2]) << 6) | @as(u8, quad[3]),
+            };
+            for (out_bytes) |b| {
+                if (written >= dst.len) return setResult(arena, read, written);
+                dst[written] = b;
+                written += 1;
+            }
+            qn = 0;
+            read = idx + 1;
+        }
+    }
+    // Trailing partial group (2 or 3 base64 chars => 1 or 2 bytes).
+    if (qn >= 2) {
+        const partial = [_]u8{
+            (@as(u8, quad[0]) << 2) | (@as(u8, quad[1]) >> 4),
+            (@as(u8, quad[1]) << 4) | (@as(u8, quad[2]) >> 2),
+        };
+        const nbytes: usize = qn - 1;
+        var k: usize = 0;
+        while (k < nbytes and written < dst.len) : (k += 1) {
+            dst[written] = partial[k];
+            written += 1;
+        }
+        read = str.len;
+    }
+    return setResult(arena, read, written);
+}
+
+pub fn nativeU8SetFromHex(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const str = try requireStringArg(arena, args);
+    const dst = try validateU8This(arena, this_val);
+    if (str.len % 2 != 0) return throwSyntaxError(arena, "Hex string must have an even number of characters");
+    var written: usize = 0;
+    var read: usize = 0;
+    var i: usize = 0;
+    while (i + 2 <= str.len) : (i += 2) {
+        if (written >= dst.len) break;
+        const hi = hexDigit(str[i]) orelse return throwSyntaxError(arena, "Invalid hex character");
+        const lo = hexDigit(str[i + 1]) orelse return throwSyntaxError(arena, "Invalid hex character");
+        dst[written] = (hi << 4) | lo;
+        written += 1;
+        read = i + 2;
+    }
+    return setResult(arena, read, written);
+}
+
+fn hexDigit(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
 /// ValidateDataViewThis: extract DataView data and validate, or throw TypeError.
 /// Used by all DataView.prototype methods to ensure `this` is a valid DataView.
 fn validateDataViewThis(arena: std.mem.Allocator, this_val: Value) anyerror!*DataViewData {
@@ -677,12 +897,36 @@ fn validateDataViewThis(arena: std.mem.Allocator, this_val: Value) anyerror!*Dat
 /// `? Get(pending_new_target,"prototype")` (fires getters, throws propagate),
 /// set `this_obj`'s prototype when it is an object, and CONSUME the pending
 /// NewTarget so the dispatcher does not re-apply it. No-op when none pending.
-fn applyNewTargetProto(arena: std.mem.Allocator, this_obj: *JsObject) anyerror!void {
+/// Selects which intrinsic %…Prototype% to use as the GetPrototypeFromConstructor
+/// fallback (ES 9.1.14 step 4b) when `newTarget.prototype` is not an object.
+pub const DefaultProtoKind = union(enum) {
+    array_buffer,
+    shared_array_buffer,
+    data_view,
+    typed_array: TAKind,
+};
+
+fn applyNewTargetProto(arena: std.mem.Allocator, this_obj: *JsObject, dpk: DefaultProtoKind) anyerror!void {
     const nt = realm_mod.pending_new_target;
     if (nt.bits == 0) return;
     realm_mod.pending_new_target = Value{}; // consume before the (throwing) Get
     const pv = try vmGet(arena, nt, "prototype");
-    if (pv.bits != 0 and pv.unbox() == .object) this_obj.proto = pv.toPtr().object;
+    if (pv.bits != 0 and pv.unbox() == .object) {
+        this_obj.proto = pv.toPtr().object;
+        return;
+    }
+    // GetPrototypeFromConstructor fallback: NewTarget.prototype is not an object,
+    // so use the intrinsic default prototype of NewTarget's [[Realm]] (which for a
+    // cross-realm NewTarget differs from the running realm's). Untagged functions
+    // yield null → keep this_obj's already-default (running-realm) prototype.
+    const fr = realm_mod.getFunctionRealm(nt) orelse return;
+    const fallback: ?*JsObject = switch (dpk) {
+        .array_buffer => fr.ab_prototype,
+        .shared_array_buffer => fr.sab_prototype,
+        .data_view => fr.dv_prototype,
+        .typed_array => |k| fr.ta_kind_prototypes[@intFromEnum(k)],
+    };
+    if (fallback) |p| this_obj.proto = p;
 }
 
 // ---------------------------------------------------------------- element IO ---
@@ -810,6 +1054,9 @@ pub fn nativeArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []
     if (!realm_mod.active_constructing or this_val.bits == 0 or this_val.unbox() != .object) {
         return throwTypeError(arena, "Constructor ArrayBuffer requires 'new'");
     }
+    // Capture NewTarget before any user-observable coercion (length / the
+    // maxByteLength getter) clears `pending_new_target` via a nested VM call.
+    const saved_nt = realm_mod.pending_new_target;
     const len: usize = if (args.len > 0) try toIndexThrowing(arena, args[0]) else 0;
     // GetArrayBufferMaxByteLengthOption: options.maxByteLength (ToIndex) marks
     // resizable. Read it OBSERVABLY (vmGet fires an accessor getter + propagates
@@ -827,7 +1074,8 @@ pub fn nativeArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []
     // AllocateArrayBuffer: GetPrototypeFromConstructor(newTarget) runs BEFORE the
     // backing-store allocation (after ToIndex(length) + the maxByteLength option),
     // so a throwing NewTarget.prototype getter throws before any allocation.
-    try applyNewTargetProto(arena, obj);
+    realm_mod.pending_new_target = saved_nt;
+    try applyNewTargetProto(arena, obj, .array_buffer);
     if ((max_bl orelse len) > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     const cap = max_bl orelse len;
     const bytes = try arena.alloc(u8, cap);
@@ -889,30 +1137,37 @@ fn getSabData(v: Value) ?*ArrayBufferData {
 }
 
 pub fn nativeSharedArrayBufferCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
+    // [[Construct]]-only: `SharedArrayBuffer()` as a plain call (NewTarget
+    // undefined) must throw. A plain call receives globalThis (an object) as
+    // `this`, so the object check alone is insufficient — gate on the native
+    // construct path's flag, mirroring ArrayBuffer.
+    if (!realm_mod.active_constructing or this_val.bits == 0 or this_val.unbox() != .object) {
         return throwTypeError(arena, "Constructor SharedArrayBuffer requires 'new'");
     }
     const len: usize = if (args.len > 0) try toIndexThrowing(arena, args[0]) else 0;
-    // GetArrayBufferMaxByteLengthOption → growable.
+    // GetArrayBufferMaxByteLengthOption → growable. Read it OBSERVABLY (vmGet
+    // fires an accessor getter + propagates a throw) — a poisoned
+    // `get maxByteLength()` must be surfaced.
     var max_bl: ?usize = null;
     if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) {
-        const opts = args[1].toPtr().object;
-        if (opts.get("maxByteLength")) |mv| {
-            if (mv.bits != 0 and mv.unbox() != .undefined_)
-                max_bl = try toIndexThrowing(arena, mv);
-        }
+        const mv = try vmGet(arena, args[1], "maxByteLength");
+        if (mv.bits != 0 and mv.unbox() != .undefined_)
+            max_bl = try toIndexThrowing(arena, mv);
     }
     if (max_bl) |m| {
         if (len > m) return throwRangeError(arena, "SharedArrayBuffer length exceeds maxByteLength");
     }
+    const obj = this_val.toPtr().object;
+    // AllocateSharedArrayBuffer: OrdinaryCreateFromConstructor reads
+    // NewTarget.prototype BEFORE the backing-store allocation, so a throwing
+    // NewTarget.prototype getter throws before any allocation (RangeError).
+    try applyNewTargetProto(arena, obj, .shared_array_buffer);
     if ((max_bl orelse len) > MAX_AB_BYTES) return throwRangeError(arena, "ArrayBuffer allocation size too large");
     const cap = max_bl orelse len;
     const bytes = try arena.alloc(u8, cap);
     @memset(bytes, 0);
     const data = try arena.create(ArrayBufferData);
     data.* = .{ .bytes = bytes, .byte_length = len, .max_byte_length = max_bl, .shared = true };
-    const obj = this_val.toPtr().object;
-    try applyNewTargetProto(arena, obj);
     obj.internal_kind = .array_buffer;
     obj.internal_slot = data;
     return this_val;
@@ -981,6 +1236,77 @@ pub fn nativeSabSlice(arena: std.mem.Allocator, this_val: Value, args: []const V
     if (res_ab.byte_length < new_len) return throwTypeError(arena, "SharedArrayBuffer[@@species] result is too small");
     @memcpy(res_ab.bytes[0..new_len], ab.bytes[start .. start + new_len]);
     return result;
+}
+
+// -------------------------------------------------------------------- Atomics ---
+// Single-agent runtime: there is never another agent to wake or to be woken by,
+// so wait/notify/waitAsync only need spec-exact *argument validation* and the
+// degenerate single-agent result. The validation order matters: the TypedArray
+// brand/type check (ValidateIntegerTypedArray) runs BEFORE any index/value
+// coercion, so a poisoned index/count whose valueOf throws must never be
+// evaluated when the array is the wrong type.
+
+/// ValidateIntegerTypedArray(typedArray, waitable): the receiver must be a
+/// non-detached, in-bounds TypedArray; when `waitable` it must additionally be
+/// an Int32Array or BigInt64Array; otherwise it must be any integer (non-float)
+/// element type. Throws TypeError on any mismatch.
+fn validateIntegerTA(arena: std.mem.Allocator, val: Value, waitable: bool) anyerror!*TypedArrayData {
+    const td = getTd(val) orelse return throwTypeError(arena, "Atomics operation called on a non-TypedArray");
+    try validateTypedArray(arena, td);
+    if (waitable) {
+        if (td.kind != .i32 and td.kind != .i64big)
+            return throwTypeError(arena, "Atomics.wait/notify requires an Int32Array or BigInt64Array");
+    } else switch (td.kind) {
+        .f16, .f32, .f64 => return throwTypeError(arena, "Atomics operation requires an integer TypedArray"),
+        else => {},
+    }
+    return td;
+}
+
+/// Atomics.notify(typedArray, index, count) → number of agents woken. With no
+/// other agents this is always 0; validation still runs first.
+pub fn nativeAtomicsNotify(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateIntegerTA(arena, a0, true);
+    // ValidateAtomicAccess: ToIndex(index), bound against the live length.
+    const idx = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
+    if (idx >= taCurrentLen(td)) return throwRangeError(arena, "Atomics.notify index out of range");
+    // count: undefined → +∞ (all), else max(ToInteger, 0). Observed for coercion side effects.
+    if (args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_)
+        _ = try toIntegerThrowing(arena, args[2]);
+    return val_mod.makeNumber(arena, 0);
+}
+
+/// Atomics.wait(typedArray, index, value, timeout). No agent can ever signal
+/// this single agent, so after spec-exact validation the only reachable result
+/// would be a block; `[[CanBlock]]` is false for the runner agent → TypeError.
+pub fn nativeAtomicsWait(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateIntegerTA(arena, a0, true);
+    if (!td.ab.shared) return throwTypeError(arena, "Atomics.wait requires a shared buffer");
+    return throwTypeError(arena, "Atomics.wait: the current agent cannot be suspended");
+}
+
+/// Atomics.waitAsync(typedArray, index, value, timeout) → { async, value }.
+/// With no possible signaller and a value mismatch unknowable without blocking,
+/// the single-agent degenerate result is a synchronous "not-equal".
+pub fn nativeAtomicsWaitAsync(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const a0 = if (args.len > 0) args[0] else Value{};
+    const td = try validateIntegerTA(arena, a0, true);
+    if (!td.ab.shared) return throwTypeError(arena, "Atomics.waitAsync requires a shared buffer");
+    const res = try JsObject.create(arena, realm_mod.active_object_proto);
+    _ = try res.defineOwnData("async", try val_mod.makeBool(arena, false),
+        .{ .writable = true, .enumerable = true, .configurable = true });
+    _ = try res.defineOwnData("value", try val_mod.makeString(arena, "not-equal"),
+        .{ .writable = true, .enumerable = true, .configurable = true });
+    return val_mod.makeObject(arena, res);
+}
+
+/// Atomics.isLockFree(size) → true for the natively lock-free element widths.
+pub fn nativeAtomicsIsLockFree(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const n = try toIntegerThrowing(arena, if (args.len > 0) args[0] else Value{});
+    const lockfree = n == 1 or n == 2 or n == 4 or n == 8;
+    return val_mod.makeBool(arena, lockfree);
 }
 
 pub fn nativeArrayBufferSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1392,24 +1718,26 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
 
         // GetPrototypeFromConstructor runs first for object arguments (before any
         // byteOffset/length coercion); a throwing NewTarget.prototype getter throws here.
-        try applyNewTargetProto(arena, this_obj);
+        try applyNewTargetProto(arena, this_obj, .{ .typed_array = kind });
 
         // Form 2: new TA(buffer, byteOffset?, length?)  → view onto the buffer.
         if (src.internal_kind == .array_buffer) {
             const ab: *ArrayBufferData = @ptrCast(@alignCast(src.internal_slot.?));
-            // 1. byteOffset = ToIndex(args[1]) — side-effecting valueOf runs first.
+            // Spec §23.2.5.1 InitializeTypedArrayFromArrayBuffer, in order:
+            // 6. byteOffset = ToIndex(args[1]) — side-effecting valueOf runs first.
             const byte_offset = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
-            // 2. byteOffset % elementSize != 0 → RangeError.
+            // 7. byteOffset % elementSize != 0 → RangeError (BEFORE ToIndex(length)).
             if (byte_offset % esize != 0) return throwRangeError(arena, "start offset is not aligned");
-            // 3. Detached check (after coercing byteOffset).
-            if (ab.detached) return throwTypeError(arena, "Cannot construct a typed array from a detached ArrayBuffer");
+            // 8.a. If length is present, newLength = ToIndex(length) — another
+            // side-effecting coercion that runs BEFORE the IsDetachedBuffer check
+            // (its valueOf may itself detach the buffer).
+            const has_len = args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_;
             var length: usize = undefined;
+            if (has_len) length = try toIndexThrowing(arena, args[2]);
+            // 9. IsDetachedBuffer(buffer) → TypeError (after both coercions).
+            if (ab.detached) return throwTypeError(arena, "Cannot construct a typed array from a detached ArrayBuffer");
             var track_len = false;
-            if (args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_) {
-                // length = ToIndex(args[2]) — another side-effecting coercion.
-                length = try toIndexThrowing(arena, args[2]);
-                // Re-check detached: a valueOf may have detached mid-construction.
-                if (ab.detached) return throwTypeError(arena, "Cannot construct a typed array from a detached ArrayBuffer");
+            if (has_len) {
                 if (byte_offset > ab.byte_length) return throwRangeError(arena, "byteOffset out of bounds");
                 if (byte_offset + length * esize > ab.byte_length) return throwRangeError(arena, "length out of bounds");
             } else {
@@ -1499,7 +1827,7 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
     // ToIndex, which throws on negative / Symbol / out-of-range / throwing-valueOf
     // — this runs BEFORE GetPrototypeFromConstructor for the primitive path.
     const length = try toIndexThrowing(arena, if (args.len > 0) args[0] else Value{});
-    try applyNewTargetProto(arena, this_obj);
+    try applyNewTargetProto(arena, this_obj, .{ .typed_array = kind });
     const res = try makeArrayBuffer(arena, length * esize);
     _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
     return val_mod.makeObject(arena, this_obj);
@@ -1647,7 +1975,15 @@ fn isConstructor(v: Value) bool {
     return switch (v.unbox()) {
         .function, .bc_function => true,
         .native_function => true,
-        .object => |o| o.get("__call__") != null or o.internal_kind == .bound_function,
+        .object => |o| {
+            // A Proxy is a constructor iff its [[ProxyTarget]] is a constructor.
+            if (o.internal_kind == .proxy) {
+                const proxy_mod = @import("proxy.zig");
+                if (proxy_mod.proxyTarget(o)) |t| return isConstructor(t);
+                return false;
+            }
+            return o.get("__call__") != null or o.internal_kind == .bound_function;
+        },
         else => false,
     };
 }
@@ -1757,6 +2093,22 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
     // at their initialized 0 (NOT undefined→NaN); only in-bounds indices are read.
     const cur_len = taCurrentLen(td);
     const copy_end = if (start < cur_len) @min(new_len, cur_len - start) else 0;
+    // §23.2.3.27 step 14.d: when source and target have the same element type
+    // the bytes are copied directly, preserving exact bit patterns (notably NaN
+    // payloads, which a float→f64→float round-trip would canonicalize).
+    if (copy_end > 0 and a_td.kind == td.kind) {
+        const sz = td.kind.elemSize();
+        const src_start = td.byte_offset + start * sz;
+        const dst_start = a_td.byte_offset;
+        const nbytes = copy_end * sz;
+        const src_bytes = td.ab.bytes[src_start .. src_start + nbytes];
+        const dst_bytes = a_td.ab.bytes[dst_start .. dst_start + nbytes];
+        // Spec step 14.g.ix copies uint8-by-uint8 FORWARD. When a species ctor
+        // returns a view on the same buffer at a higher offset, this intentionally
+        // "smears" overlapping bytes (not a memmove) — copyForwards reproduces that.
+        std.mem.copyForwards(u8, dst_bytes, src_bytes);
+        return result;
+    }
     var i: usize = 0;
     while (i < copy_end) : (i += 1) {
         const ev = try taLoad(arena, td, start + i);
@@ -1766,7 +2118,10 @@ pub fn nativeTaSlice(arena: std.mem.Allocator, this_val: Value, args: []const Va
 }
 
 pub fn nativeTaSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const td = try validateTypedArrayThis(arena, this_val);
+    // §23.2.3.26 step 1: RequireInternalSlot only — NO detached/OOB check on
+    // entry. The detached/OOB validation happens after ToIntegerOrInfinity(offset)
+    // (below), so a throwing offset coercion surfaces its error first.
+    const td = getTd(this_val) orelse return throwTypeError(arena, "TypedArray.prototype.set called on non-TypedArray");
     if (td.ab.immutable) return throwTypeError(arena, "Cannot set on an immutable-buffer-backed TypedArray");
     // targetOffset = ToIntegerOrInfinity(offset) (runs valueOf, propagates throws);
     // negative → RangeError. May be +Inf (caught by the bounds check below).
@@ -2174,13 +2529,56 @@ pub fn nativeTaFrom(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const map_present = args.len > 1 and !(args[1].bits == 0 or args[1].unbox() == .undefined_);
     if (map_present and !function_proto_isCallable(args[1]))
         return throwTypeError(arena, "TypedArray.from: mapfn is not a function");
+    // GetMethod(source, @@iterator) performs GetV(source, ...) which does
+    // ToObject(source); a null/undefined (or absent) source throws TypeError.
+    // This happens AFTER the mapfn-callable check above.
+    if (args.len < 1 or args[0].bits == 0 or args[0].unbox() == .undefined_ or args[0].unbox() == .null_)
+        return throwTypeError(arena, "TypedArray.from: source is null or undefined");
     const this_arg: Value = if (args.len > 2) args[2] else Value{};
 
     // Collect source: iterable → pre-materialized list; array-like → object + len.
     var list_items: []const Value = &[_]Value{};
     var arr_src: ?*JsObject = null;
     var length: usize = 0;
-    if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object) {
+    if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .string) {
+        const s = args[0].unbox().string;
+        // GetMethod(source, @@iterator): a String is normally iterable via
+        // String.prototype[@@iterator] (by code point), but the method is
+        // observable and user-overridable/deletable — honor its current value.
+        var iter_method: Value = .{};
+        if (realm_mod.active_sym_iterator) |sym| {
+            const m = try vmGetSym(arena, args[0], sym);
+            if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+                if (!function_proto_isCallable(m))
+                    return throwTypeError(arena, "Symbol.iterator is not a function");
+                iter_method = m;
+            }
+        }
+        if (iter_method.bits != 0) {
+            const list = try iterableToList(arena, args[0], iter_method);
+            list_items = list.items;
+            length = list.items.len;
+        } else {
+            // No @@iterator: ToObject(string) exposes a length + indexed UTF-16
+            // code units, so iterate code units (astral chars split into a
+            // surrogate pair).
+            var units = std.ArrayList(Value){};
+            var i: usize = 0;
+            while (i < s.len) {
+                const dec = string_proto_mod.decodeWtf8At(s, i);
+                if (dec.cp <= 0xFFFF) {
+                    try units.append(arena, try val_mod.makeString(arena, try arena.dupe(u8, s[i .. i + dec.len])));
+                } else {
+                    const v: u21 = dec.cp - 0x10000;
+                    try units.append(arena, try val_mod.makeString(arena, try encodeWtf8Cu(arena, 0xD800 + (v >> 10))));
+                    try units.append(arena, try val_mod.makeString(arena, try encodeWtf8Cu(arena, 0xDC00 + (v & 0x3FF))));
+                }
+                i += dec.len;
+            }
+            list_items = units.items;
+            length = units.items.len;
+        }
+    } else if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object) {
         const src = args[0].toPtr().object;
         const probe = try detectIterable(arena, src);
         if (probe.decision == .iterate) {
@@ -2240,7 +2638,15 @@ fn function_proto_isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .bc_function, .native_function => true,
-        .object => |o| o.get("__call__") != null or o.internal_kind == .bound_function,
+        .object => |o| {
+            // A Proxy is callable iff its [[ProxyTarget]] is callable.
+            if (o.internal_kind == .proxy) {
+                const proxy_mod = @import("proxy.zig");
+                if (proxy_mod.proxyTarget(o)) |t| return function_proto_isCallable(t);
+                return false;
+            }
+            return o.get("__call__") != null or o.internal_kind == .bound_function;
+        },
         else => false,
     };
 }
@@ -2281,6 +2687,26 @@ fn bigintSearch(v: Value) ?i128 {
     return v.toPtr().bigint.toConst().toInt(i128) catch null;
 }
 
+/// SortCompare predicate: returns true when `a` must sort *after* `b`
+/// (compare(a, b) > 0). With a user comparator, ToNumber of its result is
+/// observable (fires valueOf/Symbol.toPrimitive, propagates throws); NaN → +0.
+fn taSortGreater(
+    arena: std.mem.Allocator,
+    td: *const TypedArrayData,
+    cmp_fn: Value,
+    undef: Value,
+    a: Value,
+    b: Value,
+) anyerror!bool {
+    if (cmp_fn.bits != 0) {
+        const cr = try function_proto.invokeCallback(arena, undef, cmp_fn, &[_]Value{ a, b });
+        const rv = try toNumberThrowing(arena, cr);
+        return (if (std.math.isNan(rv)) @as(f64, 0) else rv) > 0;
+    }
+    if (td.kind.isBigInt()) return bigintSearch(a).? > bigintSearch(b).?;
+    return taNumCompare(toNum(a), toNum(b)) > 0;
+}
+
 /// Default TypedArray numeric SortCompare: ascending, NaN sorts last, -0 before +0.
 fn taNumCompare(x: f64, y: f64) f64 {
     const xn = std.math.isNan(x);
@@ -2316,29 +2742,47 @@ pub fn nativeTaSort(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const items = try arena.alloc(Value, n);
     var r: usize = 0;
     while (r < n) : (r += 1) items[r] = try taLoad(arena, td, r);
-    // Stable insertion sort over the snapshot.
-    var i: usize = 1;
-    while (i < n) : (i += 1) {
-        const key = items[i];
-        var j = i;
-        while (j > 0) : (j -= 1) {
-            const a = items[j - 1];
-            const should_swap = blk: {
-                if (cmp_fn.bits != 0) {
-                    const cr = try function_proto.invokeCallback(arena, undef, cmp_fn, &[_]Value{ a, key });
-                    // SortCompare: ToNumber(callResult) is observable (fires
-                    // valueOf / Symbol.toPrimitive, propagates throws); NaN → +0.
-                    const rv = try toNumberThrowing(arena, cr);
-                    break :blk (if (std.math.isNan(rv)) @as(f64, 0) else rv) > 0;
+    // Stable bottom-up merge sort over the snapshot (O(n log n) comparator
+    // calls — an insertion sort's O(n²) is unusably slow for large arrays).
+    // Stability: when merging, take from the left run unless it compares
+    // *strictly greater* than the right head, so equal elements keep order.
+    const buf = try arena.alloc(Value, n);
+    var src = items;
+    var dst = buf;
+    var width: usize = 1;
+    while (width < n) : (width *= 2) {
+        var lo: usize = 0;
+        while (lo < n) : (lo += 2 * width) {
+            const mid = @min(lo + width, n);
+            const hi = @min(lo + 2 * width, n);
+            var a: usize = lo;
+            var b: usize = mid;
+            var k: usize = lo;
+            while (a < mid and b < hi) {
+                if (try taSortGreater(arena, td, cmp_fn, undef, src[a], src[b])) {
+                    dst[k] = src[b];
+                    b += 1;
+                } else {
+                    dst[k] = src[a];
+                    a += 1;
                 }
-                if (td.kind.isBigInt()) break :blk bigintSearch(a).? > bigintSearch(key).?;
-                break :blk taNumCompare(toNum(a), toNum(key)) > 0;
-            };
-            if (!should_swap) break;
-            items[j] = a;
+                k += 1;
+            }
+            while (a < mid) : (a += 1) {
+                dst[k] = src[a];
+                k += 1;
+            }
+            while (b < hi) : (b += 1) {
+                dst[k] = src[b];
+                k += 1;
+            }
         }
-        items[j] = key;
+        const tmp = src;
+        src = dst;
+        dst = tmp;
     }
+    // Final sorted run lives in `src`; mirror it back into `items` if needed.
+    if (src.ptr != items.ptr) @memcpy(items, src);
     // Write back, guarding each index against the (possibly shrunk) live bounds.
     var w: usize = 0;
     while (w < n) : (w += 1) {
@@ -2732,6 +3176,10 @@ pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     }
     const buf_obj = args[0].toPtr().object;
     const ab: *ArrayBufferData = @ptrCast(@alignCast(buf_obj.internal_slot.?));
+    // Capture NewTarget now: coercing an object byteOffset/length below runs user
+    // valueOf through the VM, which clears `pending_new_target`. Restore it before
+    // the GetPrototypeFromConstructor read so the prototype getter still fires.
+    const saved_nt = realm_mod.pending_new_target;
     // Spec: ToNumber(byteOffset) runs before the detached check.
     const byte_offset: usize = if (args.len > 1) try toIndexThrowing(arena, args[1]) else 0;
     const has_len = args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_;
@@ -2744,7 +3192,8 @@ pub fn nativeDataViewCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     if (has_len and byte_offset + byte_length > ab.byte_length) return throwRangeError(arena, "Invalid DataView length");
     const obj = this_val.toPtr().object;
     // GetPrototypeFromConstructor runs after offset/length coercion + bounds checks.
-    try applyNewTargetProto(arena, obj);
+    realm_mod.pending_new_target = saved_nt;
+    try applyNewTargetProto(arena, obj, .data_view);
     // OrdinaryCreateFromConstructor may have run user code (a `prototype` getter)
     // that detached or resized the buffer; re-validate against the current length.
     if (ab.detached) return throwTypeError(arena, "Cannot perform operation on a detached ArrayBuffer");

@@ -29,6 +29,25 @@ fn globalObjectOwn(frame: *BcCallFrame, name: []const u8) ?Value {
     return gt.toPtr().object.getOwn(name);
 }
 
+/// ES §9.1.1.4 (global environment record): a `var`/function declaration (or a
+/// sloppy implicit global assignment) at the top level of a Script becomes an
+/// own property of the global object, observable as `globalThis.name`. We keep a
+/// separate environment record for global bindings, so mirror the value onto the
+/// `globalThis` object here. Only runs at true global scope (`parent == null`),
+/// which naturally excludes block/catch/function-local bindings (those execute
+/// in a child environment). Internal `__`-prefixed names are never exposed.
+fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value) void {
+    if (frame.env.parent != null) return;
+    if (name.len >= 2 and name[0] == '_' and name[1] == '_') return;
+    const gt = frame.env.lookup("globalThis") catch return;
+    if (gt.bits == 0 or gt.unbox() != .object) return;
+    // Non-enumerable to match the built-in globals already installed on the
+    // object (and to avoid polluting `for-in`/`Object.keys(globalThis)`); read
+    // and `in` visibility — what the global-object semantics require — are
+    // unaffected by enumerability.
+    _ = gt.toPtr().object.defineOwnData(name, value, .{ .writable = true, .enumerable = false, .configurable = true }) catch {};
+}
+
 pub inline fn opLoadK(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     _ = self;
     const code = frame.func.chunk.code;
@@ -97,6 +116,14 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name_val = frame.func.chunk.constants[kidx];
     const name = name_val.toPtr().string;
+    // `with` scopes (if any) shadow the lexical/global scope: an object whose
+    // [[HasProperty]] is true provides the binding via [[Get]].
+    if (frame.with_stack.items.len > 0) {
+        if (try withLookup(self, frame, name)) |v| {
+            frame.registers[rdst] = v;
+            return null;
+        }
+    }
     // Look up in frame env (chains to global), then realm global.
     // An identifier that resolves nowhere is a ReferenceError
     // (env lookups run no user code, so no frame realloc here).
@@ -236,6 +263,39 @@ pub inline fn opExitScope(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+pub inline fn opPushWith(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const robj = code[frame.pc];
+    frame.pc += 1;
+    frame.with_stack.append(self.arena, frame.registers[robj]) catch return error.OutOfMemory;
+    return null;
+}
+
+pub inline fn opPopWith(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    if (frame.with_stack.items.len > 0) _ = frame.with_stack.pop();
+    return null;
+}
+
+/// `with`-scope resolution: search the frame's with-object stack (innermost
+/// last) for the first object that HasProperty(name); return its value via
+/// [[Get]]. Returns null when no with-object provides the binding (the caller
+/// then falls back to the lexical/global scope). Only the HasProperty/Get of a
+/// matching object runs user code.
+inline fn withLookup(self: *BcVm, frame: *BcCallFrame, name: []const u8) !?Value {
+    if (frame.with_stack.items.len == 0) return null;
+    const key = try val_mod.makeString(self.arena, name);
+    var i = frame.with_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        const wobj = frame.with_stack.items[i];
+        if (wobj.bits == 0 or wobj.unbox() != .object) continue;
+        if (try self.hasProperty(wobj, key)) {
+            return try self.getProp(wobj, name);
+        }
+    }
+    return null;
+}
+
 pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const lo = code[frame.pc];
@@ -249,6 +309,20 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const name = name_val.toPtr().string;
     const value = frame.registers[rsrc];
     const cur_is_strict = frame.func.is_strict;
+    // `with` scopes: assign through an object whose [[HasProperty]] is true.
+    if (frame.with_stack.items.len > 0) {
+        const key = try val_mod.makeString(self.arena, name);
+        var i = frame.with_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            const wobj = frame.with_stack.items[i];
+            if (wobj.bits == 0 or wobj.unbox() != .object) continue;
+            if (try self.hasProperty(wobj, key)) {
+                try self.setProp(wobj, name, value);
+                return null;
+            }
+        }
+    }
     // Try to assign in env chain (covers locals and upvalues).
     // TemporalDeadZone and ConstAssignment are real errors that must propagate.
     frame.env.assign(name, value) catch |err| {
@@ -287,6 +361,10 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         error.OutOfMemory => return error.OutOfMemory,
     }
 };
+    // Keep the global object in sync when assigning a global binding (covers
+    // both reassignment of an existing global and sloppy implicit-global
+    // creation). The helper no-ops outside true global scope.
+    mirrorGlobalBinding(frame, name, value);
     return null;
 }
 
@@ -313,6 +391,9 @@ pub inline fn opDefineGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             frame.env.define(name, value) catch return error.OutOfMemory;
         }
     };
+    // Top-level `var`/function declarations are also own properties of the
+    // global object (observable as `globalThis.name`).
+    mirrorGlobalBinding(frame, name, value);
     return null;
 }
 

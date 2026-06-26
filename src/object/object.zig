@@ -143,6 +143,22 @@ pub const JsObject = struct {
     /// Set own property. Respects non-writable data props (sloppy: silent no-op)
     /// and non-extensibility (cannot add new keys). Keeps `attrs` in lockstep.
     pub fn set(self: *JsObject, key: []const u8, value: Value) !void {
+        // Array `length` write (ArraySetLength): adjust the cached length and, on
+        // a shrink, delete the now-out-of-range indexed own properties. A `length`
+        // assignment never creates an ordinary "length" data slot.
+        if (self.is_array and std.mem.eql(u8, key, "length")) {
+            const new_len = arrayLengthFromValue(value) orelse return;
+            if (new_len < self.array_length) {
+                var idx = new_len;
+                var key_buf: [10]u8 = undefined;
+                while (idx < self.array_length) : (idx += 1) {
+                    const k = std.fmt.bufPrint(&key_buf, "{d}", .{idx}) catch continue;
+                    if (self.shape.key_to_slot.contains(k)) _ = self.deleteOwn(k) catch {};
+                }
+            }
+            self.array_length = new_len;
+            return;
+        }
         if (self.shape.key_to_slot.get(key)) |slot| {
             if (slot < self.slots.items.len) {
                 if (slot < self.attrs.items.len and !self.attrs.items[slot].writable) return;
@@ -163,6 +179,22 @@ pub const JsObject = struct {
                 self.array_length = idx + 1;
             }
         }
+    }
+
+    /// ToUint32-style coercion of an array-`length` assignment value. Returns the
+    /// clamped length, or null when the value is not a number (the caller leaves
+    /// the array unchanged rather than synthesizing an ordinary property).
+    fn arrayLengthFromValue(v: Value) ?u32 {
+        if (v.bits == 0) return null;
+        return switch (v.unbox()) {
+            .number => |n| blk: {
+                if (std.math.isNan(n) or n <= 0) break :blk 0;
+                if (n >= 4294967295.0) break :blk 4294967295;
+                break :blk @intFromFloat(@trunc(n));
+            },
+            .boolean => |b| if (b) 1 else 0,
+            else => null,
+        };
     }
 
     /// Grow `slots` and `attrs` together to at least `n` entries, padding with
@@ -354,12 +386,39 @@ pub const JsObject = struct {
     /// JsObject with own "get"/"set". Forces a shape transition so any stale
     /// data inline cache for the previous shape misses. Returns false if
     /// disallowed (non-configurable redefine, or add when non-extensible).
+    /// Identity of an accessor holder's `get`/`set` slot (absent / undefined → 0).
+    fn holderFnBits(o: *JsObject, k: []const u8) u64 {
+        const v = o.getOwn(k) orelse return 0;
+        if (v.bits == 0) return 0;
+        if (v.unbox() == .undefined_) return 0;
+        return v.bits;
+    }
+
+    /// SameValue on two accessor holders: identical get and identical set.
+    fn accessorHoldersEqual(a: Value, b: Value) bool {
+        if (a.bits == b.bits) return true;
+        if (!(a.bits != 0 and a.unbox() == .object)) return false;
+        if (!(b.bits != 0 and b.unbox() == .object)) return false;
+        const ao = a.toPtr().object;
+        const bo = b.toPtr().object;
+        return holderFnBits(ao, "get") == holderFnBits(bo, "get") and
+            holderFnBits(ao, "set") == holderFnBits(bo, "set");
+    }
+
     pub fn defineOwnAccessor(self: *JsObject, key: []const u8, holder: Value, attr_in: PropAttr) !bool {
         var attr = attr_in;
         attr.is_accessor = true;
         if (self.shape.key_to_slot.get(key)) |slot| {
             const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
-            if (!cur.configurable) return false;
+            if (!cur.configurable) {
+                // Non-configurable: a redefine is rejected unless it makes no
+                // observable change — same accessor with identical get/set and
+                // unchanged enumerable (ValidateAndApplyPropertyDescriptor).
+                if (!cur.is_accessor or cur.enumerable != attr.enumerable) return false;
+                const cur_holder = if (slot < self.slots.items.len) self.slots.items[slot] else Value{};
+                if (!accessorHoldersEqual(cur_holder, holder)) return false;
+                return true;
+            }
             _ = try self.deleteOwn(key);
         } else {
             if (!self.extensible) return false;
@@ -369,6 +428,12 @@ pub const JsObject = struct {
         try self.growSlots(new_slot + 1);
         self.slots.items[new_slot] = holder;
         self.attrs.items[new_slot] = attr;
+        // Array exotic [[DefineOwnProperty]]: defining an own property at an array
+        // index >= length extends the array's length (matches defineOwnData).
+        if (self.is_array) {
+            const idx = std.fmt.parseUnsigned(u32, key, 10) catch return true;
+            if (idx != std.math.maxInt(u32) and idx >= self.array_length) self.array_length = idx + 1;
+        }
         return true;
     }
 
@@ -509,6 +574,20 @@ pub const JsObject = struct {
 
     /// [[DefineOwnProperty]] for a symbol-keyed ACCESSOR property. `holder` is an
     /// object carrying `get`/`set` (same shape the VM reads via getPropSym).
+    /// Existing accessor holder for a symbol key, or null. Mirrors
+    /// `ownAccessorHolder` for the symbol-keyed property table.
+    pub fn ownAccessorHolderSym(self: *JsObject, sym_key: Value) ?Value {
+        if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return null;
+        const target = sym_key.toPtr().symbol;
+        for (self.sym_props.items) |sp| {
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
+                if (!sp.attr.is_accessor) return null;
+                return sp.value;
+            }
+        }
+        return null;
+    }
+
     pub fn defineOwnAccessorSym(self: *JsObject, sym_key: Value, holder: Value, attr: PropAttr) !bool {
         if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return false;
         const target = sym_key.toPtr().symbol;

@@ -142,6 +142,10 @@ pub const Op = enum(u8) {
     PUSH_TRY,
     POP_TRY,
     NEW_INSTANCE,
+    /// NEW_INSTANCE_SPREAD: op, Rdst u8, Rcallee u8, Rargs u8 (4 bytes). Constructs
+    /// R[Rcallee] with the elements of the array R[Rargs] as arguments — used for
+    /// `new C(...xs)` where the argument list contains a spread.
+    NEW_INSTANCE_SPREAD,
     INSTANCEOF,
     // Phase 4d opcodes
     /// GET_KEYS: op, Rdst u8, Robj u8
@@ -176,6 +180,10 @@ pub const Op = enum(u8) {
     /// Installs an accessor (getter if kind==0, setter if kind==1) named Kname on
     /// R[Robj], merging into an existing accessor holder for the same key.
     DEFINE_ACCESSOR,
+    /// DEFINE_ACCESSOR_DYN: op, Robj u8, Rkey u8, kind u8 (0=get,1=set), Rfn u8.
+    /// Like DEFINE_ACCESSOR but the key is a runtime value in R[Rkey] (string or
+    /// symbol) — used for computed accessor keys `{ get [expr]() {} }`.
+    DEFINE_ACCESSOR_DYN,
     /// ARRAY_APPEND: op, Rarr u8, Rval u8 (3 bytes). Appends R[Rval] to the array
     /// R[Rarr] at its current length (used for array-literal elements when the
     /// literal contains a spread, so indices are dynamic).
@@ -218,6 +226,12 @@ pub const Op = enum(u8) {
     /// EXIT_SCOPE | 1 | op. Pop the current frame env back to its parent,
     /// discarding the most recent block scope's bindings.
     EXIT_SCOPE,
+    /// PUSH_WITH | 2 | op, Robj u8. Push R[obj] onto the frame's with-object
+    /// stack: subsequent unqualified name lookups consult it (via HasProperty)
+    /// before the lexical/global scope. Paired with POP_WITH.
+    PUSH_WITH,
+    /// POP_WITH | 1 | op. Pop the innermost with-object off the frame stack.
+    POP_WITH,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -236,6 +250,8 @@ pub fn instrSize(op: Op) usize {
         .INIT_LEX => 5,
         .ENTER_SCOPE => 1,
         .EXIT_SCOPE => 1,
+        .PUSH_WITH => 2,
+        .POP_WITH => 1,
         .SET_GLOBAL => 4,
         .GET_LOCAL => 3,
         .SET_LOCAL => 3,
@@ -291,6 +307,7 @@ pub fn instrSize(op: Op) usize {
         .PUSH_TRY => 4,
         .POP_TRY => 1,
         .NEW_INSTANCE => 4,
+        .NEW_INSTANCE_SPREAD => 4,
         .INSTANCEOF => 4,
         // Phase 4d
         .GET_KEYS => 3,
@@ -301,6 +318,7 @@ pub fn instrSize(op: Op) usize {
         .YIELD => 2,
         .TAIL_METHOD_CALL => 4,
         .DEFINE_ACCESSOR => 6,
+        .DEFINE_ACCESSOR_DYN => 5,
         .ARRAY_APPEND => 3,
         .ARRAY_SPREAD => 3,
         .IN => 4,

@@ -129,6 +129,18 @@ fn makeObj(arena: std.mem.Allocator, proto: ?*JsObject, kind: InternalKind) !Val
     return val_mod.makeObject(arena, obj);
 }
 
+/// A WeakMap/WeakSet key must be held weakly, which the spec restricts to
+/// objects (incl. callable objects: ordinary functions and class constructors)
+/// and non-registered symbols. Reject primitives. We treat all function value
+/// representations as valid keys; a plain primitive is not.
+fn canBeWeakKey(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .object, .function, .bc_function, .native_function => true,
+        else => false,
+    };
+}
+
 fn getMapData(this_val: Value, expected: InternalKind) ?*MapData {
     if (this_val.bits == 0 or this_val.unbox() != .object) return null;
     const obj = this_val.toPtr().object;
@@ -229,7 +241,7 @@ pub fn nativeMapSet(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const data = getMapData(this_val, .map) orelse getMapData(this_val, .weakmap) orelse return this_val;
     if (args.len < 2) return this_val;
     const weak = this_val.toPtr().object.internal_kind == .weakmap;
-    if (weak and (args[0].bits == 0 or args[0].unbox() != .object)) return this_val;
+    if (weak and !canBeWeakKey(args[0])) return this_val;
     for (data.keys.items, 0..) |k, i| {
         if (strictEq(k, args[0])) {
             data.values.items[i] = args[1];
@@ -288,7 +300,7 @@ pub fn nativeSetAdd(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const data = getSetData(this_val, .set) orelse getSetData(this_val, .weakset) orelse return this_val;
     if (args.len == 0) return this_val;
     const weak = this_val.toPtr().object.internal_kind == .weakset;
-    if (weak and (args[0].bits == 0 or args[0].unbox() != .object)) return this_val;
+    if (weak and !canBeWeakKey(args[0])) return this_val;
     for (data.values.items) |v| if (strictEq(v, args[0])) return this_val;
     try data.values.append(arena, args[0]);
     return this_val;
@@ -429,6 +441,7 @@ pub fn nativeSetIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
 // (one exposing next()); __iterStep__(it) calls it.next() and returns the result.
 
 const function_proto = @import("function_proto.zig");
+const string_proto = @import("string_proto.zig");
 
 fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
@@ -503,6 +516,25 @@ pub fn nativeArrayValues(arena: std.mem.Allocator, this_val: Value, _: []const V
     return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
 }
 
+/// String.prototype[Symbol.iterator](): a by-code-point iterator over `this`
+/// coerced to a string. `this` may be a primitive string or a String wrapper.
+pub fn nativeStringValues(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    var sv = this_val;
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
+        // Unwrap a String object via its [[PrimitiveValue]] slot.
+        if (this_val.toPtr().object.get("[[PrimitiveValue]]")) |pv| {
+            if (pv.bits != 0 and pv.unbox() == .string) sv = pv;
+        }
+    }
+    if (sv.bits == 0 or sv.unbox() != .string) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "String.prototype[Symbol.iterator] called on non-string");
+        return error.JsException;
+    }
+    const d = try arena.create(SeqIterData);
+    d.* = .{ .seq = sv, .kind = .value, .is_string = true };
+    return makeSeqIterator(arena, d);
+}
+
 /// Wrap iterator state in an object whose [[Prototype]] is the shared
 /// %ArrayIteratorPrototype% (so `next` is inherited, not own).
 pub fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
@@ -540,8 +572,17 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
             d.done = true;
             return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
         }
-        const ch = try arena.dupe(u8, s[d.index .. d.index + 1]);
-        d.index += 1;
+        // String iteration is by code point (spec %StringIteratorPrototype%):
+        // decode one WTF-8 sequence; a high surrogate immediately followed by a
+        // low surrogate is a single code point (yield both units together).
+        const dec = string_proto.decodeWtf8At(s, d.index);
+        var step = dec.len;
+        if (dec.cp >= 0xD800 and dec.cp <= 0xDBFF and d.index + dec.len < s.len) {
+            const dec2 = string_proto.decodeWtf8At(s, d.index + dec.len);
+            if (dec2.cp >= 0xDC00 and dec2.cp <= 0xDFFF) step += dec2.len;
+        }
+        const ch = try arena.dupe(u8, s[d.index .. d.index + step]);
+        d.index += step;
         return makeIteratorResult(arena, try val_mod.makeString(arena, ch), false);
     }
     if (d.is_typed) {
@@ -567,7 +608,17 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
         };
     }
     const arr = d.seq.toPtr().object;
-    if (d.index >= arr.getArrayLength()) {
+    // Array iterator length: a true Array uses its [[ArrayLength]]; a generic
+    // array-like (e.g. the `arguments` object) reads its `length` property.
+    const arr_len: usize = if (arr.is_array) arr.getArrayLength() else blk: {
+        const lv = arr.get("length") orelse break :blk 0;
+        if (lv.bits == 0 or lv.unbox() != .number) break :blk 0;
+        const n = lv.unbox().number;
+        if (!(n > 0)) break :blk 0;
+        if (n > 9007199254740991.0) break :blk 9007199254740991;
+        break :blk @intFromFloat(n);
+    };
+    if (d.index >= arr_len) {
         d.done = true;
         return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     }

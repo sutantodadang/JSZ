@@ -112,6 +112,7 @@ pub fn lowerFunctionDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
         false, // function body: no implicit last-expr return
         false, // function declarations are never arrows
         fd.rest_param,
+        fd.param_defaults,
     );
     const child_idx: u16 = @intCast(self.child_functions.items.len);
     try self.child_functions.append(self.arena, child_fn);
@@ -252,6 +253,23 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     const fs = node.data.for_stmt;
     const loop_lbl = self.pending_label;
     self.pending_label = null;
+
+    // A `let`/`const` in the C-style header (`for (let i = 0; ...)`) is scoped
+    // to the loop, not the enclosing block. Wrap init + test + body + update in
+    // a dedicated scope so the bindings shadow same-named outer bindings without
+    // leaking, and so a read in the enclosing scope before the loop does not
+    // resolve to the loop binding in TDZ. The EXIT_SCOPE is emitted AFTER the
+    // break/normal-exit target, so break and continue both unwind to the same
+    // (inner) depth and the single EXIT_SCOPE pops the loop scope on every exit.
+    var for_lex = std.ArrayList([]const u8){};
+    if (fs.init) |init_node| try self.collectLexicalNames(init_node, &for_lex);
+    const has_for_scope = for_lex.items.len > 0;
+    if (has_for_scope) {
+        try self.emitOp(.ENTER_SCOPE, line);
+        self.block_scope_depth += 1;
+        for (for_lex.items) |nm| try self.emitHoistLexical(nm, line);
+    }
+
     if (fs.init) |init_node| {
         var dummy: ?u8 = null;
         try self.compileStmt(init_node, &dummy);
@@ -294,6 +312,11 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         self.patchJump(pe, exit_offset);
     }
     self.resolveLoop(update_offset, exit_offset);
+
+    if (has_for_scope) {
+        try self.emitOp(.EXIT_SCOPE, line);
+        self.block_scope_depth -= 1;
+    }
 }
 
 pub fn lowerReturnStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
@@ -862,6 +885,20 @@ pub fn lowerEmptyStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     _ = self;
     _ = node;
     _ = last_expr_reg;
+}
+
+pub fn lowerWithStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
+    const line: u32 = node.start;
+    const ws = node.data.with_stmt;
+    // Evaluate the object, push it as a with-scope, compile the body, then pop.
+    // The PUSH_WITH copies the value onto the frame's with-stack, so the source
+    // register is free immediately after.
+    const robj = try self.compileExpr(ws.object);
+    try self.emitOp(.PUSH_WITH, line);
+    try self.emitU8(robj);
+    self.sp = robj;
+    try self.compileStmt(ws.body, last_expr_reg);
+    try self.emitOp(.POP_WITH, line);
 }
 
 pub fn lowerDebuggerStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {

@@ -54,6 +54,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "hypot", nativeHypot },
         .{ "clz32", nativeClz32 },
         .{ "fround", nativeFround },
+        .{ "f16round", nativeF16round },
         .{ "imul", nativeImul },
     };
     inline for (func_fns) |pair| {
@@ -298,6 +299,13 @@ pub fn nativeFround(arena: std.mem.Allocator, _: Value, args: []const Value) any
     const n = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
     if (std.math.isNan(n)) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f: f32 = @floatCast(n);
+    return val_mod.makeNumber(arena, @floatCast(f));
+}
+
+pub fn nativeF16round(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const n = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
+    if (std.math.isNan(n)) return val_mod.makeNumber(arena, std.math.nan(f64));
+    const f: f16 = @floatCast(n);
     return val_mod.makeNumber(arena, @floatCast(f));
 }
 

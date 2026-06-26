@@ -4,10 +4,118 @@
 const std = @import("std");
 const parser_file = @import("./parser.zig");
 const Parser = parser_file.Parser;
+const expr_mod = @import("./expr.zig");
 const ast = @import("./ast.zig");
 const Node = ast.Node;
 
 pub const ParamParse = parser_file.ParamParse;
+
+/// Rewrite every `this` in a derived-class constructor body to read the hidden
+/// `__superthis` binding (the object returned by `super()`), which is the real
+/// instance for a derived class. A derived constructor's lexical `this` is the
+/// super-constructed object — and for built-in exotics (TypedArray, Map, …) that
+/// object carries the internal slots, so `this.buffer` etc. must resolve to it,
+/// not to the constructor function's raw this-binding. Descends into arrow
+/// functions (they inherit `this`) but NOT into ordinary functions / methods /
+/// function declarations, which establish their own `this`.
+fn rewriteThisToSuperThis(node: *Node) void {
+    switch (node.data) {
+        .this_expr => {
+            node.kind = .identifier;
+            node.data = .{ .identifier = "__superthis" };
+        },
+        .unary_expr => |u| rewriteThisToSuperThis(u.operand),
+        .binary_expr => |b| {
+            rewriteThisToSuperThis(b.left);
+            rewriteThisToSuperThis(b.right);
+        },
+        .logical_expr => |b| {
+            rewriteThisToSuperThis(b.left);
+            rewriteThisToSuperThis(b.right);
+        },
+        .assignment_expr => |a| {
+            rewriteThisToSuperThis(a.target);
+            rewriteThisToSuperThis(a.value);
+        },
+        .update_expr => |u| rewriteThisToSuperThis(u.operand),
+        .conditional_expr => |c| {
+            rewriteThisToSuperThis(c.test_);
+            rewriteThisToSuperThis(c.consequent);
+            rewriteThisToSuperThis(c.alternate);
+        },
+        .sequence_expr => |s| for (s.exprs) |e| rewriteThisToSuperThis(e),
+        .spread_expr => |e| rewriteThisToSuperThis(e),
+        .yield_expr => |e| if (e) |ee| rewriteThisToSuperThis(ee),
+        .call_expr => |c| {
+            rewriteThisToSuperThis(c.callee);
+            for (c.args) |a| rewriteThisToSuperThis(a);
+        },
+        .new_expr => |n| {
+            rewriteThisToSuperThis(n.callee);
+            for (n.args) |a| rewriteThisToSuperThis(a);
+        },
+        .member_expr => |m| {
+            rewriteThisToSuperThis(m.object);
+            if (m.computed) rewriteThisToSuperThis(m.property);
+        },
+        .optional_chain => |e| rewriteThisToSuperThis(e),
+        .function_expr => |f| if (f.is_arrow) {
+            for (f.param_defaults) |d| if (d) |dd| rewriteThisToSuperThis(dd);
+            for (f.body) |s| rewriteThisToSuperThis(s);
+        },
+        .object_literal => |o| for (o.properties) |pr| {
+            rewriteThisToSuperThis(pr.value);
+            if (pr.computed_key) |k| rewriteThisToSuperThis(k);
+        },
+        .array_literal => |a| for (a.elements) |e| rewriteThisToSuperThis(e),
+        .expr_stmt => |e| rewriteThisToSuperThis(e),
+        .block_stmt => |b| for (b.body) |s| rewriteThisToSuperThis(s),
+        .var_decl => |v| if (v.init) |i| rewriteThisToSuperThis(i),
+        .if_stmt => |i| {
+            rewriteThisToSuperThis(i.test_);
+            rewriteThisToSuperThis(i.consequent);
+            if (i.alternate) |a| rewriteThisToSuperThis(a);
+        },
+        .while_stmt => |w| {
+            rewriteThisToSuperThis(w.test_);
+            rewriteThisToSuperThis(w.body);
+        },
+        .do_while_stmt => |w| {
+            rewriteThisToSuperThis(w.body);
+            rewriteThisToSuperThis(w.test_);
+        },
+        .for_stmt => |f| {
+            if (f.init) |i| rewriteThisToSuperThis(i);
+            if (f.test_) |t| rewriteThisToSuperThis(t);
+            if (f.update) |u| rewriteThisToSuperThis(u);
+            rewriteThisToSuperThis(f.body);
+        },
+        .return_stmt => |e| if (e) |ee| rewriteThisToSuperThis(ee),
+        .throw_stmt => |e| rewriteThisToSuperThis(e),
+        .try_stmt => |t| {
+            rewriteThisToSuperThis(t.block);
+            if (t.handler) |h| rewriteThisToSuperThis(h.body);
+            if (t.finalizer) |f| rewriteThisToSuperThis(f);
+        },
+        .for_in_stmt => |f| {
+            rewriteThisToSuperThis(f.left);
+            rewriteThisToSuperThis(f.right);
+            rewriteThisToSuperThis(f.body);
+        },
+        .switch_stmt => |s| {
+            rewriteThisToSuperThis(s.discriminant);
+            for (s.cases) |c| {
+                if (c.test_) |t| rewriteThisToSuperThis(t);
+                for (c.body) |st| rewriteThisToSuperThis(st);
+            }
+        },
+        .labeled_stmt => |l| rewriteThisToSuperThis(l.body),
+        .program => |pr| for (pr.body) |s| rewriteThisToSuperThis(s),
+        // Ordinary functions/declarations bind their own `this`; literals and
+        // identifiers have no children to rewrite.
+        else => {},
+    }
+}
 
 /// Build the NewTarget node for a derived constructor's `Reflect.construct(Super,
 /// arguments, <newTarget>)` desugaring: `__new_target__ || ClassName`. The hidden
@@ -51,6 +159,10 @@ const ClassBodyParse = struct {
     ctor_params: [][]const u8 = &[_][]const u8{},
     ctor_rest: ?[]const u8 = null,
     ctor_body: []*Node = &[_]*Node{},
+    // Distinguishes an explicit `constructor() {}` (empty body, but present —
+    // must NOT auto-call super) from a class with no constructor at all (which
+    // synthesizes the default `return Reflect.construct(Super, ...)`).
+    has_ctor: bool = false,
     members: []ClassMember = &[_]ClassMember{},
     fields: []ClassField = &[_]ClassField{},
 };
@@ -137,6 +249,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             res.ctor_params = mparams.params;
             res.ctor_rest = mparams.rest_param;
             res.ctor_body = mbody;
+            res.has_ctor = true;
         } else {
             members.append(p.arena, .{
                 .is_static = is_static,
@@ -400,7 +513,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     const members = parsed.members;
     const fields = parsed.fields;
 
-    if (ctor_body.len == 0) {
+    if (!parsed.has_ctor) {
         if (super_name) |sname| {
             // Derived default constructor: `return Reflect.construct(Super,
             // arguments, ClassName)`. Constructs the parent (incl. built-in
@@ -534,7 +647,35 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
             .var_decl = .{ .kind = .var_, .name = "super", .init = helper_fn },
         }) orelse return null;
         ctor_stmts.append(p.arena, super_decl) catch return null;
+        // Bind `this` to the super-constructed instance (`__superthis`).
+        for (ctor_body) |st| rewriteThisToSuperThis(st);
         for (ctor_body) |st| ctor_stmts.append(p.arena, st) catch return null;
+        // `this` TDZ: a derived constructor that returns without having called
+        // super() leaves `__superthis` unassigned (undefined). Reading `this`
+        // (the implicit `return this`) must throw a ReferenceError. Emit:
+        //   if (__superthis === undefined)
+        //     throw new ReferenceError("must call super constructor ...");
+        {
+            const guard_lhs = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+            const guard_rhs = p.makeNode(.identifier, start, start, .{ .identifier = "undefined" }) orelse return null;
+            const guard_test = p.makeNode(.binary_expr, start, start, .{
+                .binary_expr = .{ .op = .strict_eq, .left = guard_lhs, .right = guard_rhs },
+            }) orelse return null;
+            const id_re = p.makeNode(.identifier, start, start, .{ .identifier = "ReferenceError" }) orelse return null;
+            const re_msg = p.makeNode(.string_literal, start, start, .{
+                .string_literal = "must call super constructor before accessing 'this'",
+            }) orelse return null;
+            var re_args = std.ArrayList(*Node){};
+            re_args.append(p.arena, re_msg) catch return null;
+            const re_new = p.makeNode(.new_expr, start, start, .{
+                .new_expr = .{ .callee = id_re, .args = re_args.items },
+            }) orelse return null;
+            const throw_st = p.makeNode(.throw_stmt, start, start, .{ .throw_stmt = re_new }) orelse return null;
+            const guard_if = p.makeNode(.if_stmt, start, start, .{
+                .if_stmt = .{ .test_ = guard_test, .consequent = throw_st, .alternate = null },
+            }) orelse return null;
+            ctor_stmts.append(p.arena, guard_if) catch return null;
+        }
         // return __superthis;
         const id_st_final = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
         const final_ret = p.makeNode(.return_stmt, start, start, .{ .return_stmt = id_st_final }) orelse return null;
@@ -695,7 +836,7 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
         const fields = parsed.fields;
 
         // If no constructor and derives from something, generate default
-        if (ctor_body.len == 0 and super_name != null) {
+        if (!parsed.has_ctor and super_name != null) {
             const sname = super_name.?;
             const id_reflect = p.makeNode(.identifier, start, start, .{ .identifier = "Reflect" }) orelse return null;
             const id_construct = p.makeNode(.identifier, start, start, .{ .identifier = "construct" }) orelse return null;
@@ -760,8 +901,34 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             }) orelse return null;
             out.append(p.arena, super_binding) catch return null;
 
+            // Bind `this` to the super-constructed instance (`__superthis`).
+            for (ctor_body) |stmt| rewriteThisToSuperThis(stmt);
             for (ctor_body) |stmt| {
                 out.append(p.arena, stmt) catch return null;
+            }
+
+            // `this` TDZ: returning without calling super() leaves __superthis
+            // undefined; reading `this` must throw a ReferenceError.
+            {
+                const guard_lhs = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+                const guard_rhs = p.makeNode(.identifier, start, start, .{ .identifier = "undefined" }) orelse return null;
+                const guard_test = p.makeNode(.binary_expr, start, start, .{
+                    .binary_expr = .{ .op = .strict_eq, .left = guard_lhs, .right = guard_rhs },
+                }) orelse return null;
+                const id_re = p.makeNode(.identifier, start, start, .{ .identifier = "ReferenceError" }) orelse return null;
+                const re_msg = p.makeNode(.string_literal, start, start, .{
+                    .string_literal = "must call super constructor before accessing 'this'",
+                }) orelse return null;
+                var re_args = std.ArrayList(*Node){};
+                re_args.append(p.arena, re_msg) catch return null;
+                const re_new = p.makeNode(.new_expr, start, start, .{
+                    .new_expr = .{ .callee = id_re, .args = re_args.items },
+                }) orelse return null;
+                const throw_st = p.makeNode(.throw_stmt, start, start, .{ .throw_stmt = re_new }) orelse return null;
+                const guard_if = p.makeNode(.if_stmt, start, start, .{
+                    .if_stmt = .{ .test_ = guard_test, .consequent = throw_st, .alternate = null },
+                }) orelse return null;
+                out.append(p.arena, guard_if) catch return null;
             }
 
             const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
@@ -895,11 +1062,50 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
     _ = p.expect(.left_paren) orelse return null;
     var params = std.ArrayList([]const u8){};
     var defaults = std.ArrayList(?*Node){};
+    // Destructuring-param decls accumulated locally, then published to
+    // p.pending_param_prelude at the end so default exprs containing nested
+    // functions/arrows (which reuse p.arrow_prelude) can't clobber them.
+    var param_prelude = std.ArrayList(*Node){};
     var saw_rest = false;
     var rest_param: ?[]const u8 = null;
     while (!p.check(.right_paren) and !p.check(.eof) and !p.had_error) {
         var is_rest = false;
         if (p.match(.ellipsis)) is_rest = true;
+        // Destructuring parameter: `[...]` / `{...}` binding pattern (with an
+        // optional `= default`). Desugared to a synthetic `__param_N` name plus
+        // `let` decls prepended to the body, mirroring the arrow-param path.
+        if (!is_rest and (p.check(.left_bracket) or p.check(.left_brace))) {
+            const pat = p.parseAssignmentExpr() orelse return null;
+            const tmp_name = std.fmt.allocPrint(p.arena, "__param_{d}", .{p.param_destruct_counter}) catch {
+                p.had_error = true;
+                return null;
+            };
+            p.param_destruct_counter += 1;
+            params.append(p.arena, tmp_name) catch {
+                p.had_error = true;
+                return null;
+            };
+            var pattern_node = pat;
+            var default_expr: ?*Node = null;
+            if (pat.kind == .assignment_expr and pat.data.assignment_expr.op == .assign) {
+                pattern_node = pat.data.assignment_expr.target;
+                default_expr = pat.data.assignment_expr.value;
+            }
+            defaults.append(p.arena, default_expr) catch {
+                p.had_error = true;
+                return null;
+            };
+            const src = p.makeNode(.identifier, pat.start, pat.start, .{ .identifier = tmp_name }) orelse return null;
+            p.arrow_prelude = .{};
+            if (!expr_mod.desugarParamPattern(p, pattern_node, src)) return null;
+            param_prelude.appendSlice(p.arena, p.arrow_prelude.items) catch {
+                p.had_error = true;
+                return null;
+            };
+            p.arrow_prelude = .{};
+            if (!p.match(.comma)) break;
+            continue;
+        }
         const param_tok = p.expect(.identifier) orelse return null;
         if (is_rest) {
             saw_rest = true;
@@ -941,6 +1147,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         if (!p.match(.comma)) break;
     }
     _ = p.expect(.right_paren) orelse return null;
+    p.pending_param_prelude = param_prelude.items;
     return parser_file.ParamParse{
         .params = params.items,
         .param_defaults = defaults.items,
@@ -949,6 +1156,11 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
 }
 
 pub fn parseFunctionBody(p: *Parser) ?[]*Node {
+    // Capture (and clear) any destructuring-param prelude produced by the
+    // preceding parseFunctionParams before parsing the body, since nested
+    // functions/arrows inside the body reuse the same staging field.
+    const param_prelude = p.pending_param_prelude;
+    p.pending_param_prelude = &.{};
     _ = p.expect(.left_brace) orelse return null;
     p.fn_nesting_depth += 1;
     // A function body is strict if it inherits strictness from the enclosing
@@ -977,5 +1189,19 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     p.strict = saved_strict;
     p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
+    // Prepend destructuring-param decls (binding the synthetic `__param_N`
+    // names) so they run before the function body proper.
+    if (param_prelude.len > 0) {
+        var combined = std.ArrayList(*Node){};
+        combined.appendSlice(p.arena, param_prelude) catch {
+            p.had_error = true;
+            return null;
+        };
+        combined.appendSlice(p.arena, body.items) catch {
+            p.had_error = true;
+            return null;
+        };
+        return combined.items;
+    }
     return body.items;
 }

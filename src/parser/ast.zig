@@ -107,6 +107,7 @@ pub const NodeKind = enum {
     if_stmt,
     while_stmt,
     do_while_stmt,
+    with_stmt,
     for_stmt,
     return_stmt,
     break_stmt,
@@ -168,6 +169,7 @@ pub const Data = union(NodeKind) {
     if_stmt: IfStmt,
     while_stmt: WhileStmt,
     do_while_stmt: DoWhileStmt,
+    with_stmt: WithStmt,
     for_stmt: ForStmt,
     return_stmt: ?*Node,
     break_stmt: ?[]const u8,
@@ -257,6 +259,10 @@ pub const FuncExpr = struct {
     is_async: bool = false,
     is_strict: bool = false,
     requires_super: bool = false,
+    /// True for object/class method shorthand. A method's name (for the `.name`
+    /// property) is NOT bound inside its own body — unlike a named function
+    /// expression — so this suppresses the inner self-binding at compile time.
+    is_method: bool = false,
 };
 
 /// Phase 3a: a single property in an object literal.
@@ -317,10 +323,20 @@ pub const VarKind = enum {
     const_,
 };
 
+/// Explicit resource management: marks a `let`-lowered declaration that came from
+/// a `using` / `await using` declaration so the scope-wrapping desugar can find
+/// the resources to register on the disposable-resource stack.
+pub const UsingKind = enum {
+    none,
+    using_,
+    await_using_,
+};
+
 pub const VarDecl = struct {
     kind: VarKind = .var_,
     name: []const u8,
     init: ?*Node,
+    using_kind: UsingKind = .none,
 };
 
 pub const FuncDecl = struct {
@@ -348,6 +364,11 @@ pub const WhileStmt = struct {
 pub const DoWhileStmt = struct {
     body: *Node,
     test_: *Node,
+};
+
+pub const WithStmt = struct {
+    object: *Node,
+    body: *Node,
 };
 
 pub const ForStmt = struct {

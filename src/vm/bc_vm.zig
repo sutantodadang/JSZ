@@ -70,6 +70,9 @@ pub const BcCallFrame = struct {
     this_val: Value = Value{},
     /// Phase 4a: try stack (pushed by PUSH_TRY, popped by POP_TRY/THROW).
     try_stack: std.ArrayListUnmanaged(TryEntry) = .empty,
+    /// `with` statement: object scopes consulted (innermost last) by unqualified
+    /// name lookups before the lexical/global scope. Pushed by PUSH_WITH.
+    with_stack: std.ArrayListUnmanaged(Value) = .empty,
     /// W2: when this frame belongs to a generator, links back to its state so
     /// YIELD can save the suspended frame. Null for ordinary frames.
     gen: ?*BcGeneratorState = null,
@@ -239,9 +242,13 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
-                if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, this_val, args);
-                if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, this_val, args);
-                const call_env = try Environment.init(self.arena, def_env);
+                // Arrows ignore the provided `this` and use their captured lexical one.
+                const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
+                if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, eff_this, args);
+                if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, eff_this, args);
+                // Eval code shares the calling/global VariableEnvironment directly
+                // so its top-level declarations hoist there (not a discarded child).
+                const call_env = if (fn_ptr.is_eval) def_env else try Environment.init(self.arena, def_env);
                 try call_env.define("__new_target__", if (captured_nt.bits != 0) captured_nt else try val_mod.makeUndefined(self.arena));
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
@@ -257,6 +264,27 @@ pub const BcVm = struct {
                         new_regs[i] = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
                     }
                 }
+                // Sloppy-mode this correction (ES §10.2.1.1 step 2): non-strict
+                // function called with undefined/null this → substitute global
+                // object. The inline Call opcode does this; the native re-entry
+                // path (builtins invoking user callbacks, e.g. %TypedArray%
+                // .prototype.every) must do it too.
+                const frame_this: Value = if (fn_ptr.is_arrow)
+                    eff_this // arrow: exact captured lexical this, no coercion
+                else if (!fn_ptr.is_strict and (eff_this.isUndefined() or eff_this.isNull())) blk: {
+                    // Cross-realm: use the FUNCTION's realm's globalThis, not
+                    // the current active realm's.
+                    const realm_m = @import("../runtime/realm.zig");
+                    if (closure.realm) |r_opaque| {
+                        const fr = @as(*Realm, @ptrCast(@alignCast(r_opaque)));
+                        break :blk fr.global_env.lookup("globalThis") catch eff_this;
+                    }
+                    // Fallback: no realm tagged — use active global env.
+                    if (realm_m.active_global_env) |genv| {
+                        break :blk genv.lookup("globalThis") catch eff_this;
+                    }
+                    break :blk eff_this;
+                } else eff_this;
                 const caller_idx = if (self.frames.items.len > 0) self.frames.items.len - 1 else 0;
                 try self.frames.append(self.arena, BcCallFrame{
                     .func = fn_ptr,
@@ -265,7 +293,7 @@ pub const BcVm = struct {
                     .env = call_env,
                     .return_dst = 255,
                     .caller_idx = if (self.frames.items.len > 0) caller_idx else null,
-                    .this_val = this_val,
+                    .this_val = frame_this,
                 });
                 // Run until this frame returns.
                 const frames_before = self.frames.items.len - 1;
@@ -371,11 +399,68 @@ pub const BcVm = struct {
     /// GetPrototypeFromConstructor(newTarget, default): `? Get(newTarget,"prototype")`
     /// (fires accessor getters / proxy traps, abrupt throws propagate); falls back
     /// to `default` when the result is not an object.
-    fn protoFromNewTarget(self: *BcVm, new_target: Value, default_proto: ?*JsObject) anyerror!?*JsObject {
+    fn protoFromNewTarget(self: *BcVm, new_target: Value, ctor: Value, default_proto: ?*JsObject) anyerror!?*JsObject {
         if (new_target.bits == 0) return default_proto;
         const pv = try self.getProp(new_target, "prototype");
         if (pv.bits != 0 and pv.unbox() == .object) return pv.toPtr().object;
+        // GetPrototypeFromConstructor fallback (ES 9.1.14 step 4): NewTarget.prototype
+        // is not an object, so use the intrinsic default prototype from NewTarget's
+        // [[Realm]]. That intrinsic is the SAME-named constructor's `.prototype` in
+        // that realm, so for a cross-realm NewTarget it resolves to the foreign
+        // realm's prototype (e.g. `Reflect.construct(Array, …, otherFn)` →
+        // `other.Array.prototype`). Untagged / same-realm functions keep the
+        // running realm's default.
+        const realm_m = @import("../runtime/realm.zig");
+        if (realm_m.getFunctionRealm(new_target)) |fr| {
+            if (fr != self.realm) {
+                if (foreignIntrinsicProto(fr, ctor)) |p| return p;
+            }
+        }
         return default_proto;
+    }
+
+    /// The constructor's reported `.name`, used to find its counterpart in another
+    /// realm by GetPrototypeFromConstructor's fallback.
+    fn ctorNameOf(ctor: Value) ?[]const u8 {
+        if (ctor.bits == 0 or !ctor.isHeapPtr()) return null;
+        switch (ctor.toPtr().*) {
+            .bc_function => |c| return c.func.name,
+            .native_function => |e| return e.name,
+            .object => |o| {
+                if (o.getOwn("name")) |nv| {
+                    if (nv.bits != 0 and nv.unbox() == .string) return nv.toPtr().string;
+                }
+                // Constructor objects keep their callable behind `__call__`.
+                if (o.getOwn("__call__")) |cv| return ctorNameOf(cv);
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// `realm`'s intrinsic prototype for the same-named constructor as `ctor`:
+    /// `realm.global[name].prototype`, also probing the `Intl` namespace for
+    /// nested constructors (Intl.Collator, …).
+    fn foreignIntrinsicProto(realm: *Realm, ctor: Value) ?*JsObject {
+        const name = ctorNameOf(ctor) orelse return null;
+        if (name.len == 0) return null;
+        const g = realm.global_object orelse return null;
+        if (protoOfNamed(g, name)) |p| return p;
+        if (g.get("Intl")) |iv| {
+            if (iv.bits != 0 and iv.isHeapPtr() and iv.unbox() == .object) {
+                if (protoOfNamed(iv.toPtr().object, name)) |p| return p;
+            }
+        }
+        return null;
+    }
+
+    /// `container[name].prototype` when both are objects, else null.
+    fn protoOfNamed(container: *JsObject, name: []const u8) ?*JsObject {
+        const cv = container.get(name) orelse return null;
+        if (cv.bits == 0 or !cv.isHeapPtr() or cv.unbox() != .object) return null;
+        const pv = cv.toPtr().object.get("prototype") orelse return null;
+        if (pv.bits == 0 or !pv.isHeapPtr() or pv.unbox() != .object) return null;
+        return pv.toPtr().object;
     }
 
     /// Construct with an explicit NewTarget (Reflect.construct / subclassing).
@@ -388,7 +473,7 @@ pub const BcVm = struct {
         }
         switch (ctor.unbox()) {
             .bc_function => {
-                const proto = try self.protoFromNewTarget(new_target, self.realm.object_prototype);
+                const proto = try self.protoFromNewTarget(new_target, ctor, self.realm.object_prototype);
                 const new_obj = if (self.heap) |heap|
                     try JsObject.createOnHeap(heap, proto)
                 else
@@ -444,7 +529,7 @@ pub const BcVm = struct {
                         }) result else this_val;
                         // Ctor didn't consume the NewTarget → apply prototype now.
                         if (realm_m.pending_new_target.bits != 0) {
-                            const p = self.protoFromNewTarget(new_target, null) catch |e| {
+                            const p = self.protoFromNewTarget(new_target, ctor, null) catch |e| {
                                 realm_m.pending_new_target = saved_nt;
                                 return e;
                             };
@@ -560,6 +645,10 @@ pub const BcVm = struct {
         };
         const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(stmts) };
         const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<eval>");
+        // Eval's top-level `var`/function declarations belong to the calling
+        // VariableEnvironment (the global environment here), so run the body with
+        // that env directly rather than a fresh child — see BcFunction.is_eval.
+        main_func.is_eval = true;
         // An undefined `break`/`continue` label is an early SyntaxError; the
         // compiler records it (it can't unwind), and eval surfaces it as a throw.
         if (compiler_mod.last_label_error) |msg| {
@@ -568,7 +657,7 @@ pub const BcVm = struct {
             return error.JsException;
         }
         const closure = try self.arena.create(BcClosure);
-        closure.* = .{ .func = main_func, .env = @ptrCast(self.realm.global_env) };
+        closure.* = .{ .func = main_func, .env = @ptrCast(self.realm.global_env), .realm = self.realmAsOpaque() };
         const closure_val = try val_mod.makeBcFunction(self.arena, closure);
         const undef = try val_mod.makeUndefined(self.arena);
         return bcInvokeJs(self, self.arena, undef, closure_val, &[_]Value{});
@@ -596,6 +685,62 @@ pub const BcVm = struct {
         const saved_global_env = realm_mod.active_global_env;
         realm_mod.active_global_env = env;
         defer realm_mod.active_global_env = saved_global_env;
+
+        // Cross-realm: temporarily switch self.realm to the shadow realm so
+        // NEW_CLOSURE tags closures with the correct realm identity.
+        const saved_realm = self.realm;
+        if (realm_mod.active_shadow_realm) |sr| self.realm = sr;
+        defer self.realm = saved_realm;
+
+        // Cross-realm: also switch typed-array/buffer thread-locals to the
+        // shadow realm's intrinsics so buffer creation (e.g. via TypedArray
+        // constructor) uses the correct realm's prototype chain. Without this,
+        // `g.eval("new Int8Array(…).buffer")` creates a buffer whose proto is
+        // the PRIMARY realm's ArrayBuffer.prototype, making `.constructor`
+        // resolve to the primary realm's ArrayBuffer instead of g.ArrayBuffer.
+        const ta_mod = @import("../runtime/builtins/typed_array.zig");
+        const saved_ta_ab_proto = ta_mod.active_arraybuffer_proto;
+        const saved_ta_ab_ctor = ta_mod.active_arraybuffer_ctor;
+        const saved_ta_sab_proto = ta_mod.active_sharedarraybuffer_proto;
+        const saved_ta_sab_ctor = ta_mod.active_sharedarraybuffer_ctor;
+        const saved_ta_dv_proto = ta_mod.active_dataview_proto;
+        const saved_ta_ta_proto = ta_mod.active_typedarray_proto;
+        const saved_ta_ta_ctor = ta_mod.active_typedarray_ctor;
+        if (realm_mod.active_shadow_realm) |sr| {
+            // Use intrinsics captured by the Realm struct (from captureIntrinsics).
+            if (sr.ab_prototype) |p| ta_mod.active_arraybuffer_proto = p;
+            if (sr.sab_prototype) |p| ta_mod.active_sharedarraybuffer_proto = p;
+            if (sr.dv_prototype) |p| ta_mod.active_dataview_proto = p;
+            if (sr.ta_shared_prototype) |p| ta_mod.active_typedarray_proto = p;
+            // Constructors: look up from prototype.constructor
+            if (sr.ab_prototype) |p| {
+                if (p.getOwn("constructor")) |cv| {
+                    if (cv.bits != 0 and cv.unbox() == .object)
+                        ta_mod.active_arraybuffer_ctor = cv.toPtr().object;
+                }
+            }
+            if (sr.sab_prototype) |p| {
+                if (p.getOwn("constructor")) |cv| {
+                    if (cv.bits != 0 and cv.unbox() == .object)
+                        ta_mod.active_sharedarraybuffer_ctor = cv.toPtr().object;
+                }
+            }
+            if (sr.ta_shared_prototype) |p| {
+                if (p.getOwn("constructor")) |cv| {
+                    if (cv.bits != 0 and cv.unbox() == .object)
+                        ta_mod.active_typedarray_ctor = cv.toPtr().object;
+                }
+            }
+        }
+        defer {
+            ta_mod.active_arraybuffer_proto = saved_ta_ab_proto;
+            ta_mod.active_arraybuffer_ctor = saved_ta_ab_ctor;
+            ta_mod.active_sharedarraybuffer_proto = saved_ta_sab_proto;
+            ta_mod.active_sharedarraybuffer_ctor = saved_ta_sab_ctor;
+            ta_mod.active_dataview_proto = saved_ta_dv_proto;
+            ta_mod.active_typedarray_proto = saved_ta_ta_proto;
+            ta_mod.active_typedarray_ctor = saved_ta_ta_ctor;
+        }
 
         const transformed = isolate_mod.rewriteTemplateLiterals(self.arena, source) catch source;
         var p = parser_mod.Parser.init(transformed, self.arena);
@@ -663,6 +808,150 @@ pub const BcVm = struct {
         return self.result;
     }
 
+    /// Cross-realm host hook for `$262.createRealm`. Builds a fully independent
+    /// secondary Realm that shares this isolate's GC heap and lives in the
+    /// persistent eval arena, then returns a `{global, evalScript}` record built
+    /// in the PRIMARY realm. `Realm.init` clobbers the per-realm thread-local
+    /// intrinsic pointers, so we snapshot them first and restore afterward,
+    /// leaving the primary realm's continued execution untouched.
+    fn bcCreateRealm(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!Value {
+        _ = arena;
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        const realm_mod = @import("../runtime/realm.zig");
+
+        const snap = realm_mod.ThreadLocalSnapshot.capture();
+
+        const nr = try self.arena.create(Realm);
+        nr.* = Realm.init(self.arena) catch |e| {
+            snap.restore();
+            return e;
+        };
+        realm_mod.next_realm_id += 1;
+        nr.realm_id = realm_mod.next_realm_id - 1;
+        if (self.heap) |h| {
+            nr.activateHeap(h) catch |e| {
+                snap.restore();
+                return e;
+            };
+        }
+        // Snapshot this realm's intrinsics for GetFunctionRealm's fallback while
+        // its objects are still the active thread-locals, then restore the primary
+        // realm's thread-locals and tag the new realm's builtins (tagging reads no
+        // thread-local state).
+        // ALSO capture the secondary realm's constructors/prototypes from the
+        // active thread-locals (currently pointing at the new realm), before
+        // snap.restore() resets them to the primary realm's values.
+        const ta_mod = @import("../runtime/builtins/typed_array.zig");
+        const sec_ab_ctor = ta_mod.active_arraybuffer_ctor;
+        const sec_sab_ctor = ta_mod.active_sharedarraybuffer_ctor;
+        const sec_ta_ctor = ta_mod.active_typedarray_ctor;
+        const sec_ta_proto = ta_mod.active_typedarray_proto;
+        const sec_ab_proto = ta_mod.active_arraybuffer_proto;
+        const sec_sab_proto = ta_mod.active_sharedarraybuffer_proto;
+        const sec_dv_proto = ta_mod.active_dataview_proto;
+        const sec_atomics = ta_mod.active_atomics;
+        nr.captureIntrinsics();
+        snap.restore();
+        nr.tagNativeFunctions();
+        // Cross-realm: make the secondary realm's well-known symbols *shared* with
+        // the primary realm by replacing the Symbol constructor's properties directly.
+        // Without this, a class defined via g.eval("get [Symbol.species]() { … }")
+        // uses the secondary realm's Symbol.species, which is a *different* symbol
+        // object than the primary realm's — so SpeciesConstructor lookups miss.
+        {
+            const sym_binding = nr.global_env.bindings.get("Symbol");
+            const sym_val = if (sym_binding) |b| b.value else Value{};
+            if (sym_val.bits != 0 and sym_val.unbox() == .object) {
+                const sym_obj = sym_val.toPtr().object;
+                // Direct-slot overwrite bypasses non-writable/non-configurable guard.
+                inline for (.{
+                    .{ "species", realm_mod.active_sym_species },
+                    .{ "iterator", realm_mod.active_sym_iterator },
+                    .{ "toStringTag", realm_mod.active_sym_to_string_tag },
+                    .{ "toPrimitive", realm_mod.active_sym_to_primitive },
+                }) |entry| {
+                    if (entry[1]) |primary_sym| {
+                        if (sym_obj.shape.key_to_slot.get(entry[0])) |slot| {
+                            if (slot < sym_obj.slots.items.len) {
+                                sym_obj.slots.items[slot] = primary_sym;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Re-register @@species, @@toStringTag, @@iterator on the secondary realm's
+        // prototypes/constructors using the PRIMARY realm's well-known symbols
+        // (restored above). The secondary realm's registerSymbols (called during
+        // Realm.init) wired these with its own (now-replaced) symbols, so primary
+        // realm lookups would still miss the old getter keys.
+        {
+            // Save primary realm's thread-local pointers
+            const saved_ta_proto = ta_mod.active_typedarray_proto;
+            const saved_ab_proto = ta_mod.active_arraybuffer_proto;
+            const saved_sab_proto = ta_mod.active_sharedarraybuffer_proto;
+            const saved_dv_proto = ta_mod.active_dataview_proto;
+            const saved_atomics = ta_mod.active_atomics;
+            const saved_ta_ctor = ta_mod.active_typedarray_ctor;
+            const saved_ab_ctor = ta_mod.active_arraybuffer_ctor;
+            const saved_sab_ctor = ta_mod.active_sharedarraybuffer_ctor;
+            // Swap to secondary realm's objects
+            ta_mod.active_typedarray_proto = sec_ta_proto;
+            ta_mod.active_arraybuffer_proto = sec_ab_proto;
+            ta_mod.active_sharedarraybuffer_proto = sec_sab_proto;
+            ta_mod.active_dataview_proto = sec_dv_proto;
+            ta_mod.active_atomics = sec_atomics;
+            ta_mod.active_typedarray_ctor = sec_ta_ctor;
+            ta_mod.active_arraybuffer_ctor = sec_ab_ctor;
+            ta_mod.active_sharedarraybuffer_ctor = sec_sab_ctor;
+            // registerSymbols reads the primary realm's well-known symbols (active_sym_*)
+            // and writes to whatever prototypes/constructors the thread-locals point at.
+            ta_mod.registerSymbols(self.arena) catch {};
+            // Restore primary realm's pointers
+            ta_mod.active_typedarray_proto = saved_ta_proto;
+            ta_mod.active_arraybuffer_proto = saved_ab_proto;
+            ta_mod.active_sharedarraybuffer_proto = saved_sab_proto;
+            ta_mod.active_dataview_proto = saved_dv_proto;
+            ta_mod.active_atomics = saved_atomics;
+            ta_mod.active_typedarray_ctor = saved_ta_ctor;
+            ta_mod.active_arraybuffer_ctor = saved_ab_ctor;
+            ta_mod.active_sharedarraybuffer_ctor = saved_sab_ctor;
+        }
+        // Re-register Array.prototype[@@iterator] with primary realm's symbol too
+        // (the existing fix above already does this via nr.array_prototype.setSym).
+        if (realm_mod.active_sym_iterator) |symv| {
+            nr.array_prototype.setSym(symv, try val_mod.makeNativeFunction(self.arena, @import("../runtime/builtins/es2015_collections.zig").nativeArrayValues)) catch {};
+        }
+
+        // Build the record object in the (now-restored) primary realm.
+        const rec = if (self.heap) |h|
+            try JsObject.createOnHeap(h, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        const global_obj = nr.global_object orelse self.realm.object_prototype;
+        try rec.set("global", try val_mod.makeObject(self.arena, global_obj));
+        // Store both the env and realm as native userdata so evalScript
+        // can set active_shadow_realm before running user code.
+        const EvalData = struct { env: *anyopaque, realm: *Realm };
+        const eval_data = try self.arena.create(EvalData);
+        eval_data.* = .{ .env = @ptrCast(nr.global_env), .realm = nr };
+        const eval_fn = try val_mod.makeNativeFunctionData(
+            self.arena,
+            realm_mod.nativeRealmEvalScript,
+            @ptrCast(eval_data),
+        );
+        try rec.set("evalScript", eval_fn);
+        // Replace the global env's `eval` binding so h.eval(...) runs in
+        // the secondary realm's env (tagging closures with the right realm).
+        nr.global_env.assign("eval", eval_fn) catch {};
+        return val_mod.makeObject(self.arena, rec);
+    }
+
+    /// Cross-realm: convenience wrapper to pass `self.realm` as *anyopaque.
+    pub fn realmAsOpaque(self: *const BcVm) *anyopaque {
+        return @ptrCast(self.realm);
+    }
+
     fn activateContext(self: *BcVm) void {
         const realm_mod = @import("../runtime/realm.zig");
         self.context = realm_mod.Context{
@@ -677,6 +966,7 @@ pub const BcVm = struct {
             .set_proto_fn = bcSetProto,
             .backing_obj_fn = bcBackingObj,
             .shadow_eval_fn = bcEvalInEnv,
+            .create_realm_fn = bcCreateRealm,
         };
         realm_mod.active_context = &self.context;
     }
@@ -814,6 +1104,8 @@ pub const BcVm = struct {
                 .INIT_LEX => if (try load_ops.opInitLexical(self, frame)) |o| return o,
                 .ENTER_SCOPE => if (try load_ops.opEnterScope(self, frame)) |o| return o,
                 .EXIT_SCOPE => if (try load_ops.opExitScope(self, frame)) |o| return o,
+                .PUSH_WITH => if (try load_ops.opPushWith(self, frame)) |o| return o,
+                .POP_WITH => if (try load_ops.opPopWith(self, frame)) |o| return o,
                 .SET_GLOBAL => if (try load_ops.opSetGlobal(self, frame)) |o| return o,
                 .DEFINE_GLOBAL => if (try load_ops.opDefineGlobal(self, frame)) |o| return o,
                 .GET_LOCAL => if (try load_ops.opGetLocal(self, frame)) |o| return o,
@@ -871,6 +1163,7 @@ pub const BcVm = struct {
                 .SET_PROP => if (try property_ops.opSetProp(self, frame)) |o| return o,
                 .SET_PROP_DYN => if (try property_ops.opSetPropDyn(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR => if (try property_ops.opDefineAccessor(self, frame)) |o| return o,
+                .DEFINE_ACCESSOR_DYN => if (try property_ops.opDefineAccessorDyn(self, frame)) |o| return o,
                 .GET_THIS => if (try property_ops.opGetThis(self, frame)) |o| return o,
                 .IN => if (try property_ops.opIn(self, frame)) |o| return o,
                 .DELETE_PROP => if (try property_ops.opDeleteProp(self, frame)) |o| return o,
@@ -880,9 +1173,24 @@ pub const BcVm = struct {
                 .POP_TRY => if (try exception_ops.opPopTry(self, frame)) |o| return o,
                 .INSTANCEOF => if (try exception_ops.opInstanceof(self, frame)) |o| return o,
                 .NEW_INSTANCE => if (try exception_ops.opNewInstance(self, frame)) |o| return o,
+                .NEW_INSTANCE_SPREAD => if (try exception_ops.opNewInstanceSpread(self, frame)) |o| return o,
             }
         }
         return RunOutcome{ .ok = try val_mod.makeUndefined(self.arena) };
+    }
+
+    /// If a resource-limit interrupt fired inside a native callee's JS callback
+    /// (e.g. a comparator passed to TypedArray.prototype.sort), consume the
+    /// pending interrupt and surface it as an interrupt outcome. An interrupt is
+    /// *not* a catchable throw, so this must run before native `error.JsException`
+    /// results are routed through try/catch (otherwise the interrupt leaks out as
+    /// a bogus `throw undefined`). Returns null when no interrupt is pending.
+    pub fn takeInterruptOutcome(self: *BcVm) ?RunOutcome {
+        if (self.interrupt_pending) |m| {
+            self.interrupt_pending = null;
+            return RunOutcome{ .exception = m };
+        }
+        return null;
     }
 
     /// Route a caught native `error.JsException` into the VM's try/catch
@@ -1081,17 +1389,20 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                // An arrow ignores the caller-provided `this` and uses the `this`
+                // captured at its definition site.
+                const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val, aargs);
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, eff_this, aargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
                     return null;
                 }
                 if (fn_ptr.is_generator) {
                     var gargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| gargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const g = try self.buildGenerator(fn_ptr, def_env, this_val, gargs);
+                    const g = try self.buildGenerator(fn_ptr, def_env, eff_this, gargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
@@ -1116,7 +1427,7 @@ pub const BcVm = struct {
                     .env = call_env,
                     .return_dst = ret_dst,
                     .caller_idx = caller_idx,
-                    .this_val = this_val,
+                    .this_val = eff_this,
                 });
                 return null;
             },
@@ -1203,9 +1514,17 @@ pub const BcVm = struct {
     /// Read a symbol-keyed property, walking the prototype chain (own first).
     pub fn getPropSym(self: *BcVm, obj_val: Value, sym_key: Value) !Value {
         if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);
+        const realm_m = @import("../runtime/realm.zig");
         const root_obj = switch (obj_val.unbox()) {
             .object => |o| o,
             .bc_function => |c| try self.closureBackingObj(c),
+            // Symbol-keyed [[Get]] on a primitive resolves through its wrapper
+            // prototype (e.g. "x"[Symbol.iterator] walks String.prototype).
+            .string => realm_m.active_string_proto orelse return val_mod.makeUndefined(self.arena),
+            .number => realm_m.active_number_proto orelse return val_mod.makeUndefined(self.arena),
+            .boolean => realm_m.active_boolean_proto orelse return val_mod.makeUndefined(self.arena),
+            .symbol => realm_m.active_symbol_proto orelse return val_mod.makeUndefined(self.arena),
+            .bigint => realm_m.active_bigint_proto orelse return val_mod.makeUndefined(self.arena),
             else => return val_mod.makeUndefined(self.arena),
         };
         if (root_obj.internal_kind == .proxy) {
@@ -1518,7 +1837,10 @@ pub const BcVm = struct {
             realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "proxy [[Construct]] must return an object");
             return error.JsException;
         }
-        return try self.constructFromArgs(target, args);
+        // No construct trap: forward to the target's [[Construct]] preserving the
+        // original NewTarget (the proxy), so GetPrototypeFromConstructor reads
+        // NewTarget.prototype through the proxy (its `get` trap fires).
+        return try self.constructImpl(target, args, new_target);
     }
 
     pub fn getProp(self: *BcVm, obj_val: Value, key: []const u8) !Value {
@@ -1667,6 +1989,26 @@ pub const BcVm = struct {
                 if (std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity));
                 }
+                // Walk the backing object's prototype chain. For a subclass
+                // constructor (`class C extends Base`), `bcSetProto` set the
+                // backing object's proto to the superclass constructor, so static
+                // members (e.g. `Uint8Array.BYTES_PER_ELEMENT`) resolve here. The
+                // chain ends at %Function.prototype% for ordinary functions, so
+                // inherited methods (call/apply/bind) are covered too.
+                if (closure.obj) |op| {
+                    const o: *JsObject = @ptrCast(@alignCast(op));
+                    if (o.findProperty(key)) |loc| {
+                        const a = loc.holder.attrAt(loc.slot);
+                        const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+                        if (a.is_accessor) {
+                            const getter = accessorMember(raw, "get");
+                            if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                            return try self.callAccessor(getter, obj_val, &[_]Value{});
+                        }
+                        if (raw.bits != 0) return raw;
+                        return val_mod.makeUndefined(self.arena);
+                    }
+                }
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
                     if (proto.get(key)) |v| return v;
@@ -1775,6 +2117,18 @@ pub const BcVm = struct {
         _ = try self.setPropR(obj_val, key, value, obj_val);
     }
 
+    /// Keep a top-level `var` binding in sync when its aliased property is written
+    /// through the global object (`globalThis.x = …`): the global environment
+    /// record and the global object share one binding (ES §9.1.1.4).
+    fn mirrorGlobalObjectWrite(obj: *JsObject, key: []const u8, value: Value) void {
+        const realm_mod = @import("../runtime/realm.zig");
+        if (realm_mod.active_global_object) |g| {
+            if (g == obj) {
+                if (realm_mod.active_global_env) |genv| genv.mirrorGlobalVar(key, value);
+            }
+        }
+    }
+
     /// SameValue between a Value and a raw JsObject pointer (object identity).
     fn sameObject(v: Value, ptr: *JsObject) bool {
         return v.bits != 0 and v.unbox() == .object and v.toPtr().object == ptr;
@@ -1857,11 +2211,17 @@ pub const BcVm = struct {
                     if (loc.holder == obj) {
                         if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return true;
                         _ = obj.setOwnBySlot(obj.shapePtr(), loc.slot, value);
+                        mirrorGlobalObjectWrite(obj, key, value);
                         return true;
                     }
                     // inherited data property: fall through to create an own (shadow).
                 }
+                // Creating a new own property (no own data/accessor reached above)
+                // requires the receiver to be extensible; otherwise the assignment
+                // fails (sloppy: silent no-op; strict: caller throws TypeError).
+                if (!obj.extensible and obj.resolveOwnSlot(key) == null) return false;
                 try obj.set(key, value);
+                mirrorGlobalObjectWrite(obj, key, value);
                 return true;
             },
             // W2 unification: bc functions store own properties (incl.
@@ -2213,13 +2573,15 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                // An arrow ignores the caller-provided `this`, using its captured one.
+                const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else this_val;
 
                 // W2-async: an async function call runs as a coroutine and
                 // returns a pending Promise.
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val, aargs);
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val_eff, aargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
                     return null;
                 }
@@ -2227,14 +2589,14 @@ pub const BcVm = struct {
                 if (fn_ptr.is_generator) {
                     var gargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| gargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const g = try self.buildGenerator(fn_ptr, def_env, this_val, gargs);
+                    const g = try self.buildGenerator(fn_ptr, def_env, this_val_eff, gargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
 
                 // Phase 12: native fast path for hot leaf/boxed functions
                 // (comptime-elided unless built with -Djit=true).
-                switch (try self.tryJitCall(fn_ptr, def_env, this_val, base, nargs, ret_dst)) {
+                switch (try self.tryJitCall(fn_ptr, def_env, this_val_eff, base, nargs, ret_dst)) {
                     .completed => return null,
                     .threw => {
                         // A re-entrant CALL inside the JITed function threw; the
@@ -2311,13 +2673,21 @@ pub const BcVm = struct {
 
                 // Sloppy-mode this correction (ES §10.2.1.1 step 2): non-strict
                 // function called with undefined/null this → substitute global object.
-                const frame_this: Value = if (!fn_ptr.is_strict and (this_val.isUndefined() or this_val.isNull())) blk: {
+                // Arrows use their captured `this` verbatim (no coercion).
+                const frame_this: Value = if (fn_ptr.is_arrow)
+                    this_val_eff
+                else if (!fn_ptr.is_strict and (this_val_eff.isUndefined() or this_val_eff.isNull())) blk: {
                     const realm_m = @import("../runtime/realm.zig");
-                    if (realm_m.active_global_env) |genv| {
-                        break :blk genv.lookup("globalThis") catch this_val;
+                    // Cross-realm: use the FUNCTION's realm's globalThis.
+                    if (closure.realm) |r_opaque| {
+                        const fr = @as(*Realm, @ptrCast(@alignCast(r_opaque)));
+                        break :blk fr.global_env.lookup("globalThis") catch this_val_eff;
                     }
-                    break :blk this_val;
-                } else this_val;
+                    if (realm_m.active_global_env) |genv| {
+                        break :blk genv.lookup("globalThis") catch this_val_eff;
+                    }
+                    break :blk this_val_eff;
+                } else this_val_eff;
 
                 const caller_idx = self.frames.items.len - 1;
                 try self.frames.append(self.arena, BcCallFrame{
@@ -2490,18 +2860,20 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                // An arrow ignores the receiver, using its captured lexical `this`.
+                const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else this_val;
 
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
-                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val, aargs);
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val_eff, aargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
                     return null;
                 }
                 if (fn_ptr.is_generator) {
                     var gargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| gargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
-                    const g = try self.buildGenerator(fn_ptr, def_env, this_val, gargs);
+                    const g = try self.buildGenerator(fn_ptr, def_env, this_val_eff, gargs);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
@@ -2572,7 +2944,7 @@ pub const BcVm = struct {
                     .env = call_env,
                     .return_dst = ret_dst,
                     .caller_idx = caller_idx,
-                    .this_val = this_val,
+                    .this_val = this_val_eff,
                 });
                 return null;
             },
@@ -3173,6 +3545,8 @@ fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
         }
         // this_val
         gc_mod.traceValue(frame.this_val, mark_fn);
+        // `with` object scopes are live across the body of the statement.
+        for (frame.with_stack.items) |wobj| gc_mod.traceValue(wobj, mark_fn);
         // Environment chain
         gc_mod.traceEnvironment(frame.env, mark_fn);
     }
@@ -3181,6 +3555,7 @@ fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
         if (state.done) continue;
         for (state.frame.registers) |reg| gc_mod.traceValue(reg, mark_fn);
         gc_mod.traceValue(state.frame.this_val, mark_fn);
+        for (state.frame.with_stack.items) |wobj| gc_mod.traceValue(wobj, mark_fn);
         gc_mod.traceEnvironment(state.frame.env, mark_fn);
     }
     // W2-async: keep each in-flight async function's result promise alive while
@@ -3335,29 +3710,9 @@ pub fn toUint32(v: Value) u32 {
 /// decimal float parse (NaN on failure). Diverges from a bare `parseFloat`, which
 /// maps "" to NaN and does not accept radix prefixes.
 pub fn jsStringToNumber(s: []const u8) f64 {
-    const t = std.mem.trim(u8, s, " \t\n\r\x0B\x0C");
-    if (t.len == 0) return 0;
-    if (std.mem.eql(u8, t, "Infinity") or std.mem.eql(u8, t, "+Infinity")) return std.math.inf(f64);
-    if (std.mem.eql(u8, t, "-Infinity")) return -std.math.inf(f64);
-    if (t.len > 2 and t[0] == '0') {
-        const radix: ?u8 = switch (t[1]) {
-            'x', 'X' => @as(u8, 16),
-            'o', 'O' => @as(u8, 8),
-            'b', 'B' => @as(u8, 2),
-            else => null,
-        };
-        if (radix) |r| {
-            const v = std.fmt.parseInt(u64, t[2..], r) catch return std.math.nan(f64);
-            return @floatFromInt(v);
-        }
-    }
-    // A valid decimal literal starts with a digit, sign, or dot. Reject letter
-    // leads up front so `std.fmt.parseFloat` does not accept "inf"/"infinity"/
-    // "nan" (ES ToNumber maps "INFINITY", "inf", etc. to NaN; only exact
-    // "Infinity"/"+Infinity"/"-Infinity", handled above, are special).
-    const c0 = t[0];
-    if (!(std.ascii.isDigit(c0) or c0 == '.' or c0 == '+' or c0 == '-')) return std.math.nan(f64);
-    return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
+    // Single shared implementation in value.zig so Number()/Array-index coercion
+    // (Value.toF64) and arithmetic agree on radix prefixes, Infinity, and "".
+    return val_mod.jsStringToNumber(s);
 }
 
 /// ES `Number::remainder` (the `%` operator): truncated remainder taking the sign

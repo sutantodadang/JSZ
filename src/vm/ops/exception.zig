@@ -135,6 +135,38 @@ pub inline fn opInstanceof(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+pub inline fn opNewInstanceSpread(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rdst = code[frame.pc];
+    frame.pc += 1;
+    const rcallee = code[frame.pc];
+    frame.pc += 1;
+    const rargs = code[frame.pc];
+    frame.pc += 1;
+    const callee_v = frame.registers[rcallee];
+    const args_v = frame.registers[rargs];
+    // Flatten the args array into a Value slice (built by the compiler via
+    // NEW_ARRAY/ARRAY_APPEND/ARRAY_SPREAD).
+    var args_list = std.ArrayListUnmanaged(Value){};
+    if (args_v.bits != 0 and args_v.unbox() == .object) {
+        const arr = args_v.toPtr().object;
+        const n = arr.getArrayLength();
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const key = try std.fmt.allocPrint(self.arena, "{d}", .{i});
+            const ev = arr.get(key) orelse try val_mod.makeUndefined(self.arena);
+            try args_list.append(self.arena, ev);
+        }
+    }
+    const result = self.constructFromArgs(callee_v, args_list.items) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error in spread construct")) |oc| return oc;
+        return null;
+    };
+    self.frames.items[self.frames.items.len - 1].registers[rdst] = result;
+    return null;
+}
+
 pub inline fn opNewInstance(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const rdst = code[frame.pc];

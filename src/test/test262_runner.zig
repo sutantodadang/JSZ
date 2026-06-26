@@ -267,17 +267,27 @@ const HARDCODED_PRELUDE =
 const DOLLAR262_PRELUDE =
     \\var $262 = {
     \\  detachArrayBuffer: function(buffer) { if (!buffer.detached) buffer.transfer(0); },
+    \\  gc: function() {},
     \\  global: globalThis,
     \\  createRealm: function() {
-    \\    return {
-    \\      global: globalThis,
-    \\      detachArrayBuffer: function(buffer) { if (!buffer.detached) buffer.transfer(0); },
-    \\      evalScript: function(s) { return eval(s); },
-    \\      createRealm: $262.createRealm
-    \\    };
+        \\    // A real secondary Realm (own global object + intrinsics).
+    \\    // `__jszCreateRealm__` returns `{global, evalScript}`.
+    \\    var r = __jszCreateRealm__();
+    \\    r.detachArrayBuffer = function(buffer) { if (!buffer.detached) buffer.transfer(0); };
+    \\    r.createRealm = $262.createRealm;
+    \\    r.gc = function() {};
+    \\    // Inject $262 into the secondary realm's global so cross-realm
+    \\    // tests can access otherGlobal.$262.detachArrayBuffer.
+    \\    r.global.$262 = r;
+    \\    // Make evalScript available as `eval` on the secondary realm's global,
+    \\    // so tests that do h.eval(...) run in the secondary realm's env.
+    \\    r.global.eval = r.evalScript;
+    \\    return r;
+
     \\  },
     \\  evalScript: function(s) { return eval(s); },
-    \\  AbstractModuleSource: function AbstractModuleSource() {}
+    \\  AbstractModuleSource: function AbstractModuleSource() {},
+    \\  IsHTMLDDA: function IsHTMLDDA() {}
     \\};
     \\var __moduleSourceCache__ = Object.create(null);
     \\function __moduleSource__(spec) {
@@ -436,6 +446,20 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
         "\"use strict\";\n"
     else
         "";
+    // Feature gating: the Immutable ArrayBuffer API is always present in the
+    // engine, but a conformant runner only exposes a staged feature when the
+    // test declares it. testTypedArray.js auto-enables a `makeImmutableArrayBuffer`
+    // constructor-argument variant whenever `ArrayBuffer.prototype.transferToImmutable`
+    // exists, which would subject tests that never opted into the proposal
+    // (features lacking `immutable-arraybuffer`) to immutable-backed buffers and
+    // spurious TypeErrors. Hide the API for those tests so the harness behaves as
+    // it would on a runner that gates the feature. Must run before the harness.
+    const declares_immutable = std.mem.indexOf(u8, frontmatter(source), "immutable-arraybuffer") != null;
+    const feature_gate_prefix: []const u8 = if (declares_immutable)
+        ""
+    else
+        "(function(){try{delete ArrayBuffer.prototype.transferToImmutable;}catch(e){}" ++
+            "try{delete ArrayBuffer.prototype.sliceToImmutable;}catch(e){}})();\n";
     // M16 Phase 4: [module, async] tests (TLA) use $DONE() as the async
     // completion signal. Define it as a synchronous throw-on-error wrapper;
     // since our `await` desugaring drains microtasks inline, $DONE() is
@@ -463,9 +487,9 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     // globals (`assert`, `$262`); the test body is wrapped in the entry IIFE.
     const SENTINEL = "/*__JSZ_PRELUDE_END__*/";
     const full_source = if (needs_dollar262)
-        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}{s}", .{ strict_prefix, DOLLAR262_PRELUDE, prelude, done_prefix, SENTINEL, source }) catch return .fail
+        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}{s}{s}", .{ strict_prefix, feature_gate_prefix, DOLLAR262_PRELUDE, prelude, done_prefix, SENTINEL, source }) catch return .fail
     else
-        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ strict_prefix, prelude, done_prefix, SENTINEL, source }) catch return .fail;
+        std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}{s}", .{ strict_prefix, feature_gate_prefix, prelude, done_prefix, SENTINEL, source }) catch return .fail;
     defer allocator.free(full_source);
 
     // `flags: [module]` tests must run as ES-module code (strict; import/export).

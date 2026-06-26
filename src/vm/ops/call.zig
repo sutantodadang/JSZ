@@ -32,6 +32,13 @@ pub inline fn opNewClosure(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     closure.* = BcClosure{
         .func = child_fn,
         .env = @ptrCast(frame.env),
+        .realm = self.realmAsOpaque(),
+        // Arrows have no own `this`: capture the definition site's `this` now so
+        // it's used regardless of how/with-what-this the arrow is later called.
+        .captured_this = if (child_fn.is_arrow)
+            (if (frame.this_val.bits != 0) frame.this_val else try val_mod.makeUndefined(self.arena))
+        else
+            Value{},
     };
     const jsv = try self.arena.create(@import("../../value/value.zig").JsValue);
     jsv.* = @import("../../value/value.zig").JsValue{ .bc_function = closure };
@@ -53,6 +60,7 @@ pub inline fn opCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 
     const outcome = try self.doCall(callee_val, this_val, base, nargs, ret_dst);
     if (outcome) |msg| {
+        if (self.takeInterruptOutcome()) |oc| return oc;
         if (std.mem.eql(u8, msg, "__js_exception__")) {
             // Native threw a JS exception; last_exception_value already set.
             const exc_val = self.last_exception_value;
@@ -146,13 +154,15 @@ pub inline fn opTailCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         frame.env = call_env;
         frame.return_dst = inherited_ret;
         frame.caller_idx = inherited_caller;
-        frame.this_val = this_val;
+        // Arrows use their captured lexical `this`, not the call-site value.
+        frame.this_val = if (fn_ptr.is_arrow) closure.captured_this else this_val;
         frame.try_stack = .empty;
     } else {
         // Fallback: native/bound/object callee. Do a normal call,
         // then return its result to our caller (no frame reuse).
         const outcome = try self.doCall(callee_val, this_val, base, nargs, ret_dst);
         if (outcome) |msg| {
+            if (self.takeInterruptOutcome()) |oc| return oc;
             if (std.mem.eql(u8, msg, "__js_exception__")) {
                 const exc_val = self.last_exception_value;
                 const found = try self.throwException(exc_val);
@@ -199,6 +209,7 @@ pub inline fn opMethodCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 
     const outcome = try self.doMethodCall(callee_val, this_val, base, nargs, ret_dst);
     if (outcome) |msg| {
+        if (self.takeInterruptOutcome()) |oc| return oc;
         if (std.mem.eql(u8, msg, "__js_exception__")) {
             const exc_val = self.last_exception_value;
             const found = try self.throwException(exc_val);
@@ -292,13 +303,15 @@ pub inline fn opTailMethodCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         frame.env = call_env;
         frame.return_dst = inherited_ret;
         frame.caller_idx = inherited_caller;
-        frame.this_val = this_val;
+        // Arrows use their captured lexical `this`, not the receiver.
+        frame.this_val = if (fn_ptr.is_arrow) closure.captured_this else this_val;
         frame.try_stack = .empty;
     } else {
         // Fallback: native/bound/getter/generator/async callee. Do a
         // normal method call, then return its result to our caller.
         const outcome = try self.doMethodCall(callee_val, this_val, base, nargs, ret_dst);
         if (outcome) |msg| {
+            if (self.takeInterruptOutcome()) |oc| return oc;
             if (std.mem.eql(u8, msg, "__js_exception__")) {
                 const exc_val = self.last_exception_value;
                 const found = try self.throwException(exc_val);
