@@ -82,3 +82,14 @@ pub fn nativeSymbolKeyFor(arena: std.mem.Allocator, _: Value, args: []const Valu
     }
     return val_mod.makeUndefined(arena);
 }
+
+/// Returns true if `v` is a symbol that was created via Symbol.for (registered).
+/// Registered symbols cannot be used as WeakMap/WeakSet keys per spec.
+pub fn isRegisteredSymbol(v: Value) bool {
+    if (v.bits == 0 or v.unbox() != .symbol) return false;
+    const target = v.toPtr().symbol;
+    for (registry_syms.items) |s| {
+        if (s.bits != 0 and s.unbox() == .symbol and s.toPtr().symbol == target) return true;
+    }
+    return false;
+}

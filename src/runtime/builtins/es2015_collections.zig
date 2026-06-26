@@ -8,6 +8,7 @@ const PropAttr = @import("../../object/object.zig").PropAttr;
 const realm_mod = @import("../realm.zig");
 const intrinsics = @import("intrinsics.zig");
 const ta_mod = @import("typed_array.zig");
+const symbol_mod = @import("symbol.zig");
 const InternalKind = @TypeOf((@as(JsObject, undefined)).internal_kind);
 
 /// Shared %ArrayIteratorPrototype% — the [[Prototype]] of every iterator
@@ -16,6 +17,10 @@ const InternalKind = @TypeOf((@as(JsObject, undefined)).internal_kind);
 /// init (after the well-known symbols resolve). Its [[Prototype]] is the
 /// %IteratorPrototype%.
 pub var active_array_iter_proto: ?*JsObject = null;
+/// WeakMap.prototype — stored so registerSymbols can attach @@toStringTag.
+pub var active_weakmap_proto: ?*JsObject = null;
+/// WeakSet.prototype — stored so registerSymbols can attach @@toStringTag.
+pub var active_weakset_proto: ?*JsObject = null;
 
 /// R1: install Map/Set/WeakMap/WeakSet prototypes + constructors and bind globals.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -66,37 +71,54 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try ctx.env.define("Set", try val_mod.makeObject(arena, set_ctor_obj));
 
     // ---- WeakMap ----
-    const weakmap_proto = try JsObject.create(arena, object_proto);
-    const weakmap_fns = .{
-        .{ "set", nativeMapSet },
-        .{ "get", nativeMapGet },
-        .{ "has", nativeMapHas },
-        .{ "delete", nativeMapDelete },
-    };
-    inline for (weakmap_fns) |pair| {
-        const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
-        try weakmap_proto.set(pair[0], fn_v);
-    }
-    const weakmap_ctor_obj = try JsObject.create(arena, null);
-    try weakmap_ctor_obj.set("prototype", try val_mod.makeObject(arena, weakmap_proto));
-    try weakmap_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakMapCtor));
-    try ctx.env.define("WeakMap", try val_mod.makeObject(arena, weakmap_ctor_obj));
+    const wm_proto = try JsObject.create(arena, object_proto);
+    const wm_m: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+    _ = try wm_proto.defineOwnData("set", try val_mod.makeNativeFunctionNamed(arena, nativeWeakMapSet, "set", 2), wm_m);
+    _ = try wm_proto.defineOwnData("get", try val_mod.makeNativeFunctionNamed(arena, nativeWeakMapGet, "get", 1), wm_m);
+    _ = try wm_proto.defineOwnData("has", try val_mod.makeNativeFunctionNamed(arena, nativeWeakMapHas, "has", 1), wm_m);
+    _ = try wm_proto.defineOwnData("delete", try val_mod.makeNativeFunctionNamed(arena, nativeWeakMapDelete, "delete", 1), wm_m);
+    _ = try wm_proto.defineOwnData("getOrInsert", try val_mod.makeNativeFunctionNamed(arena, nativeWeakMapGetOrInsert, "getOrInsert", 2), wm_m);
+    _ = try wm_proto.defineOwnData("getOrInsertComputed", try val_mod.makeNativeFunctionNamed(arena, nativeWeakMapGetOrInsertComputed, "getOrInsertComputed", 2), wm_m);
+
+    const wm_ctor = try JsObject.create(arena, ctx.function_proto);
+    const wm_nlen: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+    _ = try wm_ctor.defineOwnData("name", try val_mod.makeString(arena, "WeakMap"), wm_nlen);
+    _ = try wm_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), wm_nlen);
+    _ = try wm_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, wm_proto), .{ .writable = false, .enumerable = false, .configurable = false });
+    try wm_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakMapCtor));
+    _ = try wm_proto.defineOwnData("constructor", try val_mod.makeObject(arena, wm_ctor), wm_m);
+    active_weakmap_proto = wm_proto;
+    try ctx.env.define("WeakMap", try val_mod.makeObject(arena, wm_ctor));
 
     // ---- WeakSet ----
-    const weakset_proto = try JsObject.create(arena, object_proto);
-    const weakset_fns = .{
-        .{ "add", nativeSetAdd },
-        .{ "has", nativeSetHas },
-        .{ "delete", nativeSetDelete },
-    };
-    inline for (weakset_fns) |pair| {
-        const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
-        try weakset_proto.set(pair[0], fn_v);
+    const ws_proto = try JsObject.create(arena, object_proto);
+    const ws_m: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+    _ = try ws_proto.defineOwnData("add", try val_mod.makeNativeFunctionNamed(arena, nativeWeakSetAdd, "add", 1), ws_m);
+    _ = try ws_proto.defineOwnData("has", try val_mod.makeNativeFunctionNamed(arena, nativeWeakSetHas, "has", 1), ws_m);
+    _ = try ws_proto.defineOwnData("delete", try val_mod.makeNativeFunctionNamed(arena, nativeWeakSetDelete, "delete", 1), ws_m);
+
+    const ws_ctor = try JsObject.create(arena, ctx.function_proto);
+    const ws_nlen: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+    _ = try ws_ctor.defineOwnData("name", try val_mod.makeString(arena, "WeakSet"), ws_nlen);
+    _ = try ws_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), ws_nlen);
+    _ = try ws_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, ws_proto), .{ .writable = false, .enumerable = false, .configurable = false });
+    try ws_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakSetCtor));
+    _ = try ws_proto.defineOwnData("constructor", try val_mod.makeObject(arena, ws_ctor), ws_m);
+    active_weakset_proto = ws_proto;
+    try ctx.env.define("WeakSet", try val_mod.makeObject(arena, ws_ctor));
+}
+
+/// Wire @@toStringTag onto WeakMap.prototype and WeakSet.prototype.
+/// Called after Symbol well-known values are captured (same lifecycle as
+/// typed_array_mod.registerSymbols).
+pub fn registerSymbols(arena: std.mem.Allocator) !void {
+    const tag_attr: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+    if (realm_mod.active_sym_to_string_tag) |tag_sym| {
+        if (active_weakmap_proto) |p|
+            try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "WeakMap"), tag_attr);
+        if (active_weakset_proto) |p|
+            try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "WeakSet"), tag_attr);
     }
-    const weakset_ctor_obj = try JsObject.create(arena, null);
-    try weakset_ctor_obj.set("prototype", try val_mod.makeObject(arena, weakset_proto));
-    try weakset_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakSetCtor));
-    try ctx.env.define("WeakSet", try val_mod.makeObject(arena, weakset_ctor_obj));
 }
 
 const MapData = struct {
@@ -137,6 +159,9 @@ fn canBeWeakKey(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .object, .function, .bc_function, .native_function => true,
+        // Unregistered symbols may be used as weak keys (spec: "can be held weakly").
+        // Registered symbols (Symbol.for) are excluded.
+        .symbol => !symbol_mod.isRegisteredSymbol(v),
         else => false,
     };
 }
@@ -194,7 +219,11 @@ pub fn nativeMapCtor(arena: std.mem.Allocator, this_val: Value, args: []const Va
     return out;
 }
 
-pub fn nativeWeakMapCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+pub fn nativeWeakMapCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (!realm_mod.active_constructing) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "WeakMap constructor requires 'new'");
+        return error.JsException;
+    }
     var out = this_val;
     if (out.bits == 0 or out.unbox() != .object) out = try makeObj(arena, null, .weakmap);
     const obj = out.toPtr().object;
@@ -202,6 +231,14 @@ pub fn nativeWeakMapCtor(arena: std.mem.Allocator, this_val: Value, _: []const V
     d.* = .{};
     obj.internal_kind = .weakmap;
     obj.internal_slot = d;
+    if (args.len > 0) {
+        const iterable = args[0];
+        if (iterable.bits != 0) {
+            const tag = iterable.unbox();
+            if (tag != .undefined_ and tag != .null_)
+                try iterableWeakInit(arena, out, iterable, true);
+        }
+    }
     return out;
 }
 
@@ -226,7 +263,11 @@ pub fn nativeSetCtor(arena: std.mem.Allocator, this_val: Value, args: []const Va
     return out;
 }
 
-pub fn nativeWeakSetCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+pub fn nativeWeakSetCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (!realm_mod.active_constructing) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "WeakSet constructor requires 'new'");
+        return error.JsException;
+    }
     var out = this_val;
     if (out.bits == 0 or out.unbox() != .object) out = try makeObj(arena, null, .weakset);
     const obj = out.toPtr().object;
@@ -234,8 +275,290 @@ pub fn nativeWeakSetCtor(arena: std.mem.Allocator, this_val: Value, _: []const V
     d.* = .{};
     obj.internal_kind = .weakset;
     obj.internal_slot = d;
+    if (args.len > 0) {
+        const iterable = args[0];
+        if (iterable.bits != 0) {
+            const tag = iterable.unbox();
+            if (tag != .undefined_ and tag != .null_)
+                try iterableWeakInit(arena, out, iterable, false);
+        }
+    }
     return out;
 }
+
+// ---- WeakMap / WeakSet helpers ----
+
+fn isTruthy(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .undefined_, .null_ => false,
+        .boolean => |b| b,
+        .number => |n| n != 0.0 and !std.math.isNan(n),
+        .string => |s| s.len > 0,
+        else => true,
+    };
+}
+
+fn setTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror!void {
+    realm_mod.pending_exception = try makeTypeErrorVal(arena, msg);
+    return error.JsException;
+}
+
+fn closeIterator(arena: std.mem.Allocator, iter: Value) void {
+    if (iter.bits == 0 or iter.unbox() != .object) return;
+    const ret_fn = iter.toPtr().object.get("return") orelse return;
+    if (!isCallable(ret_fn)) return;
+    _ = function_proto.invokeCallback(arena, iter, ret_fn, &[_]Value{}) catch {};
+}
+
+fn getWeakMapData(arena: std.mem.Allocator, this_val: Value) anyerror!*MapData {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        try setTypeError(arena, "WeakMap method called on non-object");
+        unreachable;
+    }
+    const obj = this_val.toPtr().object;
+    if (obj.internal_kind != .weakmap or obj.internal_slot == null) {
+        try setTypeError(arena, "Method called on incompatible receiver (not a WeakMap)");
+        unreachable;
+    }
+    return @ptrCast(@alignCast(obj.internal_slot.?));
+}
+
+fn getWeakSetData(arena: std.mem.Allocator, this_val: Value) anyerror!*SetData {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        try setTypeError(arena, "WeakSet method called on non-object");
+        unreachable;
+    }
+    const obj = this_val.toPtr().object;
+    if (obj.internal_kind != .weakset or obj.internal_slot == null) {
+        try setTypeError(arena, "Method called on incompatible receiver (not a WeakSet)");
+        unreachable;
+    }
+    return @ptrCast(@alignCast(obj.internal_slot.?));
+}
+
+// ---- WeakMap methods (brand-checked: .weakmap only) ----
+
+pub fn nativeWeakMapSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getWeakMapData(arena, this_val);
+    if (args.len < 1 or !canBeWeakKey(args[0])) {
+        try setTypeError(arena, "Invalid value used as weak map key");
+        unreachable;
+    }
+    const key = args[0];
+    const val = if (args.len >= 2) args[1] else try val_mod.makeUndefined(arena);
+    for (data.keys.items, 0..) |k, i| {
+        if (strictEq(k, key)) { data.values.items[i] = val; return this_val; }
+    }
+    try data.keys.append(arena, key);
+    try data.values.append(arena, val);
+    return this_val;
+}
+
+pub fn nativeWeakMapGet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getWeakMapData(arena, this_val);
+    if (args.len == 0) return val_mod.makeUndefined(arena);
+    for (data.keys.items, 0..) |k, i| {
+        if (strictEq(k, args[0])) return data.values.items[i];
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+pub fn nativeWeakMapHas(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getWeakMapData(arena, this_val);
+    if (args.len == 0) return val_mod.makeBool(arena, false);
+    for (data.keys.items) |k| if (strictEq(k, args[0])) return val_mod.makeBool(arena, true);
+    return val_mod.makeBool(arena, false);
+}
+
+pub fn nativeWeakMapDelete(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getWeakMapData(arena, this_val);
+    if (args.len == 0) return val_mod.makeBool(arena, false);
+    for (data.keys.items, 0..) |k, i| {
+        if (strictEq(k, args[0])) {
+            _ = data.keys.orderedRemove(i);
+            _ = data.values.orderedRemove(i);
+            return val_mod.makeBool(arena, true);
+        }
+    }
+    return val_mod.makeBool(arena, false);
+}
+
+pub fn nativeWeakMapGetOrInsert(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getWeakMapData(arena, this_val);
+    if (args.len < 1 or !canBeWeakKey(args[0])) {
+        try setTypeError(arena, "Invalid value used as weak map key");
+        unreachable;
+    }
+    const key = args[0];
+    const default_val = if (args.len >= 2) args[1] else try val_mod.makeUndefined(arena);
+    for (data.keys.items, 0..) |k, i| {
+        if (strictEq(k, key)) return data.values.items[i];
+    }
+    try data.keys.append(arena, key);
+    try data.values.append(arena, default_val);
+    return default_val;
+}
+
+pub fn nativeWeakMapGetOrInsertComputed(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getWeakMapData(arena, this_val);
+    // Step 3 (spec): IsCallable check FIRST, even if key is already present.
+    const cb = if (args.len >= 2) args[1] else Value{};
+    if (!isCallable(cb)) {
+        try setTypeError(arena, "callbackfn is not callable");
+        unreachable;
+    }
+    const key = if (args.len >= 1) args[0] else try val_mod.makeUndefined(arena);
+    // Step 4: look up key (before weak-key check per spec).
+    for (data.keys.items, 0..) |k, i| {
+        if (strictEq(k, key)) return data.values.items[i];
+    }
+    // Step 5: weak-key check (after lookup per spec).
+    if (!canBeWeakKey(key)) {
+        try setTypeError(arena, "Invalid value used as weak map key");
+        unreachable;
+    }
+    // Step 6: call callbackfn(key).
+    const computed = try function_proto.invokeCallback(arena, try val_mod.makeUndefined(arena), cb, &.{key});
+    // Step 7: re-check after callback — callback may have inserted/modified key.
+    for (data.keys.items, 0..) |k, i| {
+        if (strictEq(k, key)) {
+            data.values.items[i] = computed;
+            return computed;
+        }
+    }
+    // Step 8-9: key still absent, append.
+    try data.keys.append(arena, key);
+    try data.values.append(arena, computed);
+    return computed;
+}
+
+// ---- WeakSet methods (brand-checked: .weakset only) ----
+
+pub fn nativeWeakSetAdd(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getWeakSetData(arena, this_val);
+    if (args.len == 0 or !canBeWeakKey(args[0])) {
+        try setTypeError(arena, "Invalid value used as weak set value");
+        unreachable;
+    }
+    for (data.values.items) |v| if (strictEq(v, args[0])) return this_val;
+    try data.values.append(arena, args[0]);
+    return this_val;
+}
+
+pub fn nativeWeakSetHas(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getWeakSetData(arena, this_val);
+    if (args.len == 0) return val_mod.makeBool(arena, false);
+    for (data.values.items) |v| if (strictEq(v, args[0])) return val_mod.makeBool(arena, true);
+    return val_mod.makeBool(arena, false);
+}
+
+pub fn nativeWeakSetDelete(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const data = try getWeakSetData(arena, this_val);
+    if (args.len == 0) return val_mod.makeBool(arena, false);
+    for (data.values.items, 0..) |v, i| {
+        if (strictEq(v, args[0])) {
+            _ = data.values.orderedRemove(i);
+            return val_mod.makeBool(arena, true);
+        }
+    }
+    return val_mod.makeBool(arena, false);
+}
+
+/// Shared iterable initialization for WeakMap (is_map=true, expects [key,val] pairs)
+/// and WeakSet (is_map=false, expects individual values).
+/// Implements ES spec: get adder, GetIterator, loop IteratorStep, call adder,
+/// IteratorClose on abrupt completion.
+fn iterableWeakInit(
+    arena: std.mem.Allocator,
+    out: Value,
+    iterable: Value,
+    is_map: bool,
+) !void {
+    // Get adder = M["set"] or M["add"]
+    const adder_name = if (is_map) "set" else "add";
+    const adder: Value = blk: {
+        if (realm_mod.active_context) |ctx| {
+            break :blk try ctx.getProp(arena, out, adder_name);
+        }
+        if (out.bits != 0 and out.unbox() == .object) {
+            break :blk out.toPtr().object.get(adder_name) orelse try val_mod.makeUndefined(arena);
+        }
+        break :blk try val_mod.makeUndefined(arena);
+    };
+    if (!isCallable(adder)) {
+        try setTypeError(arena, adder_name ++ " is not callable");
+        unreachable;
+    }
+
+    // GetIterator(iterable)
+    const iter = try nativeGetIterator(arena, Value{}, &.{iterable});
+
+    while (true) {
+        // IteratorStep: call iter.next()
+        const step = nativeIterStep(arena, Value{}, &.{iter}) catch |e| return e;
+
+        // IteratorComplete
+        const done_v: Value = if (step.bits != 0 and step.unbox() == .object)
+            step.toPtr().object.get("done") orelse Value{}
+        else
+            Value{};
+        if (isTruthy(done_v)) break;
+
+        // IteratorValue (observable getProp for getter-throw support)
+        const item: Value = blk: {
+            if (step.bits != 0 and step.unbox() == .object) {
+                if (realm_mod.active_context) |ctx| {
+                    break :blk ctx.getProp(arena, step, "value") catch |e| {
+                        closeIterator(arena, iter);
+                        return e;
+                    };
+                }
+                break :blk step.toPtr().object.get("value") orelse try val_mod.makeUndefined(arena);
+            }
+            break :blk try val_mod.makeUndefined(arena);
+        };
+
+        if (is_map) {
+            // Entry must be an Object
+            if (item.bits == 0 or item.unbox() != .object) {
+                closeIterator(arena, iter);
+                try setTypeError(arena, "Iterator value is not an object");
+                unreachable;
+            }
+            // Get key (index "0") and value (index "1")
+            const k: Value = blk: {
+                if (realm_mod.active_context) |ctx| {
+                    break :blk ctx.getProp(arena, item, "0") catch |e| {
+                        closeIterator(arena, iter);
+                        return e;
+                    };
+                }
+                break :blk item.toPtr().object.get("0") orelse try val_mod.makeUndefined(arena);
+            };
+            const v: Value = blk: {
+                if (realm_mod.active_context) |ctx| {
+                    break :blk ctx.getProp(arena, item, "1") catch |e| {
+                        closeIterator(arena, iter);
+                        return e;
+                    };
+                }
+                break :blk item.toPtr().object.get("1") orelse try val_mod.makeUndefined(arena);
+            };
+            _ = function_proto.invokeCallback(arena, out, adder, &.{ k, v }) catch |e| {
+                closeIterator(arena, iter);
+                return e;
+            };
+        } else {
+            _ = function_proto.invokeCallback(arena, out, adder, &.{item}) catch |e| {
+                closeIterator(arena, iter);
+                return e;
+            };
+        }
+    }
+}
+
+// ---- Map methods (unchanged, Map+WeakMap shared — kept for Map only now) ----
 
 pub fn nativeMapSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const data = getMapData(this_val, .map) orelse getMapData(this_val, .weakmap) orelse return this_val;

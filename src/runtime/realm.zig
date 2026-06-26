@@ -2824,6 +2824,8 @@ pub const Realm = struct {
         // Wire @@toStringTag + @@species onto TypedArray/ArrayBuffer/DataView protos+ctors now
         // that the well-known symbols exist (register() ran before Symbol init).
         try typed_array_mod.registerSymbols(arena);
+        // Wire @@toStringTag onto WeakMap.prototype and WeakSet.prototype.
+        try es2015_collections_mod.registerSymbols(arena);
 
         // Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain
         // now that @@iterator / @@toStringTag exist. Array + TypedArray iterators
