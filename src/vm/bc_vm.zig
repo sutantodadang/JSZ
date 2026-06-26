@@ -692,6 +692,56 @@ pub const BcVm = struct {
         if (realm_mod.active_shadow_realm) |sr| self.realm = sr;
         defer self.realm = saved_realm;
 
+        // Cross-realm: also switch typed-array/buffer thread-locals to the
+        // shadow realm's intrinsics so buffer creation (e.g. via TypedArray
+        // constructor) uses the correct realm's prototype chain. Without this,
+        // `g.eval("new Int8Array(…).buffer")` creates a buffer whose proto is
+        // the PRIMARY realm's ArrayBuffer.prototype, making `.constructor`
+        // resolve to the primary realm's ArrayBuffer instead of g.ArrayBuffer.
+        const ta_mod = @import("../runtime/builtins/typed_array.zig");
+        const saved_ta_ab_proto = ta_mod.active_arraybuffer_proto;
+        const saved_ta_ab_ctor = ta_mod.active_arraybuffer_ctor;
+        const saved_ta_sab_proto = ta_mod.active_sharedarraybuffer_proto;
+        const saved_ta_sab_ctor = ta_mod.active_sharedarraybuffer_ctor;
+        const saved_ta_dv_proto = ta_mod.active_dataview_proto;
+        const saved_ta_ta_proto = ta_mod.active_typedarray_proto;
+        const saved_ta_ta_ctor = ta_mod.active_typedarray_ctor;
+        if (realm_mod.active_shadow_realm) |sr| {
+            // Use intrinsics captured by the Realm struct (from captureIntrinsics).
+            if (sr.ab_prototype) |p| ta_mod.active_arraybuffer_proto = p;
+            if (sr.sab_prototype) |p| ta_mod.active_sharedarraybuffer_proto = p;
+            if (sr.dv_prototype) |p| ta_mod.active_dataview_proto = p;
+            if (sr.ta_shared_prototype) |p| ta_mod.active_typedarray_proto = p;
+            // Constructors: look up from prototype.constructor
+            if (sr.ab_prototype) |p| {
+                if (p.getOwn("constructor")) |cv| {
+                    if (cv.bits != 0 and cv.unbox() == .object)
+                        ta_mod.active_arraybuffer_ctor = cv.toPtr().object;
+                }
+            }
+            if (sr.sab_prototype) |p| {
+                if (p.getOwn("constructor")) |cv| {
+                    if (cv.bits != 0 and cv.unbox() == .object)
+                        ta_mod.active_sharedarraybuffer_ctor = cv.toPtr().object;
+                }
+            }
+            if (sr.ta_shared_prototype) |p| {
+                if (p.getOwn("constructor")) |cv| {
+                    if (cv.bits != 0 and cv.unbox() == .object)
+                        ta_mod.active_typedarray_ctor = cv.toPtr().object;
+                }
+            }
+        }
+        defer {
+            ta_mod.active_arraybuffer_proto = saved_ta_ab_proto;
+            ta_mod.active_arraybuffer_ctor = saved_ta_ab_ctor;
+            ta_mod.active_sharedarraybuffer_proto = saved_ta_sab_proto;
+            ta_mod.active_sharedarraybuffer_ctor = saved_ta_sab_ctor;
+            ta_mod.active_dataview_proto = saved_ta_dv_proto;
+            ta_mod.active_typedarray_proto = saved_ta_ta_proto;
+            ta_mod.active_typedarray_ctor = saved_ta_ta_ctor;
+        }
+
         const transformed = isolate_mod.rewriteTemplateLiterals(self.arena, source) catch source;
         var p = parser_mod.Parser.init(transformed, self.arena);
         p.eval_code = true;
@@ -788,13 +838,87 @@ pub const BcVm = struct {
         // its objects are still the active thread-locals, then restore the primary
         // realm's thread-locals and tag the new realm's builtins (tagging reads no
         // thread-local state).
+        // ALSO capture the secondary realm's constructors/prototypes from the
+        // active thread-locals (currently pointing at the new realm), before
+        // snap.restore() resets them to the primary realm's values.
+        const ta_mod = @import("../runtime/builtins/typed_array.zig");
+        const sec_ab_ctor = ta_mod.active_arraybuffer_ctor;
+        const sec_sab_ctor = ta_mod.active_sharedarraybuffer_ctor;
+        const sec_ta_ctor = ta_mod.active_typedarray_ctor;
+        const sec_ta_proto = ta_mod.active_typedarray_proto;
+        const sec_ab_proto = ta_mod.active_arraybuffer_proto;
+        const sec_sab_proto = ta_mod.active_sharedarraybuffer_proto;
+        const sec_dv_proto = ta_mod.active_dataview_proto;
+        const sec_atomics = ta_mod.active_atomics;
         nr.captureIntrinsics();
         snap.restore();
         nr.tagNativeFunctions();
-        // Cross-realm: re-register prototype well-known symbol properties using
-        // the PRIMARY realm's well-known symbols (which are now restored by the
-        // snapshot). The secondary realm's init created its own symbols, so
-        // prototype lookups from the primary realm would miss.
+        // Cross-realm: make the secondary realm's well-known symbols *shared* with
+        // the primary realm by replacing the Symbol constructor's properties directly.
+        // Without this, a class defined via g.eval("get [Symbol.species]() { … }")
+        // uses the secondary realm's Symbol.species, which is a *different* symbol
+        // object than the primary realm's — so SpeciesConstructor lookups miss.
+        {
+            const sym_binding = nr.global_env.bindings.get("Symbol");
+            const sym_val = if (sym_binding) |b| b.value else Value{};
+            if (sym_val.bits != 0 and sym_val.unbox() == .object) {
+                const sym_obj = sym_val.toPtr().object;
+                // Direct-slot overwrite bypasses non-writable/non-configurable guard.
+                inline for (.{
+                    .{ "species", realm_mod.active_sym_species },
+                    .{ "iterator", realm_mod.active_sym_iterator },
+                    .{ "toStringTag", realm_mod.active_sym_to_string_tag },
+                    .{ "toPrimitive", realm_mod.active_sym_to_primitive },
+                }) |entry| {
+                    if (entry[1]) |primary_sym| {
+                        if (sym_obj.shape.key_to_slot.get(entry[0])) |slot| {
+                            if (slot < sym_obj.slots.items.len) {
+                                sym_obj.slots.items[slot] = primary_sym;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Re-register @@species, @@toStringTag, @@iterator on the secondary realm's
+        // prototypes/constructors using the PRIMARY realm's well-known symbols
+        // (restored above). The secondary realm's registerSymbols (called during
+        // Realm.init) wired these with its own (now-replaced) symbols, so primary
+        // realm lookups would still miss the old getter keys.
+        {
+            // Save primary realm's thread-local pointers
+            const saved_ta_proto = ta_mod.active_typedarray_proto;
+            const saved_ab_proto = ta_mod.active_arraybuffer_proto;
+            const saved_sab_proto = ta_mod.active_sharedarraybuffer_proto;
+            const saved_dv_proto = ta_mod.active_dataview_proto;
+            const saved_atomics = ta_mod.active_atomics;
+            const saved_ta_ctor = ta_mod.active_typedarray_ctor;
+            const saved_ab_ctor = ta_mod.active_arraybuffer_ctor;
+            const saved_sab_ctor = ta_mod.active_sharedarraybuffer_ctor;
+            // Swap to secondary realm's objects
+            ta_mod.active_typedarray_proto = sec_ta_proto;
+            ta_mod.active_arraybuffer_proto = sec_ab_proto;
+            ta_mod.active_sharedarraybuffer_proto = sec_sab_proto;
+            ta_mod.active_dataview_proto = sec_dv_proto;
+            ta_mod.active_atomics = sec_atomics;
+            ta_mod.active_typedarray_ctor = sec_ta_ctor;
+            ta_mod.active_arraybuffer_ctor = sec_ab_ctor;
+            ta_mod.active_sharedarraybuffer_ctor = sec_sab_ctor;
+            // registerSymbols reads the primary realm's well-known symbols (active_sym_*)
+            // and writes to whatever prototypes/constructors the thread-locals point at.
+            ta_mod.registerSymbols(self.arena) catch {};
+            // Restore primary realm's pointers
+            ta_mod.active_typedarray_proto = saved_ta_proto;
+            ta_mod.active_arraybuffer_proto = saved_ab_proto;
+            ta_mod.active_sharedarraybuffer_proto = saved_sab_proto;
+            ta_mod.active_dataview_proto = saved_dv_proto;
+            ta_mod.active_atomics = saved_atomics;
+            ta_mod.active_typedarray_ctor = saved_ta_ctor;
+            ta_mod.active_arraybuffer_ctor = saved_ab_ctor;
+            ta_mod.active_sharedarraybuffer_ctor = saved_sab_ctor;
+        }
+        // Re-register Array.prototype[@@iterator] with primary realm's symbol too
+        // (the existing fix above already does this via nr.array_prototype.setSym).
         if (realm_mod.active_sym_iterator) |symv| {
             nr.array_prototype.setSym(symv, try val_mod.makeNativeFunction(self.arena, @import("../runtime/builtins/es2015_collections.zig").nativeArrayValues)) catch {};
         }
