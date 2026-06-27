@@ -446,15 +446,24 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 > - `structuredClone` implemented (deep clone + cycle/identity; Symbol/Function
 >   throw TypeError — no DOMException; not in test262, smoke-verified).
 >
+> **Cleanup landed (2026-06-27):**
+> - **Integer-key ascending `ownKeys` enumeration** — `Shape.orderedKeys` lazy
+>   cache (integer indices ascending, then insertion order). Fixes
+>   `Object.groupBy/groupLength` (groupBy now 14/14) and corrects
+>   `Object.keys`/values/entries, for-in, JSON.stringify, `Reflect.ownKeys`,
+>   `Object.assign` engine-wide. Built-ins corpus unchanged otherwise (0 flips).
+> - **`async function*` generators + `for await...of`** — AWAIT-tagged suspend
+>   (enum-tail opcode, ordinals preserved), `buildAsyncGenerator` with promise
+>   next/return/throw + FIFO request queue + real `@@asyncIterator`, and
+>   for-await lowering via `__getAsyncIterator__`/`__asyncIterStep__`
+>   (AsyncFromSyncIterator fallback). `Array.fromAsync(asyncGen())` now yields the
+>   values. Smoke-verified (no async-gen tests in the local sparse corpus).
+>   Gaps: `return()` skips `try/finally`; async `yield*` delegation; `yield
+>   <promise>` operand not pre-awaited.
+>
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
 >   cannot test collection — coordinate with M19 ephemerons).
-> - `async function*` generators don't drive (for-await throws) — a pre-existing
->   incomplete language feature; makes an async-generator *source* to `fromAsync`
->   yield `[]` (non-generator async sources work).
-> - Engine-wide **integer-key ascending enumeration** in `ownKeys` (the 1 remaining
->   `Object.groupBy/groupLength` fail; also affects `Object.keys`/for-in/JSON —
->   a deliberate broad change worth doing for many suites at once).
 
 ### Milestone 18 — RegExp & Intl completeness  *(~1.5–2 mo)*
 - RegExp: Unicode property escapes, lookbehind, named groups, `/v` set notation, sticky/dotAll edge cases. Consider a proven backtracking + bytecode design.
