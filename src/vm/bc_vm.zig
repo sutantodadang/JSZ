@@ -3445,8 +3445,7 @@ pub const BcVm = struct {
             try val_mod.makeNumber(self.arena, 1), nec);
         _ = try gen_fn_ctor.defineOwnData("name",
             try val_mod.makeString(self.arena, "GeneratorFunction"), nec);
-        // ponytail: %GeneratorFunction% compile-from-string (new GeneratorFunction("body"))
-        // deferred; needs same parser integration as `new Function` in realm.zig.
+        try gen_fn_ctor.set("__call__", try val_mod.makeNativeFunction(self.arena, realm_m.nativeGeneratorFunctionCtor));
 
         // Cross-link constructor back-references.
         _ = try gen_proto.defineOwnData("constructor",
@@ -3499,6 +3498,7 @@ pub const BcVm = struct {
             try val_mod.makeNumber(self.arena, 1), nec);
         _ = try async_gen_fn_ctor.defineOwnData("name",
             try val_mod.makeString(self.arena, "AsyncGeneratorFunction"), nec);
+        try async_gen_fn_ctor.set("__call__", try val_mod.makeNativeFunction(self.arena, realm_m.nativeAsyncGeneratorFunctionCtor));
 
         // Cross-link constructor back-references.
         _ = try async_gen_proto.defineOwnData("constructor",

@@ -2309,18 +2309,13 @@ fn nativeNoop(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Val
     return val_mod.makeUndefined(arena);
 }
 
-fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    // `new Function(p1, …, pN, body)`: assemble `(function anonymous(p1,…){body})`
-    // and compile it through the eval bridge, returning the function value.
-    // ponytail: string args only (ToString of non-strings skipped); covers
-    // `new Function("a","return a")` and `new Function("return class … {}")`.
-    // Cross-realm: stamp the compiled function with the Realm of the `Function`
-    // ctor that was invoked (its [[Realm]], carried via the native side channel),
-    // captured up front because evalSource runs a nested VM that clears it.
+fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []const u8) anyerror!Value {
     const ctor_realm = val_mod.g_active_native_realm;
     if (active_context) |ctx| {
         var src = std.ArrayList(u8){};
-        try src.appendSlice(arena, "(function anonymous(");
+        try src.append(arena, '(');
+        try src.appendSlice(arena, keyword);
+        try src.appendSlice(arena, " anonymous(");
         if (args.len > 1) {
             for (args[0 .. args.len - 1], 0..) |a, i| {
                 if (i > 0) try src.append(arena, ',');
@@ -2344,6 +2339,18 @@ fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) a
         try JsObject.create(arena, active_function_proto);
     try o.set("__call__", try val_mod.makeNativeFunction(arena, nativeNoop));
     return val_mod.makeObject(arena, o);
+}
+
+fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return functionCtorImpl(arena, args, "function");
+}
+
+pub fn nativeGeneratorFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return functionCtorImpl(arena, args, "function*");
+}
+
+pub fn nativeAsyncGeneratorFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return functionCtorImpl(arena, args, "async function*");
 }
 
 // ---- Function.prototype.toString ----
