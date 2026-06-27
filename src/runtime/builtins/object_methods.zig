@@ -298,6 +298,18 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
         if (std.mem.eql(u8, key, "name"))   return val_mod.makeBool(arena, !entry.name_deleted);
         return val_mod.makeBool(arena, false);
     }
+    // bc_function: resolve to backing object (materializes it, adding own name/length/prototype
+    // for generators). Without this, hasOwnProperty always returns false for bc functions.
+    if (this_val.bits != 0 and this_val.unbox() == .bc_function) {
+        const realm_mod2 = @import("../realm.zig");
+        const ctx2 = realm_mod2.active_context orelse return val_mod.makeBool(arena, false);
+        const bobj = (try ctx2.backingObject(arena, this_val)) orelse return val_mod.makeBool(arena, false);
+        const key2: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
+            args[0].toPtr().string
+        else
+            (try coerceKey(arena, args[0])) orelse return val_mod.makeBool(arena, false);
+        return val_mod.makeBool(arena, bobj.hasOwn(key2));
+    }
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         return val_mod.makeBool(arena, false);
     }
@@ -721,8 +733,15 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
         }
         return val_mod.makeUndefined(arena);
     }
-    if (arg0_unboxed != .object) return val_mod.makeUndefined(arena);
-    const obj = args[0].toPtr().object;
+    // Functions are objects: resolve bc_function (and others) to their backing
+    // JsObject so Object.getOwnPropertyDescriptor(fn, 'name') etc. work.
+    // Same pattern as defineTarget() used by Object.defineProperty.
+    const obj: *JsObject = if (arg0_unboxed == .object)
+        args[0].toPtr().object
+    else blk: {
+        const ctx = realm_mod.active_context orelse return val_mod.makeUndefined(arena);
+        break :blk (try ctx.backingObject(arena, args[0])) orelse return val_mod.makeUndefined(arena);
+    };
 
     if (args.len < 2) return val_mod.makeUndefined(arena);
 

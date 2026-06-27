@@ -1297,6 +1297,12 @@ pub const BcVm = struct {
         }
         switch (callee_val.unbox()) {
             .bc_function => {
+                // Generators and async functions are not constructors (spec 15.5.2 / 15.6.2).
+                const cl = callee_val.toPtr().bc_function;
+                if (cl.func.is_generator or cl.func.is_async) {
+                    self.last_exception_value = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                    return "__js_exception__";
+                }
                 // W2 unification: real [[Construct]] for bc functions. The new
                 // object's prototype is the constructor's `.prototype`; the ctor
                 // runs synchronously with `this` bound to it; the result is the
@@ -1763,6 +1769,18 @@ pub const BcVm = struct {
             }
             return true; // non-own key — no-op, return true
         }
+        // bc_function: delete from its backing object (generators have own name/length/prototype
+        // with configurable:true). If the backing obj hasn't been materialized yet there are
+        // no own string-keyed props — fast-path true (same as before this change).
+        if (obj_val.bits != 0 and obj_val.unbox() == .bc_function) {
+            if (key_v.bits != 0 and key_v.unbox() == .symbol) return true;
+            const closure_d = obj_val.toPtr().bc_function;
+            if (closure_d.obj == null) return true; // nothing materialized yet — no own props
+            const bk: *JsObject = @ptrCast(@alignCast(closure_d.obj.?));
+            const key_str_d = try valueToStringArena(self.arena, key_v);
+            if (!bk.hasOwn(key_str_d)) return true; // not own
+            return bk.deleteOwn(key_str_d);
+        }
         if (obj_val.bits == 0 or obj_val.unbox() != .object) return true;
         const obj = obj_val.toPtr().object;
         if (obj.internal_kind == .proxy) {
@@ -2140,7 +2158,7 @@ pub const BcVm = struct {
 
     /// W2 unification: the lazily-created backing object for a bc function's own
     /// properties. Proto is Function.prototype so call/apply/bind resolve too.
-    fn closureBackingObj(self: *BcVm, closure: *BcClosure) !*JsObject {
+    pub fn closureBackingObj(self: *BcVm, closure: *BcClosure) !*JsObject {
         if (closure.obj) |op| return @ptrCast(@alignCast(op));
         const fn_proto = if (closure.func.is_generator) blk: {
             try self.ensureGeneratorChain();
@@ -2151,6 +2169,23 @@ pub const BcVm = struct {
         else
             try JsObject.create(self.arena, fn_proto);
         closure.obj = o;
+        // Own `name`, `length`, and `prototype` descriptors for generator functions.
+        // Eagerly defined here so Object.getOwnPropertyDescriptor works without a
+        // prior .prototype access (closurePrototype short-circuits via getOwn).
+        if (closure.func.is_generator) {
+            const nm_raw = closure.func.name orelse "";
+            const nm = if (std.mem.eql(u8, nm_raw, "__esm_dflt_fn__") or
+                std.mem.eql(u8, nm_raw, "__esm_dflt_gen__")) "default" else nm_raw;
+            const nec: @import("../object/object.zig").PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+            _ = try o.defineOwnData("name", try val_mod.makeString(self.arena, nm), nec);
+            _ = try o.defineOwnData("length", try val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity)), nec);
+            // .prototype: {writable:true, enumerable:false, configurable:false} (spec §15.5.3).
+            // ensureGeneratorChain() was already called above so gen_proto/async_gen_proto are live.
+            const inst_proto = if (closure.func.is_async) self.async_gen_proto.? else self.gen_proto.?;
+            const proto_obj = try JsObject.create(self.arena, inst_proto);
+            const pv = try val_mod.makeObject(self.arena, proto_obj);
+            _ = try o.defineOwnData("prototype", pv, .{ .writable = true, .enumerable = false, .configurable = false });
+        }
         return o;
     }
 
@@ -2167,7 +2202,8 @@ pub const BcVm = struct {
             const inst_proto = if (closure.func.is_async) self.async_gen_proto.? else self.gen_proto.?;
             const proto_obj = try JsObject.create(self.arena, inst_proto);
             const pv = try val_mod.makeObject(self.arena, proto_obj);
-            try o.set("prototype", pv);
+            // Spec §15.5.3: generator .prototype is {writable:true, enumerable:false, configurable:false}
+            _ = try o.defineOwnData("prototype", pv, .{ .writable = true, .enumerable = false, .configurable = false });
             return pv;
         }
         const proto_obj = if (self.heap) |heap|
