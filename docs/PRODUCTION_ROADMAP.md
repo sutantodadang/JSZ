@@ -461,21 +461,27 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 > - **async `yield*` delegation** — `yield*` inside an async generator delegates
 >   via the async-iterator protocol (awaits each step); sync iterables wrap as
 >   AsyncFromSyncIterator. (next-only; sent value/return/throw not forwarded.)
-> - **finally on a `return` completion** — `return` inside try/finally now runs
->   the finalizer(s), innermost-first, value pinned (was skipped engine-wide, for
->   every function + generator). Covers explicit `return` statements (incl. inside
->   sync/async generator bodies).
+> - **Completion-aware try/finally** — finally now runs on every completion
+>   (normal/return/throw/break/continue), validated against the real corpus
+>   (`language/statements/try` 78→94/201, zero regressions). END_FINALLY opcode +
+>   per-try completion register route normal/throw through one finally copy
+>   (re-raise chains to outer handlers); break/continue (incl. labeled) unwind +
+>   POP_TRY each crossed try and run its finalizer inline; a catch-less
+>   try/finally re-raises; a throwing/returning finalizer overrides the pending
+>   completion. (`finally` in a labeled *non-loop* block on break/continue: TODO.)
+> - **Generator/AsyncGenerator `.throw()` / `.return()`** — both now re-enter the
+>   suspended body so its try/catch/finally runs. `.return(v)` resumes with an
+>   internal return-completion sentinel (invisible to user `catch` via
+>   JMP_IF_RET_COMPL), converted back to `{value, done:true}` on escape.
+>   `for await` 94/94 runnable.
 >
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
 >   cannot test collection — coordinate with M19 ephemerons).
-> - **Completion-aware try/finally refactor**: the external `.return()`/`.throw()`
->   iterator methods inject a completion at a suspended yield but do not re-enter
->   the coroutine, so the body's catch/finally don't run; `throw`/`break`/
->   `continue` through `finally`, and an exception escaping a catch-less
->   `try/finally`, also need separate-finally-block + completion dispatch (the
->   inline-finally bytecode conflates catch/finally). Do deliberately with the
->   `language/statements/try` corpus.
+> - `yield*` does not forward sent value / `return` / `throw` to the inner iterator
+>   (`expressions/yield` star-* fails); async-gen `yield <promise>` not pre-awaited.
+> - `%AsyncGeneratorPrototype%` structural exactness (@@toStringTag, constructor,
+>   method `length`/`name`/prop-desc) — descriptor lever, like M15 TypedArrays.
 > - async generator `yield <promise>` operand not pre-awaited; async `yield*`
 >   does not forward sent value / return / throw to the inner iterator.
 
