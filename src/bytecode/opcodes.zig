@@ -232,6 +232,14 @@ pub const Op = enum(u8) {
     PUSH_WITH,
     /// POP_WITH | 1 | op. Pop the innermost with-object off the frame stack.
     POP_WITH,
+    /// W2-asyncgen: AWAIT — op, Rval u8 (2 bytes). Identical suspend mechanics to
+    /// YIELD, but flags the suspend as an `await` (not a `yield`) so the async
+    /// generator driver resumes internally on settle instead of producing a
+    /// result to the consumer. Emitted only inside `async function*` bodies; plain
+    /// async functions keep using YIELD (their driver treats every suspend as
+    /// await). Appended at the enum tail so existing opcode ordinals (pinned by
+    /// the JIT int-subset contract test) are unchanged.
+    AWAIT,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -316,6 +324,7 @@ pub fn instrSize(op: Op) usize {
         .TAIL_CALL => 4,
         .DEBUGGER => 1,
         .YIELD => 2,
+        .AWAIT => 2,
         .TAIL_METHOD_CALL => 4,
         .DEFINE_ACCESSOR => 6,
         .DEFINE_ACCESSOR_DYN => 5,

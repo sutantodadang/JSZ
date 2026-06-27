@@ -543,7 +543,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         {
             const b = self.allocReg();
             self.sp = b;
-            const gi = try self.builder.addConstant(try val_mod.makeString(self.arena, "__getIterator__"));
+            const gi = try self.builder.addConstant(try val_mod.makeString(self.arena, if (fo.is_await) "__getAsyncIterator__" else "__getIterator__"));
             try self.emitOp(.GET_GLOBAL, line);
             try self.emitU8(b);
             try self.emitU16(@intCast(gi));
@@ -567,7 +567,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         const loop_start = self.currentOffset();
         {
             const b = self.allocReg();
-            const si = try self.builder.addConstant(try val_mod.makeString(self.arena, "__iterStep__"));
+            const si = try self.builder.addConstant(try val_mod.makeString(self.arena, if (fo.is_await) "__asyncIterStep__" else "__iterStep__"));
             try self.emitOp(.GET_GLOBAL, line);
             try self.emitU8(b);
             try self.emitU16(@intCast(si));
@@ -579,6 +579,14 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             try self.emitU8(b);
             try self.emitU8(1);
             try self.emitU8(rstep);
+            // for-await: __asyncIterStep__ returns a promise of {value,done};
+            // await it so rstep holds the resolved result. The suspend writes the
+            // resolved value back into R[rstep]. AWAIT inside an async generator,
+            // YIELD inside a plain async function.
+            if (fo.is_await) {
+                try self.emitOp(if (self.is_async_generator) .AWAIT else .YIELD, line);
+                try self.emitU8(rstep);
+            }
             self.sp = iter_sp;
         }
         // if (rstep.done) exit

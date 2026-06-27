@@ -972,8 +972,11 @@ pub fn parseDoWhileStmt(p: *Parser) ?*Node {
 pub fn parseForStmt(p: *Parser) ?*Node {
     const start = p.current.start;
     _ = p.advance(); // consume 'for'
-    // `for await (... of ...)`: consume 'await', treat as regular for-of.
+    // `for await (... of ...)`: consume 'await' and remember it so the for-of is
+    // lowered to the async-iterator protocol (awaiting each step).
+    var for_await = false;
     if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await")) {
+        for_await = true;
         _ = p.advance();
     }
     _ = p.expect(.left_paren) orelse return null;
@@ -1002,7 +1005,7 @@ pub fn parseForStmt(p: *Parser) ?*Node {
             .var_decl = .{ .kind = .let, .name = name, .init = null },
         }) orelse return null;
         return p.makeNode(.for_in_stmt, start, p.current.start, .{
-            .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = true },
+            .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = true, .is_await = for_await },
         });
     }
 
@@ -1039,7 +1042,7 @@ pub fn parseForStmt(p: *Parser) ?*Node {
                     .var_decl = .{ .kind = decl_kind, .name = name_tok.value_str, .init = null },
                 }) orelse return null;
                 return p.makeNode(.for_in_stmt, start, p.current.start, .{
-                    .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = true },
+                    .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = true, .is_await = for_await },
                 });
             } else if (p.check(.eq) or p.check(.comma) or p.check(.semicolon)) {
                 // Normal for loop: for (var/let/const name = ...; ...)
@@ -1129,7 +1132,7 @@ pub fn parseForStmt(p: *Parser) ?*Node {
             _ = p.expect(.right_paren) orelse return null;
             const body = p.parseStatement() orelse return null;
             return p.makeNode(.for_in_stmt, start, p.current.start, .{
-                .for_in_stmt = .{ .left = expr, .right = right, .body = body, .iterate_values = true },
+                .for_in_stmt = .{ .left = expr, .right = right, .body = body, .iterate_values = true, .is_await = for_await },
             });
         }
         // Normal for: consume remaining of init expr (may be comma-separated)

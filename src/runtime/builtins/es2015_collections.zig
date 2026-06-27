@@ -1777,6 +1777,77 @@ pub fn nativeIterStep(arena: std.mem.Allocator, _: Value, args: []const Value) a
     return function_proto.invokeCallback(arena, it, nx, &[_]Value{});
 }
 
+/// __getAsyncIterator__(x): obtain an async iterator for `for await`. Uses the
+/// object's @@asyncIterator method if present; otherwise wraps the sync
+/// @@iterator as an AsyncFromSyncIterator (each step settled as a promise).
+pub fn nativeGetAsyncIterator(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const x = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (x.bits != 0 and x.unbox() == .object) {
+        if (realm_mod.active_context) |ctx| {
+            if (realm_mod.active_sym_async_iterator) |sym| {
+                const m = ctx.getPropSym(arena, x, sym) catch Value{};
+                if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+                    if (!isCallable(m)) {
+                        realm_mod.pending_exception = try makeTypeErrorVal(arena, "Symbol.asyncIterator is not a function");
+                        return error.JsException;
+                    }
+                    const it = try function_proto.invokeCallback(arena, x, m, &[_]Value{});
+                    if (it.bits == 0 or it.unbox() != .object) {
+                        realm_mod.pending_exception = try makeTypeErrorVal(arena, "@@asyncIterator() did not return an object");
+                        return error.JsException;
+                    }
+                    return it;
+                }
+            }
+        }
+    }
+    // No @@asyncIterator: wrap the sync iterator (AsyncFromSyncIterator).
+    const sync_it = try nativeGetIterator(arena, Value{}, args);
+    const wrap = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    try wrap.set("__syncit__", sync_it);
+    try wrap.set("next", try val_mod.makeNativeFunction(arena, nativeAsyncFromSyncNext));
+    return val_mod.makeObject(arena, wrap);
+}
+
+/// next() of an AsyncFromSyncIterator: step the underlying sync iterator and
+/// hand back a settled promise of the {value,done} result.
+fn nativeAsyncFromSyncNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const promise_mod = @import("promise.zig");
+    const p = try promise_mod.newPendingPromise(arena);
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
+        const sync_it = this_val.toPtr().object.get("__syncit__") orelse Value{};
+        const result = nativeIterStep(arena, Value{}, &.{sync_it}) catch {
+            promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+            return p;
+        };
+        // AsyncFromSyncIteratorContinuation: await the produced value so a sync
+        // iterable of promises yields resolved values (`for await (x of [p])`).
+        if (result.bits != 0 and result.unbox() == .object) {
+            const robj = result.toPtr().object;
+            if (robj.get("value")) |val| {
+                const awaited = promise_mod.awaitValue(arena, val) catch val;
+                try robj.set("value", awaited);
+            }
+        }
+        promise_mod.settleResult(arena, p, result, true);
+    } else {
+        promise_mod.settleResult(arena, p, try makeIteratorResult(arena, try val_mod.makeUndefined(arena), true), true);
+    }
+    return p;
+}
+
+/// __asyncIterStep__(it): call it.next() and return the resulting promise (the
+/// for-await lowering awaits it to obtain the {value,done} result).
+pub fn nativeAsyncIterStep(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const it = if (args.len > 0) args[0] else return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    if (it.bits == 0 or it.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const nx = it.toPtr().object.get("next") orelse return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    return function_proto.invokeCallback(arena, it, nx, &[_]Value{});
+}
+
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
     // Use the realm's TypeError.prototype so `err instanceof TypeError` and
     // `err.constructor === TypeError` hold (assert.throws relies on both).

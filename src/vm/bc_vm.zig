@@ -91,6 +91,10 @@ pub const BcGeneratorState = struct {
     executing: bool = false,
     /// Register that receives the value passed to .next(v) on resume.
     resume_reg: u8 = 0,
+    /// W2-asyncgen: set by the suspend op — true if the last suspend was an
+    /// `await` (AWAIT op), false if a `yield` (YIELD op). Only the async
+    /// generator driver consults it; plain generators/async ignore it.
+    last_suspend_await: bool = false,
 };
 
 /// W2-async: how to resume a suspended coroutine.
@@ -118,6 +122,31 @@ pub const AsyncCtx = struct {
     state: *BcGeneratorState,
     /// The pending result promise returned to the caller.
     result: Value,
+};
+
+/// W2-asyncgen: one queued request against an async generator. Each `.next(v)`,
+/// `.return(v)`, or `.throw(e)` enqueues one of these; its `promise` is the
+/// value returned to the caller and is settled when the request completes.
+pub const AsyncGenRequest = struct {
+    /// How to resume the coroutine when this request runs.
+    kind: ResumeKind,
+    /// `.return(v)`: force completion with this value instead of resuming.
+    is_return: bool = false,
+    return_val: Value = Value{},
+    /// The pending promise handed back to the caller for this request.
+    promise: Value,
+};
+
+/// W2-asyncgen: state for one async generator object. Holds the coroutine and a
+/// FIFO request queue (per AsyncGeneratorQueue); `running` is true while a
+/// request is being driven (including across internal awaits).
+pub const AsyncGenCtx = struct {
+    vm: *BcVm,
+    state: *BcGeneratorState,
+    queue: std.ArrayListUnmanaged(AsyncGenRequest) = .empty,
+    running: bool = false,
+    /// The promise of the request currently in flight (valid while `running`).
+    cur_promise: Value = Value{},
 };
 
 pub const RunOutcome = union(enum) {
@@ -244,6 +273,7 @@ pub const BcVm = struct {
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
                 // Arrows ignore the provided `this` and use their captured lexical one.
                 const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
+                if (fn_ptr.is_async and fn_ptr.is_generator) return try self.buildAsyncGenerator(fn_ptr, def_env, eff_this, args);
                 if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, eff_this, args);
                 if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, eff_this, args);
                 // Eval code shares the calling/global VariableEnvironment directly
@@ -1153,6 +1183,7 @@ pub const BcVm = struct {
                 .RETURN_UNDEF => if (try call_ops.opReturnUndef(self, frame)) |o| return o,
                 .HALT => if (try call_ops.opHalt(self, frame)) |o| return o,
                 .YIELD => if (try call_ops.opYield(self, frame)) |o| return o,
+                .AWAIT => if (try call_ops.opAwait(self, frame)) |o| return o,
                 .DEBUGGER => if (try call_ops.opDebugger(self, frame)) |o| return o,
                 .NEW_OBJECT => if (try object_ops.opNewObject(self, frame)) |o| return o,
                 .NEW_ARRAY => if (try object_ops.opNewArray(self, frame)) |o| return o,
@@ -1392,6 +1423,13 @@ pub const BcVm = struct {
                 // An arrow ignores the caller-provided `this` and uses the `this`
                 // captured at its definition site.
                 const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
+                if (fn_ptr.is_async and fn_ptr.is_generator) {
+                    var agargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| agargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                    const ag = try self.buildAsyncGenerator(fn_ptr, def_env, eff_this, agargs);
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = ag;
+                    return null;
+                }
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
@@ -2578,6 +2616,13 @@ pub const BcVm = struct {
 
                 // W2-async: an async function call runs as a coroutine and
                 // returns a pending Promise.
+                if (fn_ptr.is_async and fn_ptr.is_generator) {
+                    var agargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| agargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                    const ag = try self.buildAsyncGenerator(fn_ptr, def_env, this_val_eff, agargs);
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = ag;
+                    return null;
+                }
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
@@ -2863,6 +2908,13 @@ pub const BcVm = struct {
                 // An arrow ignores the receiver, using its captured lexical `this`.
                 const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else this_val;
 
+                if (fn_ptr.is_async and fn_ptr.is_generator) {
+                    var agargs = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| agargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
+                    const ag = try self.buildAsyncGenerator(fn_ptr, def_env, this_val_eff, agargs);
+                    self.frames.items[self.frames.items.len - 1].registers[ret_dst] = ag;
+                    return null;
+                }
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
@@ -3282,6 +3334,102 @@ pub const BcVm = struct {
         }
     }
 
+    // -------------------------------------------------------- W2-asyncgen driver ---
+
+    /// Create an async generator object for an `async function*` call. The body
+    /// runs lazily, driven by `.next()`/`.return()`/`.throw()` which each return
+    /// a promise of an iterator result.
+    fn buildAsyncGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value) !Value {
+        const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
+        const agc = try self.arena.create(AsyncGenCtx);
+        agc.* = .{ .vm = self, .state = state };
+
+        const obj = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        obj.internal_kind = .async_generator;
+        obj.internal_slot = agc;
+        try obj.set("next", try val_mod.makeNativeFunction(self.arena, nativeAsyncGenNext));
+        try obj.set("return", try val_mod.makeNativeFunction(self.arena, nativeAsyncGenReturn));
+        try obj.set("throw", try val_mod.makeNativeFunction(self.arena, nativeAsyncGenThrow));
+        const self_iter = try val_mod.makeNativeFunction(self.arena, nativeGenSelfIter);
+        // String-key convention used by the for-await helper fallback.
+        try obj.set("@@asyncIterator", self_iter);
+        const ag_val = try val_mod.makeObject(self.arena, obj);
+        // Register the real well-known symbol so `obj[Symbol.asyncIterator]` and
+        // GetMethod(obj, @@asyncIterator) (Array.fromAsync) resolve to it.
+        const realm_m = @import("../runtime/realm.zig");
+        if (realm_m.active_sym_async_iterator) |sym| try self.setPropSym(ag_val, sym, self_iter);
+        return ag_val;
+    }
+
+    /// Settle the in-flight request's promise with an iterator result (or reject
+    /// it), mark the request done, and start the next queued request.
+    fn asyncGenComplete(self: *BcVm, agc: *AsyncGenCtx, value: Value, done: bool, is_error: bool) !void {
+        const promise_mod = @import("../runtime/builtins/promise.zig");
+        if (is_error) {
+            promise_mod.settleResult(self.arena, agc.cur_promise, value, false);
+        } else {
+            const res = try self.makeGenIterResult(value, done);
+            promise_mod.settleResult(self.arena, agc.cur_promise, res, true);
+        }
+        agc.running = false;
+        try self.pumpAsyncGen(agc);
+    }
+
+    /// Start the next queued request if the generator is idle.
+    fn pumpAsyncGen(self: *BcVm, agc: *AsyncGenCtx) anyerror!void {
+        if (agc.running) return;
+        if (agc.queue.items.len == 0) return;
+        const req = agc.queue.orderedRemove(0);
+        agc.running = true;
+        agc.cur_promise = req.promise;
+
+        if (req.is_return) {
+            agc.state.done = true;
+            try self.asyncGenComplete(agc, req.return_val, true, false);
+            return;
+        }
+        if (agc.state.done) {
+            // Resuming a completed generator: .next → {undefined,true};
+            // .throw → reject with the thrown value.
+            switch (req.kind) {
+                .next => try self.asyncGenComplete(agc, try val_mod.makeUndefined(self.arena), true, false),
+                .throw_ => |e| try self.asyncGenComplete(agc, e, true, true),
+            }
+            return;
+        }
+        try self.driveAsyncGen(agc, req.kind);
+    }
+
+    /// Resume the coroutine once and react: an internal `await` subscribes and
+    /// resumes later; a `yield` settles the current request; completion/throw
+    /// finishes it.
+    fn driveAsyncGen(self: *BcVm, agc: *AsyncGenCtx, kind: ResumeKind) anyerror!void {
+        const promise_mod = @import("../runtime/builtins/promise.zig");
+        const res = try self.runSuspendable(agc.state, kind);
+        switch (res) {
+            .returned => |v| try self.asyncGenComplete(agc, v, true, false),
+            .threw => |e| {
+                agc.state.done = true;
+                try self.asyncGenComplete(agc, e, true, true);
+            },
+            .yielded => |v| {
+                if (agc.state.last_suspend_await) {
+                    // Internal await: subscribe and resume the coroutine when the
+                    // awaited value settles. The request stays in flight.
+                    const on_f = try val_mod.makeNativeFunctionData(self.arena, asyncGenOnFulfill, agc);
+                    const on_r = try val_mod.makeNativeFunctionData(self.arena, asyncGenOnReject, agc);
+                    try promise_mod.subscribeAwait(self.arena, v, on_f, on_r);
+                } else {
+                    // A real `yield`: produce {value, done:false} to the consumer.
+                    try self.asyncGenComplete(agc, v, false, false);
+                }
+            },
+        }
+    }
+
     /// ToPrimitive that also coerces function operands. Functions are callable
     /// objects: their own props (e.g. a user-assigned `valueOf`) plus
     /// Function.prototype.toString live on a lazily-materialized backing object,
@@ -3529,6 +3677,67 @@ fn asyncOnReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
     const actx = asyncCtxFromActive() orelse return val_mod.makeUndefined(arena);
     const e = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try actx.vm.driveAsync(actx, .{ .throw_ = e });
+    return val_mod.makeUndefined(arena);
+}
+
+// ------------------------------------------------------------- W2-asyncgen natives ---
+
+fn asyncGenCtxFrom(this_val: Value) ?*AsyncGenCtx {
+    if (this_val.bits == 0 or this_val.unbox() != .object) return null;
+    const obj = this_val.toPtr().object;
+    if (obj.internal_kind != .async_generator) return null;
+    if (obj.internal_slot) |slot| return @ptrCast(@alignCast(slot));
+    return null;
+}
+
+/// Enqueue a request and (if idle) start pumping; always returns the request's
+/// promise immediately.
+fn asyncGenEnqueue(arena: std.mem.Allocator, agc: *AsyncGenCtx, req_kind: ResumeKind, is_return: bool, ret_val: Value) anyerror!Value {
+    const promise_mod = @import("../runtime/builtins/promise.zig");
+    const p = try promise_mod.newPendingPromise(arena);
+    try agc.queue.append(agc.vm.arena, .{
+        .kind = req_kind,
+        .is_return = is_return,
+        .return_val = ret_val,
+        .promise = p,
+    });
+    try agc.vm.pumpAsyncGen(agc);
+    return p;
+}
+
+fn nativeAsyncGenNext(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const agc = asyncGenCtxFrom(this_val) orelse return error.JsException;
+    const sent = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    return asyncGenEnqueue(arena, agc, .{ .next = sent }, false, Value{});
+}
+
+fn nativeAsyncGenReturn(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const agc = asyncGenCtxFrom(this_val) orelse return error.JsException;
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    return asyncGenEnqueue(arena, agc, .{ .next = v }, true, v);
+}
+
+fn nativeAsyncGenThrow(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const agc = asyncGenCtxFrom(this_val) orelse return error.JsException;
+    const e = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    return asyncGenEnqueue(arena, agc, .{ .throw_ = e }, false, Value{});
+}
+
+/// Internal await fulfilled: resume the coroutine with the resolved value.
+fn asyncGenOnFulfill(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const agc: *AsyncGenCtx = @ptrCast(@alignCast(slot));
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    try agc.vm.driveAsyncGen(agc, .{ .next = v });
+    return val_mod.makeUndefined(arena);
+}
+
+/// Internal await rejected: throw the reason at the suspended await point.
+fn asyncGenOnReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const agc: *AsyncGenCtx = @ptrCast(@alignCast(slot));
+    const e = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    try agc.vm.driveAsyncGen(agc, .{ .throw_ = e });
     return val_mod.makeUndefined(arena);
 }
 

@@ -89,6 +89,10 @@ pub const FnCompiler = struct {
     /// W2-async: is this an async function body? When true, `__await__(x)`
     /// compiles to a YIELD suspend instead of a synchronous native call.
     is_async: bool = false,
+    /// W2-asyncgen: is this an `async function*` body? When true, `await`
+    /// suspends via AWAIT (not YIELD) so the async-generator driver can tell an
+    /// await apart from a yield. `yield` always uses YIELD.
+    is_async_generator: bool = false,
     /// M14: this function literal is an arrow (no own `arguments`/`this`).
     is_arrow: bool = false,
     /// M14: the body read an identifier named `arguments`. Combined with
@@ -1402,7 +1406,9 @@ pub const FnCompiler = struct {
             std.mem.eql(u8, c.callee.data.identifier, "__await__") and c.args.len == 1)
         {
             const r = try self.compileExpr(c.args[0]);
-            try self.emitOp(.YIELD, line);
+            // Async generators tag awaits as AWAIT so the driver distinguishes
+            // them from yields; plain async functions keep YIELD.
+            try self.emitOp(if (self.is_async_generator) .AWAIT else .YIELD, line);
             try self.emitU8(r);
             return r;
         }
@@ -1868,6 +1874,7 @@ pub fn compileFunctionStrict(
     fc.nfe_name = nfe_name;
     fc.is_strict = is_strict;
     fc.is_async = is_async;
+    fc.is_async_generator = is_async and is_generator;
     fc.is_arrow = is_arrow;
 
     // Phase 2: all variable access is env-based (GET_GLOBAL/SET_GLOBAL).

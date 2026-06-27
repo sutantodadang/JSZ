@@ -170,7 +170,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d} R{d}", .{ rdst, rsrc });
         },
-        .YIELD => {
+        .YIELD, .AWAIT => {
             const r = code[new_pc];
             new_pc += 1;
             try writer.print(" R{d}", .{r});
