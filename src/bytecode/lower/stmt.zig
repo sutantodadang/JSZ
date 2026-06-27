@@ -219,7 +219,7 @@ pub fn lowerWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     // Save the completion value at the start of this iteration so a
     // `continue` (an empty completion) can revert to it.
     try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
     try self.compileStmt(ws.body, last_expr_reg);
 
     // Jump back to loop start (continue lands here too: re-eval cond).
@@ -243,7 +243,7 @@ pub fn lowerDoWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) err
     const loop_start = self.currentOffset();
 
     try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
     try self.compileStmt(dw.body, last_expr_reg);
 
     // continue in a do-while jumps to the condition test.
@@ -303,7 +303,7 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     }
 
     try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
     try self.compileStmt(fs.body, last_expr_reg);
 
     // continue in a for-loop runs the update expression, then re-tests.
@@ -349,13 +349,13 @@ pub fn lowerReturnStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
             const r = try self.compileExpr(rv_node);
             // Run any enclosing finally blocks before returning (the value in `r`
             // is pinned across them). No-op when not inside a try/finally.
-            try runPendingFinally(self, r, line);
+            try runPendingFinally(self, r, 0, line);
             try self.emitOp(.RETURN, line);
             try self.emitU8(r);
             self.freeReg();
         }
     } else {
-        try runPendingFinally(self, null, line);
+        try runPendingFinally(self, null, 0, line);
         try self.emitOp(.RETURN_UNDEF, line);
     }
 }
@@ -378,79 +378,150 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     self.try_depth += 1;
     defer self.try_depth -= 1;
 
-    // A `return` inside the try/catch bodies must run this finalizer first.
-    // Registered while those bodies compile; popped before the finalizer's own
-    // body (so a `return` within `finally` does not re-run it).
-    if (ts.finalizer) |fin| try self.finally_stack.append(self.arena, fin);
+    // --- try/catch with NO finally: a single exception handler. ---
+    if (ts.finalizer == null) {
+        const rexc: u8 = if (ts.handler != null) blk: {
+            const r = self.allocReg();
+            self.freeReg(); // PUSH_TRY reserves it
+            break :blk r;
+        } else 0xFF;
+        try self.emitOp(.PUSH_TRY, line);
+        try self.emitU8(rexc);
+        const push_try_patch = self.currentOffset();
+        try self.emitI16(0);
+        // A `return`/`break`/`continue` inside the try body must POP_TRY this
+        // handler on the way out (null = no finalizer to run). The catch body is
+        // not protected by it, so it is popped before the catch compiles.
+        try self.finally_stack.append(self.arena, null);
+        self.sp = saved_sp;
+        try self.compileStmt(ts.block, last_expr_reg);
+        self.sp = saved_sp;
+        _ = self.finally_stack.pop();
+        try self.emitOp(.POP_TRY, line);
+        try self.emitOp(.JMP, line);
+        const jmp_end = self.currentOffset();
+        try self.emitI16(0);
+        const catch_offset = self.currentOffset();
+        self.patchJump(push_try_patch, catch_offset);
+        if (ts.handler) |handler| {
+            if (handler.param_name.len > 0)
+                try self.emitDefine(handler.param_name, rexc, line);
+            self.sp = saved_sp;
+            try self.compileStmt(handler.body, last_expr_reg);
+            self.sp = saved_sp;
+        }
+        self.patchJump(jmp_end, self.currentOffset());
+        return;
+    }
 
-    // Allocate a register to receive the caught exception value.
-    const rexc: u8 = if (ts.handler != null) blk: {
-        const r = self.allocReg();
-        self.freeReg(); // don't actually consume it yet — PUSH_TRY reserves it
-        break :blk r;
-    } else 0xFF; // 0xFF = no catch
+    // --- try WITH finally: route normal + throw completions through one finally
+    // copy via a completion register (rct: 0=normal, 2=throw; rcv = value to
+    // re-raise). END_FINALLY re-raises on throw, chaining to the next outer
+    // handler. `return` runs the finalizer inline at the return site
+    // (finally_stack); a `return`/`throw` inside the finalizer overrides the
+    // pending completion because it executes before END_FINALLY.
+    const fin = ts.finalizer.?;
+    const rct = self.allocReg(); // completion type
+    const rcv = self.allocReg(); // completion value (exception)
+    const body_sp = self.sp;
+    const k_normal = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 0));
+    const k_throw = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 2));
 
-    // Emit PUSH_TRY with placeholder handler offset.
+    try self.finally_stack.append(self.arena, fin);
+
+    // An exception in the try body lands in rcv.
     try self.emitOp(.PUSH_TRY, line);
-    try self.emitU8(rexc);
+    try self.emitU8(rcv);
     const push_try_patch = self.currentOffset();
-    try self.emitI16(0); // placeholder: offset to catch/finally handler
+    try self.emitI16(0);
 
-    // Compile try block body.
-    self.sp = saved_sp;
+    self.sp = body_sp;
     try self.compileStmt(ts.block, last_expr_reg);
-    self.sp = saved_sp;
-
-    // Normal exit: POP_TRY, then JMP to finally (or end).
+    self.sp = body_sp;
+    // try body completed normally
     try self.emitOp(.POP_TRY, line);
+    try self.emitOp(.LOAD_K, line);
+    try self.emitU8(rct);
+    try self.emitI16(@intCast(k_normal));
     try self.emitOp(.JMP, line);
-    const jmp_to_finally_patch = self.currentOffset();
-    try self.emitI16(0); // placeholder: jump to finally
+    const jmp_norm = self.currentOffset();
+    try self.emitI16(0);
 
-    // --- Catch handler starts here ---
-    const catch_offset = self.currentOffset();
-    self.patchJump(push_try_patch, catch_offset);
-
+    // --- exception handler ---
+    const handler_offset = self.currentOffset();
+    self.patchJump(push_try_patch, handler_offset);
+    var jmp_catch_norm: ?usize = null;
     if (ts.handler) |handler| {
-        // Bind catch param: DEFINE_GLOBAL "name", Rexc (always defines, never strict-throws).
-        // An empty param_name is an optional catch binding (`catch { ... }`) — no binding.
         if (handler.param_name.len > 0)
-            try self.emitDefine(handler.param_name, rexc, line);
-        // Compile catch body.
-        self.sp = saved_sp;
+            try self.emitDefine(handler.param_name, rcv, line);
+        // The catch body is itself protected by the finally.
+        try self.emitOp(.PUSH_TRY, line);
+        try self.emitU8(rcv);
+        const catch_try_patch = self.currentOffset();
+        try self.emitI16(0);
+        self.sp = body_sp;
         try self.compileStmt(handler.body, last_expr_reg);
-        self.sp = saved_sp;
+        self.sp = body_sp;
+        try self.emitOp(.POP_TRY, line);
+        try self.emitOp(.LOAD_K, line);
+        try self.emitU8(rct);
+        try self.emitI16(@intCast(k_normal));
+        try self.emitOp(.JMP, line);
+        jmp_catch_norm = self.currentOffset();
+        try self.emitI16(0);
+        // catch threw → rcv holds the new exception
+        const catch_handler_offset = self.currentOffset();
+        self.patchJump(catch_try_patch, catch_handler_offset);
+        try self.emitOp(.LOAD_K, line);
+        try self.emitU8(rct);
+        try self.emitI16(@intCast(k_throw));
+        // fall through to finally
+    } else {
+        // No catch: the exception in rcv propagates after the finally.
+        try self.emitOp(.LOAD_K, line);
+        try self.emitU8(rct);
+        try self.emitI16(@intCast(k_throw));
+        // fall through to finally
     }
 
-    // --- Finally block (or end) ---
+    // --- finally ---
     const finally_offset = self.currentOffset();
-    self.patchJump(jmp_to_finally_patch, finally_offset);
-
-    if (ts.finalizer) |fin| {
-        _ = self.finally_stack.pop(); // out of the protected region now
-        try self.compileStmt(fin, last_expr_reg);
-        self.sp = saved_sp;
-    }
+    self.patchJump(jmp_norm, finally_offset);
+    if (jmp_catch_norm) |jc| self.patchJump(jc, finally_offset);
+    _ = self.finally_stack.pop(); // out of the protected region
+    self.sp = body_sp;
+    try self.compileStmt(fin, last_expr_reg);
+    self.sp = body_sp;
+    try self.emitOp(.END_FINALLY, line);
+    try self.emitU8(rct);
+    try self.emitU8(rcv);
+    self.sp = saved_sp;
 }
 
-/// Compile each pending finalizer inline (innermost first) ahead of an abrupt
-/// `return`, so try/finally runs on a return completion. `rv_reg` (if any) is
-/// pinned by keeping `sp` above it so finalizer code cannot clobber the return
-/// value. A `return` within a finalizer sees only the outer finalizers.
-pub fn runPendingFinally(self: *FnCompiler, rv_reg: ?u8, line: u32) error{OutOfMemory}!void {
-    _ = line;
+/// Unwind the open try-blocks from the top of `finally_stack` down to `floor`
+/// ahead of an abrupt completion (`return`/`break`/`continue`): POP_TRY each
+/// crossed try (so its runtime handler is removed) and run its finalizer inline,
+/// innermost-first. `rv_reg` (if any) is pinned by keeping `sp` above it so a
+/// finalizer cannot clobber the return value. A `return`/`break`/`continue`
+/// within a finalizer sees only the still-outer try-blocks.
+pub fn runPendingFinally(self: *FnCompiler, rv_reg: ?u8, floor: usize, line: u32) error{OutOfMemory}!void {
     var i = self.finally_stack.items.len;
-    while (i > 0) {
+    while (i > floor) {
         i -= 1;
         const fin = self.finally_stack.items[i];
-        const saved_len = self.finally_stack.items.len;
-        self.finally_stack.items.len = i; // only outer finalizers stay active
-        const saved_sp = self.sp;
-        if (rv_reg) |r| self.sp = r + 1; // pin the return value
-        var dummy: ?u8 = null;
-        try self.compileStmt(fin, &dummy);
-        self.sp = saved_sp;
-        self.finally_stack.items.len = saved_len;
+        // Remove this try's runtime handler; the finalizer (and the completion)
+        // run outside its protection.
+        try self.emitOp(.POP_TRY, line);
+        if (fin) |fnode| {
+            const saved_len = self.finally_stack.items.len;
+            self.finally_stack.items.len = i; // only outer try-blocks stay active
+            const saved_sp = self.sp;
+            if (rv_reg) |r| self.sp = r + 1; // pin the return value
+            var dummy: ?u8 = null;
+            try self.compileStmt(fnode, &dummy);
+            self.sp = saved_sp;
+            self.finally_stack.items.len = saved_len;
+        }
     }
 }
 
@@ -466,6 +537,7 @@ pub fn lowerBreakStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             li -= 1;
             if (self.loop_stack.items[li].label) |l| {
                 if (std.mem.eql(u8, l, lname)) {
+                    try runPendingFinally(self, null, self.loop_stack.items[li].finally_depth, line);
                     try self.emitExitScopesTo(self.loop_stack.items[li].scope_depth, line);
                     try self.emitOp(.JMP, line);
                     const patch = self.currentOffset();
@@ -496,6 +568,7 @@ pub fn lowerBreakStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         try self.emitI16(0);
     } else if (self.loop_stack.items.len > 0) {
         const ti = self.loop_stack.items.len - 1;
+        try runPendingFinally(self, null, self.loop_stack.items[ti].finally_depth, line);
         try self.emitExitScopesTo(self.loop_stack.items[ti].scope_depth, line);
         try self.emitOp(.JMP, line);
         const patch = self.currentOffset();
@@ -541,9 +614,10 @@ pub fn lowerContinueStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
             }
         }
     }
-    // Unwind any block scopes opened inside the loop body before jumping to the
-    // loop's continue target.
+    // Run (and POP_TRY) any try-blocks opened inside the loop, then unwind block
+    // scopes, before jumping to the loop's continue target.
     if (target_idx) |ti| {
+        try runPendingFinally(self, null, self.loop_stack.items[ti].finally_depth, line);
         try self.emitExitScopesTo(self.loop_stack.items[ti].scope_depth, line);
     }
     try self.emitOp(.JMP, line);
@@ -675,7 +749,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         // __iterStep__) before the next done-check. scope_depth is the depth
         // *outside* the per-iteration scope so break/continue unwind it.
         try self.saveLoopPrev(prev_reg, line);
-        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = outer_depth });
+        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = outer_depth, .finally_depth = self.finally_stack.items.len });
         try self.compileStmt(fo.body, last_expr_reg);
         if (is_lexical_loopvar) {
             try self.emitOp(.EXIT_SCOPE, line);

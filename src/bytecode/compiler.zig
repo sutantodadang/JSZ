@@ -54,6 +54,9 @@ pub const LoopCtx = struct {
     /// `break`/`continue` emit EXIT_SCOPE for each block scope between the
     /// statement and this depth so the frame env is balanced on the jump.
     scope_depth: u32 = 0,
+    /// `finally_stack` length at loop entry. `break`/`continue` run (and POP_TRY)
+    /// each try-block opened inside the loop before jumping out of it.
+    finally_depth: usize = 0,
 };
 
 pub const FnCompiler = struct {
@@ -107,7 +110,7 @@ pub const FnCompiler = struct {
     /// innermost-first, before the RETURN — ES try/finally on a return
     /// completion. Popped before a finalizer's own body is compiled so a
     /// `return` within `finally` does not re-run that same finalizer.
-    finally_stack: std.ArrayListUnmanaged(*ast.Node) = .empty,
+    finally_stack: std.ArrayListUnmanaged(?*ast.Node) = .empty,
     /// Number of block scopes (ENTER_SCOPE) currently open in the bytecode being
     /// emitted. Used so `break`/`continue` emit matching EXIT_SCOPE ops.
     block_scope_depth: u32 = 0,

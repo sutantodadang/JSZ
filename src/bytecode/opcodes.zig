@@ -240,6 +240,12 @@ pub const Op = enum(u8) {
     /// await). Appended at the enum tail so existing opcode ordinals (pinned by
     /// the JIT int-subset contract test) are unchanged.
     AWAIT,
+    /// END_FINALLY | 3 | op, Rtype u8, Rval u8. Dispatch at the end of a finally
+    /// block on the pending completion in R[Rtype] (a number: 0=normal,
+    /// 2=throw). Normal falls through; throw re-raises R[Rval] (propagating to
+    /// the next outer handler). `return` completions run their finalizers inline
+    /// at the return site, so they never reach END_FINALLY.
+    END_FINALLY,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -325,6 +331,7 @@ pub fn instrSize(op: Op) usize {
         .DEBUGGER => 1,
         .YIELD => 2,
         .AWAIT => 2,
+        .END_FINALLY => 3,
         .TAIL_METHOD_CALL => 4,
         .DEFINE_ACCESSOR => 6,
         .DEFINE_ACCESSOR_DYN => 5,

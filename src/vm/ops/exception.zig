@@ -89,6 +89,31 @@ pub inline fn opPopTry(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+pub inline fn opEndFinally(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rtype = code[frame.pc];
+    frame.pc += 1;
+    const rval = code[frame.pc];
+    frame.pc += 1;
+    // Pending completion type (a number): 2 = throw, anything else = normal.
+    const tv = frame.registers[rtype];
+    var is_throw = false;
+    if (tv.bits != 0) switch (tv.unbox()) {
+        .number => |n| is_throw = (n == 2),
+        else => {},
+    };
+    if (is_throw) {
+        const thrown = frame.registers[rval];
+        self.last_exception_value = thrown;
+        const found = try self.throwException(thrown);
+        if (!found) {
+            const msg = try bcv.formatExceptionMessage(self.arena, thrown);
+            return RunOutcome{ .exception_value = .{ .msg = msg, .value = thrown } };
+        }
+    }
+    return null;
+}
+
 pub inline fn opInstanceof(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const site_pc = frame.pc - 1;
