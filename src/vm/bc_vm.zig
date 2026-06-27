@@ -2028,6 +2028,10 @@ pub const BcVm = struct {
                 if (std.mem.eql(u8, key, "prototype")) {
                     return try self.closurePrototype(obj_val, closure);
                 }
+                // Generators inherit caller/arguments %ThrowTypeError% accessors via
+                // %Generator%/%AsyncGenerator%; materialize the backing object so the
+                // prototype-chain walk below fires those inherited accessors.
+                if (closure.func.is_generator and closure.obj == null) _ = try self.closureBackingObj(closure);
                 if (closure.obj) |op| {
                     const o: *JsObject = @ptrCast(@alignCast(op));
                     // An own property on the backing object (e.g. a `name`/`length`
@@ -2331,6 +2335,23 @@ pub const BcVm = struct {
             // `C.prototype = ...`) on their backing object.
             .bc_function => |closure| {
                 const o = try self.closureBackingObj(closure);
+                // OrdinarySet on the backing object: fire an inherited accessor setter
+                // (e.g. the caller/arguments %ThrowTypeError% poison on %Generator%) and
+                // respect a non-writable own property (generator name/length/prototype).
+                if (o.findProperty(key)) |loc| {
+                    const a = loc.holder.attrAt(loc.slot);
+                    if (a.is_accessor) {
+                        const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+                        const setter = accessorMember(raw, "set");
+                        if (isCallable(setter)) _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
+                        return true;
+                    }
+                    if (loc.holder == o) {
+                        if (loc.slot < o.attrs.items.len and !o.attrs.items[loc.slot].writable) return true;
+                        _ = o.setOwnBySlot(o.shapePtr(), loc.slot, value);
+                        return true;
+                    }
+                }
                 try o.set(key, value);
                 return true;
             },
@@ -3542,6 +3563,22 @@ pub const BcVm = struct {
         _ = try async_gen_fn_proto.defineOwnData("constructor",
             try val_mod.makeObject(self.arena, async_gen_fn_ctor), nec);
 
+        // caller/arguments %ThrowTypeError% poison (spec §16.2.4): generator and
+        // async-generator functions inherit throwing get/set accessors so
+        // `genFn.caller` / `.arguments` throw a TypeError, while the function itself
+        // has no own such properties. Placed on %Generator% / %AsyncGenerator% so the
+        // blast radius is generators only (ordinary functions are unaffected).
+        const poison_holder = try JsObject.create(self.arena, null);
+        const poison_fn = try val_mod.makeNativeFunctionNamed(self.arena, nativeRestrictedThrow, "", 0);
+        try poison_holder.set("get", poison_fn);
+        try poison_holder.set("set", poison_fn);
+        const poison_hv = try val_mod.makeObject(self.arena, poison_holder);
+        const pattr: @import("../object/object.zig").PropAttr = .{ .enumerable = false, .configurable = true, .writable = false };
+        _ = try gen_fn_proto.defineOwnAccessor("caller", poison_hv, pattr);
+        _ = try gen_fn_proto.defineOwnAccessor("arguments", poison_hv, pattr);
+        _ = try async_gen_fn_proto.defineOwnAccessor("caller", poison_hv, pattr);
+        _ = try async_gen_fn_proto.defineOwnAccessor("arguments", poison_hv, pattr);
+
         self.async_iter_proto = async_iter_proto;
         self.async_gen_proto = async_gen_proto;
         self.async_gen_fn_proto = async_gen_fn_proto;
@@ -3901,6 +3938,12 @@ fn nativeGenThrow(arena: std.mem.Allocator, this_val: Value, args: []const Value
 
 fn nativeGenSelfIter(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     return this_val;
+}
+
+/// %ThrowTypeError% poison for the `caller`/`arguments` accessors inherited by
+/// generator/async-generator functions: any get or set throws a TypeError.
+fn nativeRestrictedThrow(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    return @import("../runtime/realm.zig").throwTypeError(arena, "'caller', 'callee', and 'arguments' properties may not be accessed on this function");
 }
 
 // ---------------------------------------------------------------- W2-async natives ---
