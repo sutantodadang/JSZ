@@ -458,12 +458,26 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 >   for-await lowering via `__getAsyncIterator__`/`__asyncIterStep__`
 >   (AsyncFromSyncIterator fallback). `Array.fromAsync(asyncGen())` now yields the
 >   values. Smoke-verified (no async-gen tests in the local sparse corpus).
->   Gaps: `return()` skips `try/finally`; async `yield*` delegation; `yield
->   <promise>` operand not pre-awaited.
+> - **async `yield*` delegation** — `yield*` inside an async generator delegates
+>   via the async-iterator protocol (awaits each step); sync iterables wrap as
+>   AsyncFromSyncIterator. (next-only; sent value/return/throw not forwarded.)
+> - **finally on a `return` completion** — `return` inside try/finally now runs
+>   the finalizer(s), innermost-first, value pinned (was skipped engine-wide, for
+>   every function + generator). Covers explicit `return` statements (incl. inside
+>   sync/async generator bodies).
 >
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
 >   cannot test collection — coordinate with M19 ephemerons).
+> - **Completion-aware try/finally refactor**: the external `.return()`/`.throw()`
+>   iterator methods inject a completion at a suspended yield but do not re-enter
+>   the coroutine, so the body's catch/finally don't run; `throw`/`break`/
+>   `continue` through `finally`, and an exception escaping a catch-less
+>   `try/finally`, also need separate-finally-block + completion dispatch (the
+>   inline-finally bytecode conflates catch/finally). Do deliberately with the
+>   `language/statements/try` corpus.
+> - async generator `yield <promise>` operand not pre-awaited; async `yield*`
+>   does not forward sent value / return / throw to the inner iterator.
 
 ### Milestone 18 — RegExp & Intl completeness  *(~1.5–2 mo)*
 - RegExp: Unicode property escapes, lookbehind, named groups, `/v` set notation, sticky/dotAll edge cases. Consider a proven backtracking + bytecode design.
