@@ -177,6 +177,11 @@ pub const BcVm = struct {
     exception: ?[]const u8 = null,
     /// Phase 4a: the last thrown JS value (for catch binding).
     last_exception_value: Value = Value{},
+    /// W2-asyncgen: lazily-built per-function instance prototype for async
+    /// generators (its own proto is %AsyncGeneratorPrototype%, which carries
+    /// next/return/throw + @@toStringTag + @@asyncIterator). Arena-allocated, so
+    /// it persists for the context lifetime (not GC-managed).
+    async_gen_inst_proto: ?*JsObject = null,
     /// Phase 4d: context for re-entry from native callbacks.
     context: @import("../runtime/realm.zig").Context = undefined,
     /// Phase 9: optional JIT profiler. Null = no profiling (zero hot-path cost).
@@ -3368,29 +3373,41 @@ pub const BcVm = struct {
     /// Create an async generator object for an `async function*` call. The body
     /// runs lazily, driven by `.next()`/`.return()`/`.throw()` which each return
     /// a promise of an iterator result.
+    /// Lazily build (once per context) the async-generator instance prototype:
+    /// instance → this object → %AsyncGeneratorPrototype% (next/return/throw +
+    /// @@toStringTag "AsyncGenerator" + @@asyncIterator). Arena-allocated, so it
+    /// persists for the context lifetime and is not GC-managed.
+    fn asyncGenInstanceProto(self: *BcVm) !*JsObject {
+        if (self.async_gen_inst_proto) |p| return p;
+        const realm_m = @import("../runtime/realm.zig");
+        const proto = try JsObject.create(self.arena, self.realm.object_prototype);
+        _ = try proto.defineOwnData("next", try val_mod.makeNativeFunctionNamed(self.arena, nativeAsyncGenNext, "next", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+        _ = try proto.defineOwnData("return", try val_mod.makeNativeFunctionNamed(self.arena, nativeAsyncGenReturn, "return", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+        _ = try proto.defineOwnData("throw", try val_mod.makeNativeFunctionNamed(self.arena, nativeAsyncGenThrow, "throw", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+        // String-key alias for the for-await helper fallback.
+        try proto.set("@@asyncIterator", try val_mod.makeNativeFunction(self.arena, nativeGenSelfIter));
+        if (realm_m.active_sym_to_string_tag) |tag_sym|
+            try proto.setSymAttr(tag_sym, try val_mod.makeString(self.arena, "AsyncGenerator"), .{ .writable = false, .enumerable = false, .configurable = true });
+        if (realm_m.active_sym_async_iterator) |it_sym|
+            try proto.setSymAttr(it_sym, try val_mod.makeNativeFunctionNamed(self.arena, nativeGenSelfIter, "[Symbol.asyncIterator]", 0), .{ .writable = true, .enumerable = false, .configurable = true });
+        const inst = try JsObject.create(self.arena, proto);
+        self.async_gen_inst_proto = inst;
+        return inst;
+    }
+
     fn buildAsyncGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value) !Value {
         const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
         const agc = try self.arena.create(AsyncGenCtx);
         agc.* = .{ .vm = self, .state = state };
 
+        const inst_proto = try self.asyncGenInstanceProto();
         const obj = if (self.heap) |heap|
-            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+            try JsObject.createOnHeap(heap, inst_proto)
         else
-            try JsObject.create(self.arena, self.realm.object_prototype);
+            try JsObject.create(self.arena, inst_proto);
         obj.internal_kind = .async_generator;
         obj.internal_slot = agc;
-        try obj.set("next", try val_mod.makeNativeFunction(self.arena, nativeAsyncGenNext));
-        try obj.set("return", try val_mod.makeNativeFunction(self.arena, nativeAsyncGenReturn));
-        try obj.set("throw", try val_mod.makeNativeFunction(self.arena, nativeAsyncGenThrow));
-        const self_iter = try val_mod.makeNativeFunction(self.arena, nativeGenSelfIter);
-        // String-key convention used by the for-await helper fallback.
-        try obj.set("@@asyncIterator", self_iter);
-        const ag_val = try val_mod.makeObject(self.arena, obj);
-        // Register the real well-known symbol so `obj[Symbol.asyncIterator]` and
-        // GetMethod(obj, @@asyncIterator) (Array.fromAsync) resolve to it.
-        const realm_m = @import("../runtime/realm.zig");
-        if (realm_m.active_sym_async_iterator) |sym| try self.setPropSym(ag_val, sym, self_iter);
-        return ag_val;
+        return val_mod.makeObject(self.arena, obj);
     }
 
     /// Settle the in-flight request's promise with an iterator result (or reject
