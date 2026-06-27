@@ -273,9 +273,10 @@ pub const JsObject = struct {
         return true;
     }
 
-    /// Ordered own-property keys (insertion order). Backed by the shape.
+    /// Spec-ordered own string keys: integer indices ascending, then the rest
+    /// in insertion order (ES [[OwnPropertyKeys]]). Cached on the shape.
     pub fn ownKeys(self: *JsObject) []const []const u8 {
-        return self.shape.key_order.items;
+        return self.shape.orderedKeys(self.shape_manager.allocator);
     }
 
     /// True if `key` is an own enumerable property. Missing key → false.
