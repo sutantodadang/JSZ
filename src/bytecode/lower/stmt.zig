@@ -404,11 +404,25 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         const catch_offset = self.currentOffset();
         self.patchJump(push_try_patch, catch_offset);
         if (ts.handler) |handler| {
+            // A return-completion (Generator.return) is not observable by catch:
+            // re-raise it so it propagates (and is converted to a return at the
+            // generator boundary).
+            try self.emitOp(.JMP_IF_RET_COMPL, line);
+            try self.emitU8(rexc);
+            const rethrow_patch = self.currentOffset();
+            try self.emitI16(0);
             if (handler.param_name.len > 0)
                 try self.emitDefine(handler.param_name, rexc, line);
             self.sp = saved_sp;
             try self.compileStmt(handler.body, last_expr_reg);
             self.sp = saved_sp;
+            try self.emitOp(.JMP, line);
+            const jmp_over_rethrow = self.currentOffset();
+            try self.emitI16(0);
+            self.patchJump(rethrow_patch, self.currentOffset());
+            try self.emitOp(.THROW, line);
+            try self.emitU8(rexc);
+            self.patchJump(jmp_over_rethrow, self.currentOffset());
         }
         self.patchJump(jmp_end, self.currentOffset());
         return;
@@ -452,6 +466,13 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     self.patchJump(push_try_patch, handler_offset);
     var jmp_catch_norm: ?usize = null;
     if (ts.handler) |handler| {
+        // A return-completion (Generator.return) skips the catch body and runs
+        // only the finally: route it to the throw-completion path so END_FINALLY
+        // re-raises the sentinel after the finalizer.
+        try self.emitOp(.JMP_IF_RET_COMPL, line);
+        try self.emitU8(rcv);
+        const skip_catch_patch = self.currentOffset();
+        try self.emitI16(0);
         if (handler.param_name.len > 0)
             try self.emitDefine(handler.param_name, rcv, line);
         // The catch body is itself protected by the finally.
@@ -469,9 +490,11 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         try self.emitOp(.JMP, line);
         jmp_catch_norm = self.currentOffset();
         try self.emitI16(0);
-        // catch threw → rcv holds the new exception
+        // catch threw (or a return-completion skipped catch) → rcv holds the
+        // value; mark it a throw completion and fall to the finally.
         const catch_handler_offset = self.currentOffset();
         self.patchJump(catch_try_patch, catch_handler_offset);
+        self.patchJump(skip_catch_patch, catch_handler_offset);
         try self.emitOp(.LOAD_K, line);
         try self.emitU8(rct);
         try self.emitI16(@intCast(k_throw));

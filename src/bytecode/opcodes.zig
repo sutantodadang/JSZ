@@ -246,6 +246,12 @@ pub const Op = enum(u8) {
     /// the next outer handler). `return` completions run their finalizers inline
     /// at the return site, so they never reach END_FINALLY.
     END_FINALLY,
+    /// JMP_IF_RET_COMPL | 4 | op, Rval u8, rel i16. Jump if R[Rval] is the
+    /// internal return-completion sentinel (Generator.prototype.return resumed
+    /// the body by "throwing" it). Lets a `catch` skip its body and re-route the
+    /// sentinel to the finally / outer propagation, so `return()` runs finally
+    /// but is not observed by user `catch`.
+    JMP_IF_RET_COMPL,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -332,6 +338,7 @@ pub fn instrSize(op: Op) usize {
         .YIELD => 2,
         .AWAIT => 2,
         .END_FINALLY => 3,
+        .JMP_IF_RET_COMPL => 4,
         .TAIL_METHOD_CALL => 4,
         .DEFINE_ACCESSOR => 6,
         .DEFINE_ACCESSOR_DYN => 5,

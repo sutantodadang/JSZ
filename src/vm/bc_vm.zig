@@ -1168,6 +1168,7 @@ pub const BcVm = struct {
                 .TYPEOF => if (try compare_ops.opTypeof(self, frame)) |o| return o,
                 .JMP => if (try jump_ops.opJmp(self, frame)) |o| return o,
                 .JMP_IF_TRUE => if (try jump_ops.opJmpIfTrue(self, frame)) |o| return o,
+                .JMP_IF_RET_COMPL => if (try jump_ops.opJmpIfRetCompl(self, frame)) |o| return o,
                 .JMP_IF_FALSE => if (try jump_ops.opJmpIfFalse(self, frame)) |o| return o,
                 .JMP_IF_NULLISH => if (try jump_ops.opJmpIfNullish(self, frame)) |o| return o,
                 .JMP_IF_NOT_NULLISH => if (try jump_ops.opJmpIfNotNullish(self, frame)) |o| return o,
@@ -3304,10 +3305,29 @@ pub const BcVm = struct {
             .yielded => |v| self.makeGenIterResult(v, false),
             .returned => |v| self.makeGenIterResult(v, true),
             .threw => |e| blk: {
+                // A return-completion (Generator.return) that ran the body's
+                // finally(s) and escaped becomes a normal done result.
+                if (isReturnCompletion(e)) break :blk self.makeGenIterResult(returnCompletionValue(e), true);
                 @import("../runtime/realm.zig").pending_exception = e;
                 break :blk error.JsException;
             },
         };
+    }
+
+    /// Build the internal return-completion sentinel carrying `v`. Generator
+    /// `.return(v)` resumes the body by "throwing" it so finally blocks run; it
+    /// is invisible to user `catch` (JMP_IF_RET_COMPL) and is converted back to a
+    /// `{value: v, done: true}` result when it escapes the coroutine.
+    fn makeReturnCompletion(self: *BcVm, v: Value) !Value {
+        const obj = if (self.heap) |h|
+            try JsObject.createOnHeap(h, null)
+        else
+            try JsObject.create(self.arena, null);
+        obj.internal_kind = .return_completion;
+        const boxed = try self.arena.create(Value);
+        boxed.* = v;
+        obj.internal_slot = boxed;
+        return val_mod.makeObject(self.arena, obj);
     }
 
     // ---------------------------------------------------------- W2-async driver ---
@@ -3396,8 +3416,16 @@ pub const BcVm = struct {
         agc.cur_promise = req.promise;
 
         if (req.is_return) {
-            agc.state.done = true;
-            try self.asyncGenComplete(agc, req.return_val, true, false);
+            // Resume a suspended-started generator with a return-completion so its
+            // try/finally runs (driveAsyncGen converts the escaped sentinel to a
+            // normal done result); otherwise complete directly.
+            if (!agc.state.done and agc.state.started) {
+                const sentinel = try self.makeReturnCompletion(req.return_val);
+                try self.driveAsyncGen(agc, .{ .throw_ = sentinel });
+            } else {
+                agc.state.done = true;
+                try self.asyncGenComplete(agc, req.return_val, true, false);
+            }
             return;
         }
         if (agc.state.done) {
@@ -3422,7 +3450,12 @@ pub const BcVm = struct {
             .returned => |v| try self.asyncGenComplete(agc, v, true, false),
             .threw => |e| {
                 agc.state.done = true;
-                try self.asyncGenComplete(agc, e, true, true);
+                // A return-completion that ran the body's finally(s) becomes a
+                // normal {value, done:true}; a real exception rejects.
+                if (isReturnCompletion(e))
+                    try self.asyncGenComplete(agc, returnCompletionValue(e), true, false)
+                else
+                    try self.asyncGenComplete(agc, e, true, true);
             },
             .yielded => |v| {
                 if (agc.state.last_suspend_await) {
@@ -3645,10 +3678,29 @@ fn nativeGenNext(arena: std.mem.Allocator, this_val: Value, args: []const Value)
     return state.vm.resumeGenerator(state, sent);
 }
 
+fn isReturnCompletion(v: Value) bool {
+    return v.bits != 0 and v.unbox() == .object and v.toPtr().object.internal_kind == .return_completion;
+}
+
+fn returnCompletionValue(v: Value) Value {
+    const obj = v.toPtr().object;
+    if (obj.internal_slot) |s| {
+        const p: *Value = @ptrCast(@alignCast(s));
+        return p.*;
+    }
+    return Value{};
+}
+
 fn nativeGenReturn(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const state = genStateFrom(this_val) orelse return error.JsException;
-    state.done = true;
     const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    // Resume a suspended-started generator with a return-completion so the body's
+    // try/finally runs; otherwise complete directly.
+    if (!state.done and state.started) {
+        const sentinel = try state.vm.makeReturnCompletion(v);
+        return state.vm.resumeGeneratorKind(state, .{ .throw_ = sentinel });
+    }
+    state.done = true;
     return state.vm.makeGenIterResult(v, true);
 }
 
