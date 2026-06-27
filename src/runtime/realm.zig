@@ -1191,6 +1191,8 @@ pub var active_regexp_proto: ?*JsObject = null;
 /// Phase 4d: thread-local for Function.prototype.
 pub var active_function_proto: ?*JsObject = null;
 pub var active_promise_proto: ?*JsObject = null;
+/// %GeneratorFunction%: [[Prototype]] of generator function objects.
+pub var active_function_ctor: ?*JsObject = null;
 /// ES2015 Symbol.prototype (autoboxing lookup for symbol primitives).
 pub var active_symbol_proto: ?*JsObject = null;
 /// ES2015 Symbol.iterator well-known symbol value.
@@ -2175,7 +2177,7 @@ fn wrapperPrimitive(this_val: Value) ?Value {
 
 /// Raise a `TypeError` from a native: sets `pending_exception` and returns
 /// `error.JsException` for the VM to surface as a catchable throw.
-fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+pub fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const err_obj = if (active_heap) |h|
         try JsObject.createOnHeap(h, error_proto_TypeError)
     else
@@ -3068,6 +3070,7 @@ pub const Realm = struct {
         try function_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeFunctionCtor));
         try function_proto.set("constructor", try val_mod.makeObject(arena, function_ctor_obj));
         try env.define("Function", try val_mod.makeObject(arena, function_ctor_obj));
+        active_function_ctor = function_ctor_obj;
 
         // ---- Phase 4: global functions + value globals ----
         const boolean_proto = try JsObject.create(arena, object_proto);

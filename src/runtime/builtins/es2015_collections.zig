@@ -33,6 +33,8 @@ pub var active_set_proto: ?*JsObject = null;
 pub var active_map_iter_proto: ?*JsObject = null;
 /// Set iterator prototype — stored for @@toStringTag wiring.
 pub var active_set_iter_proto: ?*JsObject = null;
+/// %IteratorPrototype% — [[Prototype]] of every iterator protocol chain.
+pub var active_iterator_proto: ?*JsObject = null;
 
 /// R1: install Map/Set/WeakMap/WeakSet prototypes + constructors and bind globals.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -1592,6 +1594,7 @@ pub fn initArrayIteratorProto(arena: std.mem.Allocator, object_proto: *JsObject)
     if (realm_mod.active_sym_to_string_tag) |tag|
         try aip.setSymAttr(tag, try val_mod.makeString(arena, "Array Iterator"), .{ .writable = false, .enumerable = false, .configurable = true });
     active_array_iter_proto = aip;
+    active_iterator_proto = iter_proto;
 }
 
 /// Array.prototype[Symbol.iterator] (and values()): index iterator over `this`.
