@@ -3291,7 +3291,15 @@ pub const BcVm = struct {
     /// Resume a generator and wrap the outcome as an iterator result object.
     /// Exceptions propagate to the `.next()`/`.throw()` caller as before.
     fn resumeGenerator(self: *BcVm, state: *BcGeneratorState, sent: Value) !Value {
-        const res = try self.runSuspendable(state, .{ .next = sent });
+        return self.resumeGeneratorKind(state, .{ .next = sent });
+    }
+
+    /// Resume a generator with an arbitrary completion (`.next`/`.throw_`) and
+    /// wrap the outcome as an iterator result. A `.throw_` resume injects the
+    /// exception at the suspended `yield`, so the generator body's
+    /// `try`/`catch`/`finally` runs (gen.throw()).
+    fn resumeGeneratorKind(self: *BcVm, state: *BcGeneratorState, kind: ResumeKind) !Value {
+        const res = try self.runSuspendable(state, kind);
         return switch (res) {
             .yielded => |v| self.makeGenIterResult(v, false),
             .returned => |v| self.makeGenIterResult(v, true),
@@ -3646,9 +3654,16 @@ fn nativeGenReturn(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
 fn nativeGenThrow(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const state = genStateFrom(this_val) orelse return error.JsException;
-    state.done = true;
-    @import("../runtime/realm.zig").pending_exception = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    return error.JsException;
+    const err = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    // A throw at a suspended yield injects the exception there so the body's
+    // try/catch/finally runs. On a not-started or completed generator there is
+    // no suspended point: the generator completes and the exception propagates.
+    if (state.done or !state.started) {
+        state.done = true;
+        @import("../runtime/realm.zig").pending_exception = err;
+        return error.JsException;
+    }
+    return state.vm.resumeGeneratorKind(state, .{ .throw_ = err });
 }
 
 fn nativeGenSelfIter(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
