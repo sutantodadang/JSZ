@@ -56,7 +56,7 @@ pub const JsObject = struct {
     /// Arena-allocated; MUST NOT be traversed by markObject.
     internal_slot: ?*anyopaque = null,
     /// Phase 4c/4d: discriminator for internal_slot type.
-    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, promise, generator, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function } = .none,
+    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, weakref, finalization_registry, promise, generator, async_generator, return_completion, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function } = .none,
     /// Allocator for property storage (the eval arena).
     arena: std.mem.Allocator,
     /// Phase 6 hidden class manager (shared globally).
@@ -273,9 +273,10 @@ pub const JsObject = struct {
         return true;
     }
 
-    /// Ordered own-property keys (insertion order). Backed by the shape.
+    /// Spec-ordered own string keys: integer indices ascending, then the rest
+    /// in insertion order (ES [[OwnPropertyKeys]]). Cached on the shape.
     pub fn ownKeys(self: *JsObject) []const []const u8 {
-        return self.shape.key_order.items;
+        return self.shape.orderedKeys(self.shape_manager.allocator);
     }
 
     /// True if `key` is an own enumerable property. Missing key → false.

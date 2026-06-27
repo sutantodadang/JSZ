@@ -308,6 +308,52 @@ pub const Lexer = struct {
                 t.value_str = slice;
                 self.prev_kind = .number;
                 return t;
+            } else if (next_c == 'b' or next_c == 'B') {
+                // Binary literal: 0b...
+                self.pos = start + 2;
+                self.column += 2;
+                const bin_start = self.pos;
+                try self.scanDigits(isBinDigit);
+                if (self.pos == bin_start) return LexError.InvalidNumericLiteral;
+                if (self.pos < self.source.len and self.source[self.pos] == 'n') {
+                    const digits = self.source[start..self.pos];
+                    self.pos += 1;
+                    self.column += 1;
+                    var t = Token.initSimple(.bigint, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
+                    t.value_str = try self.stripSeparators(digits);
+                    self.prev_kind = .number;
+                    return t;
+                }
+                const clean = try self.stripSeparators(self.source[start + 2..self.pos]);
+                const bin_val = std.fmt.parseUnsigned(u64, clean, 2) catch return LexError.InvalidNumericLiteral;
+                var t = Token.initSimple(.number, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
+                t.value_num = @floatFromInt(bin_val);
+                t.value_str = self.source[start..self.pos];
+                self.prev_kind = .number;
+                return t;
+            } else if (next_c == 'o' or next_c == 'O') {
+                // Octal literal: 0o...
+                self.pos = start + 2;
+                self.column += 2;
+                const oct_start = self.pos;
+                try self.scanDigits(isOctDigit);
+                if (self.pos == oct_start) return LexError.InvalidNumericLiteral;
+                if (self.pos < self.source.len and self.source[self.pos] == 'n') {
+                    const digits = self.source[start..self.pos];
+                    self.pos += 1;
+                    self.column += 1;
+                    var t = Token.initSimple(.bigint, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
+                    t.value_str = try self.stripSeparators(digits);
+                    self.prev_kind = .number;
+                    return t;
+                }
+                const clean = try self.stripSeparators(self.source[start + 2..self.pos]);
+                const oct_val = std.fmt.parseUnsigned(u64, clean, 8) catch return LexError.InvalidNumericLiteral;
+                var t = Token.initSimple(.number, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
+                t.value_num = @floatFromInt(oct_val);
+                t.value_str = self.source[start..self.pos];
+                self.prev_kind = .number;
+                return t;
             }
         }
 
@@ -996,6 +1042,14 @@ fn isIdentChar(c: u8) bool {
 
 fn isDecDigit(c: u8) bool {
     return c >= '0' and c <= '9';
+}
+
+fn isBinDigit(c: u8) bool {
+    return c == '0' or c == '1';
+}
+
+fn isOctDigit(c: u8) bool {
+    return c >= '0' and c <= '7';
 }
 
 fn isHexDigit(c: u8) bool {

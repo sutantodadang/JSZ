@@ -412,6 +412,118 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 - Audit remaining spec builtins: `Array.fromAsync`, `Object.groupBy`, `Promise.withResolvers`, `String.prototype` Unicode methods, `structuredClone` (host).
 - **Gate:** `built-ins/WeakRef`, `FinalizationRegistry`, `Atomics` ≥99%.
 
+> **✅ GATE MET — independently verified 2026-06-26.** Fresh Windows-native build
+> against a clean tc39/test262 clone:
+>
+> | suite | before | after |
+> |---|---:|---:|
+> | `built-ins/WeakRef` | 0/29 | **29/29 (100%)** |
+> | `built-ins/FinalizationRegistry` | 0/46 | **46/46 (100%)** |
+> | `built-ins/Atomics` | 118/323 | **257/257 runnable (100%)** |
+> | `built-ins/WeakMap` | 40/141 | **141/141 (100%)** |
+> | `built-ins/WeakSet` | 21/85 | **85/85 (100%)** |
+>
+> Atomics: 133 multi-agent `wait`/`notify`/`CanBlockIsTrue` tests are skipped —
+> they require a `$262.agent` coordinator / a blocking agent, genuinely
+> unrunnable in a single-agent engine (standard exclusion). `zig build test` green.
+>
+> Work (3 commits): L1 WeakMap/WeakSet descriptor/brand/iterable exactness; L2
+> new WeakRef + FinalizationRegistry (API surface — `canBeWeakKey`, brand checks,
+> `@@toStringTag`, NewTarget proto); L3 Atomics 9 RMW ops
+> (add/sub/and/or/xor/exchange/compareExchange/load/store) + ValidateAtomicAccess
+> (RangeError ordering) + shared/non-shared AB + BigInt. Side fixes: binary (`0b`)
+> /octal (`0o`) numeric literals (were unparsed); `activateHeap` reparenting of
+> namespace objects (Atomics/Math/JSON) onto the migrated `Object.prototype`.
+>
+> **Cleanup landed (+2 commits 2026-06-26):**
+> - `built-ins/Map` → **198/204 (97.05%)**, `built-ins/Set` → **345/382 (90.31%)**
+>   (same descriptor/brand/iterable lever as WeakMap/WeakSet). + a required
+>   `lowerBlockStmt` per-statement register-reclamation fix (deeply-nested blocks
+>   were overflowing the u8 register space → compiler panic).
+> - `Object.groupBy` **13/14 (92.86%)** + `Map.groupBy` **14/14 (100%)**.
+> - `Array.fromAsync` **5/5 runnable** (array / sync iterable / async iterator /
+>   thenables / array-like / mapFn / rejection all smoke-verified).
+> - `structuredClone` implemented (deep clone + cycle/identity; Symbol/Function
+>   throw TypeError — no DOMException; not in test262, smoke-verified).
+>
+> **Cleanup landed (2026-06-27):**
+> - **Integer-key ascending `ownKeys` enumeration** — `Shape.orderedKeys` lazy
+>   cache (integer indices ascending, then insertion order). Fixes
+>   `Object.groupBy/groupLength` (groupBy now 14/14) and corrects
+>   `Object.keys`/values/entries, for-in, JSON.stringify, `Reflect.ownKeys`,
+>   `Object.assign` engine-wide. Built-ins corpus unchanged otherwise (0 flips).
+> - **`async function*` generators + `for await...of`** — AWAIT-tagged suspend
+>   (enum-tail opcode, ordinals preserved), `buildAsyncGenerator` with promise
+>   next/return/throw + FIFO request queue + real `@@asyncIterator`, and
+>   for-await lowering via `__getAsyncIterator__`/`__asyncIterStep__`
+>   (AsyncFromSyncIterator fallback). `Array.fromAsync(asyncGen())` now yields the
+>   values. Smoke-verified (no async-gen tests in the local sparse corpus).
+> - **async `yield*` delegation** — `yield*` inside an async generator delegates
+>   via the async-iterator protocol (awaits each step); sync iterables wrap as
+>   AsyncFromSyncIterator. (next-only; sent value/return/throw not forwarded.)
+> - **Completion-aware try/finally** — finally now runs on every completion
+>   (normal/return/throw/break/continue), validated against the real corpus
+>   (`language/statements/try` 78→94/201, zero regressions). END_FINALLY opcode +
+>   per-try completion register route normal/throw through one finally copy
+>   (re-raise chains to outer handlers); break/continue (incl. labeled) unwind +
+>   POP_TRY each crossed try and run its finalizer inline; a catch-less
+>   try/finally re-raises; a throwing/returning finalizer overrides the pending
+>   completion; `break`/`continue` (incl. labeled and labeled non-loop blocks)
+>   unwind every crossed try (POP_TRY + finalizer).
+> - **Generator/AsyncGenerator `.throw()` / `.return()`** — both now re-enter the
+>   suspended body so its try/catch/finally runs. `.return(v)` resumes with an
+>   internal return-completion sentinel (invisible to user `catch` via
+>   JMP_IF_RET_COMPL), converted back to `{value, done:true}` on escape.
+>   `for await` 94/94 runnable.
+> - **`yield*` full delegation** — forwards the sent value / `return` / `throw` to
+>   the inner iterator (`__yieldStarStep__` + a per-yield try that routes the
+>   resume completion). `expressions/yield` 27→50/63.
+> - **%AsyncGeneratorPrototype% (instance side)** — shared prototype with
+>   next/return/throw (spec descriptors) + @@toStringTag "AsyncGenerator" +
+>   @@asyncIterator; instances inherit through it.
+> - **Generator/AsyncGenerator function-side intrinsic chain** — full
+>   %IteratorPrototype%→%GeneratorPrototype%→%Generator%→%GeneratorFunction%
+>   (and async parallel via %AsyncIteratorPrototype%), built lazily in
+>   `ensureGeneratorChain` with exact descriptors. Generator function objects
+>   root at %Generator%; their `.prototype` roots at %GeneratorPrototype%;
+>   instances chain through the function's `.prototype` (real two-level proto),
+>   so `Object.getPrototypeOf(genFn).prototype` and
+>   `getPrototypeOf(getPrototypeOf(instance))` resolve correctly. Prototype
+>   next/return/throw now throw TypeError on a non-generator receiver and reject
+>   `new`. `built-ins/GeneratorPrototype` **0→61/61**,
+>   `built-ins/AsyncGeneratorPrototype` **3→13/13**; zero regressions.
+> - **GeneratorFunction / AsyncGeneratorFunction callable** — the two intrinsic
+>   constructors now compile a generator body from string args, mirroring
+>   `new Function` (`GeneratorFunction("a", "yield a")`,
+>   `new AsyncGeneratorFunction("yield 1")`). A shared `functionCtorImpl(keyword)`
+>   bridge assembles `(function* anonymous(…){…})` / `(async function* …)` and
+>   evals it; because the eval runs on the same VM, the compiled function's
+>   `[[Prototype]]` roots at the same %Generator%, so intrinsic identity holds
+>   (`getPrototypeOf(GeneratorFunction("yield 1")) === getPrototypeOf(function*(){})`).
+> - **Generator-function-object exactness** — `new genFn()` / `new asyncFn()` throw
+>   TypeError (generators/async fns aren't constructors); `genFn instanceof
+>   GeneratorFunction` works (instanceof now coerces a function LHS to its backing
+>   object — `(function(){}) instanceof Function` is now true too); generator
+>   functions carry real own `name`/`length` {w:f,e:f,c:t} + `prototype`
+>   {w:t,e:f,c:f} descriptors; and `Object.getOwnPropertyDescriptor` /
+>   `hasOwnProperty` / `delete` resolve a function to its backing object.
+>   `built-ins/GeneratorFunction` **16→21/23**, `built-ins/AsyncGeneratorFunction`
+>   **11→16/17**; zero regressions.
+>
+> **Still deferred (not gate-blocking):**
+> - Real GC weak-collection/finalization semantics (entries held strongly; test262
+>   cannot test collection — coordinate with M19 ephemerons).
+> - Generator-fn `caller`/`arguments` %ThrowTypeError% poison (engine-wide
+>   `Function.prototype` change) and cross-realm %GeneratorPrototype% identity
+>   (`proto-from-ctor-realm-prototype`) — 3 GeneratorFunction tests.
+> - `yield*` observable IteratorClose access-ordering edge cases; `yield`
+>   rhs-omitted/regexp/template parse; async-gen `yield <promise>` not pre-awaited;
+>   async `yield*` resume-completion forwarding.
+> - `%AsyncGeneratorPrototype%` structural exactness (@@toStringTag, constructor,
+>   method `length`/`name`/prop-desc) — descriptor lever, like M15 TypedArrays.
+> - async generator `yield <promise>` operand not pre-awaited; async `yield*`
+>   does not forward sent value / return / throw to the inner iterator.
+
 ### Milestone 18 — RegExp & Intl completeness  *(~1.5–2 mo)*
 - RegExp: Unicode property escapes, lookbehind, named groups, `/v` set notation, sticky/dotAll edge cases. Consider a proven backtracking + bytecode design.
 - Intl: decide build — full ICU/CLDR data (large binary) vs. a curated subset vs. host-provided. Likely **host-provided ICU hook** to keep core small (aligns Tier 2).
@@ -511,8 +623,8 @@ a value-representation change in the same milestone.
 M14 Conformance foundation   ██               1–2 mo   ← do first, unblocks measurement
 M15 TypedArrays              ███              ✅ DONE (100% test262 TA/AB/DataView)
 M16 ESM modules              ██               ✅ DONE (module-code 595/595 = 100%)
-M17 WeakRef/Atomics/builtins ██               1 mo      ← NEXT
-M18 RegExp/Intl              ███              1.5–2 mo   ← Tier 1 conformant engine ✅ after here
+M17 WeakRef/Atomics/builtins ██               ✅ GATE MET (WeakRef/FinReg/Atomics 100%)
+M18 RegExp/Intl              ███              1.5–2 mo   ← NEXT; Tier 1 conformant engine ✅ after here
 M19 GC modernization         ████             2–3 mo
 M20 JIT tier-up + NaN-box    ████             2–3 mo     ← Perf story ✅
 M21 Embedding C ABI          ██               1.5 mo     ← Tier 2 embeddable ✅

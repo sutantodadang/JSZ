@@ -163,14 +163,14 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d}", .{rdst});
         },
-        .MOVE => {
+        .MOVE, .END_FINALLY => {
             const rdst = code[new_pc];
             new_pc += 1;
             const rsrc = code[new_pc];
             new_pc += 1;
             try writer.print(" R{d} R{d}", .{ rdst, rsrc });
         },
-        .YIELD => {
+        .YIELD, .AWAIT => {
             const r = code[new_pc];
             new_pc += 1;
             try writer.print(" R{d}", .{r});
@@ -260,7 +260,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const target: i64 = @intCast(new_pc);
             try writer.print(" -> {d}", .{target + offset});
         },
-        .JMP_IF_TRUE, .JMP_IF_FALSE => {
+        .JMP_IF_TRUE, .JMP_IF_FALSE, .JMP_IF_RET_COMPL => {
             const rcond = code[new_pc];
             new_pc += 1;
             const lo = code[new_pc];

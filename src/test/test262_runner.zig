@@ -336,7 +336,13 @@ fn isRunnableFull(source: []const u8) bool {
             if (std.mem.indexOf(u8, flags, "module") == null) return false;
         }
         if (std.mem.indexOf(u8, flags, "CanBlockIsFalse") != null) return false;
+        // CanBlockIsTrue: test assumes the agent can block (Atomics.wait returns
+        // a string). Our single-agent runner always throws TypeError → skip.
+        if (std.mem.indexOf(u8, flags, "CanBlockIsTrue") != null) return false;
     }
+    // atomicsHelper.js / atomics-helpers.js: require $262.agent.* (multi-agent
+    // coordinator). Single-agent runner has no $262.agent → skip.
+    if (std.mem.indexOf(u8, yaml, "atomicsHelper.js") != null) return false;
     return true;
 }
 

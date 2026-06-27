@@ -2,6 +2,17 @@
 //! Phase 6 hidden classes (shapes) with transition caches.
 const std = @import("std");
 
+/// An ECMAScript array index: a canonical decimal string for an integer in
+/// [0, 2^32-1). Returns the numeric value, or null if `key` is not one.
+fn isArrayIndexKey(key: []const u8) ?u32 {
+    if (key.len == 0) return null;
+    for (key) |c| if (c < '0' or c > '9') return null;
+    if (key.len > 1 and key[0] == '0') return null; // non-canonical leading zero
+    const n = std.fmt.parseUnsigned(u32, key, 10) catch return null;
+    if (n == std.math.maxInt(u32)) return null; // 2^32-1 is not an array index
+    return n;
+}
+
 pub const Shape = struct {
     id: u32,
     parent: ?*Shape,
@@ -15,6 +26,58 @@ pub const Shape = struct {
     key_to_slot: std.StringHashMapUnmanaged(u32),
     /// Insertion order snapshot for delete/rebuild transitions.
     key_order: std.ArrayListUnmanaged([]const u8),
+    /// Lazily-computed spec [[OwnPropertyKeys]] ordering cache. Null until first
+    /// enumeration; shapes are immutable post-construction so it never invalidates.
+    ordered_keys: ?[]const []const u8 = null,
+
+    /// Spec [[OwnPropertyKeys]] string-key ordering: integer-index keys in
+    /// ascending numeric order, then the remaining keys in insertion order.
+    /// Cached on first call (`alloc` must match this shape's lifetime allocator).
+    pub fn orderedKeys(self: *Shape, alloc: std.mem.Allocator) []const []const u8 {
+        if (self.ordered_keys) |ok| return ok;
+        const items = self.key_order.items;
+        var has_idx = false;
+        for (items) |k| {
+            if (isArrayIndexKey(k) != null) {
+                has_idx = true;
+                break;
+            }
+        }
+        // Fast path: no integer keys → insertion order already spec-correct.
+        if (!has_idx) {
+            self.ordered_keys = items;
+            return items;
+        }
+        const IdxKey = struct { k: []const u8, n: u32 };
+        var idxs: std.ArrayListUnmanaged(IdxKey) = .empty;
+        var rest: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (items) |k| {
+            if (isArrayIndexKey(k)) |n| {
+                idxs.append(alloc, .{ .k = k, .n = n }) catch return items;
+            } else {
+                rest.append(alloc, k) catch return items;
+            }
+        }
+        std.sort.block(IdxKey, idxs.items, {}, struct {
+            fn lt(_: void, a: IdxKey, b: IdxKey) bool {
+                return a.n < b.n;
+            }
+        }.lt);
+        const out = alloc.alloc([]const u8, items.len) catch return items;
+        var i: usize = 0;
+        for (idxs.items) |e| {
+            out[i] = e.k;
+            i += 1;
+        }
+        for (rest.items) |k| {
+            out[i] = k;
+            i += 1;
+        }
+        idxs.deinit(alloc);
+        rest.deinit(alloc);
+        self.ordered_keys = out;
+        return out;
+    }
 };
 
 pub const ShapeManager = struct {
@@ -32,6 +95,7 @@ pub const ShapeManager = struct {
             .transitions = .empty,
             .key_to_slot = .empty,
             .key_order = .empty,
+            .ordered_keys = null,
         };
         return .{
             .allocator = allocator,
@@ -57,6 +121,7 @@ pub const ShapeManager = struct {
             .transitions = .empty,
             .key_to_slot = .empty,
             .key_order = .empty,
+            .ordered_keys = null,
         };
         self.next_id += 1;
 
@@ -87,6 +152,7 @@ pub const ShapeManager = struct {
             .transitions = .empty,
             .key_to_slot = .empty,
             .key_order = .empty,
+            .ordered_keys = null,
         };
         self.next_id += 1;
 

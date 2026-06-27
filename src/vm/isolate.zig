@@ -313,6 +313,12 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__importDeferDyn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImportDeferDynamic));
         try realm.global_env.define("__initExports__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeInitExports));
         try realm.global_env.define("__iterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeIterStep));
+        // W2-asyncgen: for-await-of helpers (async-iterator protocol).
+        try realm.global_env.define("__getAsyncIterator__", try val_mod.makeNativeFunction(arena, es2015.nativeGetAsyncIterator));
+        try realm.global_env.define("__asyncIterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeAsyncIterStep));
+        // yield* delegation step + return-completion value extractor.
+        try realm.global_env.define("__yieldStarStep__", try val_mod.makeNativeFunction(arena, es2015.nativeYieldStarStep));
+        try realm.global_env.define("__retComplVal__", try val_mod.makeNativeFunction(arena, es2015.nativeRetComplVal));
         // M16 Phase 3: dynamic import() native + the import.meta object binding.
         try realm.global_env.define("__import__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImport));
         try realm.global_env.define("__import_meta__", try @import("../runtime/realm.zig").makeImportMeta(arena, ""));

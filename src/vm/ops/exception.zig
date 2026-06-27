@@ -89,6 +89,31 @@ pub inline fn opPopTry(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+pub inline fn opEndFinally(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rtype = code[frame.pc];
+    frame.pc += 1;
+    const rval = code[frame.pc];
+    frame.pc += 1;
+    // Pending completion type (a number): 2 = throw, anything else = normal.
+    const tv = frame.registers[rtype];
+    var is_throw = false;
+    if (tv.bits != 0) switch (tv.unbox()) {
+        .number => |n| is_throw = (n == 2),
+        else => {},
+    };
+    if (is_throw) {
+        const thrown = frame.registers[rval];
+        self.last_exception_value = thrown;
+        const found = try self.throwException(thrown);
+        if (!found) {
+            const msg = try bcv.formatExceptionMessage(self.arena, thrown);
+            return RunOutcome{ .exception_value = .{ .msg = msg, .value = thrown } };
+        }
+    }
+    return null;
+}
+
 pub inline fn opInstanceof(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const site_pc = frame.pc - 1;
@@ -100,6 +125,14 @@ pub inline fn opInstanceof(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const lhs = frame.registers[rlhs];
     const rhs = frame.registers[rrhs];
+    // Mechanism B: a generator/async function value is .bc_function, not .object,
+    // so jsInstanceofWithTarget would always return false for it as LHS. Coerce it
+    // to its backing JsObject so the [[Prototype]] chain walk can succeed.
+    var lhs_eff = lhs;
+    if (lhs.bits != 0 and lhs.unbox() == .bc_function) {
+        const backing = try self.closureBackingObj(lhs.toPtr().bc_function);
+        lhs_eff = try val_mod.makeObject(self.arena, backing);
+    }
     var result = false;
     const cache = &@constCast(frame.func.instanceof_ic_table)[site_pc];
     if (rhs.bits != 0 and rhs.unbox() == .object) {
@@ -115,7 +148,7 @@ pub inline fn opInstanceof(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             cache.rhs_obj = @ptrCast(rhs_obj);
             cache.target_proto = if (target_proto) |tp| @ptrCast(tp) else null;
         }
-        result = bcv.jsInstanceofWithTarget(lhs, target_proto);
+        result = bcv.jsInstanceofWithTarget(lhs_eff, target_proto);
     } else if (rhs.bits != 0 and rhs.unbox() == .bc_function) {
         // W2 unification: rhs is a bc constructor; its prototype
         // lives on the backing object (materialized once any
@@ -127,7 +160,7 @@ pub inline fn opInstanceof(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 if (pv.bits != 0 and pv.unbox() == .object) target_proto = pv.toPtr().object;
             }
         }
-        result = bcv.jsInstanceofWithTarget(lhs, target_proto);
+        result = bcv.jsInstanceofWithTarget(lhs_eff, target_proto);
     } else {
         result = false;
     }

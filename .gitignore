@@ -13,3 +13,5 @@ tmp/
 jit-native/target/
 .sisyphus/
 .omo/
+.hermes/
+.claude/

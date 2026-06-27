@@ -64,6 +64,25 @@ pub inline fn opJmpIfTrue(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+pub inline fn opJmpIfRetCompl(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rcond = code[frame.pc];
+    frame.pc += 1;
+    const lo = code[frame.pc];
+    frame.pc += 1;
+    const hi = code[frame.pc];
+    frame.pc += 1;
+    const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
+    const v = frame.registers[rcond];
+    const is_rc = v.bits != 0 and v.unbox() == .object and
+        v.toPtr().object.internal_kind == .return_completion;
+    if (is_rc) {
+        const new_pc: i64 = @intCast(frame.pc);
+        frame.pc = @intCast(new_pc + offset);
+    }
+    return null;
+}
+
 pub inline fn opJmpIfFalse(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const op_site = frame.pc - 1;

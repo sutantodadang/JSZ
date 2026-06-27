@@ -232,6 +232,26 @@ pub const Op = enum(u8) {
     PUSH_WITH,
     /// POP_WITH | 1 | op. Pop the innermost with-object off the frame stack.
     POP_WITH,
+    /// W2-asyncgen: AWAIT — op, Rval u8 (2 bytes). Identical suspend mechanics to
+    /// YIELD, but flags the suspend as an `await` (not a `yield`) so the async
+    /// generator driver resumes internally on settle instead of producing a
+    /// result to the consumer. Emitted only inside `async function*` bodies; plain
+    /// async functions keep using YIELD (their driver treats every suspend as
+    /// await). Appended at the enum tail so existing opcode ordinals (pinned by
+    /// the JIT int-subset contract test) are unchanged.
+    AWAIT,
+    /// END_FINALLY | 3 | op, Rtype u8, Rval u8. Dispatch at the end of a finally
+    /// block on the pending completion in R[Rtype] (a number: 0=normal,
+    /// 2=throw). Normal falls through; throw re-raises R[Rval] (propagating to
+    /// the next outer handler). `return` completions run their finalizers inline
+    /// at the return site, so they never reach END_FINALLY.
+    END_FINALLY,
+    /// JMP_IF_RET_COMPL | 4 | op, Rval u8, rel i16. Jump if R[Rval] is the
+    /// internal return-completion sentinel (Generator.prototype.return resumed
+    /// the body by "throwing" it). Lets a `catch` skip its body and re-route the
+    /// sentinel to the finally / outer propagation, so `return()` runs finally
+    /// but is not observed by user `catch`.
+    JMP_IF_RET_COMPL,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -316,6 +336,9 @@ pub fn instrSize(op: Op) usize {
         .TAIL_CALL => 4,
         .DEBUGGER => 1,
         .YIELD => 2,
+        .AWAIT => 2,
+        .END_FINALLY => 3,
+        .JMP_IF_RET_COMPL => 4,
         .TAIL_METHOD_CALL => 4,
         .DEFINE_ACCESSOR => 6,
         .DEFINE_ACCESSOR_DYN => 5,

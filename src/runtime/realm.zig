@@ -1191,6 +1191,8 @@ pub var active_regexp_proto: ?*JsObject = null;
 /// Phase 4d: thread-local for Function.prototype.
 pub var active_function_proto: ?*JsObject = null;
 pub var active_promise_proto: ?*JsObject = null;
+/// %GeneratorFunction%: [[Prototype]] of generator function objects.
+pub var active_function_ctor: ?*JsObject = null;
 /// ES2015 Symbol.prototype (autoboxing lookup for symbol primitives).
 pub var active_symbol_proto: ?*JsObject = null;
 /// ES2015 Symbol.iterator well-known symbol value.
@@ -1201,6 +1203,8 @@ pub var active_sym_to_primitive: ?Value = null;
 pub var active_sym_to_string_tag: ?Value = null;
 /// ES2015 Symbol.species well-known symbol value.
 pub var active_sym_species: ?Value = null;
+/// ES2023 Symbol.asyncIterator well-known symbol value.
+pub var active_sym_async_iterator: ?Value = null;
 /// Phase 13: private symbols storing a Proxy's [[ProxyTarget]]/[[ProxyHandler]]
 /// as GC-traced symbol-keyed own properties.
 pub var active_sym_proxy_target: ?Value = null;
@@ -1568,6 +1572,316 @@ fn nativeArrayOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
     return val_mod.makeObject(arena, obj);
 }
 
+/// ES2023 Array.fromAsync(items, mapFn?, thisArg?) → Promise<Array>
+/// Drives async/sync iterables and array-likes; each element is awaited
+/// so thenables are unwrapped. Always returns a Promise.
+fn nativeArrayFromAsync(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    // not-a-constructor guard (§23.1.2.2 step 1)
+    if (active_constructing) {
+        active_constructing = false;
+        return throwTypeError(arena, "Array.fromAsync is not a constructor");
+    }
+    const result = arrayFromAsyncWork(arena, args) catch |e| {
+        if (e == error.JsException) {
+            const ex = pending_exception;
+            pending_exception = Value{};
+            return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{ex});
+        }
+        return e;
+    };
+    return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{result});
+}
+
+fn makeFromAsyncArray(arena: std.mem.Allocator, items: []const Value) !Value {
+    const obj = if (active_heap) |heap|
+        try JsObject.createOnHeap(heap, active_array_proto)
+    else
+        try JsObject.create(arena, active_array_proto);
+    obj.is_array = true;
+    for (items, 0..) |v, i| {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        try obj.set(key, v);
+    }
+    obj.array_length = @intCast(items.len);
+    return val_mod.makeObject(arena, obj);
+}
+
+fn arrayFromAsyncWork(arena: std.mem.Allocator, args: []const Value) anyerror!Value {
+    const src = if (args.len > 0 and args[0].bits != 0) args[0] else Value{};
+    const map_fn_raw = if (args.len > 1) args[1] else Value{};
+    const has_map = map_fn_raw.bits != 0 and
+        map_fn_raw.unbox() != .undefined_ and
+        map_fn_raw.unbox() != .null_;
+    if (has_map and !isCallableVal(map_fn_raw))
+        return throwTypeError(arena, "Array.fromAsync: mapFn is not callable");
+
+    var items = std.ArrayListUnmanaged(Value){};
+
+    if (src.bits == 0) return makeFromAsyncArray(arena, items.items);
+    if (src.unbox() != .object) return makeFromAsyncArray(arena, items.items);
+
+    const ctx = active_context orelse return makeFromAsyncArray(arena, items.items);
+
+    // 1. Try @@asyncIterator
+    if (active_sym_async_iterator) |async_sym| {
+        const iter_fn = ctx.getPropSym(arena, src, async_sym) catch Value{};
+        if (iter_fn.bits != 0 and iter_fn.unbox() != .undefined_ and
+            iter_fn.unbox() != .null_ and isCallableVal(iter_fn))
+        {
+            const iterator = try function_proto_mod.invokeCallback(arena, src, iter_fn, &[_]Value{});
+            if (iterator.bits == 0 or iterator.unbox() != .object)
+                return throwTypeError(arena, "@@asyncIterator() did not return an object");
+            const next_fn = try ctx.getProp(arena, iterator, "next");
+            if (!isCallableVal(next_fn))
+                return throwTypeError(arena, "async iterator.next is not a function");
+            var k: usize = 0;
+            while (k < 100_000_000) : (k += 1) {
+                const next_p = try function_proto_mod.invokeCallback(arena, iterator, next_fn, &[_]Value{});
+                const step = try promise_mod.awaitValue(arena, next_p);
+                if (step.bits == 0 or step.unbox() != .object) break;
+                const done_v = try ctx.getProp(arena, step, "done");
+                if (isTruthyVal(done_v)) break;
+                var val = try ctx.getProp(arena, step, "value");
+                val = try promise_mod.awaitValue(arena, val);
+                if (has_map) {
+                    const idx_v = try val_mod.makeNumber(arena, @floatFromInt(k));
+                    const mapped = try function_proto_mod.invokeCallback(arena, try val_mod.makeUndefined(arena), map_fn_raw, &[_]Value{ val, idx_v });
+                    val = try promise_mod.awaitValue(arena, mapped);
+                }
+                try items.append(arena, val);
+            }
+            return makeFromAsyncArray(arena, items.items);
+        }
+    }
+
+    // 2. Try @@iterator (sync iterable — each value is awaited per spec)
+    if (active_sym_iterator) |iter_sym| {
+        const iter_fn = ctx.getPropSym(arena, src, iter_sym) catch Value{};
+        if (iter_fn.bits != 0 and iter_fn.unbox() != .undefined_ and
+            iter_fn.unbox() != .null_ and isCallableVal(iter_fn))
+        {
+            const iterator = try function_proto_mod.invokeCallback(arena, src, iter_fn, &[_]Value{});
+            if (iterator.bits == 0 or iterator.unbox() != .object)
+                return throwTypeError(arena, "@@iterator() did not return an object");
+            const next_fn = try ctx.getProp(arena, iterator, "next");
+            if (!isCallableVal(next_fn))
+                return throwTypeError(arena, "iterator.next is not a function");
+            var k: usize = 0;
+            while (k < 100_000_000) : (k += 1) {
+                const res = try function_proto_mod.invokeCallback(arena, iterator, next_fn, &[_]Value{});
+                if (res.bits == 0 or res.unbox() != .object) break;
+                const done_v = try ctx.getProp(arena, res, "done");
+                if (isTruthyVal(done_v)) break;
+                var val = try ctx.getProp(arena, res, "value");
+                val = try promise_mod.awaitValue(arena, val);
+                if (has_map) {
+                    const idx_v = try val_mod.makeNumber(arena, @floatFromInt(k));
+                    const mapped = try function_proto_mod.invokeCallback(arena, try val_mod.makeUndefined(arena), map_fn_raw, &[_]Value{ val, idx_v });
+                    val = try promise_mod.awaitValue(arena, mapped);
+                }
+                try items.append(arena, val);
+            }
+            return makeFromAsyncArray(arena, items.items);
+        }
+    }
+
+    // 3. Array-like: read length, then elements by index (each awaited)
+    const src_obj = src.toPtr().object;
+    const len_v = src_obj.get("length") orelse Value{};
+    const len: usize = blk: {
+        if (len_v.bits == 0) break :blk 0;
+        const lv = try promise_mod.awaitValue(arena, len_v);
+        if (lv.bits == 0) break :blk 0;
+        break :blk switch (lv.unbox()) {
+            .number => |n| if (n <= 0 or std.math.isNan(n)) 0 else @min(@as(usize, @intFromFloat(@trunc(n))), 4294967295),
+            else => 0,
+        };
+    };
+    var buf: [32]u8 = undefined;
+    var k: usize = 0;
+    while (k < len) : (k += 1) {
+        const key = try std.fmt.bufPrint(&buf, "{d}", .{k});
+        var val = src_obj.get(key) orelse try val_mod.makeUndefined(arena);
+        val = try promise_mod.awaitValue(arena, val);
+        if (has_map) {
+            const idx_v = try val_mod.makeNumber(arena, @floatFromInt(k));
+            const mapped = try function_proto_mod.invokeCallback(arena, try val_mod.makeUndefined(arena), map_fn_raw, &[_]Value{ val, idx_v });
+            val = try promise_mod.awaitValue(arena, mapped);
+        }
+        try items.append(arena, val);
+    }
+    return makeFromAsyncArray(arena, items.items);
+}
+
+/// Cycle-detection context for structuredClone — O(n) list scan is fine for
+/// typical object graphs; avoids a HashMap dependency in this file.
+const StructuredCloneCtx = struct {
+    seen_keys: std.ArrayListUnmanaged(*JsObject) = .empty,
+    seen_vals: std.ArrayListUnmanaged(Value) = .empty,
+
+    fn lookup(self: *StructuredCloneCtx, obj: *JsObject) ?Value {
+        for (self.seen_keys.items, 0..) |k, i| {
+            if (k == obj) return self.seen_vals.items[i];
+        }
+        return null;
+    }
+
+    fn record(self: *StructuredCloneCtx, alloc: std.mem.Allocator, obj: *JsObject, val: Value) !void {
+        try self.seen_keys.append(alloc, obj);
+        try self.seen_vals.append(alloc, val);
+    }
+};
+
+fn structuredCloneInner(arena: std.mem.Allocator, v: Value, ctx: *StructuredCloneCtx) anyerror!Value {
+    if (v.bits == 0) return v; // undefined (zero Value)
+    switch (v.unbox()) {
+        // Primitives pass through as-is.
+        .undefined_, .null_, .boolean, .number, .string, .bigint => return v,
+        .symbol => return throwTypeError(arena, "structuredClone: Symbol values cannot be cloned"),
+        .native_function, .bc_function, .function => return throwTypeError(arena, "structuredClone: Function values cannot be cloned"),
+        .object => |obj| {
+            // Reject uncloneable internal kinds.
+            switch (obj.internal_kind) {
+                .bound_function,
+                .promise,
+                .generator,
+                .proxy,
+                .weakmap,
+                .weakset,
+                .weakref,
+                .finalization_registry,
+                .shadow_realm,
+                .module_namespace,
+                .wrapped_function,
+                => return throwTypeError(arena, "structuredClone: value could not be cloned"),
+                else => {},
+            }
+            // Callable plain objects (native ctor-objects etc.) are function-like.
+            if (obj.internal_kind == .none and obj.get("__call__") != null)
+                return throwTypeError(arena, "structuredClone: Function values cannot be cloned");
+
+            // Cycle / identity preservation.
+            if (ctx.lookup(obj)) |existing| return existing;
+
+            switch (obj.internal_kind) {
+                .date => {
+                    const ms = date_mod.getDateMs(v) orelse 0;
+                    const new_obj = if (active_heap) |h|
+                        try JsObject.createOnHeap(h, date_mod.active_date_proto)
+                    else
+                        try JsObject.create(arena, date_mod.active_date_proto);
+                    new_obj.internal_kind = .date;
+                    const dd = try arena.create(date_mod.DateData);
+                    dd.* = .{ .ms = ms };
+                    new_obj.internal_slot = dd;
+                    const cloned = try val_mod.makeObject(arena, new_obj);
+                    try ctx.record(arena, obj, cloned);
+                    return cloned;
+                },
+                .regexp => {
+                    // Shallow-clone: share the compiled pattern (read-only).
+                    const new_obj = if (active_heap) |h|
+                        try JsObject.createOnHeap(h, active_regexp_proto)
+                    else
+                        try JsObject.create(arena, active_regexp_proto);
+                    new_obj.internal_kind = .regexp;
+                    new_obj.internal_slot = obj.internal_slot; // share compiled regex
+                    for (obj.ownKeys()) |k| {
+                        if (obj.getOwn(k)) |pv| try new_obj.set(k, pv);
+                    }
+                    const cloned = try val_mod.makeObject(arena, new_obj);
+                    try ctx.record(arena, obj, cloned);
+                    return cloned;
+                },
+                .map => {
+                    const new_obj = if (active_heap) |h|
+                        try JsObject.createOnHeap(h, es2015_collections_mod.active_map_proto)
+                    else
+                        try JsObject.create(arena, es2015_collections_mod.active_map_proto);
+                    new_obj.internal_kind = .map;
+                    const new_data = try arena.create(es2015_collections_mod.MapData);
+                    new_data.* = .{};
+                    new_obj.internal_slot = new_data;
+                    const cloned = try val_mod.makeObject(arena, new_obj);
+                    try ctx.record(arena, obj, cloned);
+                    if (obj.internal_slot) |s| {
+                        const orig: *es2015_collections_mod.MapData = @ptrCast(@alignCast(s));
+                        for (orig.keys.items, 0..) |mk, i| {
+                            const mv = orig.values.items[i];
+                            const ck = try structuredCloneInner(arena, mk, ctx);
+                            const cv = try structuredCloneInner(arena, mv, ctx);
+                            try new_data.keys.append(arena, ck);
+                            try new_data.values.append(arena, cv);
+                        }
+                    }
+                    return cloned;
+                },
+                .set => {
+                    const new_obj = if (active_heap) |h|
+                        try JsObject.createOnHeap(h, es2015_collections_mod.active_set_proto)
+                    else
+                        try JsObject.create(arena, es2015_collections_mod.active_set_proto);
+                    new_obj.internal_kind = .set;
+                    const new_data = try arena.create(es2015_collections_mod.SetData);
+                    new_data.* = .{};
+                    new_obj.internal_slot = new_data;
+                    const cloned = try val_mod.makeObject(arena, new_obj);
+                    try ctx.record(arena, obj, cloned);
+                    if (obj.internal_slot) |s| {
+                        const orig: *es2015_collections_mod.SetData = @ptrCast(@alignCast(s));
+                        for (orig.values.items) |sv| {
+                            const csv = try structuredCloneInner(arena, sv, ctx);
+                            try new_data.values.append(arena, csv);
+                        }
+                    }
+                    return cloned;
+                },
+                .array_buffer, .typed_array, .data_view, .shared_array_buffer => {
+                    // Pragmatic: return same object (transfer semantics not implemented).
+                    return v;
+                },
+                else => {
+                    // Plain object, array, Error, wrapper — deep-clone own enumerable props.
+                    const is_array = obj.is_array;
+                    const proto: ?*JsObject = if (is_array) active_array_proto else active_object_proto;
+                    const new_obj = if (active_heap) |h|
+                        try JsObject.createOnHeap(h, proto)
+                    else
+                        try JsObject.create(arena, proto);
+                    new_obj.is_array = is_array;
+                    if (is_array) new_obj.array_length = obj.array_length;
+                    const cloned = try val_mod.makeObject(arena, new_obj);
+                    try ctx.record(arena, obj, cloned);
+                    // Deep-clone own enumerable string-keyed properties.
+                    for (obj.ownKeys()) |k| {
+                        if (!obj.isEnumerable(k)) continue;
+                        const pv = obj.getOwn(k) orelse continue;
+                        const cv = try structuredCloneInner(arena, pv, ctx);
+                        try new_obj.set(k, cv);
+                    }
+                    // Deep-clone own enumerable symbol-keyed properties.
+                    for (obj.sym_props.items) |sp| {
+                        if (!sp.attr.enumerable) continue;
+                        const cs = try structuredCloneInner(arena, sp.value, ctx);
+                        try new_obj.setSym(sp.key, cs);
+                    }
+                    return cloned;
+                },
+            }
+        },
+    }
+}
+
+/// ES2022 structuredClone(value, options?) — deep structural clone with
+/// circular-reference identity preservation. Throws TypeError for uncloneable
+/// types (functions, symbols). options.transfer is not implemented (stub).
+fn nativeStructuredClone(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (v.bits == 0) return v;
+    var sctx = StructuredCloneCtx{};
+    return structuredCloneInner(arena, v, &sctx);
+}
+
 fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8 {
     if (arg.bits == 0) return "undefined";
     return switch (arg.unbox()) {
@@ -1863,7 +2177,7 @@ fn wrapperPrimitive(this_val: Value) ?Value {
 
 /// Raise a `TypeError` from a native: sets `pending_exception` and returns
 /// `error.JsException` for the VM to surface as a catchable throw.
-fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+pub fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const err_obj = if (active_heap) |h|
         try JsObject.createOnHeap(h, error_proto_TypeError)
     else
@@ -1995,18 +2309,13 @@ fn nativeNoop(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Val
     return val_mod.makeUndefined(arena);
 }
 
-fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    // `new Function(p1, …, pN, body)`: assemble `(function anonymous(p1,…){body})`
-    // and compile it through the eval bridge, returning the function value.
-    // ponytail: string args only (ToString of non-strings skipped); covers
-    // `new Function("a","return a")` and `new Function("return class … {}")`.
-    // Cross-realm: stamp the compiled function with the Realm of the `Function`
-    // ctor that was invoked (its [[Realm]], carried via the native side channel),
-    // captured up front because evalSource runs a nested VM that clears it.
+fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []const u8) anyerror!Value {
     const ctor_realm = val_mod.g_active_native_realm;
     if (active_context) |ctx| {
         var src = std.ArrayList(u8){};
-        try src.appendSlice(arena, "(function anonymous(");
+        try src.append(arena, '(');
+        try src.appendSlice(arena, keyword);
+        try src.appendSlice(arena, " anonymous(");
         if (args.len > 1) {
             for (args[0 .. args.len - 1], 0..) |a, i| {
                 if (i > 0) try src.append(arena, ',');
@@ -2030,6 +2339,18 @@ fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) a
         try JsObject.create(arena, active_function_proto);
     try o.set("__call__", try val_mod.makeNativeFunction(arena, nativeNoop));
     return val_mod.makeObject(arena, o);
+}
+
+fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return functionCtorImpl(arena, args, "function");
+}
+
+pub fn nativeGeneratorFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return functionCtorImpl(arena, args, "function*");
+}
+
+pub fn nativeAsyncGeneratorFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return functionCtorImpl(arena, args, "async function*");
 }
 
 // ---- Function.prototype.toString ----
@@ -2249,6 +2570,7 @@ pub const ThreadLocalSnapshot = struct {
     promise_proto: ?*JsObject,
     symbol_proto: ?*JsObject,
     sym_iterator: ?val_mod.Value,
+    sym_async_iterator: ?val_mod.Value,
     sym_to_primitive: ?val_mod.Value,
     sym_to_string_tag: ?val_mod.Value,
     sym_species: ?val_mod.Value,
@@ -2293,6 +2615,7 @@ pub const ThreadLocalSnapshot = struct {
             .promise_proto = active_promise_proto,
             .symbol_proto = active_symbol_proto,
             .sym_iterator = active_sym_iterator,
+            .sym_async_iterator = active_sym_async_iterator,
             .sym_to_primitive = active_sym_to_primitive,
             .sym_to_string_tag = active_sym_to_string_tag,
             .sym_species = active_sym_species,
@@ -2338,6 +2661,7 @@ pub const ThreadLocalSnapshot = struct {
         active_promise_proto = self.promise_proto;
         active_symbol_proto = self.symbol_proto;
         active_sym_iterator = self.sym_iterator;
+        active_sym_async_iterator = self.sym_async_iterator;
         active_sym_to_primitive = self.sym_to_primitive;
         active_sym_to_string_tag = self.sym_to_string_tag;
         active_sym_species = self.sym_species;
@@ -2589,6 +2913,7 @@ pub const Realm = struct {
                 try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols));
                 try ctor_obj.set("is", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIs, "is", 2));
                 try ctor_obj.set("hasOwn", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectHasOwn, "hasOwn", 2));
+                try ctor_obj.set("groupBy", try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeObjectGroupBy, "groupBy", 2));
             }
         }
         // hasOwnProperty on Object.prototype (non-enumerable, writable, configurable)
@@ -2676,6 +3001,9 @@ pub const Realm = struct {
         try array_ctor_obj.set("isArray", try val_mod.makeNativeFunctionNamed(arena, nativeArrayIsArray, "isArray", 1));
         try array_ctor_obj.set("from", try val_mod.makeNativeFunctionNamed(arena, nativeArrayFrom, "from", 1));
         try array_ctor_obj.set("of", try val_mod.makeNativeFunctionNamed(arena, nativeArrayOf, "of", 0));
+        // Array.fromAsync: non-enumerable to satisfy prop-desc test (§23.1.2.1)
+        const from_async_attr = obj_mod.PropAttr{ .writable = true, .enumerable = false, .configurable = true };
+        _ = try array_ctor_obj.defineOwnData("fromAsync", try val_mod.makeNativeFunctionNamed(arena, nativeArrayFromAsync, "fromAsync", 1), from_async_attr);
         try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
 
         const string_ctor_obj = try JsObject.create(arena, null);
@@ -2749,6 +3077,7 @@ pub const Realm = struct {
         try function_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeFunctionCtor));
         try function_proto.set("constructor", try val_mod.makeObject(arena, function_ctor_obj));
         try env.define("Function", try val_mod.makeObject(arena, function_ctor_obj));
+        active_function_ctor = function_ctor_obj;
 
         // ---- Phase 4: global functions + value globals ----
         const boolean_proto = try JsObject.create(arena, object_proto);
@@ -2769,6 +3098,7 @@ pub const Realm = struct {
         try env.define("parseFloat", try val_mod.makeNativeFunction(arena, nativeParseFloat));
         try env.define("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)));
         try env.define("Infinity", try val_mod.makeNumber(arena, std.math.inf(f64)));
+        try env.define("structuredClone", try val_mod.makeNativeFunctionNamed(arena, nativeStructuredClone, "structuredClone", 1));
 
         // ---- console global ----
         try console_mod.register(&reg_ctx);
@@ -2810,6 +3140,8 @@ pub const Realm = struct {
             // and deletable, so it is a writable/configurable own property).
             try string_proto.setSymAttr(symv, try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeStringValues, "[Symbol.iterator]", 0), .{ .writable = true, .enumerable = false, .configurable = true });
         }
+        // Capture Symbol.asyncIterator.
+        active_sym_async_iterator = symbol_ctor.getOwn("asyncIterator");
         // Capture Symbol.toPrimitive and give Date the spec-correct hook so
         // `date + x` coerces to a string (default hint) rather than a number.
         active_sym_to_primitive = symbol_ctor.getOwn("toPrimitive");
@@ -2824,6 +3156,8 @@ pub const Realm = struct {
         // Wire @@toStringTag + @@species onto TypedArray/ArrayBuffer/DataView protos+ctors now
         // that the well-known symbols exist (register() ran before Symbol init).
         try typed_array_mod.registerSymbols(arena);
+        // Wire @@toStringTag onto WeakMap.prototype and WeakSet.prototype.
+        try es2015_collections_mod.registerSymbols(arena);
 
         // Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain
         // now that @@iterator / @@toStringTag exist. Array + TypedArray iterators
@@ -3098,6 +3432,9 @@ pub const Realm = struct {
                 const v = entry.value_ptr.value;
                 if (v.bits == 0 or v.unbox() != .object) continue;
                 const ctor = v.toPtr().object;
+                // Reparent namespace objects (Math, JSON, Atomics, …) that are
+                // directly parented to old_object_proto (no "prototype" property).
+                if (ctor.proto == old_object_proto) ctor.proto = hp_proto;
                 const proto_v = ctor.getOwn("prototype") orelse continue;
                 if (proto_v.bits == 0 or proto_v.unbox() != .object) continue;
                 const child = proto_v.toPtr().object;

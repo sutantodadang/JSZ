@@ -400,6 +400,9 @@ pub const ForInStmt = struct {
     right: *Node,
     body: *Node,
     iterate_values: bool = false,
+    /// `for await (x of it)`: consume via the async-iterator protocol, awaiting
+    /// each step. Only valid inside an async function / async generator body.
+    is_await: bool = false,
 };
 
 /// Phase 4d: single case in a switch statement.

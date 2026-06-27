@@ -433,11 +433,30 @@ pub inline fn opYield(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // YIELD inside generator bodies). Save the suspended frame.
     const state = frame.gen.?;
     state.resume_reg = rsrc;
+    state.last_suspend_await = false; // a `yield` suspend
     state.frame = frame.*; // pc already advanced past YIELD
     _ = self.frames.pop();
     self.result = yielded;
     self.gen_yielded = true;
     return RunOutcome{ .ok = yielded };
+}
+
+/// W2-asyncgen: AWAIT — same suspend mechanics as YIELD, but flags the suspend
+/// as an `await` so the async-generator driver resumes internally (rather than
+/// producing a result to the consumer). Used only in `async function*` bodies.
+pub inline fn opAwait(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rsrc = code[frame.pc];
+    frame.pc += 1;
+    const awaited = frame.registers[rsrc];
+    const state = frame.gen.?;
+    state.resume_reg = rsrc;
+    state.last_suspend_await = true; // an `await` suspend
+    state.frame = frame.*; // pc already advanced past AWAIT
+    _ = self.frames.pop();
+    self.result = awaited;
+    self.gen_yielded = true;
+    return RunOutcome{ .ok = awaited };
 }
 
 pub inline fn opDebugger(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
