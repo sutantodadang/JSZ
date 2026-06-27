@@ -500,10 +500,22 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 >   evals it; because the eval runs on the same VM, the compiled function's
 >   `[[Prototype]]` roots at the same %Generator%, so intrinsic identity holds
 >   (`getPrototypeOf(GeneratorFunction("yield 1")) === getPrototypeOf(function*(){})`).
+> - **Generator-function-object exactness** — `new genFn()` / `new asyncFn()` throw
+>   TypeError (generators/async fns aren't constructors); `genFn instanceof
+>   GeneratorFunction` works (instanceof now coerces a function LHS to its backing
+>   object — `(function(){}) instanceof Function` is now true too); generator
+>   functions carry real own `name`/`length` {w:f,e:f,c:t} + `prototype`
+>   {w:t,e:f,c:f} descriptors; and `Object.getOwnPropertyDescriptor` /
+>   `hasOwnProperty` / `delete` resolve a function to its backing object.
+>   `built-ins/GeneratorFunction` **16→21/23**, `built-ins/AsyncGeneratorFunction`
+>   **11→16/17**; zero regressions.
 >
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
 >   cannot test collection — coordinate with M19 ephemerons).
+> - Generator-fn `caller`/`arguments` %ThrowTypeError% poison (engine-wide
+>   `Function.prototype` change) and cross-realm %GeneratorPrototype% identity
+>   (`proto-from-ctor-realm-prototype`) — 3 GeneratorFunction tests.
 > - `yield*` observable IteratorClose access-ordering edge cases; `yield`
 >   rhs-omitted/regexp/template parse; async-gen `yield <promise>` not pre-awaited;
 >   async `yield*` resume-completion forwarding.
