@@ -481,14 +481,25 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 > - **%AsyncGeneratorPrototype% (instance side)** — shared prototype with
 >   next/return/throw (spec descriptors) + @@toStringTag "AsyncGenerator" +
 >   @@asyncIterator; instances inherit through it.
+> - **Generator/AsyncGenerator function-side intrinsic chain** — full
+>   %IteratorPrototype%→%GeneratorPrototype%→%Generator%→%GeneratorFunction%
+>   (and async parallel via %AsyncIteratorPrototype%), built lazily in
+>   `ensureGeneratorChain` with exact descriptors. Generator function objects
+>   root at %Generator%; their `.prototype` roots at %GeneratorPrototype%;
+>   instances chain through the function's `.prototype` (real two-level proto),
+>   so `Object.getPrototypeOf(genFn).prototype` and
+>   `getPrototypeOf(getPrototypeOf(instance))` resolve correctly. Prototype
+>   next/return/throw now throw TypeError on a non-generator receiver and reject
+>   `new`. `built-ins/GeneratorPrototype` **0→61/61**,
+>   `built-ins/AsyncGeneratorPrototype` **3→13/13**; zero regressions.
 >
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
 >   cannot test collection — coordinate with M19 ephemerons).
-> - Generator/AsyncGenerator **function-side intrinsic chain**
->   (%GeneratorFunction%/%AsyncGeneratorFunction% → %Generator%/%AsyncGenerator%)
->   so `Object.getPrototypeOf(genFn).prototype` + `.constructor` resolve — the
->   remaining `*GeneratorPrototype` prop-desc/constructor tests use that path.
+> - %GeneratorFunction%/%AsyncGeneratorFunction% **callable** to compile a
+>   generator body from a string (`new GeneratorFunction("yield 1")`) — needs the
+>   same parser bridge as `new Function`; the constructors' identity + descriptors
+>   are complete, only dynamic compilation is missing.
 > - `yield*` observable IteratorClose access-ordering edge cases; `yield`
 >   rhs-omitted/regexp/template parse; async-gen `yield <promise>` not pre-awaited;
 >   async `yield*` resume-completion forwarding.
