@@ -1409,6 +1409,247 @@ pub const FnCompiler = struct {
         }
     }
 
+    /// Sync `yield* rhs` with full next/throw/return forwarding (ES
+    /// YieldExpression delegation). Drives the inner iterator via
+    /// `__yieldStarStep__`, yields each value, and forwards the resume completion
+    /// (normal sent value / `throw` / `return`) back to the inner iterator.
+    fn compileYieldStar(self: *Self, rhs: *Node, line: u32) error{OutOfMemory}!u8 {
+        const lower = @import("./lower/stmt.zig");
+        const base_sp = self.sp;
+        // riter = __getIterator__(rhs)
+        const riter = self.allocReg();
+        {
+            const b = self.allocReg();
+            self.sp = b;
+            const gi = try self.builder.addConstant(try val_mod.makeString(self.arena, "__getIterator__"));
+            try self.emitOp(.GET_GLOBAL, line);
+            try self.emitU8(b);
+            try self.emitU16(@intCast(gi));
+            self.sp = b + 1;
+            _ = try self.compileExpr(rhs);
+            try self.emitOp(.CALL, line);
+            try self.emitU8(b);
+            try self.emitU8(1);
+            try self.emitU8(riter);
+            self.sp = riter + 1;
+        }
+        const rtype = self.allocReg();
+        const rval = self.allocReg();
+        const rstep = self.allocReg();
+        const rresult = self.allocReg();
+        const rret = self.allocReg();
+        const rdone = self.allocReg();
+        const loop_top = self.sp;
+        const k0 = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 0));
+        const k1 = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 1));
+        const k2 = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 2));
+        const c_step = try self.builder.addConstant(try val_mod.makeString(self.arena, "__yieldStarStep__"));
+        const c_rcv = try self.builder.addConstant(try val_mod.makeString(self.arena, "__retComplVal__"));
+        const c_ret = try self.builder.addConstant(try val_mod.makeString(self.arena, "ret"));
+        const c_val = try self.builder.addConstant(try val_mod.makeString(self.arena, "value"));
+        const c_done = try self.builder.addConstant(try val_mod.makeString(self.arena, "done"));
+        // rtype = 0 (normal); rval = undefined
+        try self.emitOp(.LOAD_K, line);
+        try self.emitU8(rtype);
+        try self.emitI16(@intCast(k0));
+        try self.emitOp(.LOAD_UNDEF, line);
+        try self.emitU8(rval);
+
+        const loop_start = self.currentOffset();
+        // rstep = __yieldStarStep__(riter, rtype, rval)
+        {
+            const b = self.allocReg();
+            try self.emitOp(.GET_GLOBAL, line);
+            try self.emitU8(b);
+            try self.emitU16(@intCast(c_step));
+            const a1 = self.allocReg();
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(a1);
+            try self.emitU8(riter);
+            const a2 = self.allocReg();
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(a2);
+            try self.emitU8(rtype);
+            const a3 = self.allocReg();
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(a3);
+            try self.emitU8(rval);
+            try self.emitOp(.CALL, line);
+            try self.emitU8(b);
+            try self.emitU8(3);
+            try self.emitU8(rstep);
+            self.sp = loop_top;
+        }
+        // rret = rstep.ret; rresult = rstep.value; rdone = rstep.done
+        try self.emitOp(.GET_PROP, line);
+        try self.emitU8(rret);
+        try self.emitU8(rstep);
+        try self.emitU16(@intCast(c_ret));
+        try self.emitOp(.GET_PROP, line);
+        try self.emitU8(rresult);
+        try self.emitU8(rstep);
+        try self.emitU16(@intCast(c_val));
+        try self.emitOp(.GET_PROP, line);
+        try self.emitU8(rdone);
+        try self.emitU8(rstep);
+        try self.emitU16(@intCast(c_done));
+        // if rret → the outer generator returns rresult
+        try self.emitOp(.JMP_IF_TRUE, line);
+        try self.emitU8(rret);
+        const ret_patch = self.currentOffset();
+        try self.emitI16(0);
+        // if rdone → yield* completes with rresult
+        try self.emitOp(.JMP_IF_TRUE, line);
+        try self.emitU8(rdone);
+        const exit_patch = self.currentOffset();
+        try self.emitI16(0);
+        // yield rresult; capture the resume completion (throw / return-completion
+        // land at the catch via PUSH_TRY; a normal resume falls through).
+        try self.emitOp(.PUSH_TRY, line);
+        try self.emitU8(rresult);
+        const catch_patch = self.currentOffset();
+        try self.emitI16(0);
+        try self.emitOp(.YIELD, line);
+        try self.emitU8(rresult);
+        try self.emitOp(.POP_TRY, line);
+        // normal resume: rval = sent value; rtype = 0
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(rval);
+        try self.emitU8(rresult);
+        try self.emitOp(.LOAD_K, line);
+        try self.emitU8(rtype);
+        try self.emitI16(@intCast(k0));
+        try self.emitOp(.JMP, line);
+        const back1 = self.currentOffset();
+        try self.emitI16(0);
+        self.patchJump(back1, loop_start);
+        // catch: rresult holds the injected exception / return-completion
+        self.patchJump(catch_patch, self.currentOffset());
+        try self.emitOp(.JMP_IF_RET_COMPL, line);
+        try self.emitU8(rresult);
+        const rc_patch = self.currentOffset();
+        try self.emitI16(0);
+        // throw resume: rval = exception; rtype = 1
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(rval);
+        try self.emitU8(rresult);
+        try self.emitOp(.LOAD_K, line);
+        try self.emitU8(rtype);
+        try self.emitI16(@intCast(k1));
+        try self.emitOp(.JMP, line);
+        const back2 = self.currentOffset();
+        try self.emitI16(0);
+        self.patchJump(back2, loop_start);
+        // return-completion resume: rval = __retComplVal__(rresult); rtype = 2
+        self.patchJump(rc_patch, self.currentOffset());
+        {
+            const b = self.allocReg();
+            try self.emitOp(.GET_GLOBAL, line);
+            try self.emitU8(b);
+            try self.emitU16(@intCast(c_rcv));
+            const a1 = self.allocReg();
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(a1);
+            try self.emitU8(rresult);
+            try self.emitOp(.CALL, line);
+            try self.emitU8(b);
+            try self.emitU8(1);
+            try self.emitU8(rval);
+            self.sp = loop_top;
+        }
+        try self.emitOp(.LOAD_K, line);
+        try self.emitU8(rtype);
+        try self.emitI16(@intCast(k2));
+        try self.emitOp(.JMP, line);
+        const back3 = self.currentOffset();
+        try self.emitI16(0);
+        self.patchJump(back3, loop_start);
+        // ret: the outer generator returns rresult (run finally first)
+        self.patchJump(ret_patch, self.currentOffset());
+        try lower.runPendingFinally(self, rresult, 0, line);
+        try self.emitOp(.RETURN, line);
+        try self.emitU8(rresult);
+        // exit: yield* evaluates to rresult
+        self.patchJump(exit_patch, self.currentOffset());
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(base_sp);
+        try self.emitU8(rresult);
+        self.sp = base_sp + 1;
+        return base_sp;
+    }
+
+    /// Async `yield* rhs` inside an `async function*`: delegate over the async
+    /// iterator, awaiting each step. (next-only; resume completions not yet
+    /// forwarded to the inner async iterator.)
+    fn compileAsyncYieldStar(self: *Self, rhs: *Node, line: u32) error{OutOfMemory}!u8 {
+        const base_sp = self.sp;
+        const riter = self.allocReg();
+        {
+            const b = self.allocReg();
+            self.sp = b;
+            const gi = try self.builder.addConstant(try val_mod.makeString(self.arena, "__getAsyncIterator__"));
+            try self.emitOp(.GET_GLOBAL, line);
+            try self.emitU8(b);
+            try self.emitU16(@intCast(gi));
+            self.sp = b + 1;
+            _ = try self.compileExpr(rhs);
+            try self.emitOp(.CALL, line);
+            try self.emitU8(b);
+            try self.emitU8(1);
+            try self.emitU8(riter);
+            self.sp = riter + 1;
+        }
+        const rstep = self.allocReg();
+        const rresult = self.allocReg();
+        const loop_start = self.currentOffset();
+        {
+            const b = self.allocReg();
+            const si = try self.builder.addConstant(try val_mod.makeString(self.arena, "__asyncIterStep__"));
+            try self.emitOp(.GET_GLOBAL, line);
+            try self.emitU8(b);
+            try self.emitU16(@intCast(si));
+            const barg = self.allocReg();
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(barg);
+            try self.emitU8(riter);
+            try self.emitOp(.CALL, line);
+            try self.emitU8(b);
+            try self.emitU8(1);
+            try self.emitU8(rstep);
+            try self.emitOp(.AWAIT, line);
+            try self.emitU8(rstep);
+            self.sp = rresult + 1;
+        }
+        const vi = try self.builder.addConstant(try val_mod.makeString(self.arena, "value"));
+        try self.emitOp(.GET_PROP, line);
+        try self.emitU8(rresult);
+        try self.emitU8(rstep);
+        try self.emitU16(@intCast(vi));
+        const rdone = self.allocReg();
+        const di = try self.builder.addConstant(try val_mod.makeString(self.arena, "done"));
+        try self.emitOp(.GET_PROP, line);
+        try self.emitU8(rdone);
+        try self.emitU8(rstep);
+        try self.emitU16(@intCast(di));
+        try self.emitOp(.JMP_IF_TRUE, line);
+        try self.emitU8(rdone);
+        const patch_exit = self.currentOffset();
+        try self.emitI16(0);
+        self.sp = rresult + 1;
+        try self.emitOp(.YIELD, line);
+        try self.emitU8(rresult);
+        try self.emitOp(.JMP, line);
+        const back = self.currentOffset();
+        try self.emitI16(0);
+        self.patchJump(back, loop_start);
+        self.patchJump(patch_exit, self.currentOffset());
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(base_sp);
+        try self.emitU8(rresult);
+        self.sp = base_sp + 1;
+        return base_sp;
+    }
+
     pub fn compileCall(self: *Self, c: ast.CallExpr, line: u32, tail: bool) error{OutOfMemory}!u8 {
         // W2-async: inside an async function `await x` is parsed as __await__(x).
         // Compile it as a YIELD suspend: evaluate x into r, suspend; the async
@@ -1424,84 +1665,11 @@ pub const FnCompiler = struct {
             try self.emitU8(r);
             return r;
         }
-        // W2: `yield* x` is parsed as __yield_star__(x). In a bytecode generator
-        // compile it inline as a delegation loop so the YIELD suspends the
-        // enclosing generator. Result = the inner iterator's return value.
+        // W2: `yield* x` is parsed as __yield_star__(x). Compiled inline as a
+        // delegation loop so the YIELD suspends the enclosing generator.
         if (c.callee.kind == .identifier and std.mem.eql(u8, c.callee.data.identifier, "__yield_star__") and c.args.len == 1) {
-            const base_sp = self.sp;
-            const riter = self.allocReg();
-            {
-                const b = self.allocReg();
-                self.sp = b;
-                const gi = try self.builder.addConstant(try val_mod.makeString(self.arena, if (self.is_async_generator) "__getAsyncIterator__" else "__getIterator__"));
-                try self.emitOp(.GET_GLOBAL, line);
-                try self.emitU8(b);
-                try self.emitU16(@intCast(gi));
-                self.sp = b + 1;
-                _ = try self.compileExpr(c.args[0]);
-                try self.emitOp(.CALL, line);
-                try self.emitU8(b);
-                try self.emitU8(1);
-                try self.emitU8(riter);
-                self.sp = riter + 1;
-            }
-            const rstep = self.allocReg();
-            const rresult = self.allocReg();
-            const loop_start = self.currentOffset();
-            {
-                const b = self.allocReg();
-                const si = try self.builder.addConstant(try val_mod.makeString(self.arena, if (self.is_async_generator) "__asyncIterStep__" else "__iterStep__"));
-                try self.emitOp(.GET_GLOBAL, line);
-                try self.emitU8(b);
-                try self.emitU16(@intCast(si));
-                const barg = self.allocReg();
-                try self.emitOp(.MOVE, line);
-                try self.emitU8(barg);
-                try self.emitU8(riter);
-                try self.emitOp(.CALL, line);
-                try self.emitU8(b);
-                try self.emitU8(1);
-                try self.emitU8(rstep);
-                // Async delegation: __asyncIterStep__ returns a promise of
-                // {value,done}; await it so rstep holds the resolved result.
-                if (self.is_async_generator) {
-                    try self.emitOp(.AWAIT, line);
-                    try self.emitU8(rstep);
-                }
-                self.sp = rresult + 1;
-            }
-            // rresult = step.value (on the done step this is the inner return value)
-            const vi = try self.builder.addConstant(try val_mod.makeString(self.arena, "value"));
-            try self.emitOp(.GET_PROP, line);
-            try self.emitU8(rresult);
-            try self.emitU8(rstep);
-            try self.emitU16(@intCast(vi));
-            // if (step.done) exit
-            const rdone = self.allocReg();
-            const di = try self.builder.addConstant(try val_mod.makeString(self.arena, "done"));
-            try self.emitOp(.GET_PROP, line);
-            try self.emitU8(rdone);
-            try self.emitU8(rstep);
-            try self.emitU16(@intCast(di));
-            try self.emitOp(.JMP_IF_TRUE, line);
-            try self.emitU8(rdone);
-            const patch_exit = self.currentOffset();
-            try self.emitI16(0);
-            self.sp = rresult + 1;
-            // yield the current value, then loop
-            try self.emitOp(.YIELD, line);
-            try self.emitU8(rresult);
-            try self.emitOp(.JMP, line);
-            const back = self.currentOffset();
-            try self.emitI16(0);
-            self.patchJump(back, loop_start);
-            self.patchJump(patch_exit, self.currentOffset());
-            // Move the result down to base_sp and return it.
-            try self.emitOp(.MOVE, line);
-            try self.emitU8(base_sp);
-            try self.emitU8(rresult);
-            self.sp = base_sp + 1;
-            return base_sp;
+            if (self.is_async_generator) return try self.compileAsyncYieldStar(c.args[0], line);
+            return try self.compileYieldStar(c.args[0], line);
         }
         // Call-argument spread: `f(...xs)` / `obj.m(a, ...xs)` build a runtime
         // args array and dispatch via CALL_SPREAD (the static-nargs CALL ABI

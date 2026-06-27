@@ -1848,6 +1848,93 @@ pub fn nativeAsyncIterStep(arena: std.mem.Allocator, _: Value, args: []const Val
     return function_proto.invokeCallback(arena, it, nx, &[_]Value{});
 }
 
+/// One `{ value, done, ret }` step record for the `yield*` delegation loop.
+/// `ret` true means the outer generator must `return value` (a Return completion
+/// forwarded to / produced by the inner iterator).
+fn makeYieldStarStep(arena: std.mem.Allocator, value: Value, done: bool, ret: bool) !Value {
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    try obj.set("value", value);
+    try obj.set("done", try val_mod.makeBool(arena, done));
+    try obj.set("ret", try val_mod.makeBool(arena, ret));
+    return val_mod.makeObject(arena, obj);
+}
+
+/// __yieldStarStep__(iterator, resumeType, resumeValue): perform one step of
+/// `yield* iterator`. resumeType 0=normal (iterator.next), 1=throw
+/// (iterator.throw), 2=return (iterator.return). Forwards the resume value,
+/// validates the result is an object, and reports whether to keep yielding,
+/// complete the `yield*`, or return from the outer generator.
+pub fn nativeYieldStarStep(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const iterator = if (args.len > 0) args[0] else Value{};
+    const rtype: u8 = blk: {
+        if (args.len > 1 and args[1].bits != 0) switch (args[1].unbox()) {
+            .number => |n| break :blk @intFromFloat(n),
+            else => {},
+        };
+        break :blk 0;
+    };
+    const rval = if (args.len > 2) args[2] else try val_mod.makeUndefined(arena);
+    if (iterator.bits == 0 or iterator.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "yield* requires an iterator");
+        return error.JsException;
+    }
+
+    var result: Value = undefined;
+    if (rtype == 1) {
+        // throw: forward to iterator.throw, else close + TypeError.
+        const m = try ctx.getProp(arena, iterator, "throw");
+        if (m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_ or !isCallable(m)) {
+            closeIterator(arena, iterator);
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "The iterator does not provide a 'throw' method");
+            return error.JsException;
+        }
+        result = try function_proto.invokeCallback(arena, iterator, m, &[_]Value{rval});
+    } else if (rtype == 2) {
+        // return: forward to iterator.return; absent → outer returns rval.
+        const m = try ctx.getProp(arena, iterator, "return");
+        if (m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_ or !isCallable(m)) {
+            return makeYieldStarStep(arena, rval, true, true);
+        }
+        result = try function_proto.invokeCallback(arena, iterator, m, &[_]Value{rval});
+    } else {
+        // normal: iterator.next(rval)
+        const m = try ctx.getProp(arena, iterator, "next");
+        if (!isCallable(m)) {
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator.next is not a function");
+            return error.JsException;
+        }
+        result = try function_proto.invokeCallback(arena, iterator, m, &[_]Value{rval});
+    }
+
+    if (result.bits == 0 or result.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
+        return error.JsException;
+    }
+    const done_v = try ctx.getProp(arena, result, "done");
+    const done = isTruthy(done_v);
+    const value = try ctx.getProp(arena, result, "value");
+    // Return path + inner done → the outer generator returns `value`.
+    return makeYieldStarStep(arena, value, done, rtype == 2 and done);
+}
+
+/// __retComplVal__(x): the value carried by a return-completion sentinel (used by
+/// the `yield*` loop to recover Generator.return's argument); `x` unchanged
+/// otherwise.
+pub fn nativeRetComplVal(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const x = if (args.len > 0) args[0] else return val_mod.makeUndefined(arena);
+    if (x.bits != 0 and x.unbox() == .object) {
+        const obj = x.toPtr().object;
+        if (obj.internal_kind == .return_completion) {
+            if (obj.internal_slot) |s| {
+                const p: *Value = @ptrCast(@alignCast(s));
+                return p.*;
+            }
+        }
+    }
+    return x;
+}
+
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
     // Use the realm's TypeError.prototype so `err instanceof TypeError` and
     // `err.constructor === TypeError` hold (assert.throws relies on both).
