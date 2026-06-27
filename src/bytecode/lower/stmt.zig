@@ -574,6 +574,7 @@ pub fn lowerBreakStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         while (i > 0) {
             i -= 1;
             if (std.mem.eql(u8, self.label_stack.items[i].name, lname)) {
+                try runPendingFinally(self, null, self.label_stack.items[i].finally_depth, line);
                 try self.emitExitScopesTo(self.label_stack.items[i].scope_depth, line);
                 try self.emitOp(.JMP, line);
                 const patch = self.currentOffset();
@@ -1017,6 +1018,7 @@ pub fn lowerLabeledStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) err
         .name = ls.name,
         .loop_start = self.currentOffset(),
         .scope_depth = self.block_scope_depth,
+        .finally_depth = self.finally_stack.items.len,
     });
     try self.compileStmt(ls.body, last_expr_reg);
     self.pending_label = null;

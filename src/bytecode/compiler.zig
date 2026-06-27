@@ -28,6 +28,9 @@ pub const LabelEntry = struct {
     /// Block-scope nesting depth at the point this label was entered, so a
     /// `break L` can emit EXIT_SCOPE for every block scope it unwinds out of.
     scope_depth: u32 = 0,
+    /// `finally_stack` length at label entry, so `break L` runs (and POP_TRY)
+    /// any try-blocks opened inside the labeled statement before jumping out.
+    finally_depth: usize = 0,
 };
 
 /// Set by `compileProgram` when a `break`/`continue` targets an undefined label
