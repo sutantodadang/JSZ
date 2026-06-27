@@ -492,14 +492,18 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 >   next/return/throw now throw TypeError on a non-generator receiver and reject
 >   `new`. `built-ins/GeneratorPrototype` **0→61/61**,
 >   `built-ins/AsyncGeneratorPrototype` **3→13/13**; zero regressions.
+> - **GeneratorFunction / AsyncGeneratorFunction callable** — the two intrinsic
+>   constructors now compile a generator body from string args, mirroring
+>   `new Function` (`GeneratorFunction("a", "yield a")`,
+>   `new AsyncGeneratorFunction("yield 1")`). A shared `functionCtorImpl(keyword)`
+>   bridge assembles `(function* anonymous(…){…})` / `(async function* …)` and
+>   evals it; because the eval runs on the same VM, the compiled function's
+>   `[[Prototype]]` roots at the same %Generator%, so intrinsic identity holds
+>   (`getPrototypeOf(GeneratorFunction("yield 1")) === getPrototypeOf(function*(){})`).
 >
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
 >   cannot test collection — coordinate with M19 ephemerons).
-> - %GeneratorFunction%/%AsyncGeneratorFunction% **callable** to compile a
->   generator body from a string (`new GeneratorFunction("yield 1")`) — needs the
->   same parser bridge as `new Function`; the constructors' identity + descriptors
->   are complete, only dynamic compilation is missing.
 > - `yield*` observable IteratorClose access-ordering edge cases; `yield`
 >   rhs-omitted/regexp/template parse; async-gen `yield <promise>` not pre-awaited;
 >   async `yield*` resume-completion forwarding.
