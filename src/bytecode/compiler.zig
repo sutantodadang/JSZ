@@ -1421,7 +1421,7 @@ pub const FnCompiler = struct {
             {
                 const b = self.allocReg();
                 self.sp = b;
-                const gi = try self.builder.addConstant(try val_mod.makeString(self.arena, "__getIterator__"));
+                const gi = try self.builder.addConstant(try val_mod.makeString(self.arena, if (self.is_async_generator) "__getAsyncIterator__" else "__getIterator__"));
                 try self.emitOp(.GET_GLOBAL, line);
                 try self.emitU8(b);
                 try self.emitU16(@intCast(gi));
@@ -1438,7 +1438,7 @@ pub const FnCompiler = struct {
             const loop_start = self.currentOffset();
             {
                 const b = self.allocReg();
-                const si = try self.builder.addConstant(try val_mod.makeString(self.arena, "__iterStep__"));
+                const si = try self.builder.addConstant(try val_mod.makeString(self.arena, if (self.is_async_generator) "__asyncIterStep__" else "__iterStep__"));
                 try self.emitOp(.GET_GLOBAL, line);
                 try self.emitU8(b);
                 try self.emitU16(@intCast(si));
@@ -1450,6 +1450,12 @@ pub const FnCompiler = struct {
                 try self.emitU8(b);
                 try self.emitU8(1);
                 try self.emitU8(rstep);
+                // Async delegation: __asyncIterStep__ returns a promise of
+                // {value,done}; await it so rstep holds the resolved result.
+                if (self.is_async_generator) {
+                    try self.emitOp(.AWAIT, line);
+                    try self.emitU8(rstep);
+                }
                 self.sp = rresult + 1;
             }
             // rresult = step.value (on the done step this is the inner return value)
