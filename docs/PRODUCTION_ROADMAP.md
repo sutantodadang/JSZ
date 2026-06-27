@@ -468,18 +468,30 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 >   (re-raise chains to outer handlers); break/continue (incl. labeled) unwind +
 >   POP_TRY each crossed try and run its finalizer inline; a catch-less
 >   try/finally re-raises; a throwing/returning finalizer overrides the pending
->   completion. (`finally` in a labeled *non-loop* block on break/continue: TODO.)
+>   completion; `break`/`continue` (incl. labeled and labeled non-loop blocks)
+>   unwind every crossed try (POP_TRY + finalizer).
 > - **Generator/AsyncGenerator `.throw()` / `.return()`** — both now re-enter the
 >   suspended body so its try/catch/finally runs. `.return(v)` resumes with an
 >   internal return-completion sentinel (invisible to user `catch` via
 >   JMP_IF_RET_COMPL), converted back to `{value, done:true}` on escape.
 >   `for await` 94/94 runnable.
+> - **`yield*` full delegation** — forwards the sent value / `return` / `throw` to
+>   the inner iterator (`__yieldStarStep__` + a per-yield try that routes the
+>   resume completion). `expressions/yield` 27→50/63.
+> - **%AsyncGeneratorPrototype% (instance side)** — shared prototype with
+>   next/return/throw (spec descriptors) + @@toStringTag "AsyncGenerator" +
+>   @@asyncIterator; instances inherit through it.
 >
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
 >   cannot test collection — coordinate with M19 ephemerons).
-> - `yield*` does not forward sent value / `return` / `throw` to the inner iterator
->   (`expressions/yield` star-* fails); async-gen `yield <promise>` not pre-awaited.
+> - Generator/AsyncGenerator **function-side intrinsic chain**
+>   (%GeneratorFunction%/%AsyncGeneratorFunction% → %Generator%/%AsyncGenerator%)
+>   so `Object.getPrototypeOf(genFn).prototype` + `.constructor` resolve — the
+>   remaining `*GeneratorPrototype` prop-desc/constructor tests use that path.
+> - `yield*` observable IteratorClose access-ordering edge cases; `yield`
+>   rhs-omitted/regexp/template parse; async-gen `yield <promise>` not pre-awaited;
+>   async `yield*` resume-completion forwarding.
 > - `%AsyncGeneratorPrototype%` structural exactness (@@toStringTag, constructor,
 >   method `length`/`name`/prop-desc) — descriptor lever, like M15 TypedArrays.
 > - async generator `yield <promise>` operand not pre-awaited; async `yield*`
