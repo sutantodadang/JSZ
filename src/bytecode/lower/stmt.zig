@@ -347,11 +347,15 @@ pub fn lowerReturnStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
             _ = try self.compileCall(rv_node.data.call_expr, rv_node.start, true);
         } else {
             const r = try self.compileExpr(rv_node);
+            // Run any enclosing finally blocks before returning (the value in `r`
+            // is pinned across them). No-op when not inside a try/finally.
+            try runPendingFinally(self, r, line);
             try self.emitOp(.RETURN, line);
             try self.emitU8(r);
             self.freeReg();
         }
     } else {
+        try runPendingFinally(self, null, line);
         try self.emitOp(.RETURN_UNDEF, line);
     }
 }
@@ -373,6 +377,11 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     // tail position (a pending finally must run after the callee).
     self.try_depth += 1;
     defer self.try_depth -= 1;
+
+    // A `return` inside the try/catch bodies must run this finalizer first.
+    // Registered while those bodies compile; popped before the finalizer's own
+    // body (so a `return` within `finally` does not re-run it).
+    if (ts.finalizer) |fin| try self.finally_stack.append(self.arena, fin);
 
     // Allocate a register to receive the caught exception value.
     const rexc: u8 = if (ts.handler != null) blk: {
@@ -418,8 +427,30 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     self.patchJump(jmp_to_finally_patch, finally_offset);
 
     if (ts.finalizer) |fin| {
+        _ = self.finally_stack.pop(); // out of the protected region now
         try self.compileStmt(fin, last_expr_reg);
         self.sp = saved_sp;
+    }
+}
+
+/// Compile each pending finalizer inline (innermost first) ahead of an abrupt
+/// `return`, so try/finally runs on a return completion. `rv_reg` (if any) is
+/// pinned by keeping `sp` above it so finalizer code cannot clobber the return
+/// value. A `return` within a finalizer sees only the outer finalizers.
+pub fn runPendingFinally(self: *FnCompiler, rv_reg: ?u8, line: u32) error{OutOfMemory}!void {
+    _ = line;
+    var i = self.finally_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        const fin = self.finally_stack.items[i];
+        const saved_len = self.finally_stack.items.len;
+        self.finally_stack.items.len = i; // only outer finalizers stay active
+        const saved_sp = self.sp;
+        if (rv_reg) |r| self.sp = r + 1; // pin the return value
+        var dummy: ?u8 = null;
+        try self.compileStmt(fin, &dummy);
+        self.sp = saved_sp;
+        self.finally_stack.items.len = saved_len;
     }
 }
 

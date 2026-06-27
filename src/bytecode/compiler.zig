@@ -102,6 +102,12 @@ pub const FnCompiler = struct {
     /// operand of `return` is only in tail position when try_depth == 0
     /// (a pending finally would run after the call returns, so it is not tail).
     try_depth: u32 = 0,
+    /// Finalizer AST nodes of the try/catch regions currently being compiled
+    /// (innermost last). A `return` inside these runs each finalizer inline,
+    /// innermost-first, before the RETURN — ES try/finally on a return
+    /// completion. Popped before a finalizer's own body is compiled so a
+    /// `return` within `finally` does not re-run that same finalizer.
+    finally_stack: std.ArrayListUnmanaged(*ast.Node) = .empty,
     /// Number of block scopes (ENTER_SCOPE) currently open in the bytecode being
     /// emitted. Used so `break`/`continue` emit matching EXIT_SCOPE ops.
     block_scope_depth: u32 = 0,
