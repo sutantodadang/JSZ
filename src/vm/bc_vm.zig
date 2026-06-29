@@ -177,19 +177,6 @@ pub const BcVm = struct {
     exception: ?[]const u8 = null,
     /// Phase 4a: the last thrown JS value (for catch binding).
     last_exception_value: Value = Value{},
-    /// W2-asyncgen: lazily-built per-function instance prototype for async
-    /// generators (its own proto is %AsyncGeneratorPrototype%, which carries
-    /// next/return/throw + @@toStringTag + @@asyncIterator). Arena-allocated, so
-    /// it persists for the context lifetime (not GC-managed).
-    async_gen_inst_proto: ?*JsObject = null,
-    /// Generator intrinsic chain (built lazily by ensureGeneratorChain).
-    gen_proto: ?*JsObject = null,
-    gen_fn_proto: ?*JsObject = null,
-    gen_fn_ctor: ?*JsObject = null,
-    async_gen_proto: ?*JsObject = null,
-    async_gen_fn_proto: ?*JsObject = null,
-    async_gen_fn_ctor: ?*JsObject = null,
-    async_iter_proto: ?*JsObject = null,
     /// Phase 4d: context for re-entry from native callbacks.
     context: @import("../runtime/realm.zig").Context = undefined,
     /// Phase 9: optional JIT profiler. Null = no profiling (zero hot-path cost).
@@ -995,6 +982,12 @@ pub const BcVm = struct {
         return @ptrCast(self.realm);
     }
 
+    fn bcEnsureGenChain(ptr: *anyopaque, realm: *anyopaque) anyerror!void {
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        const r: *Realm = @ptrCast(@alignCast(realm));
+        try self.ensureGeneratorChain(r);
+    }
+
     fn activateContext(self: *BcVm) void {
         const realm_mod = @import("../runtime/realm.zig");
         self.context = realm_mod.Context{
@@ -1009,6 +1002,7 @@ pub const BcVm = struct {
             .set_proto_fn = bcSetProto,
             .backing_obj_fn = bcBackingObj,
             .shadow_eval_fn = bcEvalInEnv,
+            .ensure_gen_chain_fn = bcEnsureGenChain,
             .create_realm_fn = bcCreateRealm,
         };
         realm_mod.active_context = &self.context;
@@ -2164,9 +2158,10 @@ pub const BcVm = struct {
     /// properties. Proto is Function.prototype so call/apply/bind resolve too.
     pub fn closureBackingObj(self: *BcVm, closure: *BcClosure) !*JsObject {
         if (closure.obj) |op| return @ptrCast(@alignCast(op));
+        const gr: *Realm = if (closure.realm) |ro| @ptrCast(@alignCast(ro)) else self.realm;
         const fn_proto = if (closure.func.is_generator) blk: {
-            try self.ensureGeneratorChain();
-            break :blk if (closure.func.is_async) self.async_gen_fn_proto.? else self.gen_fn_proto.?;
+            try self.ensureGeneratorChain(gr);
+            break :blk if (closure.func.is_async) gr.async_gen_fn_proto.? else gr.gen_fn_proto.?;
         } else self.realm.function_prototype;
         const o = if (self.heap) |heap|
             try JsObject.createOnHeap(heap, fn_proto)
@@ -2184,8 +2179,8 @@ pub const BcVm = struct {
             _ = try o.defineOwnData("name", try val_mod.makeString(self.arena, nm), nec);
             _ = try o.defineOwnData("length", try val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity)), nec);
             // .prototype: {writable:true, enumerable:false, configurable:false} (spec §15.5.3).
-            // ensureGeneratorChain() was already called above so gen_proto/async_gen_proto are live.
-            const inst_proto = if (closure.func.is_async) self.async_gen_proto.? else self.gen_proto.?;
+            // ensureGeneratorChain(gr) was already called above so gen_proto/async_gen_proto are live.
+            const inst_proto = if (closure.func.is_async) gr.async_gen_proto.? else gr.gen_proto.?;
             const proto_obj = try JsObject.create(self.arena, inst_proto);
             const pv = try val_mod.makeObject(self.arena, proto_obj);
             _ = try o.defineOwnData("prototype", pv, .{ .writable = true, .enumerable = false, .configurable = false });
@@ -2202,8 +2197,9 @@ pub const BcVm = struct {
         // does not short-circuit before we create this function's own fresh .prototype object.
         if (o.getOwn("prototype")) |p| return p;
         if (closure.func.is_generator) {
-            try self.ensureGeneratorChain();
-            const inst_proto = if (closure.func.is_async) self.async_gen_proto.? else self.gen_proto.?;
+            const gr: *Realm = if (closure.realm) |ro| @ptrCast(@alignCast(ro)) else self.realm;
+            try self.ensureGeneratorChain(gr);
+            const inst_proto = if (closure.func.is_async) gr.async_gen_proto.? else gr.gen_proto.?;
             const proto_obj = try JsObject.create(self.arena, inst_proto);
             const pv = try val_mod.makeObject(self.arena, proto_obj);
             // Spec §15.5.3: generator .prototype is {writable:true, enumerable:false, configurable:false}
@@ -3450,19 +3446,10 @@ pub const BcVm = struct {
 
     // -------------------------------------------------------- W2-asyncgen driver ---
 
-    /// Create an async generator object for an `async function*` call. The body
-    /// runs lazily, driven by `.next()`/`.return()`/`.throw()` which each return
-    /// a promise of an iterator result.
-    /// Delegates to ensureGeneratorChain and returns the shared %AsyncGeneratorPrototype%.
-    fn asyncGenInstanceProto(self: *BcVm) !*JsObject {
-        try self.ensureGeneratorChain();
-        return self.async_gen_proto.?;
-    }
-
     /// Lazily build the full ES generator/async-generator intrinsic chain (both
-    /// sync and async). Idempotent: returns immediately if already built.
-    fn ensureGeneratorChain(self: *BcVm) !void {
-        if (self.gen_proto != null) return;
+    /// sync and async) for `realm`. Idempotent: returns immediately if already built.
+    fn ensureGeneratorChain(self: *BcVm, realm: *Realm) !void {
+        if (realm.gen_proto != null) return;
         const realm_m = @import("../runtime/realm.zig");
         const es2015 = @import("../runtime/builtins/es2015_collections.zig");
 
@@ -3472,7 +3459,29 @@ pub const BcVm = struct {
 
         // ---- SYNC chain ----
         // %GeneratorPrototype%: [[Prototype]] = %IteratorPrototype%
-        const iter_root = es2015.active_iterator_proto orelse self.realm.object_prototype;
+        const shared_iter = realm.gen_iterator_proto orelse es2015.active_iterator_proto orelse realm.object_prototype;
+        // Fix stale/cross-realm [[Prototype]] on iter_root:
+        // - Primary realm: activateHeap may have migrated object_prototype to heap, leaving
+        //   iter_proto.proto pointing at the old arena copy. Fix in-place (safe: no other realm
+        //   shares the primary iter_proto via gen_iterator_proto).
+        // - Secondary realm: gen_iterator_proto is the primary's shared iter_proto whose .proto
+        //   points to the PRIMARY Object.prototype, not this realm's. Never mutate the shared
+        //   object — create a fresh per-realm copy with the correct [[Prototype]] instead.
+        const iter_root = root_blk: {
+            if (shared_iter.proto == realm.object_prototype) break :root_blk shared_iter;
+            if (realm.gen_iterator_proto == null) {
+                // Primary realm: stale pointer after activateHeap — fix in-place.
+                shared_iter.proto = realm.object_prototype;
+                break :root_blk shared_iter;
+            }
+            // Secondary realm: create a realm-private IteratorPrototype copy.
+            const fresh = try JsObject.create(self.arena, realm.object_prototype);
+            if (realm_m.active_sym_iterator) |sym| {
+                if (shared_iter.getOwnSym(sym)) |sv|
+                    try fresh.setSymAttr(sym, sv, wec);
+            }
+            break :root_blk fresh;
+        };
         const gen_proto = try JsObject.create(self.arena, iter_root);
         _ = try gen_proto.defineOwnData("next",
             try val_mod.makeNativeFunctionNamed(self.arena, nativeGenNext, "next", 1), wec);
@@ -3484,8 +3493,8 @@ pub const BcVm = struct {
             try gen_proto.setSymAttr(tag_sym, try val_mod.makeString(self.arena, "Generator"),
                 .{ .writable = false, .enumerable = false, .configurable = true });
 
-        // %Generator% (= %GeneratorFunction.prototype%): [[Prototype]] = Function.prototype
-        const fn_root = self.realm.function_prototype;
+        // %Generator% (= %GeneratorFunction.prototype%): [[Prototype]] = realm's Function.prototype
+        const fn_root = realm.function_prototype;
         const gen_fn_proto = try JsObject.create(self.arena, fn_root);
         _ = try gen_fn_proto.defineOwnData("prototype",
             try val_mod.makeObject(self.arena, gen_proto), nec);
@@ -3493,8 +3502,8 @@ pub const BcVm = struct {
             try gen_fn_proto.setSymAttr(tag_sym, try val_mod.makeString(self.arena, "GeneratorFunction"),
                 .{ .writable = false, .enumerable = false, .configurable = true });
 
-        // %GeneratorFunction%: [[Prototype]] = Function constructor object
-        const fn_ctor_root = realm_m.active_function_ctor orelse self.realm.function_prototype;
+        // %GeneratorFunction%: [[Prototype]] = realm's Function constructor object
+        const fn_ctor_root = realm.gen_function_ctor orelse realm_m.active_function_ctor orelse realm.function_prototype;
         const gen_fn_ctor = try JsObject.create(self.arena, fn_ctor_root);
         _ = try gen_fn_ctor.defineOwnData("prototype",
             try val_mod.makeObject(self.arena, gen_fn_proto), nef);
@@ -3503,6 +3512,8 @@ pub const BcVm = struct {
         _ = try gen_fn_ctor.defineOwnData("name",
             try val_mod.makeString(self.arena, "GeneratorFunction"), nec);
         try gen_fn_ctor.set("__call__", try val_mod.makeNativeFunction(self.arena, realm_m.nativeGeneratorFunctionCtor));
+        // Realm-tag __call__ so g_active_native_realm resolves to this realm when invoked.
+        if (gen_fn_ctor.getOwn("__call__")) |cv| val_mod.setValueRealm(cv, @ptrCast(realm));
 
         // Cross-link constructor back-references.
         _ = try gen_proto.defineOwnData("constructor",
@@ -3510,13 +3521,13 @@ pub const BcVm = struct {
         _ = try gen_fn_proto.defineOwnData("constructor",
             try val_mod.makeObject(self.arena, gen_fn_ctor), nec);
 
-        self.gen_proto = gen_proto;
-        self.gen_fn_proto = gen_fn_proto;
-        self.gen_fn_ctor = gen_fn_ctor;
+        realm.gen_proto = gen_proto;
+        realm.gen_fn_proto = gen_fn_proto;
+        realm.gen_fn_ctor = gen_fn_ctor;
 
         // ---- ASYNC chain ----
         // %AsyncIteratorPrototype%: [[Prototype]] = Object.prototype, @@asyncIterator → this
-        const async_iter_proto = try JsObject.create(self.arena, self.realm.object_prototype);
+        const async_iter_proto = try JsObject.create(self.arena, realm.object_prototype);
         if (realm_m.active_sym_async_iterator) |it_sym|
             try async_iter_proto.setSymAttr(it_sym,
                 try val_mod.makeNativeFunctionNamed(self.arena, nativeGenSelfIter, "[Symbol.asyncIterator]", 0), wec);
@@ -3539,7 +3550,7 @@ pub const BcVm = struct {
             try async_gen_proto.setSymAttr(it_sym,
                 try val_mod.makeNativeFunctionNamed(self.arena, nativeGenSelfIter, "[Symbol.asyncIterator]", 0), wec);
 
-        // %AsyncGenerator% (= %AsyncGeneratorFunction.prototype%): [[Prototype]] = Function.prototype
+        // %AsyncGenerator% (= %AsyncGeneratorFunction.prototype%): [[Prototype]] = realm's Function.prototype
         const async_gen_fn_proto = try JsObject.create(self.arena, fn_root);
         _ = try async_gen_fn_proto.defineOwnData("prototype",
             try val_mod.makeObject(self.arena, async_gen_proto), nec);
@@ -3547,7 +3558,7 @@ pub const BcVm = struct {
             try async_gen_fn_proto.setSymAttr(tag_sym, try val_mod.makeString(self.arena, "AsyncGeneratorFunction"),
                 .{ .writable = false, .enumerable = false, .configurable = true });
 
-        // %AsyncGeneratorFunction%: [[Prototype]] = Function constructor object
+        // %AsyncGeneratorFunction%: [[Prototype]] = realm's Function constructor object
         const async_gen_fn_ctor = try JsObject.create(self.arena, fn_ctor_root);
         _ = try async_gen_fn_ctor.defineOwnData("prototype",
             try val_mod.makeObject(self.arena, async_gen_fn_proto), nef);
@@ -3556,6 +3567,8 @@ pub const BcVm = struct {
         _ = try async_gen_fn_ctor.defineOwnData("name",
             try val_mod.makeString(self.arena, "AsyncGeneratorFunction"), nec);
         try async_gen_fn_ctor.set("__call__", try val_mod.makeNativeFunction(self.arena, realm_m.nativeAsyncGeneratorFunctionCtor));
+        // Realm-tag __call__ so g_active_native_realm resolves to this realm when invoked.
+        if (async_gen_fn_ctor.getOwn("__call__")) |cv| val_mod.setValueRealm(cv, @ptrCast(realm));
 
         // Cross-link constructor back-references.
         _ = try async_gen_proto.defineOwnData("constructor",
@@ -3579,12 +3592,10 @@ pub const BcVm = struct {
         _ = try async_gen_fn_proto.defineOwnAccessor("caller", poison_hv, pattr);
         _ = try async_gen_fn_proto.defineOwnAccessor("arguments", poison_hv, pattr);
 
-        self.async_iter_proto = async_iter_proto;
-        self.async_gen_proto = async_gen_proto;
-        self.async_gen_fn_proto = async_gen_fn_proto;
-        self.async_gen_fn_ctor = async_gen_fn_ctor;
-        // Keep async_gen_inst_proto pointing at async_gen_proto for backward compat.
-        self.async_gen_inst_proto = async_gen_proto;
+        realm.async_iter_proto = async_iter_proto;
+        realm.async_gen_proto = async_gen_proto;
+        realm.async_gen_fn_proto = async_gen_fn_proto;
+        realm.async_gen_fn_ctor = async_gen_fn_ctor;
     }
 
     fn buildAsyncGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, closure: *BcClosure) !Value {
