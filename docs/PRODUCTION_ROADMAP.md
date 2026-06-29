@@ -545,12 +545,15 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 >   sloppy-mode arguments feature on the property hot path (parameter-map object
 >   kind), not a generator deferral — scoped separately to avoid hot-path risk.
 
-### Milestone 17.x — Async-generator completion  *(milestone, ~97% landed)*
+### Milestone 17.x — Async-generator completion  *(✅ COMPLETE — 292/292)*
 A scratch-corpus probe of `language/{statements,expressions}/async-generator`
 started at **122/292** (stmt 33/90, expr 89/202) and showed async generators were
-**broadly** incomplete. This pass took it to **283/292 (97%)** across 14 commits,
-all general engine improvements (not async-gen-specific), each verified with
-0 regression (unit gate green, 0 unexpected pass throughout):
+**broadly** incomplete. Driven to **292/292 (100%)** across 18 commits, all
+general engine improvements (not async-gen-specific), each verified with
+0 regression (unit gate green, 0 unexpected pass throughout). Every
+generator/yield suite is now 100%: `expressions/yield` 63/63,
+`{statements,expressions}/async-generator` 90+202, `for-await-of` 94,
+`Generator{Function,Prototype}` 23+61, `AsyncGenerator{Function,Prototype}` 17+13.
 - **Crash fix**: non-object `.prototype` → realm default proto (70c5dfd).
 - **Formal-parameter destructuring parsing**: array elision (`[, x]`) / rest
   (`[a, ...r]`), object CoverInitializedName (`{ x = 1 }`), nested
@@ -568,20 +571,21 @@ all general engine improvements (not async-gen-specific), each verified with
   propagate (e64c3f3).
 - **GetIterator honors a deleted/overridden array `@@iterator`** — removed the
   index-synthesis shortcut that masked it (46fd5d2). Improved other suites too.
+- **TDZ for default parameters** (5cdd96e): a non-simple list puts every parameter
+  in a TDZ until its own initializer (`function* g(a = a)` / `g(a = b, b)` →
+  ReferenceError). Modeled by renaming params to synthetic `__arg_N` + rebinding
+  the real name as a body-scoped `let` (existing let TDZ enforces it).
+- **Mapped `arguments`** (c0b4651): sloppy + simple param list → `arguments[i]`
+  aliases parameter `i` both ways (new `mapped_arguments` exotic object). Required
+  fixing a general bug: function **declarations** did not inherit enclosing
+  strictness (`lowerFunctionDecl` dropped `or self.is_strict`).
+- **Direct-eval var/lexical conflict** (c88c0ce): a top-level `var` in eval that
+  collides with a `let`/`const` in the immediate calling scope is a SyntaxError
+  (EvalDeclarationInstantiation), checked against the caller's own env.
 
-**Remaining (9 / 292):** both need a param-binding-model / eval-scope change for
-marginal gain, deferred to a focused follow-up:
-- **TDZ for default parameters** (4): `function* g(a = a)` / `g(a = b, b)` must
-  throw ReferenceError — params should be in TDZ until their own initializer.
-  Needs sequential, TDZ-aware parameter binding (current model binds all params
-  eagerly before defaults run).
-- **`eval` var/lexical scope SyntaxError** (2): direct-eval redeclaration conflict.
-
-Also still open (separate, lower priority): mapped (aliased) sloppy `arguments`
-(1 `expressions/yield` test); anonymous `async function*( … )` expression parse;
-async `yield <promise>` pre-await; async `yield*` sent/return/throw forwarding
-(`compileAsyncYieldStar` is next-only). `%AsyncGeneratorPrototype%` structural
-exactness is already covered (`built-ins/AsyncGeneratorPrototype` 13/13).
+Separate, still open (lower priority, not generator-blocking): anonymous
+`async function*( … )` expression parse; async `yield <promise>` pre-await; async
+`yield*` sent/return/throw forwarding (`compileAsyncYieldStar` is next-only).
 
 ### Milestone 18 — RegExp & Intl completeness  *(~1.5–2 mo)*
 - RegExp: Unicode property escapes, lookbehind, named groups, `/v` set notation, sticky/dotAll edge cases. Consider a proven backtracking + bytecode design.
