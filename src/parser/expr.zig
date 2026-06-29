@@ -607,10 +607,19 @@ pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
         },
         .object_literal => {
             for (pattern.data.object_literal.properties) |prop| {
-                const key = p.makeNode(.identifier, prop.value.start, prop.value.start, .{ .identifier = prop.key }) orelse return false;
-                const access = p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
-                    .member_expr = .{ .object = src, .property = key, .computed = false },
-                }) orelse return false;
+                // Computed key `{ [expr]: target }`: evaluate the key expression
+                // (a throwing key propagates) and access src[key]. Static keys use
+                // a plain `src.key`.
+                const access = if (prop.computed_key) |ke|
+                    p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
+                        .member_expr = .{ .object = src, .property = ke, .computed = true },
+                    }) orelse return false
+                else acc: {
+                    const key = p.makeNode(.identifier, prop.value.start, prop.value.start, .{ .identifier = prop.key }) orelse return false;
+                    break :acc p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
+                        .member_expr = .{ .object = src, .property = key, .computed = false },
+                    }) orelse return false;
+                };
                 if (!bindPatternElement(p, prop.value, access)) return false;
             }
         },
