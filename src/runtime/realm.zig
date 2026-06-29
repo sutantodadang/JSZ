@@ -3245,6 +3245,9 @@ pub const Realm = struct {
         // all inherit from it.
         try es2015_collections_mod.initArrayIteratorProto(arena, object_proto);
 
+        // ---- ES2024 Iterator global (map/filter/take/drop/… helpers) ----
+        try es2015_collections_mod.registerIteratorGlobal(&reg_ctx);
+
         // ---- ES2015 Reflect ----
         try reflect_mod.register(&reg_ctx);
 

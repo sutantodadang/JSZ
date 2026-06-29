@@ -138,10 +138,13 @@ const AccessorKind = enum { none, get, set };
 /// runtime key expression (`[expr]`); otherwise `name` is the literal key.
 const ClassMember = struct {
     is_static: bool = false,
+    is_generator: bool = false,
+    is_async: bool = false,
     accessor: AccessorKind = .none,
     name: []const u8 = "",
     computed_key: ?*Node = null,
     params: [][]const u8 = &[_][]const u8{},
+    param_defaults: []?*Node = &[_]?*Node{},
     rest_param: ?[]const u8 = null,
     body: []*Node = &[_]*Node{},
 };
@@ -189,6 +192,19 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             is_static = true;
             _ = p.advance();
         }
+
+        // ES2015/2017 `*`/`async` method modifiers (after optional `static`).
+        // `async` is contextual: only a modifier when a method-key follows on
+        // the same line (else it is a method/field named `async`).
+        var is_generator = false;
+        var is_async = false;
+        if (p.currentIsAsyncKw() and !p.peekNext().line_terminator_before and
+            expr_mod.isMethodKeyStart(p.peekNext().kind))
+        {
+            is_async = true;
+            _ = p.advance(); // consume `async`
+        }
+        if (p.match(.star)) is_generator = true;
 
         var accessor: AccessorKind = .none;
         if (p.check(.identifier) and !nextTokenEndsName(p)) {
@@ -243,7 +259,13 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
         }
 
         const mparams = p.parseFunctionParams() orelse return null;
-        const mbody = p.parseFunctionBody() orelse return null;
+        const prev_gen = p.in_generator_function;
+        p.in_generator_function = is_generator;
+        const mbody = p.parseFunctionBody() orelse {
+            p.in_generator_function = prev_gen;
+            return null;
+        };
+        p.in_generator_function = prev_gen;
 
         if (!is_static and accessor == .none and computed_key == null and std.mem.eql(u8, name, "constructor")) {
             res.ctor_params = mparams.params;
@@ -253,10 +275,13 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
         } else {
             members.append(p.arena, .{
                 .is_static = is_static,
+                .is_generator = is_generator,
+                .is_async = is_async,
                 .accessor = accessor,
                 .name = name,
                 .computed_key = computed_key,
                 .params = mparams.params,
+                .param_defaults = mparams.param_defaults,
                 .rest_param = mparams.rest_param,
                 .body = mbody,
             }) catch return null;
@@ -446,9 +471,12 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
     const fn_expr = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
         .name = null,
         .params = m.params,
+        .param_defaults = m.param_defaults,
         .rest_param = m.rest_param,
         .body = body,
         .is_arrow = false,
+        .is_generator = m.is_generator,
+        .is_async = m.is_async,
     } }) orelse return null;
 
     const target = if (m.is_static)
@@ -457,12 +485,34 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         (nodeMember(p, nodeIdent(p, class_name) orelse return null, "prototype") orelse return null);
 
     if (m.accessor == .none) {
-        const lhs = if (m.computed_key) |k|
-            (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = target, .property = k, .computed = true } }) orelse return null)
-        else
-            (nodeMember(p, target, m.name) orelse return null);
-        const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = fn_expr } }) orelse return null;
-        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+        // Class methods are non-enumerable own data properties (writable +
+        // configurable), per MethodDefinitionEvaluation → CreateMethodProperty
+        // (enumerable:false). A plain `target.name = fn` assignment creates an
+        // *enumerable* property, failing every propertyHelper enumerability
+        // check. Private names (`#x`) keep the member-assignment form
+        // (PrivateMethodAdd — not a real enumerable-checkable property).
+        if (m.computed_key == null and m.name.len > 0 and m.name[0] == '#') {
+            const lhs = nodeMember(p, target, m.name) orelse return null;
+            const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = fn_expr } }) orelse return null;
+            return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+        }
+        const key_val = if (m.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = m.name }) orelse return null);
+        const t_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
+        const f_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = false }) orelse return null;
+        var props = std.ArrayList(ast.ObjectProp){};
+        props.append(p.arena, .{ .key = "value", .value = fn_expr }) catch return null;
+        props.append(p.arena, .{ .key = "writable", .value = t_val }) catch return null;
+        props.append(p.arena, .{ .key = "enumerable", .value = f_val }) catch return null;
+        props.append(p.arena, .{ .key = "configurable", .value = t_val }) catch return null;
+        const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
+        const id_obj = nodeIdent(p, "Object") orelse return null;
+        const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+        var args = std.ArrayList(*Node){};
+        args.append(p.arena, target) catch return null;
+        args.append(p.arena, key_val) catch return null;
+        args.append(p.arena, desc) catch return null;
+        const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
+        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
     }
 
     // Accessor: Object.defineProperty(target, key, { get|set: fn, configurable: true, enumerable: false })

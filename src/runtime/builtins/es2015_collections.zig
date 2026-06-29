@@ -36,6 +36,8 @@ pub var active_map_iter_proto: ?*JsObject = null;
 pub var active_set_iter_proto: ?*JsObject = null;
 /// %IteratorPrototype% — [[Prototype]] of every iterator protocol chain.
 pub var active_iterator_proto: ?*JsObject = null;
+/// %IteratorHelperPrototype% — [[Prototype]] of every lazy Iterator helper object.
+pub var active_iterator_helper_proto: ?*JsObject = null;
 
 /// R1: install Map/Set/WeakMap/WeakSet prototypes + constructors and bind globals.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -820,6 +822,16 @@ pub fn gcStrongTrace(heap: *Heap, obj: *JsObject) void {
             // lifetime — otherwise a collection mid-`for...of` frees it.
             const d: *SeqIterData = @ptrCast(@alignCast(obj.internal_slot orelse return));
             heap.markValueLive(d.seq);
+        },
+        .iterator_helper => {
+            // Keep the source iterator, cached next method, user callback, and
+            // any active inner iterator (flatMap) alive for the helper's lifetime.
+            const d: *IterHelperData = @ptrCast(@alignCast(obj.internal_slot orelse return));
+            heap.markValueLive(d.source);
+            heap.markValueLive(d.next_fn);
+            heap.markValueLive(d.callback);
+            heap.markValueLive(d.inner_iter);
+            heap.markValueLive(d.inner_next_fn);
         },
         else => {},
     }
@@ -1701,27 +1713,119 @@ pub const SeqIterData = struct {
     done: bool = false,
 };
 
+/// Kind discriminant for lazy Iterator Helper objects.
+pub const IterHelperKind = enum { map, filter, take, drop, flatMap };
+
+/// Per-instance state for a lazy Iterator Helper (map/filter/take/drop/flatMap).
+/// Heap-allocated and referenced via JsObject.internal_slot.
+/// gcStrongTrace must trace all Value fields to prevent UAF on GC collection.
+pub const IterHelperData = struct {
+    source: Value,        // the upstream iterator
+    next_fn: Value,       // cached source.next method (avoids repeated get)
+    callback: Value,      // user callback (map / filter / flatMap); Value{} otherwise
+    counter: u64 = 0,     // iteration counter (passed to callbacks); drop: skip count
+    limit: i64 = 0,       // take: remaining; drop: total to skip
+    done: bool = false,
+    kind: IterHelperKind,
+    inner_iter: Value,    // flatMap: active inner iterator (Value{} = none)
+    inner_next_fn: Value, // flatMap: cached inner.next (Value{} = none)
+};
+
+/// Helper struct returned by getThisSourceIter.
+const SourceIter = struct { source: Value, next_fn: Value };
+
+/// Extract the source iterator and its cached `next` method from `this_val`.
+/// Throws TypeError if `this_val` is not an object with a callable `next`.
+fn getThisSourceIter(arena: std.mem.Allocator, this_val: Value) anyerror!SourceIter {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        try setTypeError(arena, "Iterator method called on non-object");
+        unreachable;
+    }
+    const obj = this_val.toPtr().object;
+    const next_fn = obj.get("next") orelse {
+        try setTypeError(arena, "Iterator: missing next method");
+        unreachable;
+    };
+    if (!isCallable(next_fn)) {
+        try setTypeError(arena, "Iterator: next is not callable");
+        unreachable;
+    }
+    return SourceIter{ .source = this_val, .next_fn = next_fn };
+}
+
+/// Wrap an IterHelperData into a branded object whose [[Prototype]] is
+/// %IteratorHelperPrototype%. GC will trace the data fields via gcStrongTrace.
+fn makeIteratorHelper(arena: std.mem.Allocator, d: *IterHelperData) !Value {
+    const proto = active_iterator_helper_proto;
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
+    obj.internal_slot = d;
+    obj.internal_kind = .iterator_helper;
+    return val_mod.makeObject(arena, obj);
+}
+
+/// Get the IterHelperData from an iterator helper `this`. Throws TypeError on
+/// wrong receiver (brand check).
+fn getIterHelperData(arena: std.mem.Allocator, this_val: Value) anyerror!*IterHelperData {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        try setTypeError(arena, "Iterator Helper method called on non-object");
+        unreachable;
+    }
+    const obj = this_val.toPtr().object;
+    if (obj.internal_kind != .iterator_helper or obj.internal_slot == null) {
+        try setTypeError(arena, "Iterator Helper method called on wrong type");
+        unreachable;
+    }
+    return @ptrCast(@alignCast(obj.internal_slot.?));
+}
+
 /// %IteratorPrototype%[@@iterator] and %ArrayIteratorPrototype% reuse: return
 /// the `this` iterator itself.
 fn nativeIterSelf(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     return this_val;
 }
 
-/// Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain. Call
-/// once at realm init, after @@iterator / @@toStringTag are resolved.
+/// Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain, attach
+/// all ES2024 Iterator Helper methods, and build %IteratorHelperPrototype%.
+/// Call once at realm init, after @@iterator / @@toStringTag are resolved.
 pub fn initArrayIteratorProto(arena: std.mem.Allocator, object_proto: *JsObject) !void {
     const cfg: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
-    // %IteratorPrototype%: { [@@iterator]() { return this } }.
+    const tag_cfg: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+
+    // %IteratorPrototype%: { [@@iterator]() { return this }, [@@toStringTag]: "Iterator", … }
     const iter_proto = try JsObject.create(arena, object_proto);
     if (realm_mod.active_sym_iterator) |sym|
         try iter_proto.setSymAttr(sym, try val_mod.makeNativeFunctionNamed(arena, nativeIterSelf, "[Symbol.iterator]", 0), cfg);
+    if (realm_mod.active_sym_to_string_tag) |tag|
+        try iter_proto.setSymAttr(tag, try val_mod.makeString(arena, "Iterator"), tag_cfg);
+
+    // ES2024 Iterator Helper methods — all live on %IteratorPrototype%.
+    _ = try iter_proto.defineOwnData("map",     try val_mod.makeNativeFunctionNamed(arena, nativeIterMap,     "map",     1), cfg);
+    _ = try iter_proto.defineOwnData("filter",  try val_mod.makeNativeFunctionNamed(arena, nativeIterFilter,  "filter",  1), cfg);
+    _ = try iter_proto.defineOwnData("take",    try val_mod.makeNativeFunctionNamed(arena, nativeIterTake,    "take",    1), cfg);
+    _ = try iter_proto.defineOwnData("drop",    try val_mod.makeNativeFunctionNamed(arena, nativeIterDrop,    "drop",    1), cfg);
+    _ = try iter_proto.defineOwnData("flatMap", try val_mod.makeNativeFunctionNamed(arena, nativeIterFlatMap, "flatMap", 1), cfg);
+    _ = try iter_proto.defineOwnData("reduce",  try val_mod.makeNativeFunctionNamed(arena, nativeIterReduce,  "reduce",  1), cfg);
+    _ = try iter_proto.defineOwnData("toArray", try val_mod.makeNativeFunctionNamed(arena, nativeIterToArray, "toArray", 0), cfg);
+    _ = try iter_proto.defineOwnData("forEach", try val_mod.makeNativeFunctionNamed(arena, nativeIterForEach, "forEach", 1), cfg);
+    _ = try iter_proto.defineOwnData("some",    try val_mod.makeNativeFunctionNamed(arena, nativeIterSome,    "some",    1), cfg);
+    _ = try iter_proto.defineOwnData("every",   try val_mod.makeNativeFunctionNamed(arena, nativeIterEvery,   "every",   1), cfg);
+    _ = try iter_proto.defineOwnData("find",    try val_mod.makeNativeFunctionNamed(arena, nativeIterFind,    "find",    1), cfg);
+
     // %ArrayIteratorPrototype%: { next, [@@toStringTag]: "Array Iterator" }.
     const aip = try JsObject.create(arena, iter_proto);
     _ = try aip.defineOwnData("next", try val_mod.makeNativeFunctionNamed(arena, nativeSeqIterNext, "next", 0), cfg);
     if (realm_mod.active_sym_to_string_tag) |tag|
-        try aip.setSymAttr(tag, try val_mod.makeString(arena, "Array Iterator"), .{ .writable = false, .enumerable = false, .configurable = true });
+        try aip.setSymAttr(tag, try val_mod.makeString(arena, "Array Iterator"), tag_cfg);
     active_array_iter_proto = aip;
     active_iterator_proto = iter_proto;
+
+    // %IteratorHelperPrototype%: parent = %IteratorPrototype%, own next + return.
+    const ihp = try JsObject.create(arena, iter_proto);
+    _ = try ihp.defineOwnData("next",   try val_mod.makeNativeFunctionNamed(arena, nativeIterHelperNext,   "next",   0), cfg);
+    _ = try ihp.defineOwnData("return", try val_mod.makeNativeFunctionNamed(arena, nativeIterHelperReturn, "return", 1), cfg);
+    if (realm_mod.active_sym_to_string_tag) |tag|
+        try ihp.setSymAttr(tag, try val_mod.makeString(arena, "Iterator Helper"), tag_cfg);
+    active_iterator_helper_proto = ihp;
 }
 
 /// Array.prototype[Symbol.iterator] (and values()): index iterator over `this`.
@@ -2222,4 +2326,504 @@ fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     try obj.set("message", try val_mod.makeString(arena, msg));
     return val_mod.makeObject(arena, obj);
+}
+
+// ============================================================
+// ES2024 Iterator Helpers — lazy (map/filter/take/drop/flatMap)
+// ============================================================
+
+/// %IteratorHelperPrototype%.next — advance the lazy pipeline by one step.
+fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const d = try getIterHelperData(arena, this_val);
+    if (d.done) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const undef = try val_mod.makeUndefined(arena);
+
+    switch (d.kind) {
+        .map => {
+            const result = function_proto.invokeCallback(arena, d.source, d.next_fn, &[_]Value{}) catch |e| {
+                d.done = true;
+                return e;
+            };
+            if (result.bits == 0 or result.unbox() != .object) {
+                d.done = true;
+                return makeIteratorResult(arena, undef, true);
+            }
+            const done_v = result.toPtr().object.get("done") orelse undef;
+            if (isTruthy(done_v)) {
+                d.done = true;
+                return makeIteratorResult(arena, undef, true);
+            }
+            const value = result.toPtr().object.get("value") orelse undef;
+            const counter_v = try val_mod.makeNumber(arena, @floatFromInt(d.counter));
+            d.counter += 1;
+            const mapped = function_proto.invokeCallback(arena, undef, d.callback, &[_]Value{ value, counter_v }) catch |e| {
+                closeIterator(arena, d.source);
+                d.done = true;
+                return e;
+            };
+            return makeIteratorResult(arena, mapped, false);
+        },
+
+        .filter => {
+            while (true) {
+                const result = function_proto.invokeCallback(arena, d.source, d.next_fn, &[_]Value{}) catch |e| {
+                    d.done = true;
+                    return e;
+                };
+                if (result.bits == 0 or result.unbox() != .object) {
+                    d.done = true;
+                    return makeIteratorResult(arena, undef, true);
+                }
+                const done_v = result.toPtr().object.get("done") orelse undef;
+                if (isTruthy(done_v)) {
+                    d.done = true;
+                    return makeIteratorResult(arena, undef, true);
+                }
+                const value = result.toPtr().object.get("value") orelse undef;
+                const counter_v = try val_mod.makeNumber(arena, @floatFromInt(d.counter));
+                d.counter += 1;
+                const passed = function_proto.invokeCallback(arena, undef, d.callback, &[_]Value{ value, counter_v }) catch |e| {
+                    closeIterator(arena, d.source);
+                    d.done = true;
+                    return e;
+                };
+                if (isTruthy(passed)) return makeIteratorResult(arena, value, false);
+            }
+        },
+
+        .take => {
+            if (d.limit <= 0) {
+                if (!d.done) {
+                    d.done = true;
+                    closeIterator(arena, d.source);
+                }
+                return makeIteratorResult(arena, undef, true);
+            }
+            const result = function_proto.invokeCallback(arena, d.source, d.next_fn, &[_]Value{}) catch |e| {
+                d.done = true;
+                return e;
+            };
+            if (result.bits == 0 or result.unbox() != .object) {
+                d.done = true;
+                return makeIteratorResult(arena, undef, true);
+            }
+            const done_v = result.toPtr().object.get("done") orelse undef;
+            if (isTruthy(done_v)) {
+                d.done = true;
+                return makeIteratorResult(arena, undef, true);
+            }
+            const value = result.toPtr().object.get("value") orelse undef;
+            d.limit -= 1;
+            if (d.limit <= 0) {
+                d.done = true;
+                closeIterator(arena, d.source);
+            }
+            return makeIteratorResult(arena, value, false);
+        },
+
+        .drop => {
+            // Skip the first `limit` items (counter tracks how many skipped).
+            const n_skip: u64 = @intCast(d.limit);
+            while (d.counter < n_skip) {
+                const result = function_proto.invokeCallback(arena, d.source, d.next_fn, &[_]Value{}) catch |e| {
+                    d.done = true;
+                    return e;
+                };
+                if (result.bits == 0 or result.unbox() != .object) {
+                    d.done = true;
+                    return makeIteratorResult(arena, undef, true);
+                }
+                const done_v = result.toPtr().object.get("done") orelse undef;
+                if (isTruthy(done_v)) {
+                    d.done = true;
+                    return makeIteratorResult(arena, undef, true);
+                }
+                d.counter += 1;
+            }
+            // Dropping phase complete — yield the next value.
+            const result = function_proto.invokeCallback(arena, d.source, d.next_fn, &[_]Value{}) catch |e| {
+                d.done = true;
+                return e;
+            };
+            if (result.bits == 0 or result.unbox() != .object) {
+                d.done = true;
+                return makeIteratorResult(arena, undef, true);
+            }
+            const done_v = result.toPtr().object.get("done") orelse undef;
+            if (isTruthy(done_v)) {
+                d.done = true;
+                return makeIteratorResult(arena, undef, true);
+            }
+            const value = result.toPtr().object.get("value") orelse undef;
+            return makeIteratorResult(arena, value, false);
+        },
+
+        .flatMap => {
+            while (true) {
+                // If we have an active inner iterator, drain it first.
+                if (d.inner_iter.bits != 0) {
+                    const inner_result = function_proto.invokeCallback(arena, d.inner_iter, d.inner_next_fn, &[_]Value{}) catch |e| {
+                        d.done = true;
+                        closeIterator(arena, d.source);
+                        return e;
+                    };
+                    const inner_done = if (inner_result.bits != 0 and inner_result.unbox() == .object)
+                        isTruthy(inner_result.toPtr().object.get("done") orelse undef)
+                    else
+                        true;
+                    if (inner_done) {
+                        d.inner_iter = Value{ .bits = 0 };
+                        d.inner_next_fn = Value{ .bits = 0 };
+                        // fall through to fetch next outer value
+                    } else {
+                        const inner_val = inner_result.toPtr().object.get("value") orelse undef;
+                        return makeIteratorResult(arena, inner_val, false);
+                    }
+                }
+                // Fetch the next outer value.
+                const result = function_proto.invokeCallback(arena, d.source, d.next_fn, &[_]Value{}) catch |e| {
+                    d.done = true;
+                    return e;
+                };
+                if (result.bits == 0 or result.unbox() != .object) {
+                    d.done = true;
+                    return makeIteratorResult(arena, undef, true);
+                }
+                const done_v = result.toPtr().object.get("done") orelse undef;
+                if (isTruthy(done_v)) {
+                    d.done = true;
+                    return makeIteratorResult(arena, undef, true);
+                }
+                const value = result.toPtr().object.get("value") orelse undef;
+                const counter_v = try val_mod.makeNumber(arena, @floatFromInt(d.counter));
+                d.counter += 1;
+                // Call the callback to get a sub-iterable.
+                const sub_iterable = function_proto.invokeCallback(arena, undef, d.callback, &[_]Value{ value, counter_v }) catch |e| {
+                    closeIterator(arena, d.source);
+                    d.done = true;
+                    return e;
+                };
+                // GetIterator on the sub-iterable.
+                const inner_iter = nativeGetIterator(arena, Value{ .bits = 0 }, &[_]Value{sub_iterable}) catch |e| {
+                    closeIterator(arena, d.source);
+                    d.done = true;
+                    return e;
+                };
+                if (inner_iter.bits == 0 or inner_iter.unbox() != .object) continue;
+                const inner_next = inner_iter.toPtr().object.get("next") orelse continue;
+                d.inner_iter = inner_iter;
+                d.inner_next_fn = inner_next;
+                // Loop back to drain the new inner iterator.
+            }
+        },
+    }
+}
+
+/// %IteratorHelperPrototype%.return — close the helper and its source.
+fn nativeIterHelperReturn(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
+        const obj = this_val.toPtr().object;
+        if (obj.internal_kind == .iterator_helper and obj.internal_slot != null) {
+            const d: *IterHelperData = @ptrCast(@alignCast(obj.internal_slot.?));
+            if (!d.done) {
+                d.done = true;
+                closeIterator(arena, d.source);
+            }
+        }
+    }
+    return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+}
+
+// ---- Lazy factory methods on %IteratorPrototype% ----
+
+fn nativeIterMap(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (!isCallable(cb)) {
+        try setTypeError(arena, "Iterator.prototype.map: callback is not a function");
+        unreachable;
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const d = try arena.create(IterHelperData);
+    d.* = IterHelperData{ .source = it.source, .next_fn = it.next_fn, .callback = cb, .kind = .map, .inner_iter = Value{ .bits = 0 }, .inner_next_fn = Value{ .bits = 0 } };
+    return makeIteratorHelper(arena, d);
+}
+
+fn nativeIterFilter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (!isCallable(cb)) {
+        try setTypeError(arena, "Iterator.prototype.filter: callback is not a function");
+        unreachable;
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const d = try arena.create(IterHelperData);
+    d.* = IterHelperData{ .source = it.source, .next_fn = it.next_fn, .callback = cb, .kind = .filter, .inner_iter = Value{ .bits = 0 }, .inner_next_fn = Value{ .bits = 0 } };
+    return makeIteratorHelper(arena, d);
+}
+
+fn nativeIterTake(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const limit_v = if (args.len > 0) args[0] else try val_mod.makeNumber(arena, 0);
+    var limit: i64 = 0;
+    if (limit_v.bits != 0) {
+        switch (limit_v.unbox()) {
+            .number => |n| {
+                if (std.math.isNan(n) or n < 0) {
+                    try setTypeError(arena, "Iterator.prototype.take: limit must be non-negative");
+                    unreachable;
+                }
+                limit = if (n >= 9007199254740991.0) 9007199254740991 else @intFromFloat(n);
+            },
+            else => {
+                try setTypeError(arena, "Iterator.prototype.take: limit must be a number");
+                unreachable;
+            },
+        }
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const d = try arena.create(IterHelperData);
+    d.* = IterHelperData{ .source = it.source, .next_fn = it.next_fn, .callback = Value{ .bits = 0 }, .limit = limit, .kind = .take, .inner_iter = Value{ .bits = 0 }, .inner_next_fn = Value{ .bits = 0 } };
+    return makeIteratorHelper(arena, d);
+}
+
+fn nativeIterDrop(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const limit_v = if (args.len > 0) args[0] else try val_mod.makeNumber(arena, 0);
+    var limit: i64 = 0;
+    if (limit_v.bits != 0) {
+        switch (limit_v.unbox()) {
+            .number => |n| {
+                if (std.math.isNan(n) or n < 0) {
+                    try setTypeError(arena, "Iterator.prototype.drop: limit must be non-negative");
+                    unreachable;
+                }
+                limit = if (n >= 9007199254740991.0) 9007199254740991 else @intFromFloat(n);
+            },
+            else => {
+                try setTypeError(arena, "Iterator.prototype.drop: limit must be a number");
+                unreachable;
+            },
+        }
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const d = try arena.create(IterHelperData);
+    d.* = IterHelperData{ .source = it.source, .next_fn = it.next_fn, .callback = Value{ .bits = 0 }, .limit = limit, .kind = .drop, .inner_iter = Value{ .bits = 0 }, .inner_next_fn = Value{ .bits = 0 } };
+    return makeIteratorHelper(arena, d);
+}
+
+fn nativeIterFlatMap(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (!isCallable(cb)) {
+        try setTypeError(arena, "Iterator.prototype.flatMap: callback is not a function");
+        unreachable;
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const d = try arena.create(IterHelperData);
+    d.* = IterHelperData{ .source = it.source, .next_fn = it.next_fn, .callback = cb, .kind = .flatMap, .inner_iter = Value{ .bits = 0 }, .inner_next_fn = Value{ .bits = 0 } };
+    return makeIteratorHelper(arena, d);
+}
+
+// ============================================================
+// ES2024 Iterator Helpers — eager (reduce/toArray/forEach/…)
+// ============================================================
+
+fn nativeIterReduce(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const reducer = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (!isCallable(reducer)) {
+        try setTypeError(arena, "Iterator.prototype.reduce: reducer is not a function");
+        unreachable;
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const undef = try val_mod.makeUndefined(arena);
+    var acc: Value = undef;
+    var has_acc = args.len > 1;
+    if (has_acc) acc = args[1];
+    while (true) {
+        const result = function_proto.invokeCallback(arena, it.source, it.next_fn, &[_]Value{}) catch |e| return e;
+        if (result.bits == 0 or result.unbox() != .object) break;
+        const done_v = result.toPtr().object.get("done") orelse undef;
+        if (isTruthy(done_v)) break;
+        const value = result.toPtr().object.get("value") orelse undef;
+        if (!has_acc) {
+            acc = value;
+            has_acc = true;
+        } else {
+            acc = function_proto.invokeCallback(arena, undef, reducer, &[_]Value{ acc, value }) catch |e| return e;
+        }
+    }
+    if (!has_acc) {
+        try setTypeError(arena, "Iterator.prototype.reduce: reduce of empty iterator with no initial value");
+        unreachable;
+    }
+    return acc;
+}
+
+fn nativeIterToArray(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const it = try getThisSourceIter(arena, this_val);
+    const arr = if (realm_mod.active_heap) |h|
+        try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
+    else
+        try JsObject.createArray(arena, realm_mod.active_array_proto);
+    arr.is_array = true;
+    var n: usize = 0;
+    const undef = try val_mod.makeUndefined(arena);
+    while (true) {
+        const result = function_proto.invokeCallback(arena, it.source, it.next_fn, &[_]Value{}) catch |e| return e;
+        if (result.bits == 0 or result.unbox() != .object) break;
+        const done_v = result.toPtr().object.get("done") orelse undef;
+        if (isTruthy(done_v)) break;
+        const value = result.toPtr().object.get("value") orelse undef;
+        const key = try std.fmt.allocPrint(arena, "{d}", .{n});
+        try arr.set(key, value);
+        n += 1;
+    }
+    try arr.set("length", try val_mod.makeNumber(arena, @floatFromInt(n)));
+    return val_mod.makeObject(arena, arr);
+}
+
+fn nativeIterForEach(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (!isCallable(cb)) {
+        try setTypeError(arena, "Iterator.prototype.forEach: callback is not a function");
+        unreachable;
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const undef = try val_mod.makeUndefined(arena);
+    var counter: u64 = 0;
+    while (true) {
+        const result = function_proto.invokeCallback(arena, it.source, it.next_fn, &[_]Value{}) catch |e| return e;
+        if (result.bits == 0 or result.unbox() != .object) break;
+        const done_v = result.toPtr().object.get("done") orelse undef;
+        if (isTruthy(done_v)) break;
+        const value = result.toPtr().object.get("value") orelse undef;
+        const counter_v = try val_mod.makeNumber(arena, @floatFromInt(counter));
+        counter += 1;
+        _ = function_proto.invokeCallback(arena, undef, cb, &[_]Value{ value, counter_v }) catch |e| {
+            closeIterator(arena, it.source);
+            return e;
+        };
+    }
+    return undef;
+}
+
+fn nativeIterSome(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (!isCallable(cb)) {
+        try setTypeError(arena, "Iterator.prototype.some: callback is not a function");
+        unreachable;
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const undef = try val_mod.makeUndefined(arena);
+    var counter: u64 = 0;
+    while (true) {
+        const result = function_proto.invokeCallback(arena, it.source, it.next_fn, &[_]Value{}) catch |e| return e;
+        if (result.bits == 0 or result.unbox() != .object) break;
+        const done_v = result.toPtr().object.get("done") orelse undef;
+        if (isTruthy(done_v)) break;
+        const value = result.toPtr().object.get("value") orelse undef;
+        const counter_v = try val_mod.makeNumber(arena, @floatFromInt(counter));
+        counter += 1;
+        const passed = function_proto.invokeCallback(arena, undef, cb, &[_]Value{ value, counter_v }) catch |e| {
+            closeIterator(arena, it.source);
+            return e;
+        };
+        if (isTruthy(passed)) {
+            closeIterator(arena, it.source);
+            return val_mod.makeBool(arena, true);
+        }
+    }
+    return val_mod.makeBool(arena, false);
+}
+
+fn nativeIterEvery(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (!isCallable(cb)) {
+        try setTypeError(arena, "Iterator.prototype.every: callback is not a function");
+        unreachable;
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const undef = try val_mod.makeUndefined(arena);
+    var counter: u64 = 0;
+    while (true) {
+        const result = function_proto.invokeCallback(arena, it.source, it.next_fn, &[_]Value{}) catch |e| return e;
+        if (result.bits == 0 or result.unbox() != .object) break;
+        const done_v = result.toPtr().object.get("done") orelse undef;
+        if (isTruthy(done_v)) break;
+        const value = result.toPtr().object.get("value") orelse undef;
+        const counter_v = try val_mod.makeNumber(arena, @floatFromInt(counter));
+        counter += 1;
+        const passed = function_proto.invokeCallback(arena, undef, cb, &[_]Value{ value, counter_v }) catch |e| {
+            closeIterator(arena, it.source);
+            return e;
+        };
+        if (!isTruthy(passed)) {
+            closeIterator(arena, it.source);
+            return val_mod.makeBool(arena, false);
+        }
+    }
+    return val_mod.makeBool(arena, true);
+}
+
+fn nativeIterFind(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (!isCallable(cb)) {
+        try setTypeError(arena, "Iterator.prototype.find: callback is not a function");
+        unreachable;
+    }
+    const it = try getThisSourceIter(arena, this_val);
+    const undef = try val_mod.makeUndefined(arena);
+    var counter: u64 = 0;
+    while (true) {
+        const result = function_proto.invokeCallback(arena, it.source, it.next_fn, &[_]Value{}) catch |e| return e;
+        if (result.bits == 0 or result.unbox() != .object) break;
+        const done_v = result.toPtr().object.get("done") orelse undef;
+        if (isTruthy(done_v)) break;
+        const value = result.toPtr().object.get("value") orelse undef;
+        const counter_v = try val_mod.makeNumber(arena, @floatFromInt(counter));
+        counter += 1;
+        const passed = function_proto.invokeCallback(arena, undef, cb, &[_]Value{ value, counter_v }) catch |e| {
+            closeIterator(arena, it.source);
+            return e;
+        };
+        if (isTruthy(passed)) {
+            closeIterator(arena, it.source);
+            return value;
+        }
+    }
+    return undef;
+}
+
+// ============================================================
+// Iterator global constructor + Iterator.from
+// ============================================================
+
+/// Abstract Iterator constructor: direct instantiation is forbidden.
+fn nativeIteratorCtor(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    realm_mod.pending_exception = try makeTypeErrorVal(arena, "Abstract class Iterator not directly constructable");
+    return error.JsException;
+}
+
+/// Iterator.from(O): obtain an iterator from any iterable or iterator-like.
+/// Per spec: if O already inherits %IteratorPrototype% return it unchanged;
+/// otherwise get its @@iterator method and call it, or treat as an iterator
+/// directly if it exposes a `next` method.
+fn nativeIteratorFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const o = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    // Delegate to the existing GetIterator helper which handles all cases.
+    return nativeGetIterator(arena, Value{ .bits = 0 }, &[_]Value{o});
+}
+
+/// Register the `Iterator` constructor on the global object.
+/// Must be called AFTER initArrayIteratorProto (active_iterator_proto must be set).
+pub fn registerIteratorGlobal(ctx: *const intrinsics.Ctx) !void {
+    const arena = ctx.arena;
+    const iter_proto = active_iterator_proto orelse return; // guard: not yet built
+    const cfg: PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+    const nc: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+
+    const iter_ctor = try JsObject.create(arena, ctx.function_proto);
+    _ = try iter_ctor.defineOwnData("name", try val_mod.makeString(arena, "Iterator"), nc);
+    _ = try iter_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), nc);
+    _ = try iter_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, iter_proto), .{ .writable = false, .enumerable = false, .configurable = false });
+    _ = try iter_ctor.defineOwnData("from", try val_mod.makeNativeFunctionNamed(arena, nativeIteratorFrom, "from", 1), cfg);
+    try iter_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeIteratorCtor));
+    _ = try iter_proto.defineOwnData("constructor", try val_mod.makeObject(arena, iter_ctor), cfg);
+    try ctx.env.define("Iterator", try val_mod.makeObject(arena, iter_ctor));
 }

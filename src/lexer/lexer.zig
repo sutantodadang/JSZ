@@ -477,7 +477,17 @@ pub const Lexer = struct {
                 '\'' => try buf.append(self.allocator, '\''),
                 '"' => try buf.append(self.allocator, '"'),
                 '\\' => try buf.append(self.allocator, '\\'),
-                '\n', '\r' => {}, // line continuation
+                '\n' => {}, // LineContinuation: LF removed from the value
+                '\r' => {
+                    // CRLF line continuation: consume the paired LF too, so it
+                    // isn't seen as a raw (string-terminating) line terminator
+                    // on the next iteration. The whole LineTerminatorSequence is
+                    // removed from the string value.
+                    if (self.pos < self.source.len and self.source[self.pos] == '\n') {
+                        self.pos += 1;
+                        self.column += 1;
+                    }
+                },
                 'x' => {
                     if (self.pos + 1 >= self.source.len) return LexError.InvalidEscape;
                     const h1 = hexVal(self.source[self.pos]) orelse return LexError.InvalidEscape;
