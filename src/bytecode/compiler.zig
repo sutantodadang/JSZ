@@ -99,6 +99,12 @@ pub const FnCompiler = struct {
     /// suspends via AWAIT (not YIELD) so the async-generator driver can tell an
     /// await apart from a yield. `yield` always uses YIELD.
     is_async_generator: bool = false,
+    /// True for any generator body (sync `function*` or `async function*`).
+    /// Gates emission of the PARAMS_DONE marker for eager parameter binding.
+    is_generator: bool = false,
+    /// Set when a PARAMS_DONE marker was emitted (the function has a
+    /// destructuring-param prelude). The VM runs the prelude eagerly at call time.
+    has_param_init: bool = false,
     /// M14: this function literal is an arrow (no own `arguments`/`this`).
     is_arrow: bool = false,
     /// M14: the body read an identifier named `arguments`. Combined with
@@ -1439,6 +1445,7 @@ pub const FnCompiler = struct {
         const rresult = self.allocReg();
         const rret = self.allocReg();
         const rdone = self.allocReg();
+        const rraw = self.allocReg();
         const loop_top = self.sp;
         const k0 = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 0));
         const k1 = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 1));
@@ -1448,6 +1455,7 @@ pub const FnCompiler = struct {
         const c_ret = try self.builder.addConstant(try val_mod.makeString(self.arena, "ret"));
         const c_val = try self.builder.addConstant(try val_mod.makeString(self.arena, "value"));
         const c_done = try self.builder.addConstant(try val_mod.makeString(self.arena, "done"));
+        const c_raw = try self.builder.addConstant(try val_mod.makeString(self.arena, "raw"));
         // rtype = 0 (normal); rval = undefined
         try self.emitOp(.LOAD_K, line);
         try self.emitU8(rtype);
@@ -1493,6 +1501,11 @@ pub const FnCompiler = struct {
         try self.emitU8(rdone);
         try self.emitU8(rstep);
         try self.emitU16(@intCast(c_done));
+        // rraw = rstep.raw — the inner iterator result object, yielded verbatim
+        try self.emitOp(.GET_PROP, line);
+        try self.emitU8(rraw);
+        try self.emitU8(rstep);
+        try self.emitU16(@intCast(c_raw));
         // if rret → the outer generator returns rresult
         try self.emitOp(.JMP_IF_TRUE, line);
         try self.emitU8(rret);
@@ -1509,13 +1522,15 @@ pub const FnCompiler = struct {
         try self.emitU8(rresult);
         const catch_patch = self.currentOffset();
         try self.emitI16(0);
-        try self.emitOp(.YIELD, line);
-        try self.emitU8(rresult);
+        // YIELD_STAR rraw: surface the inner result object to the consumer
+        // verbatim. On normal resume the sent value lands back in rraw.
+        try self.emitOp(.YIELD_STAR, line);
+        try self.emitU8(rraw);
         try self.emitOp(.POP_TRY, line);
         // normal resume: rval = sent value; rtype = 0
         try self.emitOp(.MOVE, line);
         try self.emitU8(rval);
-        try self.emitU8(rresult);
+        try self.emitU8(rraw);
         try self.emitOp(.LOAD_K, line);
         try self.emitU8(rtype);
         try self.emitI16(@intCast(k0));
@@ -1895,6 +1910,14 @@ pub const FnCompiler = struct {
             .labeled_stmt => try lower.lowerLabeledStmt(self, node, last_expr_reg),
             .empty_stmt => try lower.lowerEmptyStmt(self, node, last_expr_reg),
             .debugger_stmt => try lower.lowerDebuggerStmt(self, node, last_expr_reg),
+            .params_done => {
+                // Boundary between formal-parameter init and the body. Only
+                // generators run their prelude eagerly; others ignore the marker.
+                if (self.is_generator) {
+                    try self.emitOp(.PARAMS_DONE, node.start);
+                    self.has_param_init = true;
+                }
+            },
             else => {},
         }
     }
@@ -2061,6 +2084,7 @@ pub fn compileFunctionStrict(
     fc.is_strict = is_strict;
     fc.is_async = is_async;
     fc.is_async_generator = is_async and is_generator;
+    fc.is_generator = is_generator;
     fc.is_arrow = is_arrow;
 
     // Phase 2: all variable access is env-based (GET_GLOBAL/SET_GLOBAL).
@@ -2098,6 +2122,7 @@ pub fn compileFunctionStrict(
         .rest_param = rest_param,
         .is_strict = is_strict,
         .is_generator = is_generator,
+        .has_param_init = fc.has_param_init,
         .is_async = is_async,
         .is_arrow = is_arrow,
         .uses_arguments = fc.saw_arguments and !is_arrow,

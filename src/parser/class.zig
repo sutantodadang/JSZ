@@ -1147,6 +1147,48 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         if (!p.match(.comma)) break;
     }
     _ = p.expect(.right_paren) orelse return null;
+    // TDZ for default parameters: a non-simple parameter list (one with a
+    // default) puts every parameter in a TDZ until its own initializer, so a
+    // default referencing a not-yet-initialized parameter is a ReferenceError
+    // (`function f(x = x)`, `function f(x = y, y)`). Model it by renaming each
+    // parameter to a synthetic positional `__arg_N` and rebinding the real name
+    // as a body-scoped `let` initialized from it — the existing let TDZ + hoisting
+    // does the rest. Scoped to simple-named param lists (no destructuring / rest),
+    // which is where these tests live; mixed lists keep the prior behavior.
+    var any_default = false;
+    for (defaults.items) |d| {
+        if (d != null) {
+            any_default = true;
+            break;
+        }
+    }
+    if (any_default and rest_param == null and param_prelude.items.len == 0) {
+        var lets = std.ArrayList(*Node){};
+        for (params.items, 0..) |orig, i| {
+            const synth = std.fmt.allocPrint(p.arena, "__arg_{d}", .{i}) catch {
+                p.had_error = true;
+                return null;
+            };
+            var init_node: *Node = undefined;
+            if (defaults.items[i]) |dexpr| {
+                const ar1 = p.makeNode(.identifier, 0, 0, .{ .identifier = synth }) orelse return null;
+                const undef = p.makeNode(.undefined_literal, 0, 0, .{ .undefined_literal = {} }) orelse return null;
+                const test_ = p.makeNode(.binary_expr, 0, 0, .{ .binary_expr = .{ .op = .strict_neq, .left = ar1, .right = undef } }) orelse return null;
+                const ar2 = p.makeNode(.identifier, 0, 0, .{ .identifier = synth }) orelse return null;
+                init_node = p.makeNode(.conditional_expr, 0, 0, .{ .conditional_expr = .{ .test_ = test_, .consequent = ar2, .alternate = dexpr } }) orelse return null;
+            } else {
+                init_node = p.makeNode(.identifier, 0, 0, .{ .identifier = synth }) orelse return null;
+            }
+            const vd = p.makeNode(.var_decl, 0, 0, .{ .var_decl = .{ .kind = .let, .name = orig, .init = init_node } }) orelse return null;
+            lets.append(p.arena, vd) catch {
+                p.had_error = true;
+                return null;
+            };
+            params.items[i] = synth;
+            defaults.items[i] = null;
+        }
+        param_prelude = lets;
+    }
     p.pending_param_prelude = param_prelude.items;
     return parser_file.ParamParse{
         .params = params.items,
@@ -1190,7 +1232,33 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
     // Prepend destructuring-param decls (binding the synthetic `__param_N`
-    // names) so they run before the function body proper.
+    // names) so they run before the function body proper. A `params_done` marker
+    // always separates parameter initialization from the body: for generators the
+    // build driver runs everything up to it eagerly at call time (so destructuring
+    // AND default-parameter side effects — e.g. `g.prototype = null` — happen
+    // during FunctionDeclarationInstantiation, before OrdinaryCreateFromConstructor).
+    // Default-param inits are prepended later (applyParamDefaults), landing in
+    // front of the prelude and thus still before the marker. Only generators get
+    // the marker (gated on in_generator_function) so a regular function's body
+    // structure — and tail-call analysis — is unchanged. A destructuring prelude
+    // outside a generator is still prepended (it just runs as ordinary body code).
+    if (p.in_generator_function) {
+        var combined = std.ArrayList(*Node){};
+        combined.appendSlice(p.arena, param_prelude) catch {
+            p.had_error = true;
+            return null;
+        };
+        const marker = p.makeNode(.params_done, 0, 0, .{ .params_done = {} }) orelse return null;
+        combined.append(p.arena, marker) catch {
+            p.had_error = true;
+            return null;
+        };
+        combined.appendSlice(p.arena, body.items) catch {
+            p.had_error = true;
+            return null;
+        };
+        return combined.items;
+    }
     if (param_prelude.len > 0) {
         var combined = std.ArrayList(*Node){};
         combined.appendSlice(p.arena, param_prelude) catch {

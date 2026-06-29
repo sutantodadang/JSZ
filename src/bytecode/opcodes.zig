@@ -252,6 +252,19 @@ pub const Op = enum(u8) {
     /// sentinel to the finally / outer propagation, so `return()` runs finally
     /// but is not observed by user `catch`.
     JMP_IF_RET_COMPL,
+    /// YIELD_STAR — op, Rval u8 (2 bytes). Same suspend mechanics as YIELD, but
+    /// the yielded value is surfaced to the consumer VERBATIM (no `{value,done}`
+    /// wrapping). Used by `yield*` delegation: spec GeneratorYield(innerResult)
+    /// passes the inner iterator's result object through unchanged (so a missing
+    /// `done` stays `undefined`). Declared last to keep earlier opcode ordinals
+    /// stable for the pinned JIT int-subset contract.
+    YIELD_STAR,
+    /// PARAMS_DONE — op only (1 byte). Marks the end of a generator's eager
+    /// formal-parameter initialization. The build driver runs the body to this
+    /// point at call time and suspends here; the first `.next()` resumes after it.
+    /// A no-op suspend with no consumer-visible value. Declared last (ordinal
+    /// stability for the pinned JIT contract).
+    PARAMS_DONE,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -336,6 +349,8 @@ pub fn instrSize(op: Op) usize {
         .TAIL_CALL => 4,
         .DEBUGGER => 1,
         .YIELD => 2,
+        .YIELD_STAR => 2,
+        .PARAMS_DONE => 1,
         .AWAIT => 2,
         .END_FINALLY => 3,
         .JMP_IF_RET_COMPL => 4,

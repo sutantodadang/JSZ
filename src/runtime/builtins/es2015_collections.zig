@@ -1724,6 +1724,94 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
     };
 }
 
+/// __requireObjectCoercible__(v): RequireObjectCoercible — throw a TypeError when
+/// `v` is null or undefined (a destructuring pattern cannot be applied to it),
+/// otherwise return `v` unchanged. Used by the formal-parameter destructuring
+/// desugar before reading a pattern's properties.
+pub fn nativeRequireObjectCoercible(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (v.bits == 0 or v.unbox() == .undefined_ or v.unbox() == .null_) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "Cannot destructure 'undefined' or 'null'");
+        return error.JsException;
+    }
+    return v;
+}
+
+/// __destrIterStep__(iterator, box): one element of array-pattern destructuring.
+/// `box.done` tracks iterator exhaustion. Returns the element value, or undefined
+/// when the iterator is already/now done (so an absent element binds undefined /
+/// triggers a default). A throwing `next()` or `value` getter propagates (the
+/// iterator is then considered done — spec sets [[Done]] before the abrupt return).
+pub fn nativeDestrIterStep(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const it = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const box = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    if (box) |b| {
+        if (b.get("done")) |dv| if (isTruthy(dv)) return val_mod.makeUndefined(arena);
+    }
+    const r = try nativeIterStep(arena, Value{}, &[_]Value{it});
+    if (r.bits == 0 or r.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
+        return error.JsException;
+    }
+    const done = try ctx.getProp(arena, r, "done");
+    if (isTruthy(done)) {
+        if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
+        return val_mod.makeUndefined(arena);
+    }
+    return try ctx.getProp(arena, r, "value");
+}
+
+/// __destrIterRest__(iterator, box): collect the remaining iterator values into a
+/// fresh Array (the `[...rest]` binding). Sets `box.done` when exhausted.
+pub fn nativeDestrIterRest(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const it = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const box = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    const arr = if (realm_mod.active_heap) |h|
+        try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
+    else
+        try JsObject.createArray(arena, realm_mod.active_array_proto);
+    arr.is_array = true;
+    var n: usize = 0;
+    while (true) {
+        if (box) |b| if (b.get("done")) |dv| if (isTruthy(dv)) break;
+        const r = try nativeIterStep(arena, Value{}, &[_]Value{it});
+        if (r.bits == 0 or r.unbox() != .object) {
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
+            return error.JsException;
+        }
+        const done = try ctx.getProp(arena, r, "done");
+        if (isTruthy(done)) {
+            if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
+            break;
+        }
+        const v = try ctx.getProp(arena, r, "value");
+        const key = try std.fmt.allocPrint(arena, "{d}", .{n});
+        try arr.set(key, v);
+        n += 1;
+    }
+    try arr.set("length", try val_mod.makeNumber(arena, @floatFromInt(n)));
+    return val_mod.makeObject(arena, arr);
+}
+
+/// __destrIterClose__(iterator, box): IteratorClose when the pattern finished
+/// binding but the iterator was not exhausted (`[a] = [1,2,3]`). Calls
+/// `return()` if present; a normal completion swallows a non-throwing return,
+/// while a throwing `return()` propagates.
+pub fn nativeDestrIterClose(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const it = if (args.len > 0) args[0] else return val_mod.makeUndefined(arena);
+    const box = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    if (box) |b| if (b.get("done")) |dv| if (isTruthy(dv)) return val_mod.makeUndefined(arena);
+    if (it.bits == 0 or it.unbox() != .object) return val_mod.makeUndefined(arena);
+    const ret = try ctx.getProp(arena, it, "return");
+    if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_) return val_mod.makeUndefined(arena);
+    if (!isCallable(ret)) return val_mod.makeUndefined(arena);
+    _ = try function_proto.invokeCallback(arena, it, ret, &[_]Value{});
+    return val_mod.makeUndefined(arena);
+}
+
 /// __getIterator__(x): obtain an iterator (object with next()) for `x`.
 pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const x = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
@@ -1741,15 +1829,11 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
         if (obj.get("@@iterator")) |itf| {
             if (isCallable(itf)) return function_proto.invokeCallback(arena, x, itf, &[_]Value{});
         }
-        // Array fallback: synthesize an index iterator.
-        if (obj.is_array) {
-            const d = try arena.create(SeqIterData);
-            d.* = .{ .seq = x, .index = 0, .is_string = false };
-            return makeSeqIterator(arena, d);
-        }
-        // Fallback: an accessor-defined @@iterator (a getter) is invisible to the
-        // raw slot reads above. Do an observable [[Get]] (fires the getter / a
-        // Proxy trap) and, if it yields a callable, drive it as the iterator.
+        // Observable @@iterator lookup through the prototype chain (fires a getter
+        // / Proxy trap, finds an inherited `Array.prototype[Symbol.iterator]`). This
+        // also covers plain arrays: their iterator comes from %Array.prototype%, so
+        // a deleted/overridden @@iterator is honored (deleting it makes an array
+        // non-iterable, per spec) rather than masked by a synthesized fallback.
         if (realm_mod.active_context) |ctx| {
             if (realm_mod.active_sym_iterator) |sym| {
                 const m = try ctx.getPropSym(arena, x, sym);
@@ -1762,12 +1846,42 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
                 }
             }
         }
+        // Last resort: a plain array with no resolvable @@iterator at all (e.g. no
+        // active context) still iterates by index, so existing call sites that
+        // build arrays internally keep working.
+        if (obj.is_array and realm_mod.active_context == null) {
+            const d = try arena.create(SeqIterData);
+            d.* = .{ .seq = x, .index = 0, .is_string = false };
+            return makeSeqIterator(arena, d);
+        }
     }
     if (x.bits != 0 and x.unbox() == .string) {
         const d = try arena.create(SeqIterData);
         d.* = .{ .seq = x, .index = 0, .is_string = true };
         return makeSeqIterator(arena, d);
     }
+    // Other primitives (boolean/number/bigint/symbol): GetIterator does
+    // GetMethod(@@iterator) which ToObjects the primitive for the lookup, then
+    // calls the method with the primitive as `this` (e.g. a user-defined
+    // `Boolean.prototype[Symbol.iterator]`). undefined/null fall through to the
+    // "not iterable" TypeError.
+    if (x.bits != 0) switch (x.unbox()) {
+        .boolean, .number, .bigint, .symbol => {
+            if (realm_mod.active_context) |ctx| {
+                if (realm_mod.active_sym_iterator) |sym| {
+                    const m = try ctx.getPropSym(arena, x, sym);
+                    if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+                        if (!isCallable(m)) {
+                            realm_mod.pending_exception = try makeTypeErrorVal(arena, "Symbol.iterator is not a function");
+                            return error.JsException;
+                        }
+                        return function_proto.invokeCallback(arena, x, m, &[_]Value{});
+                    }
+                }
+            }
+        },
+        else => {},
+    };
     realm_mod.pending_exception = try makeTypeErrorVal(arena, "value is not iterable");
     return error.JsException;
 }
@@ -1854,11 +1968,15 @@ pub fn nativeAsyncIterStep(arena: std.mem.Allocator, _: Value, args: []const Val
 /// One `{ value, done, ret }` step record for the `yield*` delegation loop.
 /// `ret` true means the outer generator must `return value` (a Return completion
 /// forwarded to / produced by the inner iterator).
-fn makeYieldStarStep(arena: std.mem.Allocator, value: Value, done: bool, ret: bool) !Value {
+fn makeYieldStarStep(arena: std.mem.Allocator, value: Value, done: bool, ret: bool, raw: Value) !Value {
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    // `value`: the yield* completion value (only read from the inner result when
+    // done). `raw`: the inner iterator result object, yielded verbatim while
+    // delegation continues (spec GeneratorYield passes it through unchanged).
     try obj.set("value", value);
     try obj.set("done", try val_mod.makeBool(arena, done));
     try obj.set("ret", try val_mod.makeBool(arena, ret));
+    try obj.set("raw", raw);
     return val_mod.makeObject(arena, obj);
 }
 
@@ -1885,11 +2003,31 @@ pub fn nativeYieldStarStep(arena: std.mem.Allocator, _: Value, args: []const Val
 
     var result: Value = undefined;
     if (rtype == 1) {
-        // throw: forward to iterator.throw, else close + TypeError.
+        // throw: GetMethod(iterator, "throw"). A throwing getter propagates.
         const m = try ctx.getProp(arena, iterator, "throw");
-        if (m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_ or !isCallable(m)) {
-            closeIterator(arena, iterator);
+        if (m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_) {
+            // No throw method → IteratorClose(iterator, normal completion) before
+            // raising the yield* protocol-violation TypeError (spec step b.iii).
+            // GetMethod(return) — a throwing getter propagates (rtrn-get-err); a
+            // throwing return call propagates (rtrn-call-err); both replace the
+            // TypeError. The return result must be an Object.
+            const ret_m = try ctx.getProp(arena, iterator, "return");
+            if (ret_m.bits != 0 and ret_m.unbox() != .undefined_ and ret_m.unbox() != .null_) {
+                if (!isCallable(ret_m)) {
+                    realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'return' property is not a function");
+                    return error.JsException;
+                }
+                const r = try function_proto.invokeCallback(arena, iterator, ret_m, &[_]Value{});
+                if (r.bits == 0 or r.unbox() != .object) {
+                    realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'return' method returned a non-object value");
+                    return error.JsException;
+                }
+            }
             realm_mod.pending_exception = try makeTypeErrorVal(arena, "The iterator does not provide a 'throw' method");
+            return error.JsException;
+        }
+        if (!isCallable(m)) {
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'throw' property is not a function");
             return error.JsException;
         }
         result = try function_proto.invokeCallback(arena, iterator, m, &[_]Value{rval});
@@ -1897,7 +2035,7 @@ pub fn nativeYieldStarStep(arena: std.mem.Allocator, _: Value, args: []const Val
         // return: forward to iterator.return; absent → outer returns rval.
         const m = try ctx.getProp(arena, iterator, "return");
         if (m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_ or !isCallable(m)) {
-            return makeYieldStarStep(arena, rval, true, true);
+            return makeYieldStarStep(arena, rval, true, true, try val_mod.makeUndefined(arena));
         }
         result = try function_proto.invokeCallback(arena, iterator, m, &[_]Value{rval});
     } else {
@@ -1916,9 +2054,15 @@ pub fn nativeYieldStarStep(arena: std.mem.Allocator, _: Value, args: []const Val
     }
     const done_v = try ctx.getProp(arena, result, "done");
     const done = isTruthy(done_v);
+    if (!done) {
+        // Delegation continues: GeneratorYield surfaces the inner result object
+        // verbatim. Per spec, `value` is NOT accessed while iteration is incomplete.
+        return makeYieldStarStep(arena, try val_mod.makeUndefined(arena), false, false, result);
+    }
+    // Inner iteration is done → IteratorValue reads `value` exactly once. On the
+    // return path this becomes the outer generator's return value.
     const value = try ctx.getProp(arena, result, "value");
-    // Return path + inner done → the outer generator returns `value`.
-    return makeYieldStarStep(arena, value, done, rtype == 2 and done);
+    return makeYieldStarStep(arena, value, true, rtype == 2, try val_mod.makeUndefined(arena));
 }
 
 /// __retComplVal__(x): the value carried by a return-completion sentinel (used by

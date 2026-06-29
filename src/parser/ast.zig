@@ -114,6 +114,11 @@ pub const NodeKind = enum {
     continue_stmt,
     empty_stmt,
     debugger_stmt,
+    // Marker between a generator's formal-parameter initialization (destructuring
+    // prelude + defaults) and its body. The generator build driver runs the body
+    // up to this point eagerly at call time, so param errors propagate to the
+    // caller (spec FunctionDeclarationInstantiation runs before GeneratorStart).
+    params_done,
     // Phase 4a: exceptions
     throw_stmt,
     try_stmt,
@@ -176,6 +181,7 @@ pub const Data = union(NodeKind) {
     continue_stmt: ?[]const u8,
     empty_stmt: void,
     debugger_stmt: void,
+    params_done: void,
     // Phase 4a
     throw_stmt: *Node,
     try_stmt: TryStmt,

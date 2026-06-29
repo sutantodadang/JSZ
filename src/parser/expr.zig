@@ -496,23 +496,130 @@ fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)
 /// expression node) according to `pattern` (an array/object literal acting as a
 /// binding pattern). Recurses for nested patterns. Defaults (`[a = d]`,
 /// `{x = d}`) substitute `d` when the read is `undefined`.
+/// Build a `__helper__(a, b)` call node (b optional) for the destructuring desugar.
+fn mkDestrCall(p: *Parser, helper: []const u8, a: *Node, b: ?*Node) ?*Node {
+    const callee = p.makeNode(.identifier, a.start, a.start, .{ .identifier = helper }) orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, a) catch {
+        p.had_error = true;
+        return null;
+    };
+    if (b) |bb| args.append(p.arena, bb) catch {
+        p.had_error = true;
+        return null;
+    };
+    return p.makeNode(.call_expr, a.start, a.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+}
+
+/// Append a `let <name> = <init>;` decl to the param prelude. Returns false on OOM.
+fn pushLet(p: *Parser, name: []const u8, init: *Node, at: u32) bool {
+    const vd = p.makeNode(.var_decl, at, at, .{ .var_decl = .{ .kind = .let, .name = name, .init = init } }) orelse return false;
+    p.arrow_prelude.append(p.arena, vd) catch {
+        p.had_error = true;
+        return false;
+    };
+    return true;
+}
+
 pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
+    // RequireObjectCoercible: a pattern cannot be applied to null/undefined.
+    // `src` is always an identifier (`__param_N` or a `__dp_N` temp), so reading
+    // it here has no observable side effect / double-evaluation.
+    {
+        const coerce = p.makeNode(.identifier, src.start, src.start, .{ .identifier = "__requireObjectCoercible__" }) orelse return false;
+        var gargs = std.ArrayList(*Node){};
+        gargs.append(p.arena, src) catch {
+            p.had_error = true;
+            return false;
+        };
+        const call = p.makeNode(.call_expr, src.start, src.start, .{ .call_expr = .{ .callee = coerce, .args = gargs.items } }) orelse return false;
+        const stmt = p.makeNode(.expr_stmt, src.start, src.start, .{ .expr_stmt = call }) orelse return false;
+        p.arrow_prelude.append(p.arena, stmt) catch {
+            p.had_error = true;
+            return false;
+        };
+    }
     switch (pattern.kind) {
         .array_literal => {
-            for (pattern.data.array_literal.elements, 0..) |el, i| {
-                const idx = p.makeNode(.number_literal, el.start, el.start, .{ .number_literal = @floatFromInt(i) }) orelse return false;
-                const access = p.makeNode(.member_expr, el.start, el.start, .{
-                    .member_expr = .{ .object = src, .property = idx, .computed = true },
-                }) orelse return false;
-                if (!bindPatternElement(p, el, access)) return false;
+            // Iterator-protocol array destructuring: GetIterator(src), step per
+            // element (IteratorStep + IteratorValue), collect the rest, and
+            // IteratorClose when the pattern finishes binding before the iterator
+            // is exhausted. `__box` ({}) tracks done-ness across the helper calls.
+            const ctr = p.param_destruct_counter;
+            p.param_destruct_counter += 1;
+            const it_name = std.fmt.allocPrint(p.arena, "__it_{d}", .{ctr}) catch {
+                p.had_error = true;
+                return false;
+            };
+            const box_name = std.fmt.allocPrint(p.arena, "__box_{d}", .{ctr}) catch {
+                p.had_error = true;
+                return false;
+            };
+            const get_it = mkDestrCall(p, "__getIterator__", src, null) orelse return false;
+            if (!pushLet(p, it_name, get_it, src.start)) return false;
+            const empty_box = p.makeNode(.object_literal, src.start, src.start, .{ .object_literal = .{ .properties = &.{} } }) orelse return false;
+            if (!pushLet(p, box_name, empty_box, src.start)) return false;
+
+            var saw_rest = false;
+            for (pattern.data.array_literal.elements) |el| {
+                const it_ref = p.makeNode(.identifier, el.start, el.start, .{ .identifier = it_name }) orelse return false;
+                const box_ref = p.makeNode(.identifier, el.start, el.start, .{ .identifier = box_name }) orelse return false;
+                // Elision (`[, x]`): advance the iterator one step, discard.
+                if (el.kind == .undefined_literal) {
+                    const step = mkDestrCall(p, "__destrIterStep__", it_ref, box_ref) orelse return false;
+                    const stmt = p.makeNode(.expr_stmt, el.start, el.start, .{ .expr_stmt = step }) orelse return false;
+                    p.arrow_prelude.append(p.arena, stmt) catch {
+                        p.had_error = true;
+                        return false;
+                    };
+                    continue;
+                }
+                // Rest (`[...rest]`): collect remaining values; no IteratorClose after.
+                if (el.kind == .spread_expr) {
+                    const rest = mkDestrCall(p, "__destrIterRest__", it_ref, box_ref) orelse return false;
+                    if (!bindPatternElement(p, el.data.spread_expr, rest)) return false;
+                    saw_rest = true;
+                    break;
+                }
+                // Normal element: bind the step value to a temp (single step), then
+                // destructure (handles identifier / default / nested sub-pattern).
+                const step = mkDestrCall(p, "__destrIterStep__", it_ref, box_ref) orelse return false;
+                const e_ctr = p.param_destruct_counter;
+                p.param_destruct_counter += 1;
+                const e_name = std.fmt.allocPrint(p.arena, "__e_{d}", .{e_ctr}) catch {
+                    p.had_error = true;
+                    return false;
+                };
+                if (!pushLet(p, e_name, step, el.start)) return false;
+                const e_ref = p.makeNode(.identifier, el.start, el.start, .{ .identifier = e_name }) orelse return false;
+                if (!bindPatternElement(p, el, e_ref)) return false;
+            }
+            if (!saw_rest) {
+                const it_ref = p.makeNode(.identifier, src.start, src.start, .{ .identifier = it_name }) orelse return false;
+                const box_ref = p.makeNode(.identifier, src.start, src.start, .{ .identifier = box_name }) orelse return false;
+                const close = mkDestrCall(p, "__destrIterClose__", it_ref, box_ref) orelse return false;
+                const stmt = p.makeNode(.expr_stmt, src.start, src.start, .{ .expr_stmt = close }) orelse return false;
+                p.arrow_prelude.append(p.arena, stmt) catch {
+                    p.had_error = true;
+                    return false;
+                };
             }
         },
         .object_literal => {
             for (pattern.data.object_literal.properties) |prop| {
-                const key = p.makeNode(.identifier, prop.value.start, prop.value.start, .{ .identifier = prop.key }) orelse return false;
-                const access = p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
-                    .member_expr = .{ .object = src, .property = key, .computed = false },
-                }) orelse return false;
+                // Computed key `{ [expr]: target }`: evaluate the key expression
+                // (a throwing key propagates) and access src[key]. Static keys use
+                // a plain `src.key`.
+                const access = if (prop.computed_key) |ke|
+                    p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
+                        .member_expr = .{ .object = src, .property = ke, .computed = true },
+                    }) orelse return false
+                else acc: {
+                    const key = p.makeNode(.identifier, prop.value.start, prop.value.start, .{ .identifier = prop.key }) orelse return false;
+                    break :acc p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
+                        .member_expr = .{ .object = src, .property = key, .computed = false },
+                    }) orelse return false;
+                };
                 if (!bindPatternElement(p, prop.value, access)) return false;
             }
         },
@@ -538,15 +645,30 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
                 return false;
             };
         },
-        .array_literal, .object_literal => return desugarParamPattern(p, target, access),
-        // `[a = default]` / `{x = default}`: parsed as an assignment expression.
+        // Nested sub-pattern (`{ w: { x } }`, `[ [a] ]`): bind the source to a
+        // temp first so it (and any getter) is evaluated exactly once, then
+        // destructure from the temp.
+        .array_literal, .object_literal => {
+            const tmp = std.fmt.allocPrint(p.arena, "__dp_{d}", .{p.param_destruct_counter}) catch {
+                p.had_error = true;
+                return false;
+            };
+            p.param_destruct_counter += 1;
+            const vd = p.makeNode(.var_decl, target.start, target.start, .{
+                .var_decl = .{ .kind = .let, .name = tmp, .init = access },
+            }) orelse return false;
+            p.arrow_prelude.append(p.arena, vd) catch {
+                p.had_error = true;
+                return false;
+            };
+            const tmp_ref = p.makeNode(.identifier, target.start, target.start, .{ .identifier = tmp }) orelse return false;
+            return desugarParamPattern(p, target, tmp_ref);
+        },
+        // `[a = default]` / `{x = default}` / `{w: {x} = default}`: parsed as an
+        // assignment expression whose target may itself be a nested pattern.
         .assignment_expr => {
             const ae = target.data.assignment_expr;
-            if (ae.target.kind != .identifier) {
-                arrowParamError(p);
-                return false;
-            }
-            // init = (access !== undefined) ? access : default
+            // value = (access !== undefined) ? access : default
             const undef = p.makeNode(.identifier, target.start, target.start, .{ .identifier = "undefined" }) orelse return false;
             const test_ = p.makeNode(.binary_expr, target.start, target.start, .{
                 .binary_expr = .{ .op = .strict_neq, .left = access, .right = undef },
@@ -554,13 +676,36 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
             const cond = p.makeNode(.conditional_expr, target.start, target.start, .{
                 .conditional_expr = .{ .test_ = test_, .consequent = access, .alternate = ae.value },
             }) orelse return false;
-            const vd = p.makeNode(.var_decl, target.start, target.start, .{
-                .var_decl = .{ .kind = .let, .name = ae.target.data.identifier, .init = cond },
-            }) orelse return false;
-            p.arrow_prelude.append(p.arena, vd) catch {
-                p.had_error = true;
-                return false;
-            };
+            if (ae.target.kind == .identifier) {
+                const vd = p.makeNode(.var_decl, target.start, target.start, .{
+                    .var_decl = .{ .kind = .let, .name = ae.target.data.identifier, .init = cond },
+                }) orelse return false;
+                p.arrow_prelude.append(p.arena, vd) catch {
+                    p.had_error = true;
+                    return false;
+                };
+                return true;
+            }
+            // Nested pattern with a default: bind the defaulted value to a temp,
+            // then destructure the sub-pattern from it.
+            if (ae.target.kind == .array_literal or ae.target.kind == .object_literal) {
+                const tmp = std.fmt.allocPrint(p.arena, "__dp_{d}", .{p.param_destruct_counter}) catch {
+                    p.had_error = true;
+                    return false;
+                };
+                p.param_destruct_counter += 1;
+                const vd = p.makeNode(.var_decl, target.start, target.start, .{
+                    .var_decl = .{ .kind = .let, .name = tmp, .init = cond },
+                }) orelse return false;
+                p.arrow_prelude.append(p.arena, vd) catch {
+                    p.had_error = true;
+                    return false;
+                };
+                const tmp_ref = p.makeNode(.identifier, target.start, target.start, .{ .identifier = tmp }) orelse return false;
+                return desugarParamPattern(p, ae.target, tmp_ref);
+            }
+            arrowParamError(p);
+            return false;
         },
         else => {
             arrowParamError(p);
@@ -1155,7 +1300,12 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
                     .call_expr = .{ .callee = helper, .args = args.items },
                 });
             }
-            const can_have_arg = !(p.current.line_terminator_before or p.check(.semicolon) or p.check(.right_brace) or p.check(.eof));
+            // YieldExpression arg is optional: present only when the next token can
+            // begin an AssignmentExpression. Closers/separators that cannot (`)`, `]`,
+            // `,`, `:`, `;`, `}`, EOF, or a line terminator) → arg-less yield.
+            const can_have_arg = !(p.current.line_terminator_before or p.check(.semicolon) or
+                p.check(.right_brace) or p.check(.right_paren) or p.check(.right_bracket) or
+                p.check(.comma) or p.check(.colon) or p.check(.eof));
             const yielded = if (can_have_arg) p.parseAssignmentExpr() orelse return null else null;
             return p.makeNode(.yield_expr, start, p.current.start, .{ .yield_expr = yielded });
         },
@@ -1531,6 +1681,25 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 .identifier = key,
             }) orelse return null;
             props.append(p.arena, ast.ObjectProp{ .key = key, .value = id_node, .kind = .init }) catch {
+                p.had_error = true;
+                return null;
+            };
+            if (!p.match(.comma)) break;
+            continue;
+        }
+        // CoverInitializedName: `{ x = default }`. Only legal as a destructuring
+        // target (e.g. an object binding pattern in params or assignment). Parsed
+        // permissively here; the value is `ident = default` so the param /
+        // assignment-pattern desugar applies the default. A real object literal
+        // using this form is a refinement error we currently accept.
+        if (p.check(.eq)) {
+            _ = p.advance();
+            const def = p.parseAssignmentExpr() orelse return null;
+            const id_node = p.makeNode(.identifier, prop_start, prop_start, .{ .identifier = key }) orelse return null;
+            const ae = p.makeNode(.assignment_expr, prop_start, p.current.start, .{
+                .assignment_expr = .{ .target = id_node, .value = def, .op = .assign },
+            }) orelse return null;
+            props.append(p.arena, ast.ObjectProp{ .key = key, .value = ae, .kind = .init }) catch {
                 p.had_error = true;
                 return null;
             };

@@ -357,8 +357,17 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 // Already at global env.
                 frame.env.define(name, value) catch return error.OutOfMemory;
             } else {
-                // Function-local env: define locally (var hoisting into current env).
-                frame.env.define(name, value) catch return error.OutOfMemory;
+                // Sloppy-mode implicit global: write reaches the global object, not a
+                // local binding (spec §8.1.1.4.11 PutValue). Handles cross-realm functions
+                // whose frame.env chains to a foreign realm's global env — `globalThis`
+                // there is that realm's global object.
+                const wrote = blk: {
+                    const gt = frame.env.lookup("globalThis") catch break :blk false;
+                    if (gt.bits == 0 or gt.unbox() != .object) break :blk false;
+                    gt.toPtr().object.set(name, value) catch break :blk false;
+                    break :blk true;
+                };
+                if (!wrote) frame.env.define(name, value) catch return error.OutOfMemory;
             }
         },
         error.OutOfMemory => return error.OutOfMemory,

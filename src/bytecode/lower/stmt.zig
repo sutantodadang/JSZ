@@ -119,7 +119,7 @@ pub fn lowerFunctionDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
         fd.params,
         fd.body,
         null,
-        fd.is_strict,
+        fd.is_strict or self.is_strict, // strictness is inherited by nested declarations
         fd.is_generator,
         fd.is_async,
         false, // function body: no implicit last-expr return

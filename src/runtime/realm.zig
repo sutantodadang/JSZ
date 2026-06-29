@@ -89,10 +89,17 @@ pub const Context = struct {
     /// the caller can distinguish it from a runtime throw (`error.JsException`).
     shadow_eval_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8, global_env: *anyopaque) anyerror!Value,
 
+    /// Per-realm generator chain hook: build the lazily-created generator/async-generator
+    /// intrinsic chain for `realm` (an opaque *Realm). No-op if already built.
+    ensure_gen_chain_fn: *const fn (ptr: *anyopaque, realm: *anyopaque) anyerror!void,
     /// Cross-realm (`$262.createRealm`): build a fully independent secondary Realm
     /// sharing the isolate's heap, and return a JS record `{global, evalScript}`
     /// (a `*JsObject` Value). The host owns the realm lifetime (isolate arena).
     create_realm_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator) anyerror!Value,
+
+    pub fn ensureGenChain(self: *Context, realm: *anyopaque) anyerror!void {
+        return self.ensure_gen_chain_fn(self.ptr, realm);
+    }
 
     pub fn createRealm(self: *Context, arena: std.mem.Allocator) anyerror!Value {
         return self.create_realm_fn(self.ptr, arena);
@@ -2328,7 +2335,51 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
             if (body.bits != 0 and body.unbox() == .string) try src.appendSlice(arena, body.toPtr().string);
         }
         try src.appendSlice(arena, "})");
-        const result = try ctx.evalSource(arena, src.items);
+        // NewTarget [[Prototype]] override for dynamic generator/async-generator
+        // functions (CreateDynamicFunction step 18: proto from newTarget's realm).
+        // IMPORTANT: capture pending_new_target BEFORE evalSource/shadowEval, because
+        // bcInvokeJs (called inside evalSource) unconditionally clears pending_new_target.
+        const is_gen = !std.mem.eql(u8, keyword, "function");
+        const captured_nt = if (is_gen) pending_new_target else Value{};
+        // Cross-realm: if the constructor realm's global env differs from the
+        // current active global env, run the body in the constructor realm's scope
+        // so closures capture that realm's globals and the realm tag propagates.
+        const result = blk: {
+            if (ctor_realm) |cr_opaque| {
+                const rp: *Realm = @ptrCast(@alignCast(cr_opaque));
+                const agenv = active_global_env;
+                if (agenv == null or agenv.? != rp.global_env) {
+                    const saved_sr = active_shadow_realm;
+                    active_shadow_realm = rp;
+                    defer active_shadow_realm = saved_sr;
+                    break :blk try ctx.shadowEval(arena, src.items, @ptrCast(rp.global_env));
+                }
+            }
+            break :blk try ctx.evalSource(arena, src.items);
+        };
+        if (is_gen and captured_nt.bits != 0) {
+            const nt = captured_nt;
+            const derived_proto: ?*JsObject = proto_blk: {
+                const pv = try ctx.getProp(arena, nt, "prototype");
+                if (pv.bits != 0 and pv.unbox() == .object) break :proto_blk pv.toPtr().object;
+                // Fallback: GetFunctionRealm(newTarget) then that realm's gen proto.
+                if (getFunctionRealm(nt)) |fr| {
+                    try ctx.ensureGenChain(@ptrCast(fr));
+                    const is_async_gen = std.mem.eql(u8, keyword, "async function*");
+                    break :proto_blk if (is_async_gen) fr.async_gen_fn_proto else fr.gen_fn_proto;
+                }
+                break :proto_blk null;
+            };
+            if (derived_proto) |dp| {
+                if (try ctx.backingObject(arena, result)) |bobj| {
+                    bobj.proto = dp;
+                }
+            }
+            // Consume pending newTarget so constructImpl's post-hoc override does
+            // not attempt to re-apply it (it only handles .object returns, not
+            // .bc_function — the generator function type).
+            pending_new_target = Value{};
+        }
         if (ctor_realm) |r| val_mod.setValueRealm(result, r);
         return result;
     }
@@ -2741,6 +2792,17 @@ pub const Realm = struct {
     /// Per-kind TypedArray prototypes, indexed by typed_array.TAKind.
     ta_kind_prototypes: [typed_array_mod.all_kinds.len]?*JsObject =
         .{null} ** typed_array_mod.all_kinds.len,
+    // Per-realm generator intrinsic chain (built lazily by BcVm.ensureGeneratorChain).
+    gen_proto: ?*JsObject = null,
+    gen_fn_proto: ?*JsObject = null,
+    gen_fn_ctor: ?*JsObject = null,
+    async_gen_proto: ?*JsObject = null,
+    async_gen_fn_proto: ?*JsObject = null,
+    async_gen_fn_ctor: ?*JsObject = null,
+    async_iter_proto: ?*JsObject = null,
+    // Cached roots for the generator chain (captured at captureIntrinsics time).
+    gen_iterator_proto: ?*JsObject = null,
+    gen_function_ctor: ?*JsObject = null,
 
     pub fn init(arena: std.mem.Allocator) !Realm {
         const env = try Environment.init(arena, null);
@@ -3264,6 +3326,9 @@ pub const Realm = struct {
             slot.* = p;
         }
         if (self.global_object == null) self.global_object = active_global_object;
+        const es2015_mod = @import("builtins/es2015_collections.zig");
+        self.gen_iterator_proto = es2015_mod.active_iterator_proto;
+        self.gen_function_ctor = active_function_ctor;
     }
 
     /// Cross-realm: tag every top-level builtin function in this realm's global

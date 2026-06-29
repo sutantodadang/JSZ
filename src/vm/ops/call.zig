@@ -434,7 +434,27 @@ pub inline fn opYield(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const state = frame.gen.?;
     state.resume_reg = rsrc;
     state.last_suspend_await = false; // a `yield` suspend
+    state.raw_yield = false; // plain yield → consumer gets a wrapped result
     state.frame = frame.*; // pc already advanced past YIELD
+    _ = self.frames.pop();
+    self.result = yielded;
+    self.gen_yielded = true;
+    return RunOutcome{ .ok = yielded };
+}
+
+/// YIELD_STAR — identical suspend to YIELD, but flags the suspend so the driver
+/// surfaces the yielded value to the consumer VERBATIM (no `{value,done}` wrap).
+/// Used by `yield*`: the inner iterator's result object passes through unchanged.
+pub inline fn opYieldStar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rsrc = code[frame.pc];
+    frame.pc += 1;
+    const yielded = frame.registers[rsrc];
+    const state = frame.gen.?;
+    state.resume_reg = rsrc;
+    state.last_suspend_await = false; // still a `yield` suspend
+    state.raw_yield = true; // delegated yield → pass inner result through unwrapped
+    state.frame = frame.*; // pc already advanced past YIELD_STAR
     _ = self.frames.pop();
     self.result = yielded;
     self.gen_yielded = true;
@@ -457,6 +477,23 @@ pub inline fn opAwait(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     self.result = awaited;
     self.gen_yielded = true;
     return RunOutcome{ .ok = awaited };
+}
+
+/// PARAMS_DONE — suspend after a generator's eager parameter initialization.
+/// No operand, no consumer-visible value: the generator build driver runs the
+/// body to this point at call time and stops here. The first `.next(v)` resumes
+/// after this op (v is ignored, per spec, so resume_reg points at a scratch reg).
+pub inline fn opParamsDone(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const state = frame.gen.?;
+    state.resume_reg = 0; // first .next() value is discarded
+    state.last_suspend_await = false;
+    state.raw_yield = false;
+    state.params_initialized = true;
+    state.frame = frame.*; // pc already points past the 1-byte op
+    _ = self.frames.pop();
+    self.result = try val_mod.makeUndefined(self.arena);
+    self.gen_yielded = true;
+    return RunOutcome{ .ok = self.result };
 }
 
 pub inline fn opDebugger(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {

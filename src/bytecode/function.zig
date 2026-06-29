@@ -35,6 +35,10 @@ pub const BcFunction = struct {
     /// W2: whether this is a generator function (`function*`). When called it
     /// produces a generator object instead of running the body.
     is_generator: bool = false,
+    /// True when the (async)generator body contains a PARAMS_DONE marker (it has
+    /// a destructuring-param prelude). The build driver runs the body up to the
+    /// marker eagerly at call time so parameter errors propagate to the caller.
+    has_param_init: bool = false,
     /// W2-async: whether this is an async function (`async function`). When
     /// called it runs as a reaction-driven coroutine and returns a Promise;
     /// each `await` suspends via a YIELD opcode.

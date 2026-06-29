@@ -509,20 +509,83 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 >   `hasOwnProperty` / `delete` resolve a function to its backing object.
 >   `built-ins/GeneratorFunction` **16→21/23**, `built-ins/AsyncGeneratorFunction`
 >   **11→16/17**; zero regressions.
+> - **`caller`/`arguments` %ThrowTypeError% poison** — gen-scoped inherited
+>   accessor (get+set both throw) on %Generator%/%AsyncGenerator%. getProp
+>   materializes the generator backing obj so the inherited accessor fires;
+>   setPropR routes bc_function writes through OrdinarySet/findProperty. (commit
+>   351af81)
+> - **Per-realm generator intrinsic chain** — moved the chain off VM-global state
+>   onto per-`Realm` fields; secondary realms (`$262.createRealm`) build their own
+>   chain rooted in that realm's Object/Function prototypes. `functionCtorImpl`
+>   evals cross-realm dynamic generator bodies in the ctor realm's scope +
+>   NewTarget `[[Prototype]]` override; sloppy implicit-global writes route through
+>   `globalThis` (spec PutValue). Fixes the 2 cross-realm `proto-from-ctor-realm`
+>   tests. **`built-ins/GeneratorFunction` 23/23, `built-ins/AsyncGeneratorFunction`
+>   17/17** — generator-function-object exactness at 100%. Flip gate stash-compared:
+>   +2 pass, 0 regression. (commit eb09f6c)
+>
+> - **Spec-exact `yield` + `yield*` delegation** — `yield` arg-less before
+>   `)`/`]`/`,`/`:`, `/` after `yield` lexes as regexp, and a `${ yield }` template
+>   substitution parses. `yield*` gained a `YIELD_STAR` opcode that surfaces the
+>   inner iterator result to the consumer verbatim (missing `done` stays
+>   `undefined`); `.value` is no longer read while iteration is incomplete (read
+>   once via IteratorValue when done); the throw-path with a missing `throw` method
+>   performs a real IteratorClose (GetMethod/Call `return` errors propagate) before
+>   the protocol-violation TypeError; GetIterator boxes non-string primitives so a
+>   user-defined wrapper-proto `Symbol.iterator` is honored. `expressions/yield`
+>   **50→62/63**; flip gate −12, 0 regression. (commit 52ef5f0)
 >
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
->   cannot test collection — coordinate with M19 ephemerons).
-> - Generator-fn `caller`/`arguments` %ThrowTypeError% poison (engine-wide
->   `Function.prototype` change) and cross-realm %GeneratorPrototype% identity
->   (`proto-from-ctor-realm-prototype`) — 3 GeneratorFunction tests.
-> - `yield*` observable IteratorClose access-ordering edge cases; `yield`
->   rhs-omitted/regexp/template parse; async-gen `yield <promise>` not pre-awaited;
->   async `yield*` resume-completion forwarding.
-> - `%AsyncGeneratorPrototype%` structural exactness (@@toStringTag, constructor,
->   method `length`/`name`/prop-desc) — descriptor lever, like M15 TypedArrays.
-> - async generator `yield <promise>` operand not pre-awaited; async `yield*`
->   does not forward sent value / return / throw to the inner iterator.
+>   cannot test collection — coordinate with M19 ephemerons). *(excluded from the
+>   "fix all deferred" pass — owned by M19.)*
+> - **Mapped (aliased) `arguments`** for sloppy simple-parameter functions
+>   (`arguments[0]=v` ↔ param `a`). One `expressions/yield` test
+>   (`formal-parameters-after-reassignment-non-strict`) needs it, but it is a
+>   sloppy-mode arguments feature on the property hot path (parameter-map object
+>   kind), not a generator deferral — scoped separately to avoid hot-path risk.
+
+### Milestone 17.x — Async-generator completion  *(✅ COMPLETE — 292/292)*
+A scratch-corpus probe of `language/{statements,expressions}/async-generator`
+started at **122/292** (stmt 33/90, expr 89/202) and showed async generators were
+**broadly** incomplete. Driven to **292/292 (100%)** across 18 commits, all
+general engine improvements (not async-gen-specific), each verified with
+0 regression (unit gate green, 0 unexpected pass throughout). Every
+generator/yield suite is now 100%: `expressions/yield` 63/63,
+`{statements,expressions}/async-generator` 90+202, `for-await-of` 94,
+`Generator{Function,Prototype}` 23+61, `AsyncGenerator{Function,Prototype}` 17+13.
+- **Crash fix**: non-object `.prototype` → realm default proto (70c5dfd).
+- **Formal-parameter destructuring parsing**: array elision (`[, x]`) / rest
+  (`[a, ...r]`), object CoverInitializedName (`{ x = 1 }`), nested
+  pattern-with-default (`{ w: { x } = d }`) (779867d, 59b8726). General gaps —
+  `function f([,]){}` mis-parsed for ALL functions.
+- **Eager parameter binding** at call time via a `PARAMS_DONE` marker + opcode:
+  generators run destructuring AND default-param side effects during
+  FunctionDeclarationInstantiation, before the generator object / its prototype
+  is read (bce478b, feb09a2). `g(throwingObj)` now throws synchronously.
+- **RequireObjectCoercible**: destructuring null/undefined throws TypeError
+  (9050dd2).
+- **Iterator-protocol array destructuring**: GetIterator + IteratorStep +
+  IteratorValue + rest-collect + IteratorClose via native helpers (52ebfbd).
+- **Computed keys in object patterns** (`{ [expr]: x }`) — key evaluated, throws
+  propagate (e64c3f3).
+- **GetIterator honors a deleted/overridden array `@@iterator`** — removed the
+  index-synthesis shortcut that masked it (46fd5d2). Improved other suites too.
+- **TDZ for default parameters** (5cdd96e): a non-simple list puts every parameter
+  in a TDZ until its own initializer (`function* g(a = a)` / `g(a = b, b)` →
+  ReferenceError). Modeled by renaming params to synthetic `__arg_N` + rebinding
+  the real name as a body-scoped `let` (existing let TDZ enforces it).
+- **Mapped `arguments`** (c0b4651): sloppy + simple param list → `arguments[i]`
+  aliases parameter `i` both ways (new `mapped_arguments` exotic object). Required
+  fixing a general bug: function **declarations** did not inherit enclosing
+  strictness (`lowerFunctionDecl` dropped `or self.is_strict`).
+- **Direct-eval var/lexical conflict** (c88c0ce): a top-level `var` in eval that
+  collides with a `let`/`const` in the immediate calling scope is a SyntaxError
+  (EvalDeclarationInstantiation), checked against the caller's own env.
+
+Separate, still open (lower priority, not generator-blocking): anonymous
+`async function*( … )` expression parse; async `yield <promise>` pre-await; async
+`yield*` sent/return/throw forwarding (`compileAsyncYieldStar` is next-only).
 
 ### Milestone 18 — RegExp & Intl completeness  *(~1.5–2 mo)*
 - RegExp: Unicode property escapes, lookbehind, named groups, `/v` set notation, sticky/dotAll edge cases. Consider a proven backtracking + bytecode design.

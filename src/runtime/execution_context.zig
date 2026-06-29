@@ -85,6 +85,14 @@ pub const Environment = struct {
         return EnvError.NotDefined;
     }
 
+    /// True if THIS frame has an own lexical (`let`/`const`) binding for `name`.
+    /// Used by direct `eval` to detect a `var` declaration that conflicts with a
+    /// lexical binding in the surrounding scope (EvalDeclarationInstantiation).
+    pub fn hasOwnLexical(self: *Environment, name: []const u8) bool {
+        if (self.bindings.get(name)) |b| return b.kind == .let or b.kind == .const_;
+        return false;
+    }
+
     /// Look up a binding in this frame or any parent.
     pub fn lookup(self: *Environment, name: []const u8) EnvError!Value {
         if (self.bindings.get(name)) |b| {
