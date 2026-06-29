@@ -170,12 +170,6 @@ pub const Op = enum(u8) {
     /// surfacing R[Rval] as the yielded value. On resume the value passed to
     /// .next(v) is written back into R[Rval] (so `x = yield e` works).
     YIELD,
-    /// YIELD_STAR — op, Rval u8 (2 bytes). Same suspend mechanics as YIELD, but
-    /// the yielded value is surfaced to the consumer VERBATIM (no `{value,done}`
-    /// wrapping). Used by `yield*` delegation: spec GeneratorYield(innerResult)
-    /// passes the inner iterator's result object through unchanged (so a missing
-    /// `done` stays `undefined`).
-    YIELD_STAR,
     /// TAIL_METHOD_CALL: same encoding as METHOD_CALL (op, Rbase u8, nargs u8,
     /// Rret u8) with R[base]=this, R[base+1]=callee. Member-position proper tail
     /// call (`return obj.m()`, strict mode): reuses the current frame in place
@@ -258,6 +252,13 @@ pub const Op = enum(u8) {
     /// sentinel to the finally / outer propagation, so `return()` runs finally
     /// but is not observed by user `catch`.
     JMP_IF_RET_COMPL,
+    /// YIELD_STAR — op, Rval u8 (2 bytes). Same suspend mechanics as YIELD, but
+    /// the yielded value is surfaced to the consumer VERBATIM (no `{value,done}`
+    /// wrapping). Used by `yield*` delegation: spec GeneratorYield(innerResult)
+    /// passes the inner iterator's result object through unchanged (so a missing
+    /// `done` stays `undefined`). Declared last to keep earlier opcode ordinals
+    /// stable for the pinned JIT int-subset contract.
+    YIELD_STAR,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
