@@ -1829,15 +1829,11 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
         if (obj.get("@@iterator")) |itf| {
             if (isCallable(itf)) return function_proto.invokeCallback(arena, x, itf, &[_]Value{});
         }
-        // Array fallback: synthesize an index iterator.
-        if (obj.is_array) {
-            const d = try arena.create(SeqIterData);
-            d.* = .{ .seq = x, .index = 0, .is_string = false };
-            return makeSeqIterator(arena, d);
-        }
-        // Fallback: an accessor-defined @@iterator (a getter) is invisible to the
-        // raw slot reads above. Do an observable [[Get]] (fires the getter / a
-        // Proxy trap) and, if it yields a callable, drive it as the iterator.
+        // Observable @@iterator lookup through the prototype chain (fires a getter
+        // / Proxy trap, finds an inherited `Array.prototype[Symbol.iterator]`). This
+        // also covers plain arrays: their iterator comes from %Array.prototype%, so
+        // a deleted/overridden @@iterator is honored (deleting it makes an array
+        // non-iterable, per spec) rather than masked by a synthesized fallback.
         if (realm_mod.active_context) |ctx| {
             if (realm_mod.active_sym_iterator) |sym| {
                 const m = try ctx.getPropSym(arena, x, sym);
@@ -1849,6 +1845,14 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
                     return function_proto.invokeCallback(arena, x, m, &[_]Value{});
                 }
             }
+        }
+        // Last resort: a plain array with no resolvable @@iterator at all (e.g. no
+        // active context) still iterates by index, so existing call sites that
+        // build arrays internally keep working.
+        if (obj.is_array and realm_mod.active_context == null) {
+            const d = try arena.create(SeqIterData);
+            d.* = .{ .seq = x, .index = 0, .is_string = false };
+            return makeSeqIterator(arena, d);
         }
     }
     if (x.bits != 0 and x.unbox() == .string) {
