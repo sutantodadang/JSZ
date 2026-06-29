@@ -524,16 +524,45 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 >   17/17** — generator-function-object exactness at 100%. Flip gate stash-compared:
 >   +2 pass, 0 regression. (commit eb09f6c)
 >
+> - **Spec-exact `yield` + `yield*` delegation** — `yield` arg-less before
+>   `)`/`]`/`,`/`:`, `/` after `yield` lexes as regexp, and a `${ yield }` template
+>   substitution parses. `yield*` gained a `YIELD_STAR` opcode that surfaces the
+>   inner iterator result to the consumer verbatim (missing `done` stays
+>   `undefined`); `.value` is no longer read while iteration is incomplete (read
+>   once via IteratorValue when done); the throw-path with a missing `throw` method
+>   performs a real IteratorClose (GetMethod/Call `return` errors propagate) before
+>   the protocol-violation TypeError; GetIterator boxes non-string primitives so a
+>   user-defined wrapper-proto `Symbol.iterator` is honored. `expressions/yield`
+>   **50→62/63**; flip gate −12, 0 regression. (commit 52ef5f0)
+>
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
->   cannot test collection — coordinate with M19 ephemerons).
-> - `yield*` observable IteratorClose access-ordering edge cases; `yield`
->   rhs-omitted/regexp/template parse; async-gen `yield <promise>` not pre-awaited;
->   async `yield*` resume-completion forwarding.
-> - `%AsyncGeneratorPrototype%` structural exactness (@@toStringTag, constructor,
->   method `length`/`name`/prop-desc) — descriptor lever, like M15 TypedArrays.
-> - async generator `yield <promise>` operand not pre-awaited; async `yield*`
->   does not forward sent value / return / throw to the inner iterator.
+>   cannot test collection — coordinate with M19 ephemerons). *(excluded from the
+>   "fix all deferred" pass — owned by M19.)*
+> - **Mapped (aliased) `arguments`** for sloppy simple-parameter functions
+>   (`arguments[0]=v` ↔ param `a`). One `expressions/yield` test
+>   (`formal-parameters-after-reassignment-non-strict`) needs it, but it is a
+>   sloppy-mode arguments feature on the property hot path (parameter-map object
+>   kind), not a generator deferral — scoped separately to avoid hot-path risk.
+
+### Milestone 17.x — Async-generator completion  *(milestone, not a lever)*
+A scratch-corpus probe of `language/{statements,expressions}/async-generator`
+(57 fails / 90 in `statements/async-generator`) showed async generators are
+**broadly** incomplete — far beyond the two "async-gen levers" the M17 notes
+implied. Reclassified as its own milestone:
+- **Destructuring params via the iterator protocol** (~20 fails, `dstr/`): array
+  binding patterns with elision (`[,]`) / rest (`[...r]`) currently desugar to
+  index access (`src[i]`); spec requires the iterator protocol (the
+  `*-iter-step-err` / `*-iter-val-err` / `*-elision-step-err` tests verify it).
+  This is a general formal-parameter rework (affects all functions, e.g.
+  `function f([,]){}` already mis-parses), not async-gen-specific.
+- **Async-generator early errors** (~35 fails): negative tests expecting
+  Syntax/Type/Reference errors that are not raised.
+- Anonymous `async function*( … )` expression parse; async `yield <promise>`
+  operand pre-await; async `yield*` sent/return/throw forwarding
+  (`compileAsyncYieldStar` is next-only today).
+- `%AsyncGeneratorPrototype%` structural exactness is already covered
+  (`built-ins/AsyncGeneratorPrototype` 13/13).
 
 ### Milestone 18 — RegExp & Intl completeness  *(~1.5–2 mo)*
 - RegExp: Unicode property escapes, lookbehind, named groups, `/v` set notation, sticky/dotAll edge cases. Consider a proven backtracking + bytecode design.
