@@ -3284,12 +3284,21 @@ pub const BcVm = struct {
     /// Create a generator object for a `function*` call instead of running it.
     /// Instance [[Prototype]] = genFn.prototype (ES 27.3.1.1) so that two-hop
     /// prototype lookups (e.g. Symbol.toStringTag on %GeneratorPrototype%) resolve.
+    /// Resolve a (async)generator instance's [[Prototype]] from the function's
+    /// `.prototype`, with the spec GetPrototypeFromConstructor fallback: a
+    /// non-object `.prototype` (e.g. user set it to undefined/null) falls back to
+    /// the realm's %GeneratorPrototype% / %AsyncGeneratorPrototype%.
+    fn genInstProto(self: *BcVm, closure: *BcClosure) !*JsObject {
+        const proto_val = try self.closurePrototype(Value{}, closure);
+        if (proto_val.bits != 0 and proto_val.unbox() == .object) return proto_val.toPtr().object;
+        const gr: *Realm = if (closure.realm) |ro| @ptrCast(@alignCast(ro)) else self.realm;
+        try self.ensureGeneratorChain(gr);
+        return if (closure.func.is_async) gr.async_gen_proto.? else gr.gen_proto.?;
+    }
+
     fn buildGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, closure: *BcClosure) !Value {
         const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
-        // closurePrototype builds genFn.prototype lazily ([[Prototype]] = %GeneratorPrototype%).
-        // Passing Value{} is safe: the generator branch of closurePrototype ignores fn_val.
-        const proto_val = try self.closurePrototype(Value{}, closure);
-        const inst_proto = proto_val.toPtr().object;
+        const inst_proto = try self.genInstProto(closure);
         const obj = if (self.heap) |heap|
             try JsObject.createOnHeap(heap, inst_proto)
         else
@@ -3609,10 +3618,7 @@ pub const BcVm = struct {
         const agc = try self.arena.create(AsyncGenCtx);
         agc.* = .{ .vm = self, .state = state };
 
-        // closurePrototype builds asyncGenFn.prototype lazily ([[Prototype]] = %AsyncGeneratorPrototype%).
-        // Passing Value{} is safe: the generator branch of closurePrototype ignores fn_val.
-        const proto_val = try self.closurePrototype(Value{}, closure);
-        const inst_proto = proto_val.toPtr().object;
+        const inst_proto = try self.genInstProto(closure);
         const obj = if (self.heap) |heap|
             try JsObject.createOnHeap(heap, inst_proto)
         else
