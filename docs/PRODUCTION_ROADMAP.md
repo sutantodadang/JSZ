@@ -545,42 +545,43 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 >   sloppy-mode arguments feature on the property hot path (parameter-map object
 >   kind), not a generator deferral — scoped separately to avoid hot-path risk.
 
-### Milestone 17.x — Async-generator completion  *(milestone, not a lever)*
+### Milestone 17.x — Async-generator completion  *(milestone, ~97% landed)*
 A scratch-corpus probe of `language/{statements,expressions}/async-generator`
-(stmt 33/90, expr 89/202) showed async generators are **broadly** incomplete —
-far beyond the two "async-gen levers" the M17 notes implied. Reclassified as its
-own milestone. **Done this pass** (committed, 0 regression):
-- Crash fix: non-object `.prototype` → realm default proto (commit 70c5dfd).
-- General formal-parameter destructuring **parsing**: array elision (`[, x]`) /
-  rest (`[a, ...r]`), object CoverInitializedName (`{ x = 1 }`), and nested
-  pattern-with-default (`{ w: { x } = d }`). All `dstr/` parse failures cleared
-  (commits 779867d, 59b8726). These were general engine gaps (e.g.
-  `function f([,]){}` mis-parsed for ALL functions).
+started at **122/292** (stmt 33/90, expr 89/202) and showed async generators were
+**broadly** incomplete. This pass took it to **283/292 (97%)** across 14 commits,
+all general engine improvements (not async-gen-specific), each verified with
+0 regression (unit gate green, 0 unexpected pass throughout):
+- **Crash fix**: non-object `.prototype` → realm default proto (70c5dfd).
+- **Formal-parameter destructuring parsing**: array elision (`[, x]`) / rest
+  (`[a, ...r]`), object CoverInitializedName (`{ x = 1 }`), nested
+  pattern-with-default (`{ w: { x } = d }`) (779867d, 59b8726). General gaps —
+  `function f([,]){}` mis-parsed for ALL functions.
+- **Eager parameter binding** at call time via a `PARAMS_DONE` marker + opcode:
+  generators run destructuring AND default-param side effects during
+  FunctionDeclarationInstantiation, before the generator object / its prototype
+  is read (bce478b, feb09a2). `g(throwingObj)` now throws synchronously.
+- **RequireObjectCoercible**: destructuring null/undefined throws TypeError
+  (9050dd2).
+- **Iterator-protocol array destructuring**: GetIterator + IteratorStep +
+  IteratorValue + rest-collect + IteratorClose via native helpers (52ebfbd).
+- **Computed keys in object patterns** (`{ [expr]: x }`) — key evaluated, throws
+  propagate (e64c3f3).
+- **GetIterator honors a deleted/overridden array `@@iterator`** — removed the
+  index-synthesis shortcut that masked it (46fd5d2). Improved other suites too.
 
-**Remaining — two deep architectural blockers** (~156 `dstr/` + ~14 default-param
-fails), both general (not async-gen-specific) and warranting dedicated TDD:
-1. **Eager parameter binding for generators.** Param destructuring currently
-   desugars into the body prelude, so for generators/async-generators it runs
-   lazily on the first `.next()` instead of at call time. Spec evaluates formal
-   parameters during FunctionDeclarationInstantiation, *before* the generator
-   object is returned — so `g(throwingObj)` must throw synchronously. Verified:
-   `function f({x}){}` fires a throwing `x` getter at call; `function* g({x}){}`
-   does not. Fixes the ~66 `obj-ptrn-*-err` + default-param-abrupt cases. Needs a
-   separate eagerly-run param-init region (run in buildGenerator/
-   buildAsyncGenerator) rather than prelude-in-body.
-2. **Iterator-protocol array destructuring.** Array binding patterns desugar to
-   index access (`src[i]` / `src.slice(i)`); spec requires GetIterator +
-   IteratorStep + IteratorValue + IteratorClose (the `ary-ptrn-*-iter-step-err` /
-   `*-iter-val-err` / `*-iter-close` tests verify it). `desugarParamPattern` is
-   param-only (function + arrow params), so the rework is well-scoped, but the
-   IteratorClose-on-abrupt ordering needs careful try/finally emission. ~66
-   `ary-ptrn-*` cases.
+**Remaining (9 / 292):** both need a param-binding-model / eval-scope change for
+marginal gain, deferred to a focused follow-up:
+- **TDZ for default parameters** (4): `function* g(a = a)` / `g(a = b, b)` must
+  throw ReferenceError — params should be in TDZ until their own initializer.
+  Needs sequential, TDZ-aware parameter binding (current model binds all params
+  eagerly before defaults run).
+- **`eval` var/lexical scope SyntaxError** (2): direct-eval redeclaration conflict.
 
-- Also: anonymous `async function*( … )` expression parse; async `yield
-  <promise>` operand pre-await; async `yield*` sent/return/throw forwarding
-  (`compileAsyncYieldStar` is next-only today).
-- `%AsyncGeneratorPrototype%` structural exactness is already covered
-  (`built-ins/AsyncGeneratorPrototype` 13/13).
+Also still open (separate, lower priority): mapped (aliased) sloppy `arguments`
+(1 `expressions/yield` test); anonymous `async function*( … )` expression parse;
+async `yield <promise>` pre-await; async `yield*` sent/return/throw forwarding
+(`compileAsyncYieldStar` is next-only). `%AsyncGeneratorPrototype%` structural
+exactness is already covered (`built-ins/AsyncGeneratorPrototype` 13/13).
 
 ### Milestone 18 — RegExp & Intl completeness  *(~1.5–2 mo)*
 - RegExp: Unicode property escapes, lookbehind, named groups, `/v` set notation, sticky/dotAll edge cases. Consider a proven backtracking + bytecode design.
