@@ -1439,6 +1439,7 @@ pub const FnCompiler = struct {
         const rresult = self.allocReg();
         const rret = self.allocReg();
         const rdone = self.allocReg();
+        const rraw = self.allocReg();
         const loop_top = self.sp;
         const k0 = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 0));
         const k1 = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 1));
@@ -1448,6 +1449,7 @@ pub const FnCompiler = struct {
         const c_ret = try self.builder.addConstant(try val_mod.makeString(self.arena, "ret"));
         const c_val = try self.builder.addConstant(try val_mod.makeString(self.arena, "value"));
         const c_done = try self.builder.addConstant(try val_mod.makeString(self.arena, "done"));
+        const c_raw = try self.builder.addConstant(try val_mod.makeString(self.arena, "raw"));
         // rtype = 0 (normal); rval = undefined
         try self.emitOp(.LOAD_K, line);
         try self.emitU8(rtype);
@@ -1493,6 +1495,11 @@ pub const FnCompiler = struct {
         try self.emitU8(rdone);
         try self.emitU8(rstep);
         try self.emitU16(@intCast(c_done));
+        // rraw = rstep.raw — the inner iterator result object, yielded verbatim
+        try self.emitOp(.GET_PROP, line);
+        try self.emitU8(rraw);
+        try self.emitU8(rstep);
+        try self.emitU16(@intCast(c_raw));
         // if rret → the outer generator returns rresult
         try self.emitOp(.JMP_IF_TRUE, line);
         try self.emitU8(rret);
@@ -1509,13 +1516,15 @@ pub const FnCompiler = struct {
         try self.emitU8(rresult);
         const catch_patch = self.currentOffset();
         try self.emitI16(0);
-        try self.emitOp(.YIELD, line);
-        try self.emitU8(rresult);
+        // YIELD_STAR rraw: surface the inner result object to the consumer
+        // verbatim. On normal resume the sent value lands back in rraw.
+        try self.emitOp(.YIELD_STAR, line);
+        try self.emitU8(rraw);
         try self.emitOp(.POP_TRY, line);
         // normal resume: rval = sent value; rtype = 0
         try self.emitOp(.MOVE, line);
         try self.emitU8(rval);
-        try self.emitU8(rresult);
+        try self.emitU8(rraw);
         try self.emitOp(.LOAD_K, line);
         try self.emitU8(rtype);
         try self.emitI16(@intCast(k0));

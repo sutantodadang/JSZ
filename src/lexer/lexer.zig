@@ -256,6 +256,9 @@ pub const Lexer = struct {
             .kw_else,
             .kw_case,
             .kw_throw,
+            // `yield /re/` — yield is an operator-position keyword, so a following
+            // `/` starts a regex (`received = yield/abc/i`), not division.
+            .kw_yield,
             => true,
             else => false,
         };

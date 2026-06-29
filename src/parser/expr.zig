@@ -1155,7 +1155,12 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
                     .call_expr = .{ .callee = helper, .args = args.items },
                 });
             }
-            const can_have_arg = !(p.current.line_terminator_before or p.check(.semicolon) or p.check(.right_brace) or p.check(.eof));
+            // YieldExpression arg is optional: present only when the next token can
+            // begin an AssignmentExpression. Closers/separators that cannot (`)`, `]`,
+            // `,`, `:`, `;`, `}`, EOF, or a line terminator) → arg-less yield.
+            const can_have_arg = !(p.current.line_terminator_before or p.check(.semicolon) or
+                p.check(.right_brace) or p.check(.right_paren) or p.check(.right_bracket) or
+                p.check(.comma) or p.check(.colon) or p.check(.eof));
             const yielded = if (can_have_arg) p.parseAssignmentExpr() orelse return null else null;
             return p.makeNode(.yield_expr, start, p.current.start, .{ .yield_expr = yielded });
         },

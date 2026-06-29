@@ -95,6 +95,10 @@ pub const BcGeneratorState = struct {
     /// `await` (AWAIT op), false if a `yield` (YIELD op). Only the async
     /// generator driver consults it; plain generators/async ignore it.
     last_suspend_await: bool = false,
+    /// Set by the suspend op — true if the last suspend was a YIELD_STAR (the
+    /// yielded value must reach the consumer unwrapped, per yield* delegation),
+    /// false for a plain YIELD (wrapped as `{value, done:false}`).
+    raw_yield: bool = false,
 };
 
 /// W2-async: how to resume a suspended coroutine.
@@ -1191,6 +1195,7 @@ pub const BcVm = struct {
                 .RETURN_UNDEF => if (try call_ops.opReturnUndef(self, frame)) |o| return o,
                 .HALT => if (try call_ops.opHalt(self, frame)) |o| return o,
                 .YIELD => if (try call_ops.opYield(self, frame)) |o| return o,
+                .YIELD_STAR => if (try call_ops.opYieldStar(self, frame)) |o| return o,
                 .AWAIT => if (try call_ops.opAwait(self, frame)) |o| return o,
                 .DEBUGGER => if (try call_ops.opDebugger(self, frame)) |o| return o,
                 .NEW_OBJECT => if (try object_ops.opNewObject(self, frame)) |o| return o,
@@ -3383,7 +3388,8 @@ pub const BcVm = struct {
     fn resumeGeneratorKind(self: *BcVm, state: *BcGeneratorState, kind: ResumeKind) !Value {
         const res = try self.runSuspendable(state, kind);
         return switch (res) {
-            .yielded => |v| self.makeGenIterResult(v, false),
+            // yield* delegation surfaces the inner iterator result unwrapped.
+            .yielded => |v| if (state.raw_yield) v else self.makeGenIterResult(v, false),
             .returned => |v| self.makeGenIterResult(v, true),
             .threw => |e| blk: {
                 // A return-completion (Generator.return) that ran the body's
