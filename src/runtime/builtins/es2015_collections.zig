@@ -1724,6 +1724,19 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
     };
 }
 
+/// __requireObjectCoercible__(v): RequireObjectCoercible — throw a TypeError when
+/// `v` is null or undefined (a destructuring pattern cannot be applied to it),
+/// otherwise return `v` unchanged. Used by the formal-parameter destructuring
+/// desugar before reading a pattern's properties.
+pub fn nativeRequireObjectCoercible(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (v.bits == 0 or v.unbox() == .undefined_ or v.unbox() == .null_) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "Cannot destructure 'undefined' or 'null'");
+        return error.JsException;
+    }
+    return v;
+}
+
 /// __getIterator__(x): obtain an iterator (object with next()) for `x`.
 pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const x = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);

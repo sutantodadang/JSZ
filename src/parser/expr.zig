@@ -497,6 +497,23 @@ fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)
 /// binding pattern). Recurses for nested patterns. Defaults (`[a = d]`,
 /// `{x = d}`) substitute `d` when the read is `undefined`.
 pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
+    // RequireObjectCoercible: a pattern cannot be applied to null/undefined.
+    // `src` is always an identifier (`__param_N` or a `__dp_N` temp), so reading
+    // it here has no observable side effect / double-evaluation.
+    {
+        const coerce = p.makeNode(.identifier, src.start, src.start, .{ .identifier = "__requireObjectCoercible__" }) orelse return false;
+        var gargs = std.ArrayList(*Node){};
+        gargs.append(p.arena, src) catch {
+            p.had_error = true;
+            return false;
+        };
+        const call = p.makeNode(.call_expr, src.start, src.start, .{ .call_expr = .{ .callee = coerce, .args = gargs.items } }) orelse return false;
+        const stmt = p.makeNode(.expr_stmt, src.start, src.start, .{ .expr_stmt = call }) orelse return false;
+        p.arrow_prelude.append(p.arena, stmt) catch {
+            p.had_error = true;
+            return false;
+        };
+    }
     switch (pattern.kind) {
         .array_literal => {
             for (pattern.data.array_literal.elements, 0..) |el, i| {
@@ -560,7 +577,25 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
                 return false;
             };
         },
-        .array_literal, .object_literal => return desugarParamPattern(p, target, access),
+        // Nested sub-pattern (`{ w: { x } }`, `[ [a] ]`): bind the source to a
+        // temp first so it (and any getter) is evaluated exactly once, then
+        // destructure from the temp.
+        .array_literal, .object_literal => {
+            const tmp = std.fmt.allocPrint(p.arena, "__dp_{d}", .{p.param_destruct_counter}) catch {
+                p.had_error = true;
+                return false;
+            };
+            p.param_destruct_counter += 1;
+            const vd = p.makeNode(.var_decl, target.start, target.start, .{
+                .var_decl = .{ .kind = .let, .name = tmp, .init = access },
+            }) orelse return false;
+            p.arrow_prelude.append(p.arena, vd) catch {
+                p.had_error = true;
+                return false;
+            };
+            const tmp_ref = p.makeNode(.identifier, target.start, target.start, .{ .identifier = tmp }) orelse return false;
+            return desugarParamPattern(p, target, tmp_ref);
+        },
         // `[a = default]` / `{x = default}` / `{w: {x} = default}`: parsed as an
         // assignment expression whose target may itself be a nested pattern.
         .assignment_expr => {
