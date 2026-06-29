@@ -1191,9 +1191,16 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     _ = p.expect(.right_brace) orelse return null;
     // Prepend destructuring-param decls (binding the synthetic `__param_N`
     // names) so they run before the function body proper. A `params_done` marker
-    // separates them from the body — for generators the build driver runs the
-    // prelude eagerly up to this marker at call time.
-    if (param_prelude.len > 0) {
+    // always separates parameter initialization from the body: for generators the
+    // build driver runs everything up to it eagerly at call time (so destructuring
+    // AND default-parameter side effects — e.g. `g.prototype = null` — happen
+    // during FunctionDeclarationInstantiation, before OrdinaryCreateFromConstructor).
+    // Default-param inits are prepended later (applyParamDefaults), landing in
+    // front of the prelude and thus still before the marker. Only generators get
+    // the marker (gated on in_generator_function) so a regular function's body
+    // structure — and tail-call analysis — is unchanged. A destructuring prelude
+    // outside a generator is still prepended (it just runs as ordinary body code).
+    if (p.in_generator_function) {
         var combined = std.ArrayList(*Node){};
         combined.appendSlice(p.arena, param_prelude) catch {
             p.had_error = true;
@@ -1201,6 +1208,18 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
         };
         const marker = p.makeNode(.params_done, 0, 0, .{ .params_done = {} }) orelse return null;
         combined.append(p.arena, marker) catch {
+            p.had_error = true;
+            return null;
+        };
+        combined.appendSlice(p.arena, body.items) catch {
+            p.had_error = true;
+            return null;
+        };
+        return combined.items;
+    }
+    if (param_prelude.len > 0) {
+        var combined = std.ArrayList(*Node){};
+        combined.appendSlice(p.arena, param_prelude) catch {
             p.had_error = true;
             return null;
         };

@@ -3332,6 +3332,11 @@ pub const BcVm = struct {
 
     fn buildGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, closure: *BcClosure) !Value {
         const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
+        // Run parameter initialization before reading `.prototype`, so a default
+        // that mutates it (`function* g(a = (g.prototype = null)) {}`) is observed
+        // by GetPrototypeFromConstructor (FunctionDeclarationInstantiation precedes
+        // OrdinaryCreateFromConstructor).
+        if (fn_ptr.has_param_init) try self.runParamInit(state);
         const inst_proto = try self.genInstProto(closure);
         const obj = if (self.heap) |heap|
             try JsObject.createOnHeap(heap, inst_proto)
@@ -3339,7 +3344,6 @@ pub const BcVm = struct {
             try JsObject.create(self.arena, inst_proto);
         obj.internal_kind = .generator;
         obj.internal_slot = state;
-        if (fn_ptr.has_param_init) try self.runParamInit(state);
         return val_mod.makeObject(self.arena, obj);
     }
 
@@ -3653,6 +3657,8 @@ pub const BcVm = struct {
         const agc = try self.arena.create(AsyncGenCtx);
         agc.* = .{ .vm = self, .state = state };
 
+        // Parameter init runs before reading `.prototype` (see buildGenerator).
+        if (fn_ptr.has_param_init) try self.runParamInit(state);
         const inst_proto = try self.genInstProto(closure);
         const obj = if (self.heap) |heap|
             try JsObject.createOnHeap(heap, inst_proto)
@@ -3660,7 +3666,6 @@ pub const BcVm = struct {
             try JsObject.create(self.arena, inst_proto);
         obj.internal_kind = .async_generator;
         obj.internal_slot = agc;
-        if (fn_ptr.has_param_init) try self.runParamInit(state);
         return val_mod.makeObject(self.arena, obj);
     }
 
