@@ -561,14 +561,11 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
             };
         },
         .array_literal, .object_literal => return desugarParamPattern(p, target, access),
-        // `[a = default]` / `{x = default}`: parsed as an assignment expression.
+        // `[a = default]` / `{x = default}` / `{w: {x} = default}`: parsed as an
+        // assignment expression whose target may itself be a nested pattern.
         .assignment_expr => {
             const ae = target.data.assignment_expr;
-            if (ae.target.kind != .identifier) {
-                arrowParamError(p);
-                return false;
-            }
-            // init = (access !== undefined) ? access : default
+            // value = (access !== undefined) ? access : default
             const undef = p.makeNode(.identifier, target.start, target.start, .{ .identifier = "undefined" }) orelse return false;
             const test_ = p.makeNode(.binary_expr, target.start, target.start, .{
                 .binary_expr = .{ .op = .strict_neq, .left = access, .right = undef },
@@ -576,13 +573,36 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
             const cond = p.makeNode(.conditional_expr, target.start, target.start, .{
                 .conditional_expr = .{ .test_ = test_, .consequent = access, .alternate = ae.value },
             }) orelse return false;
-            const vd = p.makeNode(.var_decl, target.start, target.start, .{
-                .var_decl = .{ .kind = .let, .name = ae.target.data.identifier, .init = cond },
-            }) orelse return false;
-            p.arrow_prelude.append(p.arena, vd) catch {
-                p.had_error = true;
-                return false;
-            };
+            if (ae.target.kind == .identifier) {
+                const vd = p.makeNode(.var_decl, target.start, target.start, .{
+                    .var_decl = .{ .kind = .let, .name = ae.target.data.identifier, .init = cond },
+                }) orelse return false;
+                p.arrow_prelude.append(p.arena, vd) catch {
+                    p.had_error = true;
+                    return false;
+                };
+                return true;
+            }
+            // Nested pattern with a default: bind the defaulted value to a temp,
+            // then destructure the sub-pattern from it.
+            if (ae.target.kind == .array_literal or ae.target.kind == .object_literal) {
+                const tmp = std.fmt.allocPrint(p.arena, "__dp_{d}", .{p.param_destruct_counter}) catch {
+                    p.had_error = true;
+                    return false;
+                };
+                p.param_destruct_counter += 1;
+                const vd = p.makeNode(.var_decl, target.start, target.start, .{
+                    .var_decl = .{ .kind = .let, .name = tmp, .init = cond },
+                }) orelse return false;
+                p.arrow_prelude.append(p.arena, vd) catch {
+                    p.had_error = true;
+                    return false;
+                };
+                const tmp_ref = p.makeNode(.identifier, target.start, target.start, .{ .identifier = tmp }) orelse return false;
+                return desugarParamPattern(p, ae.target, tmp_ref);
+            }
+            arrowParamError(p);
+            return false;
         },
         else => {
             arrowParamError(p);
