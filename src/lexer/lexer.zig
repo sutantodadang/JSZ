@@ -362,8 +362,11 @@ pub const Lexer = struct {
 
         // Decimal/octal
         try self.scanDigits(isDecDigit);
-        // BigInt decimal literal: 123n (integer only, no fraction/exponent)
-        if (self.pos < self.source.len and self.source[self.pos] == 'n') {
+        // BigInt decimal literal: 123n (integer only, no fraction/exponent).
+        // A leading-dot number (e.g. `.5n`) already consumed its `.` in the
+        // dispatcher, so `source[start] == '.'` means it is a fraction and the
+        // `n` must NOT be folded into a (malformed) BigInt literal.
+        if (self.source[start] != '.' and self.pos < self.source.len and self.source[self.pos] == 'n') {
             const digits = self.source[start..self.pos];
             self.pos += 1;
             self.column += 1;

@@ -20,6 +20,10 @@ pub const ChunkBuilder = struct {
     constants: std.ArrayListUnmanaged(Value) = .empty,
     lines: std.ArrayListUnmanaged(u32) = .empty,
     allocator: std.mem.Allocator,
+    /// Set when a jump offset exceeds the i16 range (function too large between a
+    /// jump and its target). The 16-bit jump ISA can't encode it; `finalize`
+    /// surfaces this as a compile failure instead of letting `patchJump` panic.
+    jump_overflow: bool = false,
 
     const Self = @This();
 
@@ -109,13 +113,28 @@ pub const ChunkBuilder = struct {
     pub fn patchJump(self: *Self, at: usize, target: usize) void {
         const diff: i64 = @intCast(target);
         const base: i64 = @intCast(at + 2);
-        const rel: i16 = @intCast(diff - base);
+        const delta = diff - base;
+        // A jump beyond the i16 range can't be encoded (function too large). Flag
+        // it (finalize fails the compile) and clamp instead of panicking @intCast.
+        if (delta < std.math.minInt(i16) or delta > std.math.maxInt(i16)) {
+            self.jump_overflow = true;
+            const clamped: i16 = if (delta < 0) std.math.minInt(i16) else std.math.maxInt(i16);
+            const bytes: [2]u8 = @bitCast(clamped);
+            self.code.items[at] = bytes[0];
+            self.code.items[at + 1] = bytes[1];
+            return;
+        }
+        const rel: i16 = @intCast(delta);
         const bytes: [2]u8 = @bitCast(rel);
         self.code.items[at] = bytes[0];
         self.code.items[at + 1] = bytes[1];
     }
 
     pub fn finalize(self: *Self, source_name: []const u8, num_locals: u16) !Chunk {
+        // A jump offset overflowed i16 (function too large for the 16-bit jump
+        // ISA). Reuse OutOfMemory (the compiler's only error) so this surfaces as
+        // a graceful compile failure rather than emitting corrupt jumps.
+        if (self.jump_overflow) return error.OutOfMemory;
         return Chunk{
             .code = try self.code.toOwnedSlice(self.allocator),
             .constants = try self.constants.toOwnedSlice(self.allocator),

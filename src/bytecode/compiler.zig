@@ -458,7 +458,10 @@ pub const FnCompiler = struct {
                 const r = self.allocReg();
                 const v = val_mod.makeBigIntFromLiteral(self.arena, node.data.bigint_literal) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    else => unreachable, // lexer guarantees valid digits/radix
+                    // The lexer should only emit valid BigInt digits/radix; if a
+                    // malformed literal slips through, fall back to 0n rather than
+                    // crashing the process (such inputs are rejected at parse time).
+                    else => val_mod.makeBigIntFromLiteral(self.arena, "0") catch return error.OutOfMemory,
                 };
                 const kidx = try self.addConstant(v);
                 try self.emitOp(.LOAD_K, line);

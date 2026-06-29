@@ -563,9 +563,13 @@ const PatternParser = struct {
             'f' => RegexNode{ .literal = 0x0C },
             '0' => RegexNode{ .literal = 0 },
             'x' => {
-                if (self.pos + 1 > self.src.len) return ParseError.InvalidPattern;
-                const h1 = hexVal(self.src[self.pos]) orelse return ParseError.InvalidPattern;
-                const h2 = hexVal(self.src[self.pos + 1]) orelse return ParseError.InvalidPattern;
+                // `\xHH`: two hex digits. Annex B (non-unicode): if NOT followed by
+                // two hex digits, `\x` is an identity escape matching literal 'x'.
+                // Bounds: need src[pos] and src[pos+1], so pos+2 must be <= len
+                // (the old `pos+1 > len` check read src[pos+1] out of bounds).
+                if (self.pos + 2 > self.src.len) return RegexNode{ .literal = 'x' };
+                const h1 = hexVal(self.src[self.pos]) orelse return RegexNode{ .literal = 'x' };
+                const h2 = hexVal(self.src[self.pos + 1]) orelse return RegexNode{ .literal = 'x' };
                 self.pos += 2;
                 return RegexNode{ .literal = @intCast(h1 * 16 + h2) };
             },

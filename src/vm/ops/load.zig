@@ -123,7 +123,9 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // [[HasProperty]] is true provides the binding via [[Get]].
     if (frame.with_stack.items.len > 0) {
         if (try withLookup(self, frame, name)) |v| {
-            frame.registers[rdst] = v;
+            // withLookup may run a getter (re-entrant) → self.frames can realloc,
+            // leaving `frame` dangling. Write through the re-fetched top frame.
+            self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
             return null;
         }
     }

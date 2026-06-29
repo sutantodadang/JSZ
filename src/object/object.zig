@@ -62,7 +62,7 @@ pub const JsObject = struct {
     /// Arena-allocated; MUST NOT be traversed by markObject.
     internal_slot: ?*anyopaque = null,
     /// Phase 4c/4d: discriminator for internal_slot type.
-    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, weakref, finalization_registry, promise, generator, async_generator, return_completion, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function, mapped_arguments } = .none,
+    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, weakref, finalization_registry, promise, generator, async_generator, return_completion, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function, mapped_arguments, map_iterator, set_iterator, array_iterator } = .none,
     /// Allocator for property storage (the eval arena).
     arena: std.mem.Allocator,
     /// Phase 6 hidden class manager (shared globally).
@@ -176,12 +176,20 @@ pub const JsObject = struct {
         if (self.is_array and std.mem.eql(u8, key, "length")) {
             const new_len = arrayLengthFromValue(value) orelse return;
             if (new_len < self.array_length) {
-                var idx = new_len;
-                var key_buf: [10]u8 = undefined;
-                while (idx < self.array_length) : (idx += 1) {
-                    const k = std.fmt.bufPrint(&key_buf, "{d}", .{idx}) catch continue;
-                    if (self.shape.key_to_slot.contains(k)) _ = self.deleteOwn(k) catch {};
+                // Delete only the EXISTING indexed own properties >= new_len.
+                // Iterating the full [new_len, array_length) numeric range is
+                // catastrophic for sparse arrays: `a[4294967294]=v; a.length=2`
+                // would spin ~4.29e9 times. Snapshot matching keys first (deleteOwn
+                // mutates the shape), then delete — key strings live in the shape
+                // arena and stay valid across transitions.
+                var to_delete: std.ArrayListUnmanaged([]const u8) = .empty;
+                for (self.shape.key_order.items) |k| {
+                    if (k.len > 1 and k[0] == '0') continue; // non-canonical → not an index
+                    const kidx = std.fmt.parseUnsigned(u32, k, 10) catch continue;
+                    if (kidx == std.math.maxInt(u32)) continue;
+                    if (kidx >= new_len) to_delete.append(self.arena, k) catch continue;
                 }
+                for (to_delete.items) |k| _ = self.deleteOwn(k) catch {};
             }
             self.array_length = new_len;
             return;

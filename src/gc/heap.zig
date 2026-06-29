@@ -434,7 +434,15 @@ pub const Heap = struct {
         const inner = v.toPtr();
         switch (inner.*) {
             .object => |obj| self.markObject(obj),
-            // All other variants are arena-only; nothing to mark.
+            // A bc function may carry a heap-allocated backing object (own props +
+            // lazily-created `prototype`). It is reachable through this Value, so a
+            // closure stored as an object property must keep its backing alive —
+            // otherwise GC frees it and a later `.prototype`/property access reads a
+            // dangling pointer. (Mirrors gc.traceValue for the root-scan path.)
+            .bc_function => |c| {
+                if (c.obj) |o| self.markObject(@ptrCast(@alignCast(o)));
+            },
+            // Other variants are arena-only; nothing to mark.
             else => {},
         }
     }

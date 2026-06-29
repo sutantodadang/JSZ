@@ -204,6 +204,8 @@ pub fn build(b: *std.Build) void {
     run_conformance_full.addArg("--full");
     run_conformance_full.addArg("--dashboard");
     run_conformance_full.addArg("docs/CONFORMANCE_FULL.md");
+    run_conformance_full.addArg("--jobs");
+    run_conformance_full.addArg("0");
     const conformance_full_step = b.step("conformance-full", "Run the entire Test262 corpus and report the true baseline");
     conformance_full_step.dependOn(&run_conformance_full.step);
 

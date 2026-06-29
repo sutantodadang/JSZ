@@ -105,15 +105,20 @@ pub fn bigIntEql(x: Value, y: Value) bool {
 /// selects the radix, otherwise base-10. Returns a boxed BigInt Value.
 pub fn makeBigIntFromLiteral(arena: std.mem.Allocator, lit: []const u8) !Value {
     var m = try std.math.big.int.Managed.init(arena);
-    if (lit.len >= 2 and lit[0] == '0' and (lit[1] == 'x' or lit[1] == 'X')) {
-        try m.setString(16, lit[2..]);
-    } else if (lit.len >= 2 and lit[0] == '0' and (lit[1] == 'o' or lit[1] == 'O')) {
-        try m.setString(8, lit[2..]);
-    } else if (lit.len >= 2 and lit[0] == '0' and (lit[1] == 'b' or lit[1] == 'B')) {
-        try m.setString(2, lit[2..]);
-    } else {
-        try m.setString(10, lit);
-    }
+    const radix: u8, const digits: []const u8 = if (lit.len >= 2 and lit[0] == '0' and (lit[1] == 'x' or lit[1] == 'X'))
+        .{ 16, lit[2..] }
+    else if (lit.len >= 2 and lit[0] == '0' and (lit[1] == 'o' or lit[1] == 'O'))
+        .{ 8, lit[2..] }
+    else if (lit.len >= 2 and lit[0] == '0' and (lit[1] == 'b' or lit[1] == 'B'))
+        .{ 2, lit[2..] }
+    else
+        .{ 10, lit };
+    // std `setString` unwraps `charToDigit` internally (panics) on a malformed
+    // input such as `1.5` reaching the BigInt path. Validate first so an invalid
+    // literal surfaces as a catchable error instead of crashing the process.
+    if (digits.len == 0) return error.InvalidBigIntLiteral;
+    for (digits) |c| _ = std.fmt.charToDigit(c, radix) catch return error.InvalidBigIntLiteral;
+    m.setString(radix, digits) catch return error.InvalidBigIntLiteral;
     return makeBigInt(arena, m.toConst());
 }
 

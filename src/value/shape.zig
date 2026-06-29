@@ -167,13 +167,72 @@ pub const ShapeManager = struct {
     }
 };
 
+/// Byte-budget wrapper around `page_allocator` for the global shape store. The
+/// shape transition graph is otherwise unbounded; a single pathological input
+/// (e.g. an Array.prototype method over a 2^32-1 sparse length, which mints one
+/// shape transition per index) can grow it to many GB before any time limit
+/// fires. Capping it makes such a run fail with OOM (caught/skipped) instead of
+/// exhausting RAM. The cap is generous (128 MB ≈ >1M shapes) so it never trips
+/// for real programs — only runaway mass-property creation.
+const ShapeCap = struct {
+    used: usize = 0,
+    const limit: usize = 128 * 1024 * 1024;
+    fn allocator(self: *ShapeCap) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = capAlloc, .resize = capResize, .remap = capRemap, .free = capFree } };
+    }
+    fn capAlloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ShapeCap = @ptrCast(@alignCast(ctx));
+        if (self.used + len > limit) return null;
+        const p = std.heap.page_allocator.rawAlloc(len, a, ra) orelse return null;
+        self.used += len;
+        return p;
+    }
+    fn capResize(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *ShapeCap = @ptrCast(@alignCast(ctx));
+        if (new_len > buf.len and self.used + (new_len - buf.len) > limit) return false;
+        if (!std.heap.page_allocator.rawResize(buf, a, new_len, ra)) return false;
+        self.used = self.used - buf.len + new_len;
+        return true;
+    }
+    fn capRemap(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *ShapeCap = @ptrCast(@alignCast(ctx));
+        if (new_len > buf.len and self.used + (new_len - buf.len) > limit) return null;
+        const p = std.heap.page_allocator.rawRemap(buf, a, new_len, ra) orelse return null;
+        self.used = self.used - buf.len + new_len;
+        return p;
+    }
+    fn capFree(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *ShapeCap = @ptrCast(@alignCast(ctx));
+        std.heap.page_allocator.rawFree(buf, a, ra);
+        self.used -= buf.len;
+    }
+};
+
+var shape_cap: ShapeCap = .{};
+var global_arena: ?std.heap.ArenaAllocator = null;
 var global_manager: ?ShapeManager = null;
 
 pub fn globalManager() *ShapeManager {
     if (global_manager == null) {
-        global_manager = ShapeManager.init(std.heap.page_allocator) catch unreachable;
+        shape_cap = .{};
+        global_arena = std.heap.ArenaAllocator.init(shape_cap.allocator());
+        global_manager = ShapeManager.init(global_arena.?.allocator()) catch unreachable;
     }
     return &global_manager.?;
+}
+
+/// Test-harness hook: free every shape and reset the store to empty. The shape
+/// transition graph is never freed during normal operation; the Test262 runner
+/// creates tens of thousands of isolates in one process, so without this the
+/// global store grows without bound (multi-GB). UNSAFE while any live object
+/// references a shape — only call when no isolate is active (e.g. right after a
+/// per-test isolate has been fully deinit'd).
+pub fn resetGlobalManager() void {
+    if (global_arena) |*a| {
+        a.deinit();
+        global_arena = null;
+        global_manager = null;
+    }
 }
 
 test "shape transition add reuses cached edge" {

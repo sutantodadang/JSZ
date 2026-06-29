@@ -391,6 +391,10 @@ pub const IsolateImpl = struct {
         bc_vm.ic_stats_enabled = self.ic_stats_enabled;
         if (self.time_limit_ms != 0)
             bc_vm.deadline_ns = std.time.nanoTimestamp() + @as(i128, self.time_limit_ms) * std.time.ns_per_ms;
+        // Mirror the deadline so long native loops (Array.prototype methods over a
+        // huge/sparse length, etc.) can self-interrupt like bytecode loops do.
+        @import("../runtime/realm.zig").native_deadline_ns = bc_vm.deadline_ns;
+        defer @import("../runtime/realm.zig").native_deadline_ns = 0;
         // Phase 9: attach JIT profiler when a mode other than .off is requested.
         var jc: jit_mod.JitCompiler = undefined;
         if (self.jit_mode != .off) {

@@ -944,6 +944,35 @@ pub const BcVm = struct {
                 snap.restore();
                 return e;
             };
+            // Root the secondary realm's heap-migrated Object/Array prototypes.
+            // Without this the primary realm roots them but this one does not, so a
+            // GC collection frees the secondary realm's protos while `otherGlobal`
+            // (and objects inheriting from them) are still live → use-after-free.
+            // `nr` is arena-allocated at a stable address, so its root slots are safe.
+            nr.registerRoots() catch |e| {
+                snap.restore();
+                return e;
+            };
+            // Pin the secondary realm's global object as a permanent GC root: it
+            // aliases the global environment record, so everything reachable from
+            // the realm (its intrinsics, constructors, prototypes) stays live for
+            // the isolate's lifetime. Secondary realms are test-only and never torn
+            // down before the isolate, so permanent retention is fine — and it's the
+            // robust fix for the cross-realm use-after-free under GC.
+            if (nr.global_object) |go| {
+                const groot = self.arena.create(Value) catch |e| {
+                    snap.restore();
+                    return e;
+                };
+                groot.* = val_mod.makeObject(self.arena, go) catch |e| {
+                    snap.restore();
+                    return e;
+                };
+                h.addRoot(groot) catch |e| {
+                    snap.restore();
+                    return e;
+                };
+            }
         }
         // Snapshot this realm's intrinsics for GetFunctionRealm's fallback while
         // its objects are still the active thread-locals, then restore the primary

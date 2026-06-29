@@ -82,6 +82,95 @@ fn exitCodeForResults(policy: ExitPolicy) u8 {
     return 0;
 }
 
+/// Per-shard thread arguments for the crash-resilient parallel orchestrator.
+const ShardArgs = struct {
+    shard_index: usize,
+    shard_count: usize,
+    exe_path: []const u8,
+    shard_dir: []const u8,
+    path_filter: ?[]const u8,
+};
+
+/// Worker thread: manages one shard with a crash-resume loop.
+/// Uses page_allocator for all local allocations (ArenaAllocator is not
+/// thread-safe for concurrent allocation).
+fn runShard(args: ShardArgs) void {
+    const alloc = std.heap.page_allocator;
+
+    const results_path = std.fmt.allocPrint(alloc, "{s}/shard_{d}.txt", .{ args.shard_dir, args.shard_index }) catch return;
+    defer alloc.free(results_path);
+    const prog_path = std.fmt.allocPrint(alloc, "{s}/prog_{d}.txt", .{ args.shard_dir, args.shard_index }) catch return;
+    defer alloc.free(prog_path);
+    const crash_path = std.fmt.allocPrint(alloc, "{s}/crash_{d}.txt", .{ args.shard_dir, args.shard_index }) catch return;
+    defer alloc.free(crash_path);
+    const shard_arg = std.fmt.allocPrint(alloc, "{d}/{d}", .{ args.shard_index, args.shard_count }) catch return;
+    defer alloc.free(shard_arg);
+
+    // Owned start_after string; freed when replaced or at function exit.
+    var start_after_owned: ?[]u8 = null;
+    defer if (start_after_owned) |sa| alloc.free(sa);
+
+    while (true) {
+        var child_argv: std.ArrayList([]const u8) = .empty;
+        defer child_argv.deinit(alloc);
+
+        child_argv.append(alloc, args.exe_path) catch return;
+        child_argv.append(alloc, "--full") catch return;
+        child_argv.append(alloc, "--shard") catch return;
+        child_argv.append(alloc, shard_arg) catch return;
+        child_argv.append(alloc, "--results-file") catch return;
+        child_argv.append(alloc, results_path) catch return;
+        child_argv.append(alloc, "--progress-file") catch return;
+        child_argv.append(alloc, prog_path) catch return;
+        if (args.path_filter) |pf| {
+            child_argv.append(alloc, "--filter") catch return;
+            child_argv.append(alloc, pf) catch return;
+        }
+        if (start_after_owned) |sa| {
+            child_argv.append(alloc, "--start-after") catch return;
+            child_argv.append(alloc, sa) catch return;
+        }
+
+        var child = std.process.Child.init(child_argv.items, alloc);
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch return;
+        const term = child.wait() catch return;
+
+        const clean = switch (term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+        if (clean) break;
+
+        // Crash / abnormal exit: read progress file to identify the crasher.
+        const prog_data = std.fs.cwd().readFileAlloc(alloc, prog_path, 65536) catch break;
+        defer alloc.free(prog_data);
+        const crasher = std.mem.trim(u8, prog_data, " \t\r\n");
+
+        if (crasher.len == 0) break; // Cannot identify crasher; stop this shard.
+        if (start_after_owned) |sa| {
+            if (std.mem.eql(u8, crasher, sa)) break; // No forward progress; stop.
+        }
+
+        // Record the crasher as FAIL in the crash file.
+        append_crash: {
+            const cf = std.fs.cwd().openFile(crash_path, .{ .mode = .write_only }) catch
+                (std.fs.cwd().createFile(crash_path, .{ .truncate = false }) catch break :append_crash);
+            defer cf.close();
+            cf.seekFromEnd(0) catch {};
+            var line_buf: [4096]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "FAIL {s}\n", .{crasher}) catch break :append_crash;
+            cf.writeAll(line) catch {};
+        }
+
+        // Advance past the crasher on the next iteration.
+        const new_sa = alloc.dupe(u8, crasher) catch break;
+        if (start_after_owned) |old| alloc.free(old);
+        start_after_owned = new_sa;
+    }
+}
+
 fn formatPercent(out: *std.Io.Writer, numerator: u32, denominator: u32) !void {
     if (denominator == 0) {
         try out.print("n/a", .{});
@@ -428,7 +517,7 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     // `EvalResult.exception` with an "interrupted:"/"out of memory" message,
     // which we treat as `.skip` (not a genuine pass/fail).
     ctx.setLimits(.{
-        .time_ms = 1000,
+        .time_ms = 500,
         .mem_bytes = 256 * 1024 * 1024,
         .gas = 0,
     });
@@ -764,6 +853,9 @@ pub fn main() !void {
     // --filter <substr>: only run tests whose relative path contains <substr>
     // (full mode only). Lets a single feature area be measured in isolation.
     var path_filter: ?[]const u8 = null;
+    var shard_index: u32 = 0;
+    var shard_count: u32 = 0;
+    var jobs: u32 = 1;
     var arg_idx: usize = 1;
     while (arg_idx < argv.len) : (arg_idx += 1) {
         const arg = argv[arg_idx];
@@ -806,6 +898,16 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--filter") and arg_idx + 1 < argv.len) {
             arg_idx += 1;
             path_filter = argv[arg_idx];
+        } else if (std.mem.eql(u8, arg, "--shard") and arg_idx + 1 < argv.len) {
+            arg_idx += 1;
+            const sv = argv[arg_idx];
+            if (std.mem.indexOf(u8, sv, "/")) |slash| {
+                shard_index = std.fmt.parseInt(u32, sv[0..slash], 10) catch 0;
+                shard_count = std.fmt.parseInt(u32, sv[slash + 1 ..], 10) catch 0;
+            }
+        } else if (std.mem.eql(u8, arg, "--jobs") and arg_idx + 1 < argv.len) {
+            arg_idx += 1;
+            jobs = std.fmt.parseInt(u32, argv[arg_idx], 10) catch 1;
         }
     }
 
@@ -896,10 +998,6 @@ pub fn main() !void {
         break :blk true;
     };
 
-    // Run the selected tests.
-    // `quiet` = a full baseline run (no flip gate): suppress the per-test
-    // UNEXPECTED_/KNOWN_/STALE lines that would otherwise be thousands long. The
-    // delta gate (full + --fail-on-flips) keeps them so regressions are visible.
     const quiet = full_mode and !fail_on_flips;
     var failing_list: std.ArrayList([]const u8) = .empty;
     defer failing_list.deinit(allocator);
@@ -909,6 +1007,160 @@ pub fn main() !void {
     var skipped: u32 = 0;
     var unexpected_fail: u32 = 0;
     var unexpected_pass: u32 = 0;
+
+    // Parent mode: spawn J child shards, merge results, print summary.
+    if (full_mode and shard_count == 0 and (jobs == 0 or jobs > 1)) {
+        const J: u32 = @max(1, if (jobs == 0) @as(u32, @intCast(std.Thread.getCpuCount() catch 1)) else jobs);
+        var parent_arena = std.heap.ArenaAllocator.init(allocator);
+        defer parent_arena.deinit();
+        const pa = parent_arena.allocator();
+
+        const exe_path = try std.fs.selfExePathAlloc(pa);
+        const shard_dir = ".test262_shards";
+        try std.fs.cwd().makePath(shard_dir);
+
+        // Pre-create shard result and crash files (truncate) before threads start.
+        const shard_paths = try pa.alloc([]u8, @as(usize, J));
+        const crash_paths = try pa.alloc([]u8, @as(usize, J));
+        for (0..@as(usize, J)) |i| {
+            shard_paths[i] = try std.fmt.allocPrint(pa, "{s}/shard_{d}.txt", .{ shard_dir, i });
+            crash_paths[i] = try std.fmt.allocPrint(pa, "{s}/crash_{d}.txt", .{ shard_dir, i });
+            const sf = try std.fs.cwd().createFile(shard_paths[i], .{ .truncate = true });
+            sf.close();
+            const cf = try std.fs.cwd().createFile(crash_paths[i], .{ .truncate = true });
+            cf.close();
+        }
+
+        // Launch one thread per shard; each manages its own crash-resume loop.
+        const threads = try pa.alloc(std.Thread, @as(usize, J));
+        const thread_args = try pa.alloc(ShardArgs, @as(usize, J));
+        for (0..@as(usize, J)) |i| {
+            thread_args[i] = .{
+                .shard_index = i,
+                .shard_count = @as(usize, J),
+                .exe_path = exe_path,
+                .shard_dir = shard_dir,
+                .path_filter = path_filter,
+            };
+            threads[i] = try std.Thread.spawn(.{}, runShard, .{thread_args[i]});
+        }
+        for (0..@as(usize, J)) |i| {
+            threads[i].join();
+        }
+
+        // Merge: read shard result files and crash files; tally into counters.
+        // seen deduplicates any test appearing in both (crash-window race guard).
+        var seen = std.StringHashMap(void).init(allocator);
+        defer seen.deinit();
+
+        for (0..@as(usize, J)) |i| {
+            const sources = [_][]const u8{ shard_paths[i], crash_paths[i] };
+            for (sources) |src_path| {
+                const data = std.fs.cwd().readFileAlloc(pa, src_path, 256 * 1024 * 1024) catch continue;
+                var line_it = std.mem.splitScalar(u8, data, '\n');
+                while (line_it.next()) |line| {
+                    if (line.len == 0) continue;
+                    const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+                    const tag = line[0..sp];
+                    const rel_path = line[sp + 1 ..];
+                    if (rel_path.len == 0) continue;
+
+                    // Dedup: skip if already tallied from another source file.
+                    if (seen.contains(rel_path)) continue;
+                    try seen.put(try pa.dupe(u8, rel_path), {});
+
+                    const category = classifyCategory(rel_path);
+                    const cat_idx = @intFromEnum(category);
+                    const expected_fail = known_failing.contains(rel_path);
+
+                    if (expected_fail) try seen_known.put(try pa.dupe(u8, rel_path), {});
+
+                    if (std.mem.eql(u8, tag, "SKIP")) {
+                        skipped += 1;
+                    } else if (std.mem.eql(u8, tag, "PASS")) {
+                        pass += 1;
+                        categories[cat_idx].pass += 1;
+                        if (expected_fail) {
+                            unexpected_pass += 1;
+                            if (!quiet) try out.print("UNEXPECTED_PASS: {s}\n", .{rel_path});
+                        }
+                    } else if (std.mem.eql(u8, tag, "FAIL")) {
+                        fail += 1;
+                        categories[cat_idx].fail += 1;
+                        if (write_failing_path != null) try failing_list.append(allocator, try pa.dupe(u8, rel_path));
+                        if (!expected_fail) {
+                            unexpected_fail += 1;
+                            if (!quiet) try out.print("UNEXPECTED_FAIL: {s}\n", .{rel_path});
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!quiet) {
+            for (known_data.entries.items) |entry| {
+                if (!seen_known.contains(entry)) {
+                    try out.print("STALE_KNOWN_FAILING_ENTRY: {s}\n", .{entry});
+                    unexpected_fail += 1;
+                }
+            }
+        }
+
+        if (write_failing_path) |path| {
+            std.mem.sort([]const u8, failing_list.items, {}, struct {
+                fn lt(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lt);
+            const wf = try std.fs.cwd().createFile(path, .{ .truncate = true });
+            defer wf.close();
+            var fbuf: [4096]u8 = undefined;
+            var fw = wf.writer(&fbuf);
+            const fout = &fw.interface;
+            try fout.print("# Auto-generated by --write-known-failing. {d} failing tests.\n", .{failing_list.items.len});
+            for (failing_list.items) |entry| try fout.print("{s}\n", .{entry});
+            try fout.flush();
+            try out.print("Wrote known-failing list ({d} entries): {s}\n", .{ failing_list.items.len, path });
+        }
+
+        try printCategorySummary(out, categories, pass, fail, pass + fail);
+        if (full_mode) try out.print("Skipped (unsupported flags/includes): {d}\n", .{skipped});
+        try out.print("Known-failing flips: {d} unexpected fail, {d} unexpected pass\n", .{
+            unexpected_fail,
+            unexpected_pass,
+        });
+
+        if (dashboard_path) |path| {
+            try writeDashboard(
+                allocator,
+                path,
+                true,
+                categories,
+                pass,
+                fail,
+                total_count,
+                known_failing_count,
+                unexpected_fail,
+                unexpected_pass,
+            );
+            try out.print("Dashboard: {s}\n", .{path});
+        }
+
+        try out.flush();
+
+        const exit_code = exitCodeForResults(.{
+            .fail_on_flips = fail_on_flips,
+            .strict_failures = strict_failures,
+            .fail = fail,
+            .unexpected_fail = unexpected_fail,
+            .unexpected_pass = unexpected_pass,
+        });
+        std.fs.cwd().deleteTree(shard_dir) catch {};
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    // Run the selected tests.
 
     // Append-mode results sink for crash-resilient runs (one line per test).
     var results_file: ?std.fs.File = null;
@@ -924,7 +1176,16 @@ pub fn main() !void {
     // including the named path; begin running at the next one.
     var resumed = (start_after == null);
 
-    for (tests) |rel_path| {
+    // Per-test arena: runOneTest uses this as the Isolate backing allocator.
+    // Nothing it allocates escapes the call, so resetting after each test
+    // reclaims everything (incl. engine-internal leaks), capping peak memory
+    // at one test's footprint instead of growing unbounded across the corpus.
+    var test_arena = std.heap.ArenaAllocator.init(allocator);
+    defer test_arena.deinit();
+    for (tests, 0..) |rel_path, gidx| {
+        // Shard by absolute index so assignment is stable regardless of
+        // --start-after / --filter (required for crash-resume correctness).
+        if (shard_count > 0 and (gidx % @as(usize, shard_count)) != @as(usize, shard_index)) continue;
         if (!resumed) {
             if (start_after) |sa| {
                 if (std.mem.eql(u8, rel_path, sa)) resumed = true;
@@ -972,7 +1233,7 @@ pub fn main() !void {
             } else |_| {}
         }
 
-        const outcome = try runOneTest(allocator, source, full_mode, harness_present, full);
+        const outcome = try runOneTest(test_arena.allocator(), source, full_mode, harness_present, full);
 
         // Append the per-test outcome (survives across resumed runs).
         if (results_file) |f| {
@@ -1012,6 +1273,8 @@ pub fn main() !void {
                 }
             },
         }
+        _ = test_arena.reset(.retain_capacity);
+        jsz.resetGlobalShapes();
     }
 
     // Stale known-failing entries are noise during a quiet baseline run.
