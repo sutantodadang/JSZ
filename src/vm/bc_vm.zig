@@ -104,6 +104,25 @@ pub const BcGeneratorState = struct {
     params_initialized: bool = false,
 };
 
+/// Backing data for a mapped `arguments` object (sloppy mode + simple parameter
+/// list). Integer indices `[0, count)` alias the corresponding parameter binding
+/// in `env`, so reads/writes of `arguments[i]` and the parameter stay in sync.
+pub const MappedArgsData = struct {
+    env: *Environment,
+    param_names: [][]const u8,
+    count: usize,
+};
+
+/// If `key` names a mapped argument index (an integer in `[0, count)`), return
+/// the aliased parameter name; otherwise null.
+fn mappedArgParam(obj: *JsObject, key: []const u8) ?[]const u8 {
+    if (obj.internal_kind != .mapped_arguments) return null;
+    const md: *MappedArgsData = @ptrCast(@alignCast(obj.internal_slot orelse return null));
+    const idx = std.fmt.parseInt(usize, key, 10) catch return null;
+    if (idx >= md.count) return null;
+    return md.param_names[idx];
+}
+
 /// W2-async: how to resume a suspended coroutine.
 pub const ResumeKind = union(enum) {
     /// Resume normally, writing `next` into the await/yield result register.
@@ -1938,6 +1957,13 @@ pub const BcVm = struct {
                     const key_v = try val_mod.makeString(self.arena, key);
                     return try self.proxyGet(obj_val, obj, key_v);
                 }
+                // Mapped arguments: an index in range reads the aliased parameter.
+                if (obj.internal_kind == .mapped_arguments) {
+                    if (mappedArgParam(obj, key)) |pname| {
+                        const md: *MappedArgsData = @ptrCast(@alignCast(obj.internal_slot.?));
+                        return md.env.lookup(pname) catch obj.get(key) orelse val_mod.makeUndefined(self.arena);
+                    }
+                }
                 // M15: integer-indexed TypedArray element read (exotic). A canonical
                 // index past the end (or on a detached buffer) yields undefined and
                 // never falls through to ordinary property lookup.
@@ -2278,6 +2304,16 @@ pub const BcVm = struct {
                 // M16: Module Namespace exotic [[Set]] always fails (the strict
                 // module caller turns the false return into a TypeError).
                 if (obj.internal_kind == .module_namespace) return false;
+                // Mapped arguments: an index in range writes through to the aliased
+                // parameter binding (and the own data property stays in sync).
+                if (obj.internal_kind == .mapped_arguments) {
+                    if (mappedArgParam(obj, key)) |pname| {
+                        const md: *MappedArgsData = @ptrCast(@alignCast(obj.internal_slot.?));
+                        md.env.assign(pname, value) catch {};
+                        try obj.set(key, value);
+                        return true;
+                    }
+                }
                 // M15: integer-indexed TypedArray element write (exotic). Coerce the
                 // value (ToNumber/ToBigInt) then store; out-of-bounds is a silent
                 // no-op and indexed keys never create ordinary properties.
@@ -3238,6 +3274,26 @@ pub const BcVm = struct {
         if (realm_mod.active_sym_iterator) |symv| {
             const coll = @import("../runtime/builtins/es2015_collections.zig");
             try obj.setSym(symv, try val_mod.makeNativeFunction(self.arena, coll.nativeArrayValues));
+        }
+        // Mapped arguments (sloppy mode + simple parameter list): indices alias the
+        // parameter bindings both ways (`arguments[0] = v` writes param 0; reading
+        // a reassigned param reflects in `arguments[0]`). Synthetic param names
+        // (`__param_*` destructuring, `__arg_*` defaults) and a rest parameter make
+        // the list non-simple → unmapped.
+        const simple = blk: {
+            if (fn_ptr.is_strict) break :blk false;
+            if (fn_ptr.rest_param != null) break :blk false;
+            if (fn_ptr.param_names.len == 0) break :blk false;
+            for (fn_ptr.param_names) |p| {
+                if (std.mem.startsWith(u8, p, "__param_") or std.mem.startsWith(u8, p, "__arg_")) break :blk false;
+            }
+            break :blk true;
+        };
+        if (simple) {
+            const md = try self.arena.create(MappedArgsData);
+            md.* = .{ .env = env, .param_names = fn_ptr.param_names, .count = @min(args.len, fn_ptr.param_names.len) };
+            obj.internal_kind = .mapped_arguments;
+            obj.internal_slot = md;
         }
         try env.define("arguments", try val_mod.makeObject(self.arena, obj));
     }
