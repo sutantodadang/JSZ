@@ -671,6 +671,42 @@ pub const BcVm = struct {
     /// global environment, returning its completion value (the value of the last
     /// expression, which `compileProgram` emits as an implicit return). Reachable
     /// from `nativeEval` via the Context bridge.
+    /// Collect the `var`/function-declaration names introduced at the top level of
+    /// `stmts` (recursing through blocks/control flow but NOT into nested function
+    /// bodies, whose vars belong to their own scope). Used for the direct-eval
+    /// var/lexical conflict check.
+    fn collectEvalVarNames(stmts: []const *@import("../parser/ast.zig").Node, out: *std.ArrayList([]const u8), arena: std.mem.Allocator) void {
+        for (stmts) |node| collectEvalVarNamesNode(node, out, arena);
+    }
+
+    fn collectEvalVarNamesNode(node: *@import("../parser/ast.zig").Node, out: *std.ArrayList([]const u8), arena: std.mem.Allocator) void {
+        switch (node.kind) {
+            .var_decl => {
+                const vd = node.data.var_decl;
+                if (vd.kind == .var_) out.append(arena, vd.name) catch {};
+            },
+            .function_decl => out.append(arena, node.data.function_decl.name) catch {},
+            .block_stmt => collectEvalVarNames(node.data.block_stmt.body, out, arena),
+            .if_stmt => {
+                collectEvalVarNamesNode(node.data.if_stmt.consequent, out, arena);
+                if (node.data.if_stmt.alternate) |a| collectEvalVarNamesNode(a, out, arena);
+            },
+            .for_stmt => {
+                if (node.data.for_stmt.init) |i| collectEvalVarNamesNode(i, out, arena);
+                collectEvalVarNamesNode(node.data.for_stmt.body, out, arena);
+            },
+            .while_stmt => collectEvalVarNamesNode(node.data.while_stmt.body, out, arena),
+            .do_while_stmt => collectEvalVarNamesNode(node.data.do_while_stmt.body, out, arena),
+            .labeled_stmt => collectEvalVarNamesNode(node.data.labeled_stmt.body, out, arena),
+            .try_stmt => {
+                collectEvalVarNamesNode(node.data.try_stmt.block, out, arena);
+                if (node.data.try_stmt.handler) |h| collectEvalVarNamesNode(h.body, out, arena);
+                if (node.data.try_stmt.finalizer) |f| collectEvalVarNamesNode(f, out, arena);
+            },
+            else => {},
+        }
+    }
+
     fn bcEval(ptr: *anyopaque, arena: std.mem.Allocator, source: []const u8) anyerror!Value {
         _ = arena;
         const self: *BcVm = @ptrCast(@alignCast(ptr));
@@ -699,6 +735,21 @@ pub const BcVm = struct {
                 return error.JsException;
             },
         };
+        // Direct eval: a top-level `var` whose name collides with a lexical
+        // (`let`/`const`) binding in the immediately-enclosing scope is a
+        // SyntaxError (EvalDeclarationInstantiation). Checked against the calling
+        // frame's own env to avoid crossing function boundaries.
+        if (self.frames.items.len > 0) {
+            const caller_env: *Environment = self.frames.items[self.frames.items.len - 1].env;
+            var var_names = std.ArrayList([]const u8){};
+            collectEvalVarNames(stmts, &var_names, self.arena);
+            for (var_names.items) |vn| {
+                if (caller_env.hasOwnLexical(vn)) {
+                    realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", "Identifier has already been declared");
+                    return error.JsException;
+                }
+            }
+        }
         const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(stmts) };
         const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<eval>");
         // Eval's top-level `var`/function declarations belong to the calling
