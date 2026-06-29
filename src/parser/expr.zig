@@ -496,6 +496,31 @@ fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)
 /// expression node) according to `pattern` (an array/object literal acting as a
 /// binding pattern). Recurses for nested patterns. Defaults (`[a = d]`,
 /// `{x = d}`) substitute `d` when the read is `undefined`.
+/// Build a `__helper__(a, b)` call node (b optional) for the destructuring desugar.
+fn mkDestrCall(p: *Parser, helper: []const u8, a: *Node, b: ?*Node) ?*Node {
+    const callee = p.makeNode(.identifier, a.start, a.start, .{ .identifier = helper }) orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, a) catch {
+        p.had_error = true;
+        return null;
+    };
+    if (b) |bb| args.append(p.arena, bb) catch {
+        p.had_error = true;
+        return null;
+    };
+    return p.makeNode(.call_expr, a.start, a.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+}
+
+/// Append a `let <name> = <init>;` decl to the param prelude. Returns false on OOM.
+fn pushLet(p: *Parser, name: []const u8, init: *Node, at: u32) bool {
+    const vd = p.makeNode(.var_decl, at, at, .{ .var_decl = .{ .kind = .let, .name = name, .init = init } }) orelse return false;
+    p.arrow_prelude.append(p.arena, vd) catch {
+        p.had_error = true;
+        return false;
+    };
+    return true;
+}
+
 pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
     // RequireObjectCoercible: a pattern cannot be applied to null/undefined.
     // `src` is always an identifier (`__param_N` or a `__dp_N` temp), so reading
@@ -516,34 +541,68 @@ pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
     }
     switch (pattern.kind) {
         .array_literal => {
-            for (pattern.data.array_literal.elements, 0..) |el, i| {
-                // Elision (hole, e.g. `[, x]`): no binding for this position.
-                if (el.kind == .undefined_literal) continue;
-                // Rest element `[...rest]`: bind to the tail `src.slice(i)`.
-                // (Index-based, like the rest of this desugar; iterator-protocol
-                // exactness for array patterns is tracked separately.)
-                if (el.kind == .spread_expr) {
-                    const slice_key = p.makeNode(.identifier, el.start, el.start, .{ .identifier = "slice" }) orelse return false;
-                    const slice_member = p.makeNode(.member_expr, el.start, el.start, .{
-                        .member_expr = .{ .object = src, .property = slice_key, .computed = false },
-                    }) orelse return false;
-                    const from_idx = p.makeNode(.number_literal, el.start, el.start, .{ .number_literal = @floatFromInt(i) }) orelse return false;
-                    var sargs = std.ArrayList(*Node){};
-                    sargs.append(p.arena, from_idx) catch {
+            // Iterator-protocol array destructuring: GetIterator(src), step per
+            // element (IteratorStep + IteratorValue), collect the rest, and
+            // IteratorClose when the pattern finishes binding before the iterator
+            // is exhausted. `__box` ({}) tracks done-ness across the helper calls.
+            const ctr = p.param_destruct_counter;
+            p.param_destruct_counter += 1;
+            const it_name = std.fmt.allocPrint(p.arena, "__it_{d}", .{ctr}) catch {
+                p.had_error = true;
+                return false;
+            };
+            const box_name = std.fmt.allocPrint(p.arena, "__box_{d}", .{ctr}) catch {
+                p.had_error = true;
+                return false;
+            };
+            const get_it = mkDestrCall(p, "__getIterator__", src, null) orelse return false;
+            if (!pushLet(p, it_name, get_it, src.start)) return false;
+            const empty_box = p.makeNode(.object_literal, src.start, src.start, .{ .object_literal = .{ .properties = &.{} } }) orelse return false;
+            if (!pushLet(p, box_name, empty_box, src.start)) return false;
+
+            var saw_rest = false;
+            for (pattern.data.array_literal.elements) |el| {
+                const it_ref = p.makeNode(.identifier, el.start, el.start, .{ .identifier = it_name }) orelse return false;
+                const box_ref = p.makeNode(.identifier, el.start, el.start, .{ .identifier = box_name }) orelse return false;
+                // Elision (`[, x]`): advance the iterator one step, discard.
+                if (el.kind == .undefined_literal) {
+                    const step = mkDestrCall(p, "__destrIterStep__", it_ref, box_ref) orelse return false;
+                    const stmt = p.makeNode(.expr_stmt, el.start, el.start, .{ .expr_stmt = step }) orelse return false;
+                    p.arrow_prelude.append(p.arena, stmt) catch {
                         p.had_error = true;
                         return false;
                     };
-                    const slice_call = p.makeNode(.call_expr, el.start, el.start, .{
-                        .call_expr = .{ .callee = slice_member, .args = sargs.items },
-                    }) orelse return false;
-                    if (!bindPatternElement(p, el.data.spread_expr, slice_call)) return false;
+                    continue;
+                }
+                // Rest (`[...rest]`): collect remaining values; no IteratorClose after.
+                if (el.kind == .spread_expr) {
+                    const rest = mkDestrCall(p, "__destrIterRest__", it_ref, box_ref) orelse return false;
+                    if (!bindPatternElement(p, el.data.spread_expr, rest)) return false;
+                    saw_rest = true;
                     break;
                 }
-                const idx = p.makeNode(.number_literal, el.start, el.start, .{ .number_literal = @floatFromInt(i) }) orelse return false;
-                const access = p.makeNode(.member_expr, el.start, el.start, .{
-                    .member_expr = .{ .object = src, .property = idx, .computed = true },
-                }) orelse return false;
-                if (!bindPatternElement(p, el, access)) return false;
+                // Normal element: bind the step value to a temp (single step), then
+                // destructure (handles identifier / default / nested sub-pattern).
+                const step = mkDestrCall(p, "__destrIterStep__", it_ref, box_ref) orelse return false;
+                const e_ctr = p.param_destruct_counter;
+                p.param_destruct_counter += 1;
+                const e_name = std.fmt.allocPrint(p.arena, "__e_{d}", .{e_ctr}) catch {
+                    p.had_error = true;
+                    return false;
+                };
+                if (!pushLet(p, e_name, step, el.start)) return false;
+                const e_ref = p.makeNode(.identifier, el.start, el.start, .{ .identifier = e_name }) orelse return false;
+                if (!bindPatternElement(p, el, e_ref)) return false;
+            }
+            if (!saw_rest) {
+                const it_ref = p.makeNode(.identifier, src.start, src.start, .{ .identifier = it_name }) orelse return false;
+                const box_ref = p.makeNode(.identifier, src.start, src.start, .{ .identifier = box_name }) orelse return false;
+                const close = mkDestrCall(p, "__destrIterClose__", it_ref, box_ref) orelse return false;
+                const stmt = p.makeNode(.expr_stmt, src.start, src.start, .{ .expr_stmt = close }) orelse return false;
+                p.arrow_prelude.append(p.arena, stmt) catch {
+                    p.had_error = true;
+                    return false;
+                };
             }
         },
         .object_literal => {

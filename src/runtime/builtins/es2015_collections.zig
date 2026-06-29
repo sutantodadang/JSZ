@@ -1737,6 +1737,81 @@ pub fn nativeRequireObjectCoercible(arena: std.mem.Allocator, _: Value, args: []
     return v;
 }
 
+/// __destrIterStep__(iterator, box): one element of array-pattern destructuring.
+/// `box.done` tracks iterator exhaustion. Returns the element value, or undefined
+/// when the iterator is already/now done (so an absent element binds undefined /
+/// triggers a default). A throwing `next()` or `value` getter propagates (the
+/// iterator is then considered done — spec sets [[Done]] before the abrupt return).
+pub fn nativeDestrIterStep(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const it = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const box = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    if (box) |b| {
+        if (b.get("done")) |dv| if (isTruthy(dv)) return val_mod.makeUndefined(arena);
+    }
+    const r = try nativeIterStep(arena, Value{}, &[_]Value{it});
+    if (r.bits == 0 or r.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
+        return error.JsException;
+    }
+    const done = try ctx.getProp(arena, r, "done");
+    if (isTruthy(done)) {
+        if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
+        return val_mod.makeUndefined(arena);
+    }
+    return try ctx.getProp(arena, r, "value");
+}
+
+/// __destrIterRest__(iterator, box): collect the remaining iterator values into a
+/// fresh Array (the `[...rest]` binding). Sets `box.done` when exhausted.
+pub fn nativeDestrIterRest(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const it = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const box = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    const arr = if (realm_mod.active_heap) |h|
+        try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
+    else
+        try JsObject.createArray(arena, realm_mod.active_array_proto);
+    arr.is_array = true;
+    var n: usize = 0;
+    while (true) {
+        if (box) |b| if (b.get("done")) |dv| if (isTruthy(dv)) break;
+        const r = try nativeIterStep(arena, Value{}, &[_]Value{it});
+        if (r.bits == 0 or r.unbox() != .object) {
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
+            return error.JsException;
+        }
+        const done = try ctx.getProp(arena, r, "done");
+        if (isTruthy(done)) {
+            if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
+            break;
+        }
+        const v = try ctx.getProp(arena, r, "value");
+        const key = try std.fmt.allocPrint(arena, "{d}", .{n});
+        try arr.set(key, v);
+        n += 1;
+    }
+    try arr.set("length", try val_mod.makeNumber(arena, @floatFromInt(n)));
+    return val_mod.makeObject(arena, arr);
+}
+
+/// __destrIterClose__(iterator, box): IteratorClose when the pattern finished
+/// binding but the iterator was not exhausted (`[a] = [1,2,3]`). Calls
+/// `return()` if present; a normal completion swallows a non-throwing return,
+/// while a throwing `return()` propagates.
+pub fn nativeDestrIterClose(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const it = if (args.len > 0) args[0] else return val_mod.makeUndefined(arena);
+    const box = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    if (box) |b| if (b.get("done")) |dv| if (isTruthy(dv)) return val_mod.makeUndefined(arena);
+    if (it.bits == 0 or it.unbox() != .object) return val_mod.makeUndefined(arena);
+    const ret = try ctx.getProp(arena, it, "return");
+    if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_) return val_mod.makeUndefined(arena);
+    if (!isCallable(ret)) return val_mod.makeUndefined(arena);
+    _ = try function_proto.invokeCallback(arena, it, ret, &[_]Value{});
+    return val_mod.makeUndefined(arena);
+}
+
 /// __getIterator__(x): obtain an iterator (object with next()) for `x`.
 pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const x = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
