@@ -516,6 +516,7 @@ pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
     if (obj.internal_kind == .module_namespace)
         return val_mod.makeBool(arena, new_proto == null);
     obj.proto = new_proto;
+    obj.setProtoBarrier(new_proto);
     return val_mod.makeBool(arena, true);
 }
 

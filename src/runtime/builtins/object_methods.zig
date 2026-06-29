@@ -541,6 +541,7 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
     if (target.bits != 0) {
         if (target.unbox() == .object) {
             target.toPtr().object.proto = new_proto;
+            target.toPtr().object.setProtoBarrier(new_proto);
         } else if (@import("../realm.zig").active_context) |ctx| {
             try ctx.setProto(arena, target, new_proto); // bc_function ctor (static inheritance)
         }

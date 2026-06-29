@@ -424,3 +424,65 @@ test "gc: local var of in-progress call is rooted (bc)" {
     }
 }
 
+
+test "gc: WeakRef target is cleared after collection (bc)" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setInterpMode(.bc);
+
+    // The target object is created inside an IIFE so its only live reference
+    // after the call returns is the WeakRef's (weak) internal slot — the IIFE's
+    // frame registers are gone. A collection must then reclaim it and deref()
+    // must report undefined.
+    const result = ctx.eval(
+        "var wr = (function(){ return new WeakRef({}); })(); __gc__(); wr.deref() === undefined ? 1 : 0",
+        "<test>",
+    );
+    switch (result) {
+        .ok => |v| try std.testing.expectEqual(@as(f64, 1), v.toF64()),
+        else => return error.UnexpectedResult,
+    }
+}
+
+
+test "gc: strong Map keeps value reachable only through it (bc)" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setInterpMode(.bc);
+
+    // The value object lives only inside the Map; the strong-trace hook must keep
+    // it alive across a collection (regression guard against dangling Map values).
+    const result = ctx.eval(
+        "var m = new Map(); m.set('k', {v: 42}); __gc__(); m.get('k').v",
+        "<test>",
+    );
+    switch (result) {
+        .ok => |v| try std.testing.expectEqual(@as(f64, 42), v.toF64()),
+        else => return error.UnexpectedResult,
+    }
+}
+
+
+test "gc: WeakMap value survives while key is live (ephemeron) (bc)" {
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.setInterpMode(.bc);
+
+    // The value object is reachable only via the WeakMap entry, whose key `k` is
+    // live → ephemeron marking must keep the value alive across a collection.
+    const result = ctx.eval(
+        "var k = {}; var wm = new WeakMap(); wm.set(k, {n: 7}); __gc__(); wm.get(k).n",
+        "<test>",
+    );
+    switch (result) {
+        .ok => |v| try std.testing.expectEqual(@as(f64, 7), v.toF64()),
+        else => return error.UnexpectedResult,
+    }
+}
+

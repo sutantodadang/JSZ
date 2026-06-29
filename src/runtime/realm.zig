@@ -2373,6 +2373,7 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
             if (derived_proto) |dp| {
                 if (try ctx.backingObject(arena, result)) |bobj| {
                     bobj.proto = dp;
+                    bobj.setProtoBarrier(dp);
                 }
             }
             // Consume pending newTarget so constructImpl's post-hoc override does
@@ -3358,6 +3359,13 @@ pub const Realm = struct {
     pub fn activateHeap(self: *Realm, heap: *Heap) !void {
         self.heap = heap;
         active_heap = heap;
+
+        // M19: wire the collector's strong-trace and weak-process hooks so Map/Set
+        // keep their entries alive and WeakMap/WeakSet/WeakRef/FinalizationRegistry
+        // get true ephemeron semantics (dead entries purged, dead refs cleared).
+        const es2015 = @import("builtins/es2015_collections.zig");
+        heap.strong_trace_fn = es2015.gcStrongTrace;
+        heap.weak_process_fn = es2015.gcProcessWeak;
 
         // Create arena-backed Value wrappers for the prototypes and register as GC roots.
         // We store them as fields so their lifetimes match the Realm.

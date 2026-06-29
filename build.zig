@@ -338,19 +338,34 @@ pub fn build(b: *std.Build) void {
     const gc_stress_step = b.step("gc-stress", "Run Phase 3b GC stress test");
     gc_stress_step.dependOn(&run_gc_stress.step);
 
+    // GC perf benchmark (M19): generational vs mark-sweep. zig build gc-bench
+    const gc_bench_exe = b.addExecutable(.{
+        .name = "gc-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/gc_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "jsz", .module = mod }},
+        }),
+    });
+    b.installArtifact(gc_bench_exe);
+    const run_gc_bench = b.addRunArtifact(gc_bench_exe);
+    const gc_bench_step = b.step("gc-bench", "Run M19 generational-vs-mark-sweep GC benchmark");
+    gc_bench_step.dependOn(&run_gc_bench.step);
+
     // Under -Djit=true, link the cdylib into every remaining artifact that embeds
     // the `jsz` module (bc_vm references the native JIT). Default build: no-op.
     if (enable_jit) {
         for ([_]*std.Build.Step.Compile{
             conformance_exe, diff_exe,    hello_exe,      embed_exe,
-            bench_exe,       bench_phase6_exe, gc_stress_exe,
+            bench_exe,       bench_phase6_exe, gc_stress_exe,  gc_bench_exe,
             parser_fuzz,     vm_fuzz,      regex_fuzz,     json_fuzz,
             test262_runner_tests, docs_mod_test,
         }) |c| jit_link.link(c);
         for ([_]*std.Build.Step.Run{
             run_conformance, run_conformance_summary, run_conformance_delta,
             run_diff,        run_hello,    run_embed,      run_bench,
-            run_bench_phase6, run_gc_stress, run_test262_runner_tests,
+            run_bench_phase6, run_gc_stress, run_gc_bench, run_test262_runner_tests,
         }) |r| jit_link.path(r);
     }
 
