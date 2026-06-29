@@ -99,6 +99,9 @@ pub const BcGeneratorState = struct {
     /// yielded value must reach the consumer unwrapped, per yield* delegation),
     /// false for a plain YIELD (wrapped as `{value, done:false}`).
     raw_yield: bool = false,
+    /// Set once the eager parameter-initialization phase (PARAMS_DONE) has run.
+    /// Distinguishes the build-time param-init suspend from later user yields.
+    params_initialized: bool = false,
 };
 
 /// W2-async: how to resume a suspended coroutine.
@@ -1196,6 +1199,7 @@ pub const BcVm = struct {
                 .HALT => if (try call_ops.opHalt(self, frame)) |o| return o,
                 .YIELD => if (try call_ops.opYield(self, frame)) |o| return o,
                 .YIELD_STAR => if (try call_ops.opYieldStar(self, frame)) |o| return o,
+                .PARAMS_DONE => if (try call_ops.opParamsDone(self, frame)) |o| return o,
                 .AWAIT => if (try call_ops.opAwait(self, frame)) |o| return o,
                 .DEBUGGER => if (try call_ops.opDebugger(self, frame)) |o| return o,
                 .NEW_OBJECT => if (try object_ops.opNewObject(self, frame)) |o| return o,
@@ -1434,6 +1438,19 @@ pub const BcVm = struct {
         }
     }
 
+    /// Convert a JsException raised while eagerly initializing generator params
+    /// (buildGenerator/buildAsyncGenerator) into the string exception-marker the
+    /// doCall/doCallWithThis machinery propagates. Re-raises any other error.
+    fn paramInitExcMarker(self: *BcVm, e: anyerror) anyerror![]const u8 {
+        if (e != error.JsException) return e;
+        const realm_m = @import("../runtime/realm.zig");
+        if (realm_m.pending_exception.bits != 0) {
+            self.last_exception_value = realm_m.pending_exception;
+            realm_m.pending_exception = Value{};
+        }
+        return "__js_exception__";
+    }
+
     fn doCallWithThis(self: *BcVm, callee_val: Value, this_val: Value, base: u8, nargs: u8, ret_dst: u8) !?[]const u8 {
         const frame = &self.frames.items[self.frames.items.len - 1];
         switch (callee_val.unbox()) {
@@ -1446,7 +1463,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_async and fn_ptr.is_generator) {
                     var agargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| agargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const ag = try self.buildAsyncGenerator(fn_ptr, def_env, eff_this, agargs, closure);
+                    const ag = self.buildAsyncGenerator(fn_ptr, def_env, eff_this, agargs, closure) catch |e| return try self.paramInitExcMarker(e);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = ag;
                     return null;
                 }
@@ -1460,7 +1477,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_generator) {
                     var gargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| gargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const g = try self.buildGenerator(fn_ptr, def_env, eff_this, gargs, closure);
+                    const g = self.buildGenerator(fn_ptr, def_env, eff_this, gargs, closure) catch |e| return try self.paramInitExcMarker(e);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
@@ -2706,7 +2723,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_async and fn_ptr.is_generator) {
                     var agargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| agargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const ag = try self.buildAsyncGenerator(fn_ptr, def_env, this_val_eff, agargs, closure);
+                    const ag = self.buildAsyncGenerator(fn_ptr, def_env, this_val_eff, agargs, closure) catch |e| return try self.paramInitExcMarker(e);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = ag;
                     return null;
                 }
@@ -2721,7 +2738,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_generator) {
                     var gargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| gargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const g = try self.buildGenerator(fn_ptr, def_env, this_val_eff, gargs, closure);
+                    const g = self.buildGenerator(fn_ptr, def_env, this_val_eff, gargs, closure) catch |e| return try self.paramInitExcMarker(e);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
@@ -2998,7 +3015,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_async and fn_ptr.is_generator) {
                     var agargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| agargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
-                    const ag = try self.buildAsyncGenerator(fn_ptr, def_env, this_val_eff, agargs, closure);
+                    const ag = self.buildAsyncGenerator(fn_ptr, def_env, this_val_eff, agargs, closure) catch |e| return try self.paramInitExcMarker(e);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = ag;
                     return null;
                 }
@@ -3012,7 +3029,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_generator) {
                     var gargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| gargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
-                    const g = try self.buildGenerator(fn_ptr, def_env, this_val_eff, gargs, closure);
+                    const g = self.buildGenerator(fn_ptr, def_env, this_val_eff, gargs, closure) catch |e| return try self.paramInitExcMarker(e);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
@@ -3296,6 +3313,23 @@ pub const BcVm = struct {
         return if (closure.func.is_async) gr.async_gen_proto.? else gr.gen_proto.?;
     }
 
+    /// Run a generator's eager formal-parameter initialization (destructuring
+    /// prelude + defaults) at call time, up to the PARAMS_DONE marker. A parameter
+    /// error propagates to the caller (no generator object is produced), matching
+    /// FunctionDeclarationInstantiation running before Generator/AsyncGeneratorStart.
+    fn runParamInit(self: *BcVm, state: *BcGeneratorState) anyerror!void {
+        const res = try self.runSuspendable(state, .{ .next = try val_mod.makeUndefined(self.arena) });
+        switch (res) {
+            .threw => |e| {
+                @import("../runtime/realm.zig").pending_exception = e;
+                return error.JsException;
+            },
+            // .yielded → suspended at PARAMS_DONE (expected). .returned → body had
+            // no code after the params; the generator is already complete.
+            else => {},
+        }
+    }
+
     fn buildGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, closure: *BcClosure) !Value {
         const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
         const inst_proto = try self.genInstProto(closure);
@@ -3305,6 +3339,7 @@ pub const BcVm = struct {
             try JsObject.create(self.arena, inst_proto);
         obj.internal_kind = .generator;
         obj.internal_slot = state;
+        if (fn_ptr.has_param_init) try self.runParamInit(state);
         return val_mod.makeObject(self.arena, obj);
     }
 
@@ -3625,6 +3660,7 @@ pub const BcVm = struct {
             try JsObject.create(self.arena, inst_proto);
         obj.internal_kind = .async_generator;
         obj.internal_slot = agc;
+        if (fn_ptr.has_param_init) try self.runParamInit(state);
         return val_mod.makeObject(self.arena, obj);
     }
 

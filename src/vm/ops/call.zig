@@ -479,6 +479,23 @@ pub inline fn opAwait(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return RunOutcome{ .ok = awaited };
 }
 
+/// PARAMS_DONE — suspend after a generator's eager parameter initialization.
+/// No operand, no consumer-visible value: the generator build driver runs the
+/// body to this point at call time and stops here. The first `.next(v)` resumes
+/// after this op (v is ignored, per spec, so resume_reg points at a scratch reg).
+pub inline fn opParamsDone(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const state = frame.gen.?;
+    state.resume_reg = 0; // first .next() value is discarded
+    state.last_suspend_await = false;
+    state.raw_yield = false;
+    state.params_initialized = true;
+    state.frame = frame.*; // pc already points past the 1-byte op
+    _ = self.frames.pop();
+    self.result = try val_mod.makeUndefined(self.arena);
+    self.gen_yielded = true;
+    return RunOutcome{ .ok = self.result };
+}
+
 pub inline fn opDebugger(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // Phase 8: fire the installed debug hook (no-op if none).
     const debugger_mod = @import("../../runtime/debugger.zig");

@@ -99,6 +99,12 @@ pub const FnCompiler = struct {
     /// suspends via AWAIT (not YIELD) so the async-generator driver can tell an
     /// await apart from a yield. `yield` always uses YIELD.
     is_async_generator: bool = false,
+    /// True for any generator body (sync `function*` or `async function*`).
+    /// Gates emission of the PARAMS_DONE marker for eager parameter binding.
+    is_generator: bool = false,
+    /// Set when a PARAMS_DONE marker was emitted (the function has a
+    /// destructuring-param prelude). The VM runs the prelude eagerly at call time.
+    has_param_init: bool = false,
     /// M14: this function literal is an arrow (no own `arguments`/`this`).
     is_arrow: bool = false,
     /// M14: the body read an identifier named `arguments`. Combined with
@@ -1904,6 +1910,14 @@ pub const FnCompiler = struct {
             .labeled_stmt => try lower.lowerLabeledStmt(self, node, last_expr_reg),
             .empty_stmt => try lower.lowerEmptyStmt(self, node, last_expr_reg),
             .debugger_stmt => try lower.lowerDebuggerStmt(self, node, last_expr_reg),
+            .params_done => {
+                // Boundary between formal-parameter init and the body. Only
+                // generators run their prelude eagerly; others ignore the marker.
+                if (self.is_generator) {
+                    try self.emitOp(.PARAMS_DONE, node.start);
+                    self.has_param_init = true;
+                }
+            },
             else => {},
         }
     }
@@ -2070,6 +2084,7 @@ pub fn compileFunctionStrict(
     fc.is_strict = is_strict;
     fc.is_async = is_async;
     fc.is_async_generator = is_async and is_generator;
+    fc.is_generator = is_generator;
     fc.is_arrow = is_arrow;
 
     // Phase 2: all variable access is env-based (GET_GLOBAL/SET_GLOBAL).
@@ -2107,6 +2122,7 @@ pub fn compileFunctionStrict(
         .rest_param = rest_param,
         .is_strict = is_strict,
         .is_generator = is_generator,
+        .has_param_init = fc.has_param_init,
         .is_async = is_async,
         .is_arrow = is_arrow,
         .uses_arguments = fc.saw_arguments and !is_arrow,

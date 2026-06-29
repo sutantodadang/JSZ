@@ -1190,10 +1190,17 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
     // Prepend destructuring-param decls (binding the synthetic `__param_N`
-    // names) so they run before the function body proper.
+    // names) so they run before the function body proper. A `params_done` marker
+    // separates them from the body — for generators the build driver runs the
+    // prelude eagerly up to this marker at call time.
     if (param_prelude.len > 0) {
         var combined = std.ArrayList(*Node){};
         combined.appendSlice(p.arena, param_prelude) catch {
+            p.had_error = true;
+            return null;
+        };
+        const marker = p.makeNode(.params_done, 0, 0, .{ .params_done = {} }) orelse return null;
+        combined.append(p.arena, marker) catch {
             p.had_error = true;
             return null;
         };

@@ -295,7 +295,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d}", .{rsrc});
         },
-        .RETURN_UNDEF, .HALT, .DEBUGGER => {},
+        .RETURN_UNDEF, .HALT, .DEBUGGER, .PARAMS_DONE => {},
         // Phase 3a
         .NEW_OBJECT => {
             const rdst = code[new_pc];
