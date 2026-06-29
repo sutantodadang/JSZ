@@ -547,19 +547,37 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 
 ### Milestone 17.x — Async-generator completion  *(milestone, not a lever)*
 A scratch-corpus probe of `language/{statements,expressions}/async-generator`
-(57 fails / 90 in `statements/async-generator`) showed async generators are
-**broadly** incomplete — far beyond the two "async-gen levers" the M17 notes
-implied. Reclassified as its own milestone:
-- **Destructuring params via the iterator protocol** (~20 fails, `dstr/`): array
-  binding patterns with elision (`[,]`) / rest (`[...r]`) currently desugar to
-  index access (`src[i]`); spec requires the iterator protocol (the
-  `*-iter-step-err` / `*-iter-val-err` / `*-elision-step-err` tests verify it).
-  This is a general formal-parameter rework (affects all functions, e.g.
-  `function f([,]){}` already mis-parses), not async-gen-specific.
-- **Async-generator early errors** (~35 fails): negative tests expecting
-  Syntax/Type/Reference errors that are not raised.
-- Anonymous `async function*( … )` expression parse; async `yield <promise>`
-  operand pre-await; async `yield*` sent/return/throw forwarding
+(stmt 33/90, expr 89/202) showed async generators are **broadly** incomplete —
+far beyond the two "async-gen levers" the M17 notes implied. Reclassified as its
+own milestone. **Done this pass** (committed, 0 regression):
+- Crash fix: non-object `.prototype` → realm default proto (commit 70c5dfd).
+- General formal-parameter destructuring **parsing**: array elision (`[, x]`) /
+  rest (`[a, ...r]`), object CoverInitializedName (`{ x = 1 }`), and nested
+  pattern-with-default (`{ w: { x } = d }`). All `dstr/` parse failures cleared
+  (commits 779867d, 59b8726). These were general engine gaps (e.g.
+  `function f([,]){}` mis-parsed for ALL functions).
+
+**Remaining — two deep architectural blockers** (~156 `dstr/` + ~14 default-param
+fails), both general (not async-gen-specific) and warranting dedicated TDD:
+1. **Eager parameter binding for generators.** Param destructuring currently
+   desugars into the body prelude, so for generators/async-generators it runs
+   lazily on the first `.next()` instead of at call time. Spec evaluates formal
+   parameters during FunctionDeclarationInstantiation, *before* the generator
+   object is returned — so `g(throwingObj)` must throw synchronously. Verified:
+   `function f({x}){}` fires a throwing `x` getter at call; `function* g({x}){}`
+   does not. Fixes the ~66 `obj-ptrn-*-err` + default-param-abrupt cases. Needs a
+   separate eagerly-run param-init region (run in buildGenerator/
+   buildAsyncGenerator) rather than prelude-in-body.
+2. **Iterator-protocol array destructuring.** Array binding patterns desugar to
+   index access (`src[i]` / `src.slice(i)`); spec requires GetIterator +
+   IteratorStep + IteratorValue + IteratorClose (the `ary-ptrn-*-iter-step-err` /
+   `*-iter-val-err` / `*-iter-close` tests verify it). `desugarParamPattern` is
+   param-only (function + arrow params), so the rework is well-scoped, but the
+   IteratorClose-on-abrupt ordering needs careful try/finally emission. ~66
+   `ary-ptrn-*` cases.
+
+- Also: anonymous `async function*( … )` expression parse; async `yield
+  <promise>` operand pre-await; async `yield*` sent/return/throw forwarding
   (`compileAsyncYieldStar` is next-only today).
 - `%AsyncGeneratorPrototype%` structural exactness is already covered
   (`built-ins/AsyncGeneratorPrototype` 13/13).
