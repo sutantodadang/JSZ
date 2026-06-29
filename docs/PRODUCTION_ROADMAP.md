@@ -509,13 +509,24 @@ cross-realm proto (`proto-from-ctor-realm`/`detached-buffer-realm`/`use-custom-p
 >   `hasOwnProperty` / `delete` resolve a function to its backing object.
 >   `built-ins/GeneratorFunction` **16→21/23**, `built-ins/AsyncGeneratorFunction`
 >   **11→16/17**; zero regressions.
+> - **`caller`/`arguments` %ThrowTypeError% poison** — gen-scoped inherited
+>   accessor (get+set both throw) on %Generator%/%AsyncGenerator%. getProp
+>   materializes the generator backing obj so the inherited accessor fires;
+>   setPropR routes bc_function writes through OrdinarySet/findProperty. (commit
+>   351af81)
+> - **Per-realm generator intrinsic chain** — moved the chain off VM-global state
+>   onto per-`Realm` fields; secondary realms (`$262.createRealm`) build their own
+>   chain rooted in that realm's Object/Function prototypes. `functionCtorImpl`
+>   evals cross-realm dynamic generator bodies in the ctor realm's scope +
+>   NewTarget `[[Prototype]]` override; sloppy implicit-global writes route through
+>   `globalThis` (spec PutValue). Fixes the 2 cross-realm `proto-from-ctor-realm`
+>   tests. **`built-ins/GeneratorFunction` 23/23, `built-ins/AsyncGeneratorFunction`
+>   17/17** — generator-function-object exactness at 100%. Flip gate stash-compared:
+>   +2 pass, 0 regression. (commit eb09f6c)
 >
 > **Still deferred (not gate-blocking):**
 > - Real GC weak-collection/finalization semantics (entries held strongly; test262
 >   cannot test collection — coordinate with M19 ephemerons).
-> - Generator-fn `caller`/`arguments` %ThrowTypeError% poison (engine-wide
->   `Function.prototype` change) and cross-realm %GeneratorPrototype% identity
->   (`proto-from-ctor-realm-prototype`) — 3 GeneratorFunction tests.
 > - `yield*` observable IteratorClose access-ordering edge cases; `yield`
 >   rhs-omitted/regexp/template parse; async-gen `yield <promise>` not pre-awaited;
 >   async `yield*` resume-completion forwarding.
