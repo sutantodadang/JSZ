@@ -500,6 +500,28 @@ pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
     switch (pattern.kind) {
         .array_literal => {
             for (pattern.data.array_literal.elements, 0..) |el, i| {
+                // Elision (hole, e.g. `[, x]`): no binding for this position.
+                if (el.kind == .undefined_literal) continue;
+                // Rest element `[...rest]`: bind to the tail `src.slice(i)`.
+                // (Index-based, like the rest of this desugar; iterator-protocol
+                // exactness for array patterns is tracked separately.)
+                if (el.kind == .spread_expr) {
+                    const slice_key = p.makeNode(.identifier, el.start, el.start, .{ .identifier = "slice" }) orelse return false;
+                    const slice_member = p.makeNode(.member_expr, el.start, el.start, .{
+                        .member_expr = .{ .object = src, .property = slice_key, .computed = false },
+                    }) orelse return false;
+                    const from_idx = p.makeNode(.number_literal, el.start, el.start, .{ .number_literal = @floatFromInt(i) }) orelse return false;
+                    var sargs = std.ArrayList(*Node){};
+                    sargs.append(p.arena, from_idx) catch {
+                        p.had_error = true;
+                        return false;
+                    };
+                    const slice_call = p.makeNode(.call_expr, el.start, el.start, .{
+                        .call_expr = .{ .callee = slice_member, .args = sargs.items },
+                    }) orelse return false;
+                    if (!bindPatternElement(p, el.data.spread_expr, slice_call)) return false;
+                    break;
+                }
                 const idx = p.makeNode(.number_literal, el.start, el.start, .{ .number_literal = @floatFromInt(i) }) orelse return false;
                 const access = p.makeNode(.member_expr, el.start, el.start, .{
                     .member_expr = .{ .object = src, .property = idx, .computed = true },
@@ -1536,6 +1558,25 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 .identifier = key,
             }) orelse return null;
             props.append(p.arena, ast.ObjectProp{ .key = key, .value = id_node, .kind = .init }) catch {
+                p.had_error = true;
+                return null;
+            };
+            if (!p.match(.comma)) break;
+            continue;
+        }
+        // CoverInitializedName: `{ x = default }`. Only legal as a destructuring
+        // target (e.g. an object binding pattern in params or assignment). Parsed
+        // permissively here; the value is `ident = default` so the param /
+        // assignment-pattern desugar applies the default. A real object literal
+        // using this form is a refinement error we currently accept.
+        if (p.check(.eq)) {
+            _ = p.advance();
+            const def = p.parseAssignmentExpr() orelse return null;
+            const id_node = p.makeNode(.identifier, prop_start, prop_start, .{ .identifier = key }) orelse return null;
+            const ae = p.makeNode(.assignment_expr, prop_start, p.current.start, .{
+                .assignment_expr = .{ .target = id_node, .value = def, .op = .assign },
+            }) orelse return null;
+            props.append(p.arena, ast.ObjectProp{ .key = key, .value = ae, .kind = .init }) catch {
                 p.had_error = true;
                 return null;
             };
