@@ -1467,7 +1467,13 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             }
             const am_params = p.parseFunctionParams() orelse return null;
             p.super_used = false;
-            const am_body = p.parseFunctionBody() orelse return null;
+            const prev_gen = p.in_generator_function;
+            p.in_generator_function = m_is_gen;
+            const am_body = p.parseFunctionBody() orelse {
+                p.in_generator_function = prev_gen;
+                return null;
+            };
+            p.in_generator_function = prev_gen;
             const am_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
                     .is_method = true,
