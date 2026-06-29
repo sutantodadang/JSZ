@@ -592,13 +592,41 @@ Separate, still open (lower priority, not generator-blocking): anonymous
 - Intl: decide build — full ICU/CLDR data (large binary) vs. a curated subset vs. host-provided. Likely **host-provided ICU hook** to keep core small (aligns Tier 2).
 - **Gate:** `built-ins/RegExp` ≥99%; Intl scoped + documented (full ICU optional/host).
 
-### Milestone 19 — GC modernization  *(~2–3 mo)*
+### Milestone 19 — GC modernization  *(✅ COMPLETE)*
 **Goal:** lift the throughput/pause ceiling.
-- Generational collector (nursery + tenured); write barriers.
-- Incremental marking to bound pause times; concurrent sweep.
-- Ephemeron support for WeakMap/WeakRef correctness (feeds M17).
-- Decide on moving/compacting nursery — interacts with pointer-boxing (§6.2) and JIT root scanning (already exists). Handle-based rooting (`gc/handle.zig`) is the lever.
-- **Gate:** p99 pause <10ms on a GC-heavy benchmark; throughput +2× vs mark-sweep; no fuzz regressions.
+- ✅ **Iterative (worklist) marking** — replaced recursive marking; a deep/long
+  object graph (200k-node chain test) can no longer overflow the native stack.
+- ✅ **Automatic collection** — fixed-size nursery; a collection fires once
+  `nursery_bytes` of young allocation accrues. Suppressed until a VM root scanner
+  is installed (bootstrap safety); disable via `JSZ_GC_OFF`, stress via
+  `JSZ_GC_STRESS`. Verified safe by re-running the whole conformance/differential/
+  fuzz corpus with a 64 KiB nursery (collection on ~every allocation): identical
+  results, zero crashes — proving the engine's rooting discipline is sound.
+- ✅ **Generational collector (nursery + tenured) + write barriers** — non-moving
+  (pointer-stable, required by §6.2). Minor GC scans roots + a precise remembered
+  set (old→young edges recorded by a write barrier on every property/proto store)
+  and sweeps only the nursery, promoting survivors to old. A major every
+  `major_period` minors reclaims old-gen floating garbage.
+- ✅ **Ephemeron support** — WeakRef targets cleared on collection; WeakMap values
+  kept alive iff the key is live (ephemeron fixpoint); dead WeakMap/WeakSet
+  entries purged; FinalizationRegistry dead cells dropped (callback *scheduling*
+  needs a host job queue — deferred). Also fixed a latent dangling-pointer class
+  for *strong* Map/Set whose entries were never traced (harmless when GC never
+  ran; real once auto-GC collects).
+- **Moving/compacting nursery:** decided **against** — `value.zig` is pointer-boxed
+  and pointer-stability is relied on across the engine/JIT (§6.2); the non-moving
+  generational design delivers the gate without a moving collector.
+- **Incremental marking:** not built — the pause gate is met by the generational
+  design alone (see below); incremental marking was only a means to that end.
+  Re-open if a larger old gen pushes major pauses toward 10 ms.
+- **Gate — MET** (`zig build gc-bench -Doptimize=ReleaseFast`, 20k retained + 1.5M
+  churned objects, 1 MiB nursery): **GC throughput 4.11× vs mark-sweep** (GC time
+  1213 ms → 295 ms; target ≥2×); **p99 pause 3.97 ms** (target <10 ms). No fuzz
+  regressions; conformance 0-flip and differential 148/148 hold both normally and
+  under `JSZ_GC_STRESS`. (Wall-time speedup 1.42× — total time is mutator-dominated,
+  so GC-time ratio is the meaningful throughput metric.)
+- **Remaining (non-gating) follow-ups:** concurrent sweep; incremental marking;
+  FinalizationRegistry callback scheduling (needs the M23 job queue).
 
 ### Milestone 20 — JIT tier-up  *(~2–3 mo)*
 **Goal:** real multi-tier engine, falsifiable perf.

@@ -14,6 +14,7 @@ const Value = @import("../value/value.zig").Value;
 const shape_mod = @import("../value/shape.zig");
 const Shape = shape_mod.Shape;
 const ShapeManager = shape_mod.ShapeManager;
+const heap_mod = @import("../gc/heap.zig");
 
 /// Maximum prototype chain depth before we give up (cycle guard, Phase 3a).
 const MAX_PROTO_DEPTH: usize = 64;
@@ -46,6 +47,11 @@ pub const JsObject = struct {
     /// Used by the GC mark phase to avoid dereferencing a fake header on
     /// arena objects reached via proto walks.
     is_gc_managed: bool = false,
+    /// The owning GC Heap (`*heap_mod.Heap`), set by Heap.allocateObject; null
+    /// for arena objects. Used by the generational write barrier (gcWrite) to
+    /// record old→young edges. Stored as opaque to avoid an import cycle in the
+    /// field type (the barrier casts it back).
+    gc_heap: ?*anyopaque = null,
     /// Transient GC cycle guard for arena-allocated (non-GC-managed) intrinsics,
     /// which have no GcHeader `marked` bit. Set while the mark phase is walking
     /// this object and cleared after each collection (see Heap.markObject). Guards
@@ -111,6 +117,27 @@ pub const JsObject = struct {
         return heap.allocateArray(proto);
     }
 
+    /// Generational write barrier: call after storing `v` into this object so the
+    /// collector records an old→young edge. No-op for arena objects (gc_heap is
+    /// null); the barrier itself filters out young owners and non-young values.
+    pub inline fn gcWrite(self: *JsObject, v: Value) void {
+        if (self.gc_heap) |hp| {
+            const heap: *heap_mod.Heap = @ptrCast(@alignCast(hp));
+            heap.writeBarrier(self, v);
+        }
+    }
+
+    /// Write barrier for a `proto` assignment. Call after `self.proto = child`
+    /// so an old→young prototype edge is recorded for the next minor GC.
+    pub inline fn setProtoBarrier(self: *JsObject, child: ?*JsObject) void {
+        if (child) |c| {
+            if (self.gc_heap) |hp| {
+                const heap: *heap_mod.Heap = @ptrCast(@alignCast(hp));
+                heap.writeBarrierObj(self, c);
+            }
+        }
+    }
+
     /// Get own property (no proto walk). Returns null for accessor slots so
     /// enumeration and the plain `get` path skip them (accessor dispatch happens
     /// in the VM via `findProperty`/`ownAccessorHolder`).
@@ -172,6 +199,7 @@ pub const JsObject = struct {
             self.slots.items[new_slot] = value;
             self.attrs.items[new_slot] = .{};
         }
+        self.gcWrite(value);
         if (self.is_array) {
             const idx = std.fmt.parseUnsigned(u32, key, 10) catch return;
             // "4294967295" (u32 max) is not a valid array index; `idx + 1` overflows.
@@ -241,6 +269,7 @@ pub const JsObject = struct {
         if (@as(*anyopaque, @ptrCast(self.shape)) != expected_shape) return false;
         if (slot >= self.slots.items.len) return false;
         self.slots.items[slot] = value;
+        self.gcWrite(value);
         return true;
     }
 
@@ -313,6 +342,7 @@ pub const JsObject = struct {
                 }
                 if (slot < self.slots.items.len) self.slots.items[slot] = value;
                 if (slot < self.attrs.items.len) self.attrs.items[slot] = attr;
+                self.gcWrite(value);
                 return true;
             }
         }
@@ -324,6 +354,7 @@ pub const JsObject = struct {
             try self.growSlots(new_slot + 1);
             self.slots.items[new_slot] = value;
             self.attrs.items[new_slot] = attr;
+            self.gcWrite(value);
             if (self.is_array) {
                 const idx = std.fmt.parseUnsigned(u32, key, 10) catch return true;
                 // Valid array indices are 0..2^32-2; "4294967295" (u32 max) is a
@@ -429,6 +460,7 @@ pub const JsObject = struct {
         try self.growSlots(new_slot + 1);
         self.slots.items[new_slot] = holder;
         self.attrs.items[new_slot] = attr;
+        self.gcWrite(holder);
         // Array exotic [[DefineOwnProperty]]: defining an own property at an array
         // index >= length extends the array's length (matches defineOwnData).
         if (self.is_array) {
@@ -515,11 +547,13 @@ pub const JsObject = struct {
                 if (!sp.attr.writable) return;
                 sp.value = value;
                 sp.attr = attr;
+                self.gcWrite(value);
                 return;
             }
         }
         if (!self.extensible) return;
         try self.sym_props.append(self.arena, .{ .key = sym_key, .value = value, .attr = attr });
+        self.gcWrite(value);
     }
 
     /// Delete own symbol-keyed property; honors configurable. Returns true if removed.
@@ -563,6 +597,7 @@ pub const JsObject = struct {
                 sp.value = value;
                 sp.attr = attr;
                 sp.attr.is_accessor = false;
+                self.gcWrite(value);
                 return true;
             }
         }
@@ -570,6 +605,7 @@ pub const JsObject = struct {
         var a = attr;
         a.is_accessor = false;
         try self.sym_props.append(self.arena, .{ .key = sym_key, .value = value, .attr = a });
+        self.gcWrite(value);
         return true;
     }
 
@@ -603,6 +639,7 @@ pub const JsObject = struct {
                 sp.value = holder;
                 sp.attr = attr;
                 sp.attr.is_accessor = true;
+                self.gcWrite(holder);
                 return true;
             }
         }
@@ -610,6 +647,7 @@ pub const JsObject = struct {
         var a = attr;
         a.is_accessor = true;
         try self.sym_props.append(self.arena, .{ .key = sym_key, .value = holder, .attr = a });
+        self.gcWrite(holder);
         return true;
     }
 };

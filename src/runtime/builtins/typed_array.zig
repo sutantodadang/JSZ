@@ -923,6 +923,7 @@ fn applyNewTargetProto(arena: std.mem.Allocator, this_obj: *JsObject, dpk: Defau
     const pv = try vmGet(arena, nt, "prototype");
     if (pv.bits != 0 and pv.unbox() == .object) {
         this_obj.proto = pv.toPtr().object;
+        this_obj.setProtoBarrier(pv.toPtr().object);
         return;
     }
     // GetPrototypeFromConstructor fallback: NewTarget.prototype is not an object,
@@ -936,7 +937,10 @@ fn applyNewTargetProto(arena: std.mem.Allocator, this_obj: *JsObject, dpk: Defau
         .data_view => fr.dv_prototype,
         .typed_array => |k| fr.ta_kind_prototypes[@intFromEnum(k)],
     };
-    if (fallback) |p| this_obj.proto = p;
+    if (fallback) |p| {
+        this_obj.proto = p;
+        this_obj.setProtoBarrier(p);
+    }
 }
 
 // ---------------------------------------------------------------- element IO ---

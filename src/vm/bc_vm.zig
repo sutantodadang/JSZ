@@ -639,12 +639,16 @@ pub const BcVm = struct {
         const self: *BcVm = @ptrCast(@alignCast(ptr));
         if (obj_val.bits == 0) return;
         switch (obj_val.unbox()) {
-            .object => |o| o.proto = proto,
+            .object => |o| {
+                o.proto = proto;
+                o.setProtoBarrier(proto);
+            },
             // bc_function ctor: set the backing object's proto so static members
             // resolve along the constructor chain (class subclassing).
             .bc_function => |c| {
                 const bo = try self.closureBackingObj(c);
                 bo.proto = proto;
+                bo.setProtoBarrier(proto);
             },
             else => {},
         }
@@ -981,6 +985,7 @@ pub const BcVm = struct {
                         if (sym_obj.shape.key_to_slot.get(entry[0])) |slot| {
                             if (slot < sym_obj.slots.items.len) {
                                 sym_obj.slots.items[slot] = primary_sym;
+                                sym_obj.gcWrite(primary_sym);
                             }
                         }
                     }
@@ -3633,6 +3638,7 @@ pub const BcVm = struct {
             if (realm.gen_iterator_proto == null) {
                 // Primary realm: stale pointer after activateHeap — fix in-place.
                 shared_iter.proto = realm.object_prototype;
+                shared_iter.setProtoBarrier(realm.object_prototype);
                 break :root_blk shared_iter;
             }
             // Secondary realm: create a realm-private IteratorPrototype copy.

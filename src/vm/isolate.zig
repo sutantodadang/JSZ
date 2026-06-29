@@ -127,7 +127,28 @@ pub const IsolateImpl = struct {
         const lim = impl.limiter.allocator();
         impl.eval_arena = std.heap.ArenaAllocator.init(lim);
         impl.heap = Heap.init(lim);
+        applyGcEnv(&impl.heap, backing);
         return impl;
+    }
+
+    /// M19: tune the GC auto-trigger from environment variables. Off by default
+    /// (the built-in defaults apply). `JSZ_GC_OFF=1` disables automatic GC;
+    /// `JSZ_GC_STRESS=1` forces a very low watermark so a collection fires on
+    /// nearly every allocation — used to flush out unrooted-local bugs across the
+    /// conformance/fuzz corpus. `JSZ_GC_STRESS=<bytes>` sets an explicit watermark.
+    fn applyGcEnv(heap: *Heap, alloc: std.mem.Allocator) void {
+        if (std.process.getEnvVarOwned(alloc, "JSZ_GC_OFF")) |v| {
+            alloc.free(v);
+            heap.gc_enabled = false;
+            return;
+        } else |_| {}
+        if (std.process.getEnvVarOwned(alloc, "JSZ_GC_STRESS")) |v| {
+            defer alloc.free(v);
+            const bytes = std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t\r\n"), 10) catch 0;
+            // Tiny nursery → a collection fires on nearly every allocation, flushing
+            // out unrooted-local / missed-barrier bugs across the corpus.
+            heap.nursery_bytes = if (bytes >= 4096) bytes else 64 * 1024;
+        } else |_| {}
     }
 
     /// W3: set resource limits. 0 = unlimited. Memory applies isolate-wide
@@ -148,6 +169,26 @@ pub const IsolateImpl = struct {
     /// Manually trigger a GC cycle. Returns stats.
     pub fn gc(self: *IsolateImpl) CollectStats {
         return self.heap.collect();
+    }
+
+    /// Benchmark/embedding GC tuning. `nursery_bytes` is the fixed nursery size
+    /// (bytes of young allocation between collections); `major_period` is the
+    /// number of minor collections between full majors (0 ⇒ every auto-collect is
+    /// a major ⇒ non-generational mark-sweep). `pause_log` records pauses.
+    pub fn gcConfigure(self: *IsolateImpl, nursery_bytes: usize, major_period: usize, pause_log: bool) void {
+        self.heap.nursery_bytes = nursery_bytes;
+        self.heap.major_period = major_period;
+        self.heap.pause_log_enabled = pause_log;
+    }
+
+    /// Recorded per-collection pauses (ns), if pause logging was enabled.
+    pub fn gcPauses(self: *IsolateImpl) []const u64 {
+        return self.heap.pause_log.items;
+    }
+
+    /// (minor, major) collection counts.
+    pub fn gcGenCounts(self: *IsolateImpl) struct { minor: usize, major: usize } {
+        return .{ .minor = self.heap.minor_collections, .major = self.heap.major_collections };
     }
 
     /// Heap stats snapshot (cumulative).

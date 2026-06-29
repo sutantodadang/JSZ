@@ -150,6 +150,9 @@ pub const GcStats = struct {
     objects_alive: usize,
 };
 
+/// M19: minor/major GC collection counts (Context.gcGenCounts).
+pub const GcGenCounts = struct { minor: usize, major: usize };
+
 /// Signature for a native function callable from JS.
 pub const NativeFn = *const fn (*Context, []const Value) NativeResult;
 
@@ -450,6 +453,30 @@ pub const Context = struct {
             .bytes_freed = s.bytes_freed,
             .objects_alive = s.objects_alive,
         };
+    }
+
+    /// EXPERIMENTAL (unstable, may change before 1.0).
+    /// M19: tune the generational GC. `nursery_bytes` = fixed nursery size (young
+    /// bytes between collections); `major_period` = minor collections between full
+    /// majors (0 ⇒ every collect is a major, i.e. classic non-generational
+    /// mark-sweep — used for A/B perf comparison); `pause_log` records pauses.
+    pub fn gcConfigure(self: *Context, nursery_bytes: usize, major_period: usize, pause_log: bool) void {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        impl.gcConfigure(nursery_bytes, major_period, pause_log);
+    }
+
+    /// EXPERIMENTAL. M19: per-collection pauses (ns) recorded since pause logging
+    /// was enabled via gcConfigure.
+    pub fn gcPauses(self: *Context) []const u64 {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        return impl.gcPauses();
+    }
+
+    /// EXPERIMENTAL. M19: (minor, major) collection counts.
+    pub fn gcGenCounts(self: *Context) GcGenCounts {
+        const impl: *IsolateImpl = @ptrCast(@alignCast(self._isolate._impl.?));
+        const c = impl.gcGenCounts();
+        return GcGenCounts{ .minor = c.minor, .major = c.major };
     }
 
     /// EXPERIMENTAL (unstable, may change before 1.0).

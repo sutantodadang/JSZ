@@ -9,6 +9,7 @@ const realm_mod = @import("../realm.zig");
 const intrinsics = @import("intrinsics.zig");
 const ta_mod = @import("typed_array.zig");
 const symbol_mod = @import("symbol.zig");
+const Heap = @import("../../gc/heap.zig").Heap;
 const InternalKind = @TypeOf((@as(JsObject, undefined)).internal_kind);
 
 /// Shared %ArrayIteratorPrototype% — the [[Prototype]] of every iterator
@@ -217,10 +218,12 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
 
         if (active_map_iter_proto) |p| {
             p.proto = iter_proto;
+            p.setProtoBarrier(iter_proto);
             try p.setSymAttr(iter_sym, try val_mod.makeNativeFunctionNamed(arena, nativeIterSelf, "[Symbol.iterator]", 0), iter_attr);
         }
         if (active_set_iter_proto) |p| {
             p.proto = iter_proto;
+            p.setProtoBarrier(iter_proto);
             try p.setSymAttr(iter_sym, try val_mod.makeNativeFunctionNamed(arena, nativeIterSelf, "[Symbol.iterator]", 0), iter_attr);
         }
         // Map.prototype[@@iterator] = Map.prototype.entries
@@ -311,7 +314,19 @@ fn getSetDataBranded(arena: std.mem.Allocator, this_val: Value) anyerror!*SetDat
 fn makeObj(arena: std.mem.Allocator, proto: ?*JsObject, kind: InternalKind) !Value {
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
     obj.internal_kind = kind;
+    registerCollection(obj, kind);
     return val_mod.makeObject(arena, obj);
+}
+
+/// Register a collection object with the GC so it is traced/weak-processed even
+/// after tenuring. Idempotent (dedups via the header). No-op for non-collections.
+fn registerCollection(obj: *JsObject, kind: InternalKind) void {
+    switch (kind) {
+        .map, .set, .weakmap, .weakset, .weakref, .finalization_registry => {
+            if (realm_mod.active_heap) |h| h.noteWeakContainer(obj);
+        },
+        else => {},
+    }
 }
 
 /// A WeakMap/WeakSet key must be held weakly, which the spec restricts to
@@ -368,6 +383,7 @@ pub fn nativeMapCtor(arena: std.mem.Allocator, this_val: Value, args: []const Va
     const d = try arena.create(MapData);
     d.* = .{};
     obj.internal_kind = .map;
+    registerCollection(obj, .map);
     obj.internal_slot = d;
     if (args.len > 0) {
         const iterable = args[0];
@@ -391,6 +407,7 @@ pub fn nativeWeakMapCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
     const d = try arena.create(MapData);
     d.* = .{};
     obj.internal_kind = .weakmap;
+    registerCollection(obj, .weakmap);
     obj.internal_slot = d;
     if (args.len > 0) {
         const iterable = args[0];
@@ -414,6 +431,7 @@ pub fn nativeSetCtor(arena: std.mem.Allocator, this_val: Value, args: []const Va
     const d = try arena.create(SetData);
     d.* = .{};
     obj.internal_kind = .set;
+    registerCollection(obj, .set);
     obj.internal_slot = d;
     if (args.len > 0) {
         const iterable = args[0];
@@ -437,6 +455,7 @@ pub fn nativeWeakSetCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
     const d = try arena.create(SetData);
     d.* = .{};
     obj.internal_kind = .weakset;
+    registerCollection(obj, .weakset);
     obj.internal_slot = d;
     if (args.len > 0) {
         const iterable = args[0];
@@ -664,6 +683,7 @@ pub fn nativeWeakRefCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
     const d = try arena.create(WeakRefData);
     d.* = .{ .target = target };
     obj.internal_kind = .weakref;
+    registerCollection(obj, .weakref);
     obj.internal_slot = d;
     return out;
 }
@@ -720,6 +740,7 @@ pub fn nativeFinRegCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     const d = try arena.create(FinRegData);
     d.* = .{ .callback = cb };
     obj.internal_kind = .finalization_registry;
+    registerCollection(obj, .finalization_registry);
     obj.internal_slot = d;
     return out;
 }
@@ -774,6 +795,93 @@ pub fn nativeFinRegUnregister(arena: std.mem.Allocator, this_val: Value, args: [
         }
     }
     return val_mod.makeBool(arena, removed);
+}
+
+// ---- GC integration (M19) -------------------------------------------------
+
+/// GC mark hook: trace the STRONG internal contents of a marked collection.
+/// Ordinary Map/Set keep their keys and values alive (their entries live in an
+/// arena-side struct the collector cannot see by walking object slots). Weak
+/// containers are deliberately NOT traced here — their reachability is decided
+/// by gcProcessWeak after marking. Registered as Heap.strong_trace_fn.
+pub fn gcStrongTrace(heap: *Heap, obj: *JsObject) void {
+    switch (obj.internal_kind) {
+        .map => {
+            const d: *MapData = @ptrCast(@alignCast(obj.internal_slot orelse return));
+            for (d.keys.items) |k| heap.markValueLive(k);
+            for (d.values.items) |v| heap.markValueLive(v);
+        },
+        .set => {
+            const d: *SetData = @ptrCast(@alignCast(obj.internal_slot orelse return));
+            for (d.values.items) |v| heap.markValueLive(v);
+        },
+        else => {},
+    }
+}
+
+/// GC weak hook: after marking, run ephemeron marking then purge dead weak
+/// entries / clear dead WeakRef targets. Registered as Heap.weak_process_fn.
+///
+/// Ephemeron semantics: a WeakMap value is reachable iff its key is reachable.
+/// Marking a value can make further keys reachable, so iterate to a fixpoint.
+/// FinalizationRegistry: dead cells are dropped (cleanup callbacks are not yet
+/// scheduled — that needs a host job queue and is a separate follow-up).
+pub fn gcProcessWeak(heap: *Heap) void {
+    while (true) {
+        var changed = false;
+        var i: usize = 0;
+        while (i < heap.weakList().len) : (i += 1) {
+            const obj = heap.weakList()[i];
+            if (obj.internal_kind != .weakmap) continue;
+            const d: *MapData = @ptrCast(@alignCast(obj.internal_slot orelse continue));
+            for (d.keys.items, d.values.items) |k, v| {
+                if (heap.isValueLive(k) and !heap.isValueLive(v)) {
+                    heap.markValueLive(v);
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) break;
+        heap.drainWeak(); // propagate; may append newly-live weak containers
+    }
+
+    for (heap.weakList()) |obj| {
+        switch (obj.internal_kind) {
+            .weakref => {
+                const d: *WeakRefData = @ptrCast(@alignCast(obj.internal_slot orelse continue));
+                if (d.target.bits != 0 and !heap.isValueLive(d.target)) d.target = Value{};
+            },
+            .weakmap => {
+                const d: *MapData = @ptrCast(@alignCast(obj.internal_slot orelse continue));
+                var i: usize = 0;
+                while (i < d.keys.items.len) {
+                    if (!heap.isValueLive(d.keys.items[i])) {
+                        _ = d.keys.swapRemove(i);
+                        _ = d.values.swapRemove(i);
+                    } else i += 1;
+                }
+            },
+            .weakset => {
+                const d: *SetData = @ptrCast(@alignCast(obj.internal_slot orelse continue));
+                var i: usize = 0;
+                while (i < d.values.items.len) {
+                    if (!heap.isValueLive(d.values.items[i])) {
+                        _ = d.values.swapRemove(i);
+                    } else i += 1;
+                }
+            },
+            .finalization_registry => {
+                const d: *FinRegData = @ptrCast(@alignCast(obj.internal_slot orelse continue));
+                var i: usize = 0;
+                while (i < d.cells.items.len) {
+                    if (!heap.isValueLive(d.cells.items[i].target)) {
+                        _ = d.cells.swapRemove(i);
+                    } else i += 1;
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 /// Shared iterable initialization for WeakMap (is_map=true, expects [key,val] pairs)
