@@ -99,6 +99,10 @@ fn formatNumber(
     const min_frac = min_frac_in;
     var max_frac = max_frac_in;
     if (max_frac < min_frac) max_frac = min_frac;
+    // `pow10(max_frac)` must fit u64 (10^18 < 2^63) and f64 carries only ~17
+    // significant digits, so a larger fraction-digit count cannot be represented;
+    // clamp the scale exponent to avoid integer overflow in pow10.
+    if (max_frac > 18) max_frac = 18;
 
     const sign_prefix: []const u8 = if (negative) "-" else "";
     var cur_prefix: []const u8 = "";
@@ -115,7 +119,12 @@ fn formatNumber(
     const scale = pow10(max_frac);
     const scale_f: f64 = @floatFromInt(scale);
     const scaled: f64 = @round(n * scale_f);
-    const scaled_u: u64 = @intFromFloat(scaled);
+    // Guard the float→int conversion: a value large enough to overflow u64 (or NaN)
+    // would panic @intFromFloat. Saturate instead of crashing.
+    const scaled_u: u64 = if (std.math.isNan(scaled) or scaled < 0 or scaled >= 1.8446744073709552e19)
+        std.math.maxInt(u64)
+    else
+        @intFromFloat(scaled);
     const int_part = scaled_u / scale;
     const frac_part = scaled_u % scale;
 
@@ -144,6 +153,25 @@ fn currencySymbol(code: []const u8) []const u8 {
     return "$";
 }
 
+fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    const obj = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.error_proto_RangeError)
+    else
+        try JsObject.create(arena, realm_mod.error_proto_RangeError);
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "RangeError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
+}
+
+/// Coerce an Intl fraction-digits option to u32. Per ECMA-402 these must be
+/// integers in a bounded range; a NaN / negative / huge value would panic
+/// `@intFromFloat`, so validate and throw RangeError (the spec error) instead.
+fn toFracDigits(arena: std.mem.Allocator, m: f64) anyerror!u32 {
+    if (std.math.isNan(m) or m < 0 or m > 100) return throwRangeError(arena, "fraction digits value is out of range");
+    return @intFromFloat(@floor(m));
+}
+
 // ----------------------------------------------------------------- NumberFormat ---
 
 /// `new Intl.NumberFormat(locales, options)` — store resolved options on `this`.
@@ -165,8 +193,8 @@ pub fn nativeNumberFormatCtor(arena: std.mem.Allocator, this_val: Value, args: [
     const default_min: u32 = if (is_currency) (if (is_jpy) 0 else 2) else 0;
     const default_max: u32 = if (is_currency) (if (is_jpy) 0 else 2) else if (std.mem.eql(u8, style, "percent")) 0 else 3;
 
-    const min_frac: u32 = if (optNum(opts, "minimumFractionDigits")) |m| @intFromFloat(m) else default_min;
-    const max_frac: u32 = if (optNum(opts, "maximumFractionDigits")) |m| @intFromFloat(m) else @max(default_max, min_frac);
+    const min_frac: u32 = if (optNum(opts, "minimumFractionDigits")) |m| try toFracDigits(arena, m) else default_min;
+    const max_frac: u32 = if (optNum(opts, "maximumFractionDigits")) |m| try toFracDigits(arena, m) else @max(default_max, min_frac);
     const group: bool = optBool(opts, "useGrouping") orelse true;
 
     try obj.set("__intl_style", try val_mod.makeString(arena, style));

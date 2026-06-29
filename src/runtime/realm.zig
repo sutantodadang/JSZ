@@ -189,6 +189,24 @@ pub fn evalModule(
 /// Thread-local pointer to the currently active Context (set by VMs at eval entry).
 pub var active_context: ?*Context = null;
 
+/// Wall-clock deadline (ns, `std.time.nanoTimestamp` epoch) for the current eval,
+/// mirrored from the bc VM so long native loops (e.g. Array.prototype methods over
+/// a huge/sparse length) can be interrupted just like bytecode loops. 0 = no limit.
+pub var native_deadline_ns: i128 = 0;
+
+/// Cheap periodic deadline check for hot native loops. Only samples the clock
+/// every 8192 calls (clock reads are relatively expensive); returns true once the
+/// eval's wall-clock deadline has passed. Callers return `error.OutOfMemory` (the
+/// Test262 runner treats both "out of memory" and "interrupted:" as skip), which
+/// unwinds the native loop instead of letting it run for billions of iterations.
+var native_deadline_counter: u32 = 0;
+pub fn nativeDeadlineExceeded() bool {
+    if (native_deadline_ns == 0) return false;
+    native_deadline_counter +%= 1;
+    if (native_deadline_counter & 0x1FFF != 0) return false;
+    return std.time.nanoTimestamp() >= native_deadline_ns;
+}
+
 /// Thread-local reentrant callback depth counter.
 pub var callback_depth: u32 = 0;
 

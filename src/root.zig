@@ -284,6 +284,15 @@ pub fn asyncDoneSignaled() bool {
     return realm_mod.async_done_signaled;
 }
 
+/// Test-harness hook: free the process-global hidden-class (shape) store and
+/// reset it to empty. The shape transition graph is never freed during normal
+/// operation; the Test262 runner spawns tens of thousands of isolates in one
+/// process, so without this the global store grows unbounded (multi-GB). Safe
+/// only between fully-deinit'd isolates (no live object may reference a shape).
+pub fn resetGlobalShapes() void {
+    @import("./value/shape.zig").resetGlobalManager();
+}
+
 /// EXPERIMENTAL (unstable, may change before 1.0).
 /// Phase 8: compile `source` and write a bytecode→source JSON source map to
 /// `writer`. Maps each opcode (and nested function literals) back to a

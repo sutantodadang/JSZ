@@ -431,7 +431,18 @@ pub inline fn opYield(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const yielded = frame.registers[rsrc];
     // The frame must belong to a generator (compiler only emits
     // YIELD inside generator bodies). Save the suspended frame.
-    const state = frame.gen.?;
+    const state = frame.gen orelse {
+        // `yield`/`await` reached a frame with no generator state. The compiler
+        // normally emits these only in generator/async bodies, but some
+        // desugarings (e.g. `yield` inside a class computed property name) can
+        // land here. Throw a SyntaxError instead of dereferencing null (segfault).
+        const msg = "yield/await in unsupported context";
+        const exc_val = try self.makeErrorObjectBc("SyntaxError", msg);
+        self.last_exception_value = exc_val;
+        const found = try self.throwException(exc_val);
+        if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+        return null;
+    };
     state.resume_reg = rsrc;
     state.last_suspend_await = false; // a `yield` suspend
     state.raw_yield = false; // plain yield → consumer gets a wrapped result
@@ -450,7 +461,18 @@ pub inline fn opYieldStar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const yielded = frame.registers[rsrc];
-    const state = frame.gen.?;
+    const state = frame.gen orelse {
+        // `yield`/`await` reached a frame with no generator state. The compiler
+        // normally emits these only in generator/async bodies, but some
+        // desugarings (e.g. `yield` inside a class computed property name) can
+        // land here. Throw a SyntaxError instead of dereferencing null (segfault).
+        const msg = "yield/await in unsupported context";
+        const exc_val = try self.makeErrorObjectBc("SyntaxError", msg);
+        self.last_exception_value = exc_val;
+        const found = try self.throwException(exc_val);
+        if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+        return null;
+    };
     state.resume_reg = rsrc;
     state.last_suspend_await = false; // still a `yield` suspend
     state.raw_yield = true; // delegated yield → pass inner result through unwrapped
@@ -469,7 +491,18 @@ pub inline fn opAwait(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const awaited = frame.registers[rsrc];
-    const state = frame.gen.?;
+    const state = frame.gen orelse {
+        // `yield`/`await` reached a frame with no generator state. The compiler
+        // normally emits these only in generator/async bodies, but some
+        // desugarings (e.g. `yield` inside a class computed property name) can
+        // land here. Throw a SyntaxError instead of dereferencing null (segfault).
+        const msg = "yield/await in unsupported context";
+        const exc_val = try self.makeErrorObjectBc("SyntaxError", msg);
+        self.last_exception_value = exc_val;
+        const found = try self.throwException(exc_val);
+        if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+        return null;
+    };
     state.resume_reg = rsrc;
     state.last_suspend_await = true; // an `await` suspend
     state.frame = frame.*; // pc already advanced past AWAIT
@@ -484,7 +517,18 @@ pub inline fn opAwait(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 /// body to this point at call time and stops here. The first `.next(v)` resumes
 /// after this op (v is ignored, per spec, so resume_reg points at a scratch reg).
 pub inline fn opParamsDone(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
-    const state = frame.gen.?;
+    const state = frame.gen orelse {
+        // `yield`/`await` reached a frame with no generator state. The compiler
+        // normally emits these only in generator/async bodies, but some
+        // desugarings (e.g. `yield` inside a class computed property name) can
+        // land here. Throw a SyntaxError instead of dereferencing null (segfault).
+        const msg = "yield/await in unsupported context";
+        const exc_val = try self.makeErrorObjectBc("SyntaxError", msg);
+        self.last_exception_value = exc_val;
+        const found = try self.throwException(exc_val);
+        if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+        return null;
+    };
     state.resume_reg = 0; // first .next() value is discarded
     state.last_suspend_await = false;
     state.raw_yield = false;

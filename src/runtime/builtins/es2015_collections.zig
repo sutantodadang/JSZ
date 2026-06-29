@@ -815,6 +815,12 @@ pub fn gcStrongTrace(heap: *Heap, obj: *JsObject) void {
             const d: *SetData = @ptrCast(@alignCast(obj.internal_slot orelse return));
             for (d.values.items) |v| heap.markValueLive(v);
         },
+        .array_iterator => {
+            // Keep the array/string being iterated alive for the iterator's
+            // lifetime — otherwise a collection mid-`for...of` frees it.
+            const d: *SeqIterData = @ptrCast(@alignCast(obj.internal_slot orelse return));
+            heap.markValueLive(d.seq);
+        },
         else => {},
     }
 }
@@ -1196,6 +1202,7 @@ fn makeMapIterator(arena: std.mem.Allocator, data: *MapIterData) !Value {
     const proto = active_map_iter_proto;
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
     obj.internal_slot = data;
+    obj.internal_kind = .map_iterator;
     return val_mod.makeObject(arena, obj);
 }
 
@@ -1203,6 +1210,7 @@ fn makeSetIterator(arena: std.mem.Allocator, data: *SetIterData) !Value {
     const proto = active_set_iter_proto;
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
     obj.internal_slot = data;
+    obj.internal_kind = .set_iterator;
     return val_mod.makeObject(arena, obj);
 }
 
@@ -1242,7 +1250,13 @@ pub fn nativeSetEntries(arena: std.mem.Allocator, this_val: Value, _: []const Va
 pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const obj = this_val.toPtr().object;
-    if (obj.internal_slot == null) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    // Brand check: %MapIteratorPrototype%.next on a non-iterator receiver (e.g. a
+    // Map) must throw TypeError, NOT @ptrCast the wrong internal_slot (type
+    // confusion → segfault).
+    if (obj.internal_kind != .map_iterator or obj.internal_slot == null) {
+        try setTypeError(arena, "Method called on incompatible receiver (not a Map Iterator)");
+        unreachable;
+    }
     const iter: *MapIterData = @ptrCast(@alignCast(obj.internal_slot.?));
     if (iter.index >= iter.map.keys.items.len) {
         return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
@@ -1269,7 +1283,12 @@ pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
 pub fn nativeSetIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const obj = this_val.toPtr().object;
-    if (obj.internal_slot == null) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    // Brand check (see nativeMapIteratorNext): non-iterator receiver → TypeError,
+    // never a wrong-type @ptrCast.
+    if (obj.internal_kind != .set_iterator or obj.internal_slot == null) {
+        try setTypeError(arena, "Method called on incompatible receiver (not a Set Iterator)");
+        unreachable;
+    }
     const iter: *SetIterData = @ptrCast(@alignCast(obj.internal_slot.?));
     if (iter.index >= iter.set.values.items.len) {
         return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
@@ -1740,6 +1759,11 @@ pub fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
     const proto = active_array_iter_proto;
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
     obj.internal_slot = d;
+    // Brand so the GC traces `d.seq` (the array/string being iterated) via
+    // gcStrongTrace. Without a brand `internal_kind == .none` and scanChildren
+    // skips the internal slot, so the iterated array is collected mid-loop →
+    // use-after-free. Also lets `next` reject a non-iterator receiver.
+    obj.internal_kind = .array_iterator;
     // Fallback when the shared proto is not built (early bootstrap): own next.
     if (proto == null) try obj.set("next", try val_mod.makeNativeFunction(arena, nativeSeqIterNext));
     return val_mod.makeObject(arena, obj);

@@ -756,6 +756,7 @@ fn genLength(arena: std.mem.Allocator, this_val: Value) !usize {
 
 /// ? Get(O, ToString(i)) firing exotic/accessor reads.
 fn genGet(arena: std.mem.Allocator, this_val: Value, i: usize) !Value {
+    if (realm_mod.nativeDeadlineExceeded()) return error.OutOfMemory;
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
     if (realm_mod.active_context) |ctx| return ctx.getProp(arena, this_val, key);
     if (this_val.isHeapPtr() and this_val.toPtr().* == .object)
@@ -765,6 +766,7 @@ fn genGet(arena: std.mem.Allocator, this_val: Value, i: usize) !Value {
 
 /// ? Set(O, ToString(i), v, true) firing exotic/accessor writes.
 fn genSet(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
+    if (realm_mod.nativeDeadlineExceeded()) return error.OutOfMemory;
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
     if (realm_mod.active_context) |ctx| {
         try ctx.setProp(arena, this_val, key, v);
