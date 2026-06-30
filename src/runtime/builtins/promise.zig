@@ -28,6 +28,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !*JsObject {
     try promise_ctor_obj.set("any", try val_mod.makeNativeFunctionNamed(arena, nativePromiseAny, "any", 0));
     try promise_ctor_obj.set("withResolvers", try val_mod.makeNativeFunctionNamed(arena, nativePromiseWithResolvers, "withResolvers", 0));
     try promise_proto.set("finally", try val_mod.makeNativeFunctionNamed(arena, nativePromiseFinally, "finally", 0));
+    _ = try promise_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Promise"), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try promise_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
     try ctx.env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
     return promise_proto;
 }

@@ -37,6 +37,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
     const date_ctor = try intrinsics.makeCtor(arena, date_proto, nativeDateCtor, null);
     try intrinsics.setMethod(arena, date_ctor, "now", nativeDateNow);
+    _ = try date_ctor.defineOwnData("name", try val_mod.makeString(arena, "Date"), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try date_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 7), .{ .writable = false, .enumerable = false, .configurable = true });
     try ctx.defineGlobal("Date", date_ctor);
 }
 

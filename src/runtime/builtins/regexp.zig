@@ -31,6 +31,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try regexp_ctor_obj.set("prototype", regexp_proto_val);
     const regexp_call_fn = try val_mod.makeNativeFunction(arena, nativeRegExpCtor);
     try regexp_ctor_obj.set("__call__", regexp_call_fn);
+    _ = try regexp_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "RegExp"), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try regexp_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 2), .{ .writable = false, .enumerable = false, .configurable = true });
     const regexp_ctor_val = try val_mod.makeObject(arena, regexp_ctor_obj);
     try ctx.env.define("RegExp", regexp_ctor_val);
 

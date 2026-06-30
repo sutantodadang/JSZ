@@ -2844,6 +2844,8 @@ pub const Realm = struct {
         try object_ctor.set("prototype", proto_val);
 
         // Define "Object" in global env as the constructor object.
+        _ = try object_ctor.defineOwnData("name", try val_mod.makeString(arena, "Object"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try object_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         const ctor_val = try val_mod.makeObject(arena, object_ctor);
         try env.define("Object", ctor_val);
 
@@ -3086,6 +3088,8 @@ pub const Realm = struct {
         // Array.fromAsync: non-enumerable to satisfy prop-desc test (§23.1.2.1)
         const from_async_attr = obj_mod.PropAttr{ .writable = true, .enumerable = false, .configurable = true };
         _ = try array_ctor_obj.defineOwnData("fromAsync", try val_mod.makeNativeFunctionNamed(arena, nativeArrayFromAsync, "fromAsync", 1), from_async_attr);
+        _ = try array_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Array"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try array_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
 
         const string_ctor_obj = try JsObject.create(arena, null);
@@ -3093,6 +3097,8 @@ pub const Realm = struct {
         try string_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeStringCtor));
         try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCharCode, "fromCharCode", 0));
         try string_proto.set("constructor", try val_mod.makeObject(arena, string_ctor_obj));
+        _ = try string_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "String"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try string_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("String", try val_mod.makeObject(arena, string_ctor_obj));
 
         const number_proto = try JsObject.create(arena, object_proto);
@@ -3122,6 +3128,8 @@ pub const Realm = struct {
         _ = try number_ctor_obj.defineOwnData("isNaN", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsNaN, "isNaN", 1), num_method_attr);
         _ = try number_ctor_obj.defineOwnData("isSafeInteger", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsSafeInteger, "isSafeInteger", 1), num_method_attr);
         try number_proto.set("constructor", try val_mod.makeObject(arena, number_ctor_obj));
+        _ = try number_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Number"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try number_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
 
         // ---- BigInt(value) global (conversion function; literals `1n` lex
@@ -3149,6 +3157,8 @@ pub const Realm = struct {
             try bigint_ctor_obj.set("prototype", try val_mod.makeObject(arena, bigint_proto));
             active_bigint_proto = bigint_proto;
         }
+        _ = try bigint_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try bigint_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("BigInt", try val_mod.makeObject(arena, bigint_ctor_obj));
 
         // ---- Function constructor (minimal): callable object so `typeof Function`
@@ -3158,6 +3168,8 @@ pub const Realm = struct {
         try function_ctor_obj.set("prototype", try val_mod.makeObject(arena, function_proto));
         try function_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeFunctionCtor));
         try function_proto.set("constructor", try val_mod.makeObject(arena, function_ctor_obj));
+        _ = try function_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Function"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try function_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Function", try val_mod.makeObject(arena, function_ctor_obj));
         active_function_ctor = function_ctor_obj;
 
@@ -3172,6 +3184,8 @@ pub const Realm = struct {
         try boolean_ctor_obj.set("prototype", try val_mod.makeObject(arena, boolean_proto));
         try boolean_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBooleanCtor));
         try boolean_proto.set("constructor", try val_mod.makeObject(arena, boolean_ctor_obj));
+        _ = try boolean_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Boolean"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try boolean_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Boolean", try val_mod.makeObject(arena, boolean_ctor_obj));
         try env.define("isNaN", try val_mod.makeNativeFunction(arena, nativeIsNaN));
         try env.define("eval", try val_mod.makeNativeFunction(arena, nativeEval));
@@ -3207,6 +3221,8 @@ pub const Realm = struct {
         // Symbol.prototype.constructor === Symbol, and the `description` accessor
         // (a getter holder `{ get: nativeFn }`, matching the live-reexport pattern).
         try symbol_proto.set("constructor", try val_mod.makeObject(arena, symbol_ctor));
+        _ = try symbol_ctor.defineOwnData("name", try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try symbol_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
         const sym_desc_holder = try JsObject.create(arena, null);
         try sym_desc_holder.set("get", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolDescriptionGet, "get", 0));
         _ = try symbol_proto.defineOwnAccessor("description", try val_mod.makeObject(arena, sym_desc_holder), .{
@@ -3264,6 +3280,8 @@ pub const Realm = struct {
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
         _ = try proxy_ctor.defineOwnData("revocable", try val_mod.makeNativeFunctionNamed(arena, proxy_mod.nativeProxyRevocable, "revocable", 2), .{ .writable = true, .enumerable = false, .configurable = true });
+        _ = try proxy_ctor.defineOwnData("name", try val_mod.makeString(arena, "Proxy"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try proxy_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 2), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
 
         // ---- Intl (en-US, dependency-free) ----
