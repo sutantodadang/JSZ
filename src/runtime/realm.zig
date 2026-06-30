@@ -3118,6 +3118,7 @@ pub const Realm = struct {
         _ = try array_ctor_obj.defineOwnData("fromAsync", try val_mod.makeNativeFunctionNamed(arena, nativeArrayFromAsync, "fromAsync", 1), from_async_attr);
         _ = try array_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Array"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try array_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try array_proto.defineOwnData("constructor", try val_mod.makeObject(arena, array_ctor_obj), .{ .writable = true, .enumerable = false, .configurable = true });
         try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
 
         const string_ctor_obj = try JsObject.create(arena, null);

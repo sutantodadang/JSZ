@@ -34,6 +34,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     _ = try regexp_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "RegExp"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try regexp_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 2), .{ .writable = false, .enumerable = false, .configurable = true });
     const regexp_ctor_val = try val_mod.makeObject(arena, regexp_ctor_obj);
+    _ = try regexp_proto.defineOwnData("constructor", regexp_ctor_val, .{ .writable = true, .enumerable = false, .configurable = true });
     try ctx.env.define("RegExp", regexp_ctor_val);
 
     realm_mod.active_regexp_proto = regexp_proto;
