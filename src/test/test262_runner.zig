@@ -642,12 +642,14 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     switch (result) {
         .ok => return .pass,
         .exception => |e| {
+            if (debug_fail) std.debug.print("EXC {s} :: {s}\n", .{ test_path, e.message });
             const n = @min(e.message.len, g_fail_msg_buf.len);
             @memcpy(g_fail_msg_buf[0..n], e.message[0..n]);
             g_fail_msg_len = n;
             return .fail;
         },
         .parse_error => |e| {
+            if (debug_fail) std.debug.print("PERR {s} :: {s} (line {d}:{d})\n", .{ test_path, e.message, e.line, e.column });
             const n = @min(e.message.len, g_fail_msg_buf.len);
             @memcpy(g_fail_msg_buf[0..n], e.message[0..n]);
             g_fail_msg_len = n;

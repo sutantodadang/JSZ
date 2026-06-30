@@ -1869,7 +1869,7 @@ pub fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
     // use-after-free. Also lets `next` reject a non-iterator receiver.
     obj.internal_kind = .array_iterator;
     // Fallback when the shared proto is not built (early bootstrap): own next.
-    if (proto == null) try obj.set("next", try val_mod.makeNativeFunction(arena, nativeSeqIterNext));
+    if (proto == null) try obj.set("next", try val_mod.makeNativeFunctionNamed(arena, nativeSeqIterNext, "next", 0));
     return val_mod.makeObject(arena, obj);
 }
 
@@ -2161,7 +2161,7 @@ pub fn nativeGetAsyncIterator(arena: std.mem.Allocator, _: Value, args: []const 
     else
         try JsObject.create(arena, null);
     try wrap.set("__syncit__", sync_it);
-    try wrap.set("next", try val_mod.makeNativeFunction(arena, nativeAsyncFromSyncNext));
+    try wrap.set("next", try val_mod.makeNativeFunctionNamed(arena, nativeAsyncFromSyncNext, "next", 0));
     return val_mod.makeObject(arena, wrap);
 }
 

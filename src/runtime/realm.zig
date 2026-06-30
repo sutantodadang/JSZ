@@ -43,6 +43,7 @@ const proxy_mod = @import("./builtins/proxy.zig");
 const shadow_realm_mod = @import("./builtins/shadow_realm.zig");
 // Phase 13 Intl
 const intl_mod = @import("./builtins/intl.zig");
+const builtinLength = @import("./builtins/builtin_lengths.zig").builtinLength;
 
 // ---------------------------------------------------------------- Context interface ---
 
@@ -647,7 +648,7 @@ pub fn nativeLiveReexport(arena: std.mem.Allocator, _: Value, args: []const Valu
     // and use a generic getter that reads them back.
     try getter_holder.set("__source__", args[2]);
     try getter_holder.set("__prop__", args[3]);
-    try getter_holder.set("get", try val_mod.makeNativeFunction(arena, liveReexportGetter));
+    try getter_holder.set("get", try val_mod.makeNativeFunctionNamed(arena, liveReexportGetter, "get", 0));
     const holder_val = try val_mod.makeObject(arena, getter_holder);
 
     const ok = try exports_obj.defineOwnAccessor(name, holder_val, .{
@@ -2499,7 +2500,7 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
     };
     const str_method_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (fns) |pair| {
-        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0);
+        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], builtinLength("String.prototype." ++ pair[0]));
         _ = try proto.defineOwnData(pair[0], fn_val, str_method_attr);
     }
     // String.prototype is itself a String object with [[StringData]] = "".
@@ -2552,7 +2553,7 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
     };
     const method_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (fns) |pair| {
-        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0);
+        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], builtinLength("Array.prototype." ++ pair[0]));
         _ = try proto.defineOwnData(pair[0], fn_val, method_attr);
     }
 }
@@ -2968,30 +2969,30 @@ pub const Realm = struct {
             const obj_val_ptr = &obj_binding.value;
             if (obj_val_ptr.bits != 0 and obj_val_ptr.unbox() == .object) {
                 const ctor_obj = obj_val_ptr.toPtr().object;
-                const keys_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectKeys);
-                const values_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectValues);
+                const keys_fn = try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectKeys, "keys", 1);
+                const values_fn = try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectValues, "values", 1);
                 try ctor_obj.set("keys", keys_fn);
                 try ctor_obj.set("values", values_fn);
-                try ctor_obj.set("assign", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectAssign));
+                try ctor_obj.set("assign", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectAssign, "assign", 0));
                 const entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectEntries);
                 try ctor_obj.set("entries", entries_fn);
                 const from_entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFromEntries);
                 try ctor_obj.set("fromEntries", from_entries_fn);
                 const gopd_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptors);
                 try ctor_obj.set("getOwnPropertyDescriptors", gopd_fn);
-                try ctor_obj.set("getPrototypeOf", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetPrototypeOf));
-                try ctor_obj.set("setPrototypeOf", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectSetPrototypeOf));
-                try ctor_obj.set("getOwnPropertyNames", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyNames));
-                try ctor_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptor));
-                try ctor_obj.set("defineProperty", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectDefineProperty));
-                try ctor_obj.set("defineProperties", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectDefineProperties));
-                try ctor_obj.set("freeze", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFreeze));
-                try ctor_obj.set("seal", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectSeal));
-                try ctor_obj.set("preventExtensions", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectPreventExtensions));
-                try ctor_obj.set("isFrozen", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsFrozen));
-                try ctor_obj.set("isSealed", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsSealed));
-                try ctor_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsExtensible));
-                try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols));
+                try ctor_obj.set("getPrototypeOf", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetPrototypeOf, "getPrototypeOf", 0));
+                try ctor_obj.set("setPrototypeOf", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectSetPrototypeOf, "setPrototypeOf", 0));
+                try ctor_obj.set("getOwnPropertyNames", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetOwnPropertyNames, "getOwnPropertyNames", 0));
+                try ctor_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptor, "getOwnPropertyDescriptor", 0));
+                try ctor_obj.set("defineProperty", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectDefineProperty, "defineProperty", 0));
+                try ctor_obj.set("defineProperties", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectDefineProperties, "defineProperties", 0));
+                try ctor_obj.set("freeze", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectFreeze, "freeze", 0));
+                try ctor_obj.set("seal", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectSeal, "seal", 0));
+                try ctor_obj.set("preventExtensions", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectPreventExtensions, "preventExtensions", 0));
+                try ctor_obj.set("isFrozen", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsFrozen, "isFrozen", 0));
+                try ctor_obj.set("isSealed", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsSealed, "isSealed", 0));
+                try ctor_obj.set("isExtensible", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsExtensible, "isExtensible", 0));
+                try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols, "getOwnPropertySymbols", 0));
                 try ctor_obj.set("is", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIs, "is", 2));
                 try ctor_obj.set("hasOwn", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectHasOwn, "hasOwn", 2));
                 try ctor_obj.set("groupBy", try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeObjectGroupBy, "groupBy", 2));
@@ -3065,7 +3066,7 @@ pub const Realm = struct {
         try env.define("__require_cache__", try val_mod.makeObject(arena, require_cache_obj));
         const require_obj = try JsObject.create(arena, function_proto);
         try require_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeRequire));
-        try require_obj.set("resolve", try val_mod.makeNativeFunction(arena, nativeRequireResolve));
+        try require_obj.set("resolve", try val_mod.makeNativeFunctionNamed(arena, nativeRequireResolve, "resolve", 0));
         try require_obj.set("cache", try val_mod.makeObject(arena, require_cache_obj));
         try env.define("require", try val_mod.makeObject(arena, require_obj));
         const module_obj = try JsObject.create(arena, null);
@@ -3090,15 +3091,15 @@ pub const Realm = struct {
         const string_ctor_obj = try JsObject.create(arena, null);
         try string_ctor_obj.set("prototype", try val_mod.makeObject(arena, string_proto));
         try string_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeStringCtor));
-        try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunction(arena, nativeStringFromCharCode));
+        try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCharCode, "fromCharCode", 0));
         try string_proto.set("constructor", try val_mod.makeObject(arena, string_ctor_obj));
         try env.define("String", try val_mod.makeObject(arena, string_ctor_obj));
 
         const number_proto = try JsObject.create(arena, object_proto);
         // Number.prototype is itself a Number object with [[NumberData]] = +0.
         try number_proto.set("[[PrimitiveValue]]", try val_mod.makeNumber(arena, 0));
-        try number_proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeNumberValueOf));
-        try number_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeNumberToString));
+        try number_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeNumberValueOf, "valueOf", 0));
+        try number_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToString, "toString", 0));
         active_number_proto = number_proto;
         const number_ctor_obj = try JsObject.create(arena, null);
         try number_ctor_obj.set("prototype", try val_mod.makeObject(arena, number_proto));
@@ -3164,8 +3165,8 @@ pub const Realm = struct {
         const boolean_proto = try JsObject.create(arena, object_proto);
         // Boolean.prototype is itself a Boolean object with [[BooleanData]] = false.
         try boolean_proto.set("[[PrimitiveValue]]", try val_mod.makeBool(arena, false));
-        try boolean_proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeBooleanValueOf));
-        try boolean_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeBooleanToString));
+        try boolean_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeBooleanValueOf, "valueOf", 0));
+        try boolean_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeBooleanToString, "toString", 0));
         active_boolean_proto = boolean_proto;
         const boolean_ctor_obj = try JsObject.create(arena, null);
         try boolean_ctor_obj.set("prototype", try val_mod.makeObject(arena, boolean_proto));
@@ -3186,7 +3187,7 @@ pub const Realm = struct {
 
         // ---- ES2015 Symbol ----
         const symbol_proto = try JsObject.create(arena, object_proto);
-        try symbol_proto.set("toString", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolToString));
+        try symbol_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolToString, "toString", 0));
         active_symbol_proto = symbol_proto;
         const symbol_ctor = try JsObject.create(arena, null);
         try symbol_ctor.set("__call__", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolCall));
@@ -3195,8 +3196,8 @@ pub const Realm = struct {
         // live in this realm's arena; a stale registry from a prior (freed) realm
         // dangles and causes a use-after-free on the next Symbol.for.
         symbol_mod.resetRegistry();
-        try symbol_ctor.set("for", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolFor));
-        try symbol_ctor.set("keyFor", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolKeyFor));
+        try symbol_ctor.set("for", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolFor, "for", 0));
+        try symbol_ctor.set("keyFor", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolKeyFor, "keyFor", 0));
         // Well-known symbols (identity constants; inert in S1).
         const wk_names = [_][]const u8{ "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable", "match", "replace", "search", "split", "species", "toPrimitive", "toStringTag", "unscopables" };
         for (wk_names) |name| {
@@ -3207,7 +3208,7 @@ pub const Realm = struct {
         // (a getter holder `{ get: nativeFn }`, matching the live-reexport pattern).
         try symbol_proto.set("constructor", try val_mod.makeObject(arena, symbol_ctor));
         const sym_desc_holder = try JsObject.create(arena, null);
-        try sym_desc_holder.set("get", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolDescriptionGet));
+        try sym_desc_holder.set("get", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolDescriptionGet, "get", 0));
         _ = try symbol_proto.defineOwnAccessor("description", try val_mod.makeObject(arena, sym_desc_holder), .{
             .enumerable = false,
             .configurable = true,
@@ -3270,21 +3271,21 @@ pub const Realm = struct {
             const intl_obj = try JsObject.create(arena, object_proto);
             // Intl.NumberFormat
             const nf_proto = try JsObject.create(arena, object_proto);
-            try nf_proto.set("format", try val_mod.makeNativeFunction(arena, intl_mod.nativeNumberFormatFormat));
+            try nf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeNumberFormatFormat, "format", 0));
             const nf_ctor = try JsObject.create(arena, null);
             try nf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeNumberFormatCtor));
             try nf_ctor.set("prototype", try val_mod.makeObject(arena, nf_proto));
             try intl_obj.set("NumberFormat", try val_mod.makeObject(arena, nf_ctor));
             // Intl.DateTimeFormat
             const dtf_proto = try JsObject.create(arena, object_proto);
-            try dtf_proto.set("format", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatFormat));
+            try dtf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatFormat, "format", 0));
             const dtf_ctor = try JsObject.create(arena, null);
             try dtf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatCtor));
             try dtf_ctor.set("prototype", try val_mod.makeObject(arena, dtf_proto));
             try intl_obj.set("DateTimeFormat", try val_mod.makeObject(arena, dtf_ctor));
             // Intl.Collator
             const col_proto = try JsObject.create(arena, object_proto);
-            try col_proto.set("compare", try val_mod.makeNativeFunction(arena, intl_mod.nativeCollatorCompare));
+            try col_proto.set("compare", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeCollatorCompare, "compare", 0));
             const col_ctor = try JsObject.create(arena, null);
             try col_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeCollatorCtor));
             try col_ctor.set("prototype", try val_mod.makeObject(arena, col_proto));

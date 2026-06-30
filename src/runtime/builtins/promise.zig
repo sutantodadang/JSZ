@@ -14,20 +14,20 @@ const intrinsics = @import("intrinsics.zig");
 pub fn register(ctx: *const intrinsics.Ctx) !*JsObject {
     const arena = ctx.arena;
     const promise_proto = try JsObject.create(arena, ctx.object_proto);
-    try promise_proto.set("then", try val_mod.makeNativeFunction(arena, nativePromiseThen));
-    try promise_proto.set("catch", try val_mod.makeNativeFunction(arena, nativePromiseCatch));
+    try promise_proto.set("then", try val_mod.makeNativeFunctionNamed(arena, nativePromiseThen, "then", 0));
+    try promise_proto.set("catch", try val_mod.makeNativeFunctionNamed(arena, nativePromiseCatch, "catch", 0));
 
     const promise_ctor_obj = try JsObject.create(arena, null);
     try promise_ctor_obj.set("prototype", try val_mod.makeObject(arena, promise_proto));
     try promise_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativePromiseCtor));
-    try promise_ctor_obj.set("resolve", try val_mod.makeNativeFunction(arena, nativePromiseResolve));
-    try promise_ctor_obj.set("reject", try val_mod.makeNativeFunction(arena, nativePromiseReject));
-    try promise_ctor_obj.set("allSettled", try val_mod.makeNativeFunction(arena, nativePromiseAllSettled));
-    try promise_ctor_obj.set("all", try val_mod.makeNativeFunction(arena, nativePromiseAll));
-    try promise_ctor_obj.set("race", try val_mod.makeNativeFunction(arena, nativePromiseRace));
-    try promise_ctor_obj.set("any", try val_mod.makeNativeFunction(arena, nativePromiseAny));
-    try promise_ctor_obj.set("withResolvers", try val_mod.makeNativeFunction(arena, nativePromiseWithResolvers));
-    try promise_proto.set("finally", try val_mod.makeNativeFunction(arena, nativePromiseFinally));
+    try promise_ctor_obj.set("resolve", try val_mod.makeNativeFunctionNamed(arena, nativePromiseResolve, "resolve", 0));
+    try promise_ctor_obj.set("reject", try val_mod.makeNativeFunctionNamed(arena, nativePromiseReject, "reject", 0));
+    try promise_ctor_obj.set("allSettled", try val_mod.makeNativeFunctionNamed(arena, nativePromiseAllSettled, "allSettled", 0));
+    try promise_ctor_obj.set("all", try val_mod.makeNativeFunctionNamed(arena, nativePromiseAll, "all", 0));
+    try promise_ctor_obj.set("race", try val_mod.makeNativeFunctionNamed(arena, nativePromiseRace, "race", 0));
+    try promise_ctor_obj.set("any", try val_mod.makeNativeFunctionNamed(arena, nativePromiseAny, "any", 0));
+    try promise_ctor_obj.set("withResolvers", try val_mod.makeNativeFunctionNamed(arena, nativePromiseWithResolvers, "withResolvers", 0));
+    try promise_proto.set("finally", try val_mod.makeNativeFunctionNamed(arena, nativePromiseFinally, "finally", 0));
     try ctx.env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
     return promise_proto;
 }

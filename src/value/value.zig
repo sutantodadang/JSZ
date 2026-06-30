@@ -11,6 +11,7 @@ const BcClosure = @import("../bytecode/function.zig").BcClosure;
 
 /// Phase 3a object type.
 const JsObject = @import("../object/object.zig").JsObject;
+const builtin_lengths = @import("../runtime/builtins/builtin_lengths.zig");
 
 /// Signature for a native function callable from JS (mirrors root.zig NativeFn).
 /// We use a simpler form here to avoid circular imports: args are []Value, returns Value.
@@ -651,10 +652,14 @@ pub fn makeNativeFunction(arena: std.mem.Allocator, fn_ptr: NativeFnPtr) !Value 
     return Value.fromPtr(v);
 }
 
-/// Wrap a native function with a name and length.
+/// Wrap a native function with a name and length. When `length` is 0, fall back
+/// to the spec `length` for `name` if it is an unambiguous built-in method name
+/// (most registration sites pass 0; this gives them the correct arity without
+/// threading an owner-qualified key through every call site).
 pub fn makeNativeFunctionNamed(arena: std.mem.Allocator, fn_ptr: NativeFnPtr, name: []const u8, length: u8) !Value {
+    const eff_len = if (length == 0) builtin_lengths.builtinLengthByName(name) else length;
     const v = try arena.create(JsValue);
-    v.* = .{ .native_function = .{ .call = fn_ptr, .name = name, .length = length } };
+    v.* = .{ .native_function = .{ .call = fn_ptr, .name = name, .length = eff_len } };
     return Value.fromPtr(v);
 }
 

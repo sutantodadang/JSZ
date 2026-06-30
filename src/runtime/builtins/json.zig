@@ -11,8 +11,8 @@ const intrinsics = @import("intrinsics.zig");
 pub fn register(ctx: *const intrinsics.Ctx) !void {
     const arena = ctx.arena;
     const json_obj = try JsObject.create(arena, null);
-    const stringify_fn = try val_mod.makeNativeFunction(arena, nativeJsonStringify);
-    const parse_fn = try val_mod.makeNativeFunction(arena, nativeJsonParse);
+    const stringify_fn = try val_mod.makeNativeFunctionNamed(arena, nativeJsonStringify, "stringify", 3);
+    const parse_fn = try val_mod.makeNativeFunctionNamed(arena, nativeJsonParse, "parse", 2);
     try json_obj.set("stringify", stringify_fn);
     try json_obj.set("parse", parse_fn);
     const json_val = try val_mod.makeObject(arena, json_obj);
