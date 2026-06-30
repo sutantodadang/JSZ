@@ -2254,6 +2254,105 @@ fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, _: []const Va
     return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
 }
 
+fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toFixed requires a Number");
+    const f_raw: f64 = if (args.len == 0) 0.0 else args[0].toF64();
+    const f: i64 = if (std.math.isNan(f_raw)) 0 else @as(i64, @intFromFloat(@trunc(f_raw)));
+    if (f < 0 or f > 100) return throwRangeError(arena, "toFixed() digits argument must be between 0 and 100");
+    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
+    if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    if (@abs(n) >= 1e21) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    const fu: usize = @intCast(f);
+    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ n, fu }));
+}
+
+/// Shared helper: format `n` in exponential notation.
+/// `f == -1` means no fractionDigits argument (use shortest form).
+fn numberToExponentialImpl(arena: std.mem.Allocator, n: f64, f: i64) ![]const u8 {
+    const abs_n = @abs(n);
+    // Avoid -0 in sign
+    const negative = n < 0.0 and abs_n != 0.0;
+
+    // Compute exponent and mantissa
+    var exp: i64 = 0;
+    var mant: f64 = 0.0;
+    if (abs_n != 0.0) {
+        const log = std.math.log10(abs_n);
+        exp = @as(i64, @intFromFloat(@floor(log)));
+        mant = abs_n / std.math.pow(f64, 10.0, @as(f64, @floatFromInt(exp)));
+        // Clamp to [1, 10) due to floating-point rounding
+        if (mant >= 10.0) { mant /= 10.0; exp += 1; }
+        else if (mant < 1.0) { mant *= 10.0; exp -= 1; }
+    }
+
+    var buf = std.ArrayList(u8){};
+    if (negative) try buf.append(arena, '-');
+
+    if (f == -1) {
+        // Not provided: shortest representation (trim trailing zeros)
+        const high_prec: usize = 17;
+        const full = try std.fmt.allocPrint(arena, "{d:.[1]}", .{ mant, high_prec });
+        var end = full.len;
+        if (std.mem.indexOfScalar(u8, full, '.') != null) {
+            while (end > 0 and full[end - 1] == '0') end -= 1;
+            if (end > 0 and full[end - 1] == '.') end -= 1;
+        }
+        try buf.appendSlice(arena, full[0..end]);
+    } else {
+        const fu: usize = @intCast(f);
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ mant, fu }));
+    }
+
+    // Exponent: e+N or e-N, no leading zeros
+    try buf.append(arena, 'e');
+    if (exp >= 0) {
+        try buf.append(arena, '+');
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(exp))}));
+    } else {
+        try buf.append(arena, '-');
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(-exp))}));
+    }
+    return buf.items;
+}
+
+fn nativeNumberToExponential(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toExponential requires a Number");
+    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
+    if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
+    var f: i64 = -1; // -1 = not provided → shortest
+    if (has_arg) {
+        const f_raw = args[0].toF64();
+        f = if (std.math.isNan(f_raw)) 0 else @as(i64, @intFromFloat(@trunc(f_raw)));
+        if (f < 0 or f > 100) return throwRangeError(arena, "toExponential() argument must be between 0 and 100");
+    }
+    return val_mod.makeString(arena, try numberToExponentialImpl(arena, n, f));
+}
+
+fn nativeNumberToPrecision(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toPrecision requires a Number");
+    const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
+    // No argument → same as toString
+    if (!has_arg) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    const p_raw = args[0].toF64();
+    const p: i64 = if (std.math.isNan(p_raw)) 1 else @as(i64, @intFromFloat(@trunc(p_raw)));
+    if (p < 1 or p > 100) return throwRangeError(arena, "toPrecision() argument must be between 1 and 100");
+    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
+    if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    const abs_n = @abs(n);
+    // e = floor(log10(|n|)), 0 for n == 0
+    const e: i64 = if (abs_n == 0.0) 0 else @as(i64, @intFromFloat(@floor(std.math.log10(abs_n))));
+    if (e >= p or e < -6) {
+        // Exponential form: p-1 fraction digits
+        return val_mod.makeString(arena, try numberToExponentialImpl(arena, n, p - 1));
+    } else {
+        // Fixed form: p-1-e fraction digits
+        const frac: i64 = p - 1 - e;
+        const fu: usize = if (frac < 0) 0 else @intCast(frac);
+        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ n, fu }));
+    }
+}
+
 /// ES Number.isInteger / isFinite / isNaN / isSafeInteger: no coercion — a
 /// non-Number argument yields false rather than being converted.
 fn numberArg(args: []const Value) ?f64 {
@@ -3135,6 +3234,9 @@ pub const Realm = struct {
         try number_proto.set("[[PrimitiveValue]]", try val_mod.makeNumber(arena, 0));
         try number_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeNumberValueOf, "valueOf", 0));
         try number_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToString, "toString", 0));
+        try number_proto.set("toFixed", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToFixed, "toFixed", 1));
+        try number_proto.set("toExponential", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToExponential, "toExponential", 1));
+        try number_proto.set("toPrecision", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToPrecision, "toPrecision", 1));
         active_number_proto = number_proto;
         const number_ctor_obj = try JsObject.create(arena, null);
         try number_ctor_obj.set("prototype", try val_mod.makeObject(arena, number_proto));
