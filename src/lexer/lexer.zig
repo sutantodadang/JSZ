@@ -259,6 +259,9 @@ pub const Lexer = struct {
             // `yield /re/` — yield is an operator-position keyword, so a following
             // `/` starts a regex (`received = yield/abc/i`), not division.
             .kw_yield,
+            // `=> /re/` — a concise arrow body begins in expression position, so a
+            // following `/` starts a regex (`x => /a/.test(x)`), not division.
+            .arrow,
             => true,
             else => false,
         };
