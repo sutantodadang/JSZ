@@ -875,3 +875,321 @@ pub fn nativePadStart(arena: std.mem.Allocator, this_val: Value, args: []const V
 pub fn nativePadEnd(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     return padImpl(arena, this_val, args, false);
 }
+
+// ---------------------------------------------------------------------------
+// HTML wrapper methods (Annex B B.2.3)
+// ---------------------------------------------------------------------------
+
+/// Wrap receiver S in an HTML tag. When attrName is non-null, escapes `"` in
+/// attrVal to `&quot;` and produces `<tag attrName="attrVal">S</tag>`.
+fn htmlWrap(
+    arena: std.mem.Allocator,
+    s: []const u8,
+    tag: []const u8,
+    attr_name: ?[]const u8,
+    attr_val: ?[]const u8,
+) !Value {
+    if (attr_name) |aname| {
+        const av = attr_val orelse "undefined";
+        var esc = std.ArrayList(u8){};
+        for (av) |c| {
+            if (c == '"') {
+                try esc.appendSlice(arena, "&quot;");
+            } else {
+                try esc.append(arena, c);
+            }
+        }
+        const result = try std.fmt.allocPrint(arena, "<{s} {s}=\"{s}\">{s}</{s}>", .{ tag, aname, esc.items, s, tag });
+        return val_mod.makeString(arena, result);
+    } else {
+        const result = try std.fmt.allocPrint(arena, "<{s}>{s}</{s}>", .{ tag, s, tag });
+        return val_mod.makeString(arena, result);
+    }
+}
+
+pub fn nativeAnchor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const name = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    return htmlWrap(arena, s, "a", "name", name);
+}
+
+pub fn nativeLink(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const url = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    return htmlWrap(arena, s, "a", "href", url);
+}
+
+pub fn nativeFontcolor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const c = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    return htmlWrap(arena, s, "font", "color", c);
+}
+
+pub fn nativeFontsize(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const sz = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    return htmlWrap(arena, s, "font", "size", sz);
+}
+
+pub fn nativeBig(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return htmlWrap(arena, getThis(this_val), "big", null, null);
+}
+
+pub fn nativeBlink(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return htmlWrap(arena, getThis(this_val), "blink", null, null);
+}
+
+pub fn nativeBold(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return htmlWrap(arena, getThis(this_val), "b", null, null);
+}
+
+pub fn nativeFixed(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return htmlWrap(arena, getThis(this_val), "tt", null, null);
+}
+
+pub fn nativeItalics(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return htmlWrap(arena, getThis(this_val), "i", null, null);
+}
+
+pub fn nativeSmall(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return htmlWrap(arena, getThis(this_val), "small", null, null);
+}
+
+pub fn nativeStrike(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return htmlWrap(arena, getThis(this_val), "strike", null, null);
+}
+
+pub fn nativeSub(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return htmlWrap(arena, getThis(this_val), "sub", null, null);
+}
+
+pub fn nativeSup(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return htmlWrap(arena, getThis(this_val), "sup", null, null);
+}
+
+// ---------------------------------------------------------------------------
+// Core string methods
+// ---------------------------------------------------------------------------
+
+/// String.prototype.substring(start, end) — ES5.
+/// NaN/negatives → 0; clamped to [0, len]; min(a,b)..max(a,b).
+pub fn nativeSubstring(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const len = s.len;
+
+    const clampIdx = struct {
+        fn f(n: f64, l: usize) usize {
+            if (std.math.isNan(n) or n < 0.0) return 0;
+            const i: i64 = val_mod.f64ToI64Sat(n);
+            if (i > @as(i64, @intCast(l))) return l;
+            return @intCast(i);
+        }
+    }.f;
+
+    const a0: f64 = if (args.len > 0 and args[0].bits != 0)
+        switch (args[0].unbox()) {
+            .number => |n| n,
+            else => 0.0,
+        }
+    else
+        0.0;
+    const a = clampIdx(a0, len);
+
+    const b: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        clampIdx(switch (args[1].unbox()) {
+            .number => |n| n,
+            else => 0.0,
+        }, len)
+    else
+        len;
+
+    const from = if (a < b) a else b;
+    const to = if (a < b) b else a;
+    return val_mod.makeString(arena, try arena.dupe(u8, s[from..to]));
+}
+
+/// String.prototype.substr(start, length) — legacy (Annex B).
+pub fn nativeSubstr(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const len = s.len;
+
+    const start_f: f64 = if (args.len > 0 and args[0].bits != 0)
+        switch (args[0].unbox()) {
+            .number => |n| n,
+            else => 0.0,
+        }
+    else
+        0.0;
+    const int_start: i64 = if (std.math.isNan(start_f)) 0 else val_mod.f64ToI64Sat(start_f);
+
+    const start: usize = if (int_start < 0) blk: {
+        const r = @as(i64, @intCast(len)) + int_start;
+        break :blk if (r < 0) 0 else @intCast(r);
+    } else blk: {
+        const u: usize = @intCast(int_start);
+        break :blk if (u > len) len else u;
+    };
+
+    const size: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        blk: {
+            const n: f64 = switch (args[1].unbox()) {
+                .number => |nn| nn,
+                else => 0.0,
+            };
+            if (n <= 0.0 or std.math.isNan(n)) break :blk 0;
+            const u: usize = @intCast(val_mod.f64ToI64Sat(n));
+            const max = len - start;
+            break :blk if (u > max) max else u;
+        }
+    else
+        len - start;
+
+    return val_mod.makeString(arena, try arena.dupe(u8, s[start .. start + size]));
+}
+
+/// String.prototype.at(index) — ES2022.
+pub fn nativeStringAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const raw: f64 = if (args.len > 0 and args[0].bits != 0)
+        switch (args[0].unbox()) {
+            .number => |n| n,
+            else => 0.0,
+        }
+    else
+        0.0;
+    var k: i64 = if (std.math.isNan(raw)) 0 else val_mod.f64ToI64Sat(raw);
+    if (k < 0) k = @as(i64, @intCast(s.len)) + k;
+    if (k < 0 or k >= @as(i64, @intCast(s.len))) return val_mod.makeUndefined(arena);
+    const idx: usize = @intCast(k);
+    return val_mod.makeString(arena, try arena.dupe(u8, s[idx .. idx + 1]));
+}
+
+/// String.prototype.repeat(count) — ES2015.
+pub fn nativeRepeat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const n_raw: f64 = if (args.len > 0 and args[0].bits != 0)
+        switch (args[0].unbox()) {
+            .number => |n| n,
+            else => 0.0,
+        }
+    else
+        0.0;
+
+    if (n_raw < 0.0 or std.math.isInf(n_raw)) {
+        const JsObject = @import("../../object/object.zig").JsObject;
+        const eo = try JsObject.create(arena, realm_mod.error_proto_RangeError);
+        try eo.set("message", try val_mod.makeString(arena, "Invalid count value"));
+        try eo.set("name", try val_mod.makeString(arena, "RangeError"));
+        realm_mod.pending_exception = try val_mod.makeObject(arena, eo);
+        return error.JsException;
+    }
+
+    if (std.math.isNan(n_raw) or n_raw == 0.0 or s.len == 0) return val_mod.makeString(arena, "");
+    const n: usize = @intCast(val_mod.f64ToI64Sat(n_raw));
+    const buf = try arena.alloc(u8, s.len * n);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        @memcpy(buf[i * s.len .. (i + 1) * s.len], s);
+    }
+    return val_mod.makeString(arena, buf);
+}
+
+/// String.prototype.lastIndexOf(searchString, position).
+pub fn nativeLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    if (args.len == 0) return val_mod.makeNumber(arena, -1.0);
+
+    const search = try argToStr(arena, args[0]);
+
+    const pos_limit: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        blk: {
+            const n: f64 = switch (args[1].unbox()) {
+                .number => |nn| nn,
+                else => @as(f64, @floatFromInt(s.len)),
+            };
+            if (std.math.isNan(n)) break :blk s.len;
+            if (n < 0.0) break :blk 0;
+            const u: usize = @intCast(val_mod.f64ToI64Sat(n));
+            break :blk if (u > s.len) s.len else u;
+        }
+    else
+        s.len;
+
+    if (search.len == 0) {
+        return val_mod.makeNumber(arena, @floatFromInt(if (pos_limit > s.len) s.len else pos_limit));
+    }
+    if (s.len < search.len) return val_mod.makeNumber(arena, -1.0);
+
+    const max_start: usize = if (pos_limit > s.len - search.len) s.len - search.len else pos_limit;
+
+    var i: usize = max_start + 1;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, s[i .. i + search.len], search)) {
+            return val_mod.makeNumber(arena, @floatFromInt(i));
+        }
+    }
+    return val_mod.makeNumber(arena, -1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Locale aliases
+// ---------------------------------------------------------------------------
+
+pub fn nativeToLocaleLowerCase(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return nativeToLowerCase(arena, this_val, args);
+}
+
+pub fn nativeToLocaleUpperCase(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return nativeToUpperCase(arena, this_val, args);
+}
+
+// ---------------------------------------------------------------------------
+// localeCompare
+// ---------------------------------------------------------------------------
+
+/// String.prototype.localeCompare(that) — byte-wise lexicographic order.
+pub fn nativeLocaleCompare(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    const that = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    const result: f64 = switch (std.mem.order(u8, s, that)) {
+        .lt => -1.0,
+        .eq => 0.0,
+        .gt => 1.0,
+    };
+    return val_mod.makeNumber(arena, result);
+}
+
+// ---------------------------------------------------------------------------
+// ES2024 well-formed
+// ---------------------------------------------------------------------------
+
+/// String.prototype.isWellFormed() — true iff no lone surrogates in WTF-8.
+pub fn nativeIsWellFormed(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    var i: usize = 0;
+    while (i < s.len) {
+        const dec = decodeWtf8At(s, i);
+        if (dec.cp >= 0xD800 and dec.cp <= 0xDFFF) return val_mod.makeBool(arena, false);
+        i += dec.len;
+    }
+    return val_mod.makeBool(arena, true);
+}
+
+/// String.prototype.toWellFormed() — replace lone surrogates with U+FFFD.
+pub fn nativeToWellFormed(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const s = getThis(this_val);
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < s.len) {
+        const dec = decodeWtf8At(s, i);
+        if (dec.cp >= 0xD800 and dec.cp <= 0xDFFF) {
+            // U+FFFD encoded as EF BF BD in UTF-8/WTF-8
+            try buf.appendSlice(arena, &[_]u8{ 0xEF, 0xBF, 0xBD });
+        } else {
+            try buf.appendSlice(arena, s[i .. i + dec.len]);
+        }
+        i += dec.len;
+    }
+    return val_mod.makeString(arena, try arena.dupe(u8, buf.items));
+}

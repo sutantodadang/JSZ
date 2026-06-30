@@ -2497,6 +2497,34 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "replace", string_proto_mod.nativeReplace },
         .{ "replaceAll", string_proto_mod.nativeReplaceAll },
         .{ "search", string_proto_mod.nativeSearch },
+        // Core string methods
+        .{ "substring", string_proto_mod.nativeSubstring },
+        .{ "substr", string_proto_mod.nativeSubstr },
+        .{ "at", string_proto_mod.nativeStringAt },
+        .{ "repeat", string_proto_mod.nativeRepeat },
+        .{ "lastIndexOf", string_proto_mod.nativeLastIndexOf },
+        // Locale aliases
+        .{ "toLocaleLowerCase", string_proto_mod.nativeToLocaleLowerCase },
+        .{ "toLocaleUpperCase", string_proto_mod.nativeToLocaleUpperCase },
+        // localeCompare
+        .{ "localeCompare", string_proto_mod.nativeLocaleCompare },
+        // ES2024 well-formed
+        .{ "isWellFormed", string_proto_mod.nativeIsWellFormed },
+        .{ "toWellFormed", string_proto_mod.nativeToWellFormed },
+        // Annex B HTML wrapper methods
+        .{ "anchor", string_proto_mod.nativeAnchor },
+        .{ "link", string_proto_mod.nativeLink },
+        .{ "fontcolor", string_proto_mod.nativeFontcolor },
+        .{ "fontsize", string_proto_mod.nativeFontsize },
+        .{ "big", string_proto_mod.nativeBig },
+        .{ "blink", string_proto_mod.nativeBlink },
+        .{ "bold", string_proto_mod.nativeBold },
+        .{ "fixed", string_proto_mod.nativeFixed },
+        .{ "italics", string_proto_mod.nativeItalics },
+        .{ "small", string_proto_mod.nativeSmall },
+        .{ "strike", string_proto_mod.nativeStrike },
+        .{ "sub", string_proto_mod.nativeSub },
+        .{ "sup", string_proto_mod.nativeSup },
     };
     const str_method_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (fns) |pair| {
