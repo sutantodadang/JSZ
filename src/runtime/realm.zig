@@ -2249,9 +2249,66 @@ fn nativeNumberValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Val
     return val_mod.makeNumber(arena, n);
 }
 
-fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+const RADIX_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// Stringify a finite f64 in an arbitrary radix 2..36 (ES Number::toString).
+fn numberToRadixString(arena: std.mem.Allocator, n: f64, radix: i32) ![]const u8 {
+    const rf: f64 = @floatFromInt(radix);
+    const neg = n < 0;
+    const x = @abs(n);
+
+    var out: std.ArrayList(u8) = .{};
+    // Integer part (most-significant digit emitted last, so reverse it).
+    var int_part = @floor(x);
+    var int_digits: std.ArrayList(u8) = .{};
+    if (int_part == 0) {
+        try int_digits.append(arena, '0');
+    } else {
+        while (int_part > 0) {
+            const d: usize = @intFromFloat(@mod(int_part, rf));
+            try int_digits.append(arena, RADIX_DIGITS[d]);
+            int_part = @floor(int_part / rf);
+        }
+    }
+    var i: usize = int_digits.items.len;
+    while (i > 0) {
+        i -= 1;
+        try out.append(arena, int_digits.items[i]);
+    }
+
+    // Fractional part (cap at 20 digits — matches engine precision budget).
+    var frac = x - @floor(x);
+    if (frac > 0) {
+        try out.append(arena, '.');
+        var count: usize = 0;
+        while (frac > 0 and count < 20) : (count += 1) {
+            frac *= rf;
+            const d: usize = @intFromFloat(@floor(frac));
+            try out.append(arena, RADIX_DIGITS[d]);
+            frac -= @floor(frac);
+        }
+    }
+
+    if (neg) {
+        var signed: std.ArrayList(u8) = .{};
+        try signed.append(arena, '-');
+        try signed.appendSlice(arena, out.items);
+        return signed.items;
+    }
+    return out.items;
+}
+
+fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toString requires a Number");
-    return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    var radix: i32 = 10;
+    if (args.len > 0 and args[0].bits != 0) {
+        radix = @intFromFloat(@trunc(args[0].toF64()));
+        if (radix < 2 or radix > 36) return throwRangeError(arena, "toString() radix must be between 2 and 36");
+    }
+    if (radix == 10) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
+    if (std.math.isInf(n)) return val_mod.makeString(arena, if (n < 0) "-Infinity" else "Infinity");
+    return val_mod.makeString(arena, try numberToRadixString(arena, n, radix));
 }
 
 fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
