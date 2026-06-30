@@ -110,6 +110,10 @@ pub const FnCompiler = struct {
     /// M14: the body read an identifier named `arguments`. Combined with
     /// `!is_arrow` this drives BcFunction.uses_arguments.
     saw_arguments: bool = false,
+    /// NamedEvaluation: when set, the next compiled anonymous function expression
+    /// adopts this as its name. Consumed (cleared) immediately on use so nested
+    /// functions are unaffected.
+    name_hint: ?[]const u8 = null,
     /// Phase 8: nesting depth of try/catch/finally regions. A call in the
     /// operand of `return` is only in tail position when try_depth == 0
     /// (a pending finally would run after the call returns, so it is not tail).
@@ -954,7 +958,12 @@ pub const FnCompiler = struct {
                     return rsrc;
                 }
             }
+            // NamedEvaluation: `x = function(){}` — inject binding name as hint.
+            if (a.target.kind == .identifier and a.value.kind == .function_expr) {
+                self.name_hint = a.target.data.identifier;
+            }
             const rhs = try self.compileExpr(a.value);
+            self.name_hint = null; // defensive clear (no-op if consumed inside)
             if (a.target.kind == .identifier) {
                 try self.emitStore(a.target.data.identifier, rhs, line);
             } else if (a.target.kind == .member_expr) {
@@ -1316,7 +1325,12 @@ pub const FnCompiler = struct {
                 self.freeReg(); // free rkey
                 continue;
             }
+            // NamedEvaluation: `{key: function(){}}` data property — inject key as hint.
+            if (prop.kind == .init and prop.value.kind == .function_expr) {
+                self.name_hint = prop.key;
+            }
             const rval = try self.compileExpr(prop.value);
+            self.name_hint = null; // defensive clear (no-op if consumed inside)
             const sv = try val_mod.makeString(self.arena, prop.key);
             const kidx = try self.addConstant(sv);
             if (prop.kind == .init) {
@@ -1855,13 +1869,18 @@ pub const FnCompiler = struct {
     }
 
     pub fn compileFuncExpr(self: *Self, fe: ast.FuncExpr, line: u32) error{OutOfMemory}!u8 {
+        // NamedEvaluation: consume the transient hint and apply it when this
+        // function expression is genuinely anonymous and not a method.
+        const hint = self.name_hint;
+        self.name_hint = null; // consume once — nested anonymous fns must not inherit it
+        const eff_name: ?[]const u8 = if (!fe.is_method and fe.name == null) hint else fe.name;
         // Compile inner function.
         const child_fn = try compileFunctionStrict(
             self.arena,
-            fe.name,
+            eff_name,
             fe.params,
             fe.body,
-            if (fe.is_method) null else fe.name, // nfe_name: named fn exprs self-bind; methods do not
+            if (fe.is_method) null else eff_name, // nfe_name: named fn exprs self-bind; methods do not
             fe.is_strict or self.is_strict, // strictness is inherited by nested functions
             fe.is_generator,
             fe.is_async,
