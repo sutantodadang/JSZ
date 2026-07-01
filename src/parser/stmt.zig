@@ -720,7 +720,7 @@ pub fn parseVarDeclarators(p: *Parser, start: u32, kind: ast.VarKind, consume_se
 pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     const start = p.current.start;
     if (p.check(.left_bracket) or p.check(.left_brace)) {
-        return p.parseDestructuringDeclarator(kind, start);
+        return parseDestructuringDeclarator(p, kind, start);
     }
     const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
     const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
@@ -756,35 +756,23 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     return p.makeNode(.var_decl, start, end, .{ .var_decl = .{ .kind = kind, .name = name, .init = init_node } });
 }
 
-/// One destructuring target: `bind` is the variable name introduced; `key` is
-/// the source property name (object patterns only — for an `{ a: x }` renaming
-/// `key` = "a" and `bind` = "x"; for shorthand `{ a }` both are "a"). Array
-/// patterns leave `key` empty and read by positional index.
-const DestructTarget = struct { key: []const u8, bind: []const u8 };
-
-pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?*Node {
-    const is_array = p.match(.left_bracket);
-    if (is_array) return parseArrayDestructuringDeclarator(p, kind, start);
-
-    var targets = std.ArrayList(DestructTarget){};
-    _ = p.expect(.left_brace) orelse return null;
-    while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
-        const key = p.expect(.identifier) orelse return null;
-        var bind_name = key.value_str;
-        if (p.match(.colon)) {
-            const alias = p.expect(.identifier) orelse return null;
-            bind_name = alias.value_str;
-        }
-        // Read source property `key`, bind to `bind_name` (they differ when
-        // the pattern renames, e.g. `{ get: description }`).
-        targets.append(p.arena, .{ .key = key.value_str, .bind = bind_name }) catch return null;
-        // Skip optional default value (= expr) — runtime falls back to undefined.
-        if (p.match(.eq)) {
-            _ = p.parseAssignmentExpr();
-        }
-        if (!p.match(.comma)) break;
-    }
-    _ = p.expect(.right_brace) orelse return null;
+/// `let/const/var [a, b = 1, ...r] = rhs` / `let/const/var {a, b: c = 1, ...r} = rhs`.
+/// Parses the pattern as an ARRAY/OBJECT LITERAL EXPRESSION — array patterns
+/// reuse `parseArrayLiteral` (already handles elision/defaults/rest/nesting via
+/// `a=9` -> assignment_expr, `...r` -> spread_expr, `[[a],b]` -> nested
+/// literals); object patterns use `expr_mod.parseObjectPattern`, the pattern-only
+/// grammar that additionally accepts a trailing `...rest`. The RHS is bound to a
+/// fresh temp of the declared `kind`, then `desugarParamPattern` walks the
+/// pattern emitting one decl per binding (also of `kind`) into a local list,
+/// scoped via `p.destruct_out`/`p.destruct_kind` (saved/restored so this can't
+/// leak into unrelated arrow-param desugaring). Destructuring declarations
+/// always require an initializer, even for `var`/`let` (spec: only a bare
+/// identifier binding may omit one).
+fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?*Node {
+    const pattern: *Node = if (p.check(.left_bracket))
+        p.parseArrayLiteral() orelse return null
+    else
+        expr_mod.parseObjectPattern(p) orelse return null;
     _ = p.expect(.eq) orelse return null;
     const rhs = p.parseAssignmentExpr() orelse return null;
     const tmp_name = std.fmt.allocPrint(p.arena, "__destruct_{d}", .{start}) catch return null;
@@ -794,93 +782,19 @@ pub fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?
         .var_decl = .{ .kind = kind, .name = tmp_name, .init = rhs },
     }) orelse return null;
     body.append(p.arena, tmp_decl) catch return null;
+    const tmp_ref = p.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
 
-    for (targets.items) |tgt| {
-        const tmp_id = p.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
-        const prop = p.makeNode(.identifier, start, start, .{ .identifier = tgt.key }) orelse return null;
-        const access = p.makeNode(.member_expr, start, start, .{
-            .member_expr = .{ .object = tmp_id, .property = prop, .computed = false },
-        }) orelse return null;
-        const vd = p.makeNode(.var_decl, start, p.current.start, .{
-            .var_decl = .{ .kind = kind, .name = tgt.bind, .init = access },
-        }) orelse return null;
-        body.append(p.arena, vd) catch return null;
-    }
-    return p.makeNode(.block_stmt, start, p.current.start, .{
-        .block_stmt = .{ .body = body.items, .lexical_scope = false },
-    });
-}
+    var decls_out = std.ArrayList(*Node){};
+    const saved_out = p.destruct_out;
+    const saved_kind = p.destruct_kind;
+    p.destruct_out = &decls_out;
+    p.destruct_kind = kind;
+    const ok = expr_mod.desugarParamPattern(p, pattern, tmp_ref);
+    p.destruct_out = saved_out;
+    p.destruct_kind = saved_kind;
+    if (!ok) return null;
+    body.appendSlice(p.arena, decls_out.items) catch return null;
 
-/// Build a single-argument call node `callee_name(arg)`.
-fn makeCall1(p: *Parser, callee_name: []const u8, arg: *Node, start: u32) ?*Node {
-    const callee = p.makeNode(.identifier, start, start, .{ .identifier = callee_name }) orelse return null;
-    const args = p.arena.alloc(*Node, 1) catch return null;
-    args[0] = arg;
-    return p.makeNode(.call_expr, start, start, .{
-        .call_expr = .{ .callee = callee, .args = args },
-    });
-}
-
-/// Array binding pattern `let [a, , b] = rhs`. Per spec, array destructuring
-/// uses the iterator protocol — `GetIterator(rhs)` then one `IteratorStep` per
-/// element (holes still step, discarding the value). Desugars to:
-///   let __destruct_it_N = __getIterator__(rhs);
-///   let a = __iterStep__(__destruct_it_N).value;   // bind
-///   __iterStep__(__destruct_it_N);                  // elision hole
-///   let b = __iterStep__(__destruct_it_N).value;
-/// Going through the iterator (rather than positional `rhs[i]`) matters for
-/// iterables whose `next()` has observable behavior — e.g. a TypedArray backed
-/// by a resized buffer throws a TypeError when out of bounds.
-fn parseArrayDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?*Node {
-    // Each element is a binding name, or `null` for an elision hole.
-    var items = std.ArrayList(?[]const u8){};
-    while (!p.check(.right_bracket) and !p.check(.eof) and !p.had_error) {
-        if (p.check(.comma)) {
-            // A bare comma at element position is an elision hole.
-            _ = p.advance();
-            items.append(p.arena, null) catch return null;
-            continue;
-        }
-        const t = p.expect(.identifier) orelse return null;
-        items.append(p.arena, t.value_str) catch return null;
-        // Skip optional default value (= expr) — runtime falls back to undefined.
-        if (p.match(.eq)) {
-            _ = p.parseAssignmentExpr();
-        }
-        if (!p.match(.comma)) break;
-    }
-    _ = p.expect(.right_bracket) orelse return null;
-    _ = p.expect(.eq) orelse return null;
-    const rhs = p.parseAssignmentExpr() orelse return null;
-    const it_name = std.fmt.allocPrint(p.arena, "__destruct_it_{d}", .{start}) catch return null;
-
-    var body = std.ArrayList(*Node){};
-    // let __destruct_it_N = __getIterator__(rhs);
-    const get_it = makeCall1(p, "__getIterator__", rhs, start) orelse return null;
-    const it_decl = p.makeNode(.var_decl, start, p.current.start, .{
-        .var_decl = .{ .kind = kind, .name = it_name, .init = get_it },
-    }) orelse return null;
-    body.append(p.arena, it_decl) catch return null;
-
-    for (items.items) |maybe_name| {
-        const it_id = p.makeNode(.identifier, start, start, .{ .identifier = it_name }) orelse return null;
-        const step = makeCall1(p, "__iterStep__", it_id, start) orelse return null;
-        if (maybe_name) |name| {
-            // let name = __iterStep__(it).value;
-            const value_prop = p.makeNode(.identifier, start, start, .{ .identifier = "value" }) orelse return null;
-            const access = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = step, .property = value_prop, .computed = false },
-            }) orelse return null;
-            const vd = p.makeNode(.var_decl, start, p.current.start, .{
-                .var_decl = .{ .kind = kind, .name = name, .init = access },
-            }) orelse return null;
-            body.append(p.arena, vd) catch return null;
-        } else {
-            // Elision hole: advance the iterator, discard the value.
-            const es = p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = step }) orelse return null;
-            body.append(p.arena, es) catch return null;
-        }
-    }
     return p.makeNode(.block_stmt, start, p.current.start, .{
         .block_stmt = .{ .body = body.items, .lexical_scope = false },
     });
@@ -1163,40 +1077,20 @@ pub fn parseForStmt(p: *Parser) ?*Node {
     }
 }
 
-/// `for (let [a,b] of x) BODY` / `for (let {k} of x) BODY` (also for-in).
-/// Desugar: `for (let __t of x) { let a = __t[0], b = __t[1]; BODY }`.
-const ForBinding = struct { name: []const u8, key: ?[]const u8, index: usize };
+/// `for (let/const/var [a, b=1, ...r] of x) BODY` / `for (let/const/var {a,
+/// b: c, ...r} of x) BODY` (also for-in). Parses the pattern the same way as
+/// `parseDestructuringDeclarator` (array patterns via `parseArrayLiteral`,
+/// object patterns via `expr_mod.parseObjectPattern`) so defaults/rest/nesting
+/// work identically. Desugars to `for (let/const/var __t of x) { <binding
+/// decls from desugarParamPattern>; BODY }` — the per-iteration destructuring
+/// happens INSIDE the loop body, which already gets a fresh lexical
+/// environment each iteration via the existing for-in/for-of lowering, so
+/// `const`/`let` bindings stay fresh per iteration without any extra work here.
 pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind) ?*Node {
-    var bindings = std.ArrayList(ForBinding){};
-    const is_array = p.match(.left_bracket);
-    if (is_array) {
-        var idx: usize = 0;
-        while (!p.check(.right_bracket) and !p.check(.eof) and !p.had_error) {
-            if (p.check(.comma)) {
-                _ = p.advance();
-                idx += 1;
-                continue;
-            }
-            const t = p.expect(.identifier) orelse return null;
-            bindings.append(p.arena, .{ .name = t.value_str, .key = null, .index = idx }) catch return null;
-            idx += 1;
-            if (!p.match(.comma)) break;
-        }
-        _ = p.expect(.right_bracket) orelse return null;
-    } else {
-        _ = p.match(.left_brace);
-        while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
-            const key = p.expect(.identifier) orelse return null;
-            var bind_name = key.value_str;
-            if (p.match(.colon)) {
-                const alias = p.expect(.identifier) orelse return null;
-                bind_name = alias.value_str;
-            }
-            bindings.append(p.arena, .{ .name = bind_name, .key = key.value_str, .index = 0 }) catch return null;
-            if (!p.match(.comma)) break;
-        }
-        _ = p.expect(.right_brace) orelse return null;
-    }
+    const pattern: *Node = if (p.check(.left_bracket))
+        p.parseArrayLiteral() orelse return null
+    else
+        expr_mod.parseObjectPattern(p) orelse return null;
 
     const iterate_values = if (p.check(.kw_of)) true else if (p.check(.kw_in)) false else {
         p.had_error = true;
@@ -1209,20 +1103,21 @@ pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind) ?*Node {
     const orig_body = p.parseStatement() orelse return null;
 
     const tmp_name = std.fmt.allocPrint(p.arena, "__forbind_{d}", .{start}) catch return null;
+    const tmp_ref = p.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
+
+    var decls_out = std.ArrayList(*Node){};
+    const saved_out = p.destruct_out;
+    const saved_kind = p.destruct_kind;
+    p.destruct_out = &decls_out;
+    p.destruct_kind = kind;
+    const ok = expr_mod.desugarParamPattern(p, pattern, tmp_ref);
+    p.destruct_out = saved_out;
+    p.destruct_kind = saved_kind;
+    if (!ok) return null;
+
     // Build the per-iteration destructuring declarations + original body.
     var body_stmts = std.ArrayList(*Node){};
-    for (bindings.items) |b| {
-        const tmp_id = p.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
-        const access = if (b.key) |k| blk: {
-            const prop = p.makeNode(.identifier, start, start, .{ .identifier = k }) orelse return null;
-            break :blk p.makeNode(.member_expr, start, start, .{ .member_expr = .{ .object = tmp_id, .property = prop, .computed = false } }) orelse return null;
-        } else blk: {
-            const idxn = p.makeNode(.number_literal, start, start, .{ .number_literal = @floatFromInt(b.index) }) orelse return null;
-            break :blk p.makeNode(.member_expr, start, start, .{ .member_expr = .{ .object = tmp_id, .property = idxn, .computed = true } }) orelse return null;
-        };
-        const d = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = kind, .name = b.name, .init = access } }) orelse return null;
-        body_stmts.append(p.arena, d) catch return null;
-    }
+    body_stmts.appendSlice(p.arena, decls_out.items) catch return null;
     body_stmts.append(p.arena, orig_body) catch return null;
     const new_body = p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = body_stmts.items, .lexical_scope = false } }) orelse return null;
     const left = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = kind, .name = tmp_name, .init = null } }) orelse return null;

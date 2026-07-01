@@ -142,6 +142,16 @@ pub const Parser = struct {
     arrow_prelude: std.ArrayList(*Node),
     /// Monotonic counter for synthetic destructuring-param names (`__param_N`).
     param_destruct_counter: u32,
+    /// Var-decl / for-of-head pattern destructuring: when set, `desugarParamPattern`
+    /// / `bindPatternElement` emit their decls here instead of into `arrow_prelude`,
+    /// and user-visible bindings use `destruct_kind` instead of a hardcoded `.let`
+    /// (synthetic temps still always use `.let`). The caller (`parseVarDeclarator`,
+    /// `parseForDestructuring`) saves/sets/restores both fields around the call so
+    /// nested arrow-param destructuring inside a default value expression is
+    /// unaffected (arrow params are parsed — and their own preludes emitted — before
+    /// these fields are ever set).
+    destruct_out: ?*std.ArrayList(*Node) = null,
+    destruct_kind: ast.VarKind = .let,
     /// Destructuring-param `let` decls produced by `parseFunctionParams` for a
     /// non-arrow function, awaiting prepend by the immediately-following
     /// `parseFunctionBody`. Drained (set to empty) on consumption. Built into a
@@ -1269,10 +1279,6 @@ pub const Parser = struct {
 
     pub fn parseVarDeclarator(self: *Parser, kind: ast.VarKind) ?*Node {
         return stmt_mod.parseVarDeclarator(self, kind);
-    }
-
-    pub fn parseDestructuringDeclarator(self: *Parser, kind: ast.VarKind, start: u32) ?*Node {
-        return stmt_mod.parseDestructuringDeclarator(self, kind, start);
     }
 
     pub fn parseFunctionDecl(self: *Parser, is_async: bool) ?*Node {

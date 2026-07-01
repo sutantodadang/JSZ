@@ -511,10 +511,18 @@ fn mkDestrCall(p: *Parser, helper: []const u8, a: *Node, b: ?*Node) ?*Node {
     return p.makeNode(.call_expr, a.start, a.start, .{ .call_expr = .{ .callee = callee, .args = args.items } });
 }
 
-/// Append a `let <name> = <init>;` decl to the param prelude. Returns false on OOM.
+/// The active destructuring-decl output list: `p.destruct_out` when a var-decl
+/// / for-of-head pattern desugar is in progress, else the arrow-param prelude.
+fn destructOut(p: *Parser) *std.ArrayList(*Node) {
+    return p.destruct_out orelse &p.arrow_prelude;
+}
+
+/// Append a `let <name> = <init>;` decl (a synthetic temp — always `let`
+/// regardless of `p.destruct_kind`, which only applies to user-visible
+/// bindings) to the active destructuring output list. Returns false on OOM.
 fn pushLet(p: *Parser, name: []const u8, init: *Node, at: u32) bool {
     const vd = p.makeNode(.var_decl, at, at, .{ .var_decl = .{ .kind = .let, .name = name, .init = init } }) orelse return false;
-    p.arrow_prelude.append(p.arena, vd) catch {
+    destructOut(p).append(p.arena, vd) catch {
         p.had_error = true;
         return false;
     };
@@ -534,7 +542,7 @@ pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
         };
         const call = p.makeNode(.call_expr, src.start, src.start, .{ .call_expr = .{ .callee = coerce, .args = gargs.items } }) orelse return false;
         const stmt = p.makeNode(.expr_stmt, src.start, src.start, .{ .expr_stmt = call }) orelse return false;
-        p.arrow_prelude.append(p.arena, stmt) catch {
+        destructOut(p).append(p.arena, stmt) catch {
             p.had_error = true;
             return false;
         };
@@ -568,7 +576,7 @@ pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
                 if (el.kind == .undefined_literal) {
                     const step = mkDestrCall(p, "__destrIterStep__", it_ref, box_ref) orelse return false;
                     const stmt = p.makeNode(.expr_stmt, el.start, el.start, .{ .expr_stmt = step }) orelse return false;
-                    p.arrow_prelude.append(p.arena, stmt) catch {
+                    destructOut(p).append(p.arena, stmt) catch {
                         p.had_error = true;
                         return false;
                     };
@@ -599,22 +607,57 @@ pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
                 const box_ref = p.makeNode(.identifier, src.start, src.start, .{ .identifier = box_name }) orelse return false;
                 const close = mkDestrCall(p, "__destrIterClose__", it_ref, box_ref) orelse return false;
                 const stmt = p.makeNode(.expr_stmt, src.start, src.start, .{ .expr_stmt = close }) orelse return false;
-                p.arrow_prelude.append(p.arena, stmt) catch {
+                destructOut(p).append(p.arena, stmt) catch {
                     p.had_error = true;
                     return false;
                 };
             }
         },
         .object_literal => {
+            // Object-rest exclusion list: the runtime key VALUE of every
+            // preceding property (string literal for a static key; a
+            // once-evaluated temp reference for a computed key, so the key
+            // expression isn't evaluated twice). Consumed by a trailing
+            // `...rest` (represented as a property whose value is a
+            // `spread_expr` wrapping the rest BindingIdentifier — see
+            // `parseObjectPattern`).
+            var exclude_keys = std.ArrayList(*Node){};
             for (pattern.data.object_literal.properties) |prop| {
+                if (prop.value.kind == .spread_expr) {
+                    const excl_arr = p.makeNode(.array_literal, prop.value.start, prop.value.start, .{
+                        .array_literal = .{ .elements = exclude_keys.items },
+                    }) orelse return false;
+                    const rest_val = mkDestrCall(p, "__destrObjRest__", src, excl_arr) orelse return false;
+                    if (!bindPatternElement(p, prop.value.data.spread_expr, rest_val)) return false;
+                    continue;
+                }
                 // Computed key `{ [expr]: target }`: evaluate the key expression
-                // (a throwing key propagates) and access src[key]. Static keys use
-                // a plain `src.key`.
-                const access = if (prop.computed_key) |ke|
-                    p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
-                        .member_expr = .{ .object = src, .property = ke, .computed = true },
-                    }) orelse return false
-                else acc: {
+                // once into a temp (a throwing key propagates; reused for both the
+                // property access and, if a later `...rest` needs it, exclusion).
+                // Static keys use a plain `src.key` access.
+                const access = if (prop.computed_key) |ke| blk: {
+                    const kctr = p.param_destruct_counter;
+                    p.param_destruct_counter += 1;
+                    const kname = std.fmt.allocPrint(p.arena, "__key_{d}", .{kctr}) catch {
+                        p.had_error = true;
+                        return false;
+                    };
+                    if (!pushLet(p, kname, ke, prop.value.start)) return false;
+                    const kref1 = p.makeNode(.identifier, prop.value.start, prop.value.start, .{ .identifier = kname }) orelse return false;
+                    const kref2 = p.makeNode(.identifier, prop.value.start, prop.value.start, .{ .identifier = kname }) orelse return false;
+                    exclude_keys.append(p.arena, kref2) catch {
+                        p.had_error = true;
+                        return false;
+                    };
+                    break :blk p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
+                        .member_expr = .{ .object = src, .property = kref1, .computed = true },
+                    }) orelse return false;
+                } else acc: {
+                    const key_str = p.makeNode(.string_literal, prop.value.start, prop.value.start, .{ .string_literal = prop.key }) orelse return false;
+                    exclude_keys.append(p.arena, key_str) catch {
+                        p.had_error = true;
+                        return false;
+                    };
                     const key = p.makeNode(.identifier, prop.value.start, prop.value.start, .{ .identifier = prop.key }) orelse return false;
                     break :acc p.makeNode(.member_expr, prop.value.start, prop.value.start, .{
                         .member_expr = .{ .object = src, .property = key, .computed = false },
@@ -638,9 +681,9 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
     switch (target.kind) {
         .identifier => {
             const vd = p.makeNode(.var_decl, target.start, target.start, .{
-                .var_decl = .{ .kind = .let, .name = target.data.identifier, .init = access },
+                .var_decl = .{ .kind = p.destruct_kind, .name = target.data.identifier, .init = access },
             }) orelse return false;
-            p.arrow_prelude.append(p.arena, vd) catch {
+            destructOut(p).append(p.arena, vd) catch {
                 p.had_error = true;
                 return false;
             };
@@ -657,7 +700,7 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
             const vd = p.makeNode(.var_decl, target.start, target.start, .{
                 .var_decl = .{ .kind = .let, .name = tmp, .init = access },
             }) orelse return false;
-            p.arrow_prelude.append(p.arena, vd) catch {
+            destructOut(p).append(p.arena, vd) catch {
                 p.had_error = true;
                 return false;
             };
@@ -678,9 +721,9 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
             }) orelse return false;
             if (ae.target.kind == .identifier) {
                 const vd = p.makeNode(.var_decl, target.start, target.start, .{
-                    .var_decl = .{ .kind = .let, .name = ae.target.data.identifier, .init = cond },
+                    .var_decl = .{ .kind = p.destruct_kind, .name = ae.target.data.identifier, .init = cond },
                 }) orelse return false;
-                p.arrow_prelude.append(p.arena, vd) catch {
+                destructOut(p).append(p.arena, vd) catch {
                     p.had_error = true;
                     return false;
                 };
@@ -697,7 +740,7 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
                 const vd = p.makeNode(.var_decl, target.start, target.start, .{
                     .var_decl = .{ .kind = .let, .name = tmp, .init = cond },
                 }) orelse return false;
-                p.arrow_prelude.append(p.arena, vd) catch {
+                destructOut(p).append(p.arena, vd) catch {
                     p.had_error = true;
                     return false;
                 };
@@ -713,6 +756,108 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
         },
     }
     return true;
+}
+
+/// Parse an OBJECT BINDING pattern `{ a, b: c, d = 1, [k]: e, ...rest }` for
+/// var-decl / for-of-head destructuring (`parseVarDeclarator`,
+/// `parseForDestructuring` in stmt.zig). Unlike the general `parseObjectLiteral`
+/// expression parser, this grammar supports a trailing `...identifier` rest
+/// element (BindingRestProperty — spec-restricted to a plain identifier, not a
+/// nested pattern) and has no methods/getters/setters. Produces an
+/// `.object_literal` node whose properties `desugarParamPattern` consumes; the
+/// rest element is represented as `ObjectProp{ .key = "", .computed_key = null,
+/// .value = <spread_expr wrapping the identifier> }`.
+pub fn parseObjectPattern(p: *Parser) ?*Node {
+    const start = p.current.start;
+    _ = p.expect(.left_brace) orelse return null;
+    var props = std.ArrayList(ast.ObjectProp){};
+    while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
+        if (p.check(.ellipsis)) {
+            _ = p.advance();
+            const id_tok = p.expect(.identifier) orelse return null;
+            const id_node = p.makeNode(.identifier, id_tok.start, id_tok.end, .{ .identifier = id_tok.value_str }) orelse return null;
+            const spread = p.makeNode(.spread_expr, id_tok.start, id_tok.end, .{ .spread_expr = id_node }) orelse return null;
+            props.append(p.arena, .{ .key = "", .value = spread, .kind = .init, .computed_key = null }) catch {
+                p.had_error = true;
+                return null;
+            };
+            break; // BindingRestProperty must be last.
+        }
+        var key: []const u8 = "";
+        var computed_key: ?*Node = null;
+        if (p.check(.left_bracket)) {
+            _ = p.advance();
+            computed_key = p.parseAssignmentExpr() orelse return null;
+            _ = p.expect(.right_bracket) orelse return null;
+        } else if (p.check(.string)) {
+            key = p.current.value_str;
+            _ = p.advance();
+        } else if (p.check(.number)) {
+            const n = p.current.value_num;
+            _ = p.advance();
+            key = if (n == @trunc(n) and n >= 0 and n < 1e15)
+                std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch {
+                    p.had_error = true;
+                    return null;
+                }
+            else
+                std.fmt.allocPrint(p.arena, "{d}", .{n}) catch {
+                    p.had_error = true;
+                    return null;
+                };
+        } else if (p.check(.identifier)) {
+            key = p.current.value_str;
+            _ = p.advance();
+        } else {
+            const kn = @tagName(p.current.kind);
+            if (kn.len > 3 and std.mem.eql(u8, kn[0..3], "kw_")) {
+                key = kn[3..];
+                _ = p.advance();
+            } else {
+                if (!p.had_error) {
+                    p.had_error = true;
+                    p.error_info = parser_file.ParseError{
+                        .message = "expected property key",
+                        .line = p.current.line,
+                        .column = p.current.column,
+                    };
+                }
+                return null;
+            }
+        }
+        var target: *Node = undefined;
+        if (p.match(.colon)) {
+            target = parseBindingTargetForPattern(p) orelse return null;
+        } else {
+            // Shorthand `{a}` / `{a = default}` — the key doubles as the binding name.
+            target = p.makeNode(.identifier, start, start, .{ .identifier = key }) orelse return null;
+        }
+        if (p.match(.eq)) {
+            const def = p.parseAssignmentExpr() orelse return null;
+            target = p.makeNode(.assignment_expr, target.start, target.start, .{
+                .assignment_expr = .{ .op = .assign, .target = target, .value = def },
+            }) orelse return null;
+        }
+        props.append(p.arena, .{ .key = key, .value = target, .kind = .init, .computed_key = computed_key }) catch {
+            p.had_error = true;
+            return null;
+        };
+        if (!p.match(.comma)) break;
+    }
+    const end = p.current.start;
+    _ = p.expect(.right_brace) orelse return null;
+    return p.makeNode(.object_literal, start, end, .{ .object_literal = .{ .properties = props.items } });
+}
+
+/// A BindingElement target after `key:` in an object pattern: a plain
+/// identifier, or a nested `[...]` / `{...}` sub-pattern (itself possibly
+/// carrying defaults/rest/further nesting — array patterns reuse the general
+/// expression array-literal parser, which already supports all of that).
+fn parseBindingTargetForPattern(p: *Parser) ?*Node {
+    if (p.check(.left_bracket)) return p.parseArrayLiteral();
+    if (p.check(.left_brace)) return parseObjectPattern(p);
+    const id_tok = p.expect(.identifier) orelse return null;
+    return p.makeNode(.identifier, id_tok.start, id_tok.end, .{ .identifier = id_tok.value_str });
 }
 
 pub fn parseConditionalExpr(p: *Parser) ?*Node {

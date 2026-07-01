@@ -2048,6 +2048,38 @@ pub fn nativeDestrIterClose(arena: std.mem.Allocator, _: Value, args: []const Va
     return val_mod.makeUndefined(arena);
 }
 
+/// __destrObjRest__(src, excludeKeys): CopyDataProperties into a fresh plain
+/// object from `src`'s own enumerable string-keyed properties, skipping any key
+/// present in `excludeKeys` (an Array of strings — the compile-time list of
+/// already-destructured keys for this pattern: static keys as literals, and
+/// computed keys pre-evaluated once into a temp so they're read exactly once).
+/// Used by the object-rest binding pattern (`{a, ...rest} = x`). `src` is
+/// non-object (e.g. a primitive) only via unusual call sites — the pattern
+/// desugar always runs `__requireObjectCoercible__` first, but that only
+/// rejects null/undefined, not other primitives — so a non-object `src` yields
+/// an empty result (no own enumerable string keys to copy) rather than a crash.
+pub fn nativeDestrObjRest(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const out = try JsObject.create(arena, realm_mod.active_object_proto);
+    const src = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (src.bits == 0 or src.unbox() != .object) return val_mod.makeObject(arena, out);
+    const src_obj = src.toPtr().object;
+    const excl_list: ?*JsObject = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    outer: for (src_obj.ownKeys()) |k| {
+        if (!src_obj.isEnumerable(k)) continue;
+        if (excl_list) |ex| {
+            var i: usize = 0;
+            while (i < ex.array_length) : (i += 1) {
+                const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
+                const ev = ex.getOwn(ek) orelse continue;
+                if (ev.bits != 0 and ev.unbox() == .string and std.mem.eql(u8, ev.unbox().string, k)) continue :outer;
+            }
+        }
+        const v = src_obj.getOwn(k) orelse continue;
+        try out.set(k, v);
+    }
+    return val_mod.makeObject(arena, out);
+}
+
 /// __getIterator__(x): obtain an iterator (object with next()) for `x`.
 pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const x = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
