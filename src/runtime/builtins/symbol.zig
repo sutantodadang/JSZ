@@ -19,10 +19,26 @@ pub fn nativeSymbolCall(arena: std.mem.Allocator, _: Value, args: []const Value)
     return val_mod.makeSymbol(arena, desc);
 }
 
+/// thisSymbolValue(v): the symbol primitive, unwrapping a boxed Symbol wrapper's
+/// [[PrimitiveValue]] (property access on a symbol primitive invokes accessor
+/// getters with `this` boxed to an Object). Returns null for a non-symbol receiver.
+fn thisSymbolValue(v: Value) ?*val_mod.SymbolData {
+    if (v.bits == 0) return null;
+    switch (v.unbox()) {
+        .symbol => |sd| return sd,
+        .object => |o| {
+            if (o.get("[[PrimitiveValue]]")) |pv| {
+                if (pv.bits != 0 and pv.unbox() == .symbol) return pv.toPtr().symbol;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
 /// Symbol.prototype.toString() → "Symbol(desc)". `this` is the symbol.
 pub fn nativeSymbolToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits != 0 and this_val.unbox() == .symbol) {
-        const sd = this_val.toPtr().symbol;
+    if (thisSymbolValue(this_val)) |sd| {
         const s = try std.fmt.allocPrint(arena, "Symbol({s})", .{sd.description orelse ""});
         return val_mod.makeString(arena, s);
     }
@@ -33,8 +49,7 @@ pub fn nativeSymbolToString(arena: std.mem.Allocator, this_val: Value, _: []cons
 /// or undefined when it was created without one. `this` is the symbol primitive
 /// (or a boxed Symbol object, though autoboxing passes the primitive here).
 pub fn nativeSymbolDescriptionGet(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits != 0 and this_val.unbox() == .symbol) {
-        const sd = this_val.toPtr().symbol;
+    if (thisSymbolValue(this_val)) |sd| {
         if (sd.description) |d| return val_mod.makeString(arena, d);
     }
     return val_mod.makeUndefined(arena);

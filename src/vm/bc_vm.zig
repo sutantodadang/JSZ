@@ -2034,6 +2034,25 @@ pub const BcVm = struct {
         return try self.constructImpl(target, args, new_target);
     }
 
+    /// [[Get]] from a prototype object with an explicit (primitive) receiver,
+    /// firing inherited accessor getters with `receiver` as `this`. Used by the
+    /// primitive autoboxing arms (symbol/number/boolean/bigint) so accessor
+    /// properties such as Symbol.prototype.description invoke their getter
+    /// instead of returning the raw accessor holder / undefined.
+    fn getFromProtoWithReceiver(self: *BcVm, proto: *JsObject, key: []const u8, receiver: Value) !Value {
+        if (proto.findProperty(key)) |loc| {
+            const a = loc.holder.attrAt(loc.slot);
+            const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+            if (a.is_accessor) {
+                const getter = accessorMember(raw, "get");
+                if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                return try self.callAccessor(getter, receiver, &[_]Value{});
+            }
+            if (raw.bits != 0) return raw;
+        }
+        return val_mod.makeUndefined(self.arena);
+    }
+
     pub fn getProp(self: *BcVm, obj_val: Value, key: []const u8) !Value {
         if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);
         switch (obj_val.unbox()) {
@@ -2255,7 +2274,7 @@ pub const BcVm = struct {
             .symbol => {
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_symbol_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -2263,7 +2282,7 @@ pub const BcVm = struct {
                 // Phase 13: autoboxing for number primitives → Number.prototype.
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_number_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -2271,7 +2290,7 @@ pub const BcVm = struct {
                 // Phase 13: autoboxing for boolean primitives → Boolean.prototype.
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_boolean_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -2279,7 +2298,7 @@ pub const BcVm = struct {
                 // Autoboxing for bigint primitives → BigInt.prototype.
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_bigint_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
