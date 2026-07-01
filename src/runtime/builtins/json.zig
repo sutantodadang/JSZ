@@ -21,9 +21,75 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
 // ---------------------------------------------------------------- stringify ---
 
+fn jsonIsCallable(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .function, .bc_function, .native_function => true,
+        .object => |o| o.get("__call__") != null,
+        else => false,
+    };
+}
+
+/// SerializeJSONProperty transform (ES §25.5.2.2 partial): call value.toJSON(key)
+/// if present, then apply a function `replacer` as replacer(holder, key, value).
+fn applyProp(arena: std.mem.Allocator, replacer: Value, holder: *JsObject, key: []const u8, value_in: Value) anyerror!Value {
+    const fpm = @import("function_proto.zig");
+    var value = value_in;
+    if (value.bits != 0 and value.unbox() == .object) {
+        if (value.toPtr().object.get("toJSON")) |tj| {
+            if (jsonIsCallable(tj)) {
+                const kv = try val_mod.makeString(arena, key);
+                value = try fpm.invokeCallback(arena, value, tj, &.{kv});
+            }
+        }
+    }
+    if (jsonIsCallable(replacer)) {
+        const kv = try val_mod.makeString(arena, key);
+        const holder_v = try val_mod.makeObject(arena, holder);
+        value = try fpm.invokeCallback(arena, holder_v, replacer, &.{ kv, value });
+    }
+    return value;
+}
+
 pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) {
         return val_mod.makeUndefined(arena);
+    }
+
+    // Replacer (args[1]): a callable is a function replacer; an array is a
+    // property-name allowlist (each element ToString'd, in order).
+    var replacer: Value = Value{};
+    var key_filter: ?[]const []const u8 = null;
+    if (args.len > 1 and args[1].bits != 0) {
+        if (jsonIsCallable(args[1])) {
+            replacer = args[1];
+        } else if (args[1].unbox() == .object and args[1].toPtr().object.is_array) {
+            const arr = args[1].toPtr().object;
+            var list = std.ArrayList([]const u8){};
+            var i: usize = 0;
+            while (i < arr.array_length) : (i += 1) {
+                const k = try std.fmt.allocPrint(arena, "{d}", .{i});
+                const e = arr.getOwn(k) orelse continue;
+                if (e.bits == 0) continue;
+                const name: ?[]const u8 = switch (e.unbox()) {
+                    .string => |s| s,
+                    .number => |n| try formatNumber(arena, n),
+                    else => null,
+                };
+                if (name) |nm| {
+                    // Dedup: JSON.stringify allowlist ignores repeat entries.
+                    var dup = false;
+                    for (list.items) |ex| {
+                        if (std.mem.eql(u8, ex, nm)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) try list.append(arena, nm);
+                }
+            }
+            key_filter = list.items;
+        }
     }
 
     const indent: usize = if (args.len > 2 and args[2].bits != 0)
@@ -38,10 +104,15 @@ pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Val
     else
         0;
 
+    // Top-level: holder is a wrapper { "": value } so a function replacer sees it.
+    const wrapper = try JsObject.create(arena, null);
+    try wrapper.set("", args[0]);
+    const top = try applyProp(arena, replacer, wrapper, "", args[0]);
+
     var buf = std.ArrayList(u8){};
     // Ancestor stack for circular-reference detection (throws TypeError on a cycle).
     var seen = std.ArrayList(*JsObject){};
-    try stringifyValue(arena, &buf, args[0], indent, 0, &seen);
+    try stringifyValue(arena, &buf, top, indent, 0, &seen, replacer, key_filter);
     // If result is empty (e.g. function top-level), return undefined
     if (buf.items.len == 0) return val_mod.makeUndefined(arena);
     return val_mod.makeString(arena, buf.items);
@@ -54,6 +125,8 @@ fn stringifyValue(
     indent: usize,
     depth: usize,
     seen: *std.ArrayList(*JsObject),
+    replacer: Value,
+    key_filter: ?[]const []const u8,
 ) anyerror!void {
     if (v.bits == 0) {
         try buf.appendSlice(arena, "undefined");
@@ -80,12 +153,14 @@ fn stringifyValue(
             for (seen.items) |a| {
                 if (a == obj) return throwStringifyTypeError(arena);
             }
+            // A callable object (function) produces nothing (caller emits null in arrays).
+            if (obj.get("__call__") != null) return;
             try seen.append(arena, obj);
             defer _ = seen.pop();
             if (obj.is_array) {
-                try stringifyArray(arena, buf, obj, indent, depth, seen);
+                try stringifyArray(arena, buf, obj, indent, depth, seen, replacer, key_filter);
             } else {
-                try stringifyObject(arena, buf, obj, indent, depth, seen);
+                try stringifyObject(arena, buf, obj, indent, depth, seen, replacer, key_filter);
             }
         },
         // functions, native_function, symbol: produce nothing (caller uses "null" for arrays)
@@ -112,16 +187,23 @@ fn stringifyObject(
     indent: usize,
     depth: usize,
     seen: *std.ArrayList(*JsObject),
+    replacer: Value,
+    key_filter: ?[]const []const u8,
 ) anyerror!void {
     try buf.append(arena, '{');
     var first = true;
-    for (obj.ownKeys()) |k| {
-        if (!obj.isEnumerable(k)) continue;
-        const val = obj.getOwn(k) orelse continue;
-        // Skip functions and undefined values (per JSON spec)
+    // With an array replacer, iterate the allowlist order; otherwise own enumerable keys.
+    const keys: []const []const u8 = if (key_filter) |kf| kf else obj.ownKeys();
+    for (keys) |k| {
+        if (key_filter == null and !obj.isEnumerable(k)) continue;
+        const raw = obj.getOwn(k) orelse continue;
+        // SerializeJSONProperty: toJSON then function replacer.
+        const val = try applyProp(arena, replacer, obj, k, raw);
+        // Skip functions and undefined values (per JSON spec), post-transform.
         if (val.bits != 0) {
             const tag = val.unbox();
-            if (tag == .function or tag == .bc_function or tag == .native_function or tag == .undefined_) continue;
+            if (tag == .function or tag == .bc_function or tag == .native_function or tag == .undefined_ or tag == .symbol) continue;
+            if (tag == .object and val.toPtr().object.get("__call__") != null) continue;
         } else {
             continue; // zero = undefined
         }
@@ -139,7 +221,7 @@ fn stringifyObject(
         try buf.append(arena, ':');
         if (indent > 0) try buf.append(arena, ' ');
 
-        try stringifyValue(arena, buf, val, indent, depth + 1, seen);
+        try stringifyValue(arena, buf, val, indent, depth + 1, seen, replacer, key_filter);
     }
     if (indent > 0 and !first) {
         try buf.append(arena, '\n');
@@ -155,6 +237,8 @@ fn stringifyArray(
     indent: usize,
     depth: usize,
     seen: *std.ArrayList(*JsObject),
+    replacer: Value,
+    key_filter: ?[]const []const u8,
 ) anyerror!void {
     try buf.append(arena, '[');
     const len = arr.array_length;
@@ -166,22 +250,24 @@ fn stringifyArray(
             try appendIndent(arena, buf, indent, depth + 1);
         }
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        if (arr.getOwn(key)) |elem| {
-            // Functions/undefined in arrays become "null"
-            if (elem.bits != 0) {
-                const tag = elem.unbox();
-                if (tag == .function or tag == .bc_function or tag == .native_function or tag == .undefined_) {
-                    try buf.appendSlice(arena, "null");
-                    continue;
-                }
-            } else {
+        // An array replacer (key_filter) does NOT filter array indices; apply
+        // toJSON + function replacer per element (holder=arr, key=index string).
+        const raw = arr.getOwn(key) orelse Value{};
+        const elem = try applyProp(arena, replacer, arr, key, raw);
+        // Functions/undefined/symbol in arrays become "null"
+        if (elem.bits != 0) {
+            const tag = elem.unbox();
+            if (tag == .function or tag == .bc_function or tag == .native_function or tag == .undefined_ or tag == .symbol or
+                (tag == .object and elem.toPtr().object.get("__call__") != null))
+            {
                 try buf.appendSlice(arena, "null");
                 continue;
             }
-            try stringifyValue(arena, buf, elem, indent, depth + 1, seen);
         } else {
             try buf.appendSlice(arena, "null");
+            continue;
         }
+        try stringifyValue(arena, buf, elem, indent, depth + 1, seen, replacer, key_filter);
     }
     if (indent > 0 and len > 0) {
         try buf.append(arena, '\n');
