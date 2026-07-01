@@ -76,6 +76,7 @@ const LiveImport = struct { name: []const u8, ns: []const u8, prop: []const u8 }
 pub const Parser = struct {
     lexer: Lexer,
     arena: std.mem.Allocator,
+    source: []const u8,
     /// Lookahead token (already lexed).
     current: Token,
     /// True if we hit an unrecoverable error.
@@ -174,6 +175,7 @@ pub const Parser = struct {
         var p = Parser{
             .lexer = Lexer.init(source, arena),
             .arena = arena,
+            .source = source,
             .current = undefined,
             .had_error = false,
             .error_info = null,
@@ -320,6 +322,25 @@ pub const Parser = struct {
         const n = self.alloc() orelse return null;
         n.* = Node{ .kind = kind, .start = start, .end = end, .data = data };
         return n;
+    }
+
+    /// Slice of the original source covering [start, end) — used to retain a
+    /// function literal's exact source text for Function.prototype.toString.
+    /// Returns null for degenerate/synthetic spans (start >= end, as produced
+    /// by compiler-synthesized nodes with no real source) or an out-of-bounds
+    /// end, so callers can fall back to the native-code format.
+    ///
+    /// `end` is conventionally `p.current.start` — the start of the NEXT
+    /// lexed token, which the lexer already advanced past any intervening
+    /// whitespace/comments to reach. That means [start, end) can include
+    /// trailing whitespace between the construct's real last character and
+    /// whatever follows (e.g. `function(){return 1} + {}` captures a
+    /// trailing space before `+`) even though that whitespace was never part
+    /// of the function literal. Trim it so the retained text matches the
+    /// construct's real source exactly.
+    pub fn sourceSlice(self: *const Parser, start: u32, end: u32) ?[]const u8 {
+        if (start >= end or end > self.source.len) return null;
+        return std.mem.trimRight(u8, self.source[start..end], " \t\r\n");
     }
 
     /// Build a string-literal AST node (e.g. for export-name array elements).

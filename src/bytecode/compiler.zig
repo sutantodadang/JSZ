@@ -1913,6 +1913,7 @@ pub const FnCompiler = struct {
             fe.is_arrow,
             fe.rest_param,
             fe.param_defaults,
+            fe.source_text,
         );
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
@@ -2066,7 +2067,7 @@ fn compileFunction(
     body: []*Node,
     nfe_name: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null, &[_]?*Node{});
+    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null, &[_]?*Node{}, null);
 }
 
 /// Allocate an AST node from `data` (synthetic — no source span).
@@ -2125,6 +2126,7 @@ pub fn compileFunctionStrict(
     is_arrow: bool,
     rest_param: ?[]const u8,
     param_defaults: []const ?*Node,
+    source_text: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
@@ -2160,6 +2162,7 @@ pub fn compileFunctionStrict(
     for (instanceof_ic_table) |*entry| entry.* = ic_mod.InstanceofCache{};
     f.* = BcFunction{
         .name = name,
+        .source_text = source_text,
         .nfe_name = nfe_name,
         .arity = @intCast(params.len),
         .chunk = chunk,
@@ -2211,6 +2214,7 @@ pub fn compileProgram(
         false, // program is not an arrow
         null, // program has no rest parameter
         &[_]?*ast.Node{}, // no parameters → no defaults
+        null,
     );
     return f;
 }
@@ -2243,6 +2247,7 @@ pub fn compileModule(
         false, // program is not an arrow
         null, // program has no rest parameter
         &[_]?*ast.Node{}, // no parameters → no defaults
+        null,
     );
     f.is_module = true;
     return f;

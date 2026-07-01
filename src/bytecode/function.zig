@@ -7,6 +7,10 @@ const ic_mod = @import("../vm/ic.zig");
 /// A compiled bytecode function. Owned by the compile arena.
 pub const BcFunction = struct {
     name: ?[]const u8,
+    /// Function.prototype.toString: retained exact source text for this
+    /// function (see ast.FuncExpr.source_text / ast.FuncDecl.source_text).
+    /// Null → native fallback format is used instead.
+    source_text: ?[]const u8 = null,
     /// Named function EXPRESSION self-name: bound (immutably, per spec) inside
     /// the function's own scope so the body can refer to itself. Null for
     /// function DECLARATIONS — their name lives in the enclosing scope and is a

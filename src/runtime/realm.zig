@@ -2652,7 +2652,10 @@ fn nativeFunctionToString(arena: std.mem.Allocator, this_val: Value, _: []const 
     var name: []const u8 = "";
     if (this_val.bits != 0) {
         switch (this_val.unbox()) {
-            .bc_function => |c| name = c.func.name orelse "",
+            .bc_function => |c| {
+                if (c.func.source_text) |src| return val_mod.makeString(arena, src);
+                name = c.func.name orelse "";
+            },
             else => {},
         }
     }

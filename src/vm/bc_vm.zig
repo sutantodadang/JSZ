@@ -4497,7 +4497,7 @@ fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
         .number => |n| try formatNumber(arena, n),
         .string => |s| s,
         .function => |f| try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{f.name orelse ""}),
-        .bc_function => |c| try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{c.func.name orelse ""}),
+        .bc_function => |c| if (c.func.source_text) |src| src else try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{c.func.name orelse ""}),
         .object => |obj| blk: {
             if (obj.is_array) {
                 var buf = std.ArrayList(u8){};

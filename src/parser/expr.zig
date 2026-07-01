@@ -210,6 +210,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
                 .is_arrow = true,
                 .is_async = false,
                 .is_strict = is_strict,
+                .source_text = p.sourceSlice(left.start, p.current.start),
             },
         });
     }
@@ -350,6 +351,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
                 .is_arrow = true,
                 .is_async = is_async_arrow,
                 .is_strict = is_strict,
+                .source_text = p.sourceSlice(start, p.current.start),
             },
         });
     }
@@ -1646,6 +1648,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_generator = m_is_gen,
                     .is_async = m_is_async,
                     .is_strict = parser_file.hasUseStrict(am_body),
+                    .source_text = p.sourceSlice(prop_start, p.current.start),
                 },
             }) orelse return null;
             if (p.super_used) super_methods.append(p.arena, am_fn) catch {
@@ -1682,6 +1685,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                         .is_generator = false,
                         .is_async = false,
                         .is_strict = parser_file.hasUseStrict(cm_body),
+                        .source_text = p.sourceSlice(prop_start, p.current.start),
                     },
                 }) orelse return null;
                 if (p.super_used) super_methods.append(p.arena, cm_fn) catch {
@@ -1798,6 +1802,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_generator = false,
                     .is_async = false,
                     .is_strict = parser_file.hasUseStrict(acc_body),
+                    .source_text = p.sourceSlice(prop_start, p.current.start),
                 },
             }) orelse return null;
             if (p.super_used) super_methods.append(p.arena, acc_fn) catch {
@@ -1828,6 +1833,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_generator = false,
                     .is_async = false,
                     .is_strict = parser_file.hasUseStrict(m_body),
+                    .source_text = p.sourceSlice(prop_start, p.current.start),
                 },
             }) orelse return null;
             if (p.super_used) super_methods.append(p.arena, m_fn) catch {
@@ -2051,6 +2057,7 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
             .is_generator = is_generator,
             .is_async = is_async,
             .is_strict = is_strict,
+            .source_text = p.sourceSlice(start, p.current.start),
         },
     });
 }

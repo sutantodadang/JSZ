@@ -147,6 +147,12 @@ const ClassMember = struct {
     param_defaults: []?*Node = &[_]?*Node{},
     rest_param: ?[]const u8 = null,
     body: []*Node = &[_]*Node{},
+    /// Source span of this member (name through end of body), captured in
+    /// parseClassMembers at parse time — emitClassMember runs later, after
+    /// `p.current` has moved on, so it cannot recover this itself. Both 0
+    /// (default) means "no real span" → toString falls back to native format.
+    src_start: u32 = 0,
+    src_end: u32 = 0,
 };
 
 /// A parsed class field (`name = init;`, `#name = init;`, `[expr] = init;`,
@@ -186,6 +192,8 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
     var fields = std.ArrayList(ClassField){};
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         if (p.match(.semicolon)) continue;
+
+        const member_start = p.current.start;
 
         var is_static = false;
         if (p.check(.identifier) and std.mem.eql(u8, p.current.value_str, "static") and !nextTokenEndsName(p)) {
@@ -266,6 +274,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             return null;
         };
         p.in_generator_function = prev_gen;
+        const member_end = p.current.start;
 
         if (!is_static and accessor == .none and computed_key == null and std.mem.eql(u8, name, "constructor")) {
             res.ctor_params = mparams.params;
@@ -284,6 +293,8 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
                 .param_defaults = mparams.param_defaults,
                 .rest_param = mparams.rest_param,
                 .body = mbody,
+                .src_start = member_start,
+                .src_end = member_end,
             }) catch return null;
         }
     }
@@ -477,6 +488,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         .is_arrow = false,
         .is_generator = m.is_generator,
         .is_async = m.is_async,
+        .source_text = p.sourceSlice(m.src_start, m.src_end),
     } }) orelse return null;
 
     const target = if (m.is_static)
@@ -747,6 +759,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
             .is_arrow = false,
             .is_strict = parser_file.hasUseStrict(ctor_body_effective),
             .requires_super = super_name != null,
+            .source_text = p.sourceSlice(start, p.current.start),
         },
     }) orelse return null;
     const ctor_decl = p.makeNode(.var_decl, start, p.current.start, .{

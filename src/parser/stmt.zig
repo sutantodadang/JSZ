@@ -825,6 +825,7 @@ pub fn parseFunctionDecl(p: *Parser, is_async: bool) ?*Node {
             .is_generator = is_generator,
             .is_async = is_async,
             .is_strict = is_strict,
+            .source_text = p.sourceSlice(start, p.current.start),
         },
     });
 }
