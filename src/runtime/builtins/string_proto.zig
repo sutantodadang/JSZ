@@ -450,10 +450,7 @@ pub fn nativeReplace(arena: std.mem.Allocator, this_val: Value, args: []const Va
                 if (e == error.JsException) return error.JsException;
                 return error.OutOfMemory;
             };
-            const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.unbox() == .string)
-                repl_val.toPtr().string
-            else
-                "undefined";
+            const repl_s: []const u8 = try argToStr(arena, repl_val);
             const result = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ s[0..idx], repl_s, s[idx + pat.len ..] });
             return val_mod.makeString(arena, result);
         }
@@ -557,10 +554,7 @@ fn replaceAllStringWithFn(arena: std.mem.Allocator, s: []const u8, pat: []const 
                 if (e == error.JsException) return error.JsException;
                 return error.OutOfMemory;
             };
-            const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.unbox() == .string)
-                repl_val.toPtr().string
-            else
-                "undefined";
+            const repl_s: []const u8 = try argToStr(arena, repl_val);
             try result.appendSlice(arena, repl_s);
             if (pos < s.len) pos += 1 else break;
         }
@@ -581,10 +575,7 @@ fn replaceAllStringWithFn(arena: std.mem.Allocator, s: []const u8, pat: []const 
             if (e == error.JsException) return error.JsException;
             return error.OutOfMemory;
         };
-        const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.unbox() == .string)
-            repl_val.toPtr().string
-        else
-            "undefined";
+        const repl_s: []const u8 = try argToStr(arena, repl_val);
         try result.appendSlice(arena, repl_s);
         pos = abs + pat.len;
     }
@@ -626,10 +617,7 @@ fn doReplaceWithFn(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mo
             if (e == error.JsException) return error.JsException;
             return error.OutOfMemory;
         };
-        const repl_s: []const u8 = if (repl_val.bits != 0 and repl_val.unbox() == .string)
-            repl_val.toPtr().string
-        else
-            "undefined";
+        const repl_s: []const u8 = try argToStr(arena, repl_val);
         try result.appendSlice(arena, repl_s);
 
         if (m.state.pos == m.start) {

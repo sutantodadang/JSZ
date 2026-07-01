@@ -25,6 +25,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const re_exec_fn = try val_mod.makeNativeFunction(arena, nativeRegExpExec);
     try regexp_proto.set("test", re_test_fn);
     try regexp_proto.set("exec", re_exec_fn);
+    try regexp_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeRegExpToString));
 
     const regexp_ctor_obj = try JsObject.create(arena, null);
     const regexp_proto_val = try val_mod.makeObject(arena, regexp_proto);
@@ -1202,6 +1203,17 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
 // ============================================================= Prototype Getters
 
 /// source getter: "(?:)" on RegExp.prototype, real pattern otherwise.
+/// RegExp.prototype.toString: "/" + Get(R,"source") + "/" + Get(R,"flags").
+pub fn nativeRegExpToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.toString called on incompatible receiver");
+    const src = try nativeRegExpGetSource(arena, this_val, &.{});
+    const flags = try nativeRegExpGetFlags(arena, this_val, &.{});
+    const src_s: []const u8 = if (src.bits != 0 and src.unbox() == .string) src.toPtr().string else "(?:)";
+    const flags_s: []const u8 = if (flags.bits != 0 and flags.unbox() == .string) flags.toPtr().string else "";
+    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "/{s}/{s}", .{ src_s, flags_s }));
+}
+
 pub fn nativeRegExpGetSource(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object)
         return realm_mod.throwTypeError(arena, "RegExp.prototype.source called on incompatible receiver");
