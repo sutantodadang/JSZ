@@ -1327,24 +1327,41 @@ fn populateErrorThis(arena: std.mem.Allocator, this_val: Value, name: []const u8
     return createErrorObj(arena, proto, name, message);
 }
 
+/// InstallErrorCause (ES §20.5.8.1): if `options` is an object with an own
+/// "cause", set `error.cause` to it (writable, non-enumerable, configurable).
+fn installErrorCause(arena: std.mem.Allocator, result: Value, options: Value) !void {
+    if (result.bits == 0 or result.unbox() != .object) return;
+    if (options.bits == 0 or options.unbox() != .object) return;
+    const opts = options.toPtr().object;
+    if (!opts.hasOwn("cause")) return;
+    const cause = opts.getOwn("cause") orelse try val_mod.makeUndefined(arena);
+    _ = try result.toPtr().object.defineOwnData("cause", cause, .{ .writable = true, .enumerable = false, .configurable = true });
+}
+
+fn errorCtorWithCause(arena: std.mem.Allocator, this_val: Value, name: []const u8, args: []const Value) anyerror!Value {
+    const result = try populateErrorThis(arena, this_val, name, extractMessage(args));
+    try installErrorCause(arena, result, if (args.len > 1) args[1] else Value{});
+    return result;
+}
+
 fn nativeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "Error", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "Error", args);
 }
 
 fn nativeTypeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "TypeError", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "TypeError", args);
 }
 
 fn nativeSyntaxErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "SyntaxError", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "SyntaxError", args);
 }
 
 fn nativeRangeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "RangeError", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "RangeError", args);
 }
 
 fn nativeReferenceErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "ReferenceError", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "ReferenceError", args);
 }
 
 fn nativeAggregateErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1367,6 +1384,8 @@ fn nativeAggregateErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []c
     if (result.bits != 0 and result.unbox() == .object) {
         try result.toPtr().object.set("errors", errors_val);
     }
+    // AggregateError options object is the third argument.
+    try installErrorCause(arena, result, if (args.len > 2) args[2] else Value{});
     return result;
 }
 
