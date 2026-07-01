@@ -98,8 +98,7 @@ pub fn nativePop(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
 
 pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireCoercible(arena, this_val);
-    const arr = getArray(this_val) orelse return val_mod.makeUndefined(arena);
-    const len = arr.array_length;
+    const len = try genLength(arena, this_val);
 
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
 
@@ -124,14 +123,8 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
         var ni: u32 = 0;
         var i: usize = start;
         while (i < end_) : (i += 1) {
-            const src_key = try std.fmt.allocPrint(arena, "{d}", .{i});
             const dst_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
-            if (arr.getOwn(src_key)) |elem| {
-                try new_arr.set(dst_key, elem);
-            } else {
-                const undef = try val_mod.makeUndefined(arena);
-                try new_arr.set(dst_key, undef);
-            }
+            try new_arr.set(dst_key, try genGet(arena, this_val, i));
             ni += 1;
         }
         new_arr.array_length = ni;
@@ -141,10 +134,10 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
 pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireCoercible(arena, this_val);
-    const arr = getArray(this_val) orelse return val_mod.makeNumber(arena, -1.0);
     if (args.len == 0) return val_mod.makeNumber(arena, -1.0);
     const search = args[0];
-    const len = arr.array_length;
+    const len = try genLength(arena, this_val);
+    const real = getArray(this_val);
 
     const from: usize = if (args.len > 1 and args[1].bits != 0)
         switch (args[1].unbox()) {
@@ -162,12 +155,11 @@ pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Va
 
     var i: usize = from;
     while (i < len) : (i += 1) {
-        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        if (arr.getOwn(key)) |elem| {
-            if (jsStrictEqual(elem, search)) {
-                return val_mod.makeNumber(arena, @floatFromInt(i));
-            }
-        }
+        const elem = if (real) |a| blk: {
+            const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            break :blk a.getOwn(key) orelse continue;
+        } else try genGet(arena, this_val, i);
+        if (jsStrictEqual(elem, search)) return val_mod.makeNumber(arena, @floatFromInt(i));
     }
     return val_mod.makeNumber(arena, -1.0);
 }
@@ -175,9 +167,8 @@ pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Va
 /// ES2016 Array.prototype.includes — SameValueZero (NaN matches NaN), scans holes as undefined.
 pub fn nativeIncludes(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireCoercible(arena, this_val);
-    const arr = getArray(this_val) orelse return val_mod.makeBool(arena, false);
     const search = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    const len = arr.array_length;
+    const len = try genLength(arena, this_val);
     const from: usize = if (args.len > 1 and args[1].bits != 0)
         switch (args[1].unbox()) {
             .number => |n| blk: {
@@ -191,11 +182,9 @@ pub fn nativeIncludes(arena: std.mem.Allocator, this_val: Value, args: []const V
         }
     else
         0;
-    const undef = try val_mod.makeUndefined(arena);
     var i: usize = from;
     while (i < len) : (i += 1) {
-        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const elem = arr.getOwn(key) orelse undef;
+        const elem = try genGet(arena, this_val, i);
         if (sameValueZero(elem, search)) return val_mod.makeBool(arena, true);
     }
     return val_mod.makeBool(arena, false);
@@ -253,6 +242,7 @@ pub fn nativeFlatMap(arena: std.mem.Allocator, this_val: Value, args: []const Va
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const len = try genLength(arena, this_val);
     const new_arr = try JsObject.createArray(arena, arr_proto);
@@ -260,7 +250,7 @@ pub fn nativeFlatMap(arena: std.mem.Allocator, this_val: Value, args: []const Va
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const elem = try genGet(arena, this_val, i);
-        const mapped = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        const mapped = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         if (mapped.bits != 0 and mapped.unbox() == .object and mapped.toPtr().object.is_array) {
             try flattenInto(arena, new_arr, mapped.toPtr().object, 1, &ni);
         } else {
@@ -275,8 +265,7 @@ pub fn nativeFlatMap(arena: std.mem.Allocator, this_val: Value, args: []const Va
 
 pub fn nativeJoin(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireCoercible(arena, this_val);
-    const arr = getArray(this_val) orelse return val_mod.makeString(arena, "");
-    const len = arr.array_length;
+    const len = try genLength(arena, this_val);
 
     // §23.1.3.18: only `undefined` (or absent) yields the default ",". Every other
     // value (including null → "null") goes through ToString(separator).
@@ -289,10 +278,9 @@ pub fn nativeJoin(arena: std.mem.Allocator, this_val: Value, args: []const Value
     var i: usize = 0;
     while (i < len) : (i += 1) {
         if (i > 0) try buf.appendSlice(arena, sep);
-        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        if (arr.getOwn(key)) |elem| {
-            const s = try elemToString(arena, elem);
-            try buf.appendSlice(arena, s);
+        const elem = try genGet(arena, this_val, i);
+        if (!(elem.bits == 0) and elem.unbox() != .undefined_ and elem.unbox() != .null_) {
+            try buf.appendSlice(arena, try elemToString(arena, elem));
         }
     }
     return val_mod.makeString(arena, buf.items);
@@ -505,11 +493,12 @@ pub fn nativeForEach(arena: std.mem.Allocator, this_val: Value, args: []const Va
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     const len = try genLength(arena, this_val);
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const elem = try genGet(arena, this_val, i);
-        _ = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        _ = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
     }
     return val_mod.makeUndefined(arena);
 }
@@ -519,6 +508,7 @@ pub fn nativeMap(arena: std.mem.Allocator, this_val: Value, args: []const Value)
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const len = try genLength(arena, this_val);
     const new_arr = try JsObject.createArray(arena, arr_proto);
@@ -526,7 +516,7 @@ pub fn nativeMap(arena: std.mem.Allocator, this_val: Value, args: []const Value)
     while (i < len) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
         const elem = try genGet(arena, this_val, i);
-        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         try new_arr.set(key, result);
     }
     return val_mod.makeObject(arena, new_arr);
@@ -537,6 +527,7 @@ pub fn nativeFilter(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const len = try genLength(arena, this_val);
     const new_arr = try JsObject.createArray(arena, arr_proto);
@@ -544,7 +535,7 @@ pub fn nativeFilter(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const elem = try genGet(arena, this_val, i);
-        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         if (isTruthy(result)) {
             const dst_key = try std.fmt.allocPrint(arena, "{d}", .{ni});
             try new_arr.set(dst_key, elem);
@@ -558,6 +549,7 @@ pub fn nativeReduce(arena: std.mem.Allocator, this_val: Value, args: []const Val
     try requireCoercible(arena, this_val);
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
+    const O = try toObject(arena, this_val);
     const len = try genLength(arena, this_val);
     var acc: Value = undefined;
     var start_i: usize = 0;
@@ -573,7 +565,7 @@ pub fn nativeReduce(arena: std.mem.Allocator, this_val: Value, args: []const Val
     while (i < len) : (i += 1) {
         const elem = try genGet(arena, this_val, i);
         const fpm = @import("../builtins/function_proto.zig");
-        const cb_args = [_]Value{ acc, elem, try val_mod.makeNumber(arena, @floatFromInt(i)), this_val };
+        const cb_args = [_]Value{ acc, elem, try val_mod.makeNumber(arena, @floatFromInt(i)), O };
         acc = try fpm.invokeCallback(arena, undef, cb, &cb_args);
     }
     return acc;
@@ -583,6 +575,7 @@ pub fn nativeReduceRight(arena: std.mem.Allocator, this_val: Value, args: []cons
     try requireCoercible(arena, this_val);
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
+    const O = try toObject(arena, this_val);
     const len = try genLength(arena, this_val);
     var acc: Value = undefined;
     var start_i: i64 = @intCast(len);
@@ -601,7 +594,7 @@ pub fn nativeReduceRight(arena: std.mem.Allocator, this_val: Value, args: []cons
     var i: i64 = start_i - 1;
     while (i >= 0) : (i -= 1) {
         const elem = try genGet(arena, this_val, @intCast(i));
-        const cb_args = [_]Value{ acc, elem, try val_mod.makeNumber(arena, @floatFromInt(i)), this_val };
+        const cb_args = [_]Value{ acc, elem, try val_mod.makeNumber(arena, @floatFromInt(i)), O };
         acc = try fpm.invokeCallback(arena, undef, cb, &cb_args);
     }
     return acc;
@@ -612,11 +605,12 @@ pub fn nativeSome(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     const len = try genLength(arena, this_val);
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const elem = try genGet(arena, this_val, i);
-        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         if (isTruthy(result)) return val_mod.makeBool(arena, true);
     }
     return val_mod.makeBool(arena, false);
@@ -627,11 +621,12 @@ pub fn nativeEvery(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     const len = try genLength(arena, this_val);
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const elem = try genGet(arena, this_val, i);
-        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         if (!isTruthy(result)) return val_mod.makeBool(arena, false);
     }
     return val_mod.makeBool(arena, true);
@@ -642,12 +637,13 @@ pub fn nativeFind(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const elem = try genGet(arena, this_val, i);
-        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         if (isTruthy(result)) return elem;
     }
     return val_mod.makeUndefined(arena);
@@ -658,12 +654,13 @@ pub fn nativeFindIndex(arena: std.mem.Allocator, this_val: Value, args: []const 
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const elem = try genGet(arena, this_val, i);
-        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         if (isTruthy(result)) return val_mod.makeNumber(arena, @floatFromInt(i));
     }
     return val_mod.makeNumber(arena, -1.0);
@@ -694,6 +691,7 @@ pub fn nativeFindLast(arena: std.mem.Allocator, this_val: Value, args: []const V
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
     if (len == 0) return val_mod.makeUndefined(arena);
@@ -701,7 +699,7 @@ pub fn nativeFindLast(arena: std.mem.Allocator, this_val: Value, args: []const V
     while (i > 0) {
         i -= 1;
         const elem = try genGet(arena, this_val, i);
-        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         if (isTruthy(result)) return elem;
     }
     return val_mod.makeUndefined(arena);
@@ -713,6 +711,7 @@ pub fn nativeFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []co
     const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     try requireCallable(arena, cb);
     const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
     try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
     if (len == 0) return val_mod.makeNumber(arena, -1.0);
@@ -720,7 +719,7 @@ pub fn nativeFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []co
     while (i > 0) {
         i -= 1;
         const elem = try genGet(arena, this_val, i);
-        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), this_val);
+        const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         if (isTruthy(result)) return val_mod.makeNumber(arena, @floatFromInt(i));
     }
     return val_mod.makeNumber(arena, -1.0);
@@ -851,6 +850,33 @@ fn genSet(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
     }
     if (this_val.isHeapPtr() and this_val.toPtr().* == .object)
         try this_val.toPtr().object.set(key, v);
+}
+
+/// ToObject(this): box a primitive into its wrapper (Number/Boolean/String/
+/// Symbol/BigInt.prototype) so array methods can pass a real object as the
+/// callback's 4th argument and `instanceof` holds; objects pass through
+/// unchanged. Callers guarantee requireCoercible first, so null/undefined
+/// never reach here (and are returned as-is defensively).
+fn toObject(arena: std.mem.Allocator, v: Value) !Value {
+    if (v.bits == 0) return v;
+    if (v.unbox() == .object) return v;
+    const proto: ?*JsObject = switch (v.unbox()) {
+        .number => realm_mod.active_number_proto,
+        .boolean => realm_mod.active_boolean_proto,
+        .string => realm_mod.active_string_proto orelse realm_mod.active_object_proto,
+        .symbol => realm_mod.active_symbol_proto orelse realm_mod.active_object_proto,
+        .bigint => realm_mod.active_bigint_proto orelse realm_mod.active_object_proto,
+        else => return v,
+    };
+    if (proto) |p| {
+        const w = if (realm_mod.active_heap) |heap|
+            try JsObject.createOnHeap(heap, p)
+        else
+            try JsObject.create(arena, p);
+        try w.set("[[PrimitiveValue]]", v);
+        return val_mod.makeObject(arena, w);
+    }
+    return v;
 }
 
 fn relIndex(idx: f64, len: usize) usize {
