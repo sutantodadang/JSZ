@@ -1557,6 +1557,21 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
     var super_methods = std.ArrayList(*Node){};
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const prop_start = p.current.start;
+        // ES2018 object-literal spread: `{...expr}` (CopyDataProperties at
+        // runtime via __objSpreadInto__, compiled in compileObjectLiteral).
+        // Unlike the object-REST *pattern* (`{a, ...rest} = x`), this is not
+        // required to be last and its operand is a full AssignmentExpression.
+        if (p.check(.ellipsis)) {
+            _ = p.advance(); // consume '...'
+            const spread_val = p.parseAssignmentExpr() orelse return null;
+            const spread_node = p.makeNode(.spread_expr, prop_start, spread_val.end, .{ .spread_expr = spread_val }) orelse return null;
+            props.append(p.arena, ast.ObjectProp{ .key = "", .value = spread_node, .kind = .init, .computed_key = null }) catch {
+                p.had_error = true;
+                return null;
+            };
+            if (!p.match(.comma)) break;
+            continue;
+        }
         // ES2017 async / ES2015 generator method shorthand:
         //   `async name(){}`, `async [expr](){}`, `async *name(){}`,
         //   `*name(){}`, `*[expr](){}`. `async` is contextual, so only treat it

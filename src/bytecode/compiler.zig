@@ -1303,6 +1303,31 @@ pub const FnCompiler = struct {
         try self.emitU8(robj);
 
         for (ol.properties) |prop| {
+            // ES2018 object-literal spread `{...expr}`: parsed as an ObjectProp
+            // whose `value` is a `.spread_expr` node (key/computed_key unused).
+            // Compile the operand, then call the `__objSpreadInto__` runtime
+            // helper to CopyDataProperties directly into `robj` (mutates in
+            // place; later properties in source order still override, since
+            // this call happens exactly where the spread sits in the loop).
+            if (prop.value.kind == .spread_expr) {
+                const base_sp = self.sp;
+                const b = self.allocReg();
+                const c_helper = try self.addConstant(try val_mod.makeString(self.arena, "__objSpreadInto__"));
+                try self.emitOp(.GET_GLOBAL, line);
+                try self.emitU8(b);
+                try self.emitU16(@intCast(c_helper));
+                const a1 = self.allocReg();
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(a1);
+                try self.emitU8(robj);
+                _ = try self.compileExpr(prop.value.data.spread_expr);
+                try self.emitOp(.CALL, line);
+                try self.emitU8(b);
+                try self.emitU8(2);
+                try self.emitU8(b);
+                self.sp = base_sp;
+                continue;
+            }
             // ES6 computed key `{ [expr]: value }`: evaluate key at runtime and
             // set dynamically (handles symbol keys).
             if (prop.computed_key) |key_node| {
