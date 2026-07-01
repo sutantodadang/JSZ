@@ -110,6 +110,10 @@ pub const FnCompiler = struct {
     /// M14: the body read an identifier named `arguments`. Combined with
     /// `!is_arrow` this drives BcFunction.uses_arguments.
     saw_arguments: bool = false,
+    /// NamedEvaluation: when set, the next compiled anonymous function expression
+    /// adopts this as its name. Consumed (cleared) immediately on use so nested
+    /// functions are unaffected.
+    name_hint: ?[]const u8 = null,
     /// Phase 8: nesting depth of try/catch/finally regions. A call in the
     /// operand of `return` is only in tail position when try_depth == 0
     /// (a pending finally would run after the call returns, so it is not tail).
@@ -954,7 +958,12 @@ pub const FnCompiler = struct {
                     return rsrc;
                 }
             }
+            // NamedEvaluation: `x = function(){}` — inject binding name as hint.
+            if (a.target.kind == .identifier and a.value.kind == .function_expr) {
+                self.name_hint = a.target.data.identifier;
+            }
             const rhs = try self.compileExpr(a.value);
+            self.name_hint = null; // defensive clear (no-op if consumed inside)
             if (a.target.kind == .identifier) {
                 try self.emitStore(a.target.data.identifier, rhs, line);
             } else if (a.target.kind == .member_expr) {
@@ -1294,6 +1303,31 @@ pub const FnCompiler = struct {
         try self.emitU8(robj);
 
         for (ol.properties) |prop| {
+            // ES2018 object-literal spread `{...expr}`: parsed as an ObjectProp
+            // whose `value` is a `.spread_expr` node (key/computed_key unused).
+            // Compile the operand, then call the `__objSpreadInto__` runtime
+            // helper to CopyDataProperties directly into `robj` (mutates in
+            // place; later properties in source order still override, since
+            // this call happens exactly where the spread sits in the loop).
+            if (prop.value.kind == .spread_expr) {
+                const base_sp = self.sp;
+                const b = self.allocReg();
+                const c_helper = try self.addConstant(try val_mod.makeString(self.arena, "__objSpreadInto__"));
+                try self.emitOp(.GET_GLOBAL, line);
+                try self.emitU8(b);
+                try self.emitU16(@intCast(c_helper));
+                const a1 = self.allocReg();
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(a1);
+                try self.emitU8(robj);
+                _ = try self.compileExpr(prop.value.data.spread_expr);
+                try self.emitOp(.CALL, line);
+                try self.emitU8(b);
+                try self.emitU8(2);
+                try self.emitU8(b);
+                self.sp = base_sp;
+                continue;
+            }
             // ES6 computed key `{ [expr]: value }`: evaluate key at runtime and
             // set dynamically (handles symbol keys).
             if (prop.computed_key) |key_node| {
@@ -1316,7 +1350,12 @@ pub const FnCompiler = struct {
                 self.freeReg(); // free rkey
                 continue;
             }
+            // NamedEvaluation: `{key: function(){}}` data property — inject key as hint.
+            if (prop.kind == .init and prop.value.kind == .function_expr) {
+                self.name_hint = prop.key;
+            }
             const rval = try self.compileExpr(prop.value);
+            self.name_hint = null; // defensive clear (no-op if consumed inside)
             const sv = try val_mod.makeString(self.arena, prop.key);
             const kidx = try self.addConstant(sv);
             if (prop.kind == .init) {
@@ -1855,13 +1894,18 @@ pub const FnCompiler = struct {
     }
 
     pub fn compileFuncExpr(self: *Self, fe: ast.FuncExpr, line: u32) error{OutOfMemory}!u8 {
+        // NamedEvaluation: consume the transient hint and apply it when this
+        // function expression is genuinely anonymous and not a method.
+        const hint = self.name_hint;
+        self.name_hint = null; // consume once — nested anonymous fns must not inherit it
+        const eff_name: ?[]const u8 = if (!fe.is_method and fe.name == null) hint else fe.name;
         // Compile inner function.
         const child_fn = try compileFunctionStrict(
             self.arena,
-            fe.name,
+            eff_name,
             fe.params,
             fe.body,
-            if (fe.is_method) null else fe.name, // nfe_name: named fn exprs self-bind; methods do not
+            if (fe.is_method) null else eff_name, // nfe_name: named fn exprs self-bind; methods do not
             fe.is_strict or self.is_strict, // strictness is inherited by nested functions
             fe.is_generator,
             fe.is_async,
@@ -1869,6 +1913,7 @@ pub const FnCompiler = struct {
             fe.is_arrow,
             fe.rest_param,
             fe.param_defaults,
+            fe.source_text,
         );
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
@@ -2022,7 +2067,7 @@ fn compileFunction(
     body: []*Node,
     nfe_name: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null, &[_]?*Node{});
+    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null, &[_]?*Node{}, null);
 }
 
 /// Allocate an AST node from `data` (synthetic — no source span).
@@ -2081,6 +2126,7 @@ pub fn compileFunctionStrict(
     is_arrow: bool,
     rest_param: ?[]const u8,
     param_defaults: []const ?*Node,
+    source_text: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
@@ -2116,6 +2162,7 @@ pub fn compileFunctionStrict(
     for (instanceof_ic_table) |*entry| entry.* = ic_mod.InstanceofCache{};
     f.* = BcFunction{
         .name = name,
+        .source_text = source_text,
         .nfe_name = nfe_name,
         .arity = @intCast(params.len),
         .chunk = chunk,
@@ -2167,6 +2214,7 @@ pub fn compileProgram(
         false, // program is not an arrow
         null, // program has no rest parameter
         &[_]?*ast.Node{}, // no parameters → no defaults
+        null,
     );
     return f;
 }
@@ -2199,6 +2247,7 @@ pub fn compileModule(
         false, // program is not an arrow
         null, // program has no rest parameter
         &[_]?*ast.Node{}, // no parameters → no defaults
+        null,
     );
     f.is_module = true;
     return f;

@@ -43,6 +43,7 @@ const proxy_mod = @import("./builtins/proxy.zig");
 const shadow_realm_mod = @import("./builtins/shadow_realm.zig");
 // Phase 13 Intl
 const intl_mod = @import("./builtins/intl.zig");
+const builtinLength = @import("./builtins/builtin_lengths.zig").builtinLength;
 
 // ---------------------------------------------------------------- Context interface ---
 
@@ -219,26 +220,31 @@ fn nativeObjectCreate(arena: std.mem.Allocator, _: Value, args: []const Value) a
     // Workaround: use a thread-local reference to the active heap.
     // This is safe because native functions are only called during eval,
     // when exactly one Realm (and heap) is live per thread.
+    // ES §20.1.2.2: the prototype argument must be an Object or null; any other
+    // value (including undefined / a missing argument) is a TypeError.
     var proto: ?*JsObject = null;
-    if (args.len > 0) {
-        const a = args[0];
-        if (a.bits != 0) {
-            switch (a.unbox()) {
-                .object => |obj| proto = obj,
-                .null_ => proto = null,
-                else => {},
-            }
-        }
+    if (args.len == 0 or args[0].bits == 0) {
+        return throwTypeError(arena, "Object prototype may only be an Object or null");
+    }
+    switch (args[0].unbox()) {
+        .object => |obj| proto = obj,
+        .null_ => proto = null,
+        else => return throwTypeError(arena, "Object prototype may only be an Object or null"),
     }
     // Allocate on the active heap if available, otherwise fallback to arena.
     // Always use `arena` for the JsValue wrapper (it's eval-arena-lifetime).
-    if (active_heap) |heap| {
-        const obj = try JsObject.createOnHeap(heap, proto);
-        return val_mod.makeObject(arena, obj);
+    const obj_val = if (active_heap) |heap|
+        try val_mod.makeObject(arena, try JsObject.createOnHeap(heap, proto))
+    else
+        // Fallback: arena (when heap not yet wired, e.g., tree-walker path).
+        try val_mod.makeObject(arena, try JsObject.create(arena, proto));
+
+    // ES §20.1.2.2 step 3: if Properties is present (not undefined), apply
+    // ObjectDefineProperties. Reuse the tested defineProperties implementation.
+    if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_) {
+        _ = try obj_methods_mod.nativeObjectDefineProperties(arena, Value{}, &.{ obj_val, args[1] });
     }
-    // Fallback: arena (when heap not yet wired, e.g., tree-walker path).
-    const obj = try JsObject.create(arena, proto);
-    return val_mod.makeObject(arena, obj);
+    return obj_val;
 }
 
 /// Minimal CommonJS-style host shim:
@@ -647,7 +653,7 @@ pub fn nativeLiveReexport(arena: std.mem.Allocator, _: Value, args: []const Valu
     // and use a generic getter that reads them back.
     try getter_holder.set("__source__", args[2]);
     try getter_holder.set("__prop__", args[3]);
-    try getter_holder.set("get", try val_mod.makeNativeFunction(arena, liveReexportGetter));
+    try getter_holder.set("get", try val_mod.makeNativeFunctionNamed(arena, liveReexportGetter, "get", 0));
     const holder_val = try val_mod.makeObject(arena, getter_holder);
 
     const ok = try exports_obj.defineOwnAccessor(name, holder_val, .{
@@ -1321,24 +1327,41 @@ fn populateErrorThis(arena: std.mem.Allocator, this_val: Value, name: []const u8
     return createErrorObj(arena, proto, name, message);
 }
 
+/// InstallErrorCause (ES §20.5.8.1): if `options` is an object with an own
+/// "cause", set `error.cause` to it (writable, non-enumerable, configurable).
+fn installErrorCause(arena: std.mem.Allocator, result: Value, options: Value) !void {
+    if (result.bits == 0 or result.unbox() != .object) return;
+    if (options.bits == 0 or options.unbox() != .object) return;
+    const opts = options.toPtr().object;
+    if (!opts.hasOwn("cause")) return;
+    const cause = opts.getOwn("cause") orelse try val_mod.makeUndefined(arena);
+    _ = try result.toPtr().object.defineOwnData("cause", cause, .{ .writable = true, .enumerable = false, .configurable = true });
+}
+
+fn errorCtorWithCause(arena: std.mem.Allocator, this_val: Value, name: []const u8, args: []const Value) anyerror!Value {
+    const result = try populateErrorThis(arena, this_val, name, extractMessage(args));
+    try installErrorCause(arena, result, if (args.len > 1) args[1] else Value{});
+    return result;
+}
+
 fn nativeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "Error", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "Error", args);
 }
 
 fn nativeTypeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "TypeError", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "TypeError", args);
 }
 
 fn nativeSyntaxErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "SyntaxError", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "SyntaxError", args);
 }
 
 fn nativeRangeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "RangeError", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "RangeError", args);
 }
 
 fn nativeReferenceErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return populateErrorThis(arena, this_val, "ReferenceError", extractMessage(args));
+    return errorCtorWithCause(arena, this_val, "ReferenceError", args);
 }
 
 fn nativeAggregateErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1361,6 +1384,8 @@ fn nativeAggregateErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []c
     if (result.bits != 0 and result.unbox() == .object) {
         try result.toPtr().object.set("errors", errors_val);
     }
+    // AggregateError options object is the third argument.
+    try installErrorCause(arena, result, if (args.len > 2) args[2] else Value{});
     return result;
 }
 
@@ -1937,6 +1962,49 @@ fn nativeStringCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
     return val_mod.makeString(arena, s);
 }
 
+/// ToString for a String.raw segment/substitution (primitive-coercing).
+fn rawToStr(arena: std.mem.Allocator, v: Value) ![]const u8 {
+    if (v.bits == 0) return "undefined";
+    switch (v.unbox()) {
+        .string => |s| return s,
+        .number => |n| return try val_mod.formatNumber(arena, n),
+        .boolean => |b| return if (b) "true" else "false",
+        .null_ => return "null",
+        .undefined_ => return "undefined",
+        else => {
+            if (try coercion_mod.toPrimitive(arena, v, .string)) |prim| {
+                if (prim.bits != 0 and prim.unbox() == .string) return prim.toPtr().string;
+                if (prim.bits != 0 and prim.unbox() == .number) return try val_mod.formatNumber(arena, prim.unbox().number);
+            }
+            return "[object Object]";
+        },
+    }
+}
+
+/// String.raw(template, ...substitutions): join template.raw segments with the
+/// ToString of each substitution interleaved (ES §22.1.2.4).
+fn nativeStringRaw(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object)
+        return throwTypeError(arena, "String.raw called on non-object");
+    const raw_v = args[0].toPtr().object.get("raw") orelse return val_mod.makeString(arena, "");
+    if (raw_v.bits == 0 or raw_v.unbox() != .object)
+        return val_mod.makeString(arena, "");
+    const raw = raw_v.toPtr().object;
+    const seg_count = raw.array_length;
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < seg_count) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const seg = raw.getOwn(key) orelse Value{};
+        try buf.appendSlice(arena, try rawToStr(arena, seg));
+        // Interleave substitution i (args[i+1]) between segments, but not after last.
+        if (i + 1 < seg_count and i + 1 < args.len) {
+            try buf.appendSlice(arena, try rawToStr(arena, args[i + 1]));
+        }
+    }
+    return val_mod.makeString(arena, buf.items);
+}
+
 fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0) return val_mod.makeString(arena, "");
     var buf: [256]u8 = undefined;
@@ -2248,9 +2316,165 @@ fn nativeNumberValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Val
     return val_mod.makeNumber(arena, n);
 }
 
-fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+const RADIX_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// Stringify a finite f64 in an arbitrary radix 2..36 (ES Number::toString).
+fn numberToRadixString(arena: std.mem.Allocator, n: f64, radix: i32) ![]const u8 {
+    const rf: f64 = @floatFromInt(radix);
+    const neg = n < 0;
+    const x = @abs(n);
+
+    var out: std.ArrayList(u8) = .{};
+    // Integer part (most-significant digit emitted last, so reverse it).
+    var int_part = @floor(x);
+    var int_digits: std.ArrayList(u8) = .{};
+    if (int_part == 0) {
+        try int_digits.append(arena, '0');
+    } else {
+        while (int_part > 0) {
+            const d: usize = @intFromFloat(@mod(int_part, rf));
+            try int_digits.append(arena, RADIX_DIGITS[d]);
+            int_part = @floor(int_part / rf);
+        }
+    }
+    var i: usize = int_digits.items.len;
+    while (i > 0) {
+        i -= 1;
+        try out.append(arena, int_digits.items[i]);
+    }
+
+    // Fractional part (cap at 20 digits — matches engine precision budget).
+    var frac = x - @floor(x);
+    if (frac > 0) {
+        try out.append(arena, '.');
+        var count: usize = 0;
+        while (frac > 0 and count < 20) : (count += 1) {
+            frac *= rf;
+            const d: usize = @intFromFloat(@floor(frac));
+            try out.append(arena, RADIX_DIGITS[d]);
+            frac -= @floor(frac);
+        }
+    }
+
+    if (neg) {
+        var signed: std.ArrayList(u8) = .{};
+        try signed.append(arena, '-');
+        try signed.appendSlice(arena, out.items);
+        return signed.items;
+    }
+    return out.items;
+}
+
+fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toString requires a Number");
-    return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    var radix: i32 = 10;
+    if (args.len > 0 and args[0].bits != 0) {
+        radix = @intFromFloat(@trunc(args[0].toF64()));
+        if (radix < 2 or radix > 36) return throwRangeError(arena, "toString() radix must be between 2 and 36");
+    }
+    if (radix == 10) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
+    if (std.math.isInf(n)) return val_mod.makeString(arena, if (n < 0) "-Infinity" else "Infinity");
+    return val_mod.makeString(arena, try numberToRadixString(arena, n, radix));
+}
+
+fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toFixed requires a Number");
+    const f_raw: f64 = if (args.len == 0) 0.0 else args[0].toF64();
+    const f: i64 = if (std.math.isNan(f_raw)) 0 else @as(i64, @intFromFloat(@trunc(f_raw)));
+    if (f < 0 or f > 100) return throwRangeError(arena, "toFixed() digits argument must be between 0 and 100");
+    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
+    if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    if (@abs(n) >= 1e21) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    const fu: usize = @intCast(f);
+    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ n, fu }));
+}
+
+/// Shared helper: format `n` in exponential notation.
+/// `f == -1` means no fractionDigits argument (use shortest form).
+fn numberToExponentialImpl(arena: std.mem.Allocator, n: f64, f: i64) ![]const u8 {
+    const abs_n = @abs(n);
+    // Avoid -0 in sign
+    const negative = n < 0.0 and abs_n != 0.0;
+
+    // Compute exponent and mantissa
+    var exp: i64 = 0;
+    var mant: f64 = 0.0;
+    if (abs_n != 0.0) {
+        const log = std.math.log10(abs_n);
+        exp = @as(i64, @intFromFloat(@floor(log)));
+        mant = abs_n / std.math.pow(f64, 10.0, @as(f64, @floatFromInt(exp)));
+        // Clamp to [1, 10) due to floating-point rounding
+        if (mant >= 10.0) { mant /= 10.0; exp += 1; }
+        else if (mant < 1.0) { mant *= 10.0; exp -= 1; }
+    }
+
+    var buf = std.ArrayList(u8){};
+    if (negative) try buf.append(arena, '-');
+
+    if (f == -1) {
+        // Not provided: shortest representation (trim trailing zeros)
+        const high_prec: usize = 17;
+        const full = try std.fmt.allocPrint(arena, "{d:.[1]}", .{ mant, high_prec });
+        var end = full.len;
+        if (std.mem.indexOfScalar(u8, full, '.') != null) {
+            while (end > 0 and full[end - 1] == '0') end -= 1;
+            if (end > 0 and full[end - 1] == '.') end -= 1;
+        }
+        try buf.appendSlice(arena, full[0..end]);
+    } else {
+        const fu: usize = @intCast(f);
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ mant, fu }));
+    }
+
+    // Exponent: e+N or e-N, no leading zeros
+    try buf.append(arena, 'e');
+    if (exp >= 0) {
+        try buf.append(arena, '+');
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(exp))}));
+    } else {
+        try buf.append(arena, '-');
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(-exp))}));
+    }
+    return buf.items;
+}
+
+fn nativeNumberToExponential(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toExponential requires a Number");
+    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
+    if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
+    var f: i64 = -1; // -1 = not provided → shortest
+    if (has_arg) {
+        const f_raw = args[0].toF64();
+        f = if (std.math.isNan(f_raw)) 0 else @as(i64, @intFromFloat(@trunc(f_raw)));
+        if (f < 0 or f > 100) return throwRangeError(arena, "toExponential() argument must be between 0 and 100");
+    }
+    return val_mod.makeString(arena, try numberToExponentialImpl(arena, n, f));
+}
+
+fn nativeNumberToPrecision(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toPrecision requires a Number");
+    const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
+    // No argument → same as toString
+    if (!has_arg) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    const p_raw = args[0].toF64();
+    const p: i64 = if (std.math.isNan(p_raw)) 1 else @as(i64, @intFromFloat(@trunc(p_raw)));
+    if (p < 1 or p > 100) return throwRangeError(arena, "toPrecision() argument must be between 1 and 100");
+    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
+    if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    const abs_n = @abs(n);
+    // e = floor(log10(|n|)), 0 for n == 0
+    const e: i64 = if (abs_n == 0.0) 0 else @as(i64, @intFromFloat(@floor(std.math.log10(abs_n))));
+    if (e >= p or e < -6) {
+        // Exponential form: p-1 fraction digits
+        return val_mod.makeString(arena, try numberToExponentialImpl(arena, n, p - 1));
+    } else {
+        // Fixed form: p-1-e fraction digits
+        const frac: i64 = p - 1 - e;
+        const fu: usize = if (frac < 0) 0 else @intCast(frac);
+        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ n, fu }));
+    }
 }
 
 /// ES Number.isInteger / isFinite / isNaN / isSafeInteger: no coercion — a
@@ -2428,7 +2652,10 @@ fn nativeFunctionToString(arena: std.mem.Allocator, this_val: Value, _: []const 
     var name: []const u8 = "";
     if (this_val.bits != 0) {
         switch (this_val.unbox()) {
-            .bc_function => |c| name = c.func.name orelse "",
+            .bc_function => |c| {
+                if (c.func.source_text) |src| return val_mod.makeString(arena, src);
+                name = c.func.name orelse "";
+            },
             else => {},
         }
     }
@@ -2496,10 +2723,38 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "replace", string_proto_mod.nativeReplace },
         .{ "replaceAll", string_proto_mod.nativeReplaceAll },
         .{ "search", string_proto_mod.nativeSearch },
+        // Core string methods
+        .{ "substring", string_proto_mod.nativeSubstring },
+        .{ "substr", string_proto_mod.nativeSubstr },
+        .{ "at", string_proto_mod.nativeStringAt },
+        .{ "repeat", string_proto_mod.nativeRepeat },
+        .{ "lastIndexOf", string_proto_mod.nativeLastIndexOf },
+        // Locale aliases
+        .{ "toLocaleLowerCase", string_proto_mod.nativeToLocaleLowerCase },
+        .{ "toLocaleUpperCase", string_proto_mod.nativeToLocaleUpperCase },
+        // localeCompare
+        .{ "localeCompare", string_proto_mod.nativeLocaleCompare },
+        // ES2024 well-formed
+        .{ "isWellFormed", string_proto_mod.nativeIsWellFormed },
+        .{ "toWellFormed", string_proto_mod.nativeToWellFormed },
+        // Annex B HTML wrapper methods
+        .{ "anchor", string_proto_mod.nativeAnchor },
+        .{ "link", string_proto_mod.nativeLink },
+        .{ "fontcolor", string_proto_mod.nativeFontcolor },
+        .{ "fontsize", string_proto_mod.nativeFontsize },
+        .{ "big", string_proto_mod.nativeBig },
+        .{ "blink", string_proto_mod.nativeBlink },
+        .{ "bold", string_proto_mod.nativeBold },
+        .{ "fixed", string_proto_mod.nativeFixed },
+        .{ "italics", string_proto_mod.nativeItalics },
+        .{ "small", string_proto_mod.nativeSmall },
+        .{ "strike", string_proto_mod.nativeStrike },
+        .{ "sub", string_proto_mod.nativeSub },
+        .{ "sup", string_proto_mod.nativeSup },
     };
     const str_method_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (fns) |pair| {
-        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0);
+        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], builtinLength("String.prototype." ++ pair[0]));
         _ = try proto.defineOwnData(pair[0], fn_val, str_method_attr);
     }
     // String.prototype is itself a String object with [[StringData]] = "".
@@ -2552,7 +2807,7 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
     };
     const method_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
     inline for (fns) |pair| {
-        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0);
+        const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], builtinLength("Array.prototype." ++ pair[0]));
         _ = try proto.defineOwnData(pair[0], fn_val, method_attr);
     }
 }
@@ -2843,6 +3098,8 @@ pub const Realm = struct {
         try object_ctor.set("prototype", proto_val);
 
         // Define "Object" in global env as the constructor object.
+        _ = try object_ctor.defineOwnData("name", try val_mod.makeString(arena, "Object"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try object_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         const ctor_val = try val_mod.makeObject(arena, object_ctor);
         try env.define("Object", ctor_val);
 
@@ -2968,30 +3225,30 @@ pub const Realm = struct {
             const obj_val_ptr = &obj_binding.value;
             if (obj_val_ptr.bits != 0 and obj_val_ptr.unbox() == .object) {
                 const ctor_obj = obj_val_ptr.toPtr().object;
-                const keys_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectKeys);
-                const values_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectValues);
+                const keys_fn = try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectKeys, "keys", 1);
+                const values_fn = try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectValues, "values", 1);
                 try ctor_obj.set("keys", keys_fn);
                 try ctor_obj.set("values", values_fn);
-                try ctor_obj.set("assign", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectAssign));
+                try ctor_obj.set("assign", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectAssign, "assign", 0));
                 const entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectEntries);
                 try ctor_obj.set("entries", entries_fn);
                 const from_entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFromEntries);
                 try ctor_obj.set("fromEntries", from_entries_fn);
                 const gopd_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptors);
                 try ctor_obj.set("getOwnPropertyDescriptors", gopd_fn);
-                try ctor_obj.set("getPrototypeOf", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetPrototypeOf));
-                try ctor_obj.set("setPrototypeOf", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectSetPrototypeOf));
-                try ctor_obj.set("getOwnPropertyNames", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyNames));
-                try ctor_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptor));
-                try ctor_obj.set("defineProperty", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectDefineProperty));
-                try ctor_obj.set("defineProperties", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectDefineProperties));
-                try ctor_obj.set("freeze", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFreeze));
-                try ctor_obj.set("seal", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectSeal));
-                try ctor_obj.set("preventExtensions", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectPreventExtensions));
-                try ctor_obj.set("isFrozen", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsFrozen));
-                try ctor_obj.set("isSealed", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsSealed));
-                try ctor_obj.set("isExtensible", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectIsExtensible));
-                try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols));
+                try ctor_obj.set("getPrototypeOf", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetPrototypeOf, "getPrototypeOf", 0));
+                try ctor_obj.set("setPrototypeOf", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectSetPrototypeOf, "setPrototypeOf", 0));
+                try ctor_obj.set("getOwnPropertyNames", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetOwnPropertyNames, "getOwnPropertyNames", 0));
+                try ctor_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptor, "getOwnPropertyDescriptor", 0));
+                try ctor_obj.set("defineProperty", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectDefineProperty, "defineProperty", 0));
+                try ctor_obj.set("defineProperties", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectDefineProperties, "defineProperties", 0));
+                try ctor_obj.set("freeze", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectFreeze, "freeze", 0));
+                try ctor_obj.set("seal", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectSeal, "seal", 0));
+                try ctor_obj.set("preventExtensions", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectPreventExtensions, "preventExtensions", 0));
+                try ctor_obj.set("isFrozen", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsFrozen, "isFrozen", 0));
+                try ctor_obj.set("isSealed", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsSealed, "isSealed", 0));
+                try ctor_obj.set("isExtensible", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsExtensible, "isExtensible", 0));
+                try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols, "getOwnPropertySymbols", 0));
                 try ctor_obj.set("is", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIs, "is", 2));
                 try ctor_obj.set("hasOwn", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectHasOwn, "hasOwn", 2));
                 try ctor_obj.set("groupBy", try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeObjectGroupBy, "groupBy", 2));
@@ -3065,7 +3322,7 @@ pub const Realm = struct {
         try env.define("__require_cache__", try val_mod.makeObject(arena, require_cache_obj));
         const require_obj = try JsObject.create(arena, function_proto);
         try require_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeRequire));
-        try require_obj.set("resolve", try val_mod.makeNativeFunction(arena, nativeRequireResolve));
+        try require_obj.set("resolve", try val_mod.makeNativeFunctionNamed(arena, nativeRequireResolve, "resolve", 0));
         try require_obj.set("cache", try val_mod.makeObject(arena, require_cache_obj));
         try env.define("require", try val_mod.makeObject(arena, require_obj));
         const module_obj = try JsObject.create(arena, null);
@@ -3085,20 +3342,29 @@ pub const Realm = struct {
         // Array.fromAsync: non-enumerable to satisfy prop-desc test (§23.1.2.1)
         const from_async_attr = obj_mod.PropAttr{ .writable = true, .enumerable = false, .configurable = true };
         _ = try array_ctor_obj.defineOwnData("fromAsync", try val_mod.makeNativeFunctionNamed(arena, nativeArrayFromAsync, "fromAsync", 1), from_async_attr);
+        _ = try array_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Array"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try array_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try array_proto.defineOwnData("constructor", try val_mod.makeObject(arena, array_ctor_obj), .{ .writable = true, .enumerable = false, .configurable = true });
         try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
 
         const string_ctor_obj = try JsObject.create(arena, null);
         try string_ctor_obj.set("prototype", try val_mod.makeObject(arena, string_proto));
         try string_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeStringCtor));
-        try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunction(arena, nativeStringFromCharCode));
+        try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCharCode, "fromCharCode", 0));
+        try string_ctor_obj.set("raw", try val_mod.makeNativeFunctionNamed(arena, nativeStringRaw, "raw", 1));
         try string_proto.set("constructor", try val_mod.makeObject(arena, string_ctor_obj));
+        _ = try string_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "String"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try string_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("String", try val_mod.makeObject(arena, string_ctor_obj));
 
         const number_proto = try JsObject.create(arena, object_proto);
         // Number.prototype is itself a Number object with [[NumberData]] = +0.
         try number_proto.set("[[PrimitiveValue]]", try val_mod.makeNumber(arena, 0));
-        try number_proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeNumberValueOf));
-        try number_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeNumberToString));
+        try number_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeNumberValueOf, "valueOf", 0));
+        try number_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToString, "toString", 0));
+        try number_proto.set("toFixed", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToFixed, "toFixed", 1));
+        try number_proto.set("toExponential", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToExponential, "toExponential", 1));
+        try number_proto.set("toPrecision", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToPrecision, "toPrecision", 1));
         active_number_proto = number_proto;
         const number_ctor_obj = try JsObject.create(arena, null);
         try number_ctor_obj.set("prototype", try val_mod.makeObject(arena, number_proto));
@@ -3121,6 +3387,8 @@ pub const Realm = struct {
         _ = try number_ctor_obj.defineOwnData("isNaN", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsNaN, "isNaN", 1), num_method_attr);
         _ = try number_ctor_obj.defineOwnData("isSafeInteger", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsSafeInteger, "isSafeInteger", 1), num_method_attr);
         try number_proto.set("constructor", try val_mod.makeObject(arena, number_ctor_obj));
+        _ = try number_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Number"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try number_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
 
         // ---- BigInt(value) global (conversion function; literals `1n` lex
@@ -3148,6 +3416,8 @@ pub const Realm = struct {
             try bigint_ctor_obj.set("prototype", try val_mod.makeObject(arena, bigint_proto));
             active_bigint_proto = bigint_proto;
         }
+        _ = try bigint_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try bigint_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("BigInt", try val_mod.makeObject(arena, bigint_ctor_obj));
 
         // ---- Function constructor (minimal): callable object so `typeof Function`
@@ -3157,6 +3427,8 @@ pub const Realm = struct {
         try function_ctor_obj.set("prototype", try val_mod.makeObject(arena, function_proto));
         try function_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeFunctionCtor));
         try function_proto.set("constructor", try val_mod.makeObject(arena, function_ctor_obj));
+        _ = try function_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Function"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try function_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Function", try val_mod.makeObject(arena, function_ctor_obj));
         active_function_ctor = function_ctor_obj;
 
@@ -3164,13 +3436,15 @@ pub const Realm = struct {
         const boolean_proto = try JsObject.create(arena, object_proto);
         // Boolean.prototype is itself a Boolean object with [[BooleanData]] = false.
         try boolean_proto.set("[[PrimitiveValue]]", try val_mod.makeBool(arena, false));
-        try boolean_proto.set("valueOf", try val_mod.makeNativeFunction(arena, nativeBooleanValueOf));
-        try boolean_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeBooleanToString));
+        try boolean_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeBooleanValueOf, "valueOf", 0));
+        try boolean_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeBooleanToString, "toString", 0));
         active_boolean_proto = boolean_proto;
         const boolean_ctor_obj = try JsObject.create(arena, null);
         try boolean_ctor_obj.set("prototype", try val_mod.makeObject(arena, boolean_proto));
         try boolean_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBooleanCtor));
         try boolean_proto.set("constructor", try val_mod.makeObject(arena, boolean_ctor_obj));
+        _ = try boolean_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Boolean"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try boolean_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Boolean", try val_mod.makeObject(arena, boolean_ctor_obj));
         try env.define("isNaN", try val_mod.makeNativeFunction(arena, nativeIsNaN));
         try env.define("eval", try val_mod.makeNativeFunction(arena, nativeEval));
@@ -3186,7 +3460,7 @@ pub const Realm = struct {
 
         // ---- ES2015 Symbol ----
         const symbol_proto = try JsObject.create(arena, object_proto);
-        try symbol_proto.set("toString", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolToString));
+        try symbol_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolToString, "toString", 0));
         active_symbol_proto = symbol_proto;
         const symbol_ctor = try JsObject.create(arena, null);
         try symbol_ctor.set("__call__", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolCall));
@@ -3195,8 +3469,8 @@ pub const Realm = struct {
         // live in this realm's arena; a stale registry from a prior (freed) realm
         // dangles and causes a use-after-free on the next Symbol.for.
         symbol_mod.resetRegistry();
-        try symbol_ctor.set("for", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolFor));
-        try symbol_ctor.set("keyFor", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolKeyFor));
+        try symbol_ctor.set("for", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolFor, "for", 0));
+        try symbol_ctor.set("keyFor", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolKeyFor, "keyFor", 0));
         // Well-known symbols (identity constants; inert in S1).
         const wk_names = [_][]const u8{ "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable", "match", "replace", "search", "split", "species", "toPrimitive", "toStringTag", "unscopables" };
         for (wk_names) |name| {
@@ -3206,8 +3480,10 @@ pub const Realm = struct {
         // Symbol.prototype.constructor === Symbol, and the `description` accessor
         // (a getter holder `{ get: nativeFn }`, matching the live-reexport pattern).
         try symbol_proto.set("constructor", try val_mod.makeObject(arena, symbol_ctor));
+        _ = try symbol_ctor.defineOwnData("name", try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try symbol_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
         const sym_desc_holder = try JsObject.create(arena, null);
-        try sym_desc_holder.set("get", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolDescriptionGet));
+        try sym_desc_holder.set("get", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolDescriptionGet, "get", 0));
         _ = try symbol_proto.defineOwnAccessor("description", try val_mod.makeObject(arena, sym_desc_holder), .{
             .enumerable = false,
             .configurable = true,
@@ -3263,6 +3539,8 @@ pub const Realm = struct {
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
         _ = try proxy_ctor.defineOwnData("revocable", try val_mod.makeNativeFunctionNamed(arena, proxy_mod.nativeProxyRevocable, "revocable", 2), .{ .writable = true, .enumerable = false, .configurable = true });
+        _ = try proxy_ctor.defineOwnData("name", try val_mod.makeString(arena, "Proxy"), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try proxy_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 2), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
 
         // ---- Intl (en-US, dependency-free) ----
@@ -3270,21 +3548,21 @@ pub const Realm = struct {
             const intl_obj = try JsObject.create(arena, object_proto);
             // Intl.NumberFormat
             const nf_proto = try JsObject.create(arena, object_proto);
-            try nf_proto.set("format", try val_mod.makeNativeFunction(arena, intl_mod.nativeNumberFormatFormat));
+            try nf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeNumberFormatFormat, "format", 0));
             const nf_ctor = try JsObject.create(arena, null);
             try nf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeNumberFormatCtor));
             try nf_ctor.set("prototype", try val_mod.makeObject(arena, nf_proto));
             try intl_obj.set("NumberFormat", try val_mod.makeObject(arena, nf_ctor));
             // Intl.DateTimeFormat
             const dtf_proto = try JsObject.create(arena, object_proto);
-            try dtf_proto.set("format", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatFormat));
+            try dtf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatFormat, "format", 0));
             const dtf_ctor = try JsObject.create(arena, null);
             try dtf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatCtor));
             try dtf_ctor.set("prototype", try val_mod.makeObject(arena, dtf_proto));
             try intl_obj.set("DateTimeFormat", try val_mod.makeObject(arena, dtf_ctor));
             // Intl.Collator
             const col_proto = try JsObject.create(arena, object_proto);
-            try col_proto.set("compare", try val_mod.makeNativeFunction(arena, intl_mod.nativeCollatorCompare));
+            try col_proto.set("compare", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeCollatorCompare, "compare", 0));
             const col_ctor = try JsObject.create(arena, null);
             try col_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeCollatorCtor));
             try col_ctor.set("prototype", try val_mod.makeObject(arena, col_proto));

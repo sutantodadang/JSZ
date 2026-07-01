@@ -2034,6 +2034,25 @@ pub const BcVm = struct {
         return try self.constructImpl(target, args, new_target);
     }
 
+    /// [[Get]] from a prototype object with an explicit (primitive) receiver,
+    /// firing inherited accessor getters with `receiver` as `this`. Used by the
+    /// primitive autoboxing arms (symbol/number/boolean/bigint) so accessor
+    /// properties such as Symbol.prototype.description invoke their getter
+    /// instead of returning the raw accessor holder / undefined.
+    fn getFromProtoWithReceiver(self: *BcVm, proto: *JsObject, key: []const u8, receiver: Value) !Value {
+        if (proto.findProperty(key)) |loc| {
+            const a = loc.holder.attrAt(loc.slot);
+            const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+            if (a.is_accessor) {
+                const getter = accessorMember(raw, "get");
+                if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                return try self.callAccessor(getter, receiver, &[_]Value{});
+            }
+            if (raw.bits != 0) return raw;
+        }
+        return val_mod.makeUndefined(self.arena);
+    }
+
     pub fn getProp(self: *BcVm, obj_val: Value, key: []const u8) !Value {
         if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);
         switch (obj_val.unbox()) {
@@ -2255,7 +2274,7 @@ pub const BcVm = struct {
             .symbol => {
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_symbol_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -2263,7 +2282,7 @@ pub const BcVm = struct {
                 // Phase 13: autoboxing for number primitives → Number.prototype.
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_number_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -2271,7 +2290,7 @@ pub const BcVm = struct {
                 // Phase 13: autoboxing for boolean primitives → Boolean.prototype.
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_boolean_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -2279,7 +2298,7 @@ pub const BcVm = struct {
                 // Autoboxing for bigint primitives → BigInt.prototype.
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_bigint_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -4310,13 +4329,20 @@ pub fn isObjectOperand(v: Value) bool {
     };
 }
 
-/// True when `v` is callable (function-like): a native/bc/legacy function, or a
-/// bound-function object.
+/// True when `v` is callable (function-like): a native/bc/legacy function, a
+/// bound-function object, an object with a [[Call]] (`__call__`), or a Proxy
+/// whose target is itself callable.
 fn isCallableValue(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
-        .object => |obj| obj.internal_kind == .bound_function or obj.get("__call__") != null,
+        .object => |obj| {
+            if (obj.internal_kind == .bound_function or obj.get("__call__") != null) return true;
+            if (obj.internal_kind == .proxy) {
+                if (proxy_mod.proxyTarget(obj)) |t| return isCallableValue(t);
+            }
+            return false;
+        },
         else => false,
     };
 }
@@ -4337,7 +4363,7 @@ pub fn classifyTypeof(v: Value) struct {
         .bigint => .{ .tag = .bigint, .shape = null, .result = "bigint" },
         .function, .bc_function, .native_function => .{ .tag = .function_like, .shape = null, .result = "function" },
         .object => |obj| blk: {
-            const callable = obj.get("__call__") != null;
+            const callable = isCallableValue(v);
             break :blk .{
                 .tag = if (callable) .function_like else .object_like,
                 .shape = obj.shapePtr(),
@@ -4400,7 +4426,7 @@ pub fn typeofValue(v: Value) []const u8 {
         .symbol => "symbol",
         .function => "function",
         .bc_function => "function",
-        .object => |obj| if (obj.get("__call__") != null) "function" else "object",
+        .object => if (isCallableValue(v)) "function" else "object",
         .native_function => "function",
         .bigint => "bigint",
     };
@@ -4471,7 +4497,7 @@ fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
         .number => |n| try formatNumber(arena, n),
         .string => |s| s,
         .function => |f| try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{f.name orelse ""}),
-        .bc_function => |c| try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{c.func.name orelse ""}),
+        .bc_function => |c| if (c.func.source_text) |src| src else try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{c.func.name orelse ""}),
         .object => |obj| blk: {
             if (obj.is_array) {
                 var buf = std.ArrayList(u8){};

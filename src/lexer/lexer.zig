@@ -259,6 +259,9 @@ pub const Lexer = struct {
             // `yield /re/` — yield is an operator-position keyword, so a following
             // `/` starts a regex (`received = yield/abc/i`), not division.
             .kw_yield,
+            // `=> /re/` — a concise arrow body begins in expression position, so a
+            // following `/` starts a regex (`x => /a/.test(x)`), not division.
+            .arrow,
             => true,
             else => false,
         };
@@ -648,6 +651,10 @@ pub const Lexer = struct {
             self.pos += 1;
             self.column += 1;
             while (self.pos < self.source.len and isIdentChar(self.source[self.pos])) {
+                // isIdentStart accepts any byte >= 0x80, but Unicode WhiteSpace
+                // (NBSP, U+2000-block, BOM, …) and line terminators (U+2028/U+2029)
+                // are NOT identifier parts — stop here so `x y` is two tokens.
+                if (self.source[self.pos] >= 0x80 and (self.unicodeWsLen() > 0 or self.isUnicodeLineTerm())) break;
                 self.pos += 1;
                 self.column += 1;
             }

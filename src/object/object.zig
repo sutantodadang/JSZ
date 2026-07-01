@@ -183,6 +183,9 @@ pub const JsObject = struct {
                 // mutates the shape), then delete — key strings live in the shape
                 // arena and stay valid across transitions.
                 var to_delete: std.ArrayListUnmanaged([]const u8) = .empty;
+                // Frees only the list's backing buffer; the key strings it holds
+                // live in the shape arena and outlive this call.
+                defer to_delete.deinit(self.arena);
                 for (self.shape.key_order.items) |k| {
                     if (k.len > 1 and k[0] == '0') continue; // non-canonical → not an index
                     const kidx = std.fmt.parseUnsigned(u32, k, 10) catch continue;
@@ -346,7 +349,14 @@ pub const JsObject = struct {
                 if (!cur.configurable) {
                     if (attr.configurable) return false;
                     if (attr.enumerable != cur.enumerable) return false;
-                    if (!cur.writable) return false;
+                    if (!cur.writable) {
+                        // Non-writable + non-configurable: a redefine is allowed only
+                        // if it changes nothing — cannot become writable, cannot change
+                        // the value (ES §10.1.6.3 ValidateAndApplyPropertyDescriptor).
+                        if (attr.writable) return false;
+                        const cur_v = if (slot < self.slots.items.len) self.slots.items[slot] else Value{};
+                        if (!sameValueRough(cur_v, value)) return false;
+                    }
                 }
                 if (slot < self.slots.items.len) self.slots.items[slot] = value;
                 if (slot < self.attrs.items.len) self.attrs.items[slot] = attr;

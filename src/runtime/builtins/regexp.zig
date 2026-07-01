@@ -25,16 +25,32 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const re_exec_fn = try val_mod.makeNativeFunction(arena, nativeRegExpExec);
     try regexp_proto.set("test", re_test_fn);
     try regexp_proto.set("exec", re_exec_fn);
+    try regexp_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeRegExpToString));
 
     const regexp_ctor_obj = try JsObject.create(arena, null);
     const regexp_proto_val = try val_mod.makeObject(arena, regexp_proto);
     try regexp_ctor_obj.set("prototype", regexp_proto_val);
     const regexp_call_fn = try val_mod.makeNativeFunction(arena, nativeRegExpCtor);
     try regexp_ctor_obj.set("__call__", regexp_call_fn);
+    _ = try regexp_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "RegExp"), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try regexp_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 2), .{ .writable = false, .enumerable = false, .configurable = true });
     const regexp_ctor_val = try val_mod.makeObject(arena, regexp_ctor_obj);
+    _ = try regexp_proto.defineOwnData("constructor", regexp_ctor_val, .{ .writable = true, .enumerable = false, .configurable = true });
     try ctx.env.define("RegExp", regexp_ctor_val);
 
     realm_mod.active_regexp_proto = regexp_proto;
+
+    // ES2024: source/flags/global/etc. are getter properties on RegExp.prototype.
+    try intrinsics.defineGetter(arena, regexp_proto, "source", nativeRegExpGetSource);
+    try intrinsics.defineGetter(arena, regexp_proto, "flags", nativeRegExpGetFlags);
+    try intrinsics.defineGetter(arena, regexp_proto, "global", nativeRegExpGetGlobal);
+    try intrinsics.defineGetter(arena, regexp_proto, "ignoreCase", nativeRegExpGetIgnoreCase);
+    try intrinsics.defineGetter(arena, regexp_proto, "multiline", nativeRegExpGetMultiline);
+    try intrinsics.defineGetter(arena, regexp_proto, "dotAll", nativeRegExpGetDotAll);
+    try intrinsics.defineGetter(arena, regexp_proto, "sticky", nativeRegExpGetSticky);
+    try intrinsics.defineGetter(arena, regexp_proto, "unicode", nativeRegExpGetUnicode);
+    try intrinsics.defineGetter(arena, regexp_proto, "hasIndices", nativeRegExpGetHasIndices);
+    try intrinsics.defineGetter(arena, regexp_proto, "unicodeSets", nativeRegExpGetUnicodeSets);
 }
 
 // ============================================================= IR =============
@@ -996,22 +1012,10 @@ pub fn makeRegExpObject(arena: std.mem.Allocator, cr: *CompiledRegex, source: []
     else
         try JsObject.create(arena, proto);
 
-    // Store source + flags as own properties
+    // Store source in a hidden slot; flags/global/etc. are resolved via prototype getters.
+    _ = flags_str; // no longer stored as a data property
     const source_val = try val_mod.makeString(arena, source);
-    const flags_val = try val_mod.makeString(arena, flags_str);
-    try obj.set("source", source_val);
-    try obj.set("flags", flags_val);
-
-    // Boolean flag properties
-    const global_val = try val_mod.makeBool(arena, cr.flags.global);
-    const ic_val = try val_mod.makeBool(arena, cr.flags.ignore_case);
-    const ml_val = try val_mod.makeBool(arena, cr.flags.multiline);
-    try obj.set("global", global_val);
-    try obj.set("ignoreCase", ic_val);
-    try obj.set("multiline", ml_val);
-    try obj.set("dotAll", try val_mod.makeBool(arena, cr.flags.dotall));
-    try obj.set("sticky", try val_mod.makeBool(arena, cr.flags.sticky));
-    try obj.set("unicode", try val_mod.makeBool(arena, cr.flags.unicode));
+    try obj.set("[[OriginalSource]]", source_val);
 
     // lastIndex = 0
     const li_val = try val_mod.makeNumber(arena, 0.0);
@@ -1065,7 +1069,7 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
             .object => |obj| blk: {
                 // If it's already a RegExp, return its source
                 if (obj.internal_kind == .regexp) {
-                    if (obj.get("source")) |sv| {
+                    if (obj.get("[[OriginalSource]]")) |sv| {
                         if (sv.bits != 0 and sv.unbox() == .string) break :blk sv.toPtr().string;
                     }
                 }
@@ -1108,19 +1112,9 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     // Populate `this` if it's a fresh object (from `new`), else create new.
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const this_obj = this_val.toPtr().object;
+        // Store source in hidden slot; flag properties resolve via prototype getters.
         const source_val = try val_mod.makeString(arena, pattern_str);
-        const flags_val = try val_mod.makeString(arena, flags_str);
-        try this_obj.set("source", source_val);
-        try this_obj.set("flags", flags_val);
-        const global_val = try val_mod.makeBool(arena, cr.flags.global);
-        const ic_val = try val_mod.makeBool(arena, cr.flags.ignore_case);
-        const ml_val = try val_mod.makeBool(arena, cr.flags.multiline);
-        try this_obj.set("global", global_val);
-        try this_obj.set("ignoreCase", ic_val);
-        try this_obj.set("multiline", ml_val);
-        try this_obj.set("dotAll", try val_mod.makeBool(arena, cr.flags.dotall));
-        try this_obj.set("sticky", try val_mod.makeBool(arena, cr.flags.sticky));
-        try this_obj.set("unicode", try val_mod.makeBool(arena, cr.flags.unicode));
+        try this_obj.set("[[OriginalSource]]", source_val);
         const li_val = try val_mod.makeNumber(arena, 0.0);
         try this_obj.set("lastIndex", li_val);
         this_obj.internal_slot = @ptrCast(cr);
@@ -1204,6 +1198,112 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
     try arr.set("input", input_val);
 
     return val_mod.makeObject(arena, arr);
+}
+
+// ============================================================= Prototype Getters
+
+/// source getter: "(?:)" on RegExp.prototype, real pattern otherwise.
+/// RegExp.prototype.toString: "/" + Get(R,"source") + "/" + Get(R,"flags").
+pub fn nativeRegExpToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.toString called on incompatible receiver");
+    const src = try nativeRegExpGetSource(arena, this_val, &.{});
+    const flags = try nativeRegExpGetFlags(arena, this_val, &.{});
+    const src_s: []const u8 = if (src.bits != 0 and src.unbox() == .string) src.toPtr().string else "(?:)";
+    const flags_s: []const u8 = if (flags.bits != 0 and flags.unbox() == .string) flags.toPtr().string else "";
+    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "/{s}/{s}", .{ src_s, flags_s }));
+}
+
+pub fn nativeRegExpGetSource(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.source called on incompatible receiver");
+    if (getCompiledRegex(this_val) == null)
+        return val_mod.makeString(arena, "(?:)");
+    const obj = this_val.toPtr().object;
+    if (obj.getOwn("[[OriginalSource]]")) |sv| return sv;
+    return val_mod.makeString(arena, "(?:)");
+}
+
+/// flags getter: "" on RegExp.prototype, canonical "gimsuy" subset otherwise.
+pub fn nativeRegExpGetFlags(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.flags called on incompatible receiver");
+    const cr = getCompiledRegex(this_val) orelse return val_mod.makeString(arena, "");
+    var buf: [8]u8 = undefined;
+    var len: usize = 0;
+    if (cr.flags.global) { buf[len] = 'g'; len += 1; }
+    if (cr.flags.ignore_case) { buf[len] = 'i'; len += 1; }
+    if (cr.flags.multiline) { buf[len] = 'm'; len += 1; }
+    if (cr.flags.dotall) { buf[len] = 's'; len += 1; }
+    if (cr.flags.unicode) { buf[len] = 'u'; len += 1; }
+    if (cr.flags.sticky) { buf[len] = 'y'; len += 1; }
+    // makeString stores the slice without copying — dupe into arena first.
+    const owned = try arena.dupe(u8, buf[0..len]);
+    return val_mod.makeString(arena, owned);
+}
+
+/// global getter.
+pub fn nativeRegExpGetGlobal(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.global called on incompatible receiver");
+    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, cr.flags.global);
+}
+
+/// ignoreCase getter.
+pub fn nativeRegExpGetIgnoreCase(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.ignoreCase called on incompatible receiver");
+    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, cr.flags.ignore_case);
+}
+
+/// multiline getter.
+pub fn nativeRegExpGetMultiline(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.multiline called on incompatible receiver");
+    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, cr.flags.multiline);
+}
+
+/// dotAll getter.
+pub fn nativeRegExpGetDotAll(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.dotAll called on incompatible receiver");
+    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, cr.flags.dotall);
+}
+
+/// sticky getter.
+pub fn nativeRegExpGetSticky(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.sticky called on incompatible receiver");
+    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, cr.flags.sticky);
+}
+
+/// unicode getter.
+pub fn nativeRegExpGetUnicode(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.unicode called on incompatible receiver");
+    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, cr.flags.unicode);
+}
+
+/// hasIndices getter (not tracked; always false).
+pub fn nativeRegExpGetHasIndices(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.hasIndices called on incompatible receiver");
+    if (getCompiledRegex(this_val) == null) return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, false);
+}
+
+/// unicodeSets getter (not tracked; always false).
+pub fn nativeRegExpGetUnicodeSets(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.unicodeSets called on incompatible receiver");
+    if (getCompiledRegex(this_val) == null) return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, false);
 }
 
 // ============================================================= Tests ==========

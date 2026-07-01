@@ -238,7 +238,9 @@ test "phase13: regex /u flag is accepted" {
 test "phase13: regex flag accessor properties" {
     const s = try dualString(std.testing.allocator, "var r=/x/gsyu; [r.global,r.dotAll,r.sticky,r.unicode,r.flags].join(',')");
     defer std.testing.allocator.free(s);
-    try std.testing.expectEqualStrings("true,true,true,true,gsyu", s);
+    // `flags` returns the canonical order d,g,i,m,s,u,v,y per spec (RegExp.prototype.flags),
+    // so `gsyu` source order normalizes to `gsuy`.
+    try std.testing.expectEqualStrings("true,true,true,true,gsuy", s);
 }
 
 

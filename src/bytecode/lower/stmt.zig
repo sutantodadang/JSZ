@@ -35,7 +35,10 @@ pub fn lowerVarDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         // via HOIST_LEX (in TDZ). Now initialize it at its source position.
         const is_const = vd.kind == .const_;
         if (vd.init) |init_node| {
+            // NamedEvaluation: `let/const x = function(){}` — inject binding name as hint.
+            if (init_node.kind == .function_expr) self.name_hint = vd.name;
             const r = try self.compileExpr(init_node);
+            self.name_hint = null; // defensive clear (no-op if consumed inside)
             try self.emitInitLexical(vd.name, r, line, is_const);
             self.freeReg();
         } else {
@@ -49,7 +52,10 @@ pub fn lowerVarDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     } else {
         // var declaration: use DEFINE_GLOBAL (define-or-assign).
         if (vd.init) |init_node| {
+            // NamedEvaluation: `var x = function(){}` — inject binding name as hint.
+            if (init_node.kind == .function_expr) self.name_hint = vd.name;
             const r = try self.compileExpr(init_node);
+            self.name_hint = null; // defensive clear (no-op if consumed inside)
             // Phase 4d: var declarations always define (not assign) — use DEFINE_GLOBAL
             // so strict-mode functions don't throw ReferenceError for var bindings.
             try self.emitDefine(vd.name, r, line);
@@ -126,6 +132,7 @@ pub fn lowerFunctionDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
         false, // function declarations are never arrows
         fd.rest_param,
         fd.param_defaults,
+        fd.source_text,
     );
     const child_idx: u16 = @intCast(self.child_functions.items.len);
     try self.child_functions.append(self.arena, child_fn);

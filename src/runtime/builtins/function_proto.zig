@@ -158,9 +158,43 @@ pub fn nativeFunctionBind(arena: std.mem.Allocator, this_val: Value, args: []con
     const bd = try arena.create(BoundData);
     bd.* = BoundData{ .target = fn_val, .this_val = bind_this, .prefix = prefix };
 
-    // Create bound function object.
-    const bound_obj = try JsObject.create(arena, null);
+    // Create bound function object. Proto is %Function.prototype% so a bound
+    // function inherits call/apply/bind (e.g. re-binding `f.bind(a).bind(b)`).
+    const bound_obj = try JsObject.create(arena, realm_mod.active_function_proto);
     bound_obj.internal_kind = .bound_function;
     bound_obj.internal_slot = bd;
+
+    // SetFunctionLength / SetFunctionName (ES §20.2.3.2): length =
+    // max(0, target.length - boundArgs), name = "bound " + target.name. Both are
+    // non-writable, non-enumerable, configurable own data properties.
+    const tln = targetLenName(fn_val);
+    const blen = @max(0.0, tln.len - @as(f64, @floatFromInt(prefix.len)));
+    _ = try bound_obj.defineOwnData("length", try val_mod.makeNumber(arena, blen), .{ .writable = false, .enumerable = false, .configurable = true });
+    const bname = try std.fmt.allocPrint(arena, "bound {s}", .{tln.name});
+    _ = try bound_obj.defineOwnData("name", try val_mod.makeString(arena, bname), .{ .writable = false, .enumerable = false, .configurable = true });
+
     return val_mod.makeObject(arena, bound_obj);
+}
+
+/// Read a function value's ECMAScript `.length` (declared param count) and
+/// `.name` across the four callable representations, for Function.prototype.bind.
+fn targetLenName(v: Value) struct { len: f64, name: []const u8 } {
+    if (v.bits == 0) return .{ .len = 0, .name = "" };
+    switch (v.unbox()) {
+        .native_function => |e| return .{ .len = @floatFromInt(e.length), .name = e.name orelse "" },
+        .function => |fv| return .{ .len = @floatFromInt(fv.params.len), .name = fv.name orelse "" },
+        .bc_function => |cl| return .{ .len = @floatFromInt(cl.func.arity), .name = cl.func.name orelse "" },
+        .object => |o| {
+            var l: f64 = 0;
+            if (o.getOwn("length")) |lv| {
+                if (lv.bits != 0 and lv.unbox() == .number) l = lv.unbox().number;
+            }
+            var nm: []const u8 = "";
+            if (o.getOwn("name")) |nv| {
+                if (nv.bits != 0 and nv.unbox() == .string) nm = nv.toPtr().string;
+            }
+            return .{ .len = l, .name = nm };
+        },
+        else => return .{ .len = 0, .name = "" },
+    }
 }

@@ -1869,7 +1869,7 @@ pub fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
     // use-after-free. Also lets `next` reject a non-iterator receiver.
     obj.internal_kind = .array_iterator;
     // Fallback when the shared proto is not built (early bootstrap): own next.
-    if (proto == null) try obj.set("next", try val_mod.makeNativeFunction(arena, nativeSeqIterNext));
+    if (proto == null) try obj.set("next", try val_mod.makeNativeFunctionNamed(arena, nativeSeqIterNext, "next", 0));
     return val_mod.makeObject(arena, obj);
 }
 
@@ -2048,6 +2048,94 @@ pub fn nativeDestrIterClose(arena: std.mem.Allocator, _: Value, args: []const Va
     return val_mod.makeUndefined(arena);
 }
 
+/// __destrObjRest__(src, excludeKeys): CopyDataProperties into a fresh plain
+/// object from `src`'s own enumerable string-keyed properties, skipping any key
+/// present in `excludeKeys` (an Array of strings — the compile-time list of
+/// already-destructured keys for this pattern: static keys as literals, and
+/// computed keys pre-evaluated once into a temp so they're read exactly once).
+/// Used by the object-rest binding pattern (`{a, ...rest} = x`). `src` is
+/// non-object (e.g. a primitive) only via unusual call sites — the pattern
+/// desugar always runs `__requireObjectCoercible__` first, but that only
+/// rejects null/undefined, not other primitives — so a non-object `src` yields
+/// an empty result (no own enumerable string keys to copy) rather than a crash.
+pub fn nativeDestrObjRest(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const out = try JsObject.create(arena, realm_mod.active_object_proto);
+    const src = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (src.bits == 0 or src.unbox() != .object) return val_mod.makeObject(arena, out);
+    const src_obj = src.toPtr().object;
+    const excl_list: ?*JsObject = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    outer: for (src_obj.ownKeys()) |k| {
+        if (!src_obj.isEnumerable(k)) continue;
+        if (excl_list) |ex| {
+            var i: usize = 0;
+            while (i < ex.array_length) : (i += 1) {
+                const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
+                const ev = ex.getOwn(ek) orelse continue;
+                if (ev.bits != 0 and ev.unbox() == .string and std.mem.eql(u8, ev.unbox().string, k)) continue :outer;
+            }
+        }
+        const v = src_obj.getOwn(k) orelse continue;
+        try out.set(k, v);
+    }
+    return val_mod.makeObject(arena, out);
+}
+
+/// __objSpreadInto__(target, src): CopyDataProperties(target, src, «»)
+/// mutating `target` IN PLACE (ES2018 object-literal spread `{...src}`,
+/// ECMA-262 13.2.5.5). Differs from `nativeDestrObjRest` above (which builds a
+/// FRESH object for object-rest *destructuring*): the object literal's
+/// properties compile straight-line in source order, so a spread must write
+/// into the object already under construction — a later literal property can
+/// override a spread value and vice versa, and `robj` keeps its own identity.
+/// - null/undefined `src`: no-op (CopyDataProperties skips non-object sources
+///   that are null/undefined; everything else is conceptually ToObject'd).
+/// - string `src`: own enumerable indexed properties "0".."len-1", one per
+///   raw byte — mirrors this engine's existing byte-indexed
+///   String.prototype.charAt/String-iteration model rather than introducing a
+///   new UTF-16/code-point convention.
+/// - other primitives (number/boolean/symbol/bigint): ToObject wrappers have
+///   no own enumerable properties of their own, so nothing is copied.
+/// - object `src` (including arrays/TypedArrays, which are ordinary
+///   JsObjects here): every own enumerable string key AND symbol key is
+///   copied, invoking [[Get]] (so getters run and their return VALUE is
+///   copied — CopyDataProperties never copies the accessor itself) via the
+///   active `Context`, then written with a plain `set`/`setSym` (a data
+///   write, matching CreateDataPropertyOrThrow — target's own accessors, if
+///   any, are never invoked).
+pub fn nativeObjSpreadInto(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const target_val = if (args.len > 0) args[0] else return val_mod.makeUndefined(arena);
+    if (target_val.bits == 0 or target_val.unbox() != .object) return val_mod.makeUndefined(arena);
+    const target_obj = target_val.toPtr().object;
+    const src = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    if (src.bits == 0 or src.unbox() == .undefined_ or src.unbox() == .null_) return val_mod.makeUndefined(arena);
+
+    if (src.unbox() == .string) {
+        const s = src.unbox().string;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            const ch = try val_mod.makeString(arena, try arena.dupe(u8, s[i .. i + 1]));
+            try target_obj.set(idx_key, ch);
+        }
+        return val_mod.makeUndefined(arena);
+    }
+    if (src.unbox() != .object) return val_mod.makeUndefined(arena);
+
+    const src_obj = src.toPtr().object;
+    const ctx = realm_mod.active_context;
+    for (src_obj.ownKeys()) |k| {
+        if (!src_obj.isEnumerable(k)) continue;
+        const v = if (ctx) |c| try c.getProp(arena, src, k) else (src_obj.getOwn(k) orelse continue);
+        try target_obj.set(k, v);
+    }
+    for (src_obj.symKeys()) |sp| {
+        if (!sp.attr.enumerable) continue;
+        const v = if (ctx) |c| try c.getPropSym(arena, src, sp.key) else sp.value;
+        try target_obj.setSym(sp.key, v);
+    }
+    return val_mod.makeUndefined(arena);
+}
+
 /// __getIterator__(x): obtain an iterator (object with next()) for `x`.
 pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const x = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
@@ -2161,7 +2249,7 @@ pub fn nativeGetAsyncIterator(arena: std.mem.Allocator, _: Value, args: []const 
     else
         try JsObject.create(arena, null);
     try wrap.set("__syncit__", sync_it);
-    try wrap.set("next", try val_mod.makeNativeFunction(arena, nativeAsyncFromSyncNext));
+    try wrap.set("next", try val_mod.makeNativeFunctionNamed(arena, nativeAsyncFromSyncNext, "next", 0));
     return val_mod.makeObject(arena, wrap);
 }
 

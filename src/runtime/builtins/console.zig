@@ -20,7 +20,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "warn", nativeConsoleWarn },
     };
     inline for (console_fns) |pair| {
-        const fn_v = try val_mod.makeNativeFunction(arena, pair[1]);
+        const fn_v = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0);
         try console_obj.set(pair[0], fn_v);
     }
     try ctx.env.define("console", try val_mod.makeObject(arena, console_obj));

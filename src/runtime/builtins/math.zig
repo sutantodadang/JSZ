@@ -58,7 +58,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "imul", nativeImul },
     };
     inline for (func_fns) |pair| {
-        try math_obj.set(pair[0], try val_mod.makeNativeFunction(arena, pair[1]));
+        try math_obj.set(pair[0], try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0));
     }
     // Math.min/max spec `.length` is 2.
     try math_obj.set("min", try val_mod.makeNativeFunctionLen(arena, nativeMin, 2));

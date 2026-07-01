@@ -269,6 +269,12 @@ pub const FuncExpr = struct {
     /// property) is NOT bound inside its own body — unlike a named function
     /// expression — so this suppresses the inner self-binding at compile time.
     is_method: bool = false,
+    /// Function.prototype.toString: exact original source text for this
+    /// function literal (params+body, or the whole arrow), sliced from the
+    /// parser's source buffer. Null when no meaningful span was captured
+    /// (synthetic/desugared function nodes) — callers fall back to the
+    /// native "[native code]" format in that case.
+    source_text: ?[]const u8 = null,
 };
 
 /// Phase 3a: a single property in an object literal.
@@ -354,6 +360,7 @@ pub const FuncDecl = struct {
     is_generator: bool = false,
     is_async: bool = false,
     is_strict: bool = false,
+    source_text: ?[]const u8 = null,
 };
 
 pub const IfStmt = struct {
