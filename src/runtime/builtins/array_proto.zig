@@ -591,9 +591,10 @@ pub fn nativeReduceRight(arena: std.mem.Allocator, this_val: Value, args: []cons
         start_i = @intCast(len);
     } else {
         if (len == 0) return throwTypeError(arena, "Reduce of empty array with no initial value");
+        // No initial value: acc = last element; iteration (below, `start_i - 1`)
+        // begins at len-2, so start_i must stay at len-1 here (do NOT pre-decrement).
         start_i = @intCast(len - 1);
         acc = try genGet(arena, this_val, len - 1);
-        start_i -= 1;
     }
     const undef = try val_mod.makeUndefined(arena);
     const fpm = @import("../builtins/function_proto.zig");

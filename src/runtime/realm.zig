@@ -1943,6 +1943,49 @@ fn nativeStringCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
     return val_mod.makeString(arena, s);
 }
 
+/// ToString for a String.raw segment/substitution (primitive-coercing).
+fn rawToStr(arena: std.mem.Allocator, v: Value) ![]const u8 {
+    if (v.bits == 0) return "undefined";
+    switch (v.unbox()) {
+        .string => |s| return s,
+        .number => |n| return try val_mod.formatNumber(arena, n),
+        .boolean => |b| return if (b) "true" else "false",
+        .null_ => return "null",
+        .undefined_ => return "undefined",
+        else => {
+            if (try coercion_mod.toPrimitive(arena, v, .string)) |prim| {
+                if (prim.bits != 0 and prim.unbox() == .string) return prim.toPtr().string;
+                if (prim.bits != 0 and prim.unbox() == .number) return try val_mod.formatNumber(arena, prim.unbox().number);
+            }
+            return "[object Object]";
+        },
+    }
+}
+
+/// String.raw(template, ...substitutions): join template.raw segments with the
+/// ToString of each substitution interleaved (ES §22.1.2.4).
+fn nativeStringRaw(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object)
+        return throwTypeError(arena, "String.raw called on non-object");
+    const raw_v = args[0].toPtr().object.get("raw") orelse return val_mod.makeString(arena, "");
+    if (raw_v.bits == 0 or raw_v.unbox() != .object)
+        return val_mod.makeString(arena, "");
+    const raw = raw_v.toPtr().object;
+    const seg_count = raw.array_length;
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < seg_count) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const seg = raw.getOwn(key) orelse Value{};
+        try buf.appendSlice(arena, try rawToStr(arena, seg));
+        // Interleave substitution i (args[i+1]) between segments, but not after last.
+        if (i + 1 < seg_count and i + 1 < args.len) {
+            try buf.appendSlice(arena, try rawToStr(arena, args[i + 1]));
+        }
+    }
+    return val_mod.makeString(arena, buf.items);
+}
+
 fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0) return val_mod.makeString(arena, "");
     var buf: [256]u8 = undefined;
@@ -3286,6 +3329,7 @@ pub const Realm = struct {
         try string_ctor_obj.set("prototype", try val_mod.makeObject(arena, string_proto));
         try string_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeStringCtor));
         try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCharCode, "fromCharCode", 0));
+        try string_ctor_obj.set("raw", try val_mod.makeNativeFunctionNamed(arena, nativeStringRaw, "raw", 1));
         try string_proto.set("constructor", try val_mod.makeObject(arena, string_ctor_obj));
         _ = try string_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "String"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try string_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
