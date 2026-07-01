@@ -346,7 +346,14 @@ pub const JsObject = struct {
                 if (!cur.configurable) {
                     if (attr.configurable) return false;
                     if (attr.enumerable != cur.enumerable) return false;
-                    if (!cur.writable) return false;
+                    if (!cur.writable) {
+                        // Non-writable + non-configurable: a redefine is allowed only
+                        // if it changes nothing — cannot become writable, cannot change
+                        // the value (ES §10.1.6.3 ValidateAndApplyPropertyDescriptor).
+                        if (attr.writable) return false;
+                        const cur_v = if (slot < self.slots.items.len) self.slots.items[slot] else Value{};
+                        if (!sameValueRough(cur_v, value)) return false;
+                    }
                 }
                 if (slot < self.slots.items.len) self.slots.items[slot] = value;
                 if (slot < self.attrs.items.len) self.attrs.items[slot] = attr;
