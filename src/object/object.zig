@@ -183,6 +183,9 @@ pub const JsObject = struct {
                 // mutates the shape), then delete — key strings live in the shape
                 // arena and stay valid across transitions.
                 var to_delete: std.ArrayListUnmanaged([]const u8) = .empty;
+                // Frees only the list's backing buffer; the key strings it holds
+                // live in the shape arena and outlive this call.
+                defer to_delete.deinit(self.arena);
                 for (self.shape.key_order.items) |k| {
                     if (k.len > 1 and k[0] == '0') continue; // non-canonical → not an index
                     const kidx = std.fmt.parseUnsigned(u32, k, 10) catch continue;
