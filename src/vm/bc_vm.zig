@@ -4329,13 +4329,20 @@ pub fn isObjectOperand(v: Value) bool {
     };
 }
 
-/// True when `v` is callable (function-like): a native/bc/legacy function, or a
-/// bound-function object.
+/// True when `v` is callable (function-like): a native/bc/legacy function, a
+/// bound-function object, an object with a [[Call]] (`__call__`), or a Proxy
+/// whose target is itself callable.
 fn isCallableValue(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
-        .object => |obj| obj.internal_kind == .bound_function or obj.get("__call__") != null,
+        .object => |obj| {
+            if (obj.internal_kind == .bound_function or obj.get("__call__") != null) return true;
+            if (obj.internal_kind == .proxy) {
+                if (proxy_mod.proxyTarget(obj)) |t| return isCallableValue(t);
+            }
+            return false;
+        },
         else => false,
     };
 }
@@ -4356,7 +4363,7 @@ pub fn classifyTypeof(v: Value) struct {
         .bigint => .{ .tag = .bigint, .shape = null, .result = "bigint" },
         .function, .bc_function, .native_function => .{ .tag = .function_like, .shape = null, .result = "function" },
         .object => |obj| blk: {
-            const callable = obj.get("__call__") != null;
+            const callable = isCallableValue(v);
             break :blk .{
                 .tag = if (callable) .function_like else .object_like,
                 .shape = obj.shapePtr(),
@@ -4419,7 +4426,7 @@ pub fn typeofValue(v: Value) []const u8 {
         .symbol => "symbol",
         .function => "function",
         .bc_function => "function",
-        .object => |obj| if (obj.get("__call__") != null) "function" else "object",
+        .object => if (isCallableValue(v)) "function" else "object",
         .native_function => "function",
         .bigint => "bigint",
     };
