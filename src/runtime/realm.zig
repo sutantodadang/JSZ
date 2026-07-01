@@ -220,26 +220,31 @@ fn nativeObjectCreate(arena: std.mem.Allocator, _: Value, args: []const Value) a
     // Workaround: use a thread-local reference to the active heap.
     // This is safe because native functions are only called during eval,
     // when exactly one Realm (and heap) is live per thread.
+    // ES §20.1.2.2: the prototype argument must be an Object or null; any other
+    // value (including undefined / a missing argument) is a TypeError.
     var proto: ?*JsObject = null;
-    if (args.len > 0) {
-        const a = args[0];
-        if (a.bits != 0) {
-            switch (a.unbox()) {
-                .object => |obj| proto = obj,
-                .null_ => proto = null,
-                else => {},
-            }
-        }
+    if (args.len == 0 or args[0].bits == 0) {
+        return throwTypeError(arena, "Object prototype may only be an Object or null");
+    }
+    switch (args[0].unbox()) {
+        .object => |obj| proto = obj,
+        .null_ => proto = null,
+        else => return throwTypeError(arena, "Object prototype may only be an Object or null"),
     }
     // Allocate on the active heap if available, otherwise fallback to arena.
     // Always use `arena` for the JsValue wrapper (it's eval-arena-lifetime).
-    if (active_heap) |heap| {
-        const obj = try JsObject.createOnHeap(heap, proto);
-        return val_mod.makeObject(arena, obj);
+    const obj_val = if (active_heap) |heap|
+        try val_mod.makeObject(arena, try JsObject.createOnHeap(heap, proto))
+    else
+        // Fallback: arena (when heap not yet wired, e.g., tree-walker path).
+        try val_mod.makeObject(arena, try JsObject.create(arena, proto));
+
+    // ES §20.1.2.2 step 3: if Properties is present (not undefined), apply
+    // ObjectDefineProperties. Reuse the tested defineProperties implementation.
+    if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_) {
+        _ = try obj_methods_mod.nativeObjectDefineProperties(arena, Value{}, &.{ obj_val, args[1] });
     }
-    // Fallback: arena (when heap not yet wired, e.g., tree-walker path).
-    const obj = try JsObject.create(arena, proto);
-    return val_mod.makeObject(arena, obj);
+    return obj_val;
 }
 
 /// Minimal CommonJS-style host shim:
