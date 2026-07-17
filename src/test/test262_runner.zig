@@ -417,13 +417,13 @@ fn isRunnableFull(source: []const u8) bool {
         // `module` is now runnable: M16 routes these through `ctx.evalModule`
         // (strict, import/export desugared). `raw`/`CanBlockIsFalse` still need
         // harness features the single-file runner can't provide.
-        // M16 Phase 4: `[module, async]` (TLA tests) are now runnable — the
-        // `await` desugaring handles synchronous draining; plain `[async]`
-        // (non-module async scripts) are still skipped.
+        // M16 Phase 4: `[module, async]` (TLA tests) are runnable — the `await`
+        // desugaring handles synchronous draining. Wave 4: plain `[async]`
+        // (non-module async scripts) are now runnable too — `$DONE` is wired to
+        // the host async-completion signals (see `done_prefix` below) and the
+        // shared eval path drains the microtask queue before returning, so a
+        // `Promise.resolve().then($DONE)` completion is observed.
         if (std.mem.indexOf(u8, flags, "raw") != null) return false;
-        if (std.mem.indexOf(u8, flags, "async") != null) {
-            if (std.mem.indexOf(u8, flags, "module") == null) return false;
-        }
         if (std.mem.indexOf(u8, flags, "CanBlockIsFalse") != null) return false;
         // CanBlockIsTrue: test assumes the agent can block (Atomics.wait returns
         // a string). Our single-agent runner always throws TypeError → skip.
@@ -555,15 +555,13 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     else
         "(function(){try{delete ArrayBuffer.prototype.transferToImmutable;}catch(e){}" ++
             "try{delete ArrayBuffer.prototype.sliceToImmutable;}catch(e){}})();\n";
-    // M16 Phase 4: [module, async] tests (TLA) use $DONE() as the async
-    // completion signal. Define it as a synchronous throw-on-error wrapper;
-    // since our `await` desugaring drains microtasks inline, $DONE() is
-    // always called synchronously before evalModule returns.
-    const is_tla_module = blk: {
+    // [async] tests (both plain scripts and `[module, async]` TLA) use $DONE()
+    // as the async completion signal. Route it through the host completion
+    // signals so a late failure/never-completion is observable after the shared
+    // eval path drains the microtask queue (see runMainBc / evalModule).
+    const is_async_test = blk: {
         const yaml = frontmatter(source);
-        const flags = flagsText(yaml);
-        break :blk std.mem.indexOf(u8, flags, "module") != null and
-            std.mem.indexOf(u8, flags, "async") != null;
+        break :blk std.mem.indexOf(u8, flagsText(yaml), "async") != null;
     };
     // M16 TLA: with true async module evaluation $DONE may be called from a
     // microtask after the synchronous run; route it through host completion
@@ -572,7 +570,7 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     // resolves) and as an own property of globalThis: asyncHelpers.js's asyncTest
     // gates on `hasOwnProperty.call(globalThis,"$DONE")`, and a top-level
     // `function $DONE` in module scope is lexical, not a global object property.
-    const done_prefix: []const u8 = if (is_tla_module)
+    const done_prefix: []const u8 = if (is_async_test)
         "function $DONE(err) { if (err) { __jszAsyncFail__(err); } else { __jszAsyncDone__(); } }\nglobalThis.$DONE = $DONE;\n"
     else
         "";
@@ -625,7 +623,7 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     // module evaluation a completion can be deferred to a microtask; if the run
     // ended `.ok` but $DONE never fired (e.g. a deadlocked async dependency), the
     // test never actually completed and must not count as a pass.
-    if (is_tla_module and result == .ok and !jsz.asyncDoneSignaled()) {
+    if (is_async_test and result == .ok and !jsz.asyncDoneSignaled()) {
         const msg = "async test did not complete ($DONE not called)";
         @memcpy(g_fail_msg_buf[0..msg.len], msg);
         g_fail_msg_len = msg.len;
@@ -1354,11 +1352,14 @@ test "includesRegion extracts inline and block forms" {
     try std.testing.expect(std.mem.indexOf(u8, r2, "features") == null);
 }
 
-test "isRunnableFull rejects raw/async but allows module" {
+test "isRunnableFull rejects raw but allows module/async" {
     try std.testing.expect(isRunnableFull("/*---\nes5id: 1\n---*/\nvar x=1;"));
     // M16: module-flagged tests are now runnable (routed via evalModule).
     try std.testing.expect(isRunnableFull("/*---\nflags: [module]\n---*/\n"));
-    try std.testing.expect(!isRunnableFull("/*---\nflags: [async]\n---*/\n"));
+    // Wave 4: plain [async] scripts are now runnable ($DONE wired to host
+    // completion signals; the eval path drains microtasks before returning).
+    try std.testing.expect(isRunnableFull("/*---\nflags: [async]\n---*/\n"));
+    try std.testing.expect(isRunnableFull("/*---\nflags: [module, async]\n---*/\n"));
     try std.testing.expect(!isRunnableFull("/*---\nflags: [raw]\n---*/\n"));
 }
 
