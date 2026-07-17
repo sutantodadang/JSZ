@@ -949,7 +949,30 @@ fn defineTarget(arena: std.mem.Allocator, val: Value) anyerror!?*JsObject {
 }
 
 /// Object.defineProperty(o, key, descriptor): define/redefine a data property.
+/// ToPropertyKey returning a Value (a Symbol stays a symbol; else a String).
+fn toPropertyKeyValue(arena: std.mem.Allocator, v: Value) !Value {
+    if (v.bits != 0 and v.unbox() == .symbol) return v;
+    const s = try @import("../realm.zig").stringPrimitive(arena, v);
+    return val_mod.makeString(arena, s);
+}
+
 pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    // Proxy [[DefineOwnProperty]]: dispatch the `defineProperty` trap.
+    if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object and
+        args[0].toPtr().object.internal_kind == .proxy)
+    {
+        const pobj = args[0].toPtr().object;
+        if (args.len < 3 or args[2].bits == 0 or args[2].unbox() != .object)
+            return throwTypeError(arena, "descriptor must be an object");
+        const key = try toPropertyKeyValue(arena, if (args.len >= 2) args[1] else Value{});
+        if (try proxy_mod.proxyDefineProperty(arena, pobj, key, args[2])) |ok| {
+            if (!ok) return throwTypeError(arena, "proxy defineProperty returned false");
+            return args[0];
+        }
+        // No trap: forward to the target.
+        if (proxy_mod.proxyTarget(pobj)) |t|
+            return nativeObjectDefineProperty(arena, Value{}, &[_]Value{ t, key, args[2] });
+    }
     // Functions are objects too: resolve a callable to its backing object so
     // `Object.defineProperty(fn, ...)` works (not just plain objects).
     const obj = try defineTarget(arena, if (args.len >= 1) args[0] else Value{}) orelse

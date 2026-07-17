@@ -533,11 +533,20 @@ pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
 // ---------------------------------------------------------------- Reflect.defineProperty ---
 
 pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len < 1 or !isObj(args[0])) return val_mod.makeBool(arena, false);
-    if (args.len < 3 or !isObj(args[2])) return val_mod.makeBool(arena, false);
+    if (args.len < 1 or !isObj(args[0]))
+        return throwTypeErrorReflect(arena, "Reflect.defineProperty called on non-object");
+    if (args.len < 3 or !isObj(args[2]))
+        return throwTypeErrorReflect(arena, "Reflect.defineProperty descriptor must be an object");
 
     const target_obj = args[0].toPtr().object;
     const key_arg = if (args.len > 1) args[1] else Value{};
+
+    // Proxy [[DefineOwnProperty]]: dispatch the defineProperty trap.
+    if (target_obj.internal_kind == .proxy) {
+        const key: Value = if (isSym(key_arg)) key_arg else try val_mod.makeString(arena, try @import("../realm.zig").stringPrimitive(arena, key_arg));
+        if (try proxy_mod.proxyDefineProperty(arena, target_obj, key, args[2])) |ok| return val_mod.makeBool(arena, ok);
+        if (proxy_mod.proxyTarget(target_obj)) |t| return nativeReflectDefineProperty(arena, Value{}, &[_]Value{ t, key, args[2] });
+    }
 
     // Symbol-keyed [[DefineOwnProperty]]: ordinary symbol property (data or accessor).
     if (isSym(key_arg)) {
