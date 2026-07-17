@@ -1432,6 +1432,11 @@ pub const FnCompiler = struct {
             try self.emitU8(r_old);
             if (u.operand.kind == .identifier) {
                 try self.emitStore(u.operand.data.identifier, r_new, line);
+            } else if (u.operand.kind == .member_expr) {
+                // Write the incremented value back to `obj.prop` / `obj[key]`.
+                // compileMemberWrite re-evaluates the object/key above r_new (it
+                // never clobbers r_new), matching the compound-assign lowering.
+                try self.compileMemberWrite(u.operand.data.member_expr, r_new, line);
             }
             return r_new;
         } else {
@@ -1445,6 +1450,10 @@ pub const FnCompiler = struct {
             try self.emitU8(r_scratch);
             if (u.operand.kind == .identifier) {
                 try self.emitStore(u.operand.data.identifier, r_scratch, line);
+            } else if (u.operand.kind == .member_expr) {
+                // Write the incremented value back to the member target while
+                // returning the pre-increment value held in r_old.
+                try self.compileMemberWrite(u.operand.data.member_expr, r_scratch, line);
             }
             self.freeReg(); // free r_scratch
             return r_old; // return old value
