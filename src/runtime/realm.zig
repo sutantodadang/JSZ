@@ -1238,6 +1238,12 @@ pub var active_sym_to_string_tag: ?Value = null;
 pub var active_sym_species: ?Value = null;
 /// ES2023 Symbol.asyncIterator well-known symbol value.
 pub var active_sym_async_iterator: ?Value = null;
+/// Well-known RegExp-related symbols (@@match/@@replace/@@search/@@split/@@matchAll).
+pub var active_sym_match: ?Value = null;
+pub var active_sym_replace: ?Value = null;
+pub var active_sym_search: ?Value = null;
+pub var active_sym_split: ?Value = null;
+pub var active_sym_match_all: ?Value = null;
 /// Phase 13: private symbols storing a Proxy's [[ProxyTarget]]/[[ProxyHandler]]
 /// as GC-traced symbol-keyed own properties.
 pub var active_sym_proxy_target: ?Value = null;
@@ -1945,7 +1951,37 @@ fn nativeStructuredClone(arena: std.mem.Allocator, _: Value, args: []const Value
     return structuredCloneInner(arena, v, &sctx);
 }
 
-fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8 {
+/// ES ToNumber with ToPrimitive(number) for objects (invokes valueOf/toString),
+/// so a `{valueOf(){...}}` receiver's hook fires. BigInt yields NaN here (callers
+/// that must reject BigInt do so separately).
+pub fn toNumberValue(arena: std.mem.Allocator, v: Value) anyerror!f64 {
+    if (v.bits == 0) return std.math.nan(f64);
+    return switch (v.unbox()) {
+        .number => |n| n,
+        .boolean => |b| if (b) 1 else 0,
+        .null_ => 0,
+        .undefined_ => std.math.nan(f64),
+        .string => |s| val_mod.jsStringToNumber(s),
+        .object => blk: {
+            if (try coercion_mod.toPrimitive(arena, v, .number)) |prim| {
+                if (prim.bits != 0 and prim.unbox() == .object) break :blk std.math.nan(f64);
+                break :blk try toNumberValue(arena, prim);
+            }
+            break :blk std.math.nan(f64);
+        },
+        else => std.math.nan(f64),
+    };
+}
+
+/// ES ToLength: ToInteger(ToNumber(v)) clamped to [0, 2^53-1].
+pub fn toLengthValue(arena: std.mem.Allocator, v: Value) anyerror!usize {
+    const n = try toNumberValue(arena, v);
+    if (std.math.isNan(n) or n <= 0) return 0;
+    const capped = @min(std.math.trunc(n), 9007199254740991.0);
+    return @intFromFloat(capped);
+}
+
+pub fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8 {
     if (arg.bits == 0) return "undefined";
     return switch (arg.unbox()) {
         .string => |s| s,
@@ -3541,7 +3577,7 @@ pub const Realm = struct {
         try symbol_ctor.set("for", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolFor, "for", 0));
         try symbol_ctor.set("keyFor", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolKeyFor, "keyFor", 0));
         // Well-known symbols (identity constants; inert in S1).
-        const wk_names = [_][]const u8{ "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable", "match", "replace", "search", "split", "species", "toPrimitive", "toStringTag", "unscopables" };
+        const wk_names = [_][]const u8{ "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable", "match", "matchAll", "replace", "search", "split", "species", "toPrimitive", "toStringTag", "unscopables" };
         for (wk_names) |name| {
             const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
             try symbol_ctor.set(name, try val_mod.makeSymbol(arena, desc));
@@ -3579,6 +3615,15 @@ pub const Realm = struct {
         // Capture Symbol.toStringTag and Symbol.species.
         active_sym_to_string_tag = symbol_ctor.getOwn("toStringTag");
         active_sym_species = symbol_ctor.getOwn("species");
+        // Capture the RegExp-related well-known symbols and install the
+        // RegExp.prototype[@@match/@@replace/@@search/@@split/@@matchAll] methods
+        // now that the symbols exist (regexp register() ran earlier).
+        active_sym_match = symbol_ctor.getOwn("match");
+        active_sym_replace = symbol_ctor.getOwn("replace");
+        active_sym_search = symbol_ctor.getOwn("search");
+        active_sym_split = symbol_ctor.getOwn("split");
+        active_sym_match_all = symbol_ctor.getOwn("matchAll");
+        try regexp_mod.registerSymbols(arena);
         // Wire @@toStringTag + @@species onto TypedArray/ArrayBuffer/DataView protos+ctors now
         // that the well-known symbols exist (register() ran before Symbol init).
         try typed_array_mod.registerSymbols(arena);
