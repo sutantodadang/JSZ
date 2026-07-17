@@ -9,6 +9,7 @@ const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
 const intrinsics = @import("intrinsics.zig");
 const coercion = @import("coercion.zig");
+const function_proto = @import("function_proto.zig");
 
 pub const DateData = struct {
     ms: i64,
@@ -52,24 +53,56 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "setSeconds", nativeDateSetSeconds },
         .{ "setMilliseconds", nativeDateSetMilliseconds },
         .{ "setTime", nativeDateSetTime },
-        .{ "setUTCFullYear", nativeDateSetUTCFullYear },
-        .{ "setUTCHours", nativeDateSetUTCHours },
         .{ "setYear", nativeDateSetYear },
         .{ "toUTCString", nativeDateToUTCString },
         .{ "toGMTString", nativeDateToGMTString },
         .{ "toDateString", nativeDateToDateString },
         .{ "toTimeString", nativeDateToTimeString },
         .{ "toJSON", nativeDateToJSON },
+        .{ "setUTCFullYear", nativeDateSetFullYear },
+        .{ "setUTCMonth", nativeDateSetMonth },
+        .{ "setUTCDate", nativeDateSetDate },
+        .{ "setUTCHours", nativeDateSetHours },
+        .{ "setUTCMinutes", nativeDateSetMinutes },
+        .{ "setUTCSeconds", nativeDateSetSeconds },
+        .{ "setUTCMilliseconds", nativeDateSetMilliseconds },
+        .{ "toLocaleString", nativeDateToString },
+        .{ "toLocaleDateString", nativeDateToDateString },
+        .{ "toLocaleTimeString", nativeDateToTimeString },
     });
     active_date_proto = date_proto;
 
     const date_ctor = try intrinsics.makeCtor(arena, date_proto, nativeDateCtor, null);
     try intrinsics.setMethod(arena, date_ctor, "now", nativeDateNow);
     try intrinsics.setMethod(arena, date_ctor, "parse", nativeDateParse);
+    try intrinsics.setMethod(arena, date_ctor, "UTC", nativeDateUTC);
+    // Date.UTC.length === 7 (year..ms); Date.parse.length === 1. Both bare names
+    // are ambiguous in the shared length table, so pin them explicitly here.
+    if (date_ctor.getOwn("UTC")) |u| {
+        if (u.bits != 0 and u.unbox() == .object) {
+            _ = try u.unbox().object.defineOwnData("length", try val_mod.makeNumber(arena, 7), .{ .writable = false, .enumerable = false, .configurable = true });
+        }
+    }
+    if (date_ctor.getOwn("parse")) |pf| {
+        if (pf.bits != 0 and pf.unbox() == .object) {
+            _ = try pf.unbox().object.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        }
+    }
     _ = try date_ctor.defineOwnData("name", try val_mod.makeString(arena, "Date"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try date_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 7), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try date_proto.defineOwnData("constructor", try val_mod.makeObject(arena, date_ctor), .{ .writable = true, .enumerable = false, .configurable = true });
     try ctx.defineGlobal("Date", date_ctor);
+}
+
+/// Wire Date.prototype[@@toPrimitive] once the well-known symbols exist (Symbol
+/// init runs after register()). The method is { [[Writable]]: false,
+/// [[Enumerable]]: false, [[Configurable]]: true } with name "[Symbol.toPrimitive]".
+pub fn registerSymbols(arena: std.mem.Allocator) !void {
+    const proto = active_date_proto orelse return;
+    if (realm_mod.active_sym_to_primitive) |sym| {
+        const fn_val = try val_mod.makeNativeFunctionNamed(arena, nativeDateToPrimitive, "[Symbol.toPrimitive]", 1);
+        try proto.setSymAttr(sym, fn_val, .{ .writable = false, .enumerable = false, .configurable = true });
+    }
 }
 
 // ------------------------------------------------------------------ helpers ---
@@ -182,6 +215,19 @@ fn msToFields(ms_epoch: i64) DateFields {
     };
 }
 
+/// Days from the epoch (1970-01-01) to Jan 1 of `y`.
+fn daysToYearStart(y: i32) i64 {
+    var days: i64 = 0;
+    if (y >= 1970) {
+        var yr: i32 = 1970;
+        while (yr < y) : (yr += 1) days += if (isLeapYear(yr)) 366 else 365;
+    } else {
+        var yr: i32 = 1969;
+        while (yr >= y) : (yr -= 1) days -= if (isLeapYear(yr)) 366 else 365;
+    }
+    return days;
+}
+
 /// UTC fields -> milliseconds since epoch.
 fn fieldsToMs(year: i32, month: i32, day: i32, hour: i32, min_: i32, sec_: i32, ms_: i32) i64 {
     // Normalize month into [0,11], carrying into the year (i64 math avoids overflow).
@@ -196,18 +242,7 @@ fn fieldsToMs(year: i32, month: i32, day: i32, hour: i32, min_: i32, sec_: i32, 
     const y: i32 = @intCast(y64);
 
     // Days from epoch to Jan 1 of year.
-    var days: i64 = 0;
-    if (y >= 1970) {
-        var yr: i32 = 1970;
-        while (yr < y) : (yr += 1) {
-            days += if (isLeapYear(yr)) 366 else 365;
-        }
-    } else {
-        var yr: i32 = 1969;
-        while (yr >= y) : (yr -= 1) {
-            days -= if (isLeapYear(yr)) 366 else 365;
-        }
-    }
+    var days: i64 = daysToYearStart(y);
     // Add days for months.
     var mo: i32 = 0;
     while (mo < m) : (mo += 1) {
@@ -216,6 +251,55 @@ fn fieldsToMs(year: i32, month: i32, day: i32, hour: i32, min_: i32, sec_: i32, 
     days += @as(i64, day) - 1;
 
     return days * 86400_000 + @as(i64, hour) * 3_600_000 + @as(i64, min_) * 60_000 + @as(i64, sec_) * 1000 + ms_;
+}
+
+/// ES MakeDate(MakeDay(year, month, date), MakeTime(hour, min, sec, ms)) followed
+/// by TimeClip. Non-finite inputs, or a result outside ±8.64e15 ms, yield null
+/// (→ Invalid Date / NaN). All numeric args are ToInteger-truncated per spec, so
+/// the day-of-month and time components may be arbitrarily large.
+fn composeTime(year: f64, month: f64, date: f64, hour: f64, min: f64, sec: f64, ms: f64) ?i64 {
+    inline for (.{ year, month, date, hour, min, sec, ms }) |x| {
+        if (!std.math.isFinite(x)) return null;
+    }
+    const y = @trunc(year);
+    const mo = @trunc(month);
+    const ym = y + @floor(mo / 12.0);
+    // Year far outside the representable Date range → definitely out of bounds.
+    if (@abs(ym) > 300000) return null;
+    const mn: i32 = @intFromFloat(mo - @floor(mo / 12.0) * 12.0);
+    const yi: i32 = @intFromFloat(ym);
+    var days: i64 = daysToYearStart(yi);
+    var k: i32 = 0;
+    while (k < mn) : (k += 1) days += daysInMonth(k, yi);
+    const day_ms = (@as(f64, @floatFromInt(days)) + (@trunc(date) - 1.0)) * 86400000.0;
+    const time_ms = ((@trunc(hour) * 3600000.0 + @trunc(min) * 60000.0) + @trunc(sec) * 1000.0) + @trunc(ms);
+    return timeClip(day_ms + time_ms);
+}
+
+/// ToNumber each argument left-to-right (every side effect runs even after an
+/// earlier arg already produced NaN). `out[0]` is always coerced — an absent
+/// first argument is `undefined` → NaN — while later slots are coerced only when
+/// the argument is present. Returns the number of slots actually filled.
+fn coerceArgs(arena: std.mem.Allocator, args: []const Value, out: []f64) !usize {
+    var i: usize = 0;
+    while (i < out.len) : (i += 1) {
+        if (i != 0 and i >= args.len) break;
+        const v: Value = if (i < args.len) args[i] else Value{};
+        out[i] = try realm_mod.toNumberValue(arena, v);
+    }
+    return i;
+}
+
+/// Commit a composed time value to the receiver's [[DateValue]]: a null result
+/// marks the date Invalid and returns NaN.
+fn applyResult(arena: std.mem.Allocator, dd: *DateData, result: ?i64) !Value {
+    if (result) |ms| {
+        dd.ms = ms;
+        dd.valid = true;
+        return val_mod.makeNumber(arena, @floatFromInt(ms));
+    }
+    dd.valid = false;
+    return val_mod.makeNumber(arena, std.math.nan(f64));
 }
 
 fn getDateData(this_val: Value) ?*DateData {
@@ -234,6 +318,34 @@ fn getValidDateData(this_val: Value) ?*DateData {
     const dd = getDateData(this_val) orelse return null;
     if (!dd.valid) return null;
     return dd;
+}
+
+/// Brand check: every Date.prototype method requires a `this` with a
+/// [[DateValue]] internal slot, throwing a TypeError otherwise (spec step 1 of
+/// thisTimeValue / the individual methods). Returns the data even when the date
+/// is Invalid — callers decide whether to surface NaN or a string for that.
+fn requireDate(arena: std.mem.Allocator, this_val: Value) anyerror!*DateData {
+    return getDateData(this_val) orelse realm_mod.throwTypeError(arena, "Date.prototype method called on an incompatible receiver");
+}
+
+/// Brand check + validity: throws a TypeError for a non-Date receiver, returns
+/// null for a valid brand but Invalid Date (so string formatters can emit
+/// "Invalid Date"), and the data otherwise.
+fn brandValidDate(arena: std.mem.Allocator, this_val: Value) anyerror!?*DateData {
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return null;
+    return dd;
+}
+
+/// Maximum representable time value per TimeClip (ES 21.4.1.1): ±8.64e15 ms.
+const MAX_TIME_MS: f64 = 8.64e15;
+
+/// ES TimeClip: a time value outside the representable range (or non-finite)
+/// becomes NaN; otherwise it is truncated toward zero to an integer millisecond.
+fn timeClip(t: f64) ?i64 {
+    if (!std.math.isFinite(t)) return null;
+    if (@abs(t) > MAX_TIME_MS) return null;
+    return @intFromFloat(@trunc(t));
 }
 
 fn createDateObject(arena: std.mem.Allocator, ms: i64, valid: bool) !Value {
@@ -413,53 +525,81 @@ pub fn nativeDateParse(arena: std.mem.Allocator, _: Value, args: []const Value) 
 
 // ------------------------------------------------------------------ Date constructor ---
 
+/// ES Date.UTC(year [, month [, date [, hours [, minutes [, seconds [, ms ]]]]]]).
+/// Every argument is ToNumber-coerced in order; the result is a TimeClip'd number
+/// (NaN when out of range), never a Date object.
+pub fn nativeDateUTC(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    var nums: [7]f64 = undefined;
+    const n = try coerceArgs(arena, args, &nums);
+    const year = makeFullYear(nums[0]);
+    const month = if (n > 1) nums[1] else 0;
+    const date = if (n > 2) nums[2] else 1;
+    const hours = if (n > 3) nums[3] else 0;
+    const minutes = if (n > 4) nums[4] else 0;
+    const seconds = if (n > 5) nums[5] else 0;
+    const ms = if (n > 6) nums[6] else 0;
+    if (composeTime(year, month, date, hours, minutes, seconds, ms)) |r|
+        return val_mod.makeNumber(arena, @floatFromInt(r));
+    return val_mod.makeNumber(arena, std.math.nan(f64));
+}
+
+/// ES MakeFullYear: a finite year in 0..99 (after ToInteger) maps to 1900+year;
+/// everything else passes through unchanged (NaN stays NaN).
+fn makeFullYear(year: f64) f64 {
+    if (!std.math.isFinite(year)) return year;
+    const yt = @trunc(year);
+    if (yt >= 0 and yt <= 99) return 1900 + yt;
+    return year;
+}
+
 pub fn nativeDateCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Called as a plain function (no `new`): ES 21.4.2.1 step 1 — ignore all
+    // arguments and return the current time as a string. Construction always
+    // passes a fresh object (with Date.prototype) as `this`; a plain call passes
+    // undefined (strict) which we treat as the function form.
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        const now_val = try createDateObject(arena, std.time.milliTimestamp(), true);
+        return nativeDateToString(arena, now_val, &[_]Value{});
+    }
     var is_invalid = false;
     const ms: i64 = blk: {
         if (args.len == 0) {
             break :blk std.time.milliTimestamp();
         } else if (args.len == 1) {
-            // new Date(ms) | new Date(string) | new Date(object)
+            // new Date(value): a Date argument copies its [[DateValue]]; otherwise
+            // ToPrimitive(value, default) → String parses, anything else ToNumbers.
             const v = args[0];
-            if (v.bits != 0) {
-                switch (v.unbox()) {
-                    .number => |n| break :blk @intFromFloat(n),
-                    .string => |s| {
-                        if (parseIsoDateString(s)) |pms| break :blk pms;
-                        is_invalid = true;
-                        break :blk 0;
-                    },
-                    .object => {
-                        const prim = try coercion.toPrimitive(arena, v, .default);
-                        if (prim) |p| {
-                            if (p.bits != 0) {
-                                switch (p.unbox()) {
-                                    .string => |ps| {
-                                        if (parseIsoDateString(ps)) |pms| break :blk pms;
-                                        is_invalid = true;
-                                        break :blk 0;
-                                    },
-                                    .number => |pn| break :blk @intFromFloat(pn),
-                                    else => break :blk std.time.milliTimestamp(),
-                                }
-                            }
-                        }
-                        break :blk std.time.milliTimestamp();
-                    },
-                    else => break :blk std.time.milliTimestamp(),
-                }
+            if (getDateData(v)) |src| {
+                is_invalid = !src.valid;
+                break :blk src.ms;
             }
+            var prim = v;
+            if (v.bits != 0 and v.unbox() == .object) {
+                prim = (try coercion.toPrimitive(arena, v, .default)) orelse v;
+            }
+            if (prim.bits != 0 and prim.unbox() == .string) {
+                if (parseIsoDateString(prim.unbox().string)) |pms| break :blk pms;
+                is_invalid = true;
+                break :blk 0;
+            }
+            const tv = try realm_mod.toNumberValue(arena, prim);
+            if (timeClip(tv)) |clamped| break :blk clamped;
+            is_invalid = true;
             break :blk 0;
         } else {
             // new Date(year, month, day?, hour?, min?, sec?, ms?)
-            const y = argToI32(args, 0, 1970);
-            const mo = argToI32(args, 1, 0);
-            const d = argToI32(args, 2, 1);
-            const h = argToI32(args, 3, 0);
-            const mi = argToI32(args, 4, 0);
-            const s = argToI32(args, 5, 0);
-            const ms_ = argToI32(args, 6, 0);
-            break :blk fieldsToMs(y, mo, d, h, mi, s, ms_);
+            var nums: [7]f64 = undefined;
+            const n = try coerceArgs(arena, args, &nums);
+            const year = makeFullYear(nums[0]);
+            const month = nums[1];
+            const day = if (n > 2) nums[2] else 1;
+            const hour = if (n > 3) nums[3] else 0;
+            const min = if (n > 4) nums[4] else 0;
+            const sec = if (n > 5) nums[5] else 0;
+            const ms_ = if (n > 6) nums[6] else 0;
+            if (composeTime(year, month, day, hour, min, sec, ms_)) |c| break :blk c;
+            is_invalid = true;
+            break :blk 0;
         }
     };
 
@@ -477,54 +617,63 @@ pub fn nativeDateCtor(arena: std.mem.Allocator, this_val: Value, args: []const V
 // ------------------------------------------------------------------ prototype methods ---
 
 pub fn nativeDateGetTime(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
 }
 
 pub fn nativeDateGetFullYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.year));
 }
 
 pub fn nativeDateGetMonth(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.month));
 }
 
 pub fn nativeDateGetDate(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.day));
 }
 
 pub fn nativeDateGetDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.weekday));
 }
 
 pub fn nativeDateGetHours(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.hour));
 }
 
 pub fn nativeDateGetMinutes(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.min));
 }
 
 pub fn nativeDateGetSeconds(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.sec));
 }
 
 pub fn nativeDateGetMilliseconds(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.ms));
 }
@@ -536,22 +685,50 @@ pub fn nativeDateValueOf(arena: std.mem.Allocator, this_val: Value, args: []cons
 /// ES2015 Date.prototype[Symbol.toPrimitive]. `args[0]` is the hint string.
 /// "number" -> numeric timestamp (valueOf); "string"/"default" -> date string.
 pub fn nativeDateToPrimitive(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Step 1-2: this must be an Object.
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "Date.prototype[Symbol.toPrimitive] called on non-object");
+    // Steps 3-5: hint selects the OrdinaryToPrimitive order; anything other than
+    // "string"/"number"/"default" is a TypeError.
     const hint: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string)
         args[0].unbox().string
     else
-        "default";
-    if (std.mem.eql(u8, hint, "number")) {
-        return nativeDateValueOf(arena, this_val, &[_]Value{});
-    }
-    return nativeDateToString(arena, this_val, &[_]Value{});
+        "";
+    const string_first = if (std.mem.eql(u8, hint, "string") or std.mem.eql(u8, hint, "default"))
+        true
+    else if (std.mem.eql(u8, hint, "number"))
+        false
+    else
+        return realm_mod.throwTypeError(arena, "invalid hint for Date.prototype[Symbol.toPrimitive]");
+    // Step 6: OrdinaryToPrimitive(O, tryFirst) — invokes the object's own
+    // toString/valueOf (user-overridable), never the @@toPrimitive path again.
+    if (try coercion.ordinaryToPrimitive(arena, this_val, string_first)) |p| return p;
+    return realm_mod.throwTypeError(arena, "Cannot convert Date to primitive value");
 }
 
 pub fn nativeDateToISOString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeString(arena, "Invalid Date");
+    const dd = try requireDate(arena, this_val);
+    // toISOString on an Invalid Date is a RangeError, not the "Invalid Date" string.
+    if (!dd.valid) return realm_mod.throwRangeError(arena, "Invalid time value");
     const f = msToFields(dd.ms);
+    // Years outside 0..9999 use the expanded ±YYYYYY form (ES 21.4.4.36).
+    if (f.year < 0 or f.year > 9999) {
+        const sign: u8 = if (f.year < 0) '-' else '+';
+        const s = try std.fmt.allocPrint(arena, "{c}{d:0>6}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+            sign,
+            @as(u32, @intCast(@abs(f.year))),
+            @as(u8, @intCast(f.month + 1)),
+            @as(u8, @intCast(f.day)),
+            @as(u8, @intCast(f.hour)),
+            @as(u8, @intCast(f.min)),
+            @as(u8, @intCast(f.sec)),
+            @as(u16, @intCast(f.ms)),
+        });
+        return val_mod.makeString(arena, s);
+    }
     // Use unsigned casts to avoid '+' sign in Zig format specifiers.
     const s = try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
-        @as(u32, @intCast(@max(0, f.year))),
+        @as(u32, @intCast(f.year)),
         @as(u8, @intCast(f.month + 1)),
         @as(u8, @intCast(f.day)),
         @as(u8, @intCast(f.hour)),
@@ -562,17 +739,27 @@ pub fn nativeDateToISOString(arena: std.mem.Allocator, this_val: Value, _: []con
     return val_mod.makeString(arena, s);
 }
 
+/// Format a year for the human-readable date strings: at least four digits,
+/// with a leading '-' for negative (extended) years, e.g. 20 -> "0020",
+/// -1 -> "-0001", 275760 -> "275760".
+fn yearString(arena: std.mem.Allocator, year: i32) ![]const u8 {
+    if (year < 0)
+        return std.fmt.allocPrint(arena, "-{d:0>4}", .{@as(u32, @intCast(-year))});
+    return std.fmt.allocPrint(arena, "{d:0>4}", .{@as(u32, @intCast(year))});
+}
+
 pub fn nativeDateToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeString(arena, "Invalid Date");
+    // ToDateString(tv): DateString + " " + TimeString + TimeZoneString.
+    const dd = (try brandValidDate(arena, this_val)) orelse return val_mod.makeString(arena, "Invalid Date");
     const f = msToFields(dd.ms);
-    const s = try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
-        @as(u32, @intCast(@max(0, f.year))),
-        @as(u8, @intCast(f.month + 1)),
+    const s = try std.fmt.allocPrint(arena, "{s} {s} {d:0>2} {s} {d:0>2}:{d:0>2}:{d:0>2} GMT+0000 (Coordinated Universal Time)", .{
+        WDAY[@intCast(f.weekday)],
+        MON[@intCast(f.month)],
         @as(u8, @intCast(f.day)),
+        try yearString(arena, f.year),
         @as(u8, @intCast(f.hour)),
         @as(u8, @intCast(f.min)),
         @as(u8, @intCast(f.sec)),
-        @as(u16, @intCast(f.ms)),
     });
     return val_mod.makeString(arena, s);
 }
@@ -580,49 +767,57 @@ pub fn nativeDateToString(arena: std.mem.Allocator, this_val: Value, _: []const 
 // ------------------------------------------------------------------ UTC getters ---
 
 pub fn nativeDateGetUTCFullYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.year));
 }
 
 pub fn nativeDateGetUTCMonth(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.month));
 }
 
 pub fn nativeDateGetUTCDate(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.day));
 }
 
 pub fn nativeDateGetUTCDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.weekday));
 }
 
 pub fn nativeDateGetUTCHours(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.hour));
 }
 
 pub fn nativeDateGetUTCMinutes(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.min));
 }
 
 pub fn nativeDateGetUTCSeconds(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.sec));
 }
 
 pub fn nativeDateGetUTCMilliseconds(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.ms));
 }
@@ -630,97 +825,114 @@ pub fn nativeDateGetUTCMilliseconds(arena: std.mem.Allocator, this_val: Value, _
 // ------------------------------------------------------------------ getTimezoneOffset / getYear ---
 
 pub fn nativeDateGetTimezoneOffset(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    _ = dd;
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     return val_mod.makeNumber(arena, 0);
 }
 
 pub fn nativeDateGetYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return val_mod.makeNumber(arena, std.math.nan(f64));
     const f = msToFields(dd.ms);
     return val_mod.makeNumber(arena, @floatFromInt(f.year - 1900));
 }
 
 // ------------------------------------------------------------------ setters ---
 
+// The setters below share a shape: brand-check the receiver, ToNumber every
+// provided argument in order (side effects run unconditionally), then recompose
+// the time from the receiver's current broken-down fields, overriding the fields
+// the setter names. On an Invalid Date the "year" setters (which reset t to +0)
+// still succeed, while the others stay NaN — but coercion has already happened.
+
 pub fn nativeDateSetFullYear(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    var f = msToFields(dd.ms);
-    f.year = argToI32(args, 0, f.year);
-    f.month = argToI32(args, 1, f.month);
-    f.day = argToI32(args, 2, f.day);
-    dd.ms = fieldsToMs(f.year, f.month, f.day, f.hour, f.min, f.sec, f.ms);
-    return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
+    const dd = try requireDate(arena, this_val);
+    var nums: [3]f64 = undefined;
+    const n = try coerceArgs(arena, args, &nums);
+    // setFullYear resets an Invalid Date: t defaults to +0 (1970-01-01 UTC).
+    const f = if (dd.valid) msToFields(dd.ms) else msToFields(0);
+    const year = nums[0];
+    const month = if (n > 1) nums[1] else @as(f64, @floatFromInt(f.month));
+    const day = if (n > 2) nums[2] else @as(f64, @floatFromInt(f.day));
+    return applyResult(arena, dd, composeTime(year, month, day, @floatFromInt(f.hour), @floatFromInt(f.min), @floatFromInt(f.sec), @floatFromInt(f.ms)));
 }
 
 pub fn nativeDateSetMonth(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    var f = msToFields(dd.ms);
-    f.month = argToI32(args, 0, f.month);
-    f.day = argToI32(args, 1, f.day);
-    dd.ms = fieldsToMs(f.year, f.month, f.day, f.hour, f.min, f.sec, f.ms);
-    return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
+    const dd = try requireDate(arena, this_val);
+    // [[DateValue]] is read BEFORE ToNumber (which may re-enter and mutate it).
+    const base_valid = dd.valid;
+    const f = msToFields(dd.ms);
+    var nums: [2]f64 = undefined;
+    const n = try coerceArgs(arena, args, &nums);
+    if (!base_valid) return applyResult(arena, dd, null);
+    const month = nums[0];
+    const day = if (n > 1) nums[1] else @as(f64, @floatFromInt(f.day));
+    return applyResult(arena, dd, composeTime(@floatFromInt(f.year), month, day, @floatFromInt(f.hour), @floatFromInt(f.min), @floatFromInt(f.sec), @floatFromInt(f.ms)));
 }
 
 pub fn nativeDateSetDate(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    var f = msToFields(dd.ms);
-    f.day = argToI32(args, 0, f.day);
-    dd.ms = fieldsToMs(f.year, f.month, f.day, f.hour, f.min, f.sec, f.ms);
-    return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
+    const dd = try requireDate(arena, this_val);
+    const base_valid = dd.valid;
+    const f = msToFields(dd.ms);
+    var nums: [1]f64 = undefined;
+    _ = try coerceArgs(arena, args, &nums);
+    if (!base_valid) return applyResult(arena, dd, null);
+    return applyResult(arena, dd, composeTime(@floatFromInt(f.year), @floatFromInt(f.month), nums[0], @floatFromInt(f.hour), @floatFromInt(f.min), @floatFromInt(f.sec), @floatFromInt(f.ms)));
 }
 
 pub fn nativeDateSetHours(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    var f = msToFields(dd.ms);
-    f.hour = argToI32(args, 0, f.hour);
-    f.min = argToI32(args, 1, f.min);
-    f.sec = argToI32(args, 2, f.sec);
-    f.ms = argToI32(args, 3, f.ms);
-    dd.ms = fieldsToMs(f.year, f.month, f.day, f.hour, f.min, f.sec, f.ms);
-    return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
+    const dd = try requireDate(arena, this_val);
+    const base_valid = dd.valid;
+    const f = msToFields(dd.ms);
+    var nums: [4]f64 = undefined;
+    const n = try coerceArgs(arena, args, &nums);
+    if (!base_valid) return applyResult(arena, dd, null);
+    const hour = nums[0];
+    const min = if (n > 1) nums[1] else @as(f64, @floatFromInt(f.min));
+    const sec = if (n > 2) nums[2] else @as(f64, @floatFromInt(f.sec));
+    const ms = if (n > 3) nums[3] else @as(f64, @floatFromInt(f.ms));
+    return applyResult(arena, dd, composeTime(@floatFromInt(f.year), @floatFromInt(f.month), @floatFromInt(f.day), hour, min, sec, ms));
 }
 
 pub fn nativeDateSetMinutes(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    var f = msToFields(dd.ms);
-    f.min = argToI32(args, 0, f.min);
-    f.sec = argToI32(args, 1, f.sec);
-    f.ms = argToI32(args, 2, f.ms);
-    dd.ms = fieldsToMs(f.year, f.month, f.day, f.hour, f.min, f.sec, f.ms);
-    return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
+    const dd = try requireDate(arena, this_val);
+    const base_valid = dd.valid;
+    const f = msToFields(dd.ms);
+    var nums: [3]f64 = undefined;
+    const n = try coerceArgs(arena, args, &nums);
+    if (!base_valid) return applyResult(arena, dd, null);
+    const min = nums[0];
+    const sec = if (n > 1) nums[1] else @as(f64, @floatFromInt(f.sec));
+    const ms = if (n > 2) nums[2] else @as(f64, @floatFromInt(f.ms));
+    return applyResult(arena, dd, composeTime(@floatFromInt(f.year), @floatFromInt(f.month), @floatFromInt(f.day), @floatFromInt(f.hour), min, sec, ms));
 }
 
 pub fn nativeDateSetSeconds(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    var f = msToFields(dd.ms);
-    f.sec = argToI32(args, 0, f.sec);
-    f.ms = argToI32(args, 1, f.ms);
-    dd.ms = fieldsToMs(f.year, f.month, f.day, f.hour, f.min, f.sec, f.ms);
-    return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
+    const dd = try requireDate(arena, this_val);
+    const base_valid = dd.valid;
+    const f = msToFields(dd.ms);
+    var nums: [2]f64 = undefined;
+    const n = try coerceArgs(arena, args, &nums);
+    if (!base_valid) return applyResult(arena, dd, null);
+    const sec = nums[0];
+    const ms = if (n > 1) nums[1] else @as(f64, @floatFromInt(f.ms));
+    return applyResult(arena, dd, composeTime(@floatFromInt(f.year), @floatFromInt(f.month), @floatFromInt(f.day), @floatFromInt(f.hour), @floatFromInt(f.min), sec, ms));
 }
 
 pub fn nativeDateSetMilliseconds(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    var f = msToFields(dd.ms);
-    f.ms = argToI32(args, 0, f.ms);
-    dd.ms = fieldsToMs(f.year, f.month, f.day, f.hour, f.min, f.sec, f.ms);
-    return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
+    const dd = try requireDate(arena, this_val);
+    const base_valid = dd.valid;
+    const f = msToFields(dd.ms);
+    var nums: [1]f64 = undefined;
+    _ = try coerceArgs(arena, args, &nums);
+    if (!base_valid) return applyResult(arena, dd, null);
+    return applyResult(arena, dd, composeTime(@floatFromInt(f.year), @floatFromInt(f.month), @floatFromInt(f.day), @floatFromInt(f.hour), @floatFromInt(f.min), @floatFromInt(f.sec), nums[0]));
 }
 
 pub fn nativeDateSetTime(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    if (args.len > 0 and args[0].bits != 0) {
-        switch (args[0].unbox()) {
-            .number => |n| {
-                if (!std.math.isNan(n)) {
-                    dd.ms = @intFromFloat(@trunc(n));
-                }
-            },
-            else => {},
-        }
-    }
-    return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
+    const dd = try requireDate(arena, this_val);
+    const t = if (args.len == 0) std.math.nan(f64) else try realm_mod.toNumberValue(arena, args[0]);
+    return applyResult(arena, dd, timeClip(t));
 }
 
 pub fn nativeDateSetUTCFullYear(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -732,24 +944,30 @@ pub fn nativeDateSetUTCHours(arena: std.mem.Allocator, this_val: Value, args: []
 }
 
 pub fn nativeDateSetYear(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
-    var f = msToFields(dd.ms);
-    const y = argToI32(args, 0, f.year - 1900);
-    f.year = if (y >= 0 and y <= 99) 1900 + y else y;
-    dd.ms = fieldsToMs(f.year, f.month, f.day, f.hour, f.min, f.sec, f.ms);
-    return val_mod.makeNumber(arena, @floatFromInt(dd.ms));
+    const dd = try requireDate(arena, this_val);
+    var nums: [1]f64 = undefined;
+    _ = try coerceArgs(arena, args, &nums);
+    // AnnexB setYear resets an Invalid Date (t defaults to +0) like setFullYear.
+    const f = if (dd.valid) msToFields(dd.ms) else msToFields(0);
+    // MakeFullYear: 0..99 maps to 1900+y; NaN stays NaN.
+    var year = nums[0];
+    if (std.math.isFinite(year)) {
+        const yt = @trunc(year);
+        if (yt >= 0 and yt <= 99) year = 1900 + yt;
+    }
+    return applyResult(arena, dd, composeTime(year, @floatFromInt(f.month), @floatFromInt(f.day), @floatFromInt(f.hour), @floatFromInt(f.min), @floatFromInt(f.sec), @floatFromInt(f.ms)));
 }
 
 // ------------------------------------------------------------------ formatters ---
 
 pub fn nativeDateToUTCString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeString(arena, "Invalid Date");
+    const dd = (try brandValidDate(arena, this_val)) orelse return val_mod.makeString(arena, "Invalid Date");
     const f = msToFields(dd.ms);
-    const s = try std.fmt.allocPrint(arena, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+    const s = try std.fmt.allocPrint(arena, "{s}, {d:0>2} {s} {s} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
         WDAY[@intCast(f.weekday)],
         @as(u8, @intCast(f.day)),
         MON[@intCast(f.month)],
-        @as(u32, @intCast(@max(0, f.year))),
+        try yearString(arena, f.year),
         @as(u8, @intCast(f.hour)),
         @as(u8, @intCast(f.min)),
         @as(u8, @intCast(f.sec)),
@@ -762,19 +980,19 @@ pub fn nativeDateToGMTString(arena: std.mem.Allocator, this_val: Value, args: []
 }
 
 pub fn nativeDateToDateString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeString(arena, "Invalid Date");
+    const dd = (try brandValidDate(arena, this_val)) orelse return val_mod.makeString(arena, "Invalid Date");
     const f = msToFields(dd.ms);
-    const s = try std.fmt.allocPrint(arena, "{s} {s} {d:0>2} {d:0>4}", .{
+    const s = try std.fmt.allocPrint(arena, "{s} {s} {d:0>2} {s}", .{
         WDAY[@intCast(f.weekday)],
         MON[@intCast(f.month)],
         @as(u8, @intCast(f.day)),
-        @as(u32, @intCast(@max(0, f.year))),
+        try yearString(arena, f.year),
     });
     return val_mod.makeString(arena, s);
 }
 
 pub fn nativeDateToTimeString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const dd = getValidDateData(this_val) orelse return val_mod.makeString(arena, "Invalid Date");
+    const dd = (try brandValidDate(arena, this_val)) orelse return val_mod.makeString(arena, "Invalid Date");
     const f = msToFields(dd.ms);
     const s = try std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2} GMT+0000 (Coordinated Universal Time)", .{
         @as(u8, @intCast(f.hour)),
@@ -784,8 +1002,19 @@ pub fn nativeDateToTimeString(arena: std.mem.Allocator, this_val: Value, _: []co
     return val_mod.makeString(arena, s);
 }
 
-pub fn nativeDateToJSON(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const dd = getDateData(this_val) orelse return val_mod.makeNull(arena);
-    _ = dd;
-    return nativeDateToISOString(arena, this_val, args);
+pub fn nativeDateToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    // ES 21.4.4.37: O = ToObject(this) (null/undefined throw); tv = ToPrimitive(O,
+    // number); a non-finite Number tv yields null; otherwise Invoke(O,
+    // "toISOString") — which is looked up on O (user-overridable) and called.
+    if (this_val.bits == 0 or this_val.unbox() == .undefined_ or this_val.unbox() == .null_)
+        return realm_mod.throwTypeError(arena, "Date.prototype.toJSON called on null or undefined");
+    const o = try realm_mod.toObjectForThis(arena, this_val);
+    const tv = (try coercion.toPrimitive(arena, o, .number)) orelse o;
+    if (tv.bits != 0 and tv.unbox() == .number and !std.math.isFinite(tv.unbox().number))
+        return val_mod.makeNull(arena);
+    const ctx = realm_mod.active_context orelse return realm_mod.throwTypeError(arena, "no active context");
+    const method = try ctx.getProp(arena, o, "toISOString");
+    if (method.bits == 0 or !function_proto.isCallableFn(method))
+        return realm_mod.throwTypeError(arena, "toISOString is not callable");
+    return function_proto.invokeCallback(arena, o, method, &[_]Value{});
 }

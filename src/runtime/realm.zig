@@ -2014,7 +2014,17 @@ fn nativeStringCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const s: []const u8 = if (args.len == 0) "" else try stringPrimitive(arena, args[0]);
     // `new String(x)`: wrap on the synthesized object; plain call returns primitive.
     if (constructing and this_val.bits != 0 and this_val.unbox() == .object) {
-        try this_val.toPtr().object.set("[[PrimitiveValue]]", try val_mod.makeString(arena, s));
+        const obj = this_val.toPtr().object;
+        try obj.set("[[PrimitiveValue]]", try val_mod.makeString(arena, s));
+        // A String exotic object exposes each code unit as an own property
+        // { enumerable, non-writable, non-configurable } plus an own non-enumerable
+        // "length" (ES 10.4.3 StringCreate / String-exotic define-own-property).
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            _ = try obj.defineOwnData(key, try val_mod.makeString(arena, try arena.dupe(u8, s[i .. i + 1])), .{ .writable = false, .enumerable = true, .configurable = false });
+        }
+        _ = try obj.defineOwnData("length", try val_mod.makeNumber(arena, @floatFromInt(s.len)), .{ .writable = false, .enumerable = false, .configurable = false });
         return this_val;
     }
     return val_mod.makeString(arena, s);
@@ -2304,7 +2314,7 @@ fn nativeBigIntProtoValueOf(arena: std.mem.Allocator, this_val: Value, _: []cons
     return bigIntThisValue(arena, this_val);
 }
 
-fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+pub fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const eo = if (active_heap) |h| try JsObject.createOnHeap(h, error_proto_RangeError) else try JsObject.create(arena, error_proto_RangeError);
     try eo.set("message", try val_mod.makeString(arena, msg));
     try eo.set("name", try val_mod.makeString(arena, "RangeError"));
@@ -2431,8 +2441,10 @@ fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, args: []const
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toString requires a Number");
     var radix: i32 = 10;
     if (args.len > 0 and args[0].bits != 0) {
-        radix = @intFromFloat(@trunc(args[0].toF64()));
-        if (radix < 2 or radix > 36) return throwRangeError(arena, "toString() radix must be between 2 and 36");
+        const r_raw = args[0].toF64();
+        const r_int: f64 = if (std.math.isNan(r_raw)) 0 else @trunc(r_raw);
+        if (r_int < 2 or r_int > 36) return throwRangeError(arena, "toString() radix must be between 2 and 36");
+        radix = @intFromFloat(r_int);
     }
     if (radix == 10) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
@@ -2443,8 +2455,9 @@ fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, args: []const
 fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toFixed requires a Number");
     const f_raw: f64 = if (args.len == 0) 0.0 else args[0].toF64();
-    const f: i64 = if (std.math.isNan(f_raw)) 0 else @as(i64, @intFromFloat(@trunc(f_raw)));
-    if (f < 0 or f > 100) return throwRangeError(arena, "toFixed() digits argument must be between 0 and 100");
+    const f_int: f64 = if (std.math.isNan(f_raw)) 0 else @trunc(f_raw);
+    if (f_int < 0 or f_int > 100) return throwRangeError(arena, "toFixed() digits argument must be between 0 and 100");
+    const f: i64 = @intFromFloat(f_int);
     if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
     if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     if (@abs(n) >= 1e21) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
@@ -2509,8 +2522,9 @@ fn nativeNumberToExponential(arena: std.mem.Allocator, this_val: Value, args: []
     var f: i64 = -1; // -1 = not provided → shortest
     if (has_arg) {
         const f_raw = args[0].toF64();
-        f = if (std.math.isNan(f_raw)) 0 else @as(i64, @intFromFloat(@trunc(f_raw)));
-        if (f < 0 or f > 100) return throwRangeError(arena, "toExponential() argument must be between 0 and 100");
+        const f_int: f64 = if (std.math.isNan(f_raw)) 0 else @trunc(f_raw);
+        if (f_int < 0 or f_int > 100) return throwRangeError(arena, "toExponential() argument must be between 0 and 100");
+        f = @intFromFloat(f_int);
     }
     return val_mod.makeString(arena, try numberToExponentialImpl(arena, n, f));
 }
@@ -2521,8 +2535,9 @@ fn nativeNumberToPrecision(arena: std.mem.Allocator, this_val: Value, args: []co
     // No argument → same as toString
     if (!has_arg) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     const p_raw = args[0].toF64();
-    const p: i64 = if (std.math.isNan(p_raw)) 1 else @as(i64, @intFromFloat(@trunc(p_raw)));
-    if (p < 1 or p > 100) return throwRangeError(arena, "toPrecision() argument must be between 1 and 100");
+    const p_int: f64 = if (std.math.isNan(p_raw)) 1 else @trunc(p_raw);
+    if (p_int < 1 or p_int > 100) return throwRangeError(arena, "toPrecision() argument must be between 1 and 100");
+    const p: i64 = @intFromFloat(p_int);
     if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
     if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     const abs_n = @abs(n);
@@ -2582,6 +2597,19 @@ fn nativeStringValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Val
     return val_mod.makeString(arena, s);
 }
 
+/// A Boolean/Number/String wrapper object carries a matching [[PrimitiveValue]];
+/// return its reserved Object.prototype.toString tag, or null for a plain object.
+fn wrapperTag(obj: *JsObject) ?[]const u8 {
+    const p = obj.get("[[PrimitiveValue]]") orelse return null;
+    if (p.bits == 0) return null;
+    return switch (p.unbox()) {
+        .boolean => "Boolean",
+        .number => "Number",
+        .string => "String",
+        else => null,
+    };
+}
+
 // ---- Object.prototype.toString / valueOf ----
 fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     // ES 20.1.3.6: "[object " + builtinTag + "]". undefined/null get special tags.
@@ -2589,8 +2617,29 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
     const builtin_tag: []const u8 = switch (this_val.unbox()) {
         .undefined_ => "Undefined",
         .null_ => "Null",
-        .object => |obj| if (obj.is_array) "Array" else if (obj.get("__call__") != null) "Function" else "Object",
+        // ES 20.1.3.6 steps 4-14: exotic internal slots select the builtin tag
+        // before falling back to "Object". Array/Arguments/callable/Error/wrapper/
+        // Date/RegExp each have a reserved tag.
+        .object => |obj| if (obj.is_array)
+            "Array"
+        else if (obj.internal_kind == .mapped_arguments)
+            "Arguments"
+        else if (obj.get("__call__") != null)
+            "Function"
+        else if (wrapperTag(obj)) |wt|
+            wt
+        else if (obj.internal_kind == .date)
+            "Date"
+        else if (obj.internal_kind == .regexp)
+            "RegExp"
+        else
+            "Object",
         .function, .bc_function, .native_function => "Function",
+        // Primitive receivers are ToObject-wrapped first; the wrapper's reserved
+        // tag is Boolean/Number/String (ES 20.1.3.6 steps 8-10).
+        .boolean => "Boolean",
+        .number => "Number",
+        .string => "String",
         else => "Object",
     };
     // ES 20.1.3.6 step 15: `Let tag be ? Get(O, @@toStringTag)` — an ordinary
@@ -2848,6 +2897,12 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         const fn_val = try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], builtinLength("String.prototype." ++ pair[0]));
         _ = try proto.defineOwnData(pair[0], fn_val, str_method_attr);
     }
+    // Annex B: String.prototype.trimLeft/trimRight are the very same function
+    // objects as trimStart/trimEnd (identity + shared "trimStart"/"trimEnd" name).
+    if (proto.getOwn("trimStart")) |ts|
+        _ = try proto.defineOwnData("trimLeft", ts, str_method_attr);
+    if (proto.getOwn("trimEnd")) |te|
+        _ = try proto.defineOwnData("trimRight", te, str_method_attr);
     // String.prototype is itself a String object with [[StringData]] = "".
     try proto.set("[[PrimitiveValue]]", try val_mod.makeString(arena, ""));
     _ = try proto.defineOwnData("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeStringValueOf, "valueOf", 0), str_method_attr);
@@ -3666,6 +3721,7 @@ pub const Realm = struct {
         try typed_array_mod.registerSymbols(arena);
         // Wire @@toStringTag onto WeakMap.prototype and WeakSet.prototype.
         try es2015_collections_mod.registerSymbols(arena);
+        try date_mod.registerSymbols(arena);
 
         // Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain
         // now that @@iterator / @@toStringTag exist. Array + TypedArray iterators
