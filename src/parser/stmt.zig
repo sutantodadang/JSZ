@@ -590,6 +590,7 @@ pub fn parseStatement(p: *Parser) ?*Node {
     // (a plain identifier); only treat it as a keyword when `function`
     // immediately follows on the same line.
     if (p.currentIsAsyncKw() and p.peekNext().kind == .kw_function and !p.peekNext().line_terminator_before) {
+        p.async_kw_start = p.current.start; // remember `async` position for the source span
         _ = p.advance(); // consume `async`
         return p.parseFunctionDecl(true);
     }
@@ -801,7 +802,11 @@ fn parseDestructuringDeclarator(p: *Parser, kind: ast.VarKind, start: u32) ?*Nod
 }
 
 pub fn parseFunctionDecl(p: *Parser, is_async: bool) ?*Node {
-    const start = p.current.start;
+    // For `async function`, the caller has already consumed `async` and recorded
+    // its start in `async_kw_start` so the source span (used by toString) begins
+    // at `async`. Otherwise the span begins at `function`.
+    const start = if (is_async and p.async_kw_start != 0) p.async_kw_start else p.current.start;
+    p.async_kw_start = 0;
     _ = p.advance(); // consume 'function'
     const is_generator = p.match(.star);
     const name_tok = p.expect(.identifier) orelse return null;
@@ -825,7 +830,7 @@ pub fn parseFunctionDecl(p: *Parser, is_async: bool) ?*Node {
             .is_generator = is_generator,
             .is_async = is_async,
             .is_strict = is_strict,
-            .source_text = p.sourceSlice(start, p.current.start),
+            .source_text = p.sourceSlice(start, p.prev_end),
         },
     });
 }

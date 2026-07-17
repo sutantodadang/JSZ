@@ -193,13 +193,15 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         if (p.match(.semicolon)) continue;
 
-        const member_start = p.current.start;
-
         var is_static = false;
         if (p.check(.identifier) and std.mem.eql(u8, p.current.value_str, "static") and !nextTokenEndsName(p)) {
             is_static = true;
             _ = p.advance();
         }
+        // Method [[SourceText]] excludes the `static` ClassElement prefix, so the
+        // source span begins at the first token after `static` (the `async`/`*`/
+        // `get`/`set` modifier or the method key itself).
+        const member_start = p.current.start;
 
         // ES2015/2017 `*`/`async` method modifiers (after optional `static`).
         // `async` is contextual: only a modifier when a method-key follows on
@@ -274,7 +276,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             return null;
         };
         p.in_generator_function = prev_gen;
-        const member_end = p.current.start;
+        const member_end = p.prev_end;
 
         if (!is_static and accessor == .none and computed_key == null and std.mem.eql(u8, name, "constructor")) {
             res.ctor_params = mparams.params;
@@ -759,7 +761,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
             .is_arrow = false,
             .is_strict = parser_file.hasUseStrict(ctor_body_effective),
             .requires_super = super_name != null,
-            .source_text = p.sourceSlice(start, p.current.start),
+            .source_text = p.sourceSlice(start, p.prev_end),
         },
     }) orelse return null;
     const ctor_decl = p.makeNode(.var_decl, start, p.current.start, .{

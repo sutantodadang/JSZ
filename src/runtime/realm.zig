@@ -1221,6 +1221,8 @@ pub var pending_new_target: Value = Value{};
 pub var active_regexp_proto: ?*JsObject = null;
 /// Phase 4d: thread-local for Function.prototype.
 pub var active_function_proto: ?*JsObject = null;
+/// The shared %ThrowTypeError% intrinsic (poison-pill for caller/arguments).
+pub var active_throw_type_error: ?Value = null;
 pub var active_promise_proto: ?*JsObject = null;
 /// %GeneratorFunction%: [[Prototype]] of generator function objects.
 pub var active_function_ctor: ?*JsObject = null;
@@ -1426,6 +1428,31 @@ fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
     else
         try JsObject.create(arena, active_object_proto);
     return val_mod.makeObject(arena, obj);
+}
+
+/// ToObject applied to a `this` value for OrdinaryCallBindThis in sloppy mode:
+/// objects/callables pass through, primitives box against their wrapper
+/// prototype (carrying [[PrimitiveValue]]). undefined/null are handled by the
+/// caller (they map to the global object), so they pass through unchanged here.
+pub fn toObjectForThis(arena: std.mem.Allocator, v: Value) !Value {
+    if (v.bits == 0) return v;
+    const proto: ?*JsObject = switch (v.unbox()) {
+        .number => active_number_proto,
+        .boolean => active_boolean_proto,
+        .string => active_string_proto orelse active_object_proto,
+        .symbol => active_symbol_proto orelse active_object_proto,
+        .bigint => active_bigint_proto orelse active_object_proto,
+        else => return v, // objects/callables/null/undefined: unchanged
+    };
+    if (proto) |p| {
+        const w = if (active_heap) |heap|
+            try JsObject.createOnHeap(heap, p)
+        else
+            try JsObject.create(arena, p);
+        try w.set("[[PrimitiveValue]]", v);
+        return val_mod.makeObject(arena, w);
+    }
+    return v;
 }
 
 fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -2643,19 +2670,44 @@ pub fn nativeAsyncFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const
 }
 
 // ---- Function.prototype.toString ----
+fn nativeSyntaxString(arena: std.mem.Allocator, name: []const u8) !Value {
+    // NativeFunction syntax: `function <name>() { [native code] }`. The name is
+    // only emitted when it is a valid identifier (no spaces), else omitted.
+    const emit_name = name.len > 0 and std.mem.indexOfScalar(u8, name, ' ') == null;
+    const s = if (emit_name)
+        try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{name})
+    else
+        try std.fmt.allocPrint(arena, "function () {{ [native code] }}", .{});
+    return val_mod.makeString(arena, s);
+}
+
 fn nativeFunctionToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    var name: []const u8 = "";
     if (this_val.bits != 0) {
         switch (this_val.unbox()) {
             .bc_function => |c| {
                 if (c.func.source_text) |src| return val_mod.makeString(arena, src);
-                name = c.func.name orelse "";
+                return nativeSyntaxString(arena, c.func.name orelse "");
+            },
+            .native_function => |e| {
+                return nativeSyntaxString(arena, e.name orelse "");
+            },
+            .function => return nativeSyntaxString(arena, ""),
+            .object => |o| {
+                // Bound function exotic and built-in function objects → NativeFunction.
+                if (o.internal_kind == .bound_function) return nativeSyntaxString(arena, "");
+                // Proxy exotic with a callable target: NativeFunction syntax.
+                if (o.internal_kind == .proxy) {
+                    if (proxy_mod.proxyTarget(o)) |t| {
+                        if (isCallableVal(t)) return nativeSyntaxString(arena, "");
+                    }
+                    return throwTypeError(arena, "Function.prototype.toString requires that 'this' be a Function");
+                }
+                if (o.get("__call__") != null) return nativeSyntaxString(arena, "");
             },
             else => {},
         }
     }
-    const s = try std.fmt.allocPrint(arena, "function {s}() {{ [native code] }}", .{name});
-    return val_mod.makeString(arena, s);
+    return throwTypeError(arena, "Function.prototype.toString requires that 'this' be a Function");
 }
 
 // ---- Cross-realm: $262.createRealm ----
@@ -3286,6 +3338,23 @@ pub const Realm = struct {
             try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionBind, "bind", 1), meth_attr);
         _ = try function_proto.defineOwnData("toString",
             try val_mod.makeNativeFunctionNamed(arena, nativeFunctionToString, "toString", 0), meth_attr);
+
+        // AddRestrictedFunctionProperties: "caller" and "arguments" are
+        // poison-pill accessors whose [[Get]] and [[Set]] are the shared
+        // %ThrowTypeError% intrinsic (enumerable:false, configurable:true).
+        const thrower = try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeThrowTypeError, "", 0);
+        active_throw_type_error = thrower;
+        const thrower_holder = try JsObject.create(arena, null);
+        try thrower_holder.set("get", thrower);
+        try thrower_holder.set("set", thrower);
+        _ = try function_proto.defineOwnAccessor("caller", try val_mod.makeObject(arena, thrower_holder), .{
+            .enumerable = false,
+            .configurable = true,
+        });
+        _ = try function_proto.defineOwnAccessor("arguments", try val_mod.makeObject(arena, thrower_holder), .{
+            .enumerable = false,
+            .configurable = true,
+        });
         active_function_proto = function_proto;
 
         // R1: shared registration context for self-registering builtins (each

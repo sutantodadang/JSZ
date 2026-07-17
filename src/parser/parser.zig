@@ -79,6 +79,15 @@ pub const Parser = struct {
     source: []const u8,
     /// Lookahead token (already lexed).
     current: Token,
+    /// End source offset of the most recently consumed token. Unlike
+    /// `current.start`, this excludes trailing trivia (comments/whitespace)
+    /// between the last real token and the next one — needed for precise
+    /// Function.prototype.toString source spans.
+    prev_end: u32 = 0,
+    /// Start offset of an `async` contextual keyword the caller consumed just
+    /// before delegating to parseFunctionDecl, so the function's source span
+    /// (Function.prototype.toString) begins at `async`. 0 when not applicable.
+    async_kw_start: u32 = 0,
     /// True if we hit an unrecoverable error.
     had_error: bool,
     error_info: ?ParseError,
@@ -229,6 +238,7 @@ pub const Parser = struct {
 
     pub fn advance(self: *Parser) Token {
         const prev = self.current;
+        self.prev_end = prev.end;
         self.current = self.lexNext();
         return prev;
     }

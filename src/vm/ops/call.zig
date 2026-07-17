@@ -154,8 +154,9 @@ pub inline fn opTailCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         frame.env = call_env;
         frame.return_dst = inherited_ret;
         frame.caller_idx = inherited_caller;
-        // Arrows use their captured lexical `this`, not the call-site value.
-        frame.this_val = if (fn_ptr.is_arrow) closure.captured_this else this_val;
+        // OrdinaryCallBindThis: arrows use captured lexical this; sloppy functions
+        // substitute the global for undefined/null and box a primitive receiver.
+        frame.this_val = try self.bindThisValue(fn_ptr, closure, this_val);
         frame.try_stack = .empty;
     } else {
         // Fallback: native/bound/object callee. Do a normal call,
@@ -303,8 +304,9 @@ pub inline fn opTailMethodCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         frame.env = call_env;
         frame.return_dst = inherited_ret;
         frame.caller_idx = inherited_caller;
-        // Arrows use their captured lexical `this`, not the receiver.
-        frame.this_val = if (fn_ptr.is_arrow) closure.captured_this else this_val;
+        // OrdinaryCallBindThis: arrows use captured lexical this; sloppy functions
+        // substitute the global for undefined/null and box a primitive receiver.
+        frame.this_val = try self.bindThisValue(fn_ptr, closure, this_val);
         frame.try_stack = .empty;
     } else {
         // Fallback: native/bound/getter/generator/async callee. Do a

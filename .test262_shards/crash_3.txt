@@ -1,0 +1,1 @@
+FAIL built-ins/Number/prototype/toFixed/S15.7.4.5_A1.3_T01.js
