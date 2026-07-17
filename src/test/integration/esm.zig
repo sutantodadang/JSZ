@@ -422,3 +422,148 @@ test "esm: module var is accessible inside module but not on globalThis" {
     }
 }
 
+// ---- Native ESM end-to-end: real multi-file graphs resolved from disk ------
+//
+// These drive the full host path a real `import`/`export` program takes:
+//   buildBundle() reads every reachable module file off disk and emits the
+//   `__modules__` factory registry, then evalModule() compiles + runs it through
+//   the bytecode VM. The entry module asserts and `throw`s on any mismatch, so a
+//   `.ok` outcome means the whole graph linked and evaluated correctly.
+
+const ModuleFile = struct { name: []const u8, source: []const u8 };
+
+/// Write `files` into a fresh temp directory, bundle `entry` from disk, run the
+/// bundle as ES-module code, and assert it completes normally (the entry module
+/// `throw`s on any mismatch, so `.ok` means the whole graph linked + evaluated).
+fn expectGraphOk(files: []const ModuleFile, entry: []const u8) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var entry_src: []const u8 = "";
+    for (files) |f| {
+        try tmp.dir.writeFile(.{ .sub_path = f.name, .data = f.source });
+        if (std.mem.eql(u8, f.name, entry)) entry_src = f.source;
+    }
+
+    const base_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base_dir);
+
+    const bundle = try root.module_loader.buildBundle(std.testing.allocator, base_dir, entry, entry_src);
+    defer std.testing.allocator.free(bundle);
+
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    switch (ctx.evalModule(bundle, "<esm-graph>")) {
+        .ok => {},
+        .exception => |e| {
+            std.debug.print("esm graph exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        .parse_error => |e| {
+            std.debug.print("esm graph parse error: {s}\n", .{e.message});
+            return error.ParseFailed;
+        },
+    }
+}
+
+test "esm e2e: named + default + namespace import across files" {
+    try expectGraphOk(&.{
+        .{ .name = "lib.js", .source =
+        \\export const x = 5;
+        \\export function add(a, b) { return a + b; }
+        \\export default 42;
+        },
+        .{ .name = "entry.js", .source =
+        \\import def, { x, add } from './lib.js';
+        \\import * as ns from './lib.js';
+        \\if (def !== 42) throw new Error('default=' + def);
+        \\if (x !== 5) throw new Error('x=' + x);
+        \\if (add(1, 2) !== 3) throw new Error('add=' + add(1, 2));
+        \\if (ns.x !== 5 || ns.default !== 42) throw new Error('namespace wrong');
+        },
+    }, "entry.js");
+}
+
+test "esm e2e: re-export (named + star) forwards bindings" {
+    try expectGraphOk(&.{
+        .{ .name = "base.js", .source =
+        \\export const a = 1;
+        \\export const b = 2;
+        },
+        .{ .name = "mid.js", .source =
+        \\export { a as renamedA } from './base.js';
+        \\export * from './base.js';
+        },
+        .{ .name = "entry.js", .source =
+        \\import { renamedA, a, b } from './mid.js';
+        \\if (renamedA !== 1) throw new Error('renamedA=' + renamedA);
+        \\if (a !== 1 || b !== 2) throw new Error('star re-export wrong: ' + a + ',' + b);
+        },
+    }, "entry.js");
+}
+
+test "esm e2e: export let is a live binding across module boundary" {
+    // Regression: `counter++` inside the exporting module must be observed at
+    // the import site (the update-expression write-back on `exports.counter`).
+    try expectGraphOk(&.{
+        .{ .name = "counter.js", .source =
+        \\export let counter = 0;
+        \\export function bump() { counter++; }
+        },
+        .{ .name = "entry.js", .source =
+        \\import { counter, bump } from './counter.js';
+        \\import * as ns from './counter.js';
+        \\if (counter !== 0) throw new Error('initial=' + counter);
+        \\bump(); bump(); bump();
+        \\if (counter !== 3) throw new Error('named live binding=' + counter);
+        \\if (ns.counter !== 3) throw new Error('namespace live binding=' + ns.counter);
+        },
+    }, "entry.js");
+}
+
+test "esm e2e: module body evaluates exactly once (shared singleton)" {
+    try expectGraphOk(&.{
+        .{ .name = "once.js", .source =
+        \\globalThis.__evalCount = (globalThis.__evalCount || 0) + 1;
+        \\export const tag = 'M';
+        },
+        .{ .name = "a.js", .source =
+        \\import { tag } from './once.js';
+        \\export const fromA = tag;
+        },
+        .{ .name = "entry.js", .source =
+        \\import './a.js';
+        \\import { tag } from './once.js';
+        \\import { fromA } from './a.js';
+        \\if (globalThis.__evalCount !== 1) throw new Error('evaluated ' + globalThis.__evalCount + ' times');
+        \\if (tag !== 'M' || fromA !== 'M') throw new Error('shared state wrong');
+        },
+    }, "entry.js");
+}
+
+test "esm e2e: circular import terminates with partial bindings" {
+    // a imports b; b imports a. Cyclic evaluation must not deadlock: b sees a's
+    // function export (hoisted/callable) even though a hasn't finished.
+    try expectGraphOk(&.{
+        .{ .name = "a.js", .source =
+        \\import { bVal } from './b.js';
+        \\export function aFn() { return 10; }
+        \\export const fromB = bVal;
+        },
+        .{ .name = "b.js", .source =
+        \\import { aFn } from './a.js';
+        \\export const bVal = 5;
+        \\export const aResult = aFn();
+        },
+        .{ .name = "entry.js", .source =
+        \\import { fromB, aFn } from './a.js';
+        \\import { aResult } from './b.js';
+        \\if (fromB !== 5) throw new Error('fromB=' + fromB);
+        \\if (aResult !== 10) throw new Error('aResult=' + aResult);
+        \\if (aFn() !== 10) throw new Error('aFn=' + aFn());
+        },
+    }, "entry.js");
+}
+
