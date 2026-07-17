@@ -42,7 +42,36 @@ pub fn nativeSymbolToString(arena: std.mem.Allocator, this_val: Value, _: []cons
         const s = try std.fmt.allocPrint(arena, "Symbol({s})", .{sd.description orelse ""});
         return val_mod.makeString(arena, s);
     }
-    return val_mod.makeString(arena, "Symbol()");
+    return @import("../realm.zig").throwTypeError(arena, "Symbol.prototype.toString requires that 'this' be a Symbol");
+}
+
+/// thisSymbolValue as a Value (the symbol primitive), or null if `this` is
+/// neither a Symbol nor a Symbol wrapper object.
+fn thisSymbolValueVal(v: Value) ?Value {
+    if (v.bits == 0) return null;
+    return switch (v.unbox()) {
+        .symbol => v,
+        .object => |o| blk: {
+            if (o.get("[[PrimitiveValue]]")) |pv| {
+                if (pv.bits != 0 and pv.unbox() == .symbol) break :blk pv;
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+/// Symbol.prototype.valueOf (§20.4.3.4): return thisSymbolValue(this).
+pub fn nativeSymbolValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (thisSymbolValueVal(this_val)) |sv| return sv;
+    return @import("../realm.zig").throwTypeError(arena, "Symbol.prototype.valueOf requires that 'this' be a Symbol");
+}
+
+/// Symbol.prototype[@@toPrimitive] (§20.4.3.5): return thisSymbolValue(this),
+/// ignoring the hint.
+pub fn nativeSymbolToPrimitive(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (thisSymbolValueVal(this_val)) |sv| return sv;
+    return @import("../realm.zig").throwTypeError(arena, "Symbol.prototype[Symbol.toPrimitive] requires that 'this' be a Symbol");
 }
 
 /// get Symbol.prototype.description — returns the symbol's description string,
