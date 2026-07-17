@@ -74,6 +74,18 @@ pub fn proxyOwnKeys(arena: std.mem.Allocator, proxy_obj: *JsObject) anyerror!?[]
     return try list.toOwnedSlice(arena);
 }
 
+/// [[DefineOwnProperty]] for a proxy: dispatch the `defineProperty` trap with
+/// (target, key, descriptorObject). Returns the ToBoolean trap result, or null
+/// when no trap exists (caller forwards to the target).
+pub fn proxyDefineProperty(arena: std.mem.Allocator, proxy_obj: *JsObject, key: Value, desc_obj: Value) anyerror!?bool {
+    const handler = proxyHandler(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const target = proxyTarget(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const trap_fn = trap(handler, "defineProperty") orelse return null;
+    const res = try function_proto.invokeCallback(arena, handler, trap_fn, &[_]Value{ target, key, desc_obj });
+    return val_mod.toBoolean(res);
+}
+
+/// [[HasProperty]] convenience for callers that already hold the proxy object.
 /// Invoke the proxy's `getOwnPropertyDescriptor` trap if present. Returns the
 /// trap result (descriptor object or undefined), or null when no trap exists
 /// (caller should forward to the target).
