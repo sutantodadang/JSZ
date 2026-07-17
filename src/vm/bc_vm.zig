@@ -1265,6 +1265,7 @@ pub const BcVm = struct {
                 .MOD => if (try arith_ops.opMod(self, frame)) |o| return o,
                 .EXP => if (try arith_ops.opExp(self, frame)) |o| return o,
                 .NEG => if (try arith_ops.opNeg(self, frame)) |o| return o,
+                .TO_NUMBER => if (try arith_ops.opToNumber(self, frame)) |o| return o,
                 .BIT_AND => if (try arith_ops.opBitAnd(self, frame)) |o| return o,
                 .BIT_OR => if (try arith_ops.opBitOr(self, frame)) |o| return o,
                 .BIT_XOR => if (try arith_ops.opBitXor(self, frame)) |o| return o,
@@ -4009,6 +4010,19 @@ pub const BcVm = struct {
         return toNumber(p);
     }
 
+    /// ES ToNumber as a Value, throwing on the types that have no Number
+    /// conversion. Unary `+` uses this (spec ToNumber, not ToNumeric), so `+1n`
+    /// throws instead of round-tripping the BigInt. An object is ToPrimitive'd
+    /// first, so `+{valueOf(){return 1n}}` throws too.
+    pub fn toNumberValueChecked(self: *BcVm, v: Value) !Value {
+        const p = (try self.coerceToPrimitive(v, .number)) orelse v;
+        if (isBigOperand(p))
+            return self.throwTypeErr("Cannot convert a BigInt value to a number");
+        if (isSymbol(p))
+            return self.throwTypeErr("Cannot convert a Symbol value to a number");
+        return val_mod.makeNumber(self.arena, toNumber(p));
+    }
+
     /// ToPrimitive(number) for relational comparison; returns `v` unchanged
     /// when no user hook applies.
     pub fn coerceForRelational(self: *BcVm, v: Value) !Value {
@@ -4385,20 +4399,7 @@ pub fn jsInstanceofWithTarget(lhs: Value, target_proto: ?*JsObject) bool {
 }
 
 pub fn isTruthy(v: Value) bool {
-    if (v.bits == 0) return false;
-    return switch (v.unbox()) {
-        .undefined_ => false,
-        .null_ => false,
-        .boolean => |b| b,
-        .number => |n| n != 0.0 and !std.math.isNan(n),
-        .string => |s| s.len > 0,
-        .function => true,
-        .bc_function => true,
-        .object => true,
-        .native_function => true,
-        .symbol => true,
-        .bigint => |b| !b.toConst().eqlZero(),
-    };
+    return val_mod.toBoolean(v);
 }
 
 fn isString(v: Value) bool {
@@ -4516,7 +4517,9 @@ fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
         },
         .native_function => "function () { [native code] }",
         .symbol => |sd| try std.fmt.allocPrint(arena, "Symbol({s})", .{sd.description orelse ""}),
-        .bigint => |b| try std.fmt.allocPrint(arena, "{s}n", .{try val_mod.bigIntToString(arena, b)}),
+        // ES BigInt::toString has no `n` suffix — that is console-inspect syntax
+        // only (see console.zig), so `1n + "x"` is "1x" and String(1n) is "1".
+        .bigint => |b| try val_mod.bigIntToString(arena, b),
     };
 }
 
