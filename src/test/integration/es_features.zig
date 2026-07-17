@@ -209,6 +209,28 @@ test "source map: emits functions, mappings, and line info" {
 }
 
 
+test "es2016: exponentiation assignment on locals" {
+    try std.testing.expectEqual(@as(f64, 9), try dualF64(std.testing.allocator, "let x = 3; x **= 2; x"));
+    // `**=` evaluates to the assigned value.
+    try std.testing.expectEqual(@as(f64, 8), try dualF64(std.testing.allocator, "let x = 2; (x **= 3)"));
+    // RHS is a full expression, and `**` is right-associative: 2 ** (3 ** 2) == 512.
+    try std.testing.expectEqual(@as(f64, 512), try dualF64(std.testing.allocator, "let x = 2; x **= 3 ** 2; x"));
+    try std.testing.expectEqual(@as(f64, 0.25), try dualF64(std.testing.allocator, "let x = 2; x **= -2; x"));
+    try std.testing.expectEqual(@as(f64, 1), try dualF64(std.testing.allocator, "let x = 5; x **= 0; x"));
+}
+
+
+test "es2016: exponentiation assignment on properties and elements" {
+    try std.testing.expectEqual(@as(f64, 1024), try dualF64(std.testing.allocator, "let o = {p: 2}; o.p **= 10; o.p"));
+    try std.testing.expectEqual(@as(f64, 27), try dualF64(std.testing.allocator, "let a = [2, 3]; a[1] **= 3; a[1]"));
+    // Nested member targets resolve through the whole chain.
+    try std.testing.expectEqual(@as(f64, 81), try dualF64(std.testing.allocator, "let o = {a: {b: 3}}; o.a.b **= 4; o.a.b"));
+    // Setters observe the exponentiated value, and the getter feeds the LHS.
+    const src = "let hits = 0; let o = { _v: 2, get p(){ return this._v; }, set p(x){ hits++; this._v = x; } }; o.p **= 5; o._v * 10 + hits";
+    try std.testing.expectEqual(@as(f64, 321), try dualF64(std.testing.allocator, src));
+}
+
+
 test "es2020: nullish coalescing basic" {
     try std.testing.expectEqual(@as(f64, 5), try dualF64(std.testing.allocator, "null ?? 5"));
     try std.testing.expectEqual(@as(f64, 7), try dualF64(std.testing.allocator, "undefined ?? 7"));
