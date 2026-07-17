@@ -47,10 +47,25 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
 
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) {
+    const input = if (args.len > 0) args[0] else Value{};
+    if (input.bits == 0 or input.unbox() == .undefined_ or input.unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
+    // Primitive string: ToObject exposes each index as an enumerable own key.
+    if (input.unbox() == .string) {
+        const s = input.unbox().string;
+        var si: u32 = 0;
+        while (si < s.len) : (si += 1) {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{si});
+            try arr.set(idx_key, try val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}", .{si})));
+        }
+        arr.array_length = si;
         return val_mod.makeObject(arena, arr);
     }
-    const obj = args[0].toPtr().object;
+    // Functions resolve to their backing object; other primitives → no own keys.
+    const obj = (try resolveObject(arena, input)) orelse {
+        arr.array_length = 0;
+        return val_mod.makeObject(arena, arr);
+    };
 
     // M16: Module Namespace — enumerable own string keys are the exported names,
     // sorted by code unit. [[GetOwnProperty]] is called for each key (per
@@ -116,18 +131,60 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
 }
 
 /// Object.values(o): returns array of own enumerable property values.
+/// EnumerableOwnPropertyNames [[Get]] (ES §7.3.23): return a property's value,
+/// running an own accessor's getter with `receiver` as `this`. `getOwn` alone
+/// skips accessors, so Object.values/entries would drop getter-backed keys.
+fn enumGetValue(arena: std.mem.Allocator, receiver: Value, obj: *JsObject, key: []const u8) anyerror!Value {
+    if (obj.ownAccessorHolder(key)) |holder| {
+        if (holder.bits != 0 and holder.unbox() == .object) {
+            const getter = holder.toPtr().object.get("get") orelse return val_mod.makeUndefined(arena);
+            if (getter.bits == 0 or getter.unbox() == .undefined_) return val_mod.makeUndefined(arena);
+            return @import("function_proto.zig").invokeCallback(arena, receiver, getter, &[_]Value{});
+        }
+    }
+    return obj.getOwn(key) orelse val_mod.makeUndefined(arena);
+}
+
+/// Snapshot an object's own STRING keys into an owned list. The list must be
+/// captured before iteration so getters that add/delete keys mid-loop don't
+/// change what is visited (ES §7.3.23 collects the key list up front). Key
+/// strings live in the shape arena and outlive shape transitions.
+fn snapshotOwnKeys(arena: std.mem.Allocator, obj: *JsObject) !std.ArrayListUnmanaged([]const u8) {
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (obj.ownKeys()) |k| try keys.append(arena, k);
+    return keys;
+}
+
 pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
 
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) {
+    const input = if (args.len > 0) args[0] else Value{};
+    // ToObject(O): undefined/null (and a missing argument) throw.
+    if (input.bits == 0 or input.unbox() == .undefined_ or input.unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
+
+    var i: u32 = 0;
+    // Primitive string: ToObject exposes each index (this engine indexes strings
+    // by byte, matching charAt) as an enumerable own property.
+    if (input.unbox() == .string) {
+        const s = input.unbox().string;
+        while (i < s.len) : (i += 1) {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            try arr.set(idx_key, try val_mod.makeString(arena, s[i .. i + 1]));
+        }
+        arr.array_length = i;
         return val_mod.makeObject(arena, arr);
     }
-    const obj = args[0].toPtr().object;
+    // Functions are objects: enumerate their backing object's own props. Other
+    // primitives box to a wrapper with no enumerable own properties → [].
+    const obj = (try resolveObject(arena, input)) orelse {
+        arr.array_length = 0;
+        return val_mod.makeObject(arena, arr);
+    };
 
     // M15: TypedArray integer-indexed element values come first (all enumerable).
-    var i: u32 = 0;
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
         const ta_mod = @import("typed_array.zig");
         const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
@@ -141,9 +198,11 @@ pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Valu
             }
         }
     }
-    for (obj.ownKeys()) |k| {
-        if (!obj.isEnumerable(k)) continue;
-        const v = obj.getOwn(k) orelse continue;
+    var keys = try snapshotOwnKeys(arena, obj);
+    defer keys.deinit(arena);
+    for (keys.items) |k| {
+        if (!obj.isEnumerable(k)) continue; // re-checked live: a getter may have flipped it
+        const v = try enumGetValue(arena, input, obj, k);
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
         try arr.set(idx_key, v);
         i += 1;
@@ -207,11 +266,30 @@ pub fn nativeObjectEntries(arena: std.mem.Allocator, _: Value, args: []const Val
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
 
-    if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, arr);
-    if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
-    const obj = args[0].toPtr().object;
+    const input = if (args.len > 0) args[0] else Value{};
+    if (input.bits == 0 or input.unbox() == .undefined_ or input.unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
 
     var i: u32 = 0;
+    // Primitive string: [index, char] pairs for each byte index.
+    if (input.unbox() == .string) {
+        const s = input.unbox().string;
+        while (i < s.len) : (i += 1) {
+            const pair = try JsObject.createArray(arena, arr_proto);
+            try pair.set("0", try val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}", .{i})));
+            try pair.set("1", try val_mod.makeString(arena, s[i .. i + 1]));
+            pair.array_length = 2;
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            try arr.set(idx_key, try val_mod.makeObject(arena, pair));
+        }
+        arr.array_length = i;
+        return val_mod.makeObject(arena, arr);
+    }
+    const obj = (try resolveObject(arena, input)) orelse {
+        arr.array_length = 0;
+        return val_mod.makeObject(arena, arr);
+    };
+
     // M15: TypedArray integer-indexed [index, value] pairs come first.
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
         const ta_mod = @import("typed_array.zig");
@@ -230,12 +308,13 @@ pub fn nativeObjectEntries(arena: std.mem.Allocator, _: Value, args: []const Val
             }
         }
     }
-    for (obj.ownKeys()) |k| {
+    var keys = try snapshotOwnKeys(arena, obj);
+    defer keys.deinit(arena);
+    for (keys.items) |k| {
         if (!obj.isEnumerable(k)) continue;
-        const v = obj.getOwn(k) orelse continue;
+        const v = try enumGetValue(arena, input, obj, k);
         const pair = try JsObject.createArray(arena, arr_proto);
-        const key_val = try val_mod.makeString(arena, k);
-        try pair.set("0", key_val);
+        try pair.set("0", try val_mod.makeString(arena, k));
         try pair.set("1", v);
         pair.array_length = 2;
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
@@ -420,6 +499,39 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
 
 /// Object.prototype.propertyIsEnumerable(V): true iff V is an OWN, enumerable
 /// property of ToObject(this). Missing / inherited → false.
+/// Resolve a Value to its backing JsObject, or null for primitives. Ordinary
+/// objects return themselves; user closures / class ctors resolve to their
+/// lazily-created backing object (so `fn.isPrototypeOf(...)` walks the right
+/// object identity).
+fn resolveObject(arena: std.mem.Allocator, v: Value) anyerror!?*JsObject {
+    if (v.bits == 0) return null;
+    return switch (v.unbox()) {
+        .object => v.toPtr().object,
+        .bc_function, .function => if (@import("../realm.zig").active_context) |ctx|
+            (try ctx.backingObject(arena, v))
+        else
+            null,
+        else => null,
+    };
+}
+
+/// Object.prototype.isPrototypeOf(V) — ES §20.1.3.3. RequireObjectCoercible(this);
+/// if V is not an object return false; otherwise return true iff O (ToObject(this))
+/// appears anywhere in V's [[Prototype]] chain.
+pub fn nativeObjectIsPrototypeOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() == .undefined_ or this_val.unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
+    const O = (try resolveObject(arena, this_val)) orelse return val_mod.makeBool(arena, false);
+    const v = if (args.len > 0) args[0] else Value{};
+    const v_obj = (try resolveObject(arena, v)) orelse return val_mod.makeBool(arena, false);
+    var cur: ?*JsObject = v_obj.proto;
+    while (cur) |c| {
+        if (c == O) return val_mod.makeBool(arena, true);
+        cur = c.proto;
+    }
+    return val_mod.makeBool(arena, false);
+}
+
 pub fn nativePropertyIsEnumerable(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         return val_mod.makeBool(arena, false);
@@ -501,6 +613,51 @@ fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     return error.JsException;
 }
 
+fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    const realm_mod = @import("../realm.zig");
+    const proto = realm_mod.error_proto_RangeError;
+    const obj = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, proto)
+    else
+        try JsObject.create(arena, proto);
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "RangeError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
+}
+
+/// ToNumber for an array-length descriptor value (ArraySetLength). Primitives
+/// convert directly; objects go through ToPrimitive(number) (running valueOf).
+fn toNumberForLength(arena: std.mem.Allocator, v: Value) anyerror!f64 {
+    var pv = v;
+    if (pv.bits != 0 and pv.unbox() == .object) {
+        pv = (try @import("coercion.zig").toPrimitive(arena, pv, .number)) orelse pv;
+    }
+    if (pv.bits == 0) return std.math.nan(f64);
+    return switch (pv.unbox()) {
+        .undefined_ => std.math.nan(f64),
+        .null_ => 0,
+        .boolean => |b| if (b) 1 else 0,
+        .number => |n| n,
+        .string => |s| blk: {
+            const t = std.mem.trim(u8, s, " \t\r\n");
+            if (t.len == 0) break :blk 0; // ToNumber("") is 0
+            break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
+        },
+        else => std.math.nan(f64),
+    };
+}
+
+/// ToUint32 (ES §7.1.6): NaN/±Inf/±0 → 0; otherwise truncate toward zero and
+/// reduce modulo 2^32.
+fn toUint32(n: f64) u32 {
+    if (std.math.isNan(n) or std.math.isInf(n) or n == 0) return 0;
+    const t = @trunc(n);
+    const m = @mod(t, 4294967296.0);
+    const pos = if (m < 0) m + 4294967296.0 else m;
+    return @intFromFloat(pos);
+}
+
 fn throwReferenceErrorObj(arena: std.mem.Allocator, name: []const u8) anyerror {
     const realm_mod = @import("../realm.zig");
     realm_mod.pending_exception = try makeReferenceErrorObj(arena, name);
@@ -512,9 +669,36 @@ fn coerceKey(arena: std.mem.Allocator, v: Value) !?[]const u8 {
     if (v.bits == 0) return null;
     return switch (v.unbox()) {
         .string => |s| s,
-        .number => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
+        // ToString(number) per spec: -0 → "0", integers without a decimal point,
+        // etc. Plain "{d}" would yield "-0" and break numeric-key lookups.
+        .number => |n| try val_mod.formatNumber(arena, n),
         else => null,
     };
+}
+
+/// HasProperty on a descriptor object (ToPropertyDescriptor uses HasProperty, so
+/// an inherited field counts): own or inherited, data or accessor.
+fn descHas(dobj: *JsObject, key: []const u8) bool {
+    return dobj.findProperty(key) != null;
+}
+
+/// [[Get]] a descriptor field: walk the prototype chain and, for an accessor,
+/// invoke its getter with `receiver` as `this`. ToPropertyDescriptor reads each
+/// field via Get, so descriptor objects with inherited or getter-backed fields
+/// (and their observable side effects) are honored.
+fn descGet(arena: std.mem.Allocator, receiver: Value, dobj: *JsObject, key: []const u8) anyerror!Value {
+    const loc = dobj.findProperty(key) orelse return val_mod.makeUndefined(arena);
+    if (loc.holder.attrAt(loc.slot).is_accessor) {
+        if (loc.holder.ownAccessorHolder(key)) |holder| {
+            if (holder.bits != 0 and holder.unbox() == .object) {
+                const getter = holder.toPtr().object.get("get") orelse return val_mod.makeUndefined(arena);
+                if (getter.bits == 0 or getter.unbox() == .undefined_) return val_mod.makeUndefined(arena);
+                return @import("function_proto.zig").invokeCallback(arena, receiver, getter, &[_]Value{});
+            }
+        }
+        return val_mod.makeUndefined(arena);
+    }
+    return loc.holder.getOwn(key) orelse val_mod.makeUndefined(arena);
 }
 
 /// Primitive ToNumber for TypedArray element coercion (no valueOf/toString calls).
@@ -542,9 +726,23 @@ fn makeAccessorHolder(arena: std.mem.Allocator, getter: ?Value, setter: ?Value) 
     return val_mod.makeObject(arena, holder);
 }
 
-/// Object.getPrototypeOf(o): return proto of o, or null for primitives.
+/// Object.getPrototypeOf(o): ES2015 §19.1.2.12 — ToObject(o) then [[GetPrototypeOf]].
+/// undefined/null (and a missing argument) throw a TypeError; primitives box to
+/// their wrapper's prototype; objects return their [[Prototype]] (or null).
 pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0) return val_mod.makeNull(arena);
+    const realm = @import("../realm.zig");
+    if (args.len == 0 or args[0].bits == 0)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
+    // ToObject on a primitive yields its wrapper, whose [[Prototype]] is the
+    // corresponding %Wrapper.prototype% intrinsic.
+    switch (args[0].unbox()) {
+        .undefined_, .null_ => return throwTypeError(arena, "Cannot convert undefined or null to object"),
+        .number => if (realm.active_number_proto) |p| return val_mod.makeObject(arena, p),
+        .boolean => if (realm.active_boolean_proto) |p| return val_mod.makeObject(arena, p),
+        .string => if (realm.active_string_proto) |p| return val_mod.makeObject(arena, p),
+        .bigint => if (realm.active_bigint_proto) |p| return val_mod.makeObject(arena, p),
+        else => {},
+    }
     // A built-in (native) function's [[Prototype]] is %Function.prototype% (ES
     // §20.2.3). The property-get path already walks Function.prototype for these
     // values; mirror that here so `Object.getPrototypeOf(fn)` is consistent (and
@@ -587,49 +785,65 @@ pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
 /// objects and bc_function ctors (sets the backing object's proto, so static
 /// members inherit along the constructor chain — needed for class subclassing).
 pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0) return val_mod.makeUndefined(arena);
-    const target = args[0];
-    const new_proto: ?*JsObject = blk: {
-        if (args.len < 2 or args[1].bits == 0) break :blk null;
-        break :blk switch (args[1].unbox()) {
-            .object => |o| o,
-            .null_ => null,
-            // A class used as a proto (`class B extends A` → setPrototypeOf(B, A))
-            // is a bc_function value; its static members live on a lazily-created
-            // backing object. Resolve to that so the constructor static chain links
-            // (needed for multi-level subclasses: @@species etc. inherit through it).
-            .bc_function, .function => if (@import("../realm.zig").active_context) |ctx|
-                (try ctx.backingObject(arena, args[1]))
-            else
-                null,
-            else => null,
-        };
+    const target = if (args.len > 0) args[0] else Value{};
+    // 1. RequireObjectCoercible(O): undefined/null (or missing) throw.
+    if (target.bits == 0 or target.unbox() == .undefined_ or target.unbox() == .null_)
+        return throwTypeError(arena, "Object.setPrototypeOf called on null or undefined");
+    // 2. proto must be an Object or null; anything else (undefined, number, …) throws.
+    const proto_arg = if (args.len > 1) args[1] else Value{};
+    if (proto_arg.bits == 0 or proto_arg.unbox() == .undefined_)
+        return throwTypeError(arena, "Object prototype may only be an Object or null");
+    const new_proto: ?*JsObject = switch (proto_arg.unbox()) {
+        .object => proto_arg.toPtr().object,
+        .null_ => null,
+        // A class used as a proto (`class B extends A` → setPrototypeOf(B, A))
+        // is a bc_function value; its static members live on a lazily-created
+        // backing object. Resolve to that so the constructor static chain links
+        // (needed for multi-level subclasses: @@species etc. inherit through it).
+        .bc_function, .function => if (@import("../realm.zig").active_context) |ctx|
+            (try ctx.backingObject(arena, proto_arg))
+        else
+            null,
+        else => return throwTypeError(arena, "Object prototype may only be an Object or null"),
     };
-    // M16: Module Namespace [[SetPrototypeOf]] is SetImmutablePrototype — only a
-    // no-op to null succeeds; any other target throws (Object.setPrototypeOf).
-    if (target.bits != 0 and target.unbox() == .object and
-        target.toPtr().object.internal_kind == .module_namespace)
-    {
-        if (new_proto == null) return target;
-        return throwTypeError(arena, "cannot set prototype of a module namespace object");
-    }
-    if (target.bits != 0) {
-        if (target.unbox() == .object) {
-            const tobj = target.toPtr().object;
-            if (tobj.internal_kind == .proxy) {
-                const proto_val = if (new_proto) |p| try val_mod.makeObject(arena, p) else try val_mod.makeNull(arena);
-                if (try proxy_mod.proxySetPrototypeOf(arena, tobj, proto_val)) |ok| {
-                    if (!ok) return throwTypeError(arena, "proxy setPrototypeOf returned false");
-                    return target;
-                }
-                // No trap: forward to the target.
-                if (proxy_mod.proxyTarget(tobj)) |t| return nativeObjectSetPrototypeOf(arena, Value{}, &[_]Value{ t, if (new_proto) |p| try val_mod.makeObject(arena, p) else try val_mod.makeNull(arena) });
-            }
-            target.toPtr().object.proto = new_proto;
-            target.toPtr().object.setProtoBarrier(new_proto);
-        } else if (@import("../realm.zig").active_context) |ctx| {
-            try ctx.setProto(arena, target, new_proto); // bc_function ctor (static inheritance)
+    // 3. If Type(O) is not Object, return O (primitive targets are a no-op).
+    if (target.unbox() == .object) {
+        const obj = target.toPtr().object;
+        // M16: Module Namespace [[SetPrototypeOf]] is SetImmutablePrototype — only a
+        // no-op to null succeeds; any other target throws.
+        if (obj.internal_kind == .module_namespace) {
+            if (new_proto == null) return target;
+            return throwTypeError(arena, "cannot set prototype of a module namespace object");
         }
+        // Proxy [[SetPrototypeOf]] trap dispatch.
+        if (obj.internal_kind == .proxy) {
+            const proto_val = if (new_proto) |p| try val_mod.makeObject(arena, p) else try val_mod.makeNull(arena);
+            if (try proxy_mod.proxySetPrototypeOf(arena, obj, proto_val)) |ok| {
+                if (!ok) return throwTypeError(arena, "proxy setPrototypeOf returned false");
+                return target;
+            }
+            // No trap: forward to the target.
+            if (proxy_mod.proxyTarget(obj)) |t| return nativeObjectSetPrototypeOf(arena, Value{}, &.{ t, proto_val });
+        }
+        // OrdinarySetPrototypeOf (ES §10.1.2): a no-op to the same proto always
+        // succeeds; otherwise a non-extensible object, or a change that would
+        // create a prototype cycle, fails and Object.setPrototypeOf throws.
+        if (obj.proto != new_proto) {
+            if (!obj.extensible)
+                return throwTypeError(arena, "#<Object> is not extensible");
+            var p: ?*JsObject = new_proto;
+            while (p) |cur| {
+                if (cur == obj) return throwTypeError(arena, "Cyclic __proto__ value");
+                // A Proxy in the chain has an exotic [[GetPrototypeOf]]; stop the
+                // static cycle walk here (spec: done becomes true).
+                if (cur.internal_kind == .proxy) break;
+                p = cur.proto;
+            }
+            obj.proto = new_proto;
+            obj.setProtoBarrier(new_proto);
+        }
+    } else if (@import("../realm.zig").active_context) |ctx| {
+        try ctx.setProto(arena, target, new_proto); // bc_function ctor (static inheritance)
     }
     return target;
 }
@@ -681,7 +895,21 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
 
-    if (args.len == 0 or args[0].bits == 0) return val_mod.makeObject(arena, arr);
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() == .undefined_ or args[0].unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
+    // Primitive string: own keys are each index "0".."n-1" then "length".
+    if (args[0].unbox() == .string) {
+        const s = args[0].unbox().string;
+        var si: u32 = 0;
+        while (si < s.len) : (si += 1) {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{si});
+            try arr.set(idx_key, try val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}", .{si})));
+        }
+        const len_key = try std.fmt.allocPrint(arena, "{d}", .{si});
+        try arr.set(len_key, try val_mod.makeString(arena, "length"));
+        arr.array_length = si + 1;
+        return val_mod.makeObject(arena, arr);
+    }
     // native_function: own string keys are "length" and "name" unless deleted (spec §10.3).
     if (args[0].unbox() == .native_function) {
         const entry = args[0].unbox().native_function;
@@ -699,8 +927,7 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
         arr.array_length = idx;
         return val_mod.makeObject(arena, arr);
     }
-    if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
-    const obj = args[0].toPtr().object;
+    const obj = (try resolveObject(arena, args[0])) orelse return val_mod.makeObject(arena, arr);
 
     // M16: Module Namespace [[OwnPropertyKeys]] — exported names sorted by code
     // unit (symbol keys are excluded from getOwnPropertyNames).
@@ -789,7 +1016,9 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
 /// Object.getOwnPropertyDescriptor(o, key): descriptor object or undefined.
 pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
-    if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
+    // ToObject(O): undefined/null (and a missing argument) throw a TypeError.
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() == .undefined_ or args[0].unbox() == .null_)
+        return throwTypeError(arena, "Cannot convert undefined or null to object");
     const arg0_unboxed = args[0].unbox();
     // Handle native_function: synthesize descriptors for .name/.length (respecting deletion).
     if (arg0_unboxed == .native_function) {
@@ -982,10 +1211,10 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
 
     // Symbol-keyed [[DefineOwnProperty]]: ordinary, never integer-indexed.
     if (key_raw.bits != 0 and key_raw.unbox() == .symbol) {
-        if (args.len < 3 or args[2].bits == 0 or args[2].unbox() != .object)
-            return throwTypeError(arena, "descriptor must be an object");
-        const sdesc = args[2].toPtr().object;
-        if (sdesc.hasOwn("get") or sdesc.hasOwn("set")) {
+        const sdesc_val = if (args.len >= 3) args[2] else Value{};
+        const sdesc = (try resolveObject(arena, sdesc_val)) orelse
+            return throwTypeError(arena, "Property description must be an object");
+        if (descHas(sdesc, "get") or descHas(sdesc, "set")) {
             const existing_acc = obj.getOwnSymEntry(key_raw);
             // Merge get/set with the existing accessor's handlers when the
             // descriptor omits one (partial-descriptor semantics).
@@ -995,26 +1224,26 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
                 null;
             const cur_get: ?Value = if (existing_holder) |hv| hv.toPtr().object.getOwn("get") else null;
             const cur_set: ?Value = if (existing_holder) |hv| hv.toPtr().object.getOwn("set") else null;
-            const getter: ?Value = if (sdesc.hasOwn("get")) sdesc.getOwn("get") else cur_get;
-            const setter: ?Value = if (sdesc.hasOwn("set")) sdesc.getOwn("set") else cur_set;
+            const getter: ?Value = if (descHas(sdesc, "get")) try descGet(arena, sdesc_val, sdesc, "get") else cur_get;
+            const setter: ?Value = if (descHas(sdesc, "set")) try descGet(arena, sdesc_val, sdesc, "set") else cur_set;
             const holder = try makeAccessorHolder(arena, getter, setter);
             // Omitted enumerable/configurable inherit from the existing property.
             const sok = try obj.defineOwnAccessorSym(key_raw, holder, .{
-                .enumerable = if (sdesc.hasOwn("enumerable")) descTruthy(sdesc.getOwn("enumerable")) else if (existing_acc) |ee| ee.attr.enumerable else false,
-                .configurable = if (sdesc.hasOwn("configurable")) descTruthy(sdesc.getOwn("configurable")) else if (existing_acc) |ee| ee.attr.configurable else false,
+                .enumerable = if (descHas(sdesc, "enumerable")) descTruthy(try descGet(arena, sdesc_val, sdesc, "enumerable")) else if (existing_acc) |ee| ee.attr.enumerable else false,
+                .configurable = if (descHas(sdesc, "configurable")) descTruthy(try descGet(arena, sdesc_val, sdesc, "configurable")) else if (existing_acc) |ee| ee.attr.configurable else false,
             });
             if (!sok) return throwTypeError(arena, "cannot redefine property");
             return args[0];
         }
         // ES §10.1.6.3 step 4: generic descriptor (no fields) on an existing prop → true.
-        const is_generic_sym = !sdesc.hasOwn("value") and !sdesc.hasOwn("writable") and
-            !sdesc.hasOwn("enumerable") and !sdesc.hasOwn("configurable");
+        const is_generic_sym = !descHas(sdesc, "value") and !descHas(sdesc, "writable") and
+            !descHas(sdesc, "enumerable") and !descHas(sdesc, "configurable");
         if (is_generic_sym and obj.hasOwnSym(key_raw)) return args[0];
         // Preserve existing value/attrs for omitted descriptor fields (partial-descriptor
         // semantics: an empty {} leaves everything unchanged on a non-configurable prop).
         const existing_sym = obj.getOwnSymEntry(key_raw);
-        const sval = if (sdesc.hasOwn("value"))
-            (sdesc.getOwn("value") orelse try val_mod.makeUndefined(arena))
+        const sval = if (descHas(sdesc, "value"))
+            (try descGet(arena, sdesc_val, sdesc, "value"))
         else if (existing_sym) |ee| if (!ee.attr.is_accessor)
             (obj.getOwnSym(key_raw) orelse try val_mod.makeUndefined(arena))
         else
@@ -1022,9 +1251,9 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         else
             try val_mod.makeUndefined(arena);
         const sok = try obj.defineOwnDataSym(key_raw, sval, .{
-            .writable = if (sdesc.hasOwn("writable")) descTruthy(sdesc.getOwn("writable")) else if (existing_sym) |ee| ee.attr.writable else false,
-            .enumerable = if (sdesc.hasOwn("enumerable")) descTruthy(sdesc.getOwn("enumerable")) else if (existing_sym) |ee| ee.attr.enumerable else false,
-            .configurable = if (sdesc.hasOwn("configurable")) descTruthy(sdesc.getOwn("configurable")) else if (existing_sym) |ee| ee.attr.configurable else false,
+            .writable = if (descHas(sdesc, "writable")) descTruthy(try descGet(arena, sdesc_val, sdesc, "writable")) else if (existing_sym) |ee| ee.attr.writable else false,
+            .enumerable = if (descHas(sdesc, "enumerable")) descTruthy(try descGet(arena, sdesc_val, sdesc, "enumerable")) else if (existing_sym) |ee| ee.attr.enumerable else false,
+            .configurable = if (descHas(sdesc, "configurable")) descTruthy(try descGet(arena, sdesc_val, sdesc, "configurable")) else if (existing_sym) |ee| ee.attr.configurable else false,
         });
         if (!sok) return throwTypeError(arena, "cannot redefine property");
         return args[0];
@@ -1099,31 +1328,58 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         // Non-canonical-numeric key: fall through to ordinary defineProperty.
     }
 
-    if (args.len < 3 or args[2].bits == 0 or args[2].unbox() != .object) {
-        return throwTypeError(arena, "descriptor must be an object");
-    }
-    const desc = args[2].toPtr().object;
+    // ToPropertyDescriptor: the descriptor must be an object (functions count).
+    const desc_val = if (args.len >= 3) args[2] else Value{};
+    const desc = (try resolveObject(arena, desc_val)) orelse
+        return throwTypeError(arena, "Property description must be an object");
 
-    if (desc.hasOwn("get") or desc.hasOwn("set")) {
-        const getter: ?Value = if (desc.hasOwn("get")) desc.getOwn("get") else null;
-        const setter: ?Value = if (desc.hasOwn("set")) desc.getOwn("set") else null;
-        const holder = try makeAccessorHolder(arena, getter, setter);
-        // Partial descriptor: omitted enumerable/configurable keep the EXISTING
-        // own attributes (redefine), else default false (create) — same merge as
-        // the data path. Without this, redefining a configurable accessor with a
-        // bare {get} silently flips it non-configurable and blocks the next redefine.
+    // Array exotic [[DefineOwnProperty]] on "length" (ES §10.4.2.1 → ArraySetLength
+    // §10.4.2.4): the new length is ToUint32(value) and must equal ToNumber(value),
+    // else a RangeError is thrown. Setting a smaller length truncates the array.
+    if (obj.is_array and std.mem.eql(u8, key, "length")) {
+        if (descHas(desc, "get") or descHas(desc, "set"))
+            return throwTypeError(arena, "cannot redefine property: length");
+        if (descHas(desc, "value")) {
+            const lv = try descGet(arena, desc_val, desc, "value");
+            const num = try toNumberForLength(arena, lv);
+            const u = toUint32(num);
+            if (@as(f64, @floatFromInt(u)) != num)
+                return throwRangeError(arena, "Invalid array length");
+            try obj.set("length", try val_mod.makeNumber(arena, @floatFromInt(u)));
+        }
+        return args[0];
+    }
+
+    if (descHas(desc, "get") or descHas(desc, "set")) {
+        // Partial descriptor: omitted get/set/enumerable/configurable keep the
+        // EXISTING accessor's handlers/attributes (redefine), else default
+        // undefined/false (create). Preserving the absent handler is required by
+        // ValidateAndApplyPropertyDescriptor — e.g. redefining a {get} accessor
+        // with a bare {set:undefined} must leave the existing getter intact and,
+        // for a non-configurable accessor, is a permitted no-op change.
         var prev_e = false;
         var prev_c = false;
+        var cur_get: ?Value = null;
+        var cur_set: ?Value = null;
         if (obj.findProperty(key)) |loc| {
             if (loc.holder == obj) {
                 const a = loc.holder.attrAt(loc.slot);
                 prev_e = a.enumerable;
                 prev_c = a.configurable;
+                if (a.is_accessor) {
+                    if (obj.ownAccessorHolder(key)) |hv| {
+                        cur_get = hv.toPtr().object.getOwn("get");
+                        cur_set = hv.toPtr().object.getOwn("set");
+                    }
+                }
             }
         }
+        const getter: ?Value = if (descHas(desc, "get")) try descGet(arena, desc_val, desc, "get") else cur_get;
+        const setter: ?Value = if (descHas(desc, "set")) try descGet(arena, desc_val, desc, "set") else cur_set;
+        const holder = try makeAccessorHolder(arena, getter, setter);
         const attr = PropAttr{
-            .enumerable = if (desc.hasOwn("enumerable")) descTruthy(desc.getOwn("enumerable")) else prev_e,
-            .configurable = if (desc.hasOwn("configurable")) descTruthy(desc.getOwn("configurable")) else prev_c,
+            .enumerable = if (descHas(desc, "enumerable")) descTruthy(try descGet(arena, desc_val, desc, "enumerable")) else prev_e,
+            .configurable = if (descHas(desc, "configurable")) descTruthy(try descGet(arena, desc_val, desc, "configurable")) else prev_c,
         };
         const ok = try obj.defineOwnAccessor(key, holder, attr);
         if (!ok) return throwTypeError(arena, "cannot redefine property");
@@ -1149,16 +1405,16 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
             }
         }
     }
-    const value = if (desc.hasOwn("value"))
-        (desc.getOwn("value") orelse try val_mod.makeUndefined(arena))
+    const value = if (descHas(desc, "value"))
+        (try descGet(arena, desc_val, desc, "value"))
     else if (has_own_data and cur_val != null)
         cur_val.?
     else
         try val_mod.makeUndefined(arena);
     const attr = PropAttr{
-        .writable = if (desc.hasOwn("writable")) descTruthy(desc.getOwn("writable")) else cur_w,
-        .enumerable = if (desc.hasOwn("enumerable")) descTruthy(desc.getOwn("enumerable")) else cur_e,
-        .configurable = if (desc.hasOwn("configurable")) descTruthy(desc.getOwn("configurable")) else cur_c,
+        .writable = if (descHas(desc, "writable")) descTruthy(try descGet(arena, desc_val, desc, "writable")) else cur_w,
+        .enumerable = if (descHas(desc, "enumerable")) descTruthy(try descGet(arena, desc_val, desc, "enumerable")) else cur_e,
+        .configurable = if (descHas(desc, "configurable")) descTruthy(try descGet(arena, desc_val, desc, "configurable")) else cur_c,
     };
     const ok = try obj.defineOwnData(key, value, attr);
     if (!ok) return throwTypeError(arena, "cannot redefine property");

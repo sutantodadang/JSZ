@@ -333,6 +333,16 @@ pub const JsObject = struct {
         return self.attrs.items[slot];
     }
 
+    /// Set every own property's [[Enumerable]] to false. Setup helper: core
+    /// built-in own properties (methods, constants) are all non-enumerable, but
+    /// many are registered via `set()` (which defaults to enumerable). A realm
+    /// post-pass calls this over the built-in objects to correct that in bulk.
+    /// Only enumerable is touched; writable/configurable are left as-is.
+    pub fn markOwnNonEnumerable(self: *JsObject) void {
+        for (self.attrs.items) |*a| a.enumerable = false;
+        for (self.sym_props.items) |*sp| sp.attr.enumerable = false;
+    }
+
     /// Define or redefine an own DATA property with explicit attributes.
     /// Returns false (caller should throw TypeError) when disallowed by
     /// non-configurability or non-extensibility. Honors lockstep growth.
@@ -469,7 +479,13 @@ pub const JsObject = struct {
                 if (!accessorHoldersEqual(cur_holder, holder)) return false;
                 return true;
             }
-            _ = try self.deleteOwn(key);
+            // Configurable redefine: update the EXISTING slot in place. Deleting
+            // and re-adding would move the key to the end of the creation order,
+            // but [[DefineOwnProperty]] must not reorder (Object.keys/values order).
+            if (slot < self.slots.items.len) self.slots.items[slot] = holder;
+            if (slot < self.attrs.items.len) self.attrs.items[slot] = attr;
+            self.gcWrite(holder);
+            return true;
         } else {
             if (!self.extensible) return false;
         }
