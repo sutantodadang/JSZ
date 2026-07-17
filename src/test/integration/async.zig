@@ -241,6 +241,185 @@ test "await: non-promise passes through" {
 }
 
 
+// ---- %AsyncFunction% intrinsic (spec §27.7) ----
+// Not a global binding: reachable only via an async function's [[Prototype]].
+
+test "AsyncFunction: async fn inherits from %AsyncFunction.prototype%, not Function.prototype" {
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "var p = Object.getPrototypeOf(async function(){}); p !== Function.prototype && Object.getPrototypeOf(p) === Function.prototype",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
+test "AsyncFunction: constructor is %AsyncFunction% with name/length, rooted at Function" {
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "var AF = Object.getPrototypeOf(async function(){}).constructor;" ++
+            "AF.name === 'AsyncFunction' && AF.length === 1 && Object.getPrototypeOf(AF) === Function",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
+test "AsyncFunction: %AsyncFunction.prototype% @@toStringTag" {
+    const s = try evalToStringMode(
+        std.testing.allocator,
+        "Object.getPrototypeOf(async function(){})[Symbol.toStringTag]",
+        .bc,
+    );
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("AsyncFunction", s);
+}
+
+
+test "AsyncFunction: @@toStringTag is non-writable, non-enumerable, configurable" {
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(async function(){}), Symbol.toStringTag);" ++
+            "d.writable === false && d.enumerable === false && d.configurable === true",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
+test "AsyncFunction: async fns are not constructors — no own .prototype" {
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "var af = async function(){};" ++
+            "!af.hasOwnProperty('prototype') && !Object.getPrototypeOf(af).hasOwnProperty('prototype')",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
+test "AsyncFunction: async arrows and async methods share %AsyncFunction.prototype%" {
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "var p = Object.getPrototypeOf(async function(){});" ++
+            "var o = { async m(){} };" ++
+            "Object.getPrototypeOf(async () => {}) === p && Object.getPrototypeOf(o.m) === p",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
+// Regression: the closure's backing object is created lazily, and a plain
+// property GET used to skip it for non-generators — so `.constructor` resolved
+// off the %Function.prototype% fallback and returned `Function`, but only until
+// something (e.g. Object.getPrototypeOf) had forced the object into existence.
+// These read `.constructor` with no prior access to keep that order-dependence
+// from coming back.
+
+test "AsyncFunction: .constructor is correct without a prior getPrototypeOf" {
+    // Expression context: `async function foo(){}.constructor` is a SyntaxError at
+    // statement start (it parses as a declaration), so bind it first — this is the
+    // exact shape test262's AsyncFunction-name.js uses.
+    const s = try evalToStringMode(
+        std.testing.allocator,
+        "var AF = async function foo(){}.constructor; AF.name",
+        .bc,
+    );
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("AsyncFunction", s);
+}
+
+
+test "AsyncFunction: @@toStringTag reachable from an instance without prior access" {
+    const s = try evalToStringMode(
+        std.testing.allocator,
+        "(async function(){})[Symbol.toStringTag]",
+        .bc,
+    );
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("AsyncFunction", s);
+}
+
+
+test "AsyncFunction: reading .prototype does not materialize one on an async fn" {
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "async function foo(){};" ++
+            // touch .prototype first: it must stay undefined and uncreated
+            "var touched = foo.prototype;" ++
+            "touched === undefined && !foo.hasOwnProperty('prototype')",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
+test "AsyncFunction: async generators still have a .prototype" {
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "async function* g(){}; typeof g.prototype === 'object' && g.hasOwnProperty('prototype')",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
+test "AsyncFunction: ordinary functions still have a .prototype with constructor" {
+    // NOTE: `.prototype` is read before hasOwnProperty because an ordinary function's
+    // own `prototype` is only materialized on first access — a pre-existing laziness
+    // quirk (spec wants it present from the start), unrelated to %AsyncFunction%.
+    // Asserted as-is so this test pins the async fix, not that quirk.
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "function f(){}; f.prototype.constructor === f && f.hasOwnProperty('prototype')",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
+test "AsyncFunction: %AsyncFunction% is not exposed as a global" {
+    const s = try evalToStringMode(std.testing.allocator, "typeof AsyncFunction", .bc);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("undefined", s);
+}
+
+
+test "AsyncFunction: dynamically constructed async fn awaits and resolves" {
+    const v = try evalToF64Mode(
+        std.testing.allocator,
+        "var AF = Object.getPrototypeOf(async function(){}).constructor;" ++
+            "var d = AF('a', 'return (await a) + 1'); await d(41)",
+        .bc,
+    );
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+
+test "AsyncFunction: dynamically constructed async fn inherits %AsyncFunction.prototype%" {
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "var AF = Object.getPrototypeOf(async function(){}).constructor;" ++
+            "Object.getPrototypeOf(AF('return 1')) === AF.prototype",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
+test "AsyncFunction: ordinary and generator fn prototypes are unaffected" {
+    const v = try evalToBoolMode(
+        std.testing.allocator,
+        "Object.getPrototypeOf(function(){}) === Function.prototype &&" ++
+            "Object.getPrototypeOf(function*(){}).constructor.name === 'GeneratorFunction' &&" ++
+            "Object.getPrototypeOf(async function*(){}).constructor.name === 'AsyncGeneratorFunction'",
+        .bc,
+    );
+    try std.testing.expect(v);
+}
+
+
 test "promise: then callback runs under microtask drain (tree+bc)" {
     const v = try evalToF64(std.testing.allocator, "var r=0; Promise.resolve(3).then(function(x){ return x*10; }).then(function(y){ r=y; }); __runMicrotasks__(); r");
     try std.testing.expectEqual(@as(f64, 30), v);
