@@ -1372,6 +1372,14 @@ fn nativeReferenceErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []c
     return errorCtorWithCause(arena, this_val, "ReferenceError", args);
 }
 
+fn nativeEvalErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return errorCtorWithCause(arena, this_val, "EvalError", args);
+}
+
+fn nativeUriErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return errorCtorWithCause(arena, this_val, "URIError", args);
+}
+
 fn nativeAggregateErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     // args[0] = errors iterable/array, args[1] = message string
     const message = if (args.len > 1) extractMessage(args[1..]) else "";
@@ -3234,6 +3242,14 @@ pub const Realm = struct {
         try aggregate_error_proto.set("name", aep_name);
         try aggregate_error_proto.set("message", ep_msg);
 
+        // EvalError.prototype / URIError.prototype: proto = Error.prototype.
+        const eval_error_proto = try JsObject.create(arena, error_proto);
+        try eval_error_proto.set("name", try val_mod.makeString(arena, "EvalError"));
+        try eval_error_proto.set("message", ep_msg);
+        const uri_error_proto = try JsObject.create(arena, error_proto);
+        try uri_error_proto.set("name", try val_mod.makeString(arena, "URIError"));
+        try uri_error_proto.set("message", ep_msg);
+
         // Set thread-local proto pointers so native ctors can find them.
         error_proto_Error = error_proto;
         error_proto_TypeError = type_error_proto;
@@ -3268,6 +3284,8 @@ pub const Realm = struct {
         const range_error_ctor_val = try makeErrorCtor(arena, nativeRangeErrorCtor, range_error_proto, "RangeError");
         const reference_error_ctor_val = try makeErrorCtor(arena, nativeReferenceErrorCtor, reference_error_proto, "ReferenceError");
         const aggregate_error_ctor_val = try makeErrorCtor(arena, nativeAggregateErrorCtor, aggregate_error_proto, "AggregateError");
+        const eval_error_ctor_val = try makeErrorCtor(arena, nativeEvalErrorCtor, eval_error_proto, "EvalError");
+        const uri_error_ctor_val = try makeErrorCtor(arena, nativeUriErrorCtor, uri_error_proto, "URIError");
 
         // Spec: ErrorPrototype.constructor = ErrorConstructor (non-enumerable, writable, configurable).
         // Required for `thrown.constructor === TypeError` identity checks in assert.throws.
@@ -3278,6 +3296,8 @@ pub const Realm = struct {
         _ = try range_error_proto.defineOwnData("constructor", range_error_ctor_val, ctor_attr);
         _ = try reference_error_proto.defineOwnData("constructor", reference_error_ctor_val, ctor_attr);
         _ = try aggregate_error_proto.defineOwnData("constructor", aggregate_error_ctor_val, ctor_attr);
+        _ = try eval_error_proto.defineOwnData("constructor", eval_error_ctor_val, ctor_attr);
+        _ = try uri_error_proto.defineOwnData("constructor", uri_error_ctor_val, ctor_attr);
 
         try env.define("Error", error_ctor_val);
         try env.define("TypeError", type_error_ctor_val);
@@ -3285,6 +3305,8 @@ pub const Realm = struct {
         try env.define("RangeError", range_error_ctor_val);
         try env.define("ReferenceError", reference_error_ctor_val);
         try env.define("AggregateError", aggregate_error_ctor_val);
+        try env.define("EvalError", eval_error_ctor_val);
+        try env.define("URIError", uri_error_ctor_val);
 
         // Also store prototypes under hidden names so vm.zig's getErrorProto can find them.
         const error_proto_val = try val_mod.makeObject(arena, error_proto);
@@ -3313,33 +3335,37 @@ pub const Realm = struct {
             const obj_val_ptr = &obj_binding.value;
             if (obj_val_ptr.bits != 0 and obj_val_ptr.unbox() == .object) {
                 const ctor_obj = obj_val_ptr.toPtr().object;
-                const keys_fn = try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectKeys, "keys", 1);
-                const values_fn = try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectValues, "values", 1);
-                try ctor_obj.set("keys", keys_fn);
-                try ctor_obj.set("values", values_fn);
-                try ctor_obj.set("assign", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectAssign, "assign", 0));
-                const entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectEntries);
-                try ctor_obj.set("entries", entries_fn);
-                const from_entries_fn = try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectFromEntries, "fromEntries", 1);
-                try ctor_obj.set("fromEntries", from_entries_fn);
-                const gopd_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptors);
-                try ctor_obj.set("getOwnPropertyDescriptors", gopd_fn);
-                try ctor_obj.set("getPrototypeOf", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetPrototypeOf, "getPrototypeOf", 0));
-                try ctor_obj.set("setPrototypeOf", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectSetPrototypeOf, "setPrototypeOf", 0));
-                try ctor_obj.set("getOwnPropertyNames", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetOwnPropertyNames, "getOwnPropertyNames", 0));
-                try ctor_obj.set("getOwnPropertyDescriptor", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptor, "getOwnPropertyDescriptor", 0));
-                try ctor_obj.set("defineProperty", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectDefineProperty, "defineProperty", 0));
-                try ctor_obj.set("defineProperties", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectDefineProperties, "defineProperties", 0));
-                try ctor_obj.set("freeze", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectFreeze, "freeze", 0));
-                try ctor_obj.set("seal", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectSeal, "seal", 0));
-                try ctor_obj.set("preventExtensions", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectPreventExtensions, "preventExtensions", 0));
-                try ctor_obj.set("isFrozen", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsFrozen, "isFrozen", 0));
-                try ctor_obj.set("isSealed", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsSealed, "isSealed", 0));
-                try ctor_obj.set("isExtensible", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsExtensible, "isExtensible", 0));
-                try ctor_obj.set("getOwnPropertySymbols", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectGetOwnPropertySymbols, "getOwnPropertySymbols", 0));
-                try ctor_obj.set("is", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIs, "is", 2));
-                try ctor_obj.set("hasOwn", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectHasOwn, "hasOwn", 2));
-                try ctor_obj.set("groupBy", try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeObjectGroupBy, "groupBy", 2));
+                // All Object static methods are { writable, !enumerable, configurable }
+                // with a spec-mandated `length` (function.length descriptor tests).
+                const m_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+                const StaticMethod = struct { name: []const u8, fn_ptr: val_mod.NativeFnPtr, len: u32 };
+                const static_methods = [_]StaticMethod{
+                    .{ .name = "keys", .fn_ptr = obj_methods_mod.nativeObjectKeys, .len = 1 },
+                    .{ .name = "values", .fn_ptr = obj_methods_mod.nativeObjectValues, .len = 1 },
+                    .{ .name = "entries", .fn_ptr = obj_methods_mod.nativeObjectEntries, .len = 1 },
+                    .{ .name = "assign", .fn_ptr = obj_methods_mod.nativeObjectAssign, .len = 2 },
+                    .{ .name = "fromEntries", .fn_ptr = obj_methods_mod.nativeObjectFromEntries, .len = 1 },
+                    .{ .name = "getOwnPropertyDescriptors", .fn_ptr = obj_methods_mod.nativeObjectGetOwnPropertyDescriptors, .len = 1 },
+                    .{ .name = "getPrototypeOf", .fn_ptr = obj_methods_mod.nativeObjectGetPrototypeOf, .len = 1 },
+                    .{ .name = "setPrototypeOf", .fn_ptr = obj_methods_mod.nativeObjectSetPrototypeOf, .len = 2 },
+                    .{ .name = "getOwnPropertyNames", .fn_ptr = obj_methods_mod.nativeObjectGetOwnPropertyNames, .len = 1 },
+                    .{ .name = "getOwnPropertyDescriptor", .fn_ptr = obj_methods_mod.nativeObjectGetOwnPropertyDescriptor, .len = 2 },
+                    .{ .name = "defineProperty", .fn_ptr = obj_methods_mod.nativeObjectDefineProperty, .len = 3 },
+                    .{ .name = "defineProperties", .fn_ptr = obj_methods_mod.nativeObjectDefineProperties, .len = 2 },
+                    .{ .name = "freeze", .fn_ptr = obj_methods_mod.nativeObjectFreeze, .len = 1 },
+                    .{ .name = "seal", .fn_ptr = obj_methods_mod.nativeObjectSeal, .len = 1 },
+                    .{ .name = "preventExtensions", .fn_ptr = obj_methods_mod.nativeObjectPreventExtensions, .len = 1 },
+                    .{ .name = "isFrozen", .fn_ptr = obj_methods_mod.nativeObjectIsFrozen, .len = 1 },
+                    .{ .name = "isSealed", .fn_ptr = obj_methods_mod.nativeObjectIsSealed, .len = 1 },
+                    .{ .name = "isExtensible", .fn_ptr = obj_methods_mod.nativeObjectIsExtensible, .len = 1 },
+                    .{ .name = "getOwnPropertySymbols", .fn_ptr = obj_methods_mod.nativeObjectGetOwnPropertySymbols, .len = 1 },
+                    .{ .name = "is", .fn_ptr = obj_methods_mod.nativeObjectIs, .len = 2 },
+                    .{ .name = "hasOwn", .fn_ptr = obj_methods_mod.nativeObjectHasOwn, .len = 2 },
+                    .{ .name = "groupBy", .fn_ptr = es2015_collections_mod.nativeObjectGroupBy, .len = 2 },
+                };
+                inline for (static_methods) |sm| {
+                    _ = try ctor_obj.defineOwnData(sm.name, try val_mod.makeNativeFunctionNamed(arena, sm.fn_ptr, sm.name, sm.len), m_attr);
+                }
             }
         }
         // hasOwnProperty on Object.prototype (non-enumerable, writable, configurable)
@@ -3348,6 +3374,8 @@ pub const Realm = struct {
             try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeHasOwnProperty, "hasOwnProperty", 1), meth_attr);
         _ = try object_proto.defineOwnData("propertyIsEnumerable",
             try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativePropertyIsEnumerable, "propertyIsEnumerable", 1), meth_attr);
+        _ = try object_proto.defineOwnData("isPrototypeOf",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsPrototypeOf, "isPrototypeOf", 1), meth_attr);
         _ = try object_proto.defineOwnData("toString",
             try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoToString, "toString", 0), meth_attr);
         _ = try object_proto.defineOwnData("valueOf",
@@ -3710,6 +3738,78 @@ pub const Realm = struct {
         // Tagged-template runtime helper (see rewriteTemplateLiterals): builds the
         // template strings object from its cooked + raw arrays.
         try env.define("__jsztag", try val_mod.makeNativeFunction(arena, nativeTemplateObject));
+
+        // ---- Post-pass: give built-in constructors and namespace objects their
+        // [[Prototype]]. Most constructor objects above were created with a null
+        // proto (an ordering artifact: e.g. the Object constructor is built before
+        // %Function.prototype% exists). A null [[Prototype]] broke
+        // Object.getPrototypeOf(ctor), `ctor instanceof Function`, and inheritance
+        // of Function.prototype.{call,bind,apply}; likewise namespace objects
+        // (Math, JSON, Reflect, ...) lost Object.prototype methods. Assign here,
+        // once %Object.prototype% and %Function.prototype% both exist. Callable
+        // globals get %Function.prototype%; plain namespace objects get
+        // %Object.prototype%. Only null protos are touched, so objects created
+        // with a correct proto (including Object.create(null) users, which are not
+        // globals) are never clobbered.
+        {
+            var it = env.bindings.iterator();
+            while (it.next()) |entry| {
+                const bname = entry.key_ptr.*;
+                // Skip hidden internal bindings (e.g. __ErrorProto__, __jsztag).
+                if (bname.len >= 2 and bname[0] == '_' and bname[1] == '_') continue;
+                const bv = entry.value_ptr.value;
+                if (bv.bits == 0 or bv.unbox() != .object) continue;
+                const bo = bv.toPtr().object;
+                if (bo.proto != null) continue;
+                const target_proto = if (bo.get("__call__") != null) function_proto else object_proto;
+                bo.proto = target_proto;
+                bo.setProtoBarrier(target_proto);
+            }
+        }
+
+        // Correct enumerability: core built-in own properties (constructor static
+        // methods, namespace-object methods/constants, and each constructor's
+        // `prototype` object's methods) are all non-enumerable, but many are
+        // registered with `set()` (which defaults to enumerable). Walk the global
+        // built-in objects and their `prototype` objects, flipping every own
+        // property to non-enumerable. Runs at realm init, before any user code, so
+        // no user-created (legitimately enumerable) property is ever affected.
+        {
+            var it = env.bindings.iterator();
+            while (it.next()) |entry| {
+                const bname = entry.key_ptr.*;
+                if (bname.len >= 2 and bname[0] == '_' and bname[1] == '_') continue;
+                const bv = entry.value_ptr.value;
+                if (bv.bits == 0 or bv.unbox() != .object) continue;
+                const bo = bv.toPtr().object;
+                bo.markOwnNonEnumerable();
+                // A constructor's `.prototype` object holds the instance methods.
+                if (bo.getOwn("prototype")) |pv| {
+                    if (pv.bits != 0 and pv.unbox() == .object) pv.toPtr().object.markOwnNonEnumerable();
+                }
+            }
+            // %Object.prototype% and %Function.prototype% are also reachable via
+            // the Object/Function constructors' `prototype` links above, but mark
+            // them directly too (defensive; they are the roots of every chain).
+            object_proto.markOwnNonEnumerable();
+            function_proto.markOwnNonEnumerable();
+        }
+        // Error subtype constructors chain to the %Error% constructor (ES §20.5.6),
+        // not directly to %Function.prototype%. (%Error% itself → %Function.prototype%
+        // via the loop above.)
+        {
+            const error_ctor_obj = error_ctor_val.toPtr().object;
+            for ([_]Value{
+                type_error_ctor_val,   syntax_error_ctor_val,
+                range_error_ctor_val,  reference_error_ctor_val,
+                aggregate_error_ctor_val, eval_error_ctor_val,
+                uri_error_ctor_val,
+            }) |cv| {
+                const co = cv.toPtr().object;
+                co.proto = error_ctor_obj;
+                co.setProtoBarrier(error_ctor_obj);
+            }
+        }
 
         // Set thread-locals for builtins that need them.
         active_array_proto = array_proto;
