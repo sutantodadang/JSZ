@@ -490,8 +490,13 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
 // ---------------------------------------------------------------- Reflect.getPrototypeOf ---
 
 pub fn nativeReflectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or !isObj(args[0])) return val_mod.makeNull(arena);
+    if (args.len == 0 or !isObj(args[0]))
+        return throwTypeErrorReflect(arena, "Reflect.getPrototypeOf called on non-object");
     const obj = args[0].toPtr().object;
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyGetPrototypeOf(arena, obj)) |p| return p;
+        if (proxy_mod.proxyTarget(obj)) |t| return nativeReflectGetPrototypeOf(arena, Value{}, &[_]Value{t});
+    }
     if (obj.proto) |p| return val_mod.makeObject(arena, p);
     return val_mod.makeNull(arena);
 }
@@ -515,6 +520,11 @@ pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
     // target fails (false). It does NOT trigger import-defer evaluation.
     if (obj.internal_kind == .module_namespace)
         return val_mod.makeBool(arena, new_proto == null);
+    if (obj.internal_kind == .proxy) {
+        const proto_val = if (new_proto) |p| try val_mod.makeObject(arena, p) else try val_mod.makeNull(arena);
+        if (try proxy_mod.proxySetPrototypeOf(arena, obj, proto_val)) |ok| return val_mod.makeBool(arena, ok);
+        if (proxy_mod.proxyTarget(obj)) |t| return nativeReflectSetPrototypeOf(arena, Value{}, &[_]Value{ t, if (new_proto) |p| try val_mod.makeObject(arena, p) else try val_mod.makeNull(arena) });
+    }
     obj.proto = new_proto;
     obj.setProtoBarrier(new_proto);
     return val_mod.makeBool(arena, true);
@@ -728,16 +738,27 @@ pub fn nativeReflectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value,
 // ---------------------------------------------------------------- Reflect.isExtensible ---
 
 pub fn nativeReflectIsExtensible(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
-    return val_mod.makeBool(arena, args[0].toPtr().object.extensible);
+    if (args.len == 0 or !isObj(args[0]))
+        return throwTypeErrorReflect(arena, "Reflect.isExtensible called on non-object");
+    const obj = args[0].toPtr().object;
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyIsExtensible(arena, obj)) |b| return val_mod.makeBool(arena, b);
+        if (proxy_mod.proxyTarget(obj)) |t| return nativeReflectIsExtensible(arena, Value{}, &[_]Value{t});
+    }
+    return val_mod.makeBool(arena, obj.extensible);
 }
 
 // ---------------------------------------------------------------- Reflect.preventExtensions ---
 
 pub fn nativeReflectPreventExtensions(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len > 0 and isObj(args[0])) {
-        args[0].toPtr().object.preventExtensionsSelf();
+    if (args.len == 0 or !isObj(args[0]))
+        return throwTypeErrorReflect(arena, "Reflect.preventExtensions called on non-object");
+    const obj = args[0].toPtr().object;
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyPreventExtensions(arena, obj)) |b| return val_mod.makeBool(arena, b);
+        if (proxy_mod.proxyTarget(obj)) |t| return nativeReflectPreventExtensions(arena, Value{}, &[_]Value{t});
     }
+    obj.preventExtensionsSelf();
     return val_mod.makeBool(arena, true);
 }
 

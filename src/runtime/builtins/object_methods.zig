@@ -574,6 +574,11 @@ pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
     }
     if (args[0].unbox() != .object) return val_mod.makeNull(arena);
     const obj = args[0].toPtr().object;
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyGetPrototypeOf(arena, obj)) |p| return p;
+        // No trap: forward to target's [[GetPrototypeOf]].
+        if (proxy_mod.proxyTarget(obj)) |t| return nativeObjectGetPrototypeOf(arena, Value{}, &[_]Value{t});
+    }
     if (obj.proto) |p| return val_mod.makeObject(arena, p);
     return val_mod.makeNull(arena);
 }
@@ -610,6 +615,16 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
     }
     if (target.bits != 0) {
         if (target.unbox() == .object) {
+            const tobj = target.toPtr().object;
+            if (tobj.internal_kind == .proxy) {
+                const proto_val = if (new_proto) |p| try val_mod.makeObject(arena, p) else try val_mod.makeNull(arena);
+                if (try proxy_mod.proxySetPrototypeOf(arena, tobj, proto_val)) |ok| {
+                    if (!ok) return throwTypeError(arena, "proxy setPrototypeOf returned false");
+                    return target;
+                }
+                // No trap: forward to the target.
+                if (proxy_mod.proxyTarget(tobj)) |t| return nativeObjectSetPrototypeOf(arena, Value{}, &[_]Value{ t, if (new_proto) |p| try val_mod.makeObject(arena, p) else try val_mod.makeNull(arena) });
+            }
             target.toPtr().object.proto = new_proto;
             target.toPtr().object.setProtoBarrier(new_proto);
         } else if (@import("../realm.zig").active_context) |ctx| {
@@ -1218,7 +1233,15 @@ pub fn nativeObjectSeal(arena: std.mem.Allocator, _: Value, args: []const Value)
 pub fn nativeObjectPreventExtensions(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
     if (args[0].unbox() != .object) return args[0];
-    args[0].toPtr().object.preventExtensionsSelf();
+    const obj = args[0].toPtr().object;
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyPreventExtensions(arena, obj)) |ok| {
+            if (!ok) return throwTypeError(arena, "proxy preventExtensions returned false");
+            return args[0];
+        }
+        if (proxy_mod.proxyTarget(obj)) |t| return nativeObjectPreventExtensions(arena, Value{}, &[_]Value{t});
+    }
+    obj.preventExtensionsSelf();
     return args[0];
 }
 
@@ -1263,7 +1286,13 @@ pub fn nativeObjectIsSealed(arena: std.mem.Allocator, _: Value, args: []const Va
 pub fn nativeObjectIsExtensible(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeBool(arena, false);
     return switch (args[0].unbox()) {
-        .object => |o| val_mod.makeBool(arena, o.extensible),
+        .object => |o| blk: {
+            if (o.internal_kind == .proxy) {
+                if (try proxy_mod.proxyIsExtensible(arena, o)) |b| break :blk val_mod.makeBool(arena, b);
+                if (proxy_mod.proxyTarget(o)) |t| break :blk nativeObjectIsExtensible(arena, Value{}, &[_]Value{t});
+            }
+            break :blk val_mod.makeBool(arena, o.extensible);
+        },
         // Functions are ordinary (extensible) objects.
         .native_function, .bc_function, .function => val_mod.makeBool(arena, true),
         else => val_mod.makeBool(arena, false),

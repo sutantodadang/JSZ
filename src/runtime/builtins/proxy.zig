@@ -92,13 +92,99 @@ fn isObjectLike(v: Value) bool {
     };
 }
 
+fn throwProxy(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    realm_mod.pending_exception = try makeTypeErrorVal(arena, msg);
+    return error.JsException;
+}
+
+/// IsExtensible(target) that dispatches a proxy target's own isExtensible trap
+/// (so nested proxies observe the invariant call), else reads the flag.
+fn isExtensibleValue(arena: std.mem.Allocator, v: Value) anyerror!bool {
+    if (v.bits == 0 or v.unbox() != .object) return false;
+    const o = v.toPtr().object;
+    if (o.internal_kind == .proxy) {
+        if (try proxyIsExtensible(arena, o)) |b| return b;
+        if (proxyTarget(o)) |t| return isExtensibleValue(arena, t);
+        return false;
+    }
+    return o.extensible;
+}
+
+/// [[GetPrototypeOf]] for a proxy: dispatch the `getPrototypeOf` trap. Result
+/// must be Object or null; when the target is non-extensible it must equal the
+/// target's own prototype. Returns null when no trap (caller forwards).
+pub fn proxyGetPrototypeOf(arena: std.mem.Allocator, proxy_obj: *JsObject) anyerror!?Value {
+    const handler = proxyHandler(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const target = proxyTarget(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const trap_fn = trap(handler, "getPrototypeOf") orelse return null;
+    const res = try function_proto.invokeCallback(arena, handler, trap_fn, &[_]Value{target});
+    if (!(res.bits != 0 and (res.unbox() == .object or res.unbox() == .null_)))
+        return throwProxy(arena, "proxy getPrototypeOf must return an object or null");
+    // Invariant: IsExtensible(target) is always consulted; a non-extensible
+    // target requires the trap result to equal the target's own prototype.
+    if (!(try isExtensibleValue(arena, target)) and target.bits != 0 and target.unbox() == .object) {
+        const tp = target.toPtr().object.proto;
+        const res_matches = if (res.unbox() == .null_) tp == null else (tp != null and res.toPtr().object == tp.?);
+        if (!res_matches) return throwProxy(arena, "proxy getPrototypeOf invariant violated on non-extensible target");
+    }
+    return res;
+}
+
+/// [[SetPrototypeOf]] for a proxy: dispatch the `setPrototypeOf` trap. Returns
+/// null when no trap (caller forwards); otherwise the ToBoolean trap result.
+pub fn proxySetPrototypeOf(arena: std.mem.Allocator, proxy_obj: *JsObject, proto: Value) anyerror!?bool {
+    const handler = proxyHandler(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const target = proxyTarget(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const trap_fn = trap(handler, "setPrototypeOf") orelse return null;
+    const proto_arg = if (proto.bits == 0) try val_mod.makeNull(arena) else proto;
+    const res = try function_proto.invokeCallback(arena, handler, trap_fn, &[_]Value{ target, proto_arg });
+    if (!val_mod.toBoolean(res)) return false;
+    // Invariant: IsExtensible(target) is always consulted; a non-extensible
+    // target requires the new proto to equal the target's own prototype.
+    if (!(try isExtensibleValue(arena, target)) and target.bits != 0 and target.unbox() == .object) {
+        const tp = target.toPtr().object.proto;
+        const matches = if (proto.bits == 0 or proto.unbox() == .null_) tp == null else (proto.unbox() == .object and tp != null and proto.toPtr().object == tp.?);
+        if (!matches) return throwProxy(arena, "proxy setPrototypeOf invariant violated on non-extensible target");
+    }
+    return true;
+}
+
+/// [[IsExtensible]] for a proxy: dispatch the `isExtensible` trap. Result's
+/// ToBoolean must equal the target's extensibility. Returns null when no trap.
+pub fn proxyIsExtensible(arena: std.mem.Allocator, proxy_obj: *JsObject) anyerror!?bool {
+    const handler = proxyHandler(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const target = proxyTarget(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const trap_fn = trap(handler, "isExtensible") orelse return null;
+    const res = try function_proto.invokeCallback(arena, handler, trap_fn, &[_]Value{target});
+    const b = val_mod.toBoolean(res);
+    const target_ext = target.bits != 0 and target.unbox() == .object and target.toPtr().object.extensible;
+    if (b != target_ext) return throwProxy(arena, "proxy isExtensible must match the target");
+    return b;
+}
+
+/// [[PreventExtensions]] for a proxy: dispatch the `preventExtensions` trap. A
+/// truthy result requires the target to be non-extensible. Returns null (no trap).
+pub fn proxyPreventExtensions(arena: std.mem.Allocator, proxy_obj: *JsObject) anyerror!?bool {
+    const handler = proxyHandler(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const target = proxyTarget(proxy_obj) orelse return throwProxy(arena, "proxy revoked");
+    const trap_fn = trap(handler, "preventExtensions") orelse return null;
+    const res = try function_proto.invokeCallback(arena, handler, trap_fn, &[_]Value{target});
+    const b = val_mod.toBoolean(res);
+    if (b and target.bits != 0 and target.unbox() == .object and target.toPtr().object.extensible)
+        return throwProxy(arena, "proxy preventExtensions cannot report true for an extensible target");
+    return b;
+}
+
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
+    // Use the real %TypeError.prototype% so `e instanceof TypeError` and the
+    // `e.constructor === TypeError` checks in test harnesses hold.
+    const proto = realm_mod.error_proto_TypeError;
     const obj = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, null)
+        try JsObject.createOnHeap(h, proto)
     else
-        try JsObject.create(arena, null);
-    try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+        try JsObject.create(arena, proto);
     try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     return val_mod.makeObject(arena, obj);
 }
 
