@@ -2638,6 +2638,10 @@ pub fn nativeAsyncGeneratorFunctionCtor(arena: std.mem.Allocator, _: Value, args
     return functionCtorImpl(arena, args, "async function*");
 }
 
+pub fn nativeAsyncFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return functionCtorImpl(arena, args, "async function");
+}
+
 // ---- Function.prototype.toString ----
 fn nativeFunctionToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     var name: []const u8 = "";
@@ -3065,6 +3069,11 @@ pub const Realm = struct {
     async_gen_fn_proto: ?*JsObject = null,
     async_gen_fn_ctor: ?*JsObject = null,
     async_iter_proto: ?*JsObject = null,
+    // %AsyncFunction.prototype% / %AsyncFunction%. Unlike the generator chain
+    // there is no matching "instance prototype" slot: async functions have no
+    // own `.prototype` property (spec §27.7).
+    async_fn_proto: ?*JsObject = null,
+    async_fn_ctor: ?*JsObject = null,
     // Cached roots for the generator chain (captured at captureIntrinsics time).
     gen_iterator_proto: ?*JsObject = null,
     gen_function_ctor: ?*JsObject = null,

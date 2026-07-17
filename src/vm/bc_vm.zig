@@ -2176,9 +2176,14 @@ pub const BcVm = struct {
                     return try self.closurePrototype(obj_val, closure);
                 }
                 // Generators inherit caller/arguments %ThrowTypeError% accessors via
-                // %Generator%/%AsyncGenerator%; materialize the backing object so the
-                // prototype-chain walk below fires those inherited accessors.
-                if (closure.func.is_generator and closure.obj == null) _ = try self.closureBackingObj(closure);
+                // %Generator%/%AsyncGenerator%; async functions inherit `constructor`
+                // and @@toStringTag via %AsyncFunction.prototype%. Materialize the
+                // backing object so the prototype-chain walk below sees the real
+                // [[Prototype]] instead of the %Function.prototype% fallback. Ordinary
+                // closures are left alone: their [[Prototype]] *is* %Function.prototype%,
+                // so the fallback is already correct and stays allocation-free.
+                if ((closure.func.is_generator or closure.func.is_async) and closure.obj == null)
+                    _ = try self.closureBackingObj(closure);
                 if (closure.obj) |op| {
                     const o: *JsObject = @ptrCast(@alignCast(op));
                     // An own property on the backing object (e.g. a `name`/`length`
@@ -2315,6 +2320,9 @@ pub const BcVm = struct {
         const fn_proto = if (closure.func.is_generator) blk: {
             try self.ensureGeneratorChain(gr);
             break :blk if (closure.func.is_async) gr.async_gen_fn_proto.? else gr.gen_fn_proto.?;
+        } else if (closure.func.is_async) blk: {
+            try self.ensureGeneratorChain(gr);
+            break :blk gr.async_fn_proto.?;
         } else self.realm.function_prototype;
         const o = if (self.heap) |heap|
             try JsObject.createOnHeap(heap, fn_proto)
@@ -2349,6 +2357,12 @@ pub const BcVm = struct {
         // Use getOwn (not get) so an inherited "prototype" from %GeneratorFunction.prototype%
         // does not short-circuit before we create this function's own fresh .prototype object.
         if (o.getOwn("prototype")) |p| return p;
+        // Spec §27.7.4: async function instances are not constructors and have no
+        // `prototype` property. Async *generators* do (handled below) — this is the
+        // plain-async case, where materializing one would be observable via
+        // `hasOwnProperty('prototype')`.
+        if (closure.func.is_async and !closure.func.is_generator)
+            return val_mod.makeUndefined(self.arena);
         if (closure.func.is_generator) {
             const gr: *Realm = if (closure.realm) |ro| @ptrCast(@alignCast(ro)) else self.realm;
             try self.ensureGeneratorChain(gr);
@@ -3808,10 +3822,34 @@ pub const BcVm = struct {
         _ = try async_gen_fn_proto.defineOwnAccessor("caller", poison_hv, pattr);
         _ = try async_gen_fn_proto.defineOwnAccessor("arguments", poison_hv, pattr);
 
+        // ---- %AsyncFunction% chain ----
+        // %AsyncFunction.prototype%: [[Prototype]] = realm's Function.prototype.
+        // No `prototype` property here and none on instances: async functions are
+        // not constructors and have no [[HomeObject]]-style instance proto (§27.7.3).
+        const async_fn_proto = try JsObject.create(self.arena, fn_root);
+        if (realm_m.active_sym_to_string_tag) |tag_sym|
+            try async_fn_proto.setSymAttr(tag_sym, try val_mod.makeString(self.arena, "AsyncFunction"),
+                .{ .writable = false, .enumerable = false, .configurable = true });
+
+        // %AsyncFunction%: [[Prototype]] = realm's Function constructor object
+        const async_fn_ctor = try JsObject.create(self.arena, fn_ctor_root);
+        _ = try async_fn_ctor.defineOwnData("prototype",
+            try val_mod.makeObject(self.arena, async_fn_proto), nef);
+        _ = try async_fn_ctor.defineOwnData("length",
+            try val_mod.makeNumber(self.arena, 1), nec);
+        _ = try async_fn_ctor.defineOwnData("name",
+            try val_mod.makeString(self.arena, "AsyncFunction"), nec);
+        try async_fn_ctor.set("__call__", try val_mod.makeNativeFunction(self.arena, realm_m.nativeAsyncFunctionCtor));
+        if (async_fn_ctor.getOwn("__call__")) |cv| val_mod.setValueRealm(cv, @ptrCast(realm));
+        _ = try async_fn_proto.defineOwnData("constructor",
+            try val_mod.makeObject(self.arena, async_fn_ctor), nec);
+
         realm.async_iter_proto = async_iter_proto;
         realm.async_gen_proto = async_gen_proto;
         realm.async_gen_fn_proto = async_gen_fn_proto;
         realm.async_gen_fn_ctor = async_gen_fn_ctor;
+        realm.async_fn_proto = async_fn_proto;
+        realm.async_fn_ctor = async_fn_ctor;
     }
 
     fn buildAsyncGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, closure: *BcClosure) !Value {
