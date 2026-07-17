@@ -1586,25 +1586,11 @@ fn isCallableVal(v: Value) bool {
 }
 
 fn isTruthyVal(v: Value) bool {
-    if (v.bits == 0) return false;
-    return switch (v.unbox()) {
-        .undefined_, .null_ => false,
-        .boolean => |b| b,
-        .number => |n| n != 0 and !std.math.isNan(n),
-        .string => |s| s.len > 0,
-        else => true,
-    };
+    return val_mod.toBoolean(v);
 }
 
 fn isTruthyValue(v: Value) bool {
-    if (v.bits == 0) return false;
-    return switch (v.unbox()) {
-        .boolean => |b| b,
-        .number => |n| n != 0 and !std.math.isNan(n),
-        .string => |s| s.len != 0,
-        .undefined_, .null_ => false,
-        else => true,
-    };
+    return val_mod.toBoolean(v);
 }
 
 /// ES2015 Array.of(...args) — creates array from arguments (no special-case for length).
@@ -1940,6 +1926,7 @@ fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8 {
         .boolean => |b| if (b) "true" else "false",
         .null_ => "null",
         .undefined_ => "undefined",
+        .bigint => |b| try val_mod.bigIntToString(arena, b),
         .object => blk: {
             // ToString(ToPrimitive(arg, "string")) when a user hook applies.
             if (try coercion_mod.toPrimitive(arena, arg, .string)) |prim|
@@ -2119,14 +2106,7 @@ fn nativeEval(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!
 }
 
 fn toBooleanCoerce(v: Value) bool {
-    if (v.bits == 0) return false;
-    return switch (v.unbox()) {
-        .boolean => |b| b,
-        .number => |n| n != 0 and !std.math.isNan(n),
-        .string => |s| s.len > 0,
-        .null_, .undefined_ => false,
-        else => true,
-    };
+    return val_mod.toBoolean(v);
 }
 
 fn nativeBooleanCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -2194,9 +2174,10 @@ fn nativeBigIntCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
         .bigint => return cur,
         .boolean => |b| return val_mod.makeBigIntFromI64(arena, if (b) 1 else 0),
         .string => |s| {
-            const t = std.mem.trim(u8, s, " \t\r\n");
-            return val_mod.makeBigIntFromLiteral(arena, if (t.len == 0) "0" else t) catch
-                throwTypeError(arena, "Cannot convert string to a BigInt");
+            // StringToBigInt handles the sign/whitespace/empty cases the bare
+            // literal grammar does not; failure is a SyntaxError per spec.
+            return val_mod.stringToBigInt(arena, s) catch
+                throwSyntaxError(arena, "Cannot convert string to a BigInt");
         },
         .number => |x| {
             if (std.math.isNan(x) or std.math.isInf(x) or std.math.floor(x) != x) {
@@ -2256,6 +2237,16 @@ fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const eo = if (active_heap) |h| try JsObject.createOnHeap(h, error_proto_RangeError) else try JsObject.create(arena, error_proto_RangeError);
     try eo.set("message", try val_mod.makeString(arena, msg));
     try eo.set("name", try val_mod.makeString(arena, "RangeError"));
+    pending_exception = try val_mod.makeObject(arena, eo);
+    return error.JsException;
+}
+
+/// Raise a `SyntaxError` from a native. Spec StringToBigInt reports a malformed
+/// numeric string this way (`BigInt("abc")`), not as a TypeError.
+fn throwSyntaxError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    const eo = if (active_heap) |h| try JsObject.createOnHeap(h, error_proto_SyntaxError) else try JsObject.create(arena, error_proto_SyntaxError);
+    try eo.set("message", try val_mod.makeString(arena, msg));
+    try eo.set("name", try val_mod.makeString(arena, "SyntaxError"));
     pending_exception = try val_mod.makeObject(arena, eo);
     return error.JsException;
 }

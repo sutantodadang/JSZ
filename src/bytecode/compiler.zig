@@ -748,22 +748,16 @@ pub const FnCompiler = struct {
                 return rdst;
             },
             .pos => {
-                // Unary +: just load as number. We can't call toNumber in compiler,
-                // so emit NEG(NEG(x)) trick — actually emit SUB 0,x is better.
-                // Simplest: load 0, then SUB is wrong. Just use the value as-is
-                // since NEG NEG would work but is wasteful.
-                // Best approach: emit NEG twice.
+                // Unary + is ToNumber(operand). A single TO_NUMBER does the
+                // coercion in one step and, unlike the previous NEG,NEG lowering,
+                // correctly throws a TypeError on a BigInt operand (`+1n`).
                 const rsrc = try self.compileExpr(u.operand);
                 const rdst = rsrc;
                 self.sp = rsrc;
                 self.sp += 1;
-                // NEG then NEG to coerce to number and negate twice = original.
-                try self.emitOp(.NEG, line);
+                try self.emitOp(.TO_NUMBER, line);
                 try self.emitU8(rdst);
                 try self.emitU8(rsrc);
-                try self.emitOp(.NEG, line);
-                try self.emitU8(rdst);
-                try self.emitU8(rdst);
                 return rdst;
             },
             .not => {

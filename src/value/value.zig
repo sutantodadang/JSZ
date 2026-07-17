@@ -123,6 +123,66 @@ pub fn makeBigIntFromLiteral(arena: std.mem.Allocator, lit: []const u8) !Value {
     return makeBigInt(arena, m.toConst());
 }
 
+/// ES ToBoolean (spec 7.1.2) — the single canonical truthiness test, shared by
+/// the VM and every builtin so they cannot drift. Falsy: undefined, null, false,
+/// ±0, NaN, "", and 0n. Everything else (incl. any object) is truthy.
+pub fn toBoolean(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .undefined_, .null_ => false,
+        .boolean => |b| b,
+        .number => |n| n != 0.0 and !std.math.isNan(n),
+        .string => |s| s.len > 0,
+        .bigint => |b| !b.toConst().eqlZero(),
+        else => true,
+    };
+}
+
+/// ES StrWhiteSpace trim for StringToBigInt/ToNumber. Beyond ASCII whitespace the
+/// spec counts NBSP (U+00A0), ZWNBSP/BOM (U+FEFF) and the line separators
+/// U+2028/U+2029, which are multi-byte in UTF-8 — so `std.mem.trim` over ASCII
+/// alone would reject `BigInt("\u{a0}7")`, which V8 accepts.
+fn trimJsWhitespace(s: []const u8) []const u8 {
+    const ws = [_][]const u8{ " ", "\t", "\n", "\r", "\x0B", "\x0C", "\u{a0}", "\u{feff}", "\u{2028}", "\u{2029}" };
+    var t = s;
+    var trimmed = true;
+    while (trimmed) {
+        trimmed = false;
+        for (ws) |w| {
+            if (std.mem.startsWith(u8, t, w)) {
+                t = t[w.len..];
+                trimmed = true;
+            }
+            if (t.len >= w.len and std.mem.endsWith(u8, t, w)) {
+                t = t[0 .. t.len - w.len];
+                trimmed = true;
+            }
+        }
+    }
+    return t;
+}
+
+/// ES StringToBigInt (spec 7.1.14). Differs from `makeBigIntFromLiteral`, which
+/// parses a source-code `123n` literal: a *string* may carry surrounding
+/// whitespace and a leading `+`/`-` sign, and an all-whitespace/empty string is
+/// 0n. A sign is valid only on the decimal form — `BigInt("-0x1f")` is an error,
+/// matching the grammar (NonDecimalIntegerLiteral admits no sign). Decimal points
+/// and exponents are rejected. Returns error.InvalidBigIntLiteral on failure, so
+/// the caller can raise the spec's SyntaxError.
+pub fn stringToBigInt(arena: std.mem.Allocator, s: []const u8) !Value {
+    const t = trimJsWhitespace(s);
+    if (t.len == 0) return makeBigIntFromI64(arena, 0);
+    // A sign is only legal ahead of DecimalDigits, never a 0x/0o/0b prefix.
+    if (t[0] == '+' or t[0] == '-') {
+        const rest = t[1..];
+        if (rest.len == 0) return error.InvalidBigIntLiteral;
+        for (rest) |c| if (!std.ascii.isDigit(c)) return error.InvalidBigIntLiteral;
+        const v = try makeBigIntFromLiteral(arena, rest);
+        return if (t[0] == '-') bigIntNegate(arena, v) else v;
+    }
+    return makeBigIntFromLiteral(arena, t);
+}
+
 /// True if the BigInt Value is strictly negative.
 pub fn bigIntIsNegative(v: Value) bool {
     const c = v.toPtr().bigint.toConst();

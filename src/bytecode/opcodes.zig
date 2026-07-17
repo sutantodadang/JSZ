@@ -265,6 +265,12 @@ pub const Op = enum(u8) {
     /// A no-op suspend with no consumer-visible value. Declared last (ordinal
     /// stability for the pinned JIT contract).
     PARAMS_DONE,
+    /// TO_NUMBER | 3 | op, Rdst u8, Rsrc u8. Rdst = ToNumber(R[Rsrc]). Emitted for
+    /// unary `+`, which is ToNumber — NOT ToNumeric — so a BigInt operand throws a
+    /// TypeError (`+1n`). Previously `+x` lowered to NEG,NEG, which silently
+    /// round-tripped a BigInt instead of throwing. Declared last (ordinal
+    /// stability for the pinned JIT contract).
+    TO_NUMBER,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -351,6 +357,7 @@ pub fn instrSize(op: Op) usize {
         .YIELD => 2,
         .YIELD_STAR => 2,
         .PARAMS_DONE => 1,
+        .TO_NUMBER => 3,
         .AWAIT => 2,
         .END_FINALLY => 3,
         .JMP_IF_RET_COMPL => 4,

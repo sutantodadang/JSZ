@@ -477,15 +477,7 @@ fn callCb(arena: std.mem.Allocator, cb: Value, this_arg: Value, elem: Value, idx
 }
 
 fn isTruthy(v: Value) bool {
-    if (v.bits == 0) return false;
-    return switch (v.unbox()) {
-        .undefined_ => false,
-        .null_ => false,
-        .boolean => |b| b,
-        .number => |n| n != 0.0 and !std.math.isNan(n),
-        .string => |s| s.len > 0,
-        else => true,
-    };
+    return val_mod.toBoolean(v);
 }
 
 pub fn nativeForEach(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {

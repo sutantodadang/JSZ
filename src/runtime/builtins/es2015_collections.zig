@@ -473,14 +473,7 @@ pub fn nativeWeakSetCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
 // ---- WeakMap / WeakSet helpers ----
 
 fn isTruthy(v: Value) bool {
-    if (v.bits == 0) return false;
-    return switch (v.unbox()) {
-        .undefined_, .null_ => false,
-        .boolean => |b| b,
-        .number => |n| n != 0.0 and !std.math.isNan(n),
-        .string => |s| s.len > 0,
-        else => true,
-    };
+    return val_mod.toBoolean(v);
 }
 
 fn setTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror!void {

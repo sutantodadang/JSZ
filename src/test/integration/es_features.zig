@@ -381,3 +381,90 @@ test "es2020: Promise.allSettled preserves order" {
     try std.testing.expectEqualStrings("fulfilledfulfilledrejected", s);
 }
 
+
+
+// --------------------------------------------------------------- BigInt (ES2020)
+
+test "es2020: BigInt typeof and literal forms" {
+    try std.testing.expect(try evalToBool(std.testing.allocator, "typeof 123n === 'bigint'"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "typeof BigInt(1) === 'bigint'"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "typeof 1 === 'number'"));
+    // 0x/0o/0b literal prefixes carry over to BigInt literals.
+    try std.testing.expect(try evalToBool(std.testing.allocator, "0xffn === 255n && 0b1011n === 11n && 0o17n === 15n"));
+}
+
+test "es2020: BigInt arithmetic is arbitrary precision" {
+    const s = try evalToString(std.testing.allocator, "(2n ** 100n).toString()");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("1267650600228229401496703205376", s);
+    // Exact past 2^53, where f64 would lose precision.
+    const p = try evalToString(std.testing.allocator, "(9007199254740993n * 9007199254740993n).toString()");
+    defer std.testing.allocator.free(p);
+    try std.testing.expectEqualStrings("81129638414606699710187514626049", p);
+    // Division truncates toward zero; remainder takes the dividend's sign.
+    try std.testing.expect(try evalToBool(std.testing.allocator, "7n / 2n === 3n && -7n / 2n === -3n && -7n % 2n === -1n"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "2n + 3n === 5n && 2n - 5n === -3n && 4n * 5n === 20n"));
+}
+
+test "es2020: BigInt comparisons" {
+    try std.testing.expect(try evalToBool(std.testing.allocator, "1n < 2n && 2n > 1n && 2n <= 2n && !(2n >= 3n)"));
+    // Loose equality crosses the Number/BigInt boundary; strict does not.
+    try std.testing.expect(try evalToBool(std.testing.allocator, "1n == 1 && !(1n === 1) && 1n === 1n"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "1n < 2 && 2 > 1n"));
+}
+
+test "es2020: BigInt conversion — ctor, toString, valueOf, ToString/ToBoolean" {
+    try std.testing.expect(try evalToBool(std.testing.allocator, "BigInt(42) === 42n && BigInt('99') === 99n && BigInt(true) === 1n"));
+    const r = try evalToString(std.testing.allocator, "(255n).toString(16)");
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqualStrings("ff", r);
+    try std.testing.expect(try evalToBool(std.testing.allocator, "(7n).valueOf() === 7n"));
+    // ToString must NOT carry the `n` suffix (that is console-inspect syntax).
+    try std.testing.expect(try evalToBool(std.testing.allocator, "String(1n) === '1' && (1n + 'x') === '1x' && ('' + 255n) === '255'"));
+    // 0n is the only falsy BigInt.
+    try std.testing.expect(try evalToBool(std.testing.allocator, "Boolean(0n) === false && Boolean(1n) === true && !0n && !!(-1n)"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "(0n ? 1 : 2) === 2"));
+}
+
+test "es2020: BigInt cannot mix with Number in arithmetic" {
+    const src =
+        \\function t(f) { try { f(); return 'no'; } catch (e) { return e.name; } }
+        \\[t(function(){return 1n+1;}), t(function(){return 1+1n;}),
+        \\ t(function(){return 1n-1;}), t(function(){return 1n*2;}),
+        \\ t(function(){return 1n/2;}), t(function(){return 1n%2;}),
+        \\ t(function(){return 2n**2;}), t(function(){return +1n;})].join(',')
+    ;
+    const s = try evalToString(std.testing.allocator, src);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError", s);
+    // String concat and relational compare stay legal across the boundary.
+    try std.testing.expect(try evalToBool(std.testing.allocator, "(1n + 'x') === '1x' && (1n < 2) === true"));
+}
+
+test "es2020: BigInt division by zero and bad conversions throw" {
+    const src =
+        \\function t(f) { try { f(); return 'no'; } catch (e) { return e.name; } }
+        \\[t(function(){return 1n/0n;}), t(function(){return 1n%0n;}),
+        \\ t(function(){return 2n**-1n;}), t(function(){return BigInt('abc');}),
+        \\ t(function(){return BigInt(1.5);})].join(',')
+    ;
+    const s = try evalToString(std.testing.allocator, src);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("RangeError,RangeError,RangeError,SyntaxError,RangeError", s);
+}
+
+test "es2020: BigInt StringToBigInt handles sign, whitespace, and empty" {
+    // A signed decimal string is valid input even though `-10n` as a literal is
+    // really unary minus applied to `10n`.
+    try std.testing.expect(try evalToBool(std.testing.allocator, "BigInt('-10') === -10n && BigInt('+7') === 7n"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "BigInt('   7   ') === 7n && BigInt('     ') === 0n && BigInt('') === 0n"));
+    try std.testing.expect(try evalToBool(std.testing.allocator, "BigInt('   0b1111') === 15n && BigInt('0x1f') === 31n"));
+    const src =
+        \\function t(s) { try { BigInt(s); return 'no'; } catch (e) { return e.name; } }
+        \\// A sign is legal only on the decimal form; no points/exponents/Infinity.
+        \\[t('-0x1f'), t('1.5'), t('1e3'), t('Infinity'), t('-'), t('abc')].join(',')
+    ;
+    const s = try evalToString(std.testing.allocator, src);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError", s);
+}
