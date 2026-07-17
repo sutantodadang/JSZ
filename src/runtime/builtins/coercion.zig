@@ -113,7 +113,18 @@ pub fn toPrimitive(arena: std.mem.Allocator, v: Value, hint: Hint) anyerror!?Val
     }
 
     // 2. OrdinaryToPrimitive: method order depends on hint.
-    const names: [2][]const u8 = if (hint == .string)
+    return ordinaryToPrimitive(arena, v, hint == .string);
+}
+
+/// ES OrdinaryToPrimitive (7.1.1.1). `string_first` picks the "string" method
+/// order (toString before valueOf). Returns the produced primitive, null when
+/// neither method was callable (caller falls back to its default), or throws a
+/// TypeError when a callable method ran but no primitive resulted. Exposed so
+/// Date.prototype[@@toPrimitive] can invoke it without re-entering ToPrimitive's
+/// @@toPrimitive dispatch (which would recurse infinitely).
+pub fn ordinaryToPrimitive(arena: std.mem.Allocator, v: Value, string_first: bool) anyerror!?Value {
+    const obj = v.toPtr().object;
+    const names: [2][]const u8 = if (string_first)
         .{ "toString", "valueOf" }
     else
         .{ "valueOf", "toString" };

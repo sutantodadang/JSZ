@@ -207,16 +207,38 @@ pub fn nativeToLowerCase(arena: std.mem.Allocator, this_val: Value, _: []const V
     return val_mod.makeString(arena, out);
 }
 
+/// ES ToUint32 of a coerced Number.
+fn toUint32(n: f64) u32 {
+    if (!std.math.isFinite(n) or n == 0) return 0;
+    const int = @trunc(n);
+    const m = @mod(int, 4294967296.0);
+    const mm = if (m < 0) m + 4294967296.0 else m;
+    return @intFromFloat(mm);
+}
+
 pub fn nativeSplit(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
     const JsObject = @import("../../object/object.zig").JsObject;
 
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
 
-    // Check if separator is a RegExp
+    // ES 22.1.3.23 step 6/8: lim = ToUint32(limit); undefined → 2^32-1.
+    const lim: u32 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        toUint32(try realm_mod.toNumberValue(arena, args[1]))
+    else
+        0xFFFF_FFFF;
+
+    // A zero limit produces an empty array before the separator is even examined.
+    if (lim == 0) {
+        const empty = try JsObject.createArray(arena, arr_proto);
+        empty.array_length = 0;
+        return val_mod.makeObject(arena, empty);
+    }
+
+    // RegExp separator: delegate (limit-aware).
     if (args.len > 0 and args[0].bits != 0) {
         if (regexp_mod.getCompiledRegex(args[0])) |cr| {
-            return splitByRegex(arena, s, cr, arr_proto);
+            return splitByRegex(arena, s, cr, arr_proto, lim);
         }
     }
 
@@ -233,43 +255,53 @@ pub fn nativeSplit(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const arr = try JsObject.createArray(arena, arr_proto);
 
     if (sep == null) {
-        // No separator: return array with full string
-        const sv = try val_mod.makeString(arena, s);
-        try arr.set("0", sv);
+        // Undefined separator: the whole string is the single element.
+        try arr.set("0", try val_mod.makeString(arena, s));
         arr.array_length = 1;
         return val_mod.makeObject(arena, arr);
     }
 
     const sep_s = sep.?;
-    if (sep_s.len == 0) {
-        // Split into chars
-        var i: usize = 0;
-        while (i < s.len) : (i += 1) {
-            const ch = try arena.dupe(u8, s[i .. i + 1]);
-            const cv = try val_mod.makeString(arena, ch);
-            const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-            try arr.set(key, cv);
+
+    // Empty source string: [""] unless the separator also matches empty ("") → [].
+    if (s.len == 0) {
+        if (sep_s.len != 0) {
+            try arr.set("0", try val_mod.makeString(arena, ""));
+            arr.array_length = 1;
+        } else {
+            arr.array_length = 0;
         }
-        arr.array_length = @intCast(s.len);
         return val_mod.makeObject(arena, arr);
     }
 
-    // Split by separator
+    if (sep_s.len == 0) {
+        // Split into individual code units, honouring the limit.
+        var i: usize = 0;
+        var idx: u32 = 0;
+        while (i < s.len and idx < lim) : (i += 1) {
+            const ch = try arena.dupe(u8, s[i .. i + 1]);
+            const key = try std.fmt.allocPrint(arena, "{d}", .{idx});
+            try arr.set(key, try val_mod.makeString(arena, ch));
+            idx += 1;
+        }
+        arr.array_length = idx;
+        return val_mod.makeObject(arena, arr);
+    }
+
+    // Split by non-empty string separator, honouring the limit.
     var idx: u32 = 0;
     var rest = s;
-    while (true) {
+    while (idx < lim) {
         if (std.mem.indexOf(u8, rest, sep_s)) |pos| {
             const part = try arena.dupe(u8, rest[0..pos]);
-            const pv = try val_mod.makeString(arena, part);
             const key = try std.fmt.allocPrint(arena, "{d}", .{idx});
-            try arr.set(key, pv);
+            try arr.set(key, try val_mod.makeString(arena, part));
             idx += 1;
             rest = rest[pos + sep_s.len ..];
         } else {
             const part = try arena.dupe(u8, rest);
-            const pv = try val_mod.makeString(arena, part);
             const key = try std.fmt.allocPrint(arena, "{d}", .{idx});
-            try arr.set(key, pv);
+            try arr.set(key, try val_mod.makeString(arena, part));
             idx += 1;
             break;
         }
@@ -278,40 +310,71 @@ pub fn nativeSplit(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     return val_mod.makeObject(arena, arr);
 }
 
-fn splitByRegex(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mod.CompiledRegex, arr_proto: anytype) !Value {
+fn splitByRegex(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mod.CompiledRegex, arr_proto: anytype, lim: u32) !Value {
     const JsObject = @import("../../object/object.zig").JsObject;
     const arr = try JsObject.createArray(arena, arr_proto);
     var idx: u32 = 0;
-    var search_from: usize = 0;
 
-    while (search_from <= s.len) {
-        const m = regexp_mod.matchAnywhere(cr, s, search_from) orelse break;
+    // ES 22.2.6.14: an empty source string yields [] if the pattern matches at 0,
+    // else [""].
+    if (s.len == 0) {
+        if (regexp_mod.matchAnywhere(cr, s, 0) == null) {
+            try arr.set("0", try val_mod.makeString(arena, ""));
+            arr.array_length = 1;
+        } else {
+            arr.array_length = 0;
+        }
+        return val_mod.makeObject(arena, arr);
+    }
+
+    // p = start of the current segment; q = scan cursor. A match that ends at p
+    // (empty, or right where the previous segment began) is skipped so adjacent
+    // separators and zero-width matches behave per spec.
+    var p: usize = 0;
+    var q: usize = 0;
+    while (q < s.len) {
+        const m = regexp_mod.matchAnywhere(cr, s, q) orelse break;
         const match_start = m.start;
         const match_end = m.state.pos;
-
-        // Add segment from search_from to match_start
-        const part = try arena.dupe(u8, s[search_from..match_start]);
-        const pv = try val_mod.makeString(arena, part);
-        const key = try std.fmt.allocPrint(arena, "{d}", .{idx});
-        try arr.set(key, pv);
-        idx += 1;
-
-        if (match_end == match_start) {
-            // Zero-width match: advance by one to avoid infinite loop
-            if (search_from < s.len) {
-                search_from = match_start + 1;
-            } else {
-                break;
-            }
-        } else {
-            search_from = match_end;
+        if (match_start >= s.len) break;
+        if (match_end == p) {
+            // No progress at the segment start: advance the scan cursor.
+            q = match_start + 1;
+            continue;
         }
+        // Emit the text between the previous split point and this match.
+        const part = try arena.dupe(u8, s[p..match_start]);
+        const key = try std.fmt.allocPrint(arena, "{d}", .{idx});
+        try arr.set(key, try val_mod.makeString(arena, part));
+        idx += 1;
+        if (idx >= lim) {
+            arr.array_length = idx;
+            return val_mod.makeObject(arena, arr);
+        }
+        // Include capture groups from this match (unmatched → undefined, using
+        // the same start==0 && end==0 sentinel as RegExp exec).
+        var ci: u32 = 1;
+        while (ci <= cr.num_captures) : (ci += 1) {
+            const cap = m.state.captures[ci];
+            const cv = if (cap.start == 0 and cap.end == 0)
+                try val_mod.makeUndefined(arena)
+            else
+                try val_mod.makeString(arena, try arena.dupe(u8, s[cap.start..cap.end]));
+            const kk = try std.fmt.allocPrint(arena, "{d}", .{idx});
+            try arr.set(kk, cv);
+            idx += 1;
+            if (idx >= lim) {
+                arr.array_length = idx;
+                return val_mod.makeObject(arena, arr);
+            }
+        }
+        p = match_end;
+        q = match_end;
     }
-    // Remainder
-    const rem = try arena.dupe(u8, s[search_from..]);
-    const rv = try val_mod.makeString(arena, rem);
+    // Trailing segment from the last split point to the end.
+    const rem = try arena.dupe(u8, s[p..]);
     const rk = try std.fmt.allocPrint(arena, "{d}", .{idx});
-    try arr.set(rk, rv);
+    try arr.set(rk, try val_mod.makeString(arena, rem));
     idx += 1;
 
     arr.array_length = idx;
