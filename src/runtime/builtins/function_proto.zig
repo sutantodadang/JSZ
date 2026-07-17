@@ -104,6 +104,16 @@ fn makeRangeError(arena: std.mem.Allocator, msg: []const u8) !Value {
     return val_mod.makeObject(arena, obj);
 }
 
+/// %ThrowTypeError% — the shared poison-pill accessor used for the "caller"
+/// and "arguments" restricted properties on Function.prototype (and on strict /
+/// bound functions). Always throws a TypeError.
+pub fn nativeThrowTypeError(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    _ = this_val;
+    _ = args;
+    realm_mod.pending_exception = try makeTypeError(arena, "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them");
+    return error.JsException;
+}
+
 // ------------------------------------------------------------------ Function.prototype methods ---
 
 /// Function.prototype.call(thisArg, ...args)
@@ -121,32 +131,93 @@ pub fn nativeFunctionCall(arena: std.mem.Allocator, this_val: Value, args: []con
 /// Function.prototype.apply(thisArg, argArray)
 pub fn nativeFunctionApply(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const fn_val = this_val;
-    const call_this = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    // Extract argArray.
-    var call_args: []Value = &[_]Value{};
-    if (args.len > 1 and args[1].bits != 0) {
-        const arr_val = args[1];
-        if (arr_val.unbox() == .object) {
-            const arr = arr_val.toPtr().object;
-            if (arr.is_array) {
-                const len = arr.getArrayLength();
-                call_args = try arena.alloc(Value, len);
-                for (0..len) |i| {
-                    const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-                    call_args[i] = arr.get(key) orelse try val_mod.makeUndefined(arena);
-                }
-            }
-        }
+    // Step 1: If IsCallable(func) is false, throw a TypeError.
+    if (!isCallableFn(fn_val)) {
+        realm_mod.pending_exception = try makeTypeError(arena, "Function.prototype.apply called on non-callable");
+        return error.JsException;
     }
+    const call_this = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    // Step 2: If argArray is undefined or null, call with no arguments.
+    const arr_val = if (args.len > 1) args[1] else Value{};
+    if (arr_val.bits == 0 or arr_val.unbox() == .undefined_ or arr_val.unbox() == .null_) {
+        return invokeCallback(arena, call_this, fn_val, &[_]Value{}) catch |e| {
+            if (e == error.JsException) return error.JsException;
+            return e;
+        };
+    }
+    // Step 3: argList = CreateListFromArrayLike(argArray).
+    const call_args = try createListFromArrayLike(arena, arr_val);
     return invokeCallback(arena, call_this, fn_val, call_args) catch |e| {
         if (e == error.JsException) return error.JsException;
         return e;
     };
 }
 
+/// CreateListFromArrayLike (ES §7.3.18): reads "length" (ToLength) and each
+/// indexed element via [[Get]]. Throws TypeError if `obj` is not an Object.
+fn createListFromArrayLike(arena: std.mem.Allocator, obj: Value) ![]Value {
+    if (obj.bits == 0 or obj.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeError(arena, "CreateListFromArrayLike called on non-object");
+        return error.JsException;
+    }
+    const ctx = realm_mod.active_context orelse {
+        realm_mod.pending_exception = try makeTypeError(arena, "no active context");
+        return error.JsException;
+    };
+    const len_v = try ctx.getProp(arena, obj, "length");
+    const len = toLengthClamp(len_v);
+    const out = try arena.alloc(Value, len);
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        out[i] = try ctx.getProp(arena, obj, key);
+    }
+    return out;
+}
+
+/// ToLength restricted to what array-like `length` values in practice carry:
+/// a finite non-negative integer count, clamped into [0, 2^32-1] for allocation.
+fn toLengthClamp(v: Value) usize {
+    if (v.bits == 0) return 0;
+    const n: f64 = switch (v.unbox()) {
+        .number => v.unbox().number,
+        .boolean => if (v.unbox().boolean) 1 else 0,
+        .string => std.fmt.parseFloat(f64, v.toPtr().string) catch 0,
+        else => 0,
+    };
+    if (std.math.isNan(n) or n <= 0) return 0;
+    const capped = @min(n, @as(f64, @floatFromInt(std.math.maxInt(u32))));
+    return @intFromFloat(std.math.trunc(capped));
+}
+
+/// IsCallable for the four callable representations plus bound functions,
+/// callable proxies, and objects carrying a `__call__` slot.
+pub fn isCallableFn(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .native_function, .bc_function, .function => true,
+        .object => |o| {
+            if (o.internal_kind == .bound_function) return true;
+            if (o.internal_kind == .proxy) {
+                if (realm_mod.active_sym_proxy_target) |sym| {
+                    if (o.getOwnSym(sym)) |t| return isCallableFn(t);
+                }
+                return false;
+            }
+            return o.get("__call__") != null;
+        },
+        else => false,
+    };
+}
+
 /// Function.prototype.bind(thisArg, ...prefix) -> BoundFunction
 pub fn nativeFunctionBind(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const fn_val = this_val;
+    // Step 1: If IsCallable(Target) is false, throw a TypeError.
+    if (!isCallableFn(fn_val)) {
+        realm_mod.pending_exception = try makeTypeError(arena, "Function.prototype.bind called on non-callable");
+        return error.JsException;
+    }
     const bind_this = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     const prefix: []Value = if (args.len > 1) blk: {
         const p = try arena.alloc(Value, args.len - 1);
@@ -164,16 +235,46 @@ pub fn nativeFunctionBind(arena: std.mem.Allocator, this_val: Value, args: []con
     bound_obj.internal_kind = .bound_function;
     bound_obj.internal_slot = bd;
 
-    // SetFunctionLength / SetFunctionName (ES §20.2.3.2): length =
-    // max(0, target.length - boundArgs), name = "bound " + target.name. Both are
-    // non-writable, non-enumerable, configurable own data properties.
-    const tln = targetLenName(fn_val);
-    const blen = @max(0.0, tln.len - @as(f64, @floatFromInt(prefix.len)));
+    // SetFunctionLength (ES §20.2.3.2): read the target's "length" via [[Get]],
+    // apply ToIntegerOrInfinity, then L = max(targetLen - boundArgs, 0) with
+    // +∞ preserved and -∞ mapped to 0. Non-writable, non-enumerable, configurable.
+    const target_len = try getFnProp(arena, fn_val, "length");
+    var blen: f64 = 0;
+    if (target_len.bits != 0 and target_len.unbox() == .number) {
+        const tl = target_len.unbox().number;
+        if (std.math.isPositiveInf(tl)) {
+            blen = std.math.inf(f64);
+        } else if (std.math.isNegativeInf(tl) or std.math.isNan(tl)) {
+            blen = 0;
+        } else {
+            const ti = std.math.trunc(tl); // ToIntegerOrInfinity (finite here)
+            blen = @max(0.0, ti - @as(f64, @floatFromInt(prefix.len)));
+        }
+    }
     _ = try bound_obj.defineOwnData("length", try val_mod.makeNumber(arena, blen), .{ .writable = false, .enumerable = false, .configurable = true });
-    const bname = try std.fmt.allocPrint(arena, "bound {s}", .{tln.name});
+
+    // SetFunctionName: name = "bound " + (target.name if a String, else "").
+    const target_name = try getFnProp(arena, fn_val, "name");
+    const nm: []const u8 = if (target_name.bits != 0 and target_name.unbox() == .string)
+        target_name.toPtr().string
+    else
+        "";
+    const bname = try std.fmt.allocPrint(arena, "bound {s}", .{nm});
     _ = try bound_obj.defineOwnData("name", try val_mod.makeString(arena, bname), .{ .writable = false, .enumerable = false, .configurable = true });
 
     return val_mod.makeObject(arena, bound_obj);
+}
+
+/// [[Get]] a property of a function-valued target, honouring redefined own
+/// properties (via the active context's property machinery). Falls back to the
+/// intrinsic length/name when no active context is available.
+fn getFnProp(arena: std.mem.Allocator, v: Value, key: []const u8) !Value {
+    if (realm_mod.active_context) |ctx| {
+        return ctx.getProp(arena, v, key);
+    }
+    const tln = targetLenName(v);
+    if (std.mem.eql(u8, key, "length")) return val_mod.makeNumber(arena, tln.len);
+    return val_mod.makeString(arena, tln.name);
 }
 
 /// Read a function value's ECMAScript `.length` (declared param count) and

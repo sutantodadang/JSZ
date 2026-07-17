@@ -210,7 +210,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
                 .is_arrow = true,
                 .is_async = false,
                 .is_strict = is_strict,
-                .source_text = p.sourceSlice(left.start, p.current.start),
+                .source_text = p.sourceSlice(left.start, p.prev_end),
             },
         });
     }
@@ -299,6 +299,7 @@ pub fn parseAssignmentExpr(p: *Parser) ?*Node {
     {
         const save_lexer = p.lexer;
         const save_cur = p.current;
+        p.async_kw_start = p.current.start; // `async` position for the source span
         _ = p.advance(); // consume `async`
         const candidate = p.parseAssignmentExprCore(true);
         if (candidate) |c| {
@@ -314,6 +315,9 @@ pub fn parseAssignmentExpr(p: *Parser) ?*Node {
 
 pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
     const start = p.current.start;
+    // Source span for an async arrow begins at the caller-consumed `async`.
+    const src_start = if (is_async_arrow and p.async_kw_start != 0) p.async_kw_start else start;
+    p.async_kw_start = 0;
     // Conditional has higher precedence than assignment.
     const left = p.parseConditionalExpr() orelse return null;
     // ES2015 arrow function: params => body
@@ -351,7 +355,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
                 .is_arrow = true,
                 .is_async = is_async_arrow,
                 .is_strict = is_strict,
-                .source_text = p.sourceSlice(start, p.current.start),
+                .source_text = p.sourceSlice(src_start, p.prev_end),
             },
         });
     }
@@ -1468,6 +1472,7 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
             // expression. Contextual: only when `function` follows on the
             // same line.
             if (p.currentIsAsyncKw() and p.peekNext().kind == .kw_function and !p.peekNext().line_terminator_before) {
+                p.async_kw_start = p.current.start; // `async` position for the source span
                 _ = p.advance(); // consume `async`
                 return p.parseFunctionExpr(true);
             }
@@ -1648,7 +1653,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_generator = m_is_gen,
                     .is_async = m_is_async,
                     .is_strict = parser_file.hasUseStrict(am_body),
-                    .source_text = p.sourceSlice(prop_start, p.current.start),
+                    .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
             if (p.super_used) super_methods.append(p.arena, am_fn) catch {
@@ -1685,7 +1690,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                         .is_generator = false,
                         .is_async = false,
                         .is_strict = parser_file.hasUseStrict(cm_body),
-                        .source_text = p.sourceSlice(prop_start, p.current.start),
+                        .source_text = p.sourceSlice(prop_start, p.prev_end),
                     },
                 }) orelse return null;
                 if (p.super_used) super_methods.append(p.arena, cm_fn) catch {
@@ -1802,7 +1807,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_generator = false,
                     .is_async = false,
                     .is_strict = parser_file.hasUseStrict(acc_body),
-                    .source_text = p.sourceSlice(prop_start, p.current.start),
+                    .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
             if (p.super_used) super_methods.append(p.arena, acc_fn) catch {
@@ -1833,7 +1838,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_generator = false,
                     .is_async = false,
                     .is_strict = parser_file.hasUseStrict(m_body),
-                    .source_text = p.sourceSlice(prop_start, p.current.start),
+                    .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
             if (p.super_used) super_methods.append(p.arena, m_fn) catch {
@@ -2024,7 +2029,9 @@ pub fn parseArrayLiteral(p: *Parser) ?*Node {
 }
 
 pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
-    const start = p.current.start;
+    // Source span for an async function expression begins at the caller-consumed `async`.
+    const start = if (is_async and p.async_kw_start != 0) p.async_kw_start else p.current.start;
+    p.async_kw_start = 0;
     _ = p.advance(); // consume 'function'
     const is_generator = p.match(.star);
     var name: ?[]const u8 = null;
@@ -2057,7 +2064,7 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
             .is_generator = is_generator,
             .is_async = is_async,
             .is_strict = is_strict,
-            .source_text = p.sourceSlice(start, p.current.start),
+            .source_text = p.sourceSlice(start, p.prev_end),
         },
     });
 }

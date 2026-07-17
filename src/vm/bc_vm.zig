@@ -277,6 +277,26 @@ pub const BcVm = struct {
     }
 
     /// Phase 4d: Context re-entry — called by invokeCallback for JS functions.
+    /// OrdinaryCallBindThis (ES §10.2.1.1): compute the `this` value bound into a
+    /// bc-function frame. Arrows use their captured lexical `this`; strict
+    /// functions use the caller value verbatim; sloppy functions substitute the
+    /// (function's realm's) global object for undefined/null and ToObject-box a
+    /// primitive `this`.
+    pub fn bindThisValue(self: *BcVm, fn_ptr: *const BcFunction, closure: *BcClosure, this_val: Value) !Value {
+        if (fn_ptr.is_arrow) return closure.captured_this;
+        if (fn_ptr.is_strict) return this_val;
+        const realm_m = @import("../runtime/realm.zig");
+        if (this_val.bits == 0 or this_val.isUndefined() or this_val.isNull()) {
+            if (closure.realm) |r_opaque| {
+                const fr = @as(*Realm, @ptrCast(@alignCast(r_opaque)));
+                return fr.global_env.lookup("globalThis") catch this_val;
+            }
+            if (realm_m.active_global_env) |genv| return genv.lookup("globalThis") catch this_val;
+            return this_val;
+        }
+        return realm_m.toObjectForThis(self.arena, this_val);
+    }
+
     fn bcInvokeJs(ptr: *anyopaque, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
         _ = arena;
         const realm_nt = @import("../runtime/realm.zig");
@@ -325,22 +345,7 @@ pub const BcVm = struct {
                 // object. The inline Call opcode does this; the native re-entry
                 // path (builtins invoking user callbacks, e.g. %TypedArray%
                 // .prototype.every) must do it too.
-                const frame_this: Value = if (fn_ptr.is_arrow)
-                    eff_this // arrow: exact captured lexical this, no coercion
-                else if (!fn_ptr.is_strict and (eff_this.isUndefined() or eff_this.isNull())) blk: {
-                    // Cross-realm: use the FUNCTION's realm's globalThis, not
-                    // the current active realm's.
-                    const realm_m = @import("../runtime/realm.zig");
-                    if (closure.realm) |r_opaque| {
-                        const fr = @as(*Realm, @ptrCast(@alignCast(r_opaque)));
-                        break :blk fr.global_env.lookup("globalThis") catch eff_this;
-                    }
-                    // Fallback: no realm tagged — use active global env.
-                    if (realm_m.active_global_env) |genv| {
-                        break :blk genv.lookup("globalThis") catch eff_this;
-                    }
-                    break :blk eff_this;
-                } else eff_this;
+                const frame_this: Value = try self.bindThisValue(fn_ptr, closure, this_val);
                 const caller_idx = if (self.frames.items.len > 0) self.frames.items.len - 1 else 0;
                 try self.frames.append(self.arena, BcCallFrame{
                     .func = fn_ptr,
@@ -552,6 +557,18 @@ pub const BcVm = struct {
             },
             .object => |o| {
                 if (o.internal_kind == .proxy) return try self.proxyConstruct(o, args, ctor);
+                // Bound function exotic [[Construct]]: prepend bound args, and if
+                // newTarget is the bound function itself substitute the target.
+                if (o.internal_kind == .bound_function) {
+                    const bd: *function_proto.BoundData = @ptrCast(@alignCast(o.internal_slot.?));
+                    const total = bd.prefix.len + args.len;
+                    const combined = try self.arena.alloc(Value, total);
+                    for (bd.prefix, 0..) |v, i| combined[i] = v;
+                    for (args, 0..) |v, i| combined[bd.prefix.len + i] = v;
+                    var nt = new_target;
+                    if (nt.bits != 0 and nt.unbox() == .object and nt.toPtr().object == o) nt = bd.target;
+                    return try self.constructImpl(bd.target, combined, nt);
+                }
                 if (o.get("__call__")) |cv| {
                     if (cv.bits != 0 and cv.unbox() == .native_function) {
                         // Default proto = ctor's own .prototype (the intrinsic per-kind
@@ -1493,6 +1510,26 @@ pub const BcVm = struct {
                     self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
                     return null;
                 }
+                // Bound function exotic [[Construct]]: delegate to constructImpl
+                // (which prepends bound args and substitutes newTarget). NewTarget
+                // for a top-level `new B()` is the bound function itself.
+                if (obj.internal_kind == .bound_function) {
+                    const args = try self.arena.alloc(Value, nargs);
+                    for (0..nargs) |i| args[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
+                    const res = self.constructImpl(callee_val, args, callee_val) catch |e| {
+                        if (e == error.JsException) {
+                            const realm_m = @import("../runtime/realm.zig");
+                            if (realm_m.pending_exception.bits != 0) {
+                                self.last_exception_value = realm_m.pending_exception;
+                                realm_m.pending_exception = Value{};
+                            }
+                            return "__js_exception__";
+                        }
+                        return e;
+                    };
+                    self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+                    return null;
+                }
                 // Error constructor object: has __call__ and prototype.
                 if (obj.get("__call__")) |call_val| {
                     if (call_val.bits != 0 and call_val.unbox() == .native_function) {
@@ -1607,7 +1644,7 @@ pub const BcVm = struct {
                     .env = call_env,
                     .return_dst = ret_dst,
                     .caller_idx = caller_idx,
-                    .this_val = eff_this,
+                    .this_val = try self.bindThisValue(fn_ptr, closure, this_val),
                 });
                 return null;
             },
@@ -2238,7 +2275,10 @@ pub const BcVm = struct {
                 }
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    // Full [[Get]] on %Function.prototype% so inherited accessors
+                    // (the "caller"/"arguments" %ThrowTypeError% poison pills) fire
+                    // their getter with the function value as the receiver.
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -2273,7 +2313,7 @@ pub const BcVm = struct {
                 // Phase 4d: delegate to Function.prototype (call, apply, bind).
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_function_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    return self.getFromProtoWithReceiver(proto, key, obj_val);
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -2975,23 +3015,9 @@ pub const BcVm = struct {
                     }
                 }
 
-                // Sloppy-mode this correction (ES §10.2.1.1 step 2): non-strict
-                // function called with undefined/null this → substitute global object.
-                // Arrows use their captured `this` verbatim (no coercion).
-                const frame_this: Value = if (fn_ptr.is_arrow)
-                    this_val_eff
-                else if (!fn_ptr.is_strict and (this_val_eff.isUndefined() or this_val_eff.isNull())) blk: {
-                    const realm_m = @import("../runtime/realm.zig");
-                    // Cross-realm: use the FUNCTION's realm's globalThis.
-                    if (closure.realm) |r_opaque| {
-                        const fr = @as(*Realm, @ptrCast(@alignCast(r_opaque)));
-                        break :blk fr.global_env.lookup("globalThis") catch this_val_eff;
-                    }
-                    if (realm_m.active_global_env) |genv| {
-                        break :blk genv.lookup("globalThis") catch this_val_eff;
-                    }
-                    break :blk this_val_eff;
-                } else this_val_eff;
+                // OrdinaryCallBindThis (ES §10.2.1.1): global for undefined/null,
+                // ToObject-box a primitive receiver, arrows keep captured this.
+                const frame_this: Value = try self.bindThisValue(fn_ptr, closure, this_val);
 
                 const caller_idx = self.frames.items.len - 1;
                 try self.frames.append(self.arena, BcCallFrame{
