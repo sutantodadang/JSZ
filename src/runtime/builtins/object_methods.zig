@@ -154,21 +154,51 @@ pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Valu
 
 /// ES2015 Object.assign(target, ...sources): copy enumerable own properties.
 pub fn nativeObjectAssign(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) {
-        if (args.len > 0) return args[0];
-        return try val_mod.makeUndefined(arena);
-    }
-    const target_obj = args[0].toPtr().object;
+    const realm_mod = @import("../realm.zig");
+    const target = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    // Step 1: to = ToObject(target) — null/undefined throw.
+    if (target.bits == 0 or target.unbox() == .undefined_ or target.unbox() == .null_)
+        return throwTypeError(arena, "Object.assign target must be coercible to an object");
+    const to_val = try realm_mod.toObjectForThis(arena, target);
+    if (to_val.bits == 0 or to_val.unbox() != .object) return to_val;
+    const target_obj = to_val.toPtr().object;
+    const ctx = realm_mod.active_context;
+
+    if (args.len <= 1) return to_val;
     for (args[1..]) |src| {
-        if (src.bits == 0 or src.unbox() != .object) continue;
-        const src_obj = src.toPtr().object;
+        // Skip undefined/null sources.
+        if (src.bits == 0 or src.unbox() == .undefined_ or src.unbox() == .null_) continue;
+
+        // A primitive string source contributes its indexed characters (ToObject
+        // makes a String exotic whose own enumerable keys are its indices).
+        if (src.unbox() == .string) {
+            const s = src.toPtr().string;
+            for (s, 0..) |_, i| {
+                const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+                try target_obj.set(key, try val_mod.makeString(arena, s[i .. i + 1]));
+            }
+            continue;
+        }
+        const from_val = try realm_mod.toObjectForThis(arena, src);
+        if (from_val.bits == 0 or from_val.unbox() != .object) continue;
+        const src_obj = from_val.toPtr().object;
+
+        // String property keys in own order, then symbol keys (per OwnPropertyKeys).
         for (src_obj.ownKeys()) |k| {
             if (!src_obj.isEnumerable(k)) continue;
-            const v = src_obj.getOwn(k) orelse continue;
-            try target_obj.set(k, v);
+            const v = if (ctx) |c| try c.getProp(arena, from_val, k) else (src_obj.getOwn(k) orelse continue);
+            if (ctx) |c| try c.setProp(arena, to_val, k, v) else try target_obj.set(k, v);
+        }
+        // Copy enumerable symbol-keyed own properties.
+        var si: usize = 0;
+        while (si < src_obj.sym_props.items.len) : (si += 1) {
+            const sp = src_obj.sym_props.items[si];
+            if (!sp.attr.enumerable) continue;
+            const v = if (ctx) |c| try c.getPropSym(arena, from_val, sp.key) else sp.value;
+            try target_obj.setSym(sp.key, v);
         }
     }
-    return args[0];
+    return to_val;
 }
 
 /// ES2017 Object.entries(o): array of [key, value] pairs.
@@ -216,32 +246,72 @@ pub fn nativeObjectEntries(arena: std.mem.Allocator, _: Value, args: []const Val
     return val_mod.makeObject(arena, arr);
 }
 
-/// ES2019 Object.fromEntries(iterable): build a plain object from [key,value] array pairs.
+/// ES2019 Object.fromEntries(iterable) (§20.1.2.7): iterate `iterable`, and for
+/// each [key, value] entry create a data property with key = ToPropertyKey(key).
 pub fn nativeObjectFromEntries(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
+    const coercion_mod = @import("coercion.zig");
+    const fp = @import("function_proto.zig");
+    const collections = @import("es2015_collections.zig");
+
+    // RequireObjectCoercible(iterable): undefined/null (or a missing arg) throws.
+    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() == .undefined_ or args[0].unbox() == .null_)
+        return throwTypeError(arena, "Object.fromEntries requires an iterable argument");
+    const iterable = args[0];
+
     const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
     const out = try JsObject.create(arena, obj_proto);
+    const ctx = realm_mod.active_context orelse return val_mod.makeObject(arena, out);
 
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeObject(arena, out);
-    const list = args[0].toPtr().object;
-    if (!list.is_array) return val_mod.makeObject(arena, out);
-
-    var i: usize = 0;
-    while (i < list.array_length) : (i += 1) {
-        const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const entry = list.getOwn(ek) orelse continue;
-        if (entry.bits == 0 or entry.unbox() != .object) continue;
-        const pair = entry.toPtr().object;
-        const kv = pair.getOwn("0") orelse continue;
-        const vv = pair.getOwn("1") orelse try val_mod.makeUndefined(arena);
-        const key: []const u8 = switch (kv.unbox()) {
-            .string => |s| s,
-            .number => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
-            else => continue,
+    const iter = try collections.nativeGetIterator(arena, Value{}, &[_]Value{iterable});
+    const next_fn = try ctx.getProp(arena, iter, "next");
+    while (true) {
+        const res = try fp.invokeCallback(arena, iter, next_fn, &[_]Value{});
+        if (res.bits == 0 or res.unbox() != .object)
+            return throwTypeError(arena, "iterator.next() returned a non-object");
+        const done = try ctx.getProp(arena, res, "done");
+        if (val_mod.toBoolean(done)) break;
+        const entry = try ctx.getProp(arena, res, "value");
+        // Each entry must be an Object; otherwise close the iterator (best-effort) and throw.
+        if (entry.bits == 0 or entry.unbox() != .object) {
+            try iteratorCloseIgnore(arena, ctx, iter);
+            return throwTypeError(arena, "Object.fromEntries entry is not an object");
+        }
+        const key = ctx.getProp(arena, entry, "0") catch |e| {
+            try iteratorCloseIgnore(arena, ctx, iter);
+            return e;
         };
-        try out.set(key, vv);
+        const value = ctx.getProp(arena, entry, "1") catch |e| {
+            try iteratorCloseIgnore(arena, ctx, iter);
+            return e;
+        };
+        // ToPropertyKey(key): a Symbol stays a symbol key; else ToString it.
+        const prim = coercion_mod.toPrimitive(arena, key, .string) catch |e| {
+            try iteratorCloseIgnore(arena, ctx, iter);
+            return e;
+        };
+        if (prim != null and prim.?.bits != 0 and prim.?.unbox() == .symbol) {
+            try out.setSym(prim.?, value);
+        } else {
+            const ks = realm_mod.stringPrimitive(arena, if (prim) |p| p else key) catch |e| {
+                try iteratorCloseIgnore(arena, ctx, iter);
+                return e;
+            };
+            try out.set(ks, value);
+        }
     }
     return val_mod.makeObject(arena, out);
+}
+
+/// IteratorClose that swallows any error from the return() call (used on the
+/// abrupt-completion path, where the original exception takes precedence).
+fn iteratorCloseIgnore(arena: std.mem.Allocator, ctx: anytype, iter: Value) !void {
+    const fp = @import("function_proto.zig");
+    const ret = ctx.getProp(arena, iter, "return") catch return;
+    if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_) return;
+    _ = fp.invokeCallback(arena, iter, ret, &[_]Value{}) catch {
+        @import("../realm.zig").pending_exception = Value{};
+    };
 }
 
 fn makeDataDescriptor(arena: std.mem.Allocator, value: Value) !Value {
