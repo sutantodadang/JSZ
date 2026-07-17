@@ -3320,7 +3320,7 @@ pub const Realm = struct {
                 try ctor_obj.set("assign", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectAssign, "assign", 0));
                 const entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectEntries);
                 try ctor_obj.set("entries", entries_fn);
-                const from_entries_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectFromEntries);
+                const from_entries_fn = try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectFromEntries, "fromEntries", 1);
                 try ctor_obj.set("fromEntries", from_entries_fn);
                 const gopd_fn = try val_mod.makeNativeFunction(arena, obj_methods_mod.nativeObjectGetOwnPropertyDescriptors);
                 try ctor_obj.set("getOwnPropertyDescriptors", gopd_fn);
