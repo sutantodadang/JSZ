@@ -3566,10 +3566,12 @@ pub const Realm = struct {
         // ---- ES2015 Symbol ----
         const symbol_proto = try JsObject.create(arena, object_proto);
         try symbol_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolToString, "toString", 0));
+        try symbol_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolValueOf, "valueOf", 0));
         active_symbol_proto = symbol_proto;
         const symbol_ctor = try JsObject.create(arena, null);
         try symbol_ctor.set("__call__", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolCall));
         try symbol_ctor.set("prototype", try val_mod.makeObject(arena, symbol_proto));
+        _ = try symbol_proto.defineOwnData("constructor", try val_mod.makeObject(arena, symbol_ctor), .{ .writable = true, .enumerable = false, .configurable = true });
         // Fresh realm ⇒ fresh per-agent symbol registry. The registry's buffers
         // live in this realm's arena; a stale registry from a prior (freed) realm
         // dangles and causes a use-after-free on the next Symbol.for.
@@ -3580,7 +3582,8 @@ pub const Realm = struct {
         const wk_names = [_][]const u8{ "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable", "match", "matchAll", "replace", "search", "split", "species", "toPrimitive", "toStringTag", "unscopables" };
         for (wk_names) |name| {
             const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
-            try symbol_ctor.set(name, try val_mod.makeSymbol(arena, desc));
+            // Well-known symbols are non-writable, non-enumerable, non-configurable.
+            _ = try symbol_ctor.defineOwnData(name, try val_mod.makeSymbol(arena, desc), .{ .writable = false, .enumerable = false, .configurable = false });
         }
         // Symbol.prototype.constructor === Symbol, and the `description` accessor
         // (a getter holder `{ get: nativeFn }`, matching the live-reexport pattern).
@@ -3611,9 +3614,15 @@ pub const Realm = struct {
             if (date_mod.active_date_proto) |dp| {
                 try dp.setSym(symv, try val_mod.makeNativeFunction(arena, date_mod.nativeDateToPrimitive));
             }
+            // Symbol.prototype[@@toPrimitive] (non-writable, non-enumerable, configurable).
+            _ = try symbol_proto.defineOwnDataSym(symv, try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolToPrimitive, "[Symbol.toPrimitive]", 1), .{ .writable = false, .enumerable = false, .configurable = true });
         }
         // Capture Symbol.toStringTag and Symbol.species.
         active_sym_to_string_tag = symbol_ctor.getOwn("toStringTag");
+        if (active_sym_to_string_tag) |symv| {
+            // Symbol.prototype[@@toStringTag] = "Symbol" (non-writable/enumerable, configurable).
+            _ = try symbol_proto.defineOwnDataSym(symv, try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
+        }
         active_sym_species = symbol_ctor.getOwn("species");
         // Capture the RegExp-related well-known symbols and install the
         // RegExp.prototype[@@match/@@replace/@@search/@@split/@@matchAll] methods
