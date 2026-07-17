@@ -1477,23 +1477,11 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
 }
 
 pub fn nativeRegExpTest(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const cr = getCompiledRegex(this_val) orelse return val_mod.makeBool(arena, false);
-    const s: []const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .string => |st| st,
-            else => "",
-        }
-    else
-        "";
-
-    const use_li = cr.flags.global or cr.flags.sticky;
-    const from: usize = if (use_li) getLastIndex(this_val) else 0;
-    if (findMatch(cr, s, from)) |m| {
-        if (use_li) try setLastIndex(arena, this_val, m.state.pos);
-        return val_mod.makeBool(arena, true);
-    }
-    if (use_li) try setLastIndex(arena, this_val, 0);
-    return val_mod.makeBool(arena, false);
+    // ES §22.2.6.16: R must be an Object; result = RegExpExec(R, ToString(string)).
+    try requireObject(arena, this_val, "RegExp.prototype.test");
+    const s_str = if (args.len > 0) try realm_mod.stringPrimitive(arena, args[0]) else "undefined";
+    const match = try regExpExec(arena, this_val, try val_mod.makeString(arena, s_str));
+    return val_mod.makeBool(arena, !(match.bits == 0 or match.unbox() == .null_));
 }
 
 pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1989,18 +1977,31 @@ pub fn nativeRegExpGetSource(arena: std.mem.Allocator, this_val: Value, _: []con
     return val_mod.makeString(arena, "(?:)");
 }
 
+/// flags getter (ES §22.2.6.4): a generic accessor that reads each flag
+/// property via [[Get]] and ToBoolean, appending the letters in the fixed order
+/// d, g, i, m, s, u, v, y. Works on any object, not only RegExp instances.
 pub fn nativeRegExpGetFlags(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object)
         return realm_mod.throwTypeError(arena, "RegExp.prototype.flags called on incompatible receiver");
-    const cr = getCompiledRegex(this_val) orelse return val_mod.makeString(arena, "");
+    const pairs = [_]struct { prop: []const u8, ch: u8 }{
+        .{ .prop = "hasIndices", .ch = 'd' },
+        .{ .prop = "global", .ch = 'g' },
+        .{ .prop = "ignoreCase", .ch = 'i' },
+        .{ .prop = "multiline", .ch = 'm' },
+        .{ .prop = "dotAll", .ch = 's' },
+        .{ .prop = "unicode", .ch = 'u' },
+        .{ .prop = "unicodeSets", .ch = 'v' },
+        .{ .prop = "sticky", .ch = 'y' },
+    };
     var buf: [8]u8 = undefined;
     var len: usize = 0;
-    if (cr.flags.global) { buf[len] = 'g'; len += 1; }
-    if (cr.flags.ignore_case) { buf[len] = 'i'; len += 1; }
-    if (cr.flags.multiline) { buf[len] = 'm'; len += 1; }
-    if (cr.flags.dotall) { buf[len] = 's'; len += 1; }
-    if (cr.flags.unicode) { buf[len] = 'u'; len += 1; }
-    if (cr.flags.sticky) { buf[len] = 'y'; len += 1; }
+    for (pairs) |p| {
+        const v = try ctxGetProp(arena, this_val, p.prop);
+        if (val_mod.toBoolean(v)) {
+            buf[len] = p.ch;
+            len += 1;
+        }
+    }
     const owned = try arena.dupe(u8, buf[0..len]);
     return val_mod.makeString(arena, owned);
 }
