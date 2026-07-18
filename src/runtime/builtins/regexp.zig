@@ -22,6 +22,7 @@
 //!   - \s includes U+2028, U+2029, U+FEFF, all Zs separators.
 const std = @import("std");
 const utab = @import("unicode_tables.zig");
+const uprop = @import("unicode_prop_tables.zig");
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
@@ -172,8 +173,18 @@ pub const CharClass = struct {
     /// Extra codepoint ranges for chars > 255, populated only under /u.
     /// Uses the arena allocator; starts empty.
     extra_ranges: std.ArrayListUnmanaged(CpRange) = .{},
+    /// Unicode property-escape tables (\p{...}/\P{...}) under /u. Each entry is a
+    /// sorted, disjoint range table plus a per-property negation flag so that
+    /// `\P{X}` inside a character class means "the complement of X".
+    prop_refs: std.ArrayListUnmanaged(PropRef) = .{},
 
     pub const CpRange = struct { lo: u21, hi: u21 };
+    pub const PropRef = struct { table: []const [2]u21, negated: bool };
+
+    /// Add a Unicode property-escape table (binary-searched at match time).
+    pub fn addPropTable(self: *CharClass, alloc: std.mem.Allocator, table: []const [2]u21, negated: bool) !void {
+        try self.prop_refs.append(alloc, .{ .table = table, .negated = negated });
+    }
 
     /// Match a single byte (non-unicode mode fast path).
     pub fn matches(self: *const CharClass, c: u8) bool {
@@ -195,7 +206,34 @@ pub const CharClass = struct {
                 }
             }
         }
+        if (!hit) {
+            for (self.prop_refs.items) |pr| {
+                const in_table = tableContains(pr.table, cp);
+                if (if (pr.negated) !in_table else in_table) {
+                    hit = true;
+                    break;
+                }
+            }
+        }
         return if (self.negate) !hit else hit;
+    }
+
+    /// Binary search a sorted, disjoint [lo,hi] range table for `cp`.
+    fn tableContains(table: []const [2]u21, cp: u21) bool {
+        var lo: usize = 0;
+        var hi: usize = table.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const r = table[mid];
+            if (cp < r[0]) {
+                hi = mid;
+            } else if (cp > r[1]) {
+                lo = mid + 1;
+            } else {
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn addChar(self: *CharClass, c: u8) void {
@@ -791,26 +829,11 @@ const PatternParser = struct {
                             if (self.eof()) return ParseError.InvalidPattern;
                             const name = self.src[name_start..self.pos];
                             self.advance();
-                            const tmp_cc = try self.alloc.create(CharClass);
-                            tmp_cc.* = CharClass{};
-                            const found = try fillPropertyClass(self.alloc, tmp_cc, name, true);
-                            if (!found) return ParseError.InvalidPattern;
-                            // Merge tmp_cc into cc (bitmap + extra_ranges)
-                            for (tmp_cc.bitmap, 0..) |b, idx| {
-                                if (b) cc.bitmap[idx] = true;
-                            }
-                            for (tmp_cc.extra_ranges.items) |r| {
-                                cc.extra_ranges.append(self.alloc, r) catch return ParseError.OutOfMemory;
-                            }
-                            if (esc == 'P') {
-                                // Invert: negate flag is already on cc from outer ^, this is \P inside [...]
-                                // Actually \P inside [...] means the complement of the property set.
-                                // We need to XOR-negate what we just added. Easiest: add negated version.
-                                // For simplicity: rebuild: clear what we added and add the complement.
-                                // This is complex; for now we just negate the cc negate flag (approximate).
-                                // TODO: proper \P inside [...] merging requires set difference. For now
-                                // the bitmap bits set above remain — this is the same behavior as before.
-                            }
+                            const table = uprop.lookup(name) orelse return ParseError.InvalidPattern;
+                            // `\P{X}` inside [...] means "the complement of X"; the
+                            // per-property negation flag handles this correctly when
+                            // OR-combined with the rest of the class.
+                            cc.addPropTable(self.alloc, table, esc == 'P') catch return ParseError.OutOfMemory;
                         }
                     },
                     else => cc.addChar(esc),
@@ -983,11 +1006,10 @@ const PatternParser = struct {
                 if (self.eof()) return ParseError.InvalidPattern;
                 const name = self.src[name_start..self.pos];
                 self.advance(); // }
+                const table = uprop.lookup(name) orelse return ParseError.InvalidPattern;
                 const cc = try self.alloc.create(CharClass);
                 cc.* = CharClass{};
-                const found = try fillPropertyClass(self.alloc, cc, name, self.unicode);
-                if (!found) return ParseError.InvalidPattern;
-                if (c == 'P') cc.negate = !cc.negate;
+                cc.addPropTable(self.alloc, table, c == 'P') catch return ParseError.OutOfMemory;
                 return RegexNode{ .char_class = cc };
             },
             'n' => RegexNode{ .literal = '\n' },

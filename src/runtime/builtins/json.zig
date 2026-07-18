@@ -22,12 +22,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 // ---------------------------------------------------------------- stringify ---
 
 fn jsonIsCallable(v: Value) bool {
-    if (v.bits == 0) return false;
-    return switch (v.unbox()) {
-        .function, .bc_function, .native_function => true,
-        .object => |o| o.get("__call__") != null,
-        else => false,
-    };
+    // Canonical IsCallable: also recognizes bound functions and callable proxies.
+    return @import("../builtins/function_proto.zig").isCallableFn(v);
 }
 
 /// SerializeJSONProperty transform (ES §25.5.2.2 partial): call value.toJSON(key)

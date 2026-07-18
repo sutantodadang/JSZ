@@ -9,6 +9,7 @@ const regexp_mod = @import("./regexp.zig");
 const function_proto_mod = @import("./function_proto.zig");
 const realm_mod = @import("../realm.zig");
 const coercion_mod = @import("./coercion.zig");
+const unorm = @import("unicode_normalize.zig");
 
 /// Throw a TypeError with `msg` and return error.JsException.
 /// Used by coerceThis for null/undefined/Symbol receivers.
@@ -16,6 +17,15 @@ fn throwTypeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror![]const
     const JsObject = @import("../../object/object.zig").JsObject;
     const obj = try JsObject.create(arena, realm_mod.error_proto_TypeError);
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
+}
+
+fn throwRangeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror![]const u8 {
+    const JsObject = @import("../../object/object.zig").JsObject;
+    const obj = try JsObject.create(arena, realm_mod.error_proto_RangeError);
+    try obj.set("name", try val_mod.makeString(arena, "RangeError"));
     try obj.set("message", try val_mod.makeString(arena, msg));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
     return error.JsException;
@@ -1317,5 +1327,177 @@ pub fn nativeToWellFormed(arena: std.mem.Allocator, this_val: Value, _: []const 
         }
         i += dec.len;
     }
+    return val_mod.makeString(arena, try arena.dupe(u8, buf.items));
+}
+
+// ============================================================ normalize =======
+
+const NormForm = enum { nfc, nfd, nfkc, nfkd };
+
+// Hangul syllable composition/decomposition constants (UAX #15).
+const HANGUL_S_BASE: u21 = 0xAC00;
+const HANGUL_L_BASE: u21 = 0x1100;
+const HANGUL_V_BASE: u21 = 0x1161;
+const HANGUL_T_BASE: u21 = 0x11A7;
+const HANGUL_L_COUNT: u21 = 19;
+const HANGUL_V_COUNT: u21 = 21;
+const HANGUL_T_COUNT: u21 = 28;
+const HANGUL_N_COUNT: u21 = HANGUL_V_COUNT * HANGUL_T_COUNT; // 588
+const HANGUL_S_COUNT: u21 = HANGUL_L_COUNT * HANGUL_N_COUNT; // 11172
+
+/// Encode a single code point as WTF-8, mirroring `decodeWtf8At` (surrogates →
+/// 3-byte forms; astral → 4-byte forms) so normalize round-trips the engine's
+/// string representation exactly.
+fn encodeWtf8Cp(buf: *std.ArrayList(u8), arena: std.mem.Allocator, cp: u21) !void {
+    if (cp <= 0x7F) {
+        try buf.append(arena, @intCast(cp));
+    } else if (cp <= 0x7FF) {
+        try buf.append(arena, @intCast(0xC0 | (cp >> 6)));
+        try buf.append(arena, @intCast(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        try buf.append(arena, @intCast(0xE0 | (cp >> 12)));
+        try buf.append(arena, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+        try buf.append(arena, @intCast(0x80 | (cp & 0x3F)));
+    } else {
+        try buf.append(arena, @intCast(0xF0 | (cp >> 18)));
+        try buf.append(arena, @intCast(0x80 | ((cp >> 12) & 0x3F)));
+        try buf.append(arena, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+        try buf.append(arena, @intCast(0x80 | (cp & 0x3F)));
+    }
+}
+
+/// Recursively append the (compat or canonical) decomposition of `cp` to `out`,
+/// expanding Hangul syllables algorithmically.
+fn appendDecomp(out: *std.ArrayList(u21), arena: std.mem.Allocator, cp: u21, compat: bool) !void {
+    if (cp >= HANGUL_S_BASE and cp < HANGUL_S_BASE + HANGUL_S_COUNT) {
+        const si = cp - HANGUL_S_BASE;
+        try out.append(arena, HANGUL_L_BASE + si / HANGUL_N_COUNT);
+        try out.append(arena, HANGUL_V_BASE + (si % HANGUL_N_COUNT) / HANGUL_T_COUNT);
+        const ti = si % HANGUL_T_COUNT;
+        if (ti != 0) try out.append(arena, HANGUL_T_BASE + ti);
+        return;
+    }
+    const dm = if (compat) unorm.compatDecomp(cp) else unorm.canonDecomp(cp);
+    if (dm) |seq| {
+        for (seq) |c| try appendDecomp(out, arena, c, compat);
+    } else {
+        try out.append(arena, cp);
+    }
+}
+
+/// Canonical ordering: stable-sort each maximal run of combining marks (ccc > 0)
+/// by combining class (UAX #15 D109).
+fn canonicalOrder(cps: []u21) void {
+    var i: usize = 0;
+    while (i < cps.len) {
+        if (unorm.ccc(cps[i]) == 0) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < cps.len and unorm.ccc(cps[j]) != 0) j += 1;
+        // Stable insertion sort of cps[i..j] by combining class.
+        var k = i + 1;
+        while (k < j) : (k += 1) {
+            const v = cps[k];
+            const vc = unorm.ccc(v);
+            var m = k;
+            while (m > i and unorm.ccc(cps[m - 1]) > vc) : (m -= 1) cps[m] = cps[m - 1];
+            cps[m] = v;
+        }
+        i = j;
+    }
+}
+
+/// Compose a starter `a` with a following combining/starter `b`, handling Hangul
+/// L+V and LV+T algorithmically, else the primary-composite table.
+fn composePair(a: u21, b: u21) ?u21 {
+    // Hangul L + V -> LV
+    if (a >= HANGUL_L_BASE and a < HANGUL_L_BASE + HANGUL_L_COUNT and
+        b >= HANGUL_V_BASE and b < HANGUL_V_BASE + HANGUL_V_COUNT)
+    {
+        const li = a - HANGUL_L_BASE;
+        const vi = b - HANGUL_V_BASE;
+        return HANGUL_S_BASE + (li * HANGUL_V_COUNT + vi) * HANGUL_T_COUNT;
+    }
+    // Hangul LV + T -> LVT
+    if (a >= HANGUL_S_BASE and a < HANGUL_S_BASE + HANGUL_S_COUNT and
+        (a - HANGUL_S_BASE) % HANGUL_T_COUNT == 0 and
+        b > HANGUL_T_BASE and b < HANGUL_T_BASE + HANGUL_T_COUNT)
+    {
+        return a + (b - HANGUL_T_BASE);
+    }
+    return unorm.compose(a, b);
+}
+
+/// Canonical composition of an already-decomposed, canonically-ordered sequence
+/// (UAX #15 D117). Composes in place, returning the new length.
+fn canonicalCompose(cps: []u21) usize {
+    if (cps.len == 0) return 0;
+    var out_len: usize = 1;
+    cps[0] = cps[0];
+    var last_starter: isize = if (unorm.ccc(cps[0]) == 0) 0 else -1;
+    var last_cc: u8 = unorm.ccc(cps[0]);
+    var k: usize = 1;
+    while (k < cps.len) : (k += 1) {
+        const ch = cps[k];
+        const cc = unorm.ccc(ch);
+        if (last_starter >= 0 and (last_cc == 0 or last_cc < cc)) {
+            const si: usize = @intCast(last_starter);
+            if (composePair(cps[si], ch)) |p| {
+                cps[si] = p;
+                continue; // b consumed; last_cc/last_starter unchanged
+            }
+        }
+        cps[out_len] = ch;
+        if (cc == 0) {
+            last_starter = @intCast(out_len);
+            last_cc = 0;
+        } else {
+            last_cc = cc;
+        }
+        out_len += 1;
+    }
+    return out_len;
+}
+
+/// String.prototype.normalize([form]) — ES2024 22.1.3.14.
+pub fn nativeNormalize(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const s = try coerceThis(arena, this_val); // ToString(this); abrupt propagates
+    // Determine form: undefined/absent → "NFC"; else ToString(form) (abrupt
+    // propagates) BEFORE validating, per spec step order.
+    var form: []const u8 = "NFC";
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_) {
+        form = try argToString(arena, args[0]);
+    }
+    const nf: NormForm = if (std.mem.eql(u8, form, "NFC"))
+        .nfc
+    else if (std.mem.eql(u8, form, "NFD"))
+        .nfd
+    else if (std.mem.eql(u8, form, "NFKC"))
+        .nfkc
+    else if (std.mem.eql(u8, form, "NFKD"))
+        .nfkd
+    else {
+        _ = try throwRangeErrorStr(arena, "The normalization form should be one of NFC, NFD, NFKC, NFKD.");
+        unreachable;
+    };
+
+    const compat = (nf == .nfkc or nf == .nfkd);
+    const do_compose = (nf == .nfc or nf == .nfkc);
+
+    // Decode WTF-8 → code points.
+    var cps = std.ArrayList(u21){};
+    var i: usize = 0;
+    while (i < s.len) {
+        const dec = decodeWtf8At(s, i);
+        try appendDecomp(&cps, arena, dec.cp, compat);
+        i += dec.len;
+    }
+    canonicalOrder(cps.items);
+    const out_len = if (do_compose) canonicalCompose(cps.items) else cps.items.len;
+
+    var buf = std.ArrayList(u8){};
+    for (cps.items[0..out_len]) |cp| try encodeWtf8Cp(&buf, arena, cp);
     return val_mod.makeString(arena, try arena.dupe(u8, buf.items));
 }

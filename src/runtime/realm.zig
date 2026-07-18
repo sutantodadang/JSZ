@@ -2870,7 +2870,9 @@ fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, args: []const
 
 fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toFixed requires a Number");
-    const f_raw: f64 = if (args.len == 0) 0.0 else args[0].toF64();
+    // f = ToIntegerOrInfinity(fractionDigits): ToNumber throws TypeError for
+    // Symbol/BigInt and propagates a throwing valueOf/@@toPrimitive.
+    const f_raw: f64 = if (args.len == 0) 0.0 else try toNumberCheckedRealm(arena, args[0]);
     const f_int: f64 = if (std.math.isNan(f_raw)) 0 else @trunc(f_raw);
     if (f_int < 0 or f_int > 100) return throwRangeError(arena, "toFixed() digits argument must be between 0 and 100");
     const f: i64 = @intFromFloat(f_int);
@@ -2878,7 +2880,9 @@ fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const 
     if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     if (@abs(n) >= 1e21) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     const fu: usize = @intCast(f);
-    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ n, fu }));
+    // -0 formats without a sign ("0.00", not "-0.00").
+    const nf: f64 = if (n == 0) 0.0 else n;
+    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ nf, fu }));
 }
 
 /// Shared helper: format `n` in exponential notation.
@@ -2932,13 +2936,19 @@ fn numberToExponentialImpl(arena: std.mem.Allocator, n: f64, f: i64) ![]const u8
 
 fn nativeNumberToExponential(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toExponential requires a Number");
-    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
-    if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    // ToIntegerOrInfinity(fractionDigits) (step 2) precedes the NaN/Infinity
+    // short-circuits (step 3+), and throws TypeError for Symbol/BigInt.
     const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
     var f: i64 = -1; // -1 = not provided → shortest
+    var f_int: f64 = 0;
     if (has_arg) {
-        const f_raw = args[0].toF64();
-        const f_int: f64 = if (std.math.isNan(f_raw)) 0 else @trunc(f_raw);
+        const f_raw = try toNumberCheckedRealm(arena, args[0]);
+        f_int = if (std.math.isNan(f_raw)) 0 else @trunc(f_raw);
+    }
+    // Non-finite short-circuit (step 3) precedes the fractionDigits range check.
+    if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
+    if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    if (has_arg) {
         if (f_int < 0 or f_int > 100) return throwRangeError(arena, "toExponential() argument must be between 0 and 100");
         f = @intFromFloat(f_int);
     }
@@ -2950,23 +2960,27 @@ fn nativeNumberToPrecision(arena: std.mem.Allocator, this_val: Value, args: []co
     const has_arg = args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_;
     // No argument → same as toString
     if (!has_arg) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
-    const p_raw = args[0].toF64();
-    const p_int: f64 = if (std.math.isNan(p_raw)) 1 else @trunc(p_raw);
-    if (p_int < 1 or p_int > 100) return throwRangeError(arena, "toPrecision() argument must be between 1 and 100");
-    const p: i64 = @intFromFloat(p_int);
+    // p = ToIntegerOrInfinity(precision) (step 3); ToIntegerOrInfinity(NaN) = 0.
+    const p_raw = try toNumberCheckedRealm(arena, args[0]);
+    const p_int: f64 = if (std.math.isNan(p_raw)) 0 else @trunc(p_raw);
+    // Non-finite short-circuit (steps 4-5) precedes the precision range check.
     if (std.math.isNan(n)) return val_mod.makeString(arena, "NaN");
     if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
+    if (p_int < 1 or p_int > 100) return throwRangeError(arena, "toPrecision() argument must be between 1 and 100");
+    const p: i64 = @intFromFloat(p_int);
     const abs_n = @abs(n);
+    // -0 formats without a sign (ES: the "-" prefix is added only when x < 0).
+    const nf: f64 = if (abs_n == 0.0) 0.0 else n;
     // e = floor(log10(|n|)), 0 for n == 0
     const e: i64 = if (abs_n == 0.0) 0 else @as(i64, @intFromFloat(@floor(std.math.log10(abs_n))));
     if (e >= p or e < -6) {
         // Exponential form: p-1 fraction digits
-        return val_mod.makeString(arena, try numberToExponentialImpl(arena, n, p - 1));
+        return val_mod.makeString(arena, try numberToExponentialImpl(arena, nf, p - 1));
     } else {
         // Fixed form: p-1-e fraction digits
         const frac: i64 = p - 1 - e;
         const fu: usize = if (frac < 0) 0 else @intCast(frac);
-        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ n, fu }));
+        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ nf, fu }));
     }
 }
 
@@ -3291,6 +3305,8 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "toLocaleUpperCase", string_proto_mod.nativeToLocaleUpperCase },
         // localeCompare
         .{ "localeCompare", string_proto_mod.nativeLocaleCompare },
+        // Unicode normalization
+        .{ "normalize", string_proto_mod.nativeNormalize },
         // ES2024 well-formed
         .{ "isWellFormed", string_proto_mod.nativeIsWellFormed },
         .{ "toWellFormed", string_proto_mod.nativeToWellFormed },
