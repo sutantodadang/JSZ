@@ -1303,6 +1303,7 @@ fn createErrorObj(arena: std.mem.Allocator, proto: ?*JsObject, name: []const u8,
     const name_val = try val_mod.makeString(arena, name);
     try obj.set("message", msg_val);
     try obj.set("name", name_val);
+    obj.is_error = true;
     return val_mod.makeObject(arena, obj);
 }
 
@@ -1316,6 +1317,7 @@ pub var error_proto_SyntaxError: ?*JsObject = null;
 pub var error_proto_RangeError: ?*JsObject = null;
 pub var error_proto_ReferenceError: ?*JsObject = null;
 pub var error_proto_AggregateError: ?*JsObject = null;
+pub var error_proto_URIError: ?*JsObject = null;
 
 fn extractMessage(args: []const Value) []const u8 {
     if (args.len > 0 and args[0].bits != 0) {
@@ -1337,6 +1339,7 @@ fn populateErrorThis(arena: std.mem.Allocator, this_val: Value, name: []const u8
         const name_val = try val_mod.makeString(arena, name);
         try obj.set("message", msg_val);
         try obj.set("name", name_val);
+        obj.is_error = true;
         return this_val;
     }
     // Fallback: create new object with the right proto.
@@ -2082,20 +2085,71 @@ fn nativeStringRaw(arena: std.mem.Allocator, _: Value, args: []const Value) anye
     return val_mod.makeString(arena, buf.items);
 }
 
-fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0) return val_mod.makeString(arena, "");
-    var buf: [256]u8 = undefined;
-    var len: usize = 0;
-    for (args) |arg| {
-        if (arg.bits != 0 and arg.unbox() == .number) {
-            const code: u32 = @intFromFloat(@mod(arg.unbox().number, 65536));
-            if (code < 128 and len < buf.len) {
-                buf[len] = @intCast(code);
-                len += 1;
-            }
-        }
+/// ES ToUint16: ToNumber, then map into [0, 0xFFFF] via mathematical modulo.
+/// NaN / ±Infinity → 0. Object args coerce through ToPrimitive(number).
+fn toUint16(arena: std.mem.Allocator, v: Value) anyerror!u16 {
+    var num: f64 = undefined;
+    if (v.bits == 0) {
+        num = std.math.nan(f64);
+    } else switch (v.unbox()) {
+        .number => |n| num = n,
+        .object => {
+            const prim = (try coercion_mod.toPrimitive(arena, v, .number)) orelse Value{};
+            if (prim.bits != 0 and prim.unbox() == .object) num = std.math.nan(f64) else return toUint16(arena, prim);
+        },
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+        .bigint => return throwTypeError(arena, "Cannot convert a BigInt value to a number"),
+        else => num = toNumberCoerce(v),
     }
-    return val_mod.makeString(arena, try arena.dupe(u8, buf[0..len]));
+    if (std.math.isNan(num) or std.math.isInf(num)) return 0;
+    return @intFromFloat(@mod(@trunc(num), 65536.0));
+}
+
+/// String.fromCharCode(...codeUnits): each argument is ToUint16'd to a UTF-16
+/// code unit and appended as WTF-8 (lone surrogates stay raw, matching the
+/// engine's CESU-8 string storage).
+fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    var buf = std.ArrayList(u8){};
+    for (args) |arg| {
+        const code = try toUint16(arena, arg);
+        try appendWtf8Cp(&buf, arena, code);
+    }
+    return val_mod.makeString(arena, buf.items);
+}
+
+/// ES ToNumber that coerces objects via ToPrimitive(number) and throws on
+/// Symbol / BigInt (used by fromCodePoint's RangeError validation).
+fn toNumberCheckedRealm(arena: std.mem.Allocator, v: Value) anyerror!f64 {
+    if (v.bits == 0) return std.math.nan(f64);
+    switch (v.unbox()) {
+        .number => |n| return n,
+        .boolean => |b| return if (b) 1 else 0,
+        .null_ => return 0,
+        .undefined_ => return std.math.nan(f64),
+        .string => |s| return val_mod.jsStringToNumber(s),
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+        .bigint => return throwTypeError(arena, "Cannot convert a BigInt value to a number"),
+        .object => {
+            const prim = (try coercion_mod.toPrimitive(arena, v, .number)) orelse return std.math.nan(f64);
+            if (prim.bits != 0 and prim.unbox() == .object) return std.math.nan(f64);
+            return toNumberCheckedRealm(arena, prim);
+        },
+        else => return std.math.nan(f64),
+    }
+}
+
+/// String.fromCodePoint(...codePoints): each argument must be a non-negative
+/// integer ≤ 0x10FFFF (else RangeError); astral points become surrogate pairs.
+fn nativeStringFromCodePoint(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    var buf = std.ArrayList(u8){};
+    for (args) |arg| {
+        const num = try toNumberCheckedRealm(arena, arg);
+        if (num != @trunc(num) or std.math.isNan(num) or num < 0 or num > 0x10FFFF) {
+            return throwRangeError(arena, "Invalid code point");
+        }
+        try appendWtf8Cp(&buf, arena, @intFromFloat(num));
+    }
+    return val_mod.makeString(arena, buf.items);
 }
 
 fn toNumberCoerce(v: Value) f64 {
@@ -2123,12 +2177,48 @@ fn nativeIsFinite(arena: std.mem.Allocator, _: Value, args: []const Value) anyer
     return val_mod.makeBool(arena, !std.math.isNan(n) and !std.math.isInf(n));
 }
 
-fn nativeParseFloat(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
-        return val_mod.makeNumber(arena, std.math.nan(f64));
+/// ES StrWhiteSpace code point (WhiteSpace ∪ LineTerminator): the set of chars
+/// parseInt / parseFloat strip from the front of the input.
+fn isStrWhiteSpaceCp(cp: u21) bool {
+    return switch (cp) {
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF => true,
+        else => cp >= 0x2000 and cp <= 0x200A,
+    };
+}
+
+/// Byte offset past the leading run of StrWhiteSpace code points in a WTF-8 str.
+fn trimLeadingStrWs(s: []const u8) usize {
+    var i: usize = 0;
+    while (i < s.len) {
+        const du = string_proto_mod.decodeWtf8At(s, i);
+        if (!isStrWhiteSpaceCp(du.cp)) break;
+        i += du.len;
     }
-    const s = std.mem.trimLeft(u8, args[0].toPtr().string, &std.ascii.whitespace);
-    // Find the longest valid float prefix.
+    return i;
+}
+
+/// ES ToInt32: ToNumber (already done by caller) → truncate → wrap to [−2³¹,2³¹).
+fn toInt32FromF64(num: f64) i32 {
+    if (std.math.isNan(num) or std.math.isInf(num)) return 0;
+    const m = @mod(@trunc(num), 4294967296.0); // [0, 2^32)
+    const u: u32 = @intFromFloat(m);
+    return @bitCast(u);
+}
+
+fn nativeParseFloat(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const input = try uriToString(arena, if (args.len > 0) args[0] else Value{});
+    const s = input[trimLeadingStrWs(input)..];
+    // "Infinity" (optionally signed) → ±∞ per StrDecimalLiteral.
+    var body = s;
+    var neg = false;
+    if (s.len > 0 and (s[0] == '+' or s[0] == '-')) {
+        neg = s[0] == '-';
+        body = s[1..];
+    }
+    if (std.mem.startsWith(u8, body, "Infinity")) {
+        return val_mod.makeNumber(arena, if (neg) -std.math.inf(f64) else std.math.inf(f64));
+    }
+    // Longest StrDecimalLiteral prefix of the (signed) trimmed string.
     var end: usize = 0;
     var seen_dot = false;
     var seen_e = false;
@@ -2146,39 +2236,286 @@ fn nativeParseFloat(arena: std.mem.Allocator, _: Value, args: []const Value) any
         if ((c == '+' or c == '-') and (end == 0 or s[end - 1] == 'e' or s[end - 1] == 'E')) continue;
         break;
     }
+    // Trim a trailing exponent marker / sign with no digits (e.g. "1e", "1e+").
+    while (end > 0) {
+        const last = s[end - 1];
+        if (last == 'e' or last == 'E' or last == '+' or last == '-') end -= 1 else break;
+    }
     if (end == 0) return val_mod.makeNumber(arena, std.math.nan(f64));
     const parsed = std.fmt.parseFloat(f64, s[0..end]) catch std.math.nan(f64);
     return val_mod.makeNumber(arena, parsed);
 }
 
 fn nativeParseInt(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
-        return val_mod.makeNumber(arena, std.math.nan(f64));
-    }
-    var s = std.mem.trimLeft(u8, args[0].toPtr().string, &std.ascii.whitespace);
-    var radix: u8 = 10;
-    if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .number) {
-        const r = args[1].unbox().number;
-        if (r >= 2 and r <= 36) radix = @intFromFloat(r);
-    }
-    var neg = false;
+    const input = try uriToString(arena, if (args.len > 0) args[0] else Value{});
+    var s = input[trimLeadingStrWs(input)..];
+    var sign: f64 = 1;
     if (s.len > 0 and (s[0] == '+' or s[0] == '-')) {
-        neg = s[0] == '-';
+        if (s[0] == '-') sign = -1;
         s = s[1..];
     }
-    if ((radix == 16 or radix == 10) and s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
+    // ToInt32(radix): 0 (or absent) means "decimal, allow 0x"; else must be 2..36.
+    var radix: u8 = 10;
+    var strip_prefix = true;
+    if (args.len > 1) {
+        const r = toInt32FromF64(try toNumberCheckedRealm(arena, args[1]));
+        if (r != 0) {
+            if (r < 2 or r > 36) return val_mod.makeNumber(arena, std.math.nan(f64));
+            radix = @intCast(r);
+            if (radix != 16) strip_prefix = false;
+        }
+    }
+    if (strip_prefix and s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
         radix = 16;
         s = s[2..];
     }
     var end: usize = 0;
     while (end < s.len) : (end += 1) {
-        const d = std.fmt.charToDigit(s[end], radix) catch break;
-        _ = d;
+        _ = std.fmt.charToDigit(s[end], radix) catch break;
     }
     if (end == 0) return val_mod.makeNumber(arena, std.math.nan(f64));
-    const val = std.fmt.parseInt(i64, s[0..end], radix) catch return val_mod.makeNumber(arena, std.math.nan(f64));
-    const f: f64 = @floatFromInt(val);
-    return val_mod.makeNumber(arena, if (neg) -f else f);
+    // Accumulate in f64 so arbitrarily long digit runs saturate to the nearest
+    // representable value instead of overflowing an integer.
+    var value: f64 = 0;
+    const rf: f64 = @floatFromInt(radix);
+    for (s[0..end]) |c| {
+        const d = std.fmt.charToDigit(c, radix) catch unreachable;
+        value = value * rf + @as(f64, @floatFromInt(d));
+    }
+    return val_mod.makeNumber(arena, sign * value);
+}
+
+// ---- URI handling (encodeURI / decodeURI / *Component) — ECMAScript §19.2.6 ----
+
+/// Raise a `URIError` from a native (malformed input for decode / unpaired
+/// surrogate for encode).
+fn throwURIError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    const eo = if (active_heap) |h|
+        try JsObject.createOnHeap(h, error_proto_URIError)
+    else
+        try JsObject.create(arena, error_proto_URIError);
+    try eo.set("message", try val_mod.makeString(arena, msg));
+    try eo.set("name", try val_mod.makeString(arena, "URIError"));
+    pending_exception = try val_mod.makeObject(arena, eo);
+    return error.JsException;
+}
+
+/// ES ToString for URI arguments: primitive-coercing, throws TypeError on Symbol.
+fn uriToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
+    if (v.bits == 0) return "undefined";
+    switch (v.unbox()) {
+        .string => |s| return s,
+        .number => |n| return try val_mod.formatNumber(arena, n),
+        .boolean => |b| return if (b) "true" else "false",
+        .null_ => return "null",
+        .undefined_ => return "undefined",
+        .bigint => |bi| return try val_mod.bigIntToString(arena, bi),
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a string"),
+        .object => {
+            // ToString(object): ToPrimitive(string). A missing/uncallable
+            // toString & valueOf (null result) is a TypeError, not a fallback.
+            const prim = (try coercion_mod.toPrimitive(arena, v, .string)) orelse
+                return throwTypeError(arena, "Cannot convert object to primitive value");
+            if (prim.bits != 0 and prim.unbox() == .object) return "[object Object]";
+            return uriToString(arena, prim);
+        },
+        else => return "[object Object]",
+    }
+}
+
+fn hexDigit(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
+}
+
+/// Append a scalar value as WTF-8 / CESU-8: BMP → 1-3 bytes, astral → a
+/// UTF-16 surrogate pair (two 3-byte sequences), matching the engine's string
+/// storage so decoded astral chars round-trip through charCodeAt / length.
+fn appendWtf8Cp(buf: *std.ArrayList(u8), arena: std.mem.Allocator, cp: u21) !void {
+    if (cp <= 0x7F) {
+        try buf.append(arena, @intCast(cp));
+    } else if (cp <= 0x7FF) {
+        try buf.append(arena, @intCast(0xC0 | (cp >> 6)));
+        try buf.append(arena, @intCast(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        try buf.append(arena, @intCast(0xE0 | (cp >> 12)));
+        try buf.append(arena, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+        try buf.append(arena, @intCast(0x80 | (cp & 0x3F)));
+    } else {
+        const v: u32 = @as(u32, cp) - 0x10000;
+        try appendWtf8Cp(buf, arena, @intCast(0xD800 + (v >> 10)));
+        try appendWtf8Cp(buf, arena, @intCast(0xDC00 + (v & 0x3FF)));
+    }
+}
+
+fn appendPctByte(buf: *std.ArrayList(u8), arena: std.mem.Allocator, byte: u8) !void {
+    const upper = "0123456789ABCDEF";
+    try buf.append(arena, '%');
+    try buf.append(arena, upper[byte >> 4]);
+    try buf.append(arena, upper[byte & 0x0F]);
+}
+
+/// uriUnescaped ::: uriAlpha | DecimalDigit | uriMark  (never %-encoded).
+fn isUriUnescaped(c: u8) bool {
+    if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9')) return true;
+    return switch (c) {
+        '-', '_', '.', '!', '~', '*', '\'', '(', ')' => true,
+        else => false,
+    };
+}
+
+/// uriReserved (`; / ? : @ & = + $ ,`) plus `#`. For encodeURI these join the
+/// unescaped set; for decodeURI these stay %-encoded in the output.
+fn isUriReservedOrHash(c: u8) bool {
+    return switch (c) {
+        ';', '/', '?', ':', '@', '&', '=', '+', '$', ',', '#' => true,
+        else => false,
+    };
+}
+
+/// Shared Encode (§19.2.6.4). `component` = true for the *Component variants
+/// (only uriUnescaped survives); false for encodeURI (uriReserved + `#` also
+/// survive). Iterates the receiver's WTF-8 code units, throwing URIError on
+/// an unpaired surrogate.
+fn uriEncode(arena: std.mem.Allocator, s: []const u8, component: bool) anyerror!Value {
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < s.len) {
+        const du = string_proto_mod.decodeWtf8At(s, i);
+        const cu: u21 = du.cp;
+        // ASCII fast path: single code unit that is a member of the unescaped set.
+        const in_unescaped = cu <= 0x7F and
+            (isUriUnescaped(@intCast(cu)) or (!component and isUriReservedOrHash(@intCast(cu))));
+        if (in_unescaped) {
+            try buf.append(arena, @intCast(cu));
+            i += du.len;
+            continue;
+        }
+        // Resolve the code point, combining a UTF-16 surrogate pair; a lone
+        // surrogate (high without a following low, or a bare low) is a URIError.
+        var v: u21 = cu;
+        var consumed = du.len;
+        if (cu >= 0xDC00 and cu <= 0xDFFF) {
+            return throwURIError(arena, "URI malformed");
+        } else if (cu >= 0xD800 and cu <= 0xDBFF) {
+            const next_i = i + du.len;
+            if (next_i >= s.len) return throwURIError(arena, "URI malformed");
+            const du2 = string_proto_mod.decodeWtf8At(s, next_i);
+            if (du2.cp < 0xDC00 or du2.cp > 0xDFFF) return throwURIError(arena, "URI malformed");
+            v = @intCast((@as(u32, cu) - 0xD800) * 0x400 + (@as(u32, du2.cp) - 0xDC00) + 0x10000);
+            consumed += du2.len;
+        }
+        // Real (non-WTF) UTF-8 encoding of the scalar value, %-encoded per octet.
+        var utf8: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(v, &utf8) catch return throwURIError(arena, "URI malformed");
+        for (utf8[0..n]) |b| try appendPctByte(&buf, arena, b);
+        i += consumed;
+    }
+    return val_mod.makeString(arena, buf.items);
+}
+
+/// Shared Decode (§19.2.6.5). `preserve_reserved` = true for decodeURI (leaves
+/// reserved+`#` escapes intact); false for decodeURIComponent. Emits WTF-8, so
+/// astral scalars become CESU-8 surrogate pairs consistent with the rest of the
+/// engine's string storage.
+fn uriDecode(arena: std.mem.Allocator, s: []const u8, preserve_reserved: bool) anyerror!Value {
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c != '%') {
+            try buf.append(arena, c);
+            i += 1;
+            continue;
+        }
+        if (i + 2 >= s.len) return throwURIError(arena, "URI malformed");
+        const h1 = hexDigit(s[i + 1]) orelse return throwURIError(arena, "URI malformed");
+        const h2 = hexDigit(s[i + 2]) orelse return throwURIError(arena, "URI malformed");
+        const b0: u8 = (@as(u8, h1) << 4) | h2;
+        if (b0 < 0x80) {
+            if (preserve_reserved and isUriReservedOrHash(b0)) {
+                // Keep the escape sequence verbatim in the output.
+                try buf.appendSlice(arena, s[i .. i + 3]);
+            } else {
+                try buf.append(arena, b0);
+            }
+            i += 3;
+            continue;
+        }
+        // Multi-byte UTF-8: leading byte determines the octet count.
+        const n: usize = if (b0 >= 0xF0) 4 else if (b0 >= 0xE0) 3 else if (b0 >= 0xC0) 2 else 0;
+        if (n == 0) return throwURIError(arena, "URI malformed"); // stray continuation byte
+        var octets: [4]u8 = undefined;
+        octets[0] = b0;
+        var j = i + 3;
+        var k: usize = 1;
+        while (k < n) : (k += 1) {
+            if (j + 2 >= s.len or s[j] != '%') return throwURIError(arena, "URI malformed");
+            const c1 = hexDigit(s[j + 1]) orelse return throwURIError(arena, "URI malformed");
+            const c2 = hexDigit(s[j + 2]) orelse return throwURIError(arena, "URI malformed");
+            const bx: u8 = (@as(u8, c1) << 4) | c2;
+            if (bx & 0xC0 != 0x80) return throwURIError(arena, "URI malformed");
+            octets[k] = bx;
+            j += 3;
+        }
+        const v = std.unicode.utf8Decode(octets[0..n]) catch return throwURIError(arena, "URI malformed");
+        try appendWtf8Cp(&buf, arena, v);
+        i = j;
+    }
+    return val_mod.makeString(arena, buf.items);
+}
+
+/// Error.prototype.toString (§20.5.3.4): "name: message", with either side
+/// dropped when empty. Uses full [[Get]] so accessor `name`/`message` fire, and
+/// ToString-coerces both (throwing on Symbol / abrupt ToPrimitive).
+fn nativeErrorToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return throwTypeError(arena, "Error.prototype.toString called on non-object");
+    const name_v = if (active_context) |c|
+        try c.getProp(arena, this_val, "name")
+    else
+        this_val.toPtr().object.get("name") orelse Value{};
+    const name_s = if (name_v.isUndefined()) "Error" else try uriToString(arena, name_v);
+    const msg_v = if (active_context) |c|
+        try c.getProp(arena, this_val, "message")
+    else
+        this_val.toPtr().object.get("message") orelse Value{};
+    const msg_s = if (msg_v.isUndefined()) "" else try uriToString(arena, msg_v);
+    if (name_s.len == 0) return val_mod.makeString(arena, msg_s);
+    if (msg_s.len == 0) return val_mod.makeString(arena, name_s);
+    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ name_s, msg_s }));
+}
+
+/// Error.isError(arg) (ES2024): true iff `arg` is an Object with an
+/// [[ErrorData]] internal slot — brand-checked, so it holds across realms and
+/// rejects fakes that merely inherit from Error.prototype.
+fn nativeErrorIsError(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0) return val_mod.makeBool(arena, false);
+    const arg = args[0];
+    if (arg.bits == 0 or arg.unbox() != .object) return val_mod.makeBool(arena, false);
+    return val_mod.makeBool(arena, arg.toPtr().object.is_error);
+}
+
+fn nativeEncodeURI(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const s = try uriToString(arena, if (args.len > 0) args[0] else Value{});
+    return uriEncode(arena, s, false);
+}
+
+fn nativeEncodeURIComponent(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const s = try uriToString(arena, if (args.len > 0) args[0] else Value{});
+    return uriEncode(arena, s, true);
+}
+
+fn nativeDecodeURI(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const s = try uriToString(arena, if (args.len > 0) args[0] else Value{});
+    return uriDecode(arena, s, true);
+}
+
+fn nativeDecodeURIComponent(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const s = try uriToString(arena, if (args.len > 0) args[0] else Value{});
+    return uriDecode(arena, s, false);
 }
 
 /// Hook set by the active VM so the global `eval` can re-enter the interpreter
@@ -3068,6 +3405,7 @@ pub const ThreadLocalSnapshot = struct {
     err_RangeError: ?*JsObject,
     err_ReferenceError: ?*JsObject,
     err_AggregateError: ?*JsObject,
+    err_URIError: ?*JsObject,
     ab_proto: ?*JsObject,
     ab_ctor: ?*JsObject,
     sab_proto: ?*JsObject,
@@ -3113,6 +3451,7 @@ pub const ThreadLocalSnapshot = struct {
             .err_RangeError = error_proto_RangeError,
             .err_ReferenceError = error_proto_ReferenceError,
             .err_AggregateError = error_proto_AggregateError,
+            .err_URIError = error_proto_URIError,
             .ab_proto = typed_array_mod.active_arraybuffer_proto,
             .ab_ctor = typed_array_mod.active_arraybuffer_ctor,
             .sab_proto = typed_array_mod.active_sharedarraybuffer_proto,
@@ -3159,6 +3498,7 @@ pub const ThreadLocalSnapshot = struct {
         error_proto_RangeError = self.err_RangeError;
         error_proto_ReferenceError = self.err_ReferenceError;
         error_proto_AggregateError = self.err_AggregateError;
+        error_proto_URIError = self.err_URIError;
         typed_array_mod.active_arraybuffer_proto = self.ab_proto;
         typed_array_mod.active_arraybuffer_ctor = self.ab_ctor;
         typed_array_mod.active_sharedarraybuffer_proto = self.sab_proto;
@@ -3276,6 +3616,7 @@ pub const Realm = struct {
         const ep_msg = try val_mod.makeString(arena, "");
         try error_proto.set("name", ep_name);
         try error_proto.set("message", ep_msg);
+        _ = try error_proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeErrorToString, "toString", 0), .{ .writable = true, .enumerable = false, .configurable = true });
 
         // TypeError.prototype: proto = Error.prototype.
         const type_error_proto = try JsObject.create(arena, error_proto);
@@ -3322,6 +3663,7 @@ pub const Realm = struct {
         error_proto_RangeError = range_error_proto;
         error_proto_ReferenceError = reference_error_proto;
         error_proto_AggregateError = aggregate_error_proto;
+        error_proto_URIError = uri_error_proto;
 
         // Create Error constructor objects. Each has a .prototype property
         // and a hidden __proto__ marker so `instanceof` can find the prototype.
@@ -3363,6 +3705,9 @@ pub const Realm = struct {
         _ = try aggregate_error_proto.defineOwnData("constructor", aggregate_error_ctor_val, ctor_attr);
         _ = try eval_error_proto.defineOwnData("constructor", eval_error_ctor_val, ctor_attr);
         _ = try uri_error_proto.defineOwnData("constructor", uri_error_ctor_val, ctor_attr);
+
+        // Error.isError (ES2024 static method), non-enumerable / writable / configurable.
+        _ = try error_ctor_val.toPtr().object.defineOwnData("isError", try val_mod.makeNativeFunctionNamed(arena, nativeErrorIsError, "isError", 1), .{ .writable = true, .enumerable = false, .configurable = true });
 
         try env.define("Error", error_ctor_val);
         try env.define("TypeError", type_error_ctor_val);
@@ -3548,7 +3893,8 @@ pub const Realm = struct {
         const string_ctor_obj = try JsObject.create(arena, null);
         try string_ctor_obj.set("prototype", try val_mod.makeObject(arena, string_proto));
         try string_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeStringCtor));
-        try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCharCode, "fromCharCode", 0));
+        try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCharCode, "fromCharCode", 1));
+        try string_ctor_obj.set("fromCodePoint", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCodePoint, "fromCodePoint", 1));
         try string_ctor_obj.set("raw", try val_mod.makeNativeFunctionNamed(arena, nativeStringRaw, "raw", 1));
         try string_proto.set("constructor", try val_mod.makeObject(arena, string_ctor_obj));
         _ = try string_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "String"), .{ .writable = false, .enumerable = false, .configurable = true });
@@ -3647,8 +3993,12 @@ pub const Realm = struct {
         try env.define("isNaN", try val_mod.makeNativeFunction(arena, nativeIsNaN));
         try env.define("eval", try val_mod.makeNativeFunction(arena, nativeEval));
         try env.define("isFinite", try val_mod.makeNativeFunction(arena, nativeIsFinite));
-        try env.define("parseInt", try val_mod.makeNativeFunction(arena, nativeParseInt));
-        try env.define("parseFloat", try val_mod.makeNativeFunction(arena, nativeParseFloat));
+        try env.define("parseInt", try val_mod.makeNativeFunctionNamed(arena, nativeParseInt, "parseInt", 2));
+        try env.define("parseFloat", try val_mod.makeNativeFunctionNamed(arena, nativeParseFloat, "parseFloat", 1));
+        try env.define("encodeURI", try val_mod.makeNativeFunctionNamed(arena, nativeEncodeURI, "encodeURI", 1));
+        try env.define("encodeURIComponent", try val_mod.makeNativeFunctionNamed(arena, nativeEncodeURIComponent, "encodeURIComponent", 1));
+        try env.define("decodeURI", try val_mod.makeNativeFunctionNamed(arena, nativeDecodeURI, "decodeURI", 1));
+        try env.define("decodeURIComponent", try val_mod.makeNativeFunctionNamed(arena, nativeDecodeURIComponent, "decodeURIComponent", 1));
         try env.define("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)));
         try env.define("Infinity", try val_mod.makeNumber(arena, std.math.inf(f64)));
         try env.define("structuredClone", try val_mod.makeNativeFunctionNamed(arena, nativeStructuredClone, "structuredClone", 1));

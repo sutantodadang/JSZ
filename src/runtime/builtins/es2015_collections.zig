@@ -1719,6 +1719,7 @@ pub const IterHelperData = struct {
     counter: u64 = 0,     // iteration counter (passed to callbacks); drop: skip count
     limit: i64 = 0,       // take: remaining; drop: total to skip
     done: bool = false,
+    running: bool = false, // re-entrancy guard (spec: "generator is running")
     kind: IterHelperKind,
     inner_iter: Value,    // flatMap: active inner iterator (Value{} = none)
     inner_next_fn: Value, // flatMap: cached inner.next (Value{} = none)
@@ -2416,7 +2417,15 @@ fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
 /// %IteratorHelperPrototype%.next — advance the lazy pipeline by one step.
 fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const d = try getIterHelperData(arena, this_val);
+    // Re-entrancy guard: a callback (map/filter/flatMap) that calls this helper's
+    // own next() while it is still running is a TypeError, not infinite recursion.
+    if (d.running) {
+        try setTypeError(arena, "Iterator helper is already running");
+        unreachable;
+    }
     if (d.done) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    d.running = true;
+    defer d.running = false;
     const undef = try val_mod.makeUndefined(arena);
 
     switch (d.kind) {

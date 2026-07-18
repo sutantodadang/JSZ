@@ -148,6 +148,15 @@ fn stringifyValue(
             try buf.append(arena, '"');
         },
         .object => |obj| {
+            // §25.5.2.2 step 4: Number / String / Boolean / BigInt wrapper objects
+            // serialize as their underlying primitive (a BigInt wrapper throws).
+            if (obj.getOwn("[[PrimitiveValue]]")) |prim| {
+                if (prim.bits != 0) switch (prim.unbox()) {
+                    .number, .string, .boolean => return stringifyValue(arena, buf, prim, indent, depth, seen, replacer, key_filter),
+                    .bigint => return throwStringifyTypeErrorMsg(arena, "Do not know how to serialize a BigInt"),
+                    else => {},
+                };
+            }
             // Circular-structure guard: a value currently being stringified that
             // re-references an ancestor → TypeError (per spec SerializeJSONProperty).
             for (seen.items) |a| {
@@ -163,18 +172,24 @@ fn stringifyValue(
                 try stringifyObject(arena, buf, obj, indent, depth, seen, replacer, key_filter);
             }
         },
+        // A BigInt value cannot be serialized (§25.5.2.2 step 10) → TypeError.
+        .bigint => return throwStringifyTypeErrorMsg(arena, "Do not know how to serialize a BigInt"),
         // functions, native_function, symbol: produce nothing (caller uses "null" for arrays)
-        .function, .bc_function, .native_function, .symbol, .bigint => {},
+        .function, .bc_function, .native_function, .symbol => {},
     }
 }
 
 fn throwStringifyTypeError(arena: std.mem.Allocator) anyerror!void {
+    return throwStringifyTypeErrorMsg(arena, "Converting circular structure to JSON");
+}
+
+fn throwStringifyTypeErrorMsg(arena: std.mem.Allocator, msg: []const u8) anyerror!void {
     const realm_mod = @import("../realm.zig");
     const obj = if (realm_mod.active_heap) |heap|
         try JsObject.createOnHeap(heap, realm_mod.error_proto_TypeError)
     else
         try JsObject.create(arena, realm_mod.error_proto_TypeError);
-    try obj.set("message", try val_mod.makeString(arena, "Converting circular structure to JSON"));
+    try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
     return error.JsException;

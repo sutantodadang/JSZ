@@ -38,6 +38,9 @@ pub const JsObject = struct {
     proto: ?*JsObject = null,
     /// True if this object is the backing store for an array.
     is_array: bool = false,
+    /// True if this object has an [[ErrorData]] internal slot (created by an
+    /// Error constructor / subclass super() call). Drives Error.isError.
+    is_error: bool = false,
     /// Cached length for array-backed objects.
     array_length: u32 = 0,
     /// Whether new properties can be added (Phase 3a: always true).
