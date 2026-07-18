@@ -2518,6 +2518,76 @@ fn nativeDecodeURIComponent(arena: std.mem.Allocator, _: Value, args: []const Va
     return uriDecode(arena, s, false);
 }
 
+// ---- Annex B legacy escape / unescape (§B.2.1) ----
+
+/// The set of code units left untouched by `escape`: A-Za-z0-9 plus `@*_+-./`.
+fn isEscapeUnescaped(c: u21) bool {
+    if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9')) return true;
+    return switch (c) {
+        '@', '*', '_', '+', '-', '.', '/' => true,
+        else => false,
+    };
+}
+
+/// B.2.1.1 escape(string): %-encode code units outside the unescaped set;
+/// code units < 256 become `%XX`, the rest `%uXXXX` (uppercase hex).
+fn nativeEscape(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const s = try uriToString(arena, if (args.len > 0) args[0] else Value{});
+    const upper = "0123456789ABCDEF";
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < s.len) {
+        const du = string_proto_mod.decodeWtf8At(s, i);
+        const n: u21 = du.cp;
+        if (n <= 0x7F and isEscapeUnescaped(n)) {
+            try buf.append(arena, @intCast(n));
+        } else if (n < 256) {
+            try appendPctByte(&buf, arena, @intCast(n));
+        } else {
+            try buf.append(arena, '%');
+            try buf.append(arena, 'u');
+            try buf.append(arena, upper[(n >> 12) & 0xF]);
+            try buf.append(arena, upper[(n >> 8) & 0xF]);
+            try buf.append(arena, upper[(n >> 4) & 0xF]);
+            try buf.append(arena, upper[n & 0xF]);
+        }
+        i += du.len;
+    }
+    return val_mod.makeString(arena, buf.items);
+}
+
+/// B.2.1.2 unescape(string): decode `%XX` and `%uXXXX` sequences back to code
+/// units, leaving any malformed `%` and all other code units untouched.
+fn nativeUnescape(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const s = try uriToString(arena, if (args.len > 0) args[0] else Value{});
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%') {
+            if (i + 6 <= s.len and s[i + 1] == 'u') {
+                if (hexDigit(s[i + 2])) |h3| if (hexDigit(s[i + 3])) |h2| if (hexDigit(s[i + 4])) |h1| if (hexDigit(s[i + 5])) |h0| {
+                    const cp: u21 = (@as(u21, h3) << 12) | (@as(u21, h2) << 8) | (@as(u21, h1) << 4) | h0;
+                    try appendWtf8Cp(&buf, arena, cp);
+                    i += 6;
+                    continue;
+                };
+            }
+            if (i + 3 <= s.len) {
+                if (hexDigit(s[i + 1])) |h1| if (hexDigit(s[i + 2])) |h0| {
+                    const cp: u21 = (@as(u21, h1) << 4) | h0;
+                    try appendWtf8Cp(&buf, arena, cp);
+                    i += 3;
+                    continue;
+                };
+            }
+        }
+        const du = string_proto_mod.decodeWtf8At(s, i);
+        try buf.appendSlice(arena, s[i .. i + du.len]);
+        i += du.len;
+    }
+    return val_mod.makeString(arena, buf.items);
+}
+
 /// Hook set by the active VM so the global `eval` can re-enter the interpreter
 /// in the current realm/global scope. Returns the eval result or sets
 /// pending_exception and returns error.JsException.
@@ -3999,6 +4069,8 @@ pub const Realm = struct {
         try env.define("encodeURIComponent", try val_mod.makeNativeFunctionNamed(arena, nativeEncodeURIComponent, "encodeURIComponent", 1));
         try env.define("decodeURI", try val_mod.makeNativeFunctionNamed(arena, nativeDecodeURI, "decodeURI", 1));
         try env.define("decodeURIComponent", try val_mod.makeNativeFunctionNamed(arena, nativeDecodeURIComponent, "decodeURIComponent", 1));
+        try env.define("escape", try val_mod.makeNativeFunctionNamed(arena, nativeEscape, "escape", 1));
+        try env.define("unescape", try val_mod.makeNativeFunctionNamed(arena, nativeUnescape, "unescape", 1));
         try env.define("NaN", try val_mod.makeNumber(arena, std.math.nan(f64)));
         try env.define("Infinity", try val_mod.makeNumber(arena, std.math.inf(f64)));
         try env.define("structuredClone", try val_mod.makeNativeFunctionNamed(arena, nativeStructuredClone, "structuredClone", 1));
