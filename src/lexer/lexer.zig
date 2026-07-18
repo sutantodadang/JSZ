@@ -495,7 +495,9 @@ pub const Lexer = struct {
                     if (self.pos + 1 >= self.source.len) return LexError.InvalidEscape;
                     const h1 = hexVal(self.source[self.pos]) orelse return LexError.InvalidEscape;
                     const h2 = hexVal(self.source[self.pos + 1]) orelse return LexError.InvalidEscape;
-                    try buf.append(self.allocator, @intCast(h1 * 16 + h2));
+                    // \xHH is a code unit (0..255); WTF-8 encode so bytes ≥ 0x80
+                    // round-trip as U+00xx rather than a raw Latin-1 octet.
+                    try appendWtf8(&buf, self.allocator, h1 * 16 + h2);
                     self.pos += 2;
                     self.column += 2;
                 },
