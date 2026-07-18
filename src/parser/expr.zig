@@ -680,6 +680,19 @@ pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
     return true;
 }
 
+/// NamedEvaluation for a destructuring default: `[a = function(){}]` names the
+/// anonymous function "a". The default initializer is only ever instantiated in
+/// the branch where the default applies, so stamping the inferred name onto the
+/// AST node here is equivalent to the spec's runtime SetFunctionName. Only
+/// genuinely anonymous, non-method function expressions are affected (a named
+/// function expression `function x(){}` keeps its own name).
+fn applyDefaultNameInference(value: *Node, name: []const u8) void {
+    if (value.kind == .function_expr) {
+        const fe = &value.data.function_expr;
+        if (fe.name == null and !fe.is_method) fe.name = name;
+    }
+}
+
 /// Bind one element of a destructuring pattern: an identifier becomes a `let`
 /// decl reading `access`; an `ident = default` applies the default; a nested
 /// array/object pattern recurses.
@@ -726,6 +739,8 @@ fn bindPatternElement(p: *Parser, target: *Node, access: *Node) bool {
                 .conditional_expr = .{ .test_ = test_, .consequent = access, .alternate = ae.value },
             }) orelse return false;
             if (ae.target.kind == .identifier) {
+                // NamedEvaluation: name an anonymous function default after the target.
+                applyDefaultNameInference(ae.value, ae.target.data.identifier);
                 const vd = p.makeNode(.var_decl, target.start, target.start, .{
                     .var_decl = .{ .kind = p.destruct_kind, .name = ae.target.data.identifier, .init = cond },
                 }) orelse return false;

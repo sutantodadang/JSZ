@@ -1034,7 +1034,12 @@ pub const FnCompiler = struct {
                 try self.emitU8(rt);
                 const patch = self.currentOffset();
                 try self.emitI16(0);
+                // NamedEvaluation: `[a = function(){}] = rhs` names the anonymous
+                // default "a" (only when the target is a plain identifier).
+                if (ae.target.kind == .identifier and ae.value.kind == .function_expr)
+                    self.name_hint = ae.target.data.identifier;
                 const rd = try self.compileExpr(ae.value);
+                self.name_hint = null;
                 try self.emitOp(.MOVE, line);
                 try self.emitU8(rt);
                 try self.emitU8(rd);

@@ -2119,7 +2119,7 @@ fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Va
 
 /// ES ToNumber that coerces objects via ToPrimitive(number) and throws on
 /// Symbol / BigInt (used by fromCodePoint's RangeError validation).
-fn toNumberCheckedRealm(arena: std.mem.Allocator, v: Value) anyerror!f64 {
+pub fn toNumberCheckedRealm(arena: std.mem.Allocator, v: Value) anyerror!f64 {
     if (v.bits == 0) return std.math.nan(f64);
     switch (v.unbox()) {
         .number => |n| return n,
