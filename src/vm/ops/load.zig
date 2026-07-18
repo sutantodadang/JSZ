@@ -36,7 +36,7 @@ fn globalObjectOwn(frame: *BcCallFrame, name: []const u8) ?Value {
 /// `globalThis` object here. Only runs at true global scope (`parent == null`),
 /// which naturally excludes block/catch/function-local bindings (those execute
 /// in a child environment). Internal `__`-prefixed names are never exposed.
-fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value) void {
+fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value, configurable: bool) void {
     if (frame.env.parent != null) return;
     // ES module top-level declarations live in the Module Environment Record
     // and must NOT become own-properties of the global object (spec §16.2.1.6).
@@ -44,11 +44,21 @@ fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value) void
     if (name.len >= 2 and name[0] == '_' and name[1] == '_') return;
     const gt = frame.env.lookup("globalThis") catch return;
     if (gt.bits == 0 or gt.unbox() != .object) return;
+    const obj = gt.toPtr().object;
+    // Reassignment: just update the value, preserving the existing attributes
+    // (a top-level `var`'s property is non-configurable; overwriting its
+    // descriptor would either reject or wrongly flip configurable).
+    if (obj.hasOwn(name)) {
+        obj.set(name, value) catch {};
+        return;
+    }
+    // First definition. A declared `var`/function global is non-configurable
+    // (DontDelete); a sloppy implicit global is configurable/deletable.
     // Non-enumerable to match the built-in globals already installed on the
     // object (and to avoid polluting `for-in`/`Object.keys(globalThis)`); read
     // and `in` visibility — what the global-object semantics require — are
     // unaffected by enumerability.
-    _ = gt.toPtr().object.defineOwnData(name, value, .{ .writable = true, .enumerable = false, .configurable = true }) catch {};
+    _ = obj.defineOwnData(name, value, .{ .writable = true, .enumerable = false, .configurable = configurable }) catch {};
 }
 
 pub inline fn opLoadK(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
@@ -356,7 +366,7 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 const found = try self.throwException(exc_val);
                 if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
             } else if (frame.env.parent == null) {
-                // Already at global env.
+                // Already at global env — sloppy implicit global (deletable).
                 frame.env.define(name, value) catch return error.OutOfMemory;
             } else {
                 // Sloppy-mode implicit global: write reaches the global object, not a
@@ -377,8 +387,9 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 };
     // Keep the global object in sync when assigning a global binding (covers
     // both reassignment of an existing global and sloppy implicit-global
-    // creation). The helper no-ops outside true global scope.
-    mirrorGlobalBinding(frame, name, value);
+    // creation). A freshly created implicit global is configurable/deletable;
+    // a reassignment preserves the existing (var → non-configurable) descriptor.
+    mirrorGlobalBinding(frame, name, value, true);
     return null;
 }
 
@@ -406,8 +417,82 @@ pub inline fn opDefineGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         }
     };
     // Top-level `var`/function declarations are also own properties of the
-    // global object (observable as `globalThis.name`).
-    mirrorGlobalBinding(frame, name, value);
+    // global object (observable as `globalThis.name`), and are non-configurable
+    // (DontDelete): `delete globalThis.x` / `delete this.x` returns false.
+    mirrorGlobalBinding(frame, name, value, false);
+    return null;
+}
+
+/// `delete <identifier>` (ES `delete` on an environment Reference). Resolves the
+/// name over the scope chain WITHOUT evaluating its value, and stores the boolean
+/// result in Rdst. See the DELETE_NAME opcode doc for the full precedence.
+pub inline fn opDeleteName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rdst = code[frame.pc];
+    frame.pc += 1;
+    const lo = code[frame.pc];
+    frame.pc += 1;
+    const hi = code[frame.pc];
+    frame.pc += 1;
+    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+    const name = frame.func.chunk.constants[kidx].toPtr().string;
+    const frame_idx = self.frames.items.len - 1;
+
+    // 1) `with` scopes shadow the lexical/global scope: delete from the first
+    //    with-object whose [[HasProperty]] is true (a Proxy trap here can re-enter
+    //    the VM and reallocate self.frames — index back in afterwards).
+    if (frame.with_stack.items.len > 0) {
+        const key = try val_mod.makeString(self.arena, name);
+        var i = frame.with_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            const wobj = self.frames.items[frame_idx].with_stack.items[i];
+            if (wobj.bits == 0 or wobj.unbox() != .object) continue;
+            if (try self.hasProperty(wobj, key)) {
+                const res = self.deleteProperty(wobj, key) catch |e| {
+                    if (e != error.JsException) return e;
+                    if (try self.raisePendingException("error in deleteProperty trap")) |oc| return oc;
+                    return null;
+                };
+                self.frames.items[frame_idx].registers[rdst] = try val_mod.makeBool(self.arena, res);
+                return null;
+            }
+        }
+    }
+
+    // 2) Environment record binding. A local/lexical declarative binding is
+    //    non-deletable (false). A global object-record binding (var/function/
+    //    implicit/builtin) defers to the global object's [[Delete]] below.
+    const classify = frame.env.deleteName(name);
+    if (classify == .not_deletable) {
+        frame.registers[rdst] = try val_mod.makeBool(self.arena, false);
+        return null;
+    }
+
+    // 3) Global object [[Delete]] — reached for `.global_object_ref` bindings and
+    //    for `.not_found` names that are nonetheless own properties of the global
+    //    object (built-ins, `globalThis.x = …`). Honors configurability: a
+    //    non-configurable global (a `var`/function declaration, NaN/Infinity) → false;
+    //    a configurable one (builtin object, implicit global) → true and removed.
+    if (frame.env.lookup("globalThis")) |gt| {
+        if (gt.bits != 0 and gt.unbox() == .object and gt.toPtr().object.hasOwn(name)) {
+            const key = try val_mod.makeString(self.arena, name);
+            const res = self.deleteProperty(gt, key) catch |e| {
+                if (e != error.JsException) return e;
+                if (try self.raisePendingException("error in deleteProperty")) |oc| return oc;
+                return null;
+            };
+            // Keep the environment record in sync when the object property is gone.
+            if (res) self.frames.items[frame_idx].env.removeGlobalBinding(name);
+            self.frames.items[frame_idx].registers[rdst] = try val_mod.makeBool(self.arena, res);
+            return null;
+        }
+    } else |_| {}
+
+    // 4) Object-record binding with no global-object property (shouldn't normally
+    //    happen), or an unresolvable reference → true.
+    if (classify == .global_object_ref) frame.env.removeGlobalBinding(name);
+    frame.registers[rdst] = try val_mod.makeBool(self.arena, true);
     return null;
 }
 

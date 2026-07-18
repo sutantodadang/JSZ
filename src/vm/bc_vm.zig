@@ -1301,6 +1301,8 @@ pub const BcVm = struct {
                 .EXP => if (try arith_ops.opExp(self, frame)) |o| return o,
                 .NEG => if (try arith_ops.opNeg(self, frame)) |o| return o,
                 .TO_NUMBER => if (try arith_ops.opToNumber(self, frame)) |o| return o,
+                .TO_NUMERIC => if (try arith_ops.opToNumeric(self, frame)) |o| return o,
+                .DELETE_NAME => if (try load_ops.opDeleteName(self, frame)) |o| return o,
                 .BIT_AND => if (try arith_ops.opBitAnd(self, frame)) |o| return o,
                 .BIT_OR => if (try arith_ops.opBitOr(self, frame)) |o| return o,
                 .BIT_XOR => if (try arith_ops.opBitXor(self, frame)) |o| return o,
@@ -2626,6 +2628,23 @@ pub const BcVm = struct {
                         if (c.resolveOwnSlot(key) != null) break; // own property → ordinary handling
                         cur = c.proto;
                     }
+                }
+                // Array exotic [[Set]] of the own "length": ArraySetLength
+                // (ES §10.4.2.4). The new length is ToUint32(v) and must equal
+                // ToNumber(v) (RangeError otherwise); ToNumber runs a user
+                // valueOf/@@toPrimitive on objects and throws TypeError for a
+                // BigInt/Symbol. `obj.set("length", …)` then applies the length
+                // and truncates out-of-range index properties. Only the direct
+                // write (Receiver is the array) takes this path; a foreign
+                // Receiver falls through to ordinary handling.
+                if (obj.is_array and receiver.bits == obj_val.bits and std.mem.eql(u8, key, "length")) {
+                    const numv = try self.toNumberValueChecked(value);
+                    const num = numv.unbox().number;
+                    const u = toUint32FromNumber(num);
+                    if (@as(f64, @floatFromInt(u)) != num)
+                        return self.throwRangeErr("Invalid array length");
+                    try obj.set("length", try val_mod.makeNumber(self.arena, @floatFromInt(u)));
+                    return true;
                 }
                 if (obj.findProperty(key)) |loc| {
                     const a = loc.holder.attrAt(loc.slot);
@@ -4248,7 +4267,7 @@ pub const BcVm = struct {
 
     /// ToNumeric (ES 7.1.3): ToPrimitive(number) then keep BigInt as-is, throw on
     /// Symbol, else ToNumber. Returns a `.bigint` or `.number` Value.
-    fn toNumeric(self: *BcVm, v: Value) !Value {
+    pub fn toNumeric(self: *BcVm, v: Value) !Value {
         const prim = (try self.coerceToPrimitive(v, .number)) orelse v;
         if (prim.bits != 0 and prim.unbox() == .bigint) return prim;
         if (prim.bits != 0 and prim.unbox() == .symbol)
@@ -4650,6 +4669,18 @@ pub fn jsRemainder(a: f64, b: f64) f64 {
 pub fn jsExp(base: f64, exp: f64) f64 {
     if (std.math.isInf(exp) and (base == 1 or base == -1)) return std.math.nan(f64);
     return std.math.pow(f64, base, exp);
+}
+
+/// ToUint32 (ES §7.1.6) of an already-computed Number: NaN/±Inf/±0 → 0,
+/// otherwise truncate toward zero and reduce modulo 2^32. Used by ArraySetLength
+/// to validate an `arr.length = v` write (RangeError when the result differs from
+/// the source Number).
+pub fn toUint32FromNumber(n: f64) u32 {
+    if (std.math.isNan(n) or std.math.isInf(n) or n == 0) return 0;
+    const t = @trunc(n);
+    const m = @mod(t, 4294967296.0);
+    const pos = if (m < 0) m + 4294967296.0 else m;
+    return @intFromFloat(pos);
 }
 
 pub fn toNumber(v: Value) f64 {

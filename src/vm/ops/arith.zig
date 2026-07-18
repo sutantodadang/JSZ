@@ -276,6 +276,26 @@ pub inline fn opToNumber(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+/// TO_NUMERIC: Rdst = ToNumeric(R[Rsrc]). Unlike TO_NUMBER, a BigInt operand is
+/// preserved. Used for the old-value coercion of postfix `x++`/`x--`.
+pub inline fn opToNumeric(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rdst = code[frame.pc];
+    frame.pc += 1;
+    const rsrc = code[frame.pc];
+    frame.pc += 1;
+    const sv = frame.registers[rsrc];
+    const result = self.toNumeric(sv) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error in numeric coercion")) |oc| return oc;
+        return null;
+    };
+    // Re-fetch: coercion may run a user valueOf/[Symbol.toPrimitive] and
+    // reallocate `self.frames`, invalidating `frame`.
+    self.frames.items[self.frames.items.len - 1].registers[rdst] = result;
+    return null;
+}
+
 pub inline fn opBitAnd(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const site_pc = frame.pc - 1;

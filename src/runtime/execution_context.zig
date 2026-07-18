@@ -23,6 +23,14 @@ pub const Binding = struct {
     initialized: bool,
 };
 
+/// Result of `Environment.deleteName` (the `delete identifier` operation over the
+/// scope chain). A local declarative binding is never deletable; a binding in the
+/// global environment record's *object* part (var/function/implicit/builtin) defers
+/// to the global object's [[Delete]] (configurability); a lexical global binding
+/// (top-level let/const/class) is non-deletable; `not_found` means the caller
+/// consults the global object directly (else the reference is unresolvable → true).
+pub const DeleteNameResult = enum { not_found, not_deletable, global_object_ref };
+
 /// A single lexical environment frame. Linked to parent.
 pub const Environment = struct {
     parent: ?*Environment,
@@ -123,6 +131,34 @@ pub const Environment = struct {
         if (self.bindings.getPtr(name)) |b| {
             if (b.kind == .var_ and b.initialized) b.value = value;
         }
+    }
+
+    /// `delete identifier` classification over the scope chain (ES `delete` on an
+    /// environment Reference), WITHOUT mutating anything. Walks to the first frame
+    /// binding `name`:
+    ///   - a binding in a *local* frame (parent != null) → `.not_deletable`
+    ///     (function/block declarative bindings can't be deleted);
+    ///   - a `let`/`const` binding in the *global* frame → `.not_deletable`
+    ///     (global lexical declarations live only in the declarative record);
+    ///   - a `var`-kind binding in the global frame (var/function/implicit/builtin)
+    ///     → `.global_object_ref` (defer to the global object's [[Delete]]);
+    ///   - no binding → `.not_found`.
+    pub fn deleteName(self: *Environment, name: []const u8) DeleteNameResult {
+        if (self.bindings.getPtr(name)) |b| {
+            if (self.parent != null) return .not_deletable; // local declarative binding
+            if (b.kind == .let or b.kind == .const_) return .not_deletable; // global lexical
+            return .global_object_ref; // global object-record binding
+        }
+        if (self.parent) |p| return p.deleteName(name);
+        return .not_found;
+    }
+
+    /// Remove `name` from the global (root) environment frame. Used after a
+    /// `delete <identifier>` successfully removes the mirrored global-object
+    /// property, keeping the environment record and the global object in sync.
+    pub fn removeGlobalBinding(self: *Environment, name: []const u8) void {
+        if (self.parent) |p| return p.removeGlobalBinding(name);
+        _ = self.bindings.remove(name);
     }
 
     /// Define or create in the global frame (walk to root).

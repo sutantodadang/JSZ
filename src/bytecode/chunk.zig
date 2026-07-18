@@ -194,7 +194,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d}", .{r});
         },
-        .GET_GLOBAL, .GET_GLOBAL_OPT => {
+        .GET_GLOBAL, .GET_GLOBAL_OPT, .DELETE_NAME => {
             const rdst = code[new_pc];
             new_pc += 1;
             const lo = code[new_pc];
@@ -263,7 +263,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d} R{d} R{d}", .{ rdst, rlhs, rrhs });
         },
-        .NEG, .BIT_NOT, .NOT, .TYPEOF, .TO_NUMBER => {
+        .NEG, .BIT_NOT, .NOT, .TYPEOF, .TO_NUMBER, .TO_NUMERIC => {
             const rdst = code[new_pc];
             new_pc += 1;
             const rsrc = code[new_pc];

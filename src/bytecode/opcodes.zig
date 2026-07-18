@@ -271,6 +271,22 @@ pub const Op = enum(u8) {
     /// round-tripped a BigInt instead of throwing. Declared last (ordinal
     /// stability for the pinned JIT contract).
     TO_NUMBER,
+    /// TO_NUMERIC | 3 | op, Rdst u8, Rsrc u8. Rdst = ToNumeric(R[Rsrc]) — like
+    /// ToNumber but a BigInt operand is preserved (not thrown). Emitted for the
+    /// old-value coercion of postfix `x++`/`x--`, whose result must be the
+    /// numeric value of the operand (ES UpdateExpression step "oldValue :=
+    /// ToNumeric(...)"). Declared last (ordinal stability for the pinned JIT
+    /// contract).
+    TO_NUMERIC,
+    /// DELETE_NAME | 4 | op, Rdst u8, Kname u16-LE. `delete <identifier>`. Resolves
+    /// the name over the running scope chain (with-scopes, then the environment
+    /// record, then the global object) and stores the boolean [[Delete]] result in
+    /// Rdst: a declared binding (var/let/const/param/function) is non-deletable →
+    /// false; a sloppy implicit global or a configurable global-object property is
+    /// removed → true; an unresolvable name → true. Never evaluates the binding's
+    /// value (so `delete undeclared` does not throw). Declared last (ordinal
+    /// stability for the pinned JIT contract).
+    DELETE_NAME,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -358,6 +374,8 @@ pub fn instrSize(op: Op) usize {
         .YIELD_STAR => 2,
         .PARAMS_DONE => 1,
         .TO_NUMBER => 3,
+        .TO_NUMERIC => 3,
+        .DELETE_NAME => 4,
         .AWAIT => 2,
         .END_FINALLY => 3,
         .JMP_IF_RET_COMPL => 4,

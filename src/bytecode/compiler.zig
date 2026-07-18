@@ -728,8 +728,24 @@ pub const FnCompiler = struct {
                     self.sp = robj + 1; // free key (and computed-key reg)
                     return robj;
                 }
-                // Deleting a non-reference (e.g. `delete x`, `delete 1`): evaluate
-                // for side effects, result is `true`.
+                // `delete <identifier>`: resolve the binding reference WITHOUT
+                // evaluating its value (so `delete undeclared` never throws). The
+                // boolean result depends on whether the binding is deletable.
+                if (operand.kind == .identifier) {
+                    const name = operand.data.identifier;
+                    // `delete arguments` still references `arguments`, so the callee
+                    // must materialize its (non-deletable) binding → result false.
+                    if (std.mem.eql(u8, name, "arguments")) self.saw_arguments = true;
+                    const sv = try val_mod.makeString(self.arena, name);
+                    const kidx = try self.addConstant(sv);
+                    const r = self.allocReg();
+                    try self.emitOp(.DELETE_NAME, line);
+                    try self.emitU8(r);
+                    try self.emitU16(kidx);
+                    return r;
+                }
+                // Deleting any other non-reference (e.g. `delete 1`, `delete f()`):
+                // evaluate for side effects, result is `true`.
                 _ = try self.compileExpr(operand);
                 self.freeReg();
                 const r = self.allocReg();
@@ -1156,7 +1172,6 @@ pub const FnCompiler = struct {
     /// target, and only evaluates+stores the RHS when the condition holds. The
     /// result register always ends up holding either the original or new value.
     pub fn compileLogicalAssign(self: *Self, a: ast.AssignExpr, line: u32) error{OutOfMemory}!u8 {
-        const rcur = try self.compileExpr(a.target);
         // Skip RHS+store when the condition is NOT met (result stays = current value).
         const skip_op: Op = switch (a.op) {
             .logical_and => .JMP_IF_FALSE, // &&=: only assign if truthy
@@ -1164,6 +1179,9 @@ pub const FnCompiler = struct {
             .logical_nullish => .JMP_IF_NOT_NULLISH, // ??=: only assign if nullish
             else => unreachable,
         };
+        if (a.target.kind == .member_expr) return self.compileLogicalAssignMember(a, skip_op, line);
+
+        const rcur = try self.compileExpr(a.target);
         try self.emitOp(skip_op, line);
         try self.emitU8(rcur);
         const patch_end = self.currentOffset();
@@ -1171,11 +1189,16 @@ pub const FnCompiler = struct {
 
         // Assign branch: evaluate RHS into rcur's slot, store, keep result in rcur.
         self.freeReg(); // free rcur slot so RHS can reuse it
+        // NamedEvaluation: `ident &&= function(){}` / `... ??= () => {}` names the
+        // anonymous function after the identifier target (ES step "If
+        // IsAnonymousFunctionDefinition(rhs) and IsIdentifierRef(lhs)").
+        if (a.target.kind == .identifier and a.value.kind == .function_expr) {
+            self.name_hint = a.target.data.identifier;
+        }
         const rrhs = try self.compileExpr(a.value);
+        self.name_hint = null; // defensive clear (no-op if consumed inside)
         if (a.target.kind == .identifier) {
             try self.emitStore(a.target.data.identifier, rrhs, line);
-        } else if (a.target.kind == .member_expr) {
-            try self.compileMemberWrite(a.target.data.member_expr, rrhs, line);
         }
         if (rrhs != rcur) {
             try self.emitOp(.MOVE, line);
@@ -1187,6 +1210,79 @@ pub const FnCompiler = struct {
         const end = self.currentOffset();
         self.patchJump(patch_end, end);
         return rcur;
+    }
+
+    /// Logical assignment with a member target (`obj.p &&= v` / `obj[k()] ??= v`).
+    /// ES evaluates the LeftHandSideExpression's reference exactly ONCE (before the
+    /// RHS): the object and, for a computed access, the property key are each
+    /// evaluated a single time, then reused for both the read (GetValue) and, on
+    /// the assign branch, the write (PutValue). This also makes a nullish base
+    /// throw a TypeError before the RHS runs, per RequireObjectCoercible.
+    fn compileLogicalAssignMember(self: *Self, a: ast.AssignExpr, skip_op: Op, line: u32) error{OutOfMemory}!u8 {
+        const me = a.target.data.member_expr;
+        const robj = try self.compileExpr(me.object);
+        // Resolve the key once: a static/literal key is a constant; a computed
+        // expression key is evaluated into its own register (single evaluation).
+        var static_kidx: ?u16 = null;
+        var rkey: u8 = 0;
+        if (!me.computed) {
+            static_kidx = try self.addConstant(try val_mod.makeString(self.arena, me.property.data.identifier));
+        } else if (me.property.kind == .string_literal) {
+            static_kidx = try self.addConstant(try val_mod.makeString(self.arena, me.property.data.string_literal));
+        } else if (me.property.kind == .number_literal) {
+            const key_str = std.fmt.allocPrint(self.arena, "{d}", .{me.property.data.number_literal}) catch return error.OutOfMemory;
+            static_kidx = try self.addConstant(try val_mod.makeString(self.arena, key_str));
+        } else {
+            rkey = try self.compileExpr(me.property);
+        }
+
+        // Read current value into rcur.
+        const rcur = self.allocReg();
+        if (static_kidx) |kidx| {
+            try self.emitOp(.GET_PROP, line);
+            try self.emitU8(rcur);
+            try self.emitU8(robj);
+            try self.emitU16(kidx);
+        } else {
+            try self.emitOp(.GET_PROP_DYN, line);
+            try self.emitU8(rcur);
+            try self.emitU8(robj);
+            try self.emitU8(rkey);
+        }
+
+        // Short-circuit: on the skip path the result stays the current value.
+        try self.emitOp(skip_op, line);
+        try self.emitU8(rcur);
+        const patch_end = self.currentOffset();
+        try self.emitI16(0);
+
+        // Assign branch: evaluate RHS, write back through the SAME object/key.
+        const rrhs = try self.compileExpr(a.value);
+        if (static_kidx) |kidx| {
+            try self.emitOp(.SET_PROP, line);
+            try self.emitU8(robj);
+            try self.emitU16(kidx);
+            try self.emitU8(rrhs);
+        } else {
+            try self.emitOp(.SET_PROP_DYN, line);
+            try self.emitU8(robj);
+            try self.emitU8(rkey);
+            try self.emitU8(rrhs);
+        }
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(rcur);
+        try self.emitU8(rrhs);
+
+        const end = self.currentOffset();
+        self.patchJump(patch_end, end);
+        // Collapse the result down to the base register (where compilation
+        // started), matching the single-result-register convention of other
+        // expression compilers; free the object/key/rhs scratch above it.
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(robj);
+        try self.emitU8(rcur);
+        self.sp = robj + 1;
+        return robj;
     }
 
     pub fn compileMemberRead(self: *Self, me: ast.MemberExpr, line: u32) error{OutOfMemory}!u8 {
@@ -1474,14 +1570,19 @@ pub const FnCompiler = struct {
             }
             return r_new;
         } else {
-            // Post: compute new value, store, return OLD.
-            const r_scratch = self.allocReg();
-            try self.emitOp(.MOVE, line);
-            try self.emitU8(r_scratch);
+            // Post: compute new value, store, return OLD (coerced to numeric).
+            // ES UpdateExpression: `oldValue := ? ToNumeric(GetValue(lhs))`, so
+            // the returned old value must be the *numeric* coercion of the
+            // operand (e.g. `new Boolean(true)` → 1), not the raw operand. Coerce
+            // once into r_old (running any valueOf/@@toPrimitive exactly once);
+            // INC/DEC on the already-numeric r_old runs no further user code.
+            try self.emitOp(.TO_NUMERIC, line);
             try self.emitU8(r_old);
+            try self.emitU8(r_old);
+            const r_scratch = self.allocReg();
             try self.emitOp(if (u.op == .inc) .INC else .DEC, line);
             try self.emitU8(r_scratch);
-            try self.emitU8(r_scratch);
+            try self.emitU8(r_old);
             if (u.operand.kind == .identifier) {
                 try self.emitStore(u.operand.data.identifier, r_scratch, line);
             } else if (u.operand.kind == .member_expr) {
@@ -1490,7 +1591,7 @@ pub const FnCompiler = struct {
                 try self.compileMemberWrite(u.operand.data.member_expr, r_scratch, line);
             }
             self.freeReg(); // free r_scratch
-            return r_old; // return old value
+            return r_old; // return old (numeric) value
         }
     }
 
