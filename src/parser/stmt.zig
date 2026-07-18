@@ -723,7 +723,11 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     if (p.check(.left_bracket) or p.check(.left_brace)) {
         return parseDestructuringDeclarator(p, kind, start);
     }
-    const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
+    // `yield` is a valid BindingIdentifier in sloppy-mode code outside a
+    // generator (`var yield = 4;`); the strict/generator cases are rejected by
+    // the future-reserved-word check below or the parser's generator context.
+    const yield_as_ident = p.check(.kw_yield) and !p.strict and !p.in_generator_function;
+    const name_tok = if (p.check(.kw_of) or yield_as_ident) p.advance() else (p.expect(.identifier) orelse return null);
     const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
     // Strict-mode early error: a future-reserved word (or `eval`/`arguments`)
     // may not be a binding identifier in strict code (ES §13.1.1, §12.7.2).
@@ -935,7 +939,7 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         const decl_kind: ast.VarKind = if (p.check(.kw_var)) .var_ else if (p.check(.kw_let)) .let else .const_;
         _ = p.advance(); // consume declaration keyword
         if (p.check(.left_bracket) or p.check(.left_brace)) {
-            return p.parseForDestructuring(start, decl_kind);
+            return p.parseForDestructuring(start, decl_kind, for_await);
         }
         if (p.check(.identifier)) {
             const name_tok = p.current;
@@ -1092,7 +1096,7 @@ pub fn parseForStmt(p: *Parser) ?*Node {
 /// happens INSIDE the loop body, which already gets a fresh lexical
 /// environment each iteration via the existing for-in/for-of lowering, so
 /// `const`/`let` bindings stay fresh per iteration without any extra work here.
-pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind) ?*Node {
+pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind, for_await: bool) ?*Node {
     const pattern: *Node = if (p.check(.left_bracket))
         p.parseArrayLiteral() orelse return null
     else
@@ -1158,7 +1162,7 @@ pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind) ?*Node {
     const new_body = p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = body_stmts.items, .lexical_scope = false } }) orelse return null;
     const left = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = kind, .name = tmp_name, .init = null } }) orelse return null;
     return p.makeNode(.for_in_stmt, start, p.current.start, .{
-        .for_in_stmt = .{ .left = left, .right = right, .body = new_body, .iterate_values = iterate_values },
+        .for_in_stmt = .{ .left = left, .right = right, .body = new_body, .iterate_values = iterate_values, .is_await = for_await },
     });
 }
 
@@ -1320,12 +1324,18 @@ pub fn parseTryStmt(p: *Parser) ?*Node {
         // Optional catch binding (ES2019): `catch { ... }` with no `(param)`.
         // An empty param_name signals "no binding" to the lowering pass.
         var catch_param_name: []const u8 = "";
+        // A destructuring catch binding (`catch ({a}) {}` / `catch ([a]) {}`) is
+        // desugared: the exception is bound to a fresh temp and the pattern's own
+        // bindings are introduced by `let` declarations prepended to the body.
+        var catch_pattern: ?*Node = null;
         if (p.check(.left_paren)) {
             _ = p.advance(); // consume '('
             catch_param_name = if (p.check(.left_brace) or p.check(.left_bracket)) blk: {
-                // Destructuring catch param: skip balanced pattern, bind exc to temp.
                 const tmp = std.fmt.allocPrint(p.arena, "__catch_{d}", .{start}) catch return null;
-                skipDestructuringPattern(p);
+                catch_pattern = if (p.check(.left_bracket))
+                    p.parseArrayLiteral() orelse return null
+                else
+                    expr_mod.parseObjectPattern(p) orelse return null;
                 break :blk tmp;
             } else blk: {
                 const tok = p.expect(.identifier) orelse return null;
@@ -1333,7 +1343,28 @@ pub fn parseTryStmt(p: *Parser) ?*Node {
             };
             _ = p.expect(.right_paren) orelse return null;
         }
-        const catch_body = p.parseBlock() orelse return null;
+        var catch_body = p.parseBlock() orelse return null;
+        if (catch_pattern) |pattern| {
+            // Build the per-binding destructuring declarations reading the temp,
+            // then wrap them together with the original body in a fresh block so
+            // the catch-param bindings share the body's lexical scope.
+            const tmp_ref = p.makeNode(.identifier, start, start, .{ .identifier = catch_param_name }) orelse return null;
+            var decls_out = std.ArrayList(*Node){};
+            const saved_out = p.destruct_out;
+            const saved_kind = p.destruct_kind;
+            p.destruct_out = &decls_out;
+            p.destruct_kind = .let;
+            const ok = expr_mod.desugarParamPattern(p, pattern, tmp_ref);
+            p.destruct_out = saved_out;
+            p.destruct_kind = saved_kind;
+            if (!ok) return null;
+            var body_stmts = std.ArrayList(*Node){};
+            body_stmts.appendSlice(p.arena, decls_out.items) catch return null;
+            body_stmts.append(p.arena, catch_body) catch return null;
+            catch_body = p.makeNode(.block_stmt, start, p.current.start, .{
+                .block_stmt = .{ .body = body_stmts.items, .lexical_scope = true },
+            }) orelse return null;
+        }
         handler = ast.CatchClause{
             .param_name = catch_param_name,
             .body = catch_body,

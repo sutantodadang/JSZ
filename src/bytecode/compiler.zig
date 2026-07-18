@@ -1017,7 +1017,30 @@ pub const FnCompiler = struct {
     /// is read-only and must stay live for the caller; helpers only allocate
     /// registers above it. Array patterns read positionally (`rsrc[i]`), matching
     /// the index-based binding-declaration desugaring.
-    fn compileDestructure(self: *Self, target: *Node, rsrc: u8, line: u32) error{OutOfMemory}!void {
+    /// Emit `__requireObjectCoercible__(R[rsrc])` — a spec RequireObjectCoercible
+    /// guard that throws a TypeError when `rsrc` is null/undefined before a
+    /// destructuring-assignment pattern reads it (matching the binding-pattern
+    /// desugar, which the parser already routes through the same helper). `rsrc`
+    /// is left untouched; the call result is discarded into a scratch register.
+    fn emitRequireCoercible(self: *Self, rsrc: u8, line: u32) error{OutOfMemory}!void {
+        const save_sp = self.sp;
+        const callee = self.allocReg();
+        const gi = try self.addConstant(try val_mod.makeString(self.arena, "__requireObjectCoercible__"));
+        try self.emitOp(.GET_GLOBAL, line);
+        try self.emitU8(callee);
+        try self.emitU16(@intCast(gi));
+        const arg = self.allocReg();
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(arg);
+        try self.emitU8(rsrc);
+        try self.emitOp(.CALL, line);
+        try self.emitU8(callee);
+        try self.emitU8(1);
+        try self.emitU8(callee); // discard result
+        self.sp = save_sp;
+    }
+
+    pub fn compileDestructure(self: *Self, target: *Node, rsrc: u8, line: u32) error{OutOfMemory}!void {
         switch (target.kind) {
             .identifier => try self.emitStore(target.data.identifier, rsrc, line),
             .member_expr => try self.compileMemberWrite(target.data.member_expr, rsrc, line),
@@ -1049,6 +1072,9 @@ pub const FnCompiler = struct {
                 self.sp = rt; // free rt
             },
             .object_literal => {
+                // `({a} = null)` / `for ({a} of [null])`: destructuring null or
+                // undefined throws before any property read.
+                try self.emitRequireCoercible(rsrc, line);
                 for (target.data.object_literal.properties) |prop| {
                     if (prop.kind != .init) continue; // patterns carry only data props
                     const rval = self.allocReg();
@@ -1072,6 +1098,9 @@ pub const FnCompiler = struct {
                 }
             },
             .array_literal => {
+                // `[a] = null` / `for ([a] of [null])`: array destructuring does
+                // GetIterator first, which throws a TypeError on null/undefined.
+                try self.emitRequireCoercible(rsrc, line);
                 const elems = target.data.array_literal.elements;
                 for (elems, 0..) |elem, i| {
                     // Elision hole (`[, x] = rhs`): the parser models holes as
