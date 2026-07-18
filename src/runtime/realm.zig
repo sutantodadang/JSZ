@@ -74,6 +74,11 @@ pub const Context = struct {
     /// Write a property by string key, firing accessor setters / Proxy traps /
     /// TypedArray integer-index exotic [[Set]] (full [[Set]]). Propagates throws.
     set_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void,
+    /// [[Set]](O, key, value) with Throw=true: like `set_fn` but a failed
+    /// assignment (non-writable data, accessor without setter, Proxy `set` trap
+    /// returning false, non-extensible add) raises a TypeError instead of being a
+    /// silent no-op. Mirrors a strict-mode assignment.
+    set_throw_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void,
     /// HasProperty(O, key): own-or-inherited existence check firing Proxy `has`
     /// traps. Used by array methods to skip holes (absent indices).
     has_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool,
@@ -139,6 +144,10 @@ pub const Context = struct {
 
     pub fn setProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void {
         return self.set_fn(self.ptr, arena, obj_val, key, value);
+    }
+
+    pub fn setPropThrow(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void {
+        return self.set_throw_fn(self.ptr, arena, obj_val, key, value);
     }
 
     pub fn hasProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool {
@@ -1295,20 +1304,6 @@ pub var pending_exception: Value = Value{};
 
 // ---------------------------------------------------------------- Error constructors ---
 
-/// Create an Error object with the given name and message, using proto as [[Prototype]].
-fn createErrorObj(arena: std.mem.Allocator, proto: ?*JsObject, name: []const u8, message: []const u8) anyerror!Value {
-    const obj = if (active_heap) |heap|
-        try JsObject.createOnHeap(heap, proto)
-    else
-        try JsObject.create(arena, proto);
-    const msg_val = try val_mod.makeString(arena, message);
-    const name_val = try val_mod.makeString(arena, name);
-    try obj.set("message", msg_val);
-    try obj.set("name", name_val);
-    obj.is_error = true;
-    return val_mod.makeObject(arena, obj);
-}
-
 /// Build a native constructor for the given error kind.
 /// Returns a NativeFn that creates an error object with the right prototype.
 /// The prototype is retrieved via a thread-local pointer set during realm init.
@@ -1320,102 +1315,135 @@ pub var error_proto_RangeError: ?*JsObject = null;
 pub var error_proto_ReferenceError: ?*JsObject = null;
 pub var error_proto_AggregateError: ?*JsObject = null;
 pub var error_proto_URIError: ?*JsObject = null;
+pub var error_proto_EvalError: ?*JsObject = null;
+pub var error_proto_SuppressedError: ?*JsObject = null;
 
-fn extractMessage(args: []const Value) []const u8 {
-    if (args.len > 0 and args[0].bits != 0) {
-        return switch (args[0].unbox()) {
-            .string => |s| s,
-            .undefined_ => "",
-            else => "error",
-        };
-    }
-    return "";
-}
+/// Attributes shared by the own data properties an Error constructor installs on
+/// its instance (message / cause / errors / error / suppressed): every one is
+/// { [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }.
+const error_prop_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
 
-fn populateErrorThis(arena: std.mem.Allocator, this_val: Value, name: []const u8, message: []const u8) !Value {
-    // If this_val is an object, populate it and return it.
-    // Otherwise create a new object.
+/// OrdinaryCreateFromConstructor result for an Error subclass: mark the incoming
+/// `this` (already built by the VM with the newTarget-derived prototype) as an
+/// [[ErrorData]] object. Error instances carry NO own "name"/"message" — those
+/// inherit from the prototype; a "message" own slot is only added when a message
+/// argument is supplied (see `defineErrorMessage`). The `proto` fallback covers
+/// the constructor being *called* (no `new`) or with a non-object `this`.
+fn populateErrorThis(arena: std.mem.Allocator, this_val: Value, proto: ?*JsObject) !Value {
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const obj = this_val.toPtr().object;
-        const msg_val = try val_mod.makeString(arena, message);
-        const name_val = try val_mod.makeString(arena, name);
-        try obj.set("message", msg_val);
-        try obj.set("name", name_val);
         obj.is_error = true;
         return this_val;
     }
-    // Fallback: create new object with the right proto.
-    const proto: ?*JsObject = null;
-    return createErrorObj(arena, proto, name, message);
+    const obj = if (active_heap) |heap|
+        try JsObject.createOnHeap(heap, proto)
+    else
+        try JsObject.create(arena, proto);
+    obj.is_error = true;
+    return val_mod.makeObject(arena, obj);
 }
 
-/// InstallErrorCause (ES §20.5.8.1): if `options` is an object with an own
-/// "cause", set `error.cause` to it (writable, non-enumerable, configurable).
+/// If a message argument is present (not undefined/absent), CreateNonEnumerable-
+/// DataPropertyOrThrow(O, "message", ToString(message)). ToString goes through
+/// ToPrimitive (so an object's `toString` runs and may throw) and raises a
+/// TypeError for a Symbol — matching Error(message) step 3.
+fn defineErrorMessage(arena: std.mem.Allocator, result: Value, msg_arg: Value) !void {
+    if (result.bits == 0 or result.unbox() != .object) return;
+    if (msg_arg.bits == 0 or msg_arg.unbox() == .undefined_) return;
+    const msg = try uriToString(arena, msg_arg);
+    _ = try result.toPtr().object.defineOwnData("message", try val_mod.makeString(arena, msg), error_prop_attr);
+}
+
+/// InstallErrorCause (ES §20.5.8.1): if `options` is an Object and
+/// ? HasProperty(options, "cause") is true, set `error.cause` to ? Get(options,
+/// "cause") as a non-enumerable data property. HasProperty / Get run through the
+/// full [[HasProperty]] / [[Get]] so a Proxy trap or accessor can throw (abrupt
+/// completions propagate).
 fn installErrorCause(arena: std.mem.Allocator, result: Value, options: Value) !void {
     if (result.bits == 0 or result.unbox() != .object) return;
     if (options.bits == 0 or options.unbox() != .object) return;
-    const opts = options.toPtr().object;
-    if (!opts.hasOwn("cause")) return;
-    const cause = opts.getOwn("cause") orelse try val_mod.makeUndefined(arena);
-    _ = try result.toPtr().object.defineOwnData("cause", cause, .{ .writable = true, .enumerable = false, .configurable = true });
+    const has = if (active_context) |c| try c.hasProp(arena, options, "cause") else options.toPtr().object.hasOwn("cause");
+    if (!has) return;
+    const cause = if (active_context) |c| try c.getProp(arena, options, "cause") else (options.toPtr().object.getOwn("cause") orelse Value{});
+    _ = try result.toPtr().object.defineOwnData("cause", cause, error_prop_attr);
 }
 
-fn errorCtorWithCause(arena: std.mem.Allocator, this_val: Value, name: []const u8, args: []const Value) anyerror!Value {
-    const result = try populateErrorThis(arena, this_val, name, extractMessage(args));
+fn errorCtorWithCause(arena: std.mem.Allocator, this_val: Value, proto: ?*JsObject, args: []const Value) anyerror!Value {
+    const result = try populateErrorThis(arena, this_val, proto);
+    // Step order (Error): ToString(message) → define "message", then cause.
+    try defineErrorMessage(arena, result, if (args.len > 0) args[0] else Value{});
     try installErrorCause(arena, result, if (args.len > 1) args[1] else Value{});
     return result;
 }
 
 fn nativeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, "Error", args);
+    return errorCtorWithCause(arena, this_val, error_proto_Error, args);
 }
 
 fn nativeTypeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, "TypeError", args);
+    return errorCtorWithCause(arena, this_val, error_proto_TypeError, args);
 }
 
 fn nativeSyntaxErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, "SyntaxError", args);
+    return errorCtorWithCause(arena, this_val, error_proto_SyntaxError, args);
 }
 
 fn nativeRangeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, "RangeError", args);
+    return errorCtorWithCause(arena, this_val, error_proto_RangeError, args);
 }
 
 fn nativeReferenceErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, "ReferenceError", args);
+    return errorCtorWithCause(arena, this_val, error_proto_ReferenceError, args);
 }
 
 fn nativeEvalErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, "EvalError", args);
+    return errorCtorWithCause(arena, this_val, error_proto_EvalError, args);
 }
 
 fn nativeUriErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, "URIError", args);
+    return errorCtorWithCause(arena, this_val, error_proto_URIError, args);
+}
+
+/// CreateArrayFromList over the IteratorToList of `errs_arg` → an Array on
+/// %Array.prototype%. Throws if `errs_arg` is not iterable (GetIterator step).
+fn errorsListToArray(arena: std.mem.Allocator, errs_arg: Value) anyerror!Value {
+    var items = std.ArrayList(Value){};
+    const iterable = errs_arg.bits != 0 and errs_arg.unbox() != .undefined_ and errs_arg.unbox() != .null_;
+    if (!iterable or !try arrayFromIterate(arena, errs_arg, &items))
+        return throwTypeError(arena, "AggregateError: errors argument is not iterable");
+    const arr = if (active_heap) |h|
+        try JsObject.createOnHeap(h, active_array_proto)
+    else
+        try JsObject.create(arena, active_array_proto);
+    arr.is_array = true;
+    for (items.items, 0..) |v, i| {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        try arr.set(key, v);
+    }
+    arr.array_length = @intCast(items.items.len);
+    return val_mod.makeObject(arena, arr);
 }
 
 fn nativeAggregateErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    // args[0] = errors iterable/array, args[1] = message string
-    const message = if (args.len > 1) extractMessage(args[1..]) else "";
-    const result = try populateErrorThis(arena, this_val, "AggregateError", message);
-    // Attach the errors array (args[0]) if it is an array/object, else empty array.
-    const errors_val: Value = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object)
-        args[0]
-    else blk: {
-        const arr_proto = active_array_proto;
-        const empty_arr = if (active_heap) |h|
-            try JsObject.createOnHeap(h, arr_proto)
-        else
-            try JsObject.create(arena, arr_proto);
-        empty_arr.is_array = true;
-        empty_arr.array_length = 0;
-        break :blk try val_mod.makeObject(arena, empty_arr);
-    };
-    if (result.bits != 0 and result.unbox() == .object) {
-        try result.toPtr().object.set("errors", errors_val);
-    }
-    // AggregateError options object is the third argument.
+    // AggregateError(errors, message, options). Step order: define "message"
+    // (if provided), InstallErrorCause, then IteratorToList(errors) → "errors".
+    const result = try populateErrorThis(arena, this_val, error_proto_AggregateError);
+    try defineErrorMessage(arena, result, if (args.len > 1) args[1] else Value{});
     try installErrorCause(arena, result, if (args.len > 2) args[2] else Value{});
+    const errors_arr = try errorsListToArray(arena, if (args.len > 0) args[0] else Value{});
+    _ = try result.toPtr().object.defineOwnData("errors", errors_arr, error_prop_attr);
+    return result;
+}
+
+fn nativeSuppressedErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // SuppressedError(error, suppressed, message). Superclass-then-subclass order:
+    // define "message" (if provided) first, then always "error" and "suppressed"
+    // as non-enumerable data properties.
+    const result = try populateErrorThis(arena, this_val, error_proto_SuppressedError);
+    try defineErrorMessage(arena, result, if (args.len > 2) args[2] else Value{});
+    const obj = result.toPtr().object;
+    _ = try obj.defineOwnData("error", if (args.len > 0) args[0] else try val_mod.makeUndefined(arena), error_prop_attr);
+    _ = try obj.defineOwnData("suppressed", if (args.len > 1) args[1] else try val_mod.makeUndefined(arena), error_prop_attr);
     return result;
 }
 
@@ -2508,6 +2536,108 @@ fn nativeErrorIsError(arena: std.mem.Allocator, _: Value, args: []const Value) a
     return val_mod.makeBool(arena, arg.toPtr().object.is_error);
 }
 
+/// get Error.prototype.stack (error-stack-accessor proposal). Throws for a
+/// non-object receiver; returns undefined when the receiver lacks an
+/// [[ErrorData]] internal slot; otherwise an implementation-defined stack
+/// string. The result depends only on the [[ErrorData]] slot, never on any own
+/// "stack" property (which shadows the accessor only for ordinary [[Get]]).
+fn nativeErrorStackGet(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (!isObjectLike(this_val))
+        return throwTypeError(arena, "Error.prototype.stack getter called on non-object");
+    // Only ordinary objects can carry an [[ErrorData]] slot; callable objects
+    // (functions) never do, so they fall through to undefined.
+    const is_err = this_val.unbox() == .object and this_val.toPtr().object.is_error;
+    if (!is_err) return val_mod.makeUndefined(arena);
+    return val_mod.makeString(arena, "");
+}
+
+/// An "Object" in spec terms: an ordinary object or any callable (function).
+fn isObjectLike(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .object, .native_function, .bc_function, .function => true,
+        else => false,
+    };
+}
+
+/// set Error.prototype.stack (error-stack-accessor). Requires a String `v`
+/// (else TypeError, never touching [[ErrorData]]), then runs
+/// SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v):
+/// setting on %Error.prototype% itself throws; otherwise an existing own
+/// property receives an ordinary [[Set]] (Throw=true) and a missing one is
+/// created as a { writable, enumerable, configurable } data property.
+fn nativeErrorStackSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (!isObjectLike(this_val))
+        return throwTypeError(arena, "Error.prototype.stack setter called on non-object");
+    const v = if (args.len > 0) args[0] else Value{};
+    if (v.bits == 0 or v.unbox() != .string)
+        return throwTypeError(arena, "Error.prototype.stack setter requires a string value");
+
+    // A Proxy receiver drives SetterThatIgnoresPrototypeProperties through its
+    // [[GetOwnProperty]] / [[DefineOwnProperty]] / [[Set]] traps (which may throw).
+    if (this_val.unbox() == .object and this_val.toPtr().object.internal_kind == .proxy)
+        return errorStackSetViaProxy(arena, this_val, v);
+
+    // Ordinary object or callable: resolve the backing JsObject.
+    const obj = if (this_val.unbox() == .object)
+        this_val.toPtr().object
+    else if (active_context) |c|
+        (try c.backingObject(arena, this_val)) orelse return val_mod.makeUndefined(arena)
+    else
+        return val_mod.makeUndefined(arena);
+
+    // Home-object check: assigning to this realm's %Error.prototype% itself throws
+    // (emulates a non-writable data property in strict code).
+    if (error_proto_Error) |ep| {
+        if (obj == ep) return throwTypeError(arena, "Cannot assign to read only property 'stack' of Error.prototype");
+    }
+    if (obj.ownAttr("stack")) |attr| {
+        // Own property exists → ordinary [[Set]] with Throw=true.
+        if (attr.is_accessor) {
+            const holder = obj.ownAccessorHolder("stack") orelse Value{};
+            const setter = if (holder.bits != 0 and holder.unbox() == .object)
+                (holder.toPtr().object.get("set") orelse Value{})
+            else
+                Value{};
+            if (isCallableVal(setter)) {
+                _ = try function_proto_mod.invokeCallback(arena, this_val, setter, &[_]Value{v});
+            } else {
+                return throwTypeError(arena, "Cannot set property 'stack' which has only a getter");
+            }
+        } else if (!attr.writable) {
+            return throwTypeError(arena, "Cannot assign to read only property 'stack'");
+        } else {
+            try obj.set("stack", v); // writable data: update value, preserve attributes.
+        }
+    } else if (!try obj.defineOwnData("stack", v, .{ .writable = true, .enumerable = true, .configurable = true })) {
+        // CreateDataPropertyOrThrow failed → the receiver is non-extensible.
+        return throwTypeError(arena, "Cannot create property 'stack' on a non-extensible object");
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+/// SetterThatIgnoresPrototypeProperties for a Proxy receiver: run the property
+/// operations through the object-method builtins so the proxy's traps fire
+/// (getOwnPropertyDescriptor → then either defineProperty or set).
+fn errorStackSetViaProxy(arena: std.mem.Allocator, proxy_val: Value, v: Value) anyerror!Value {
+    const key = try val_mod.makeString(arena, "stack");
+    const desc = try obj_methods_mod.nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ proxy_val, key });
+    if (desc.bits == 0 or desc.unbox() == .undefined_) {
+        // CreateDataPropertyOrThrow: a data descriptor { value, writable,
+        // enumerable, configurable }, all true (defineProperty throws on failure).
+        const dd = try JsObject.create(arena, null);
+        try dd.set("value", v);
+        try dd.set("writable", try val_mod.makeBool(arena, true));
+        try dd.set("enumerable", try val_mod.makeBool(arena, true));
+        try dd.set("configurable", try val_mod.makeBool(arena, true));
+        _ = try obj_methods_mod.nativeObjectDefineProperty(arena, Value{}, &[_]Value{ proxy_val, key, try val_mod.makeObject(arena, dd) });
+    } else if (active_context) |c| {
+        // Set(proxy, "stack", v, true) → set trap; a false trap result throws.
+        try c.setPropThrow(arena, proxy_val, "stack", v);
+    }
+    return val_mod.makeUndefined(arena);
+}
+
 fn nativeEncodeURI(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const s = try uriToString(arena, if (args.len > 0) args[0] else Value{});
     return uriEncode(arena, s, false);
@@ -3066,6 +3196,8 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
             "Arguments"
         else if (obj.get("__call__") != null)
             "Function"
+        else if (obj.is_error)
+            "Error"
         else if (wrapperTag(obj)) |wt|
             wt
         else if (obj.internal_kind == .date)
@@ -3720,6 +3852,15 @@ pub const Realm = struct {
         try error_proto.set("name", ep_name);
         try error_proto.set("message", ep_msg);
         _ = try error_proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeErrorToString, "toString", 0), .{ .writable = true, .enumerable = false, .configurable = true });
+        // Error.prototype.stack (error-stack-accessor proposal): accessor property
+        // { [[Enumerable]]: false, [[Configurable]]: true }; get "get stack"/0,
+        // set "set stack"/1.
+        {
+            const stack_holder = try JsObject.create(arena, null);
+            try stack_holder.set("get", try val_mod.makeNativeFunctionNamed(arena, nativeErrorStackGet, "get stack", 0));
+            try stack_holder.set("set", try val_mod.makeNativeFunctionNamed(arena, nativeErrorStackSet, "set stack", 1));
+            _ = try error_proto.defineOwnAccessor("stack", try val_mod.makeObject(arena, stack_holder), .{ .enumerable = false, .configurable = true });
+        }
 
         // TypeError.prototype: proto = Error.prototype.
         const type_error_proto = try JsObject.create(arena, error_proto);
@@ -3759,6 +3900,11 @@ pub const Realm = struct {
         try uri_error_proto.set("name", try val_mod.makeString(arena, "URIError"));
         try uri_error_proto.set("message", ep_msg);
 
+        // SuppressedError.prototype (ES2024): proto = Error.prototype.
+        const suppressed_error_proto = try JsObject.create(arena, error_proto);
+        try suppressed_error_proto.set("name", try val_mod.makeString(arena, "SuppressedError"));
+        try suppressed_error_proto.set("message", ep_msg);
+
         // Set thread-local proto pointers so native ctors can find them.
         error_proto_Error = error_proto;
         error_proto_TypeError = type_error_proto;
@@ -3767,35 +3913,41 @@ pub const Realm = struct {
         error_proto_ReferenceError = reference_error_proto;
         error_proto_AggregateError = aggregate_error_proto;
         error_proto_URIError = uri_error_proto;
+        error_proto_EvalError = eval_error_proto;
+        error_proto_SuppressedError = suppressed_error_proto;
 
         // Create Error constructor objects. Each has a .prototype property
         // and a hidden __proto__ marker so `instanceof` can find the prototype.
         const makeErrorCtor = struct {
-            fn make(a: std.mem.Allocator, ctor_fn: val_mod.NativeFnPtr, proto_obj: *JsObject, name: []const u8) !Value {
+            fn make(a: std.mem.Allocator, ctor_fn: val_mod.NativeFnPtr, proto_obj: *JsObject, name: []const u8, len: f64) !Value {
                 const ctor_obj = try JsObject.create(a, null);
                 const ctor_proto_val = try val_mod.makeObject(a, proto_obj);
-                try ctor_obj.set("prototype", ctor_proto_val);
+                // §20.5.x: `Constructor.prototype` is { [[Writable]]: false,
+                // [[Enumerable]]: false, [[Configurable]]: false }.
+                _ = try ctor_obj.defineOwnData("prototype", ctor_proto_val, .{ .writable = false, .enumerable = false, .configurable = false });
                 const fn_val = try val_mod.makeNativeFunction(a, ctor_fn);
                 // Store the native fn on the ctor object as "__call__".
                 try ctor_obj.set("__call__", fn_val);
                 // §20.5.x: each Error constructor has `name` (e.g. "TypeError") and
-                // `length` 1, both non-enumerable / configurable. assert.throws and
+                // a `length` (largest named-arg count), both non-enumerable /
+                // configurable / non-writable. assert.throws and
                 // Function.prototype.toString rely on `name`.
                 const nlen_attr: obj_mod.PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
                 _ = try ctor_obj.defineOwnData("name", try val_mod.makeString(a, name), nlen_attr);
-                _ = try ctor_obj.defineOwnData("length", try val_mod.makeNumber(a, 1), nlen_attr);
+                _ = try ctor_obj.defineOwnData("length", try val_mod.makeNumber(a, len), nlen_attr);
                 return val_mod.makeObject(a, ctor_obj);
             }
         }.make;
 
-        const error_ctor_val = try makeErrorCtor(arena, nativeErrorCtor, error_proto, "Error");
-        const type_error_ctor_val = try makeErrorCtor(arena, nativeTypeErrorCtor, type_error_proto, "TypeError");
-        const syntax_error_ctor_val = try makeErrorCtor(arena, nativeSyntaxErrorCtor, syntax_error_proto, "SyntaxError");
-        const range_error_ctor_val = try makeErrorCtor(arena, nativeRangeErrorCtor, range_error_proto, "RangeError");
-        const reference_error_ctor_val = try makeErrorCtor(arena, nativeReferenceErrorCtor, reference_error_proto, "ReferenceError");
-        const aggregate_error_ctor_val = try makeErrorCtor(arena, nativeAggregateErrorCtor, aggregate_error_proto, "AggregateError");
-        const eval_error_ctor_val = try makeErrorCtor(arena, nativeEvalErrorCtor, eval_error_proto, "EvalError");
-        const uri_error_ctor_val = try makeErrorCtor(arena, nativeUriErrorCtor, uri_error_proto, "URIError");
+        const error_ctor_val = try makeErrorCtor(arena, nativeErrorCtor, error_proto, "Error", 1);
+        const type_error_ctor_val = try makeErrorCtor(arena, nativeTypeErrorCtor, type_error_proto, "TypeError", 1);
+        const syntax_error_ctor_val = try makeErrorCtor(arena, nativeSyntaxErrorCtor, syntax_error_proto, "SyntaxError", 1);
+        const range_error_ctor_val = try makeErrorCtor(arena, nativeRangeErrorCtor, range_error_proto, "RangeError", 1);
+        const reference_error_ctor_val = try makeErrorCtor(arena, nativeReferenceErrorCtor, reference_error_proto, "ReferenceError", 1);
+        const aggregate_error_ctor_val = try makeErrorCtor(arena, nativeAggregateErrorCtor, aggregate_error_proto, "AggregateError", 2);
+        const eval_error_ctor_val = try makeErrorCtor(arena, nativeEvalErrorCtor, eval_error_proto, "EvalError", 1);
+        const uri_error_ctor_val = try makeErrorCtor(arena, nativeUriErrorCtor, uri_error_proto, "URIError", 1);
+        const suppressed_error_ctor_val = try makeErrorCtor(arena, nativeSuppressedErrorCtor, suppressed_error_proto, "SuppressedError", 3);
 
         // Spec: ErrorPrototype.constructor = ErrorConstructor (non-enumerable, writable, configurable).
         // Required for `thrown.constructor === TypeError` identity checks in assert.throws.
@@ -3808,6 +3960,7 @@ pub const Realm = struct {
         _ = try aggregate_error_proto.defineOwnData("constructor", aggregate_error_ctor_val, ctor_attr);
         _ = try eval_error_proto.defineOwnData("constructor", eval_error_ctor_val, ctor_attr);
         _ = try uri_error_proto.defineOwnData("constructor", uri_error_ctor_val, ctor_attr);
+        _ = try suppressed_error_proto.defineOwnData("constructor", suppressed_error_ctor_val, ctor_attr);
 
         // Error.isError (ES2024 static method), non-enumerable / writable / configurable.
         _ = try error_ctor_val.toPtr().object.defineOwnData("isError", try val_mod.makeNativeFunctionNamed(arena, nativeErrorIsError, "isError", 1), .{ .writable = true, .enumerable = false, .configurable = true });
@@ -3820,6 +3973,7 @@ pub const Realm = struct {
         try env.define("AggregateError", aggregate_error_ctor_val);
         try env.define("EvalError", eval_error_ctor_val);
         try env.define("URIError", uri_error_ctor_val);
+        try env.define("SuppressedError", suppressed_error_ctor_val);
 
         // Also store prototypes under hidden names so vm.zig's getErrorProto can find them.
         const error_proto_val = try val_mod.makeObject(arena, error_proto);
@@ -4403,7 +4557,7 @@ pub const Realm = struct {
                 type_error_ctor_val,   syntax_error_ctor_val,
                 range_error_ctor_val,  reference_error_ctor_val,
                 aggregate_error_ctor_val, eval_error_ctor_val,
-                uri_error_ctor_val,
+                uri_error_ctor_val,    suppressed_error_ctor_val,
             }) |cv| {
                 const co = cv.toPtr().object;
                 co.proto = error_ctor_obj;

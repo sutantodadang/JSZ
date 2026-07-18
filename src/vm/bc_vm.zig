@@ -657,6 +657,16 @@ pub const BcVm = struct {
         return self.setProp(obj_val, key, value);
     }
 
+    /// [[Set]] with Throw=true: a failed assignment (setPropR returns false)
+    /// becomes a TypeError, matching a strict-mode store.
+    fn bcSetPropThrow(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void {
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        if (!try self.setPropR(obj_val, key, value, obj_val)) {
+            const realm_mod = @import("../runtime/realm.zig");
+            return realm_mod.throwTypeError(arena, "Cannot assign to read only property");
+        }
+    }
+
     fn bcSetProto(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void {
         _ = arena;
         const self: *BcVm = @ptrCast(@alignCast(ptr));
@@ -1133,6 +1143,7 @@ pub const BcVm = struct {
             .construct_nt_fn = bcConstructNt,
             .get_sym_fn = bcGetPropSym,
             .set_fn = bcSetProp,
+            .set_throw_fn = bcSetPropThrow,
             .has_fn = bcHasProp,
             .set_proto_fn = bcSetProto,
             .backing_obj_fn = bcBackingObj,
