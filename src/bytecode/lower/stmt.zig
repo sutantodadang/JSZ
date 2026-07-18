@@ -773,6 +773,12 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
                 try self.emitU16(@intCast(ni));
                 try self.emitU8(rval);
             }
+        } else switch (fo.left.kind) {
+            // `for ([a, b] of it)` / `for ({x} of it)` / `for (o.p of it)`: the
+            // head is an AssignmentPattern (or member target) with no declaration.
+            // Assign each iteration's value into it via the destructuring helper.
+            .array_literal, .object_literal, .member_expr => try self.compileDestructure(fo.left, rval, line),
+            else => {},
         }
         self.sp = iter_sp;
         // Register the loop so `break`/`continue` (labeled or innermost) resolve to

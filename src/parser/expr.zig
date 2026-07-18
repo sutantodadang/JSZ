@@ -1436,6 +1436,14 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
         },
         .kw_yield => {
             if (!p.in_generator_function) {
+                // Outside a generator, `yield` is a YieldExpression only in strict
+                // mode (where it is reserved). In sloppy-mode code it is a plain
+                // IdentifierReference (e.g. `var yield = 4; x = yield;`).
+                if (!p.strict) {
+                    const yname = p.current.value_str;
+                    _ = p.advance();
+                    return p.makeNode(.identifier, start, p.current.start, .{ .identifier = yname });
+                }
                 if (!p.had_error) {
                     p.had_error = true;
                     p.error_info = parser_file.ParseError{

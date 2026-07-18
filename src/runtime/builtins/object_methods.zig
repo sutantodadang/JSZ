@@ -414,6 +414,7 @@ pub fn nativeObjectGetOwnPropertyDescriptors(arena: std.mem.Allocator, _: Value,
     const obj = args[0].toPtr().object;
 
     for (obj.ownKeys()) |k| {
+        if (obj.isPrivate(k)) continue; // private class elements are hidden
         const v = obj.getOwn(k) orelse continue;
         const desc_val = try makeDataDescriptor(arena, v);
         try out.set(k, desc_val);
@@ -457,6 +458,7 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
             args[0].toPtr().string
         else
             (try coerceKey(arena, args[0])) orelse return val_mod.makeBool(arena, false);
+        if (bobj.isPrivate(key2)) return val_mod.makeBool(arena, false);
         return val_mod.makeBool(arena, bobj.hasOwn(key2));
     }
     if (this_val.bits == 0 or this_val.unbox() != .object) {
@@ -494,6 +496,8 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
         return val_mod.makeBool(arena, true);
     }
 
+    // A private class element (`#x`) is hidden from reflection.
+    if (obj.isPrivate(key)) return val_mod.makeBool(arena, false);
     return val_mod.makeBool(arena, obj.hasOwn(key));
 }
 
@@ -1004,6 +1008,7 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
     }
     var i: u32 = ta_key_count;
     for (obj.ownKeys()) |k| {
+        if (obj.isPrivate(k)) continue; // private class elements are hidden
         const key_val = try val_mod.makeString(arena, k);
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
         try arr.set(idx_key, key_val);
@@ -1141,6 +1146,8 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     }
 
     const key = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
+    // Private class elements (`#x`) are hidden from reflection.
+    if (obj.isPrivate(key)) return val_mod.makeUndefined(arena);
 
     const a = obj.ownAttr(key) orelse return val_mod.makeUndefined(arena);
 

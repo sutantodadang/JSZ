@@ -26,7 +26,12 @@ pub const PropAttr = packed struct(u8) {
     enumerable: bool = true,
     configurable: bool = true,
     is_accessor: bool = false,
-    _pad: u4 = 0,
+    /// True for a private class element (`#x` field / `#m()` method). Modeled as
+    /// a `"#"`-keyed own slot for storage, but hidden from every reflection path
+    /// (hasOwnProperty, getOwnPropertyNames, getOwnPropertyDescriptor, for-in,
+    /// Object.keys, spread) so it never appears as an ordinary property.
+    is_private: bool = false,
+    _pad: u3 = 0,
 };
 
 /// A symbol-keyed own property (stored separately from string-keyed slots so
@@ -327,6 +332,22 @@ pub const JsObject = struct {
         const slot = self.shape.key_to_slot.get(key) orelse return false;
         if (slot >= self.attrs.items.len) return true;
         return self.attrs.items[slot].enumerable;
+    }
+
+    /// Mark an existing own `key` as a private class element: hidden from
+    /// reflection and non-enumerable. No-op if `key` is not an own property.
+    pub fn markPrivate(self: *JsObject, key: []const u8) void {
+        const slot = self.shape.key_to_slot.get(key) orelse return;
+        if (slot >= self.attrs.items.len) return;
+        self.attrs.items[slot].is_private = true;
+        self.attrs.items[slot].enumerable = false;
+    }
+
+    /// True when `key` is an own property flagged as a private class element.
+    pub fn isPrivate(self: *JsObject, key: []const u8) bool {
+        const slot = self.shape.key_to_slot.get(key) orelse return false;
+        if (slot >= self.attrs.items.len) return false;
+        return self.attrs.items[slot].is_private;
     }
 
     /// Own attribute bits for `key`, or null if not an own property.

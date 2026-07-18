@@ -259,6 +259,21 @@ pub inline fn opSetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         if (try strictAssignThrow(self)) |oc| return oc;
         return null;
     }
+    // A static-key member write `obj.#x = v` (the only syntax that yields a
+    // "#"-prefixed non-computed key) is a private class element: hide it from
+    // reflection. Computed writes (`obj["#x"]`) go through opSetPropDyn and are
+    // never marked, so a genuine string property named "#x" stays visible.
+    if (set_ok and key.len > 0 and key[0] == '#' and obj_val.bits != 0) {
+        const tag = obj_val.unbox();
+        if (tag == .object) {
+            obj_val.toPtr().object.markPrivate(key);
+        } else if (tag == .bc_function) {
+            const realm_mod = @import("../../runtime/realm.zig");
+            if (realm_mod.active_context) |ctx| {
+                if (try ctx.backingObject(self.arena, obj_val)) |bobj| bobj.markPrivate(key);
+            }
+        }
+    }
     const site_cache = &@constCast(set_func.ic_table)[site_pc];
     if (obj_val.bits != 0 and obj_val.unbox() == .object) {
         const obj = obj_val.toPtr().object;
