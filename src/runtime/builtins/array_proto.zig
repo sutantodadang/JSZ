@@ -43,12 +43,9 @@ fn requireCoercible(arena: std.mem.Allocator, this_val: Value) !void {
 /// function/native_function/bc_function are callable, or a plain object that
 /// exposes an internal "__call__" slot.
 fn isCallable(v: Value) bool {
-    if (v.bits == 0) return false;
-    return switch (v.unbox()) {
-        .function, .native_function, .bc_function => true,
-        .object => |o| o.get("__call__") != null,
-        else => false,
-    };
+    // Delegate to the canonical IsCallable so bound functions and callable
+    // proxies (objects without a literal `__call__` slot) are recognized too.
+    return @import("../builtins/function_proto.zig").isCallableFn(v);
 }
 
 /// Throw TypeError when `cb` is not callable (used for every callback arg:
