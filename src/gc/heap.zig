@@ -313,6 +313,7 @@ pub const Heap = struct {
             slot.object.slots.deinit(self.backing_allocator);
             slot.object.attrs.deinit(self.backing_allocator);
             slot.object.sym_props.deinit(self.backing_allocator);
+            slot.object.dense.deinit(self.backing_allocator);
             self.backing_allocator.destroy(slot);
         }
     }
@@ -418,6 +419,7 @@ pub const Heap = struct {
     fn scanChildren(self: *Heap, obj: *JsObject) void {
         if (obj.proto) |proto| self.markObject(proto);
         for (obj.slots.items) |v| self.markValue(v);
+        for (obj.dense.items) |v| self.markValue(v); // dense array elements
         for (obj.sym_props.items) |sp| {
             self.markValue(sp.key);
             self.markValue(sp.value);

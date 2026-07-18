@@ -705,6 +705,12 @@ pub const FnCompiler = struct {
                     // `delete obj.prop` / `delete obj[expr]`: delete the own
                     // property and yield a boolean result.
                     const me = operand.data.member_expr;
+                    // `delete super.x` / `delete super[e]` is always a ReferenceError
+                    // (IsSuperReference). Thrown WITHOUT evaluating the base or the
+                    // key expression (ES: ToPropertyKey/this-binding never reached).
+                    if (me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super")) {
+                        return try self.emitThrowError("ReferenceError", "Unsupported reference to 'super'", line);
+                    }
                     const robj = try self.compileExpr(me.object);
                     if (me.computed) {
                         const rkey = try self.compileExpr(me.property);
@@ -1549,6 +1555,32 @@ pub const FnCompiler = struct {
             }
         }
         return robj;
+    }
+
+    /// Emit `throw new <CtorName>(<msg>)` and leave the constructed error in the
+    /// returned register. Used for runtime-thrown early-ish errors the evaluator
+    /// must raise without evaluating the surrounding operands (e.g. `delete
+    /// super.x` → ReferenceError, which never touches the base object or key).
+    fn emitThrowError(self: *Self, ctor_name: []const u8, msg: []const u8, line: u32) error{OutOfMemory}!u8 {
+        const base = self.sp;
+        _ = self.allocReg();
+        self.sp = base;
+        try self.emitLoad(ctor_name, base, line); // error constructor at R[base]
+        self.sp = base + 1;
+        const rmsg = self.allocReg();
+        const kidx = try self.addConstant(try val_mod.makeString(self.arena, msg));
+        try self.emitOp(.LOAD_K, line);
+        try self.emitU8(rmsg);
+        try self.emitU16(kidx);
+        self.sp = base + 2;
+        try self.emitOp(.NEW_INSTANCE, line);
+        try self.emitU8(base); // Rdst = base
+        try self.emitU8(base); // callee at base
+        try self.emitU8(1); // nargs
+        self.sp = base + 1;
+        try self.emitOp(.THROW, line);
+        try self.emitU8(base);
+        return base;
     }
 
     pub fn compileUpdate(self: *Self, u: ast.UpdateExpr, line: u32) error{OutOfMemory}!u8 {

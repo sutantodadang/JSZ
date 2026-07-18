@@ -415,6 +415,7 @@ pub fn nativeObjectGetOwnPropertyDescriptors(arena: std.mem.Allocator, _: Value,
 
     for (obj.ownKeys()) |k| {
         if (obj.isPrivate(k)) continue; // private class elements are hidden
+        if (JsObject.isInternalSlotKey(k)) continue; // internal slots ([[PrimitiveValue]], …)
         const v = obj.getOwn(k) orelse continue;
         const desc_val = try makeDataDescriptor(arena, v);
         try out.set(k, desc_val);
@@ -514,6 +515,9 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
 
     // A private class element (`#x`) is hidden from reflection.
     if (obj.isPrivate(key)) return val_mod.makeBool(arena, false);
+    // A string-keyed internal slot ([[PrimitiveValue]], [[OriginalSource]], …) is
+    // spec internal state, never an own property.
+    if (JsObject.isInternalSlotKey(key)) return val_mod.makeBool(arena, false);
     // Array exotic "length": a synthetic own data property not held in the
     // shape, so `hasOwn` misses it. It is always an own property of an array.
     if (obj.is_array and std.mem.eql(u8, key, "length")) return val_mod.makeBool(arena, true);
@@ -1075,6 +1079,7 @@ pub fn nativeObjectGetOwnPropertyNames(arena: std.mem.Allocator, _: Value, args:
     var i: u32 = ta_key_count;
     for (obj.ownKeys()) |k| {
         if (obj.isPrivate(k)) continue; // private class elements are hidden
+        if (JsObject.isInternalSlotKey(k)) continue; // internal slots ([[PrimitiveValue]], …)
         const key_val = try val_mod.makeString(arena, k);
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
         try arr.set(idx_key, key_val);
@@ -1217,6 +1222,8 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     const key = (try coerceKey(arena, key_v)) orelse return val_mod.makeUndefined(arena);
     // Private class elements (`#x`) are hidden from reflection.
     if (obj.isPrivate(key)) return val_mod.makeUndefined(arena);
+    // Internal slots ([[PrimitiveValue]], …) are not own properties.
+    if (JsObject.isInternalSlotKey(key)) return val_mod.makeUndefined(arena);
 
     // Array exotic "length": a synthetic own data property that is writable
     // (unless the array is non-extensible), non-enumerable, non-configurable.
@@ -1451,16 +1458,13 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         var prev_c = false;
         var cur_get: ?Value = null;
         var cur_set: ?Value = null;
-        if (obj.findProperty(key)) |loc| {
-            if (loc.holder == obj) {
-                const a = loc.holder.attrAt(loc.slot);
-                prev_e = a.enumerable;
-                prev_c = a.configurable;
-                if (a.is_accessor) {
-                    if (obj.ownAccessorHolder(key)) |hv| {
-                        cur_get = hv.toPtr().object.getOwn("get");
-                        cur_set = hv.toPtr().object.getOwn("set");
-                    }
+        if (obj.ownAttr(key)) |a| { // dense-aware own-property attrs
+            prev_e = a.enumerable;
+            prev_c = a.configurable;
+            if (a.is_accessor) {
+                if (obj.ownAccessorHolder(key)) |hv| {
+                    cur_get = hv.toPtr().object.getOwn("get");
+                    cur_set = hv.toPtr().object.getOwn("set");
                 }
             }
         }
@@ -1483,9 +1487,8 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     var cur_c = false;
     var has_own_data = false;
     var cur_val: ?Value = null;
-    if (obj.findProperty(key)) |loc| {
-        if (loc.holder == obj) {
-            const a = loc.holder.attrAt(loc.slot);
+    if (obj.ownAttr(key)) |a| { // dense-aware own-property attrs
+        {
             if (!a.is_accessor) {
                 cur_w = a.writable;
                 cur_e = a.enumerable;
