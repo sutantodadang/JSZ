@@ -151,7 +151,13 @@ fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .bc_function, .native_function => true,
-        .object => |o| o.internal_kind == .bound_function,
+        .object => |o| switch (o.internal_kind) {
+            .bound_function => true,
+            // A Proxy is callable iff its (possibly nested) target is callable.
+            // A revoked proxy has no target → not callable.
+            .proxy => if (proxy_mod.proxyTarget(o)) |t| isCallable(t) else false,
+            else => false,
+        },
         else => false,
     };
 }

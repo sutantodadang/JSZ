@@ -1243,6 +1243,8 @@ pub var active_sym_to_primitive: ?Value = null;
 pub var active_sym_to_string_tag: ?Value = null;
 /// ES2015 Symbol.species well-known symbol value.
 pub var active_sym_species: ?Value = null;
+/// ES2015 Symbol.hasInstance well-known symbol value (instanceof dispatch).
+pub var active_sym_has_instance: ?Value = null;
 /// ES2015 Symbol.isConcatSpreadable well-known symbol value.
 pub var active_sym_is_concat_spreadable: ?Value = null;
 /// ES2023 Symbol.asyncIterator well-known symbol value.
@@ -2023,6 +2025,14 @@ pub fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8
 fn nativeStringCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const constructing = active_constructing;
     active_constructing = false;
+    // String(sym) as a plain call is the sole non-throwing Symbol→String path:
+    // it returns SymbolDescriptiveString (ES §22.1.1.1 step 2b). `new String(sym)`
+    // still throws (falls through to stringPrimitive).
+    if (!constructing and args.len > 0 and args[0].bits != 0 and args[0].unbox() == .symbol) {
+        const sd = args[0].unbox().symbol;
+        const out = try std.fmt.allocPrint(arena, "Symbol({s})", .{sd.description orelse ""});
+        return val_mod.makeString(arena, out);
+    }
     const s: []const u8 = if (args.len == 0) "" else try stringPrimitive(arena, args[0]);
     // `new String(x)`: wrap on the synthesized object; plain call returns primitive.
     if (constructing and this_val.bits != 0 and this_val.unbox() == .object) {
@@ -3922,6 +3932,10 @@ pub const Realm = struct {
             .enumerable = false,
             .configurable = true,
         });
+        // %Function.prototype% is itself a function: own "length" (0) and "name"
+        // ("") are non-writable, non-enumerable, configurable data properties.
+        _ = try function_proto.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try function_proto.defineOwnData("name", try val_mod.makeString(arena, ""), .{ .writable = false, .enumerable = false, .configurable = true });
         active_function_proto = function_proto;
 
         // R1: shared registration context for self-registering builtins (each
@@ -4155,6 +4169,14 @@ pub const Realm = struct {
             // Symbol.prototype[@@toPrimitive] (non-writable, non-enumerable, configurable).
             _ = try symbol_proto.defineOwnDataSym(symv, try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolToPrimitive, "[Symbol.toPrimitive]", 1), .{ .writable = false, .enumerable = false, .configurable = true });
         }
+        // Function.prototype[@@hasInstance] — OrdinaryHasInstance, a non-writable,
+        // non-enumerable, non-configurable method (name "[Symbol.hasInstance]",
+        // length 1). Installed here once the well-known symbol exists.
+        if (symbol_ctor.getOwn("hasInstance")) |hi_sym| {
+            active_sym_has_instance = hi_sym;
+            _ = try function_proto.defineOwnDataSym(hi_sym, try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionHasInstance, "[Symbol.hasInstance]", 1), .{ .writable = false, .enumerable = false, .configurable = false });
+        }
+
         // Capture Symbol.toStringTag and Symbol.species.
         active_sym_to_string_tag = symbol_ctor.getOwn("toStringTag");
         if (active_sym_to_string_tag) |symv| {
@@ -4294,6 +4316,8 @@ pub const Realm = struct {
             try intl_obj.set("RelativeTimeFormat", try val_mod.makeObject(arena, rtf_ctor));
             // Intl.getCanonicalLocales (static)
             _ = try intl_obj.defineOwnData("getCanonicalLocales", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeGetCanonicalLocales, "getCanonicalLocales", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+            // Intl.supportedValuesOf (static)
+            _ = try intl_obj.defineOwnData("supportedValuesOf", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeSupportedValuesOf, "supportedValuesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             try env.define("Intl", try val_mod.makeObject(arena, intl_obj));
         }
 

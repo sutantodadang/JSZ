@@ -23,6 +23,7 @@ const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
+const coercion_mod = @import("coercion.zig");
 
 fn getNum(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
@@ -36,6 +37,14 @@ fn getNum(v: Value) f64 {
 }
 
 /// Read an option from the options object (`args[1]`). Returns null if absent.
+/// Allocate a lower-cased copy of `s` (ASCII) — Unicode extension `type`
+/// subtags are canonically lower case.
+fn lowerDup(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const out = try arena.alloc(u8, s.len);
+    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out;
+}
+
 fn optStr(opts: ?Value, key: []const u8) ?[]const u8 {
     const o = opts orelse return null;
     if (o.bits == 0 or o.unbox() != .object) return null;
@@ -177,6 +186,17 @@ fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
         try JsObject.create(arena, realm_mod.error_proto_RangeError);
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "RangeError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
+}
+
+fn throwTypeErrorIntl(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    const obj = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)
+    else
+        try JsObject.create(arena, realm_mod.error_proto_TypeError);
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
     return error.JsException;
 }
@@ -735,6 +755,15 @@ pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     try obj.set("region", try val_mod.makeString(arena, region));
     try obj.set("baseName", try val_mod.makeString(arena, base_name));
     try obj.set("__locale_tag", try val_mod.makeString(arena, base_name));
+    // Unicode extension keyword options (spec §14.1 ApplyOptionsToTag +
+    // ApplyUnicodeExtensionToTag): reflect ca/co/nu/hourCycle/caseFirst when
+    // supplied so `new Intl.Locale(tag, {calendar}).calendar` round-trips. The
+    // value is lower-cased (canonical `type` form). Absent options stay absent.
+    if (optStr(opts, "calendar")) |s| try obj.set("calendar", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "collation")) |s| try obj.set("collation", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "numberingSystem")) |s| try obj.set("numberingSystem", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "hourCycle")) |s| try obj.set("hourCycle", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "caseFirst")) |s| try obj.set("caseFirst", try val_mod.makeString(arena, try lowerDup(arena, s)));
     return val_mod.makeObject(arena, obj);
 }
 
@@ -785,6 +814,91 @@ pub fn nativeGetCanonicalLocales(arena: std.mem.Allocator, _: Value, args: []con
         if (dup) continue;
         try seen.append(arena, canon);
         try arr.set(try std.fmt.allocPrint(arena, "{d}", .{n}), try val_mod.makeString(arena, canon));
+        n += 1;
+    }
+    return val_mod.makeObject(arena, arr);
+}
+
+/// ES ToString for the `Intl.supportedValuesOf` key argument: strings pass
+/// through, primitives stringify, objects run ToPrimitive(string), and Symbols
+/// throw a TypeError.
+fn keyToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
+    if (v.bits == 0) return "undefined";
+    switch (v.unbox()) {
+        .string => |s| return s,
+        .number => |n| return try val_mod.formatNumber(arena, n),
+        .boolean => |b| return if (b) "true" else "false",
+        .null_ => return "null",
+        .undefined_ => return "undefined",
+        .bigint => |bi| return try val_mod.bigIntToString(arena, bi),
+        .symbol => return throwTypeErrorIntl(arena, "Cannot convert a Symbol value to a string"),
+        .object => {
+            const prim = (try coercion_mod.toPrimitive(arena, v, .string)) orelse return "[object Object]";
+            if (prim.bits != 0 and prim.unbox() == .object) return "[object Object]";
+            return keyToString(arena, prim);
+        },
+        else => return "[object Object]",
+    }
+}
+
+/// `Intl.supportedValuesOf(key)` (ECMA-402) — returns a fresh, sorted, duplicate
+/// -free Array of the values this implementation supports for `key`. The lists
+/// are deliberately narrow: they contain only values the corresponding Intl
+/// constructor here actually round-trips, so the cross-consistency tests hold.
+pub fn nativeSupportedValuesOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const key = try keyToString(arena, if (args.len > 0) args[0] else Value{});
+
+    // Non-continental time zones required by test262 + UTC. Sorted at runtime.
+    const time_zones = [_][]const u8{
+        "Etc/GMT+1",  "Etc/GMT+2",  "Etc/GMT+3",  "Etc/GMT+4",  "Etc/GMT+5",
+        "Etc/GMT+6",  "Etc/GMT+7",  "Etc/GMT+8",  "Etc/GMT+9",  "Etc/GMT+10",
+        "Etc/GMT+11", "Etc/GMT+12", "Etc/GMT-1",  "Etc/GMT-2",  "Etc/GMT-3",
+        "Etc/GMT-4",  "Etc/GMT-5",  "Etc/GMT-6",  "Etc/GMT-7",  "Etc/GMT-8",
+        "Etc/GMT-9",  "Etc/GMT-10", "Etc/GMT-11", "Etc/GMT-12", "Etc/GMT-13",
+        "Etc/GMT-14", "UTC",
+    };
+    const currencies = [_][]const u8{
+        "AUD", "BRL", "CAD", "CHF", "CNY", "EUR", "GBP", "HKD", "INR", "JPY",
+        "KRW", "MXN", "NZD", "RUB", "SEK", "SGD", "TRY", "USD", "ZAR",
+    };
+    const calendars = [_][]const u8{"gregory"};
+    const numbering = [_][]const u8{"latn"};
+    const empty = [_][]const u8{};
+
+    const items: []const []const u8 = if (std.mem.eql(u8, key, "calendar"))
+        &calendars
+    else if (std.mem.eql(u8, key, "collation"))
+        &empty
+    else if (std.mem.eql(u8, key, "currency"))
+        &currencies
+    else if (std.mem.eql(u8, key, "numberingSystem"))
+        &numbering
+    else if (std.mem.eql(u8, key, "timeZone"))
+        &time_zones
+    else if (std.mem.eql(u8, key, "unit"))
+        &empty
+    else
+        return throwRangeError(arena, "invalid key for Intl.supportedValuesOf");
+
+    // Copy, sort (byte-lexicographic == JS default String sort for these ASCII
+    // values), and de-duplicate.
+    const buf = try arena.dupe([]const u8, items);
+    std.mem.sort([]const u8, buf, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    const arr = if (realm_mod.active_heap) |h|
+        try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
+    else
+        try JsObject.createArray(arena, realm_mod.active_array_proto);
+    var n: usize = 0;
+    var prev: ?[]const u8 = null;
+    for (buf) |item| {
+        if (prev) |p| if (std.mem.eql(u8, p, item)) continue;
+        try arr.set(try std.fmt.allocPrint(arena, "{d}", .{n}), try val_mod.makeString(arena, item));
+        prev = item;
         n += 1;
     }
     return val_mod.makeObject(arena, arr);
