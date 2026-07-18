@@ -2379,13 +2379,20 @@ pub const BcVm = struct {
         // Own `name`, `length`, and `prototype` descriptors for generator functions.
         // Eagerly defined here so Object.getOwnPropertyDescriptor works without a
         // prior .prototype access (closurePrototype short-circuits via getOwn).
-        if (closure.func.is_generator) {
+        // Own `length` then `name` descriptors (spec order for functions is
+        // "length", "name", "prototype") so Object.getOwnPropertyDescriptor /
+        // getOwnPropertyNames / hasOwnProperty see them as real own properties
+        // (non-writable, non-enumerable, configurable). The virtual-resolution
+        // fast path in getProp still short-circuits via `o.hasOwn` on these.
+        {
             const nm_raw = closure.func.name orelse "";
             const nm = if (std.mem.eql(u8, nm_raw, "__esm_dflt_fn__") or
                 std.mem.eql(u8, nm_raw, "__esm_dflt_gen__")) "default" else nm_raw;
             const nec: @import("../object/object.zig").PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-            _ = try o.defineOwnData("name", try val_mod.makeString(self.arena, nm), nec);
             _ = try o.defineOwnData("length", try val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity)), nec);
+            _ = try o.defineOwnData("name", try val_mod.makeString(self.arena, nm), nec);
+        }
+        if (closure.func.is_generator) {
             // .prototype: {writable:true, enumerable:false, configurable:false} (spec §15.5.3).
             // ensureGeneratorChain(gr) was already called above so gen_proto/async_gen_proto are live.
             const inst_proto = if (closure.func.is_async) gr.async_gen_proto.? else gr.gen_proto.?;

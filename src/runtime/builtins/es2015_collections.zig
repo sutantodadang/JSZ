@@ -30,6 +30,9 @@ pub var active_finreg_proto: ?*JsObject = null;
 pub var active_map_proto: ?*JsObject = null;
 /// Set.prototype — stored so registerSymbols can wire @@toStringTag / @@iterator.
 pub var active_set_proto: ?*JsObject = null;
+/// Map/Set constructors — stored so registerSymbols can wire @@species getters.
+pub var active_map_ctor: ?*JsObject = null;
+pub var active_set_ctor: ?*JsObject = null;
 /// Map iterator prototype — stored for @@toStringTag wiring.
 pub var active_map_iter_proto: ?*JsObject = null;
 /// Set iterator prototype — stored for @@toStringTag wiring.
@@ -76,6 +79,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     _ = try map_ctor.defineOwnData("groupBy", try val_mod.makeNativeFunctionNamed(arena, nativeMapGroupBy, "groupBy", 2), mm);
     try map_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeMapCtor));
     _ = try map_proto.defineOwnData("constructor", try val_mod.makeObject(arena, map_ctor), mm);
+    active_map_ctor = map_ctor;
     try ctx.env.define("Map", try val_mod.makeObject(arena, map_ctor));
 
     // ---- Set ----
@@ -114,6 +118,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     _ = try set_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, set_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try set_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeSetCtor));
     _ = try set_proto.defineOwnData("constructor", try val_mod.makeObject(arena, set_ctor), sm);
+    active_set_ctor = set_ctor;
     try ctx.env.define("Set", try val_mod.makeObject(arena, set_ctor));
 
     // ---- WeakMap ----
@@ -211,6 +216,13 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
         if (active_set_iter_proto) |p|
             try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "Set Iterator"), tag_attr);
     }
+    // @@species: an accessor getter on the Map/Set constructors returning `this`.
+    if (realm_mod.active_sym_species) |spec_sym| {
+        if (active_map_ctor) |c|
+            try defineSymGetter(arena, c, spec_sym, nativeSpeciesReturnThis, "get [Symbol.species]");
+        if (active_set_ctor) |c|
+            try defineSymGetter(arena, c, spec_sym, nativeSpeciesReturnThis, "get [Symbol.species]");
+    }
     // Wire @@iterator on Map/Set prototypes and iterator protos
     if (realm_mod.active_sym_iterator) |iter_sym| {
         // Build %IteratorPrototype%-based chain for Map/Set iterators
@@ -239,6 +251,19 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
                 try p.setSymAttr(iter_sym, values_fn, iter_attr);
         }
     }
+}
+
+/// get [Symbol.species] — returns the `this` value (the constructor itself).
+fn nativeSpeciesReturnThis(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    _ = arena;
+    return this_val;
+}
+
+/// Install a getter-only accessor under a symbol key on `obj`.
+fn defineSymGetter(arena: std.mem.Allocator, obj: *JsObject, sym_key: Value, getter: val_mod.NativeFnPtr, name: []const u8) !void {
+    const holder = try JsObject.create(arena, null);
+    try holder.set("get", try val_mod.makeNativeFunctionNamed(arena, getter, name, 0));
+    try obj.setSymAttr(sym_key, try val_mod.makeObject(arena, holder), .{ .writable = false, .enumerable = false, .configurable = true, .is_accessor = true });
 }
 
 pub const MapData = struct {
@@ -485,7 +510,12 @@ fn closeIterator(arena: std.mem.Allocator, iter: Value) void {
     if (iter.bits == 0 or iter.unbox() != .object) return;
     const ret_fn = iter.toPtr().object.get("return") orelse return;
     if (!isCallable(ret_fn)) return;
+    // IteratorClose after an abrupt completion: if return() itself throws, that
+    // throw is discarded and the ORIGINAL pending exception propagates (spec
+    // 7.4.11 step 5). Preserve pending_exception across the return() call.
+    const saved = realm_mod.pending_exception;
     _ = function_proto.invokeCallback(arena, iter, ret_fn, &[_]Value{}) catch {};
+    realm_mod.pending_exception = saved;
 }
 
 fn getWeakMapData(arena: std.mem.Allocator, this_val: Value) anyerror!*MapData {
@@ -1128,8 +1158,8 @@ pub fn nativeMapGetOrInsertComputed(arena: std.mem.Allocator, this_val: Value, a
 
 pub fn nativeSetAdd(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const data = try getSetDataBranded(arena, this_val);
-    if (args.len == 0) return this_val;
-    const val = args[0];
+    // add() with no argument adds `undefined` (spec: value defaults to undefined).
+    const val = try canonKey(arena, if (args.len > 0) args[0] else try val_mod.makeUndefined(arena));
     for (data.values.items) |v| if (sameValueZero(v, val)) return this_val;
     try data.values.append(arena, val);
     return this_val;
@@ -1186,6 +1216,10 @@ const MapIterData = struct {
     map: *MapData,
     index: usize = 0,
     kind: MapIterKind,
+    /// Once the iterator returns done=true, it is permanently exhausted: the
+    /// [[Map]] slot is conceptually released, so entries added afterwards are
+    /// NOT visible (test262 MapIteratorPrototype/next/iteration-mutable).
+    done: bool = false,
 };
 
 const SetIterKind = enum { values, entries };
@@ -1194,6 +1228,8 @@ const SetIterData = struct {
     set: *SetData,
     index: usize = 0,
     kind: SetIterKind = .values,
+    /// See MapIterData.done — permanent exhaustion latch.
+    done: bool = false,
 };
 
 fn makeIteratorResult(arena: std.mem.Allocator, value: Value, done: bool) !Value {
@@ -1253,7 +1289,11 @@ pub fn nativeSetEntries(arena: std.mem.Allocator, this_val: Value, _: []const Va
 }
 
 pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    // Step 2: if Type(O) is not Object, throw a TypeError (spec 24.1.5.2.1).
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        try setTypeError(arena, "Map Iterator next called on non-object");
+        unreachable;
+    }
     const obj = this_val.toPtr().object;
     // Brand check: %MapIteratorPrototype%.next on a non-iterator receiver (e.g. a
     // Map) must throw TypeError, NOT @ptrCast the wrong internal_slot (type
@@ -1263,7 +1303,8 @@ pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
         unreachable;
     }
     const iter: *MapIterData = @ptrCast(@alignCast(obj.internal_slot.?));
-    if (iter.index >= iter.map.keys.items.len) {
+    if (iter.done or iter.index >= iter.map.keys.items.len) {
+        iter.done = true; // latch: post-exhaustion insertions stay invisible
         return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     }
     const value: Value = switch (iter.kind) {
@@ -1286,7 +1327,11 @@ pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
 }
 
 pub fn nativeSetIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    // Step 2: if Type(O) is not Object, throw a TypeError (spec 24.2.5.2.1).
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        try setTypeError(arena, "Set Iterator next called on non-object");
+        unreachable;
+    }
     const obj = this_val.toPtr().object;
     // Brand check (see nativeMapIteratorNext): non-iterator receiver → TypeError,
     // never a wrong-type @ptrCast.
@@ -1295,7 +1340,8 @@ pub fn nativeSetIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
         unreachable;
     }
     const iter: *SetIterData = @ptrCast(@alignCast(obj.internal_slot.?));
-    if (iter.index >= iter.set.values.items.len) {
+    if (iter.done or iter.index >= iter.set.values.items.len) {
+        iter.done = true; // latch: post-exhaustion insertions stay invisible
         return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     }
     const v = iter.set.values.items[iter.index];
@@ -1327,70 +1373,43 @@ const SetRecord = struct {
 };
 
 fn getSetRecord(arena: std.mem.Allocator, other: Value) anyerror!SetRecord {
+    // Step 1: obj must be an Object.
     if (other.bits == 0 or other.unbox() != .object) {
         try setTypeError(arena, "argument must be a Set-like object");
         unreachable;
     }
-    const o = other.toPtr().object;
-    // Get size (observable) — spec §Set.prototype.union step 2: Get(obj, "size").
-    // `size` is an accessor on Set/Map.prototype, so JsObject.get() returns null
-    // (it skips accessors). We must invoke the getter explicitly.
-    const sz: f64 = blk: {
-        // Fast path: actual Map/Set — read live count directly.
-        if (collectionSize(o)) |n| break :blk @floatFromInt(n);
-        // Generic set-like: walk proto chain, invoke accessor getter if present.
-        if (o.findProperty("size")) |loc| {
-            const a = loc.holder.attrAt(loc.slot);
-            const raw = if (loc.slot < loc.holder.slots.items.len)
-                loc.holder.slots.items[loc.slot]
-            else
-                Value{};
-            if (a.is_accessor) {
-                // Holder object stores { get: fn, set: fn }.
-                const getter = if (raw.bits != 0 and raw.unbox() == .object)
-                    raw.toPtr().object.getOwn("get") orelse Value{}
-                else
-                    Value{};
-                if (isCallable(getter)) {
-                    const r = try function_proto.invokeCallback(arena, other, getter, &.{});
-                    if (r.bits != 0) break :blk switch (r.unbox()) {
-                        .number => |n| n,
-                        .null_ => 0.0,
-                        .boolean => |b| if (b) 1.0 else 0.0,
-                        else => std.math.nan(f64),
-                    };
-                }
-                break :blk std.math.nan(f64);
-            } else {
-                // Data property
-                if (raw.bits != 0) break :blk switch (raw.unbox()) {
-                    .number => |n| n,
-                    .null_ => 0.0,
-                    .boolean => |b| if (b) 1.0 else 0.0,
-                    else => std.math.nan(f64),
-                };
-                break :blk std.math.nan(f64);
-            }
-        }
-        break :blk std.math.nan(f64);
+    const ctx = realm_mod.active_context orelse {
+        try setTypeError(arena, "no active context");
+        unreachable;
     };
-    if (std.math.isNan(sz)) {
+    // Step 2: rawSize = Get(obj, "size"). Observable — invokes accessor getters
+    // and walks the prototype chain (class-based set-likes define `size` as a
+    // getter, which JsObject.get() would skip).
+    const raw_size = try ctx.getProp(arena, other, "size");
+    // Step 3: numSize = ToNumber(rawSize). rawSize may be an object with valueOf.
+    const num_size = try realm_mod.toNumberValue(arena, raw_size);
+    // Step 5: numSize is NaN → TypeError (also covers rawSize === undefined).
+    if (std.math.isNan(num_size)) {
         try setTypeError(arena, "Set-like object must have a numeric size");
         unreachable;
     }
-    // GetMethod "has"
-    const has_v = o.get("has") orelse try val_mod.makeUndefined(arena);
+    // Step 6: intSize = ToIntegerOrInfinity(numSize) (truncate toward zero).
+    const int_size = if (std.math.isInf(num_size)) num_size else std.math.trunc(num_size);
+    // Step 7: intSize < 0 → RangeError.
+    if (int_size < 0) return realm_mod.throwRangeError(arena, "Set-like object size must be non-negative");
+    // Step 8: has = Get(obj, "has"); must be callable.
+    const has_v = try ctx.getProp(arena, other, "has");
     if (!isCallable(has_v)) {
         try setTypeError(arena, "Set-like object must have a callable has");
         unreachable;
     }
-    // GetMethod "keys"
-    const keys_v = o.get("keys") orelse try val_mod.makeUndefined(arena);
+    // Step 10: keys = Get(obj, "keys"); must be callable.
+    const keys_v = try ctx.getProp(arena, other, "keys");
     if (!isCallable(keys_v)) {
         try setTypeError(arena, "Set-like object must have a callable keys");
         unreachable;
     }
-    return .{ .obj = other, .has = has_v, .keys = keys_v, .size = sz };
+    return .{ .obj = other, .has = has_v, .keys = keys_v, .size = int_size };
 }
 
 /// Create a fresh Set pre-loaded with values from a SetData.
@@ -1406,22 +1425,94 @@ fn newSetFromData(arena: std.mem.Allocator, src: *SetData) !Value {
 
 // ---- ES2025 new Set methods ----
 
+/// CanonicalizeKeyedCollectionKey: normalize -0 → +0 for the value actually
+/// stored/returned. SameValueZero already treats -0 and +0 as equal for lookup;
+/// this makes iteration output canonical (+0) as the spec requires.
+fn canonKey(arena: std.mem.Allocator, v: Value) !Value {
+    if (v.bits != 0 and v.unbox() == .number) {
+        const n = v.unbox().number;
+        if (n == 0 and std.math.signbit(n)) return val_mod.makeNumber(arena, 0);
+    }
+    return v;
+}
+
+/// SetDataHas: SameValueZero membership test against a SetData's live values.
+fn setDataHas(d: *SetData, v: Value) bool {
+    for (d.values.items) |x| if (sameValueZero(x, v)) return true;
+    return false;
+}
+
+/// Remove the first SameValueZero match of `v` from a SetData (no-op if absent).
+fn setDataRemove(d: *SetData, v: Value) void {
+    var j: usize = 0;
+    while (j < d.values.items.len) {
+        if (sameValueZero(d.values.items[j], v)) {
+            _ = d.values.orderedRemove(j);
+            return;
+        }
+        j += 1;
+    }
+}
+
+/// A keys() iterator with its `next` method cached once (GetIteratorDirect):
+/// per spec the `next` property is read a single time at iterator acquisition,
+/// then invoked on each step.
+const KeysIter = struct { iter: Value, next_fn: Value };
+
+/// GetKeysIterator: Call(rec.[[Keys]], rec.[[SetObject]]) then cache its `next`.
+/// Both the keys() call and the `next` read are observable (getters / traps).
+fn openKeysIterator(arena: std.mem.Allocator, rec: SetRecord) !KeysIter {
+    const iter = try function_proto.invokeCallback(arena, rec.obj, rec.keys, &.{});
+    if (iter.bits == 0 or iter.unbox() != .object) {
+        try setTypeError(arena, "keys() did not return an object");
+        unreachable;
+    }
+    const next_fn = try readPropObs(arena, iter, "next");
+    if (!isCallable(next_fn)) {
+        try setTypeError(arena, "keys() iterator has no callable next");
+        unreachable;
+    }
+    return .{ .iter = iter, .next_fn = next_fn };
+}
+
+/// One IteratorStepValue on `ki`, reading `done`/`value` observably (fires
+/// getters / Proxy traps), returning the canonicalized value or null when done.
+/// Closes the iterator on an abrupt completion.
+fn keysStep(arena: std.mem.Allocator, ki: KeysIter) !?Value {
+    const step = function_proto.invokeCallback(arena, ki.iter, ki.next_fn, &.{}) catch |e| {
+        closeIterator(arena, ki.iter);
+        return e;
+    };
+    const done_v = readPropObs(arena, step, "done") catch |e| {
+        closeIterator(arena, ki.iter);
+        return e;
+    };
+    if (isTruthy(done_v)) return null;
+    const val = readPropObs(arena, step, "value") catch |e| {
+        closeIterator(arena, ki.iter);
+        return e;
+    };
+    return try canonKey(arena, val);
+}
+
+/// Observable property read (fires accessor getters / Proxy traps) with a
+/// non-observable fallback when no VM context is active.
+fn readPropObs(arena: std.mem.Allocator, obj: Value, key: []const u8) !Value {
+    if (realm_mod.active_context) |ctx| return ctx.getProp(arena, obj, key);
+    if (obj.bits != 0 and obj.unbox() == .object) return obj.toPtr().object.get(key) orelse val_mod.makeUndefined(arena);
+    return val_mod.makeUndefined(arena);
+}
+
 pub fn nativeSetUnion(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const this_data = try getSetDataBranded(arena, this_val);
     const other = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     const rec = try getSetRecord(arena, other);
     const result = try newSetFromData(arena, this_data);
     const rd: *SetData = @ptrCast(@alignCast(result.toPtr().object.internal_slot.?));
-    // Add other's keys if not already present
-    const iter = try function_proto.invokeCallback(arena, rec.obj, rec.keys, &.{});
-    while (true) {
-        const step = nativeIterStep(arena, Value{}, &.{iter}) catch |e| { closeIterator(arena, iter); return e; };
-        const done_v: Value = if (step.bits != 0 and step.unbox() == .object) step.toPtr().object.get("done") orelse Value{} else Value{};
-        if (isTruthy(done_v)) break;
-        const next_val: Value = if (step.bits != 0 and step.unbox() == .object) step.toPtr().object.get("value") orelse try val_mod.makeUndefined(arena) else try val_mod.makeUndefined(arena);
-        var found = false;
-        for (rd.values.items) |v| { if (sameValueZero(v, next_val)) { found = true; break; } }
-        if (!found) try rd.values.append(arena, next_val);
+    // Add other's keys (canonicalized) if not already present.
+    const iter = try openKeysIterator(arena, rec);
+    while (try keysStep(arena, iter)) |val| {
+        if (!setDataHas(rd, val)) try rd.values.append(arena, val);
     }
     return result;
 }
@@ -1435,9 +1526,21 @@ pub fn nativeSetIntersection(arena: std.mem.Allocator, this_val: Value, args: []
     const rd = try arena.create(SetData);
     rd.* = .{};
     obj.internal_slot = rd;
-    for (this_data.values.items) |v| {
-        const has_r = try function_proto.invokeCallback(arena, rec.obj, rec.has, &.{v});
-        if (isTruthy(has_r)) try rd.values.append(arena, v);
+    // Iterate the smaller side: when |this| ≤ |other| walk this and test via
+    // other.has (result follows this order); otherwise walk other.keys() and
+    // test membership in this (result follows other order, no has calls).
+    if (@as(f64, @floatFromInt(this_data.values.items.len)) <= rec.size) {
+        var i: usize = 0;
+        while (i < this_data.values.items.len) : (i += 1) {
+            const e = this_data.values.items[i]; // live re-read: `has` may mutate this
+            const has_r = try function_proto.invokeCallback(arena, rec.obj, rec.has, &.{e});
+            if (isTruthy(has_r) and !setDataHas(rd, e)) try rd.values.append(arena, e);
+        }
+    } else {
+        const iter = try openKeysIterator(arena, rec);
+        while (try keysStep(arena, iter)) |val| {
+            if (setDataHas(this_data, val) and !setDataHas(rd, val)) try rd.values.append(arena, val);
+        }
     }
     return result;
 }
@@ -1448,15 +1551,19 @@ pub fn nativeSetDifference(arena: std.mem.Allocator, this_val: Value, args: []co
     const rec = try getSetRecord(arena, other);
     const result = try newSetFromData(arena, this_data);
     const rd: *SetData = @ptrCast(@alignCast(result.toPtr().object.internal_slot.?));
-    // Remove values that appear in other
-    var i: usize = 0;
-    while (i < rd.values.items.len) {
-        const v = rd.values.items[i];
-        const has_r = try function_proto.invokeCallback(arena, rec.obj, rec.has, &.{v});
-        if (isTruthy(has_r)) {
-            _ = rd.values.orderedRemove(i);
-        } else {
-            i += 1;
+    // When |this| ≤ |other|, walk this and probe other.has; otherwise walk
+    // other.keys() (avoids calling has entirely — a spec-observable difference).
+    if (@as(f64, @floatFromInt(this_data.values.items.len)) <= rec.size) {
+        var i: usize = 0;
+        while (i < this_data.values.items.len) : (i += 1) {
+            const e = this_data.values.items[i];
+            const has_r = try function_proto.invokeCallback(arena, rec.obj, rec.has, &.{e});
+            if (isTruthy(has_r)) setDataRemove(rd, e);
+        }
+    } else {
+        const iter = try openKeysIterator(arena, rec);
+        while (try keysStep(arena, iter)) |val| {
+            if (setDataHas(rd, val)) setDataRemove(rd, val);
         }
     }
     return result;
@@ -1468,19 +1575,14 @@ pub fn nativeSetSymmetricDifference(arena: std.mem.Allocator, this_val: Value, a
     const rec = try getSetRecord(arena, other);
     const result = try newSetFromData(arena, this_data);
     const rd: *SetData = @ptrCast(@alignCast(result.toPtr().object.internal_slot.?));
-    // For each key in other: if in result remove, else add
-    const iter = try function_proto.invokeCallback(arena, rec.obj, rec.keys, &.{});
-    while (true) {
-        const step = nativeIterStep(arena, Value{}, &.{iter}) catch |e| { closeIterator(arena, iter); return e; };
-        const done_v: Value = if (step.bits != 0 and step.unbox() == .object) step.toPtr().object.get("done") orelse Value{} else Value{};
-        if (isTruthy(done_v)) break;
-        const next_val: Value = if (step.bits != 0 and step.unbox() == .object) step.toPtr().object.get("value") orelse try val_mod.makeUndefined(arena) else try val_mod.makeUndefined(arena);
-        var found_idx: ?usize = null;
-        for (rd.values.items, 0..) |v, idx| { if (sameValueZero(v, next_val)) { found_idx = idx; break; } }
-        if (found_idx) |idx| {
-            _ = rd.values.orderedRemove(idx);
+    // For each key in other: toggle relative to the ORIGINAL this membership.
+    const iter = try openKeysIterator(arena, rec);
+    while (try keysStep(arena, iter)) |val| {
+        const in_result = setDataHas(rd, val);
+        if (setDataHas(this_data, val)) {
+            if (in_result) setDataRemove(rd, val);
         } else {
-            try rd.values.append(arena, next_val);
+            if (!in_result) try rd.values.append(arena, val);
         }
     }
     return result;
@@ -1492,8 +1594,11 @@ pub fn nativeSetIsSubsetOf(arena: std.mem.Allocator, this_val: Value, args: []co
     const rec = try getSetRecord(arena, other);
     if (@as(f64, @floatFromInt(this_data.values.items.len)) > rec.size)
         return val_mod.makeBool(arena, false);
-    for (this_data.values.items) |v| {
-        const has_r = try function_proto.invokeCallback(arena, rec.obj, rec.has, &.{v});
+    // Walk this by live index (has may mutate this) and probe other.has.
+    var i: usize = 0;
+    while (i < this_data.values.items.len) : (i += 1) {
+        const e = this_data.values.items[i];
+        const has_r = try function_proto.invokeCallback(arena, rec.obj, rec.has, &.{e});
         if (!isTruthy(has_r)) return val_mod.makeBool(arena, false);
     }
     return val_mod.makeBool(arena, true);
@@ -1505,15 +1610,12 @@ pub fn nativeSetIsSupersetOf(arena: std.mem.Allocator, this_val: Value, args: []
     const rec = try getSetRecord(arena, other);
     if (@as(f64, @floatFromInt(this_data.values.items.len)) < rec.size)
         return val_mod.makeBool(arena, false);
-    const iter = try function_proto.invokeCallback(arena, rec.obj, rec.keys, &.{});
-    while (true) {
-        const step = nativeIterStep(arena, Value{}, &.{iter}) catch |e| { closeIterator(arena, iter); return e; };
-        const done_v: Value = if (step.bits != 0 and step.unbox() == .object) step.toPtr().object.get("done") orelse Value{} else Value{};
-        if (isTruthy(done_v)) break;
-        const next_val: Value = if (step.bits != 0 and step.unbox() == .object) step.toPtr().object.get("value") orelse try val_mod.makeUndefined(arena) else try val_mod.makeUndefined(arena);
-        var found = false;
-        for (this_data.values.items) |v| { if (sameValueZero(v, next_val)) { found = true; break; } }
-        if (!found) { closeIterator(arena, iter); return val_mod.makeBool(arena, false); }
+    const iter = try openKeysIterator(arena, rec);
+    while (try keysStep(arena, iter)) |val| {
+        if (!setDataHas(this_data, val)) {
+            closeIterator(arena, iter.iter);
+            return val_mod.makeBool(arena, false);
+        }
     }
     return val_mod.makeBool(arena, true);
 }
@@ -1522,9 +1624,23 @@ pub fn nativeSetIsDisjointFrom(arena: std.mem.Allocator, this_val: Value, args: 
     const this_data = try getSetDataBranded(arena, this_val);
     const other = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     const rec = try getSetRecord(arena, other);
-    for (this_data.values.items) |v| {
-        const has_r = try function_proto.invokeCallback(arena, rec.obj, rec.has, &.{v});
-        if (isTruthy(has_r)) return val_mod.makeBool(arena, false);
+    // When |this| ≤ |other|, probe other.has for each element of this;
+    // otherwise walk other.keys() and test membership in this.
+    if (@as(f64, @floatFromInt(this_data.values.items.len)) <= rec.size) {
+        var i: usize = 0;
+        while (i < this_data.values.items.len) : (i += 1) {
+            const e = this_data.values.items[i];
+            const has_r = try function_proto.invokeCallback(arena, rec.obj, rec.has, &.{e});
+            if (isTruthy(has_r)) return val_mod.makeBool(arena, false);
+        }
+    } else {
+        const iter = try openKeysIterator(arena, rec);
+        while (try keysStep(arena, iter)) |val| {
+            if (setDataHas(this_data, val)) {
+                closeIterator(arena, iter.iter);
+                return val_mod.makeBool(arena, false);
+            }
+        }
     }
     return val_mod.makeBool(arena, true);
 }

@@ -818,14 +818,24 @@ fn toLen(v: Value) usize {
 }
 
 /// ToLength(? Get(O, "length")). Real arrays read the [[ArrayLength]] slot.
+/// ToLength(v) but with a spec-correct ToNumber that throws for Symbol / BigInt
+/// operands (realm_mod.toLengthValue swallows those as NaN → 0).
+fn toLengthChecked(arena: std.mem.Allocator, v: Value) !usize {
+    const n = try realm_mod.toNumberCheckedRealm(arena, v);
+    if (std.math.isNan(n) or n <= 0) return 0;
+    const capped = @min(std.math.trunc(n), 9007199254740991.0);
+    return @intFromFloat(capped);
+}
+
 fn genLength(arena: std.mem.Allocator, this_val: Value) !usize {
     if (this_val.isHeapPtr() and this_val.toPtr().* == .object and this_val.toPtr().object.is_array)
         return this_val.toPtr().object.getArrayLength();
     // Array-likes: ToLength(? Get(O, "length")) with full ToNumber coercion so a
-    // `length` whose valueOf/toString yields a number is honored.
-    if (realm_mod.active_context) |ctx| return realm_mod.toLengthValue(arena, try ctx.getProp(arena, this_val, "length"));
+    // `length` whose valueOf/toString yields a number is honored. ToNumber throws
+    // a TypeError for a Symbol / BigInt `length` (spec ToLength → ToNumber).
+    if (realm_mod.active_context) |ctx| return toLengthChecked(arena, try ctx.getProp(arena, this_val, "length"));
     if (this_val.isHeapPtr() and this_val.toPtr().* == .object)
-        return realm_mod.toLengthValue(arena, this_val.toPtr().object.get("length") orelse Value{ .bits = 0 });
+        return toLengthChecked(arena, this_val.toPtr().object.get("length") orelse Value{ .bits = 0 });
     return 0;
 }
 
@@ -869,8 +879,9 @@ fn genDelete(arena: std.mem.Allocator, this_val: Value, i: usize) !void {
 }
 
 /// ToIntegerOrInfinity with full ToNumber coercion (objects via valueOf/toString).
+/// ToNumber throws a TypeError for Symbol / BigInt operands (spec ToNumber).
 fn genInteger(arena: std.mem.Allocator, v: Value) !f64 {
-    const n = try realm_mod.toNumberValue(arena, v);
+    const n = try realm_mod.toNumberCheckedRealm(arena, v);
     if (std.math.isNan(n)) return 0;
     if (std.math.isInf(n)) return n;
     return std.math.trunc(n);

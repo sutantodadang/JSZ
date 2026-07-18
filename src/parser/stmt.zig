@@ -1098,6 +1098,36 @@ pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind) ?*Node {
     else
         expr_mod.parseObjectPattern(p) orelse return null;
 
+    // C-style `for (var [a] = init; test; update)`: a destructuring declaration
+    // in the init clause (not a for-of/for-in head). Desugar the binding into a
+    // transparent block of declarations and continue with the C-style tail.
+    if (p.check(.eq)) {
+        _ = p.advance(); // consume '='
+        const rhs = p.parseAssignmentExpr() orelse return null;
+        const tmp_name = std.fmt.allocPrint(p.arena, "__forbind_{d}", .{start}) catch return null;
+        var body = std.ArrayList(*Node){};
+        const tmp_decl = p.makeNode(.var_decl, start, p.current.start, .{
+            .var_decl = .{ .kind = kind, .name = tmp_name, .init = rhs },
+        }) orelse return null;
+        body.append(p.arena, tmp_decl) catch return null;
+        const tmp_ref = p.makeNode(.identifier, start, start, .{ .identifier = tmp_name }) orelse return null;
+        var decls_out2 = std.ArrayList(*Node){};
+        const saved_out2 = p.destruct_out;
+        const saved_kind2 = p.destruct_kind;
+        p.destruct_out = &decls_out2;
+        p.destruct_kind = kind;
+        const ok2 = expr_mod.desugarParamPattern(p, pattern, tmp_ref);
+        p.destruct_out = saved_out2;
+        p.destruct_kind = saved_kind2;
+        if (!ok2) return null;
+        body.appendSlice(p.arena, decls_out2.items) catch return null;
+        const init_block = p.makeNode(.block_stmt, start, p.current.start, .{
+            .block_stmt = .{ .body = body.items, .lexical_scope = false },
+        }) orelse return null;
+        _ = p.expect(.semicolon) orelse return null;
+        return parseForTail(p, start, init_block);
+    }
+
     const iterate_values = if (p.check(.kw_of)) true else if (p.check(.kw_in)) false else {
         p.had_error = true;
         p.error_info = parser_file.ParseError{ .message = "expected 'of' or 'in' in for destructuring", .line = p.current.line, .column = p.current.column };
