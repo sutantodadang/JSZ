@@ -239,6 +239,14 @@ pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value)
         return b.get(k) orelse val_mod.makeUndefined(arena);
     }
 
+    // Dense array element: a present element is a plain data property; a hole
+    // falls through so an inherited index (Array.prototype[i]) still resolves.
+    if (target_obj.usesDense()) {
+        if (JsObject.canonicalArrayIndex(k)) |_| {
+            if (target_obj.getOwn(k)) |v| return v;
+        }
+    }
+
     if (target_obj.findProperty(k)) |found| {
         const attr = found.holder.attrAt(found.slot);
         if (attr.is_accessor) {
@@ -464,6 +472,10 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeBool(arena, false);
 
+    // Internal slots ([[PrimitiveValue]], …) are spec internal state, never a
+    // property visible to [[HasProperty]].
+    if (JsObject.isInternalSlotKey(k)) return val_mod.makeBool(arena, false);
+
     // M16: Module Namespace exotic [[HasProperty]] — string keys are exactly the
     // exported names (null prototype, no inherited keys).
     if (target_obj.internal_kind == .module_namespace) {
@@ -649,6 +661,7 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
             i += 1;
             array_length_emitted = true;
         }
+        if (JsObject.isInternalSlotKey(k)) continue; // internal slots ([[PrimitiveValue]], …)
         const key_val = try val_mod.makeString(arena, k);
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
         try arr.set(idx_key, key_val);
@@ -845,12 +858,9 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
         // this, a bare {get} silently flips a configurable prop non-configurable.
         var prev_e = false;
         var prev_c = false;
-        if (target_obj.findProperty(k)) |loc| {
-            if (loc.holder == target_obj) {
-                const a = loc.holder.attrAt(loc.slot);
-                prev_e = a.enumerable;
-                prev_c = a.configurable;
-            }
+        if (target_obj.ownAttr(k)) |a| { // dense-aware own-property attrs
+            prev_e = a.enumerable;
+            prev_c = a.configurable;
         }
         const attr = PropAttr{
             .is_accessor = true,
@@ -868,16 +878,13 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
     var cur_c = false;
     var has_own_data = false;
     var cur_val: ?Value = null;
-    if (target_obj.findProperty(k)) |loc| {
-        if (loc.holder == target_obj) {
-            const a = loc.holder.attrAt(loc.slot);
-            if (!a.is_accessor) {
-                cur_w = a.writable;
-                cur_e = a.enumerable;
-                cur_c = a.configurable;
-                cur_val = target_obj.getOwn(k);
-                has_own_data = true;
-            }
+    if (target_obj.ownAttr(k)) |a| { // dense-aware own-property attrs
+        if (!a.is_accessor) {
+            cur_w = a.writable;
+            cur_e = a.enumerable;
+            cur_c = a.configurable;
+            cur_val = target_obj.getOwn(k);
+            has_own_data = true;
         }
     }
     const value = if (desc.hasOwn("value"))
@@ -934,6 +941,9 @@ pub fn nativeReflectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value,
     }
 
     const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeUndefined(arena);
+
+    // Internal slots ([[PrimitiveValue]], …) are not own properties.
+    if (JsObject.isInternalSlotKey(k)) return val_mod.makeUndefined(arena);
 
     // M16: Module Namespace exotic [[GetOwnProperty]] for a string key — an export
     // yields { value, writable:true, enumerable:true, configurable:false }; a

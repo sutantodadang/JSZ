@@ -19,6 +19,28 @@ const heap_mod = @import("../gc/heap.zig");
 /// Maximum prototype chain depth before we give up (cycle guard, Phase 3a).
 const MAX_PROTO_DEPTH: usize = 64;
 
+/// Largest hole-gap a dense-array write past the end will pad in place (with hole
+/// sentinels) before deciding the array is genuinely sparse and deopting to the
+/// shape machinery. Bounds worst-case padding memory (`a[N]=v` on an empty array
+/// with N > this becomes a single sparse shape property, as before).
+const DENSE_MAX_GAP: usize = 1024;
+
+/// Shared, immortal pool of decimal index strings ("0","1","2",…). Dense-array
+/// key enumeration returns these rather than allocating a fresh string per key
+/// on every call. Grown lazily and shared across all arrays; entries live for the
+/// process (allocated from the long-lived shape arena). Single-threaded per
+/// isolate, so no synchronization is needed.
+var index_key_pool: std.ArrayListUnmanaged([]const u8) = .empty;
+
+fn indexKeyString(alloc: std.mem.Allocator, i: u32) ![]const u8 {
+    while (index_key_pool.items.len <= i) {
+        const n: u32 = @intCast(index_key_pool.items.len);
+        const s = try std.fmt.allocPrint(alloc, "{d}", .{n});
+        try index_key_pool.append(alloc, s);
+    }
+    return index_key_pool.items[i];
+}
+
 /// Per-property attribute bits (ES5.1 property descriptor flags). Default = all
 /// true, matching the behavior of a plain assigned data property.
 pub const PropAttr = packed struct(u8) {
@@ -84,6 +106,21 @@ pub const JsObject = struct {
     attrs: std.ArrayListUnmanaged(PropAttr) = .empty,
     /// Symbol-keyed own properties (ES2015). Looked up by symbol pointer identity.
     sym_props: std.ArrayListUnmanaged(SymProp) = .empty,
+    /// Dense element storage for `is_array` objects: contiguous element values for
+    /// indices [0, dense.items.len). A hole (absent element) is the empty Value
+    /// (`bits == 0`). Indices in [dense.items.len, array_length) are trailing
+    /// holes. Using this instead of one shape property per index avoids the
+    /// O(n²) shape-transition blowup of large arrays. Allocated from `arena`
+    /// (like `slots`), so it works for both arena- and heap-allocated arrays.
+    /// Only meaningful when `is_array and !dense_disabled`.
+    dense: std.ArrayListUnmanaged(Value) = .empty,
+    /// Set once an array needs per-element semantics the dense path cannot model
+    /// (a non-default indexed property descriptor, an indexed accessor, or
+    /// preventExtensions/seal/freeze). On the transition the existing dense
+    /// elements are migrated to ordinary shape properties (`deoptDense`) and all
+    /// subsequent indexed access uses the shape machinery — i.e. exactly the
+    /// pre-dense behavior, preserved for these rarer cases.
+    dense_disabled: bool = false,
 
     /// Allocate a plain object with an optional prototype.
     pub fn create(arena: std.mem.Allocator, proto: ?*JsObject) !*JsObject {
@@ -146,11 +183,97 @@ pub const JsObject = struct {
         }
     }
 
+    /// True when this array is using the dense element fast path.
+    pub inline fn usesDense(self: *const JsObject) bool {
+        return self.is_array and !self.dense_disabled;
+    }
+
+    /// Parse `key` as a canonical array index (ES CanonicalNumericIndexString ∩
+    /// valid array index): decimal digits, no leading zeros, value < 2^32-1.
+    /// Returns null for "length", "01", "-0", "1.0", named keys, etc.
+    pub fn canonicalArrayIndex(key: []const u8) ?u32 {
+        if (key.len == 0 or key.len > 10) return null;
+        if (key.len > 1 and key[0] == '0') return null;
+        for (key) |c| if (c < '0' or c > '9') return null;
+        const n = std.fmt.parseUnsigned(u32, key, 10) catch return null;
+        if (n == std.math.maxInt(u32)) return null;
+        return n;
+    }
+
+    /// Read a dense element by index. Returns the value (possibly `undefined`),
+    /// or null for a hole / out-of-range index. Caller must have checked
+    /// `usesDense()`.
+    inline fn denseGet(self: *const JsObject, idx: u32) ?Value {
+        if (idx >= self.dense.items.len or idx >= self.array_length) return null;
+        const v = self.dense.items[idx];
+        return if (v.bits == 0) null else v;
+    }
+
+    /// Store a dense element. Returns true when handled; false when the write is
+    /// too far past the end (sparse) and the array was deopted — the caller then
+    /// stores the element through the shape path. Caller must have checked
+    /// `usesDense()`.
+    fn denseSet(self: *JsObject, idx: u32, value: Value) !bool {
+        const i: usize = idx;
+        if (i < self.dense.items.len) {
+            self.dense.items[i] = value;
+        } else {
+            const gap = i - self.dense.items.len;
+            if (gap > DENSE_MAX_GAP) {
+                try self.deoptDense();
+                return false;
+            }
+            try self.dense.ensureTotalCapacity(self.arena, i + 1);
+            while (self.dense.items.len < i) self.dense.appendAssumeCapacity(Value{});
+            self.dense.appendAssumeCapacity(value);
+        }
+        if (idx + 1 > self.array_length) self.array_length = idx + 1;
+        self.gcWrite(value);
+        return true;
+    }
+
+    /// Migrate this array off the dense fast path: move every stored element into
+    /// an ordinary shape property, then release the dense buffer. Idempotent.
+    /// After this, indexed access uses the shape machinery (pre-dense behavior).
+    fn deoptDense(self: *JsObject) !void {
+        if (self.dense_disabled) return;
+        self.dense_disabled = true;
+        const limit = @min(self.dense.items.len, @as(usize, self.array_length));
+        var i: usize = 0;
+        while (i < limit) : (i += 1) {
+            const v = self.dense.items[i];
+            if (v.bits == 0) continue; // hole → not an own property
+            var buf: [12]u8 = undefined;
+            const k = std.fmt.bufPrint(&buf, "{d}", .{i}) catch continue;
+            // transitionAdd dupes the key, so the stack buffer is safe.
+            if (self.shape.key_to_slot.get(k) == null) {
+                self.shape = try self.shape_manager.transitionAdd(self.shape, k);
+                const slot = self.shape.key_to_slot.get(k) orelse unreachable;
+                try self.growSlots(slot + 1);
+                self.slots.items[slot] = v;
+                self.attrs.items[slot] = .{};
+                self.gcWrite(v);
+            }
+        }
+        self.dense.clearAndFree(self.arena);
+    }
+
+    /// Force the array onto the shape path (best effort — swallows an allocation
+    /// failure). Used by the `void`-returning attribute mutators (seal/freeze/
+    /// preventExtensions) that must give elements real per-slot attributes.
+    fn deoptDenseBestEffort(self: *JsObject) void {
+        self.deoptDense() catch {};
+    }
+
     /// Get own property (no proto walk). Returns null for accessor slots so
     /// enumeration and the plain `get` path skip them (accessor dispatch happens
     /// in the VM via `findProperty`/`ownAccessorHolder`).
     pub fn getOwn(self: *JsObject, key: []const u8) ?Value {
         if (self.is_array and std.mem.eql(u8, key, "length")) return null;
+        if (self.usesDense()) {
+            if (canonicalArrayIndex(key)) |idx| return self.denseGet(idx);
+            // Non-index key on a dense array → ordinary named property below.
+        }
         if (self.shape.key_to_slot.get(key)) |slot| {
             if (slot < self.attrs.items.len and self.attrs.items[slot].is_accessor) return null;
             if (slot < self.slots.items.len) return self.slots.items[slot];
@@ -183,6 +306,13 @@ pub const JsObject = struct {
         // assignment never creates an ordinary "length" data slot.
         if (self.is_array and std.mem.eql(u8, key, "length")) {
             const new_len = arrayLengthFromValue(value) orelse return;
+            if (self.usesDense()) {
+                // Dense shrink: drop the now-out-of-range trailing elements. A grow
+                // only bumps the length (the new tail is implicit holes).
+                if (new_len < self.dense.items.len) self.dense.shrinkRetainingCapacity(new_len);
+                self.array_length = new_len;
+                return;
+            }
             if (new_len < self.array_length) {
                 // Delete only the EXISTING indexed own properties >= new_len.
                 // Iterating the full [new_len, array_length) numeric range is
@@ -205,6 +335,15 @@ pub const JsObject = struct {
             self.array_length = new_len;
             return;
         }
+        // Dense array element fast path: store contiguous numeric indices in the
+        // dense buffer instead of one shape property per index. A write far past
+        // the end (a genuinely sparse array) deopts to the shape path.
+        if (self.usesDense()) {
+            if (canonicalArrayIndex(key)) |idx| {
+                if (try self.denseSet(idx, value)) return;
+                // deopt occurred → the element is stored via the shape path below.
+            }
+        }
         if (self.shape.key_to_slot.get(key)) |slot| {
             if (slot < self.slots.items.len) {
                 if (slot < self.attrs.items.len and !self.attrs.items[slot].writable) return;
@@ -216,7 +355,11 @@ pub const JsObject = struct {
             const new_slot = self.shape.key_to_slot.get(key) orelse unreachable;
             try self.growSlots(new_slot + 1);
             self.slots.items[new_slot] = value;
-            self.attrs.items[new_slot] = .{};
+            // A `[[Name]]`-shaped internal slot (e.g. [[PrimitiveValue]]) is spec
+            // internal state, not an ordinary property: create it non-enumerable
+            // so Object.keys / for-in / JSON never walk it. Reflection paths that
+            // include non-enumerable keys filter it by name (isInternalSlotKey).
+            self.attrs.items[new_slot] = if (isInternalSlotKey(key)) .{ .enumerable = false } else .{};
         }
         self.gcWrite(value);
         if (self.is_array) {
@@ -253,6 +396,9 @@ pub const JsObject = struct {
 
     /// Has own property check.
     pub fn hasOwn(self: *JsObject, key: []const u8) bool {
+        if (self.usesDense()) {
+            if (canonicalArrayIndex(key)) |idx| return self.denseGet(idx) != null;
+        }
         return self.shape.key_to_slot.contains(key);
     }
 
@@ -296,6 +442,14 @@ pub const JsObject = struct {
     /// non-configurable (returns false without deleting). Rebuilds `attrs`
     /// parallel to the new slot order.
     pub fn deleteOwn(self: *JsObject, key: []const u8) !bool {
+        // Dense array element: `delete a[i]` punches a hole (elements are always
+        // configurable) without disturbing the length.
+        if (self.usesDense()) {
+            if (canonicalArrayIndex(key)) |idx| {
+                if (idx < self.dense.items.len) self.dense.items[idx] = Value{};
+                return true;
+            }
+        }
         // [[Delete]] of an absent own property succeeds (returns true).
         const del_slot = self.shape.key_to_slot.get(key) orelse return true;
         if (del_slot < self.attrs.items.len and !self.attrs.items[del_slot].configurable) return false;
@@ -324,11 +478,57 @@ pub const JsObject = struct {
     /// Spec-ordered own string keys: integer indices ascending, then the rest
     /// in insertion order (ES [[OwnPropertyKeys]]). Cached on the shape.
     pub fn ownKeys(self: *JsObject) []const []const u8 {
+        if (self.usesDense()) return self.denseOwnKeys();
         return self.shape.orderedKeys(self.shape_manager.allocator);
+    }
+
+    /// [[OwnPropertyKeys]] for a dense array: non-hole element indices in ascending
+    /// order, followed by the shape's named keys in insertion order. A dense
+    /// array's shape never holds numeric indices, so this reproduces the spec
+    /// ordering (integer keys first). Built fresh each call (elements are mutable);
+    /// callers use the slice transiently. Allocated from the shape manager's arena
+    /// — the same long-lived, bulk-freed arena `orderedKeys` uses for its cache —
+    /// so it is not individually leak-tracked. (Index key strings come from a
+    /// shared immortal pool, so only the pointer slice is newly allocated.)
+    fn denseOwnKeys(self: *JsObject) []const []const u8 {
+        const alloc = self.shape_manager.allocator;
+        const named = self.shape.orderedKeys(alloc);
+        const limit = @min(self.dense.items.len, @as(usize, self.array_length));
+        var count: usize = 0;
+        var i: usize = 0;
+        while (i < limit) : (i += 1) {
+            if (self.dense.items[i].bits != 0) count += 1;
+        }
+        const out = alloc.alloc([]const u8, count + named.len) catch return named;
+        var o: usize = 0;
+        i = 0;
+        while (i < limit) : (i += 1) {
+            if (self.dense.items[i].bits == 0) continue;
+            out[o] = indexKeyString(alloc, @intCast(i)) catch continue;
+            o += 1;
+        }
+        for (named) |k| {
+            out[o] = k;
+            o += 1;
+        }
+        return out[0..o];
+    }
+
+    /// True when `key` is a string-keyed internal slot stored by convention as a
+    /// `[[Name]]`-shaped own property (e.g. `[[PrimitiveValue]]` on a String/
+    /// Number/Boolean wrapper, `[[OriginalSource]]` on a RegExp). Such slots back
+    /// spec internal state and MUST NOT surface through any reflection path
+    /// (getOwnPropertyNames, hasOwnProperty, getOwnPropertyDescriptor, Reflect.*,
+    /// Object.keys, for-in). They are also created non-enumerable (see `set`).
+    pub fn isInternalSlotKey(key: []const u8) bool {
+        return key.len >= 4 and key[0] == '[' and key[1] == '[';
     }
 
     /// True if `key` is an own enumerable property. Missing key → false.
     pub fn isEnumerable(self: *JsObject, key: []const u8) bool {
+        if (self.usesDense()) {
+            if (canonicalArrayIndex(key)) |idx| return self.denseGet(idx) != null;
+        }
         const slot = self.shape.key_to_slot.get(key) orelse return false;
         if (slot >= self.attrs.items.len) return true;
         return self.attrs.items[slot].enumerable;
@@ -352,6 +552,13 @@ pub const JsObject = struct {
 
     /// Own attribute bits for `key`, or null if not an own property.
     pub fn ownAttr(self: *JsObject, key: []const u8) ?PropAttr {
+        if (self.usesDense()) {
+            // A present dense element is a plain writable/enumerable/configurable
+            // data property; a hole is not an own property.
+            if (canonicalArrayIndex(key)) |idx| {
+                return if (self.denseGet(idx) != null) PropAttr{} else null;
+            }
+        }
         const slot = self.shape.key_to_slot.get(key) orelse return null;
         if (slot >= self.attrs.items.len) return PropAttr{};
         return self.attrs.items[slot];
@@ -371,6 +578,21 @@ pub const JsObject = struct {
     /// Returns false (caller should throw TypeError) when disallowed by
     /// non-configurability or non-extensibility. Honors lockstep growth.
     pub fn defineOwnData(self: *JsObject, key: []const u8, value: Value, attr: PropAttr) !bool {
+        if (self.usesDense()) {
+            if (canonicalArrayIndex(key)) |idx| {
+                // A plain data descriptor with the default attributes is exactly a
+                // dense element — keep the fast path. Anything else (non-writable/
+                // non-enumerable/non-configurable) needs real per-slot attributes,
+                // so deopt to the shape machinery.
+                const is_default = attr.writable and attr.enumerable and attr.configurable and !attr.is_private;
+                if (is_default and self.extensible) {
+                    if (try self.denseSet(idx, value)) return true;
+                    // deopted on a large gap → store through the shape path below.
+                } else {
+                    try self.deoptDense();
+                }
+            }
+        }
         if (self.shape.key_to_slot.get(key)) |slot| {
             const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
             // Converting accessor → data: delete the accessor slot first so a
@@ -419,11 +641,16 @@ pub const JsObject = struct {
 
     /// Object.preventExtensions: forbid new own properties.
     pub fn preventExtensionsSelf(self: *JsObject) void {
+        // A dense array's elements carry no per-slot attributes, and the dense
+        // write path assumes extensibility; deopt so the shape machinery enforces
+        // non-extensibility on element indices correctly.
+        self.deoptDenseBestEffort();
         self.extensible = false;
     }
 
     /// Object.seal: prevent extensions + mark all own props non-configurable.
     pub fn sealSelf(self: *JsObject) void {
+        self.deoptDenseBestEffort(); // materialize element attrs before sealing
         self.extensible = false;
         for (self.attrs.items) |*a| a.configurable = false;
         for (self.sym_props.items) |*sp| sp.attr.configurable = false;
@@ -431,6 +658,7 @@ pub const JsObject = struct {
 
     /// Object.freeze: seal + mark all own data props non-writable.
     pub fn freezeSelf(self: *JsObject) void {
+        self.deoptDenseBestEffort(); // materialize element attrs before freezing
         self.extensible = false;
         for (self.attrs.items) |*a| {
             a.configurable = false;
@@ -492,6 +720,10 @@ pub const JsObject = struct {
     pub fn defineOwnAccessor(self: *JsObject, key: []const u8, holder: Value, attr_in: PropAttr) !bool {
         var attr = attr_in;
         attr.is_accessor = true;
+        // An indexed accessor cannot live in the dense value buffer; deopt first.
+        if (self.usesDense()) {
+            if (canonicalArrayIndex(key)) |_| try self.deoptDense();
+        }
         if (self.shape.key_to_slot.get(key)) |slot| {
             const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
             if (!cur.configurable) {

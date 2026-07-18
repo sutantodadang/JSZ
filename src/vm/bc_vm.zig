@@ -2234,6 +2234,14 @@ pub const BcVm = struct {
                 if (obj.is_array and std.mem.eql(u8, key, "length")) {
                     return val_mod.makeNumber(self.arena, @floatFromInt(obj.getArrayLength()));
                 }
+                // Dense array element read: a present own element short-circuits.
+                // A hole/OOB index falls through so an inherited index (e.g. one
+                // installed on Array.prototype) is still resolved via findProperty.
+                if (obj.usesDense()) {
+                    if (JsObject.canonicalArrayIndex(key)) |_| {
+                        if (obj.getOwn(key)) |v| return v;
+                    }
+                }
                 if (std.mem.eql(u8, key, "size")) {
                     if (@import("../runtime/builtins/es2015_collections.zig").collectionSize(obj)) |n| {
                         return val_mod.makeNumber(self.arena, @floatFromInt(n));
