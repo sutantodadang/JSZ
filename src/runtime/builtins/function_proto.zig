@@ -10,6 +10,7 @@ const Value = val_mod.Value;
 const JsValue = val_mod.JsValue;
 const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
+const proxy_mod = @import("proxy.zig");
 
 /// Data stored inside a bound function object's internal_slot.
 pub const BoundData = struct {
@@ -208,6 +209,85 @@ pub fn isCallableFn(v: Value) bool {
         },
         else => false,
     };
+}
+
+/// `[[GetPrototypeOf]]` as a `?*JsObject` (null = null prototype). Proxy objects
+/// dispatch their `getPrototypeOf` trap (forwarding to the target when absent),
+/// so a throwing trap propagates and nested proxies resolve recursively.
+fn getPrototypeOfV(arena: std.mem.Allocator, obj: *JsObject) anyerror!?*JsObject {
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyGetPrototypeOf(arena, obj)) |res| {
+            if (res.bits != 0 and res.unbox() == .object) return res.toPtr().object;
+            return null; // trap returned null → null prototype
+        }
+        // No trap: forward to the target's [[GetPrototypeOf]].
+        const target = proxy_mod.proxyTarget(obj) orelse return null;
+        if (target.bits != 0 and target.unbox() == .object) return getPrototypeOfV(arena, target.toPtr().object);
+        return null;
+    }
+    return obj.proto;
+}
+
+/// OrdinaryHasInstance(C, V) — the abstract operation behind
+/// `Function.prototype[@@hasInstance]` (ECMA-262 §20.2.3.6 / §7.3.20).
+fn ordinaryHasInstance(arena: std.mem.Allocator, c_val: Value, v_val: Value) anyerror!bool {
+    // 1. If IsCallable(C) is false, return false.
+    if (!isCallableFn(c_val)) return false;
+    // 2. If C has a [[BoundTargetFunction]], return InstanceofOperator(V, target).
+    if (c_val.bits != 0 and c_val.unbox() == .object and
+        c_val.toPtr().object.internal_kind == .bound_function)
+    {
+        if (c_val.toPtr().object.internal_slot) |slot| {
+            const bd: *BoundData = @ptrCast(@alignCast(slot));
+            return ordinaryHasInstance(arena, bd.target, v_val);
+        }
+    }
+    // 3. If V is not an Object, return false. Functions (bc/native/legacy) are
+    // objects too — their [[Prototype]] chain is walked below.
+    if (v_val.bits == 0) return false;
+    const v_is_object = switch (v_val.unbox()) {
+        .object, .bc_function, .native_function, .function => true,
+        else => false,
+    };
+    if (!v_is_object) return false;
+    // 4. Let P be ? Get(C, "prototype").
+    const ctx = realm_mod.active_context orelse return false;
+    const p = try ctx.getProp(arena, c_val, "prototype");
+    // 5. If P is not an Object, throw a TypeError.
+    if (p.bits == 0 or p.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeError(arena, "Function has non-object prototype in instanceof check");
+        return error.JsException;
+    }
+    const p_obj = p.toPtr().object;
+    // 6-7. Walk V's [[GetPrototypeOf]] chain, starting from V's own prototype.
+    var cur_proto: ?*JsObject = switch (v_val.unbox()) {
+        .object => try getPrototypeOfV(arena, v_val.toPtr().object),
+        // A bc function's [[Prototype]] is its backing object's proto (a subclass
+        // ctor points at its superclass), else %Function.prototype%.
+        .bc_function => blk: {
+            const cl = v_val.unbox().bc_function;
+            if (cl.obj) |op| {
+                const o: *JsObject = @ptrCast(@alignCast(op));
+                break :blk o.proto;
+            }
+            break :blk realm_mod.active_function_proto;
+        },
+        else => realm_mod.active_function_proto,
+    };
+    var depth: usize = 0;
+    while (cur_proto) |pr| {
+        if (depth >= 100_000) break;
+        depth += 1;
+        if (pr == p_obj) return true;
+        cur_proto = try getPrototypeOfV(arena, pr);
+    }
+    return false;
+}
+
+/// `Function.prototype[Symbol.hasInstance](V)` — OrdinaryHasInstance(this, V).
+pub fn nativeFunctionHasInstance(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const v = if (args.len > 0) args[0] else Value{};
+    return val_mod.makeBool(arena, try ordinaryHasInstance(arena, this_val, v));
 }
 
 /// Function.prototype.bind(thisArg, ...prefix) -> BoundFunction

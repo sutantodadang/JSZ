@@ -435,9 +435,10 @@ pub inline fn opIn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const key_v = frame.registers[rkey];
     const obj_v = frame.registers[robj];
-    // native_function is callable — hasProperty handles it; do NOT throw for it.
+    // Functions (native, bytecode, legacy) are objects — hasProperty handles
+    // them; do NOT throw for any callable.
     const obj_is_valid = if (obj_v.bits == 0) false else switch (obj_v.unbox()) {
-        .object, .native_function => true,
+        .object, .native_function, .bc_function, .function => true,
         else => false,
     };
     if (!obj_is_valid) {

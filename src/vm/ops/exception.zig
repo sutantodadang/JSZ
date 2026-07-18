@@ -125,6 +125,52 @@ pub inline fn opInstanceof(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const lhs = frame.registers[rlhs];
     const rhs = frame.registers[rrhs];
+    const realm_mod = @import("../../runtime/realm.zig");
+    const function_proto_mod = @import("../../runtime/builtins/function_proto.zig");
+
+    // Spec §13.10.2 InstanceofOperator(V = lhs, target = rhs):
+    // 1. If Type(target) is not Object, throw a TypeError.
+    const rhs_is_object = rhs.bits != 0 and switch (rhs.unbox()) {
+        .object, .bc_function, .native_function, .function => true,
+        else => false,
+    };
+    if (!rhs_is_object) {
+        realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "Right-hand side of 'instanceof' is not an object");
+        if (try self.raisePendingException("Right-hand side of 'instanceof' is not an object")) |oc| return oc;
+        return null;
+    }
+    // 2. Let instOfHandler be ? GetMethod(target, @@hasInstance).
+    // 3. If instOfHandler is not undefined, return ToBoolean(Call(handler, target, «V»)).
+    if (realm_mod.active_sym_has_instance) |hi_sym| {
+        const handler = self.getPropSym(rhs, hi_sym) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error reading Symbol.hasInstance")) |oc| return oc;
+            return null;
+        };
+        const handler_absent = handler.bits == 0 or handler.unbox() == .undefined_ or handler.unbox() == .null_;
+        if (!handler_absent) {
+            if (!function_proto_mod.isCallableFn(handler)) {
+                realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "Symbol.hasInstance method is not callable");
+                if (try self.raisePendingException("Symbol.hasInstance method is not callable")) |oc| return oc;
+                return null;
+            }
+            const res = function_proto_mod.invokeCallback(self.arena, rhs, handler, &[_]Value{lhs}) catch |e| {
+                if (e != error.JsException) return e;
+                if (try self.raisePendingException("error in Symbol.hasInstance")) |oc| return oc;
+                return null;
+            };
+            // callAccessor may have reallocated self.frames — write via the live top frame.
+            self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, bcv.isTruthy(res));
+            return null;
+        }
+    }
+    // 4. No @@hasInstance handler: if target is not callable, throw a TypeError.
+    if (!function_proto_mod.isCallableFn(rhs)) {
+        realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "Right-hand side of 'instanceof' is not callable");
+        if (try self.raisePendingException("Right-hand side of 'instanceof' is not callable")) |oc| return oc;
+        return null;
+    }
+    // 5. OrdinaryHasInstance (the direct proto walk).
     // Mechanism B: a generator/async function value is .bc_function, not .object,
     // so jsInstanceofWithTarget would always return false for it as LHS. Coerce it
     // to its backing JsObject so the [[Prototype]] chain walk can succeed.

@@ -1867,6 +1867,40 @@ pub const BcVm = struct {
             }
             return false;
         }
+        // bc_function / legacy function: own "name"/"length" (and "prototype" for
+        // constructor-capable functions), plus properties on the lazily-created
+        // backing object, then the %Function.prototype% chain. Mirrors getProp so
+        // `key in fn` agrees with reading `fn[key]`.
+        if (obj_val.bits != 0 and (obj_val.unbox() == .bc_function or obj_val.unbox() == .function)) {
+            const realm_mod = @import("../runtime/realm.zig");
+            const key = try valueToStringArena(self.arena, key_v);
+            if (obj_val.unbox() == .bc_function) {
+                const closure = obj_val.unbox().bc_function;
+                if (closure.obj) |op| {
+                    const o: *JsObject = @ptrCast(@alignCast(op));
+                    if (o.hasOwn(key)) return true;
+                }
+                if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "length")) return true;
+                // Async (non-generator) functions have no own "prototype"; every
+                // other bc function does (getProp materializes one on demand).
+                if (std.mem.eql(u8, key, "prototype"))
+                    return !(closure.func.is_async and !closure.func.is_generator);
+            } else {
+                if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "length")) return true;
+            }
+            // Walk %Function.prototype% for inherited members (call/apply/bind/…).
+            var cur: ?*JsObject = if (realm_mod.active_function_proto) |p| p else null;
+            var depth: usize = 0;
+            while (cur) |o| {
+                if (depth >= 64) break;
+                depth += 1;
+                if (key_v.bits != 0 and key_v.unbox() == .symbol) {
+                    if (o.getOwnSym(key_v) != null) return true;
+                } else if (o.hasOwn(key)) return true;
+                cur = o.proto;
+            }
+            return false;
+        }
         if (obj_val.bits == 0 or obj_val.unbox() != .object) return false;
         const root_obj = obj_val.toPtr().object;
         if (root_obj.internal_kind == .proxy) {
@@ -2591,11 +2625,12 @@ pub const BcVm = struct {
                         // Spec OrdinarySetWithOwnDescriptor calls the setter with the
                         // Receiver as thisArg (matters when reached through a Proxy or
                         // `super.x = v`, where Receiver differs from the holder).
-                        if (isCallable(setter)) _ = try self.callAccessor(setter, receiver, &[_]Value{value});
-                        return true; // accessor with no setter: sloppy no-op
+                        if (!isCallable(setter)) return false; // accessor, no setter → [[Set]] fails
+                        _ = try self.callAccessor(setter, receiver, &[_]Value{value});
+                        return true;
                     }
                     if (loc.holder == obj) {
-                        if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return true;
+                        if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return false;
                         _ = obj.setOwnBySlot(obj.shapePtr(), loc.slot, value);
                         mirrorGlobalObjectWrite(obj, key, value);
                         return true;
@@ -2622,15 +2657,19 @@ pub const BcVm = struct {
                     if (a.is_accessor) {
                         const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
                         const setter = accessorMember(raw, "set");
-                        if (isCallable(setter)) _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
+                        if (!isCallable(setter)) return false; // accessor, no setter → fails
+                        _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
                         return true;
                     }
                     if (loc.holder == o) {
-                        if (loc.slot < o.attrs.items.len and !o.attrs.items[loc.slot].writable) return true;
+                        if (loc.slot < o.attrs.items.len and !o.attrs.items[loc.slot].writable) return false;
                         _ = o.setOwnBySlot(o.shapePtr(), loc.slot, value);
                         return true;
                     }
                 }
+                // Computed own "name"/"length" (not materialized on the backing
+                // object) are non-writable data properties → [[Set]] fails.
+                if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "length")) return false;
                 try o.set(key, value);
                 return true;
             },
