@@ -645,6 +645,12 @@ pub const BcVm = struct {
         return self.getPropSym(obj_val, sym_key);
     }
 
+    fn bcHasProp(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool {
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        const key_v = try val_mod.makeString(arena, key);
+        return self.hasProperty(obj_val, key_v);
+    }
+
     fn bcSetProp(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void {
         _ = arena;
         const self: *BcVm = @ptrCast(@alignCast(ptr));
@@ -1127,6 +1133,7 @@ pub const BcVm = struct {
             .construct_nt_fn = bcConstructNt,
             .get_sym_fn = bcGetPropSym,
             .set_fn = bcSetProp,
+            .has_fn = bcHasProp,
             .set_proto_fn = bcSetProto,
             .backing_obj_fn = bcBackingObj,
             .shadow_eval_fn = bcEvalInEnv,

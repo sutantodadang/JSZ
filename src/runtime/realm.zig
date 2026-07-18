@@ -74,6 +74,9 @@ pub const Context = struct {
     /// Write a property by string key, firing accessor setters / Proxy traps /
     /// TypedArray integer-index exotic [[Set]] (full [[Set]]). Propagates throws.
     set_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void,
+    /// HasProperty(O, key): own-or-inherited existence check firing Proxy `has`
+    /// traps. Used by array methods to skip holes (absent indices).
+    has_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool,
     /// Set [[Prototype]] of an object OR bc_function (materializing the closure's
     /// backing object). Used by Object.setPrototypeOf for class static inheritance.
     set_proto_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void,
@@ -136,6 +139,10 @@ pub const Context = struct {
 
     pub fn setProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void {
         return self.set_fn(self.ptr, arena, obj_val, key, value);
+    }
+
+    pub fn hasProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool {
+        return self.has_fn(self.ptr, arena, obj_val, key);
     }
 
     pub fn setProto(self: *Context, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void {
@@ -1236,6 +1243,8 @@ pub var active_sym_to_primitive: ?Value = null;
 pub var active_sym_to_string_tag: ?Value = null;
 /// ES2015 Symbol.species well-known symbol value.
 pub var active_sym_species: ?Value = null;
+/// ES2015 Symbol.isConcatSpreadable well-known symbol value.
+pub var active_sym_is_concat_spreadable: ?Value = null;
 /// ES2023 Symbol.asyncIterator well-known symbol value.
 pub var active_sym_async_iterator: ?Value = null;
 /// Well-known RegExp-related symbols (@@match/@@replace/@@search/@@split/@@matchAll).
@@ -2863,6 +2872,7 @@ fn registerStringProto(arena: std.mem.Allocator, proto: *JsObject) !void {
         .{ "replace", string_proto_mod.nativeReplace },
         .{ "replaceAll", string_proto_mod.nativeReplaceAll },
         .{ "search", string_proto_mod.nativeSearch },
+        .{ "matchAll", string_proto_mod.nativeMatchAll },
         // Core string methods
         .{ "substring", string_proto_mod.nativeSubstring },
         .{ "substr", string_proto_mod.nativeSubstr },
@@ -3706,7 +3716,22 @@ pub const Realm = struct {
             // Symbol.prototype[@@toStringTag] = "Symbol" (non-writable/enumerable, configurable).
             _ = try symbol_proto.defineOwnDataSym(symv, try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
         }
+        if (active_sym_to_string_tag) |symv| {
+            // Math[@@toStringTag] = "Math", JSON[@@toStringTag] = "JSON"
+            // (non-writable/enumerable, configurable) so Object.prototype.toString
+            // yields "[object Math]" / "[object JSON]".
+            const tag_attr: obj_mod.PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+            if (env.lookup("Math")) |mv| {
+                if (mv.bits != 0 and mv.unbox() == .object)
+                    _ = try mv.toPtr().object.defineOwnDataSym(symv, try val_mod.makeString(arena, "Math"), tag_attr);
+            } else |_| {}
+            if (env.lookup("JSON")) |jv| {
+                if (jv.bits != 0 and jv.unbox() == .object)
+                    _ = try jv.toPtr().object.defineOwnDataSym(symv, try val_mod.makeString(arena, "JSON"), tag_attr);
+            } else |_| {}
+        }
         active_sym_species = symbol_ctor.getOwn("species");
+        active_sym_is_concat_spreadable = symbol_ctor.getOwn("isConcatSpreadable");
         // Capture the RegExp-related well-known symbols and install the
         // RegExp.prototype[@@match/@@replace/@@search/@@split/@@matchAll] methods
         // now that the symbols exist (regexp register() ran earlier).

@@ -53,6 +53,171 @@ fn coerceThis(arena: std.mem.Allocator, this_val: Value) anyerror![]const u8 {
     }
 }
 
+/// ES ToString applied to an argument (not the receiver): undefined → "undefined",
+/// null → "null", symbol → TypeError, object → ToPrimitive(string) then stringify.
+fn argToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
+    if (v.bits == 0) return "undefined";
+    switch (v.unbox()) {
+        .string => |s| return s,
+        .number => |n| return try val_mod.formatNumber(arena, n),
+        .boolean => |b| return if (b) "true" else "false",
+        .null_ => return "null",
+        .undefined_ => return "undefined",
+        .bigint => |bi| return try val_mod.bigIntToString(arena, bi),
+        .symbol => {
+            _ = try throwTypeErrorStr(arena, "Cannot convert a Symbol value to a string");
+            unreachable;
+        },
+        .object => {
+            const prim = (try coercion_mod.toPrimitive(arena, v, .string)) orelse return "[object Object]";
+            if (prim.bits != 0 and prim.unbox() == .object) return "[object Object]";
+            return argToString(arena, prim);
+        },
+        else => return "[object Object]",
+    }
+}
+
+/// ES ToNumber that throws TypeError for Symbol / BigInt (unlike the VM's lenient
+/// toNumberValue which returns NaN). Used by string-method argument coercion.
+fn toNumberChecked(arena: std.mem.Allocator, v: Value) anyerror!f64 {
+    if (v.bits == 0) return std.math.nan(f64);
+    switch (v.unbox()) {
+        .number => |n| return n,
+        .boolean => |b| return if (b) 1 else 0,
+        .null_ => return 0,
+        .undefined_ => return std.math.nan(f64),
+        .string => |s| return val_mod.jsStringToNumber(s),
+        .symbol => {
+            _ = try throwTypeErrorStr(arena, "Cannot convert a Symbol value to a number");
+            unreachable;
+        },
+        .bigint => {
+            _ = try throwTypeErrorStr(arena, "Cannot convert a BigInt value to a number");
+            unreachable;
+        },
+        .object => {
+            const prim = (try coercion_mod.toPrimitive(arena, v, .number)) orelse return std.math.nan(f64);
+            if (prim.bits != 0 and prim.unbox() == .object) return std.math.nan(f64);
+            return toNumberChecked(arena, prim);
+        },
+        else => return std.math.nan(f64),
+    }
+}
+
+/// ES ToIntegerOrInfinity: ToNumber then NaN → 0, ±Infinity preserved, else trunc.
+fn argToInteger(arena: std.mem.Allocator, v: Value) anyerror!f64 {
+    const n = try toNumberChecked(arena, v);
+    if (std.math.isNan(n)) return 0;
+    if (std.math.isInf(n)) return n;
+    return std.math.trunc(n);
+}
+
+/// Clamp an ES ToIntegerOrInfinity result to a byte offset in [0, len].
+fn clampToLen(pos: f64, len: usize) usize {
+    if (pos <= 0) return 0;
+    const flen: f64 = @floatFromInt(len);
+    if (pos >= flen) return len;
+    return @intFromFloat(pos);
+}
+
+/// ES RequireObjectCoercible: TypeError for null / undefined receivers.
+fn requireObjectCoercible(arena: std.mem.Allocator, v: Value) anyerror!void {
+    if (v.bits == 0) {
+        _ = try throwTypeErrorStr(arena, "String.prototype method called on null or undefined");
+        unreachable;
+    }
+    switch (v.unbox()) {
+        .undefined_, .null_ => {
+            _ = try throwTypeErrorStr(arena, "String.prototype method called on null or undefined");
+            unreachable;
+        },
+        else => {},
+    }
+}
+
+/// ES GetMethod(v, symKey): returns the callable method, null when the property
+/// is undefined/null (or `v` is a primitive with no such symbol), throws when it
+/// is present but not callable.
+fn getSymMethodOf(arena: std.mem.Allocator, v: Value, sym: Value) anyerror!?Value {
+    if (v.bits == 0 or v.unbox() != .object) return null;
+    const m = v.toPtr().object.getSym(sym) orelse return null;
+    if (m.bits == 0) return null;
+    switch (m.unbox()) {
+        .undefined_, .null_ => return null,
+        else => {},
+    }
+    if (!isCallable(m)) {
+        _ = try throwTypeErrorStr(arena, "value is not a function");
+        unreachable;
+    }
+    return m;
+}
+
+/// RegExpCreate(pattern, flags) for the String-method fallback path: compiles a
+/// RegExp from `pattern_val` (undefined/null → empty pattern) with the given flags.
+fn makeRegExpFor(arena: std.mem.Allocator, pattern_val: Value, flags: []const u8) anyerror!Value {
+    // RegExpInitialize: undefined pattern → ""; every other value (incl. null) is
+    // ToString-coerced ("null", "123", …).
+    var pat: []const u8 = "";
+    const is_undef = pattern_val.bits == 0 or pattern_val.unbox() == .undefined_;
+    if (!is_undef) pat = try argToString(arena, pattern_val);
+    const cr = try arena.create(regexp_mod.CompiledRegex);
+    cr.* = regexp_mod.compileRegex(arena, pat, flags) catch {
+        const JsObject = @import("../../object/object.zig").JsObject;
+        const eo = try JsObject.create(arena, realm_mod.error_proto_SyntaxError);
+        try eo.set("name", try val_mod.makeString(arena, "SyntaxError"));
+        try eo.set("message", try val_mod.makeString(arena, "Invalid regular expression"));
+        realm_mod.pending_exception = try val_mod.makeObject(arena, eo);
+        return error.JsException;
+    };
+    return regexp_mod.makeRegExpObject(arena, cr, pat, flags);
+}
+
+/// ES Invoke(rx, symKey, [arg]): look the symbol method up on `rx` (honoring any
+/// user override of RegExp.prototype[@@match/@@search/@@matchAll]) and call it.
+fn invokeRegExpSym(arena: std.mem.Allocator, rx: Value, sym: Value, arg: Value) anyerror!Value {
+    const m = (try getSymMethodOf(arena, rx, sym)) orelse {
+        _ = try throwTypeErrorStr(arena, "RegExp method is not callable");
+        unreachable;
+    };
+    return function_proto_mod.invokeCallback(arena, rx, m, &[_]Value{arg});
+}
+
+/// True for any code point in the ES WhiteSpace or LineTerminator production
+/// (used by trim / trimStart / trimEnd). Covers the Unicode Zs category plus
+/// TAB/LF/VT/FF/CR/LS/PS and the ZWNBSP (BOM, U+FEFF).
+fn isStrWhiteSpace(cp: u21) bool {
+    return switch (cp) {
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF => true,
+        0x2000...0x200A => true,
+        else => false,
+    };
+}
+
+/// Compute trimmed byte bounds [start, end) over the WTF-8 string `s`.
+fn trimBounds(s: []const u8, left: bool, right: bool) struct { start: usize, end: usize } {
+    var start: usize = 0;
+    if (left) {
+        while (start < s.len) {
+            const dec = decodeWtf8At(s, start);
+            if (!isStrWhiteSpace(dec.cp)) break;
+            start += dec.len;
+        }
+    }
+    var end: usize = s.len;
+    if (right) {
+        var i: usize = start;
+        var last_end: usize = start;
+        while (i < s.len) {
+            const dec = decodeWtf8At(s, i);
+            i += dec.len;
+            if (!isStrWhiteSpace(dec.cp)) last_end = i;
+        }
+        end = last_end;
+    }
+    return .{ .start = start, .end = end };
+}
+
 /// Normalize a (possibly negative) index for string of given length.
 /// Returns clamped usize in [0, len].
 fn normalizeIndex(idx: f64, len: usize) usize {
@@ -69,13 +234,7 @@ fn normalizeIndex(idx: f64, len: usize) usize {
 
 pub fn nativeCharAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const idx: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
-    else
-        0.0;
+    const idx: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     const i: usize = if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeString(arena, "") else @intCast(val_mod.f64ToI64Sat(idx));
     if (i >= s.len) return val_mod.makeString(arena, "");
     const ch = try arena.dupe(u8, s[i .. i + 1]);
@@ -84,13 +243,7 @@ pub fn nativeCharAt(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
 pub fn nativeCharCodeAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const idx: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
-    else
-        0.0;
+    const idx: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     const i: usize = if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeNumber(arena, std.math.nan(f64)) else @intCast(val_mod.f64ToI64Sat(idx));
     if (i >= s.len) return val_mod.makeNumber(arena, std.math.nan(f64));
     return val_mod.makeNumber(arena, @floatFromInt(s[i]));
@@ -123,13 +276,7 @@ pub fn decodeWtf8At(s: []const u8, i: usize) struct { cp: u21, len: usize } {
 /// charCodeAt). Returns undefined when `pos` is out of range.
 pub fn nativeCodePointAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const idx: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
-    else
-        0.0;
+    const idx: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeUndefined(arena);
     const i: usize = @intCast(val_mod.f64ToI64Sat(idx));
     if (i >= s.len) return val_mod.makeUndefined(arena);
@@ -139,28 +286,13 @@ pub fn nativeCodePointAt(arena: std.mem.Allocator, this_val: Value, args: []cons
 
 pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    if (args.len == 0) return val_mod.makeNumber(arena, -1.0);
-    const search: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
-        args[0].toPtr().string
-    else
-        return val_mod.makeNumber(arena, -1.0);
-
-    const from: usize = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].unbox()) {
-            .number => |n| blk: {
-                if (n < 0.0) break :blk 0;
-                if (std.math.isNan(n)) break :blk 0;
-                const u: usize = @intCast(val_mod.f64ToI64Sat(n));
-                break :blk if (u > s.len) s.len else u;
-            },
-            else => 0,
-        }
-    else
-        0;
+    const search = try argToString(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
+    const pos: f64 = if (args.len > 1) try argToInteger(arena, args[1]) else 0;
+    const from = clampToLen(pos, s.len);
 
     if (from >= s.len and search.len > 0) return val_mod.makeNumber(arena, -1.0);
-    if (std.mem.indexOf(u8, s[from..], search)) |pos| {
-        return val_mod.makeNumber(arena, @floatFromInt(pos + from));
+    if (std.mem.indexOf(u8, s[from..], search)) |p| {
+        return val_mod.makeNumber(arena, @floatFromInt(p + from));
     }
     return val_mod.makeNumber(arena, -1.0);
 }
@@ -169,19 +301,9 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const s = try coerceThis(arena, this_val);
     const len = s.len;
 
-    const start_raw: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
-    else
-        0.0;
-    const end_raw: f64 = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].unbox()) {
-            .number => |n| n,
-            .undefined_ => @floatFromInt(len),
-            else => @floatFromInt(len),
-        }
+    const start_raw: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
+    const end_raw: f64 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        try argToInteger(arena, args[1])
     else
         @floatFromInt(len);
 
@@ -217,51 +339,47 @@ fn toUint32(n: f64) u32 {
 }
 
 pub fn nativeSplit(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const s = try coerceThis(arena, this_val);
+    try requireObjectCoercible(arena, this_val);
     const JsObject = @import("../../object/object.zig").JsObject;
+    const arr_proto: ?*JsObject = realm_mod.active_array_proto;
 
-    const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
+    const separator = if (args.len > 0) args[0] else Value{ .bits = 0 };
+    const limit_arg = if (args.len > 1) args[1] else Value{ .bits = 0 };
 
-    // ES 22.1.3.23 step 6/8: lim = ToUint32(limit); undefined → 2^32-1.
-    const lim: u32 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
-        toUint32(try realm_mod.toNumberValue(arena, args[1]))
+    // @@split dispatch (RegExp separators and custom splitters). Step 2.
+    if (realm_mod.active_sym_split) |sym| {
+        if (try getSymMethodOf(arena, separator, sym)) |m| {
+            return function_proto_mod.invokeCallback(arena, separator, m, &[_]Value{ this_val, limit_arg });
+        }
+    }
+
+    const s = try coerceThis(arena, this_val); // step 3: S = ToString(O)
+
+    // step 4: lim = ToUint32(limit); undefined → 2^32-1.
+    const lim: u32 = if (limit_arg.bits != 0 and limit_arg.unbox() != .undefined_)
+        toUint32(try toNumberChecked(arena, limit_arg))
     else
         0xFFFF_FFFF;
 
-    // A zero limit produces an empty array before the separator is even examined.
+    const sep_undefined = separator.bits == 0 or separator.unbox() == .undefined_;
+    // step 5: R = ToString(separator) — runs (and can throw) before the lim==0 test.
+    const sep_s: []const u8 = if (sep_undefined) "" else try argToString(arena, separator);
+
+    // step 6: a zero limit yields [] regardless of separator.
     if (lim == 0) {
         const empty = try JsObject.createArray(arena, arr_proto);
         empty.array_length = 0;
         return val_mod.makeObject(arena, empty);
     }
 
-    // RegExp separator: delegate (limit-aware).
-    if (args.len > 0 and args[0].bits != 0) {
-        if (regexp_mod.getCompiledRegex(args[0])) |cr| {
-            return splitByRegex(arena, s, cr, arr_proto, lim);
-        }
-    }
-
-    // Separator
-    const sep: ?[]const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .string => |sep_s| sep_s,
-            .undefined_ => null,
-            else => null,
-        }
-    else
-        null;
-
     const arr = try JsObject.createArray(arena, arr_proto);
 
-    if (sep == null) {
-        // Undefined separator: the whole string is the single element.
+    // step 7: undefined separator → the whole string is the single element.
+    if (sep_undefined) {
         try arr.set("0", try val_mod.makeString(arena, s));
         arr.array_length = 1;
         return val_mod.makeObject(arena, arr);
     }
-
-    const sep_s = sep.?;
 
     // Empty source string: [""] unless the separator also matches empty ("") → [].
     if (s.len == 0) {
@@ -383,48 +501,17 @@ fn splitByRegex(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mod.C
 
 /// String.prototype.match(re|str)
 pub fn nativeMatch(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const s = try coerceThis(arena, this_val);
-    if (args.len == 0) return val_mod.makeNull(arena);
-
-    const arg = args[0];
-    // Coerce string to RegExp
-    const cr_opt: ?*regexp_mod.CompiledRegex = regexp_mod.getCompiledRegex(arg);
-    if (cr_opt == null) {
-        // String argument: treat as pattern
-        const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
-        const cr_arena = try arena.create(regexp_mod.CompiledRegex);
-        cr_arena.* = regexp_mod.compileRegex(arena, pat, "") catch return val_mod.makeNull(arena);
-        return doExec(arena, s, cr_arena);
-    }
-    const cr = cr_opt.?;
-
-    if (!cr.flags.global) {
-        // Non-global: return exec result
-        return doExec(arena, s, cr);
-    }
-
-    // Global: return array of all match strings
-    const JsObject = @import("../../object/object.zig").JsObject;
-    const arr_proto = realm_mod.active_array_proto;
-    const arr = try JsObject.createArray(arena, arr_proto);
-    var idx: u32 = 0;
-    var pos: usize = 0;
-    while (pos <= s.len) {
-        const result = regexp_mod.matchAnywhere(cr, s, pos) orelse break;
-        const full = try arena.dupe(u8, s[result.start..result.state.pos]);
-        const fv = try val_mod.makeString(arena, full);
-        const key = try std.fmt.allocPrint(arena, "{d}", .{idx});
-        try arr.set(key, fv);
-        idx += 1;
-        if (result.state.pos == result.start) {
-            pos = result.start + 1; // prevent infinite loop on zero-width match
-        } else {
-            pos = result.state.pos;
+    try requireObjectCoercible(arena, this_val);
+    const regexp = if (args.len > 0) args[0] else Value{ .bits = 0 };
+    if (realm_mod.active_sym_match) |sym| {
+        if (try getSymMethodOf(arena, regexp, sym)) |m| {
+            return function_proto_mod.invokeCallback(arena, regexp, m, &[_]Value{this_val});
         }
     }
-    if (idx == 0) return val_mod.makeNull(arena);
-    arr.array_length = idx;
-    return val_mod.makeObject(arena, arr);
+    const s = try coerceThis(arena, this_val);
+    const s_val = try val_mod.makeString(arena, try arena.dupe(u8, s));
+    const rx = try makeRegExpFor(arena, regexp, "");
+    return invokeRegExpSym(arena, rx, realm_mod.active_sym_match.?, s_val);
 }
 
 fn doExec(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mod.CompiledRegex) !Value {
@@ -459,22 +546,59 @@ fn doExec(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mod.Compile
 
 /// String.prototype.search(re|str) -> index or -1
 pub fn nativeSearch(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const s = try coerceThis(arena, this_val);
-    if (args.len == 0) return val_mod.makeNumber(arena, 0.0);
-
-    const arg = args[0];
-    const cr: regexp_mod.CompiledRegex = blk: {
-        if (regexp_mod.getCompiledRegex(arg)) |cr_ptr| {
-            break :blk cr_ptr.*;
+    try requireObjectCoercible(arena, this_val);
+    const regexp = if (args.len > 0) args[0] else Value{ .bits = 0 };
+    if (realm_mod.active_sym_search) |sym| {
+        if (try getSymMethodOf(arena, regexp, sym)) |m| {
+            return function_proto_mod.invokeCallback(arena, regexp, m, &[_]Value{this_val});
         }
-        const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
-        break :blk regexp_mod.compileRegex(arena, pat, "") catch return val_mod.makeNumber(arena, -1.0);
-    };
-
-    if (regexp_mod.matchAnywhere(&cr, s, 0)) |result| {
-        return val_mod.makeNumber(arena, @floatFromInt(result.start));
     }
-    return val_mod.makeNumber(arena, -1.0);
+    const s = try coerceThis(arena, this_val);
+    const s_val = try val_mod.makeString(arena, try arena.dupe(u8, s));
+    const rx = try makeRegExpFor(arena, regexp, "");
+    return invokeRegExpSym(arena, rx, realm_mod.active_sym_search.?, s_val);
+}
+
+/// String.prototype.matchAll(regexp) — ES2020. Dispatches to @@matchAll; when
+/// `regexp` is a global RegExp requires the "g" flag, else creates a global one.
+pub fn nativeMatchAll(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    try requireObjectCoercible(arena, this_val);
+    const regexp = if (args.len > 0) args[0] else Value{ .bits = 0 };
+    const is_nullish = regexp.bits == 0 or switch (regexp.unbox()) {
+        .undefined_, .null_ => true,
+        else => false,
+    };
+    if (!is_nullish) {
+        // If regexp is a RegExp, read its `flags` property and require "g"
+        // (spec step 3.a-c: RequireObjectCoercible(flags) then check for 'g').
+        if (regexp_mod.getCompiledRegex(regexp) != null) {
+            const flags_val = if (realm_mod.active_context) |ctx|
+                try ctx.getProp(arena, regexp, "flags")
+            else
+                Value{ .bits = 0 };
+            if (flags_val.bits == 0 or switch (flags_val.unbox()) {
+                .undefined_, .null_ => true,
+                else => false,
+            }) {
+                _ = try throwTypeErrorStr(arena, "RegExp flags is undefined or null");
+                unreachable;
+            }
+            const flags_str = try argToString(arena, flags_val);
+            if (std.mem.indexOfScalar(u8, flags_str, 'g') == null) {
+                _ = try throwTypeErrorStr(arena, "String.prototype.matchAll called with a non-global RegExp argument");
+                unreachable;
+            }
+        }
+        if (realm_mod.active_sym_match_all) |sym| {
+            if (try getSymMethodOf(arena, regexp, sym)) |m| {
+                return function_proto_mod.invokeCallback(arena, regexp, m, &[_]Value{this_val});
+            }
+        }
+    }
+    const s = try coerceThis(arena, this_val);
+    const s_val = try val_mod.makeString(arena, try arena.dupe(u8, s));
+    const rx = try makeRegExpFor(arena, regexp, "g");
+    return invokeRegExpSym(arena, rx, realm_mod.active_sym_match_all.?, s_val);
 }
 
 /// Return true if a Value is callable (function, bc_function, native_function, bound_function).
@@ -487,160 +611,114 @@ fn isCallable(v: Value) bool {
     };
 }
 
-/// String.prototype.replace(re|str, replStr|fn)
+/// String.prototype.replace(searchValue, replaceValue) — ES 22.1.3.18.
 pub fn nativeReplace(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    try requireObjectCoercible(arena, this_val);
+    const search = if (args.len > 0) args[0] else Value{ .bits = 0 };
+    const repl_arg = if (args.len > 1) args[1] else Value{ .bits = 0 };
+
+    // @@replace dispatch (handles RegExp searchValue and custom replacers).
+    if (realm_mod.active_sym_replace) |sym| {
+        if (try getSymMethodOf(arena, search, sym)) |m| {
+            return function_proto_mod.invokeCallback(arena, search, m, &[_]Value{ this_val, repl_arg });
+        }
+    }
+
     const s = try coerceThis(arena, this_val);
-    if (args.len < 2) return val_mod.makeString(arena, s);
+    const pat = try argToString(arena, search);
+    const functional = isCallable(repl_arg);
+    const repl_str: []const u8 = if (functional) "" else try argToString(arena, repl_arg);
 
-    const repl_arg = args[1];
-    const arg = args[0];
+    const idx = std.mem.indexOf(u8, s, pat) orelse return val_mod.makeString(arena, try arena.dupe(u8, s));
+    const match_str = s[idx .. idx + pat.len];
+    const expanded: []const u8 = if (functional) blk: {
+        const undefined_val = try val_mod.makeUndefined(arena);
+        const cb_args = [_]Value{
+            try val_mod.makeString(arena, match_str),
+            try val_mod.makeNumber(arena, @floatFromInt(idx)),
+            try val_mod.makeString(arena, s),
+        };
+        const rv = try function_proto_mod.invokeCallback(arena, undefined_val, repl_arg, &cb_args);
+        break :blk try argToString(arena, rv);
+    } else try applyReplacement(arena, repl_str, match_str, s, idx, &[_][]const u8{});
 
-    // Phase 4d: if second arg is callable, use callback path.
-    if (isCallable(repl_arg)) {
-        if (regexp_mod.getCompiledRegex(arg)) |cr| {
-            return doReplaceWithFn(arena, s, cr, repl_arg);
-        }
-        // String pattern with callback: replace first occurrence only.
-        const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
-        if (std.mem.indexOf(u8, s, pat)) |idx| {
-            const match_str = s[idx .. idx + pat.len];
-            const undefined_val = try val_mod.makeUndefined(arena);
-            const match_val = try val_mod.makeString(arena, match_str);
-            const offset_val = try val_mod.makeNumber(arena, @floatFromInt(idx));
-            const source_val = try val_mod.makeString(arena, s);
-            const cb_args = [_]Value{ match_val, offset_val, source_val };
-            const repl_val = function_proto_mod.invokeCallback(arena, undefined_val, repl_arg, &cb_args) catch |e| {
-                if (e == error.JsException) return error.JsException;
-                return error.OutOfMemory;
-            };
-            const repl_s: []const u8 = try argToStr(arena, repl_val);
-            const result = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ s[0..idx], repl_s, s[idx + pat.len ..] });
-            return val_mod.makeString(arena, result);
-        }
-        return val_mod.makeString(arena, try arena.dupe(u8, s));
-    }
-
-    const repl_str: []const u8 = if (repl_arg.bits != 0 and repl_arg.unbox() == .string)
-        repl_arg.toPtr().string
-    else
-        "undefined";
-
-    // Check if it's a RegExp
-    if (regexp_mod.getCompiledRegex(arg)) |cr| {
-        return doReplace(arena, s, cr, repl_str);
-    }
-
-    // String pattern: replace first occurrence
-    const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
-    if (std.mem.indexOf(u8, s, pat)) |idx| {
-        const before = s[0..idx];
-        const after = s[idx + pat.len..];
-        const expanded = try applyReplacement(arena, repl_str, s[idx..idx + pat.len], s, idx, &[_][]const u8{});
-        const result = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ before, expanded, after });
-        return val_mod.makeString(arena, result);
-    }
-    return val_mod.makeString(arena, try arena.dupe(u8, s));
+    const result = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ s[0..idx], expanded, s[idx + pat.len ..] });
+    return val_mod.makeString(arena, result);
 }
 
-/// ES2021 String.prototype.replaceAll — all occurrences (string or global RegExp).
+/// ES2021 String.prototype.replaceAll(searchValue, replaceValue) — 22.1.3.19.
 pub fn nativeReplaceAll(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const s = try coerceThis(arena, this_val);
-    if (args.len < 2) return val_mod.makeString(arena, s);
+    try requireObjectCoercible(arena, this_val);
+    const search = if (args.len > 0) args[0] else Value{ .bits = 0 };
+    const repl_arg = if (args.len > 1) args[1] else Value{ .bits = 0 };
 
-    const repl_arg = args[1];
-    const arg = args[0];
-
-    if (isCallable(repl_arg)) {
-        if (regexp_mod.getCompiledRegex(arg)) |cr| {
-            if (!cr.flags.global) {
-                realm_mod.pending_exception = try val_mod.makeString(arena, "TypeError: replaceAll must be called with a global RegExp");
-                return error.JsException;
+    const is_nullish = search.bits == 0 or switch (search.unbox()) {
+        .undefined_, .null_ => true,
+        else => false,
+    };
+    if (!is_nullish) {
+        // If searchValue is a RegExp it must carry the "g" flag (read the
+        // `flags` property so overrides / abrupt getters are observed).
+        if (regexp_mod.getCompiledRegex(search) != null) {
+            const flags_val = if (realm_mod.active_context) |ctx|
+                try ctx.getProp(arena, search, "flags")
+            else
+                Value{ .bits = 0 };
+            if (flags_val.bits == 0 or switch (flags_val.unbox()) {
+                .undefined_, .null_ => true,
+                else => false,
+            }) {
+                _ = try throwTypeErrorStr(arena, "RegExp flags is undefined or null");
+                unreachable;
             }
-            return doReplaceWithFn(arena, s, cr, repl_arg);
+            const flags_str = try argToString(arena, flags_val);
+            if (std.mem.indexOfScalar(u8, flags_str, 'g') == null) {
+                _ = try throwTypeErrorStr(arena, "String.prototype.replaceAll called with a non-global RegExp argument");
+                unreachable;
+            }
         }
-        const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
-        return replaceAllStringWithFn(arena, s, pat, repl_arg);
+        if (realm_mod.active_sym_replace) |sym| {
+            if (try getSymMethodOf(arena, search, sym)) |m| {
+                return function_proto_mod.invokeCallback(arena, search, m, &[_]Value{ this_val, repl_arg });
+            }
+        }
     }
 
-    const repl_str: []const u8 = if (repl_arg.bits != 0 and repl_arg.unbox() == .string)
-        repl_arg.toPtr().string
-    else
-        "undefined";
-
-    if (regexp_mod.getCompiledRegex(arg)) |cr| {
-        if (!cr.flags.global) {
-            realm_mod.pending_exception = try val_mod.makeString(arena, "TypeError: replaceAll must be called with a global RegExp");
-            return error.JsException;
-        }
-        return doReplace(arena, s, cr, repl_str);
-    }
-
-    const pat: []const u8 = if (arg.bits != 0 and arg.unbox() == .string) arg.toPtr().string else "";
-    return replaceAllString(arena, s, pat, repl_str);
+    const s = try coerceThis(arena, this_val);
+    const pat = try argToString(arena, search);
+    const functional = isCallable(repl_arg);
+    const repl_str: []const u8 = if (functional) "" else try argToString(arena, repl_arg);
+    return replaceAllString(arena, s, pat, repl_str, if (functional) repl_arg else null);
 }
 
-fn replaceAllString(arena: std.mem.Allocator, s: []const u8, pat: []const u8, repl: []const u8) !Value {
-    if (pat.len == 0) {
-        var result = std.ArrayList(u8){};
-        var i: usize = 0;
-        while (i <= s.len) : (i += 1) {
-            if (i > 0) try result.appendSlice(arena, s[i - 1 .. i]);
-            try result.appendSlice(arena, repl);
-        }
-        return val_mod.makeString(arena, try arena.dupe(u8, result.items));
-    }
-    var result = std.ArrayList(u8){};
-    var pos: usize = 0;
-    while (pos <= s.len) {
-        const idx = std.mem.indexOf(u8, s[pos..], pat) orelse break;
-        const abs = pos + idx;
-        try result.appendSlice(arena, s[pos..abs]);
-        try result.appendSlice(arena, repl);
-        pos = abs + pat.len;
-    }
-    try result.appendSlice(arena, s[pos..]);
-    return val_mod.makeString(arena, try arena.dupe(u8, result.items));
-}
-
-fn replaceAllStringWithFn(arena: std.mem.Allocator, s: []const u8, pat: []const u8, fn_val: Value) !Value {
+/// Replace every occurrence of `pat` in `s`. When `fn_val` is non-null the match
+/// is passed to it and its ToString result is substituted; otherwise `repl` is
+/// applied with GetSubstitution ($-pattern) expansion.
+fn replaceAllString(arena: std.mem.Allocator, s: []const u8, pat: []const u8, repl: []const u8, fn_val: ?Value) !Value {
     const undefined_val = try val_mod.makeUndefined(arena);
-    if (pat.len == 0) {
-        var result = std.ArrayList(u8){};
-        var pos: usize = 0;
-        while (pos <= s.len) {
-            const match_str = if (pos < s.len) s[pos .. pos + 1] else "";
-            const match_val = try val_mod.makeString(arena, match_str);
-            const offset_val = try val_mod.makeNumber(arena, @floatFromInt(pos));
-            const source_val = try val_mod.makeString(arena, s);
-            const cb_args = [_]Value{ match_val, offset_val, source_val };
-            const repl_val = function_proto_mod.invokeCallback(arena, undefined_val, fn_val, &cb_args) catch |e| {
-                if (e == error.JsException) return error.JsException;
-                return error.OutOfMemory;
-            };
-            const repl_s: []const u8 = try argToStr(arena, repl_val);
-            try result.appendSlice(arena, repl_s);
-            if (pos < s.len) pos += 1 else break;
-        }
-        return val_mod.makeString(arena, try arena.dupe(u8, result.items));
-    }
     var result = std.ArrayList(u8){};
+    // Advance by 1 byte on an empty pattern so we visit every position once.
+    const step: usize = if (pat.len == 0) 1 else pat.len;
     var pos: usize = 0;
-    while (pos <= s.len) {
-        const idx = std.mem.indexOf(u8, s[pos..], pat) orelse break;
-        const abs = pos + idx;
+    var search_from: usize = 0;
+    while (search_from <= s.len) {
+        const rel = std.mem.indexOf(u8, s[search_from..], pat) orelse break;
+        const abs = search_from + rel;
         try result.appendSlice(arena, s[pos..abs]);
         const match_str = s[abs .. abs + pat.len];
-        const match_val = try val_mod.makeString(arena, match_str);
-        const offset_val = try val_mod.makeNumber(arena, @floatFromInt(abs));
-        const source_val = try val_mod.makeString(arena, s);
-        const cb_args = [_]Value{ match_val, offset_val, source_val };
-        const repl_val = function_proto_mod.invokeCallback(arena, undefined_val, fn_val, &cb_args) catch |e| {
-            if (e == error.JsException) return error.JsException;
-            return error.OutOfMemory;
-        };
-        const repl_s: []const u8 = try argToStr(arena, repl_val);
-        try result.appendSlice(arena, repl_s);
+        if (fn_val) |fv| {
+            const cb_args = [_]Value{
+                try val_mod.makeString(arena, match_str),
+                try val_mod.makeNumber(arena, @floatFromInt(abs)),
+                try val_mod.makeString(arena, s),
+            };
+            const rv = try function_proto_mod.invokeCallback(arena, undefined_val, fv, &cb_args);
+            try result.appendSlice(arena, try argToString(arena, rv));
+        } else {
+            try result.appendSlice(arena, try applyReplacement(arena, repl, match_str, s, abs, &[_][]const u8{}));
+        }
         pos = abs + pat.len;
+        search_from = abs + step;
     }
     try result.appendSlice(arena, s[pos..]);
     return val_mod.makeString(arena, try arena.dupe(u8, result.items));
@@ -724,7 +802,7 @@ fn doReplace(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mod.Comp
             }
         }
         // Apply replacement
-        const expanded = try applyReplacement(arena, repl_str, full_match, s, m.start, caps[0..]);
+        const expanded = try applyReplacement(arena, repl_str, full_match, s, m.start, caps[0 .. cr.num_captures + 1]);
         try result.appendSlice(arena, expanded);
 
         if (m.state.pos == m.start) {
@@ -756,8 +834,7 @@ fn applyReplacement(
     match_start: usize,
     caps: []const []const u8,
 ) ![]const u8 {
-    _ = input;
-    _ = match_start;
+    const match_end = match_start + full_match.len;
     var out = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < repl.len) {
@@ -769,26 +846,42 @@ fn applyReplacement(
                     i += 2;
                     continue;
                 },
+                '`' => {
+                    try out.appendSlice(arena, input[0..match_start]);
+                    i += 2;
+                    continue;
+                },
+                '\'' => {
+                    try out.appendSlice(arena, input[match_end..]);
+                    i += 2;
+                    continue;
+                },
                 '$' => {
                     try out.append(arena, '$');
                     i += 2;
                     continue;
                 },
                 '1'...'9' => {
+                    // `caps` holds groups at indices 1..=(caps.len-1); an out-of-range
+                    // reference is emitted literally ("$1" stays "$1").
                     const n: usize = next - '0';
-                    // Check for two-digit $NN
+                    // Prefer a valid two-digit $NN.
                     if (i + 2 < repl.len and repl[i + 2] >= '0' and repl[i + 2] <= '9') {
                         const nn: usize = n * 10 + (repl[i + 2] - '0');
-                        if (nn < caps.len and caps[nn].len > 0) {
+                        if (nn >= 1 and nn < caps.len) {
                             try out.appendSlice(arena, caps[nn]);
                             i += 3;
                             continue;
                         }
                     }
-                    if (n < caps.len and caps[n].len > 0) {
+                    if (n >= 1 and n < caps.len) {
                         try out.appendSlice(arena, caps[n]);
+                        i += 2;
+                        continue;
                     }
-                    i += 2;
+                    // Invalid group: keep the '$' literal, advance one char.
+                    try out.append(arena, '$');
+                    i += 1;
                     continue;
                 },
                 else => {},
@@ -805,21 +898,7 @@ pub fn nativeConcat(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var buf = std.ArrayList(u8){};
     try buf.appendSlice(arena, s);
     for (args) |a| {
-        if (a.bits != 0) {
-            switch (a.unbox()) {
-                .string => |ss| try buf.appendSlice(arena, ss),
-                .number => |n| {
-                    const ns = try formatNumber(arena, n);
-                    try buf.appendSlice(arena, ns);
-                },
-                .boolean => |b| try buf.appendSlice(arena, if (b) "true" else "false"),
-                .null_ => try buf.appendSlice(arena, "null"),
-                .undefined_ => try buf.appendSlice(arena, "undefined"),
-                else => try buf.appendSlice(arena, "[object Object]"),
-            }
-        } else {
-            try buf.appendSlice(arena, "undefined");
-        }
+        try buf.appendSlice(arena, try argToString(arena, a));
     }
     return val_mod.makeString(arena, buf.items);
 }
@@ -855,8 +934,8 @@ fn rejectRegExp(arena: std.mem.Allocator, a: Value) !void {
 pub fn nativeStartsWith(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
     if (args.len > 0) try rejectRegExp(arena, args[0]);
-    const search = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
-    const pos: usize = if (args.len > 1) normalizeIndex(toNum(args[1]), s.len) else 0;
+    const search = try argToString(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
+    const pos = if (args.len > 1) clampToLen(try argToInteger(arena, args[1]), s.len) else 0;
     if (pos + search.len > s.len) return val_mod.makeBool(arena, false);
     return val_mod.makeBool(arena, std.mem.eql(u8, s[pos .. pos + search.len], search));
 }
@@ -865,9 +944,9 @@ pub fn nativeStartsWith(arena: std.mem.Allocator, this_val: Value, args: []const
 pub fn nativeEndsWith(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
     if (args.len > 0) try rejectRegExp(arena, args[0]);
-    const search = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    const search = try argToString(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
     const end_: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
-        normalizeIndex(toNum(args[1]), s.len)
+        clampToLen(try argToInteger(arena, args[1]), s.len)
     else
         s.len;
     if (search.len > end_) return val_mod.makeBool(arena, false);
@@ -878,8 +957,8 @@ pub fn nativeEndsWith(arena: std.mem.Allocator, this_val: Value, args: []const V
 pub fn nativeStringIncludes(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
     if (args.len > 0) try rejectRegExp(arena, args[0]);
-    const search = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
-    const pos: usize = if (args.len > 1) normalizeIndex(toNum(args[1]), s.len) else 0;
+    const search = try argToString(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
+    const pos = if (args.len > 1) clampToLen(try argToInteger(arena, args[1]), s.len) else 0;
     if (pos > s.len) return val_mod.makeBool(arena, false);
     return val_mod.makeBool(arena, std.mem.indexOf(u8, s[pos..], search) != null);
 }
@@ -895,22 +974,22 @@ fn toNum(a: Value) f64 {
 
 pub fn nativeTrim(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const trimmed = std.mem.trim(u8, s, " \t\n\r");
-    return val_mod.makeString(arena, try arena.dupe(u8, trimmed));
+    const b = trimBounds(s, true, true);
+    return val_mod.makeString(arena, try arena.dupe(u8, s[b.start..b.end]));
 }
 
 /// ES2019 String.prototype.trimStart.
 pub fn nativeTrimStart(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const trimmed = std.mem.trimLeft(u8, s, " \t\n\r");
-    return val_mod.makeString(arena, try arena.dupe(u8, trimmed));
+    const b = trimBounds(s, true, false);
+    return val_mod.makeString(arena, try arena.dupe(u8, s[b.start..b.end]));
 }
 
 /// ES2019 String.prototype.trimEnd.
 pub fn nativeTrimEnd(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const trimmed = std.mem.trimRight(u8, s, " \t\n\r");
-    return val_mod.makeString(arena, try arena.dupe(u8, trimmed));
+    const b = trimBounds(s, false, true);
+    return val_mod.makeString(arena, try arena.dupe(u8, s[b.start..b.end]));
 }
 
 fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
@@ -929,16 +1008,11 @@ fn buildFiller(arena: std.mem.Allocator, pad: []const u8, count: usize) ![]const
 
 fn padImpl(arena: std.mem.Allocator, this_val: Value, args: []const Value, at_start: bool) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const target: usize = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| if (n <= 0 or std.math.isNan(n)) 0 else @intCast(val_mod.f64ToI64Sat(n)),
-            else => 0,
-        }
-    else
-        0;
+    const max_len = if (args.len > 0) try argToInteger(arena, args[0]) else 0;
+    const target: usize = if (max_len <= 0) 0 else @intCast(val_mod.f64ToI64Sat(max_len));
     if (target <= s.len) return val_mod.makeString(arena, s);
-    const pad: []const u8 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .string)
-        args[1].toPtr().string
+    const pad: []const u8 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        try argToString(arena, args[1])
     else
         " ";
     if (pad.len == 0) return val_mod.makeString(arena, s);
@@ -997,25 +1071,25 @@ fn htmlWrap(
 
 pub fn nativeAnchor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const name = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    const name = if (args.len > 0) try argToString(arena, args[0]) else "undefined";
     return htmlWrap(arena, s, "a", "name", name);
 }
 
 pub fn nativeLink(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const url = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    const url = if (args.len > 0) try argToString(arena, args[0]) else "undefined";
     return htmlWrap(arena, s, "a", "href", url);
 }
 
 pub fn nativeFontcolor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const c = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    const c = if (args.len > 0) try argToString(arena, args[0]) else "undefined";
     return htmlWrap(arena, s, "font", "color", c);
 }
 
 pub fn nativeFontsize(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const sz = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
+    const sz = if (args.len > 0) try argToString(arena, args[0]) else "undefined";
     return htmlWrap(arena, s, "font", "size", sz);
 }
 
@@ -1074,20 +1148,11 @@ pub fn nativeSubstring(arena: std.mem.Allocator, this_val: Value, args: []const 
         }
     }.f;
 
-    const a0: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
-    else
-        0.0;
+    const a0: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     const a = clampIdx(a0, len);
 
     const b: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
-        clampIdx(switch (args[1].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }, len)
+        clampIdx(try argToInteger(arena, args[1]), len)
     else
         len;
 
@@ -1101,13 +1166,7 @@ pub fn nativeSubstr(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const s = try coerceThis(arena, this_val);
     const len = s.len;
 
-    const start_f: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
-    else
-        0.0;
+    const start_f: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     const int_start: i64 = if (std.math.isNan(start_f)) 0 else val_mod.f64ToI64Sat(start_f);
 
     const start: usize = if (int_start < 0) blk: {
@@ -1120,10 +1179,7 @@ pub fn nativeSubstr(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
     const size: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
         blk: {
-            const n: f64 = switch (args[1].unbox()) {
-                .number => |nn| nn,
-                else => 0.0,
-            };
+            const n: f64 = try argToInteger(arena, args[1]);
             if (n <= 0.0 or std.math.isNan(n)) break :blk 0;
             const u: usize = @intCast(val_mod.f64ToI64Sat(n));
             const max = len - start;
@@ -1138,13 +1194,7 @@ pub fn nativeSubstr(arena: std.mem.Allocator, this_val: Value, args: []const Val
 /// String.prototype.at(index) — ES2022.
 pub fn nativeStringAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const raw: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
-    else
-        0.0;
+    const raw: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     var k: i64 = if (std.math.isNan(raw)) 0 else val_mod.f64ToI64Sat(raw);
     if (k < 0) k = @as(i64, @intCast(s.len)) + k;
     if (k < 0 or k >= @as(i64, @intCast(s.len))) return val_mod.makeUndefined(arena);
@@ -1155,13 +1205,7 @@ pub fn nativeStringAt(arena: std.mem.Allocator, this_val: Value, args: []const V
 /// String.prototype.repeat(count) — ES2015.
 pub fn nativeRepeat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const n_raw: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
-    else
-        0.0;
+    const n_raw: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
 
     if (n_raw < 0.0 or std.math.isInf(n_raw)) {
         const JsObject = @import("../../object/object.zig").JsObject;
@@ -1185,23 +1229,17 @@ pub fn nativeRepeat(arena: std.mem.Allocator, this_val: Value, args: []const Val
 /// String.prototype.lastIndexOf(searchString, position).
 pub fn nativeLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    if (args.len == 0) return val_mod.makeNumber(arena, -1.0);
+    const search = try argToString(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
 
-    const search = try argToStr(arena, args[0]);
-
-    const pos_limit: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
-        blk: {
-            const n: f64 = switch (args[1].unbox()) {
-                .number => |nn| nn,
-                else => @as(f64, @floatFromInt(s.len)),
-            };
-            if (std.math.isNan(n)) break :blk s.len;
-            if (n < 0.0) break :blk 0;
-            const u: usize = @intCast(val_mod.f64ToI64Sat(n));
-            break :blk if (u > s.len) s.len else u;
+    // position uses ToNumber (not ToIntegerOrInfinity); NaN / undefined → +Infinity.
+    var pos: f64 = std.math.inf(f64);
+    if (args.len > 1) {
+        const num_pos = try toNumberChecked(arena, args[1]);
+        if (!std.math.isNan(num_pos)) {
+            pos = if (std.math.isInf(num_pos)) num_pos else std.math.trunc(num_pos);
         }
-    else
-        s.len;
+    }
+    const pos_limit: usize = clampToLen(pos, s.len);
 
     if (search.len == 0) {
         return val_mod.makeNumber(arena, @floatFromInt(if (pos_limit > s.len) s.len else pos_limit));
