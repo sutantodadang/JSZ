@@ -30,6 +30,12 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try reflect_obj.set("preventExtensions", try val_mod.makeNativeFunctionNamed(arena, nativeReflectPreventExtensions, "preventExtensions", 1));
     try reflect_obj.set("apply", try val_mod.makeNativeFunctionNamed(arena, nativeReflectApply, "apply", 3));
     try reflect_obj.set("construct", try val_mod.makeNativeFunctionNamed(arena, nativeReflectConstruct, "construct", 2));
+    // Reflect[@@toStringTag] = "Reflect" (non-writable/enumerable, configurable),
+    // so Object.prototype.toString.call(Reflect) yields "[object Reflect]".
+    const realm_mod = @import("../realm.zig");
+    if (realm_mod.active_sym_to_string_tag) |symv| {
+        _ = try reflect_obj.defineOwnDataSym(symv, try val_mod.makeString(arena, "Reflect"), .{ .writable = false, .enumerable = false, .configurable = true });
+    }
     try ctx.env.define("Reflect", try val_mod.makeObject(arena, reflect_obj));
 }
 
@@ -46,6 +52,74 @@ fn isSym(v: Value) bool {
     if (v.bits == 0) return false;
     if (!v.isHeapPtr()) return false;
     return v.toPtr().* == .symbol;
+}
+
+/// ToPropertyKey(v): an Object argument is coerced via ToPrimitive(string hint),
+/// invoking user `Symbol.toPrimitive`/`valueOf`/`toString` — any abrupt
+/// completion propagates. A Symbol result stays a Symbol; other primitives are
+/// left as-is (the caller's `keyStr`/`isSym` handles the final ToString). This
+/// is what makes Reflect's `return-abrupt-from-property-key` behavior correct.
+fn toPropertyKey(arena: std.mem.Allocator, v: Value) anyerror!Value {
+    const coercion = @import("coercion.zig");
+    if (v.bits != 0 and v.unbox() == .object) {
+        return (try coercion.toPrimitive(arena, v, .string)) orelse v;
+    }
+    return v;
+}
+
+/// CreateListFromArrayLike(obj) (spec 7.3.18) over String/Symbol/any elements:
+/// `obj` must be an Object, `length` is ToLength(Get(obj,"length")) — the getter
+/// runs and may throw — and each element is read with [[Get]]. Used by
+/// Reflect.apply/construct to unpack the arguments list.
+fn createListFromArrayLike(arena: std.mem.Allocator, obj: Value) anyerror![]Value {
+    if (obj.bits == 0 or !isObj(obj))
+        return throwTypeErrorReflect(arena, "CreateListFromArrayLike called on non-object");
+    const realm_mod = @import("../realm.zig");
+    const len_v = try nativeReflectGet(arena, .{}, &[_]Value{ obj, try val_mod.makeString(arena, "length") });
+    const len = try realm_mod.toLengthValue(arena, len_v);
+    const list = try arena.alloc(Value, len);
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const idx_key = try val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}", .{i}));
+        list[i] = try nativeReflectGet(arena, .{}, &[_]Value{ obj, idx_key });
+    }
+    return list;
+}
+
+/// OrdinarySetWithOwnDescriptor tail for a symbol key whose data write must land
+/// on the Receiver (Receiver ≠ target): create/update the own symbol property on
+/// the Receiver, or fail if it is a non-object / non-writable / accessor / a new
+/// property on a non-extensible Receiver.
+fn ordinarySetSymToReceiver(arena: std.mem.Allocator, receiver: Value, key: Value, value: Value) anyerror!Value {
+    if (!isObj(receiver)) return val_mod.makeBool(arena, false);
+    const robj = receiver.toPtr().object;
+    if (robj.getOwnSymEntry(key)) |sp| {
+        if (sp.attr.is_accessor) return val_mod.makeBool(arena, false);
+        if (!sp.attr.writable) return val_mod.makeBool(arena, false);
+        try robj.setSymAttr(key, value, sp.attr);
+        return val_mod.makeBool(arena, true);
+    }
+    if (!robj.extensible) return val_mod.makeBool(arena, false);
+    try robj.setSym(key, value);
+    return val_mod.makeBool(arena, true);
+}
+
+/// True when `k` is a canonical array index string (no leading zeros).
+fn isArrayIndexKeyR(k: []const u8) bool {
+    if (k.len == 0) return false;
+    if (k.len > 1 and k[0] == '0') return false;
+    for (k) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+/// True when `v` is a primitive (not an Object nor a callable). Reflect's
+/// object-operation methods throw a TypeError for such a target.
+fn isPrimitiveTarget(v: Value) bool {
+    if (v.bits == 0) return true; // undefined
+    return switch (v.unbox()) {
+        .object, .bc_function, .native_function, .function => false,
+        else => true,
+    };
 }
 
 fn keyStr(arena: std.mem.Allocator, v: Value) !?[]const u8 {
@@ -97,12 +171,27 @@ fn makeAccessorHolder(arena: std.mem.Allocator, getter: ?Value, setter: ?Value) 
 // ---------------------------------------------------------------- Reflect.get ---
 
 pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
     if (args.len == 0 or !isObj(args[0])) return val_mod.makeUndefined(arena);
     const target = args[0];
-    const key = if (args.len > 1) args[1] else Value{};
+    const key = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
     const receiver = if (args.len > 2) args[2] else target;
 
     const target_obj = target.toPtr().object;
+
+    // Proxy [[Get]](P, Receiver): dispatch the `get` trap (with the get
+    // invariant), else forward to the proxy target's [[Get]] preserving Receiver.
+    if (target_obj.internal_kind == .proxy) {
+        const handler = proxy_mod.proxyHandler(target_obj) orelse return proxy_mod.throwRevoked(arena);
+        const t = proxy_mod.proxyTarget(target_obj) orelse return proxy_mod.throwRevoked(arena);
+        const pkey = if (isSym(key)) key else try val_mod.makeString(arena, (try keyStr(arena, key)) orelse "undefined");
+        if (try proxy_mod.getTrap(arena, handler, "get")) |trap_fn| {
+            const res = try fp.invokeCallback(arena, handler, trap_fn, &[_]Value{ t, pkey, receiver });
+            try proxy_mod.proxyGetInvariant(arena, t, pkey, res);
+            return res;
+        }
+        return nativeReflectGet(arena, .{}, &[_]Value{ t, pkey, receiver });
+    }
 
     if (isSym(key)) {
         // Proto-chain walk for symbol-keyed property.
@@ -118,6 +207,10 @@ pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value)
     }
 
     const k = (try keyStr(arena, key)) orelse return val_mod.makeUndefined(arena);
+
+    // Array exotic "length" is a synthetic own data property.
+    if (target_obj.is_array and std.mem.eql(u8, k, "length"))
+        return val_mod.makeNumber(arena, @floatFromInt(target_obj.getArrayLength()));
 
     // M15: TypedArray integer-indexed exotic [[Get]]: valid index → element,
     // invalid canonical-numeric (non-integer/-0/OOB/detached) → undefined.
@@ -167,12 +260,29 @@ pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value)
 // ---------------------------------------------------------------- Reflect.set ---
 
 pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
     if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
     const target = args[0];
-    const key = if (args.len > 1) args[1] else Value{};
+    const key = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
     const value = if (args.len > 2) args[2] else Value{};
+    const set_recv = if (args.len > 3) args[3] else target;
 
     const target_obj = target.toPtr().object;
+
+    // Proxy [[Set]](P, V, Receiver): dispatch the `set` trap, else forward to the
+    // proxy target's [[Set]] preserving Receiver (defaults to the proxy itself).
+    if (target_obj.internal_kind == .proxy) {
+        const set_receiver = if (args.len > 3) args[3] else target;
+        const handler = proxy_mod.proxyHandler(target_obj) orelse return proxy_mod.throwRevoked(arena);
+        const t = proxy_mod.proxyTarget(target_obj) orelse return proxy_mod.throwRevoked(arena);
+        if (try proxy_mod.getTrap(arena, handler, "set")) |trap_fn| {
+            const res = try fp.invokeCallback(arena, handler, trap_fn, &[_]Value{ t, key, value, set_receiver });
+            if (!val_mod.toBoolean(res)) return val_mod.makeBool(arena, false);
+            try proxy_mod.proxySetInvariant(arena, t, key, value);
+            return val_mod.makeBool(arena, true);
+        }
+        return nativeReflectSet(arena, .{}, &[_]Value{ t, key, value, set_receiver });
+    }
 
     if (isSym(key)) {
         // M16: Module Namespace exotic [[Set]] always fails for symbol keys too.
@@ -191,9 +301,13 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
                 return val_mod.makeBool(arena, false);
             }
             if (!sp.attr.writable) return val_mod.makeBool(arena, false);
+            // OrdinarySetWithOwnDescriptor: a data write lands on the Receiver.
+            if (set_recv.bits != target.bits) return try ordinarySetSymToReceiver(arena, set_recv, key, value);
             try target_obj.setSymAttr(key, value, sp.attr);
             return val_mod.makeBool(arena, true);
         }
+        // No own property on the target: create on the Receiver.
+        if (set_recv.bits != target.bits) return try ordinarySetSymToReceiver(arena, set_recv, key, value);
         try target_obj.setSym(key, value);
         return val_mod.makeBool(arena, true);
     }
@@ -271,7 +385,9 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
     // prototype and receiver is the instance), consult the receiver's own
     // descriptor. A Module Namespace receiver runs its exotic [[GetOwnProperty]],
     // which throws ReferenceError for an uninitialized (TDZ) export.
-    if (receiver.bits != target.bits and isObj(receiver)) {
+    if (receiver.bits != target.bits) {
+        // CreateDataProperty(Receiver, …) requires an Object Receiver.
+        if (!isObj(receiver)) return val_mod.makeBool(arena, false);
         const robj = receiver.toPtr().object;
         // A TypedArray receiver routes a canonical numeric index through its
         // exotic [[Set]] (TypedArraySetElement): ToNumber/ToBigInt(V) runs its
@@ -315,9 +431,10 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
 // ---------------------------------------------------------------- Reflect.has ---
 
 pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
     if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
     const target_obj = args[0].toPtr().object;
-    const key = if (args.len > 1) args[1] else Value{};
+    const key = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
 
     if (isSym(key)) {
         var depth: usize = 0;
@@ -358,9 +475,9 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
         // [[HasProperty]]: dispatch the `has` trap, else forward to the
         // target's [[HasProperty]] (which walks the target's own chain).
         if (o.internal_kind == .proxy) {
-            const handler = proxy_mod.proxyHandler(o) orelse return val_mod.makeBool(arena, false);
-            const target = proxy_mod.proxyTarget(o) orelse return val_mod.makeBool(arena, false);
-            if (proxy_mod.trap(handler, "has")) |trap_fn| {
+            const handler = proxy_mod.proxyHandler(o) orelse return proxy_mod.throwRevoked(arena);
+            const target = proxy_mod.proxyTarget(o) orelse return proxy_mod.throwRevoked(arena);
+            if (try proxy_mod.getTrap(arena, handler, "has")) |trap_fn| {
                 const res = try fp.invokeCallback(arena, handler, trap_fn, &[_]Value{ target, key });
                 return val_mod.makeBool(arena, descTruthy(res));
             }
@@ -375,9 +492,25 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
 // ---------------------------------------------------------------- Reflect.deleteProperty ---
 
 pub fn nativeReflectDeleteProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
     if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
     const target_obj = args[0].toPtr().object;
-    const key = if (args.len > 1) args[1] else Value{};
+    const key = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
+
+    // Proxy [[Delete]](P): dispatch the `deleteProperty` trap (with invariant),
+    // else forward to the proxy target's [[Delete]].
+    if (target_obj.internal_kind == .proxy) {
+        const handler = proxy_mod.proxyHandler(target_obj) orelse return proxy_mod.throwRevoked(arena);
+        const t = proxy_mod.proxyTarget(target_obj) orelse return proxy_mod.throwRevoked(arena);
+        const pkey = if (isSym(key)) key else try val_mod.makeString(arena, (try keyStr(arena, key)) orelse "undefined");
+        if (try proxy_mod.getTrap(arena, handler, "deleteProperty")) |trap_fn| {
+            const res = try fp.invokeCallback(arena, handler, trap_fn, &[_]Value{ t, pkey });
+            if (!val_mod.toBoolean(res)) return val_mod.makeBool(arena, false);
+            try proxy_mod.proxyReportAbsentInvariant(arena, t, pkey);
+            return val_mod.makeBool(arena, true);
+        }
+        return nativeReflectDeleteProperty(arena, .{}, &[_]Value{ t, pkey });
+    }
 
     if (isSym(key)) {
         return val_mod.makeBool(arena, target_obj.deleteOwnSym(key));
@@ -401,12 +534,16 @@ pub fn nativeReflectDeleteProperty(arena: std.mem.Allocator, _: Value, args: []c
         return val_mod.makeBool(arena, !namespace_mod.hasExport(target_obj, k));
     }
 
+    // Array "length" is a non-configurable own property: cannot be deleted.
+    if (target_obj.is_array and std.mem.eql(u8, k, "length")) return val_mod.makeBool(arena, false);
+
     return val_mod.makeBool(arena, try target_obj.deleteOwn(k));
 }
 
 // ---------------------------------------------------------------- Reflect.ownKeys ---
 
 pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
     const realm_mod = @import("../realm.zig");
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
@@ -433,6 +570,21 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
         return val_mod.makeObject(arena, arr);
     }
     const obj = args[0].toPtr().object;
+
+    // Proxy [[OwnPropertyKeys]]: dispatch the `ownKeys` trap (all keys, strings
+    // and symbols) or forward to the target — never the proxy's own slots.
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyOwnKeys(arena, obj)) |keys| {
+            var pi: u32 = 0;
+            for (keys) |kv| {
+                const idx_key = try std.fmt.allocPrint(arena, "{d}", .{pi});
+                try arr.set(idx_key, kv);
+                pi += 1;
+            }
+            arr.array_length = pi;
+        }
+        return val_mod.makeObject(arena, arr);
+    }
 
     // M16: Module Namespace exotic [[OwnPropertyKeys]] — sorted export names then symbol keys.
     if (obj.internal_kind == .module_namespace) {
@@ -472,10 +624,25 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
         }
     }
     var i: u32 = ta_count;
+    // Array [[OwnPropertyKeys]]: integer-index keys, then the synthetic "length"
+    // (a non-index own data property not present in `ownKeys()`), then remaining
+    // non-index string keys — matching OrdinaryOwnPropertyKeys ordering.
+    var array_length_emitted = false;
     for (obj.ownKeys()) |k| {
+        if (obj.is_array and !array_length_emitted and !isArrayIndexKeyR(k)) {
+            const lk = try std.fmt.allocPrint(arena, "{d}", .{i});
+            try arr.set(lk, try val_mod.makeString(arena, "length"));
+            i += 1;
+            array_length_emitted = true;
+        }
         const key_val = try val_mod.makeString(arena, k);
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
         try arr.set(idx_key, key_val);
+        i += 1;
+    }
+    if (obj.is_array and !array_length_emitted) {
+        const lk = try std.fmt.allocPrint(arena, "{d}", .{i});
+        try arr.set(lk, try val_mod.makeString(arena, "length"));
         i += 1;
     }
     for (obj.symKeys()) |sp| {
@@ -525,6 +692,19 @@ pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
         if (try proxy_mod.proxySetPrototypeOf(arena, obj, proto_val)) |ok| return val_mod.makeBool(arena, ok);
         if (proxy_mod.proxyTarget(obj)) |t| return nativeReflectSetPrototypeOf(arena, Value{}, &[_]Value{ t, if (new_proto) |p| try val_mod.makeObject(arena, p) else try val_mod.makeNull(arena) });
     }
+    // OrdinarySetPrototypeOf (spec 10.1.2.1): a no-op when unchanged; fails on a
+    // non-extensible target or when the new prototype chain cycles back to O.
+    if (new_proto == obj.proto) return val_mod.makeBool(arena, true);
+    if (!obj.extensible) return val_mod.makeBool(arena, false);
+    var p = new_proto;
+    var depth: usize = 0;
+    while (p) |pp| {
+        if (pp == obj) return val_mod.makeBool(arena, false); // prototype cycle
+        if (pp.internal_kind == .proxy) break; // an exotic [[GetPrototypeOf]] stops the static walk
+        p = pp.proto;
+        depth += 1;
+        if (depth > 100000) break;
+    }
     obj.proto = new_proto;
     obj.setProtoBarrier(new_proto);
     return val_mod.makeBool(arena, true);
@@ -535,11 +715,12 @@ pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
 pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len < 1 or !isObj(args[0]))
         return throwTypeErrorReflect(arena, "Reflect.defineProperty called on non-object");
+    const target_obj = args[0].toPtr().object;
+    // Spec order: ToPropertyKey (step 2) runs before ToPropertyDescriptor (step 3),
+    // so a throwing property-key coercion must propagate before the descriptor check.
+    const key_arg = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
     if (args.len < 3 or !isObj(args[2]))
         return throwTypeErrorReflect(arena, "Reflect.defineProperty descriptor must be an object");
-
-    const target_obj = args[0].toPtr().object;
-    const key_arg = if (args.len > 1) args[1] else Value{};
 
     // Proxy [[DefineOwnProperty]]: dispatch the defineProperty trap.
     if (target_obj.internal_kind == .proxy) {
@@ -692,19 +873,42 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
 // ---------------------------------------------------------------- Reflect.getOwnPropertyDescriptor ---
 
 pub fn nativeReflectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
     if (args.len == 0 or !isObj(args[0])) return val_mod.makeUndefined(arena);
     const obj = args[0].toPtr().object;
 
     if (args.len < 2) return val_mod.makeUndefined(arena);
-    const key_arg = args[1];
+    const key_arg = try toPropertyKey(arena, args[1]);
 
-    // Symbol keys: return undefined (not supported).
-    if (isSym(key_arg)) return val_mod.makeUndefined(arena);
-
-    const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeUndefined(arena);
+    // Proxy [[GetOwnProperty]]: dispatch the trap (with invariants), else forward
+    // to the target's [[GetOwnProperty]].
+    if (obj.internal_kind == .proxy) {
+        if (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, obj, key_arg)) |desc| return desc;
+        if (proxy_mod.proxyTarget(obj)) |t| return nativeReflectGetOwnPropertyDescriptor(arena, .{}, &[_]Value{ t, key_arg });
+        return val_mod.makeUndefined(arena);
+    }
 
     const realm_mod = @import("../realm.zig");
     const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+
+    // Symbol-keyed own property: build the descriptor from sym_props.
+    if (isSym(key_arg)) {
+        const sym_entry = obj.getOwnSymEntry(key_arg) orelse return val_mod.makeUndefined(arena);
+        const dsym = try JsObject.create(arena, obj_proto);
+        if (sym_entry.attr.is_accessor and sym_entry.value.bits != 0 and sym_entry.value.unbox() == .object) {
+            const hobj = sym_entry.value.toPtr().object;
+            try dsym.set("get", hobj.getOwn("get") orelse try val_mod.makeUndefined(arena));
+            try dsym.set("set", hobj.getOwn("set") orelse try val_mod.makeUndefined(arena));
+        } else {
+            try dsym.set("value", sym_entry.value);
+            try dsym.set("writable", try val_mod.makeBool(arena, sym_entry.attr.writable));
+        }
+        try dsym.set("enumerable", try val_mod.makeBool(arena, sym_entry.attr.enumerable));
+        try dsym.set("configurable", try val_mod.makeBool(arena, sym_entry.attr.configurable));
+        return val_mod.makeObject(arena, dsym);
+    }
+
+    const k = (try keyStr(arena, key_arg)) orelse return val_mod.makeUndefined(arena);
 
     // M16: Module Namespace exotic [[GetOwnProperty]] for a string key — an export
     // yields { value, writable:true, enumerable:true, configurable:false }; a
@@ -721,6 +925,17 @@ pub fn nativeReflectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value,
         try ndesc.set("enumerable", try val_mod.makeBool(arena, true));
         try ndesc.set("configurable", try val_mod.makeBool(arena, false));
         return val_mod.makeObject(arena, ndesc);
+    }
+
+    // Array exotic "length": synthetic own data property (writable unless the
+    // array is non-extensible, non-enumerable, non-configurable).
+    if (obj.is_array and std.mem.eql(u8, k, "length")) {
+        const dlen = try JsObject.create(arena, obj_proto);
+        try dlen.set("value", try val_mod.makeNumber(arena, @floatFromInt(obj.getArrayLength())));
+        try dlen.set("writable", try val_mod.makeBool(arena, obj.extensible));
+        try dlen.set("enumerable", try val_mod.makeBool(arena, false));
+        try dlen.set("configurable", try val_mod.makeBool(arena, false));
+        return val_mod.makeObject(arena, dlen);
     }
 
     const a = obj.ownAttr(k) orelse return val_mod.makeUndefined(arena);
@@ -778,36 +993,8 @@ pub fn nativeReflectApply(arena: std.mem.Allocator, _: Value, args: []const Valu
     const this_arg = if (args.len > 1) args[1] else Value{};
     const args_list = if (args.len > 2) args[2] else Value{};
 
-    // Unpack argsList if it is an array object.
-    var call_args: []Value = &[_]Value{};
-    if (args_list.bits != 0 and isObj(args_list)) {
-        const arr = args_list.toPtr().object;
-        if (arr.is_array) {
-            const len = arr.getArrayLength();
-            call_args = try arena.alloc(Value, len);
-            for (0..len) |i| {
-                const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
-                call_args[i] = arr.get(idx_key) orelse Value{};
-            }
-        } else {
-            // Non-array object with numeric length or just treat as empty.
-            // If it has a "length" property, treat as array-like.
-            if (arr.getOwn("length")) |len_val| {
-                if (len_val.bits != 0) {
-                    const len_f = len_val.toF64();
-                    if (!std.math.isNan(len_f) and len_f >= 0) {
-                        const len: u32 = @intFromFloat(len_f);
-                        call_args = try arena.alloc(Value, len);
-                        for (0..len) |i| {
-                            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
-                            call_args[i] = arr.getOwn(idx_key) orelse Value{};
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    if (!isCallable(target)) return throwTypeErrorReflect(arena, "Reflect.apply target must be callable");
+    const call_args = try createListFromArrayLike(arena, args_list);
     return fp.invokeCallback(arena, this_arg, target, call_args);
 }
 
@@ -863,38 +1050,13 @@ pub fn nativeReflectConstruct(arena: std.mem.Allocator, _: Value, args: []const 
     // 1. If IsConstructor(target) is false, throw a TypeError.
     if (!isConstructorVal(target)) return throwTypeErrorReflect(arena, "Reflect.construct target is not a constructor");
 
-    // Unpack argsList (second argument, array-like).
-    var arg_list: []Value = &[_]Value{};
-    if (args.len >= 2 and args[1].bits != 0 and isObj(args[1])) {
-        const arr = args[1].toPtr().object;
-        if (arr.is_array) {
-            const n = arr.getArrayLength();
-            if (n > 0) {
-                arg_list = try arena.alloc(Value, n);
-                for (0..n) |i| {
-                    const idx = try std.fmt.allocPrint(arena, "{d}", .{i});
-                    arg_list[i] = arr.get(idx) orelse try val_mod.makeUndefined(arena);
-                }
-            }
-        } else {
-            // Array-like with length property.
-            if (arr.getOwn("length")) |len_val| {
-                if (len_val.bits != 0) {
-                    const len_f = len_val.toF64();
-                    if (!std.math.isNan(len_f) and len_f >= 0) {
-                        const n: u32 = @intFromFloat(len_f);
-                        if (n > 0) {
-                            arg_list = try arena.alloc(Value, n);
-                            for (0..n) |i| {
-                                const idx = try std.fmt.allocPrint(arena, "{d}", .{i});
-                                arg_list[i] = arr.getOwn(idx) orelse try val_mod.makeUndefined(arena);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Unpack argsList (second argument) via CreateListFromArrayLike: reads
+    // "length" and each index through [[Get]], propagating any abrupt completion
+    // and throwing a TypeError when the list is not an object.
+    const arg_list: []Value = if (args.len >= 2)
+        try createListFromArrayLike(arena, args[1])
+    else
+        &[_]Value{};
 
     const ctx = realm_mod.active_context orelse {
         realm_mod.pending_exception = try val_mod.makeString(arena, "no active context");

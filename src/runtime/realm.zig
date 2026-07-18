@@ -3396,7 +3396,14 @@ fn installGlobalThis(arena: std.mem.Allocator, env: *Environment, object_proto: 
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
         if (name.len >= 2 and name[0] == '_' and name[1] == '_') continue;
-        _ = try global_obj.defineOwnData(name, entry.value_ptr.value, .{ .writable = true, .enumerable = false, .configurable = true });
+        // The global constants NaN, Infinity and undefined are non-writable,
+        // non-enumerable and non-configurable (ES §19.1).
+        const is_const = std.mem.eql(u8, name, "NaN") or std.mem.eql(u8, name, "Infinity") or std.mem.eql(u8, name, "undefined");
+        const attrs: obj_mod.PropAttr = if (is_const)
+            .{ .writable = false, .enumerable = false, .configurable = false }
+        else
+            .{ .writable = true, .enumerable = false, .configurable = true };
+        _ = try global_obj.defineOwnData(name, entry.value_ptr.value, attrs);
     }
     const global_val = try val_mod.makeObject(arena, global_obj);
     try env.define("globalThis", global_val);

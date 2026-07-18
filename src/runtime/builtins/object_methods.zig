@@ -437,10 +437,14 @@ pub fn nativeObjectHasOwn(arena: std.mem.Allocator, _: Value, args: []const Valu
 /// hasOwnProperty(key): checks if own prop exists (not in proto chain).
 pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if (args.len == 0) return val_mod.makeBool(arena, false);
+    // Step 1: P = ToPropertyKey(V) — coercion (which may throw) precedes ToObject(this).
+    const key_v = try toPropertyKeyValue(arena, args[0]);
+    // Step 2: ToObject(this) throws for null/undefined (callables/primitives box).
+    if (this_val.isNullish()) return throwTypeError(arena, "Object.prototype.hasOwnProperty called on null or undefined");
     // native_function has own "length" and "name" unless deleted (ES spec §10.3).
     if (this_val.bits != 0 and this_val.unbox() == .native_function) {
-        const key: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
-            args[0].toPtr().string
+        const key: []const u8 = if (key_v.bits != 0 and key_v.unbox() == .string)
+            key_v.toPtr().string
         else
             return val_mod.makeBool(arena, false);
         const entry = this_val.unbox().native_function;
@@ -454,10 +458,10 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
         const realm_mod2 = @import("../realm.zig");
         const ctx2 = realm_mod2.active_context orelse return val_mod.makeBool(arena, false);
         const bobj = (try ctx2.backingObject(arena, this_val)) orelse return val_mod.makeBool(arena, false);
-        const key2: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
-            args[0].toPtr().string
+        const key2: []const u8 = if (key_v.bits != 0 and key_v.unbox() == .string)
+            key_v.toPtr().string
         else
-            (try coerceKey(arena, args[0])) orelse return val_mod.makeBool(arena, false);
+            (try coerceKey(arena, key_v)) orelse return val_mod.makeBool(arena, false);
         if (bobj.isPrivate(key2)) return val_mod.makeBool(arena, false);
         return val_mod.makeBool(arena, bobj.hasOwn(key2));
     }
@@ -465,14 +469,26 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
         return val_mod.makeBool(arena, false);
     }
     const obj = this_val.toPtr().object;
-    // Symbol key: check sym_props.
-    if (args[0].bits != 0 and args[0].unbox() == .symbol) {
-        return val_mod.makeBool(arena, obj.getOwnSym(args[0]) != null);
+    // Proxy [[GetOwnProperty]]: HasOwnProperty(P) = the descriptor is not undefined.
+    if (obj.internal_kind == .proxy) {
+        const pkey = if (key_v.bits != 0 and key_v.unbox() == .symbol)
+            key_v
+        else
+            try val_mod.makeString(arena, (try coerceKey(arena, key_v)) orelse "undefined");
+        if (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, obj, pkey)) |desc| {
+            return val_mod.makeBool(arena, !(desc.bits == 0 or desc.unbox() == .undefined_));
+        }
+        if (proxy_mod.proxyTarget(obj)) |t| return nativeHasOwnProperty(arena, t, &[_]Value{pkey});
+        return val_mod.makeBool(arena, false);
     }
-    const key: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
-        args[0].toPtr().string
+    // Symbol key: check sym_props.
+    if (key_v.bits != 0 and key_v.unbox() == .symbol) {
+        return val_mod.makeBool(arena, obj.getOwnSym(key_v) != null);
+    }
+    const key: []const u8 = if (key_v.bits != 0 and key_v.unbox() == .string)
+        key_v.toPtr().string
     else
-        (try coerceKey(arena, args[0])) orelse return val_mod.makeBool(arena, false);
+        (try coerceKey(arena, key_v)) orelse return val_mod.makeBool(arena, false);
 
     // TypedArray integer-indexed elements are own iff a valid integer index;
     // a canonical-numeric-but-invalid key ("0.1","-0",OOB) is NOT an own prop.
@@ -537,11 +553,29 @@ pub fn nativeObjectIsPrototypeOf(arena: std.mem.Allocator, this_val: Value, args
 }
 
 pub fn nativePropertyIsEnumerable(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Step 1: P = ToPropertyKey(V) — coercion (may throw) precedes ToObject(this).
+    const key_arg = try toPropertyKeyValue(arena, if (args.len > 0) args[0] else Value{});
+    // Step 2: ToObject(this) throws for null/undefined.
+    if (this_val.isNullish()) return throwTypeError(arena, "Object.prototype.propertyIsEnumerable called on null or undefined");
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         return val_mod.makeBool(arena, false);
     }
     const obj = this_val.toPtr().object;
-    const key_arg = if (args.len > 0) args[0] else Value{};
+    // Proxy [[GetOwnProperty]]: enumerable iff the descriptor exists and its
+    // [[Enumerable]] field is true.
+    if (obj.internal_kind == .proxy) {
+        const pkey = if (key_arg.bits != 0 and key_arg.unbox() == .symbol)
+            key_arg
+        else
+            try val_mod.makeString(arena, (try coerceKey(arena, key_arg)) orelse "undefined");
+        if (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, obj, pkey)) |desc| {
+            if (desc.bits == 0 or desc.unbox() == .undefined_) return val_mod.makeBool(arena, false);
+            const en = desc.bits != 0 and desc.unbox() == .object and descTruthy(desc.toPtr().object.getOwn("enumerable"));
+            return val_mod.makeBool(arena, en);
+        }
+        if (proxy_mod.proxyTarget(obj)) |t| return nativePropertyIsEnumerable(arena, t, &[_]Value{pkey});
+        return val_mod.makeBool(arena, false);
+    }
     // Symbol key: consult sym_props.
     if (key_arg.bits != 0 and key_arg.unbox() == .symbol) {
         if (obj.getOwnSymEntry(key_arg)) |sp| return val_mod.makeBool(arena, sp.attr.enumerable);
@@ -670,13 +704,16 @@ fn throwReferenceErrorObj(arena: std.mem.Allocator, name: []const u8) anyerror {
 
 /// Coerce a Value to an owned key string. Returns null if not coercible.
 fn coerceKey(arena: std.mem.Allocator, v: Value) !?[]const u8 {
-    if (v.bits == 0) return null;
+    if (v.bits == 0) return "undefined";
     return switch (v.unbox()) {
         .string => |s| s,
         // ToString(number) per spec: -0 → "0", integers without a decimal point,
         // etc. Plain "{d}" would yield "-0" and break numeric-key lookups.
         .number => |n| try val_mod.formatNumber(arena, n),
-        else => null,
+        .boolean => |b| if (b) "true" else "false",
+        .undefined_ => "undefined",
+        .null_ => "null",
+        else => null, // Symbols are handled by callers before coerceKey.
     };
 }
 
@@ -1024,11 +1061,14 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     // ToObject(O): undefined/null (and a missing argument) throw a TypeError.
     if (args.len == 0 or args[0].bits == 0 or args[0].unbox() == .undefined_ or args[0].unbox() == .null_)
         return throwTypeError(arena, "Cannot convert undefined or null to object");
+    // ToPropertyKey(P): coerce Object keys via ToPrimitive(string) so e.g.
+    // getOwnPropertyDescriptor(obj, [1]) looks up "1" (may throw / yield a Symbol).
+    const key_v = try toPropertyKeyValue(arena, if (args.len >= 2) args[1] else Value{});
     const arg0_unboxed = args[0].unbox();
     // Handle native_function: synthesize descriptors for .name/.length (respecting deletion).
     if (arg0_unboxed == .native_function) {
         if (args.len < 2) return val_mod.makeUndefined(arena);
-        const key = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
+        const key = (try coerceKey(arena, key_v)) orelse return val_mod.makeUndefined(arena);
         const entry = arg0_unboxed.native_function;
         const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
         const desc = try JsObject.create(arena, obj_proto);
@@ -1067,20 +1107,20 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
 
     // Proxy: getOwnPropertyDescriptor trap (or forward to target).
     if (obj.internal_kind == .proxy) {
-        if (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, obj, args[1])) |desc| {
+        if (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, obj, key_v)) |desc| {
             return desc;
         }
         if (proxy_mod.proxyTarget(obj)) |target| {
-            return try nativeObjectGetOwnPropertyDescriptor(arena, args[0], &[_]Value{ target, args[1] });
+            return try nativeObjectGetOwnPropertyDescriptor(arena, args[0], &[_]Value{ target, key_v });
         }
         return val_mod.makeUndefined(arena);
     }
 
     // M15: TypedArray [[GetOwnProperty]] — integer-indexed exotic. Symbol keys are
     // never integer indices: skip to the ordinary symbol-property branch below.
-    if (obj.internal_kind == .typed_array and !(args[1].bits != 0 and args[1].unbox() == .symbol)) {
+    if (obj.internal_kind == .typed_array and !(key_v.bits != 0 and key_v.unbox() == .symbol)) {
         const ta_mod = @import("typed_array.zig");
-        const key2 = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
+        const key2 = (try coerceKey(arena, key_v)) orelse return val_mod.makeUndefined(arena);
         if (ta_mod.canonicalNumericIndexString(key2)) |idx_f| {
             const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
             if (!ta_mod.isValidIntegerIndex(td, idx_f)) return val_mod.makeUndefined(arena);
@@ -1104,8 +1144,8 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     // through to the ordinary sym_props branch below — e.g. @@toStringTag.)
     // [[GetOwnProperty]] calls [[Get]] for the value (step 4), which throws
     // ReferenceError for uninitialized (TDZ) bindings.
-    if (obj.internal_kind == .module_namespace and !(args[1].bits != 0 and args[1].unbox() == .symbol)) {
-        const nkey = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
+    if (obj.internal_kind == .module_namespace and !(key_v.bits != 0 and key_v.unbox() == .symbol)) {
+        const nkey = (try coerceKey(arena, key_v)) orelse return val_mod.makeUndefined(arena);
         try namespace_mod.triggerForStringKey(arena, obj, nkey); // import-defer: [[GetOwnProperty]]
         if (!namespace_mod.hasExport(obj, nkey)) return val_mod.makeUndefined(arena);
         if (namespace_mod.isTDZ(obj, nkey)) {
@@ -1127,8 +1167,8 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     }
 
     // Symbol-keyed lookup: check sym_props first.
-    if (args[1].bits != 0 and args[1].unbox() == .symbol) {
-        const sym_val = args[1];
+    if (key_v.bits != 0 and key_v.unbox() == .symbol) {
+        const sym_val = key_v;
         const sym_entry = obj.getOwnSymEntry(sym_val) orelse return val_mod.makeUndefined(arena);
         const obj_proto2: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
         const desc2 = try JsObject.create(arena, obj_proto2);
@@ -1145,9 +1185,21 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
         return val_mod.makeObject(arena, desc2);
     }
 
-    const key = (try coerceKey(arena, args[1])) orelse return val_mod.makeUndefined(arena);
+    const key = (try coerceKey(arena, key_v)) orelse return val_mod.makeUndefined(arena);
     // Private class elements (`#x`) are hidden from reflection.
     if (obj.isPrivate(key)) return val_mod.makeUndefined(arena);
+
+    // Array exotic "length": a synthetic own data property that is writable
+    // (unless the array is non-extensible), non-enumerable, non-configurable.
+    if (obj.is_array and std.mem.eql(u8, key, "length")) {
+        const obj_proto_len: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+        const dlen = try JsObject.create(arena, obj_proto_len);
+        try dlen.set("value", try val_mod.makeNumber(arena, @floatFromInt(obj.getArrayLength())));
+        try dlen.set("writable", try val_mod.makeBool(arena, obj.extensible));
+        try dlen.set("enumerable", try val_mod.makeBool(arena, false));
+        try dlen.set("configurable", try val_mod.makeBool(arena, false));
+        return val_mod.makeObject(arena, dlen);
+    }
 
     const a = obj.ownAttr(key) orelse return val_mod.makeUndefined(arena);
 
@@ -1185,10 +1237,16 @@ fn defineTarget(arena: std.mem.Allocator, val: Value) anyerror!?*JsObject {
 }
 
 /// Object.defineProperty(o, key, descriptor): define/redefine a data property.
-/// ToPropertyKey returning a Value (a Symbol stays a symbol; else a String).
+/// ToPropertyKey returning a Value: an Object is coerced via ToPrimitive(string
+/// hint) — invoking user Symbol.toPrimitive/toString/valueOf, propagating any
+/// throw — and a Symbol result stays a Symbol; every other primitive is ToString'd.
 fn toPropertyKeyValue(arena: std.mem.Allocator, v: Value) !Value {
-    if (v.bits != 0 and v.unbox() == .symbol) return v;
-    const s = try @import("../realm.zig").stringPrimitive(arena, v);
+    var prim = v;
+    if (v.bits != 0 and v.unbox() == .object) {
+        prim = (try @import("coercion.zig").toPrimitive(arena, v, .string)) orelse v;
+    }
+    if (prim.bits != 0 and prim.unbox() == .symbol) return prim;
+    const s = try @import("../realm.zig").stringPrimitive(arena, prim);
     return val_mod.makeString(arena, s);
 }
 
