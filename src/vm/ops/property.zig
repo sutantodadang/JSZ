@@ -33,6 +33,23 @@ fn strictAssignThrow(self: *BcVm) !?RunOutcome {
     return null;
 }
 
+/// RequireObjectCoercible for a source-level member read: reading a property
+/// off `null`/`undefined` is a TypeError (ES EvaluatePropertyAccess... calls
+/// `? RequireObjectCoercible(baseValue)`). Optional-chain reads short-circuit via
+/// a JMP_IF_NULLISH guard before GET_PROP/GET_PROP_DYN, so a nullish base here is
+/// always a genuine, non-optional access. Callers gate on `obj_val.isNullish()`
+/// first. Returns null when a handler caught the throw (VM resumes at the catch);
+/// a non-null RunOutcome when the exception escapes the current frame.
+fn nullishReadThrow(self: *BcVm, obj_val: Value, key_desc: []const u8) !?RunOutcome {
+    const kind: []const u8 = if (obj_val.isNull()) "null" else "undefined";
+    const msg = try std.fmt.allocPrint(self.arena, "Cannot read properties of {s} (reading '{s}')", .{ kind, key_desc });
+    const exc = try self.makeErrorObjectBc("TypeError", msg);
+    self.last_exception_value = exc;
+    const found = try self.throwException(exc);
+    if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc } };
+    return null;
+}
+
 pub inline fn opGetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const site_pc = frame.pc - 1;
@@ -48,6 +65,8 @@ pub inline fn opGetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const key_val = frame.func.chunk.constants[kidx];
     const key = key_val.toPtr().string;
     const obj_val = frame.registers[robj];
+    // RequireObjectCoercible: `null.x` / `undefined.x` throws (non-optional read).
+    if (obj_val.isNullish()) return nullishReadThrow(self, obj_val, key);
     const site_cache = &@constCast(frame.func.ic_table)[site_pc];
     if (obj_val.bits != 0 and obj_val.unbox() == .object) {
         const obj = obj_val.toPtr().object;
@@ -136,6 +155,17 @@ pub inline fn opGetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const obj_val = frame.registers[robj];
     const key_val = frame.registers[rkey];
+    // RequireObjectCoercible runs before ToPropertyKey (ES
+    // EvaluatePropertyAccessWithExpressionKey): a nullish base throws even if the
+    // key would otherwise be coerced via a user `toString`. Avoid coercing the key
+    // for the message (that would run user code) — use its string form if present.
+    if (obj_val.isNullish()) {
+        const key_desc: []const u8 = if (key_val.bits != 0 and key_val.unbox() == .string)
+            key_val.toPtr().string
+        else
+            "";
+        return nullishReadThrow(self, obj_val, key_desc);
+    }
     if (key_val.bits != 0 and key_val.unbox() == .string) {
         const key = key_val.toPtr().string;
         const site_cache = &@constCast(frame.func.ic_table)[site_pc];
@@ -467,6 +497,16 @@ pub inline fn opDeleteProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const obj_v = frame.registers[robj];
     const key_v = frame.registers[rkey];
+    // ES `delete` §13.5.1.2 step 5.b: `baseObj := ? ToObject(ref.[[Base]])`, so
+    // `delete null.x` / `delete undefined[k]` throws a TypeError. (Non-optional
+    // member: optional `delete a?.b` short-circuits before DELETE_PROP.)
+    if (obj_v.isNullish()) {
+        const key_desc: []const u8 = if (key_v.bits != 0 and key_v.unbox() == .string)
+            key_v.toPtr().string
+        else
+            "";
+        return nullishReadThrow(self, obj_v, key_desc);
+    }
     // Capture before deleteProperty: a Proxy/TypedArray trap can re-enter the VM
     // (invokeCallback grows self.frames, reallocating the backing array) which
     // invalidates `frame`. Read frame-derived state now; use indexed access after.

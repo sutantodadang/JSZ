@@ -514,6 +514,9 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
 
     // A private class element (`#x`) is hidden from reflection.
     if (obj.isPrivate(key)) return val_mod.makeBool(arena, false);
+    // Array exotic "length": a synthetic own data property not held in the
+    // shape, so `hasOwn` misses it. It is always an own property of an array.
+    if (obj.is_array and std.mem.eql(u8, key, "length")) return val_mod.makeBool(arena, true);
     return val_mod.makeBool(arena, obj.hasOwn(key));
 }
 
@@ -694,6 +697,32 @@ fn toUint32(n: f64) u32 {
     const m = @mod(t, 4294967296.0);
     const pos = if (m < 0) m + 4294967296.0 else m;
     return @intFromFloat(pos);
+}
+
+/// ArraySetLength (ES §10.4.2.4) for an ordinary `[[Set]]`/`[[DefineOwnProperty]]`
+/// of an array's own "length": ToPrimitive(number) the value (running a user
+/// valueOf/@@toPrimitive), reject a BigInt/Symbol (no Number conversion →
+/// TypeError), require the result to be a valid Uint32 (RangeError otherwise),
+/// then apply it — `obj.set("length", …)` truncates the array's out-of-range
+/// index properties. Shared by `Object`/`Reflect.defineProperty` and `Reflect.set`
+/// so every reflective length write matches the plain `arr.length = v` assignment.
+pub fn arraySetLengthThrowing(arena: std.mem.Allocator, obj: *JsObject, value: Value) anyerror!void {
+    var pv = value;
+    if (pv.bits != 0 and pv.unbox() == .object)
+        pv = (try @import("coercion.zig").toPrimitive(arena, pv, .number)) orelse pv;
+    if (pv.bits != 0) {
+        switch (pv.unbox()) {
+            .bigint => return throwTypeError(arena, "Cannot convert a BigInt value to a number"),
+            .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+            else => {},
+        }
+    }
+    // `pv` is already primitive here, so toNumberForLength does no re-coercion.
+    const num = try toNumberForLength(arena, pv);
+    const u = toUint32(num);
+    if (@as(f64, @floatFromInt(u)) != num)
+        return throwRangeError(arena, "Invalid array length");
+    try obj.set("length", try val_mod.makeNumber(arena, @floatFromInt(u)));
 }
 
 fn throwReferenceErrorObj(arena: std.mem.Allocator, name: []const u8) anyerror {
@@ -1406,11 +1435,7 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
             return throwTypeError(arena, "cannot redefine property: length");
         if (descHas(desc, "value")) {
             const lv = try descGet(arena, desc_val, desc, "value");
-            const num = try toNumberForLength(arena, lv);
-            const u = toUint32(num);
-            if (@as(f64, @floatFromInt(u)) != num)
-                return throwRangeError(arena, "Invalid array length");
-            try obj.set("length", try val_mod.makeNumber(arena, @floatFromInt(u)));
+            try arraySetLengthThrowing(arena, obj, lv);
         }
         return args[0];
     }

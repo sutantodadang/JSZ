@@ -11,15 +11,22 @@ const intrinsics = @import("intrinsics.zig");
 pub fn register(ctx: *const intrinsics.Ctx) !void {
     const arena = ctx.arena;
     const math_obj = try JsObject.create(arena, null);
-    // Constants
-    try math_obj.set("PI", try val_mod.makeNumber(arena, std.math.pi));
-    try math_obj.set("E", try val_mod.makeNumber(arena, std.math.e));
-    try math_obj.set("LN2", try val_mod.makeNumber(arena, std.math.ln2));
-    try math_obj.set("LN10", try val_mod.makeNumber(arena, std.math.ln10));
-    try math_obj.set("LOG2E", try val_mod.makeNumber(arena, std.math.log2e));
-    try math_obj.set("LOG10E", try val_mod.makeNumber(arena, std.math.log10e));
-    try math_obj.set("SQRT2", try val_mod.makeNumber(arena, std.math.sqrt2));
-    try math_obj.set("SQRT1_2", try val_mod.makeNumber(arena, 1.0 / std.math.sqrt2));
+    // Constants — ES value properties of the Math object are
+    // { writable: false, enumerable: false, configurable: false }, so
+    // `delete Math.PI` etc. returns false and never removes them.
+    const consts = .{
+        .{ "PI", std.math.pi },
+        .{ "E", std.math.e },
+        .{ "LN2", std.math.ln2 },
+        .{ "LN10", std.math.ln10 },
+        .{ "LOG2E", std.math.log2e },
+        .{ "LOG10E", std.math.log10e },
+        .{ "SQRT2", std.math.sqrt2 },
+        .{ "SQRT1_2", 1.0 / std.math.sqrt2 },
+    };
+    inline for (consts) |c| {
+        _ = try math_obj.defineOwnData(c[0], try val_mod.makeNumber(arena, c[1]), .{ .writable = false, .enumerable = false, .configurable = false });
+    }
     // Functions
     const func_fns = .{
         .{ "abs", nativeAbs },

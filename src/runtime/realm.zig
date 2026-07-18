@@ -1521,8 +1521,12 @@ fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     obj.is_array = true;
     if (args.len == 1 and args[0].bits != 0 and args[0].unbox() == .number) {
         const len = args[0].unbox().number;
+        // `new Array(len)`: len must be a valid Uint32 (ES §23.1.1.1 step 8c),
+        // else RangeError. Negative, fractional, NaN and >= 2^32 all throw.
         if (len >= 0 and len == @floor(len) and len < 4294967296) {
             obj.array_length = @intFromFloat(len);
+        } else {
+            return throwRangeError(arena, "Invalid array length");
         }
     } else {
         for (args, 0..) |arg, i| {
