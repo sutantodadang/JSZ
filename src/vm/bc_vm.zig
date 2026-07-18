@@ -556,7 +556,7 @@ pub const BcVm = struct {
                 return error.JsException;
             },
             .object => |o| {
-                if (o.internal_kind == .proxy) return try self.proxyConstruct(o, args, ctor);
+                if (o.internal_kind == .proxy) return try self.proxyConstruct(o, args, new_target);
                 // Bound function exotic [[Construct]]: prepend bound args, and if
                 // newTarget is the bound function itself substitute the target.
                 if (o.internal_kind == .bound_function) {
@@ -1759,6 +1759,10 @@ pub const BcVm = struct {
         while (cur) |o| {
             if (depth >= 64) break;
             depth += 1;
+            // A Proxy in the prototype chain dispatches its own [[Get]] with the
+            // original receiver preserved (the root proxy is handled above).
+            if (o != root_obj and o.internal_kind == .proxy)
+                return try self.proxyGet(obj_val, o, sym_key);
             if (o.getOwnSymEntry(sym_key)) |sp| {
                 if (sp.attr.is_accessor) {
                     const getter = accessorMember(sp.value, "get");
@@ -1796,11 +1800,13 @@ pub const BcVm = struct {
 
     /// Proxy `get` trap dispatch: `handler.get(target, key, receiver)`, falling
     /// back to a plain read on the target when no trap is defined.
-    fn proxyGet(self: *BcVm, proxy_val: Value, proxy_obj: *JsObject, key: Value) anyerror!Value {
-        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return val_mod.makeUndefined(self.arena);
-        const target = proxy_mod.proxyTarget(proxy_obj) orelse return val_mod.makeUndefined(self.arena);
-        if (proxy_mod.trap(handler, "get")) |trap_fn| {
-            return try self.callAccessor(trap_fn, handler, &[_]Value{ target, key, proxy_val });
+    fn proxyGet(self: *BcVm, receiver: Value, proxy_obj: *JsObject, key: Value) anyerror!Value {
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return proxy_mod.throwRevoked(self.arena);
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return proxy_mod.throwRevoked(self.arena);
+        if (try proxy_mod.getTrap(self.arena, handler, "get")) |trap_fn| {
+            const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key, receiver });
+            try proxy_mod.proxyGetInvariant(self.arena, target, key, res);
+            return res;
         }
         // No trap: forward to the target.
         if (key.bits != 0 and key.unbox() == .symbol) return try self.getPropSym(target, key);
@@ -1812,11 +1818,13 @@ pub const BcVm = struct {
     /// falling back to a plain write on the target when no trap is defined.
     fn proxySet(self: *BcVm, proxy_val: Value, proxy_obj: *JsObject, key: Value, value: Value, receiver: Value) anyerror!bool {
         _ = proxy_val;
-        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return true;
-        const target = proxy_mod.proxyTarget(proxy_obj) orelse return true;
-        if (proxy_mod.trap(handler, "set")) |trap_fn| {
+        const handler = proxy_mod.proxyHandler(proxy_obj) orelse return proxy_mod.throwRevoked(self.arena);
+        const target = proxy_mod.proxyTarget(proxy_obj) orelse return proxy_mod.throwRevoked(self.arena);
+        if (try proxy_mod.getTrap(self.arena, handler, "set")) |trap_fn| {
             const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key, value, receiver });
-            return isTruthy(res);
+            if (!isTruthy(res)) return false;
+            try proxy_mod.proxySetInvariant(self.arena, target, key, value);
+            return true;
         }
         // No trap: default [[Set]] forwards to the target, preserving Receiver
         // (spec: OrdinarySet(target, P, V, Receiver) — the write lands on Receiver,
@@ -1828,6 +1836,14 @@ pub const BcVm = struct {
         }
         const key_str = try valueToStringArena(self.arena, key);
         return try self.setPropR(target, key_str, value, receiver);
+    }
+
+    /// Shared invariant for the `has` (reports false) and `deleteProperty`
+    /// (reports true) proxy traps: if the target has an own property for `key`,
+    /// that property must be configurable, and the target must be extensible.
+    /// Otherwise the trap result contradicts the target and a TypeError is thrown.
+    fn proxyReportAbsentInvariant(self: *BcVm, target: Value, key_v: Value) anyerror!void {
+        return proxy_mod.proxyReportAbsentInvariant(self.arena, target, key_v);
     }
 
     /// HasProperty(obj, key) for the `in` operator: prototype-chain walk over
@@ -1854,11 +1870,16 @@ pub const BcVm = struct {
         if (obj_val.bits == 0 or obj_val.unbox() != .object) return false;
         const root_obj = obj_val.toPtr().object;
         if (root_obj.internal_kind == .proxy) {
-            const handler = proxy_mod.proxyHandler(root_obj) orelse return false;
-            const target = proxy_mod.proxyTarget(root_obj) orelse return false;
-            if (proxy_mod.trap(handler, "has")) |trap_fn| {
+            const handler = proxy_mod.proxyHandler(root_obj) orelse return proxy_mod.throwRevoked(self.arena);
+            const target = proxy_mod.proxyTarget(root_obj) orelse return proxy_mod.throwRevoked(self.arena);
+            if (try proxy_mod.getTrap(self.arena, handler, "has")) |trap_fn| {
                 const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v });
-                return isTruthy(res);
+                const b = isTruthy(res);
+                // Invariant: has may not report false for a non-configurable own
+                // property of the target, nor for any own property of a
+                // non-extensible target.
+                if (!b) try self.proxyReportAbsentInvariant(target, key_v);
+                return b;
             }
             return try self.hasProperty(target, key_v);
         }
@@ -1949,11 +1970,15 @@ pub const BcVm = struct {
         if (obj_val.bits == 0 or obj_val.unbox() != .object) return true;
         const obj = obj_val.toPtr().object;
         if (obj.internal_kind == .proxy) {
-            const handler = proxy_mod.proxyHandler(obj) orelse return false;
-            const target = proxy_mod.proxyTarget(obj) orelse return false;
-            if (proxy_mod.trap(handler, "deleteProperty")) |trap_fn| {
+            const handler = proxy_mod.proxyHandler(obj) orelse return proxy_mod.throwRevoked(self.arena);
+            const target = proxy_mod.proxyTarget(obj) orelse return proxy_mod.throwRevoked(self.arena);
+            if (try proxy_mod.getTrap(self.arena, handler, "deleteProperty")) |trap_fn| {
                 const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v });
-                return isTruthy(res);
+                if (!isTruthy(res)) return false;
+                // Invariant: a non-configurable own property of the target cannot
+                // be reported deleted, nor any own property of a non-extensible target.
+                try self.proxyReportAbsentInvariant(target, key_v);
+                return true;
             }
             return try self.deleteProperty(target, key_v);
         }
@@ -1981,6 +2006,8 @@ pub const BcVm = struct {
             try @import("../runtime/realm.zig").maybeTriggerDeferredStr(self.arena, obj, key);
             return !namespace_mod.hasExport(obj, key);
         }
+        // Array "length" is non-configurable: cannot be deleted.
+        if (obj.is_array and std.mem.eql(u8, key, "length")) return false;
         return obj.deleteOwn(key);
     }
 
@@ -2051,7 +2078,7 @@ pub const BcVm = struct {
     fn proxyApply(self: *BcVm, proxy_obj: *JsObject, this_val: Value, args: []const Value) anyerror!Value {
         const handler = proxy_mod.proxyHandler(proxy_obj) orelse return self.throwRevokedProxy();
         const target = proxy_mod.proxyTarget(proxy_obj) orelse return self.throwRevokedProxy();
-        if (proxy_mod.trap(handler, "apply")) |trap_fn| {
+        if (try proxy_mod.getTrap(self.arena, handler, "apply")) |trap_fn| {
             const args_arr = try self.arrayFromSlice(args);
             return try self.callAccessor(trap_fn, handler, &[_]Value{ target, this_val, args_arr });
         }
@@ -2065,7 +2092,7 @@ pub const BcVm = struct {
     fn proxyConstruct(self: *BcVm, proxy_obj: *JsObject, args: []const Value, new_target: Value) anyerror!Value {
         const handler = proxy_mod.proxyHandler(proxy_obj) orelse return self.throwRevokedProxy();
         const target = proxy_mod.proxyTarget(proxy_obj) orelse return self.throwRevokedProxy();
-        if (proxy_mod.trap(handler, "construct")) |trap_fn| {
+        if (try proxy_mod.getTrap(self.arena, handler, "construct")) |trap_fn| {
             const args_arr = try self.arrayFromSlice(args);
             const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, args_arr, new_target });
             if (res.bits != 0 and res.unbox() == .object) return res;
@@ -2187,6 +2214,10 @@ pub const BcVm = struct {
                         if (pd >= 64) break;
                         if (pp.internal_kind == .module_namespace)
                             return try self.getProp(try val_mod.makeObject(self.arena, pp), key);
+                        // A Proxy in the prototype chain dispatches its own [[Get]]
+                        // with the original receiver preserved.
+                        if (pp.internal_kind == .proxy)
+                            return try self.proxyGet(obj_val, pp, try val_mod.makeString(self.arena, key));
                         p = pp.proto;
                     }
                 }
@@ -2533,13 +2564,34 @@ pub const BcVm = struct {
                         cur = c.proto;
                     }
                 }
+                // OrdinarySet delegates to a parent's [[Set]] when O lacks an own
+                // property (spec 10.1.9.2): a Proxy in the prototype chain must
+                // therefore intercept the write — with the original Receiver — before
+                // any ordinary property that sits behind it is reached.
+                {
+                    var cur: ?*JsObject = obj;
+                    var depth: usize = 0;
+                    while (cur) |c| {
+                        if (depth >= 64) break;
+                        depth += 1;
+                        if (c != obj and c.internal_kind == .proxy) {
+                            const key_v = try val_mod.makeString(self.arena, key);
+                            return try self.proxySet(try val_mod.makeObject(self.arena, c), c, key_v, value, receiver);
+                        }
+                        if (c.resolveOwnSlot(key) != null) break; // own property → ordinary handling
+                        cur = c.proto;
+                    }
+                }
                 if (obj.findProperty(key)) |loc| {
                     const a = loc.holder.attrAt(loc.slot);
                     if (a.is_accessor) {
                         const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
                         const setter = accessorMember(raw, "set");
                         // Only invoke if setter is an actual callable (not undefined/null).
-                        if (isCallable(setter)) _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
+                        // Spec OrdinarySetWithOwnDescriptor calls the setter with the
+                        // Receiver as thisArg (matters when reached through a Proxy or
+                        // `super.x = v`, where Receiver differs from the holder).
+                        if (isCallable(setter)) _ = try self.callAccessor(setter, receiver, &[_]Value{value});
                         return true; // accessor with no setter: sloppy no-op
                     }
                     if (loc.holder == obj) {
@@ -2623,7 +2675,7 @@ pub const BcVm = struct {
     fn proxyDefineDataProperty(self: *BcVm, proxy_obj: *JsObject, key: []const u8, value: Value) anyerror!bool {
         const handler = proxy_mod.proxyHandler(proxy_obj) orelse return false;
         const target = proxy_mod.proxyTarget(proxy_obj) orelse return false;
-        if (proxy_mod.trap(handler, "defineProperty")) |trap_fn| {
+        if (try proxy_mod.getTrap(self.arena, handler, "defineProperty")) |trap_fn| {
             const key_v = try val_mod.makeString(self.arena, key);
             const desc = try self.makeDataDescriptor(value);
             const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v, desc });
