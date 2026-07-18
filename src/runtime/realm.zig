@@ -2070,15 +2070,18 @@ fn nativeStringCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (constructing and this_val.bits != 0 and this_val.unbox() == .object) {
         const obj = this_val.toPtr().object;
         try obj.set("[[PrimitiveValue]]", try val_mod.makeString(arena, s));
-        // A String exotic object exposes each code unit as an own property
+        // A String exotic object exposes each UTF-16 code unit as an own property
         // { enumerable, non-writable, non-configurable } plus an own non-enumerable
         // "length" (ES 10.4.3 StringCreate / String-exotic define-own-property).
+        const string_proto = @import("./builtins/string_proto.zig");
+        const cu_len = string_proto.cuLen(s);
         var i: usize = 0;
-        while (i < s.len) : (i += 1) {
+        while (i < cu_len) : (i += 1) {
             const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-            _ = try obj.defineOwnData(key, try val_mod.makeString(arena, try arena.dupe(u8, s[i .. i + 1])), .{ .writable = false, .enumerable = true, .configurable = false });
+            const unit = string_proto.cuUnitAt(s, i).?;
+            _ = try obj.defineOwnData(key, try val_mod.makeString(arena, try string_proto.cuToString(arena, unit)), .{ .writable = false, .enumerable = true, .configurable = false });
         }
-        _ = try obj.defineOwnData("length", try val_mod.makeNumber(arena, @floatFromInt(s.len)), .{ .writable = false, .enumerable = false, .configurable = false });
+        _ = try obj.defineOwnData("length", try val_mod.makeNumber(arena, @floatFromInt(cu_len)), .{ .writable = false, .enumerable = false, .configurable = false });
         return this_val;
     }
     return val_mod.makeString(arena, s);

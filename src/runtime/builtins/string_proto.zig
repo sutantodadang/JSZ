@@ -246,17 +246,16 @@ pub fn nativeCharAt(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const s = try coerceThis(arena, this_val);
     const idx: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     const i: usize = if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeString(arena, "") else @intCast(val_mod.f64ToI64Sat(idx));
-    if (i >= s.len) return val_mod.makeString(arena, "");
-    const ch = try arena.dupe(u8, s[i .. i + 1]);
-    return val_mod.makeString(arena, ch);
+    const unit = cuUnitAt(s, i) orelse return val_mod.makeString(arena, "");
+    return val_mod.makeString(arena, try cuToString(arena, unit));
 }
 
 pub fn nativeCharCodeAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
     const idx: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     const i: usize = if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeNumber(arena, std.math.nan(f64)) else @intCast(val_mod.f64ToI64Sat(idx));
-    if (i >= s.len) return val_mod.makeNumber(arena, std.math.nan(f64));
-    return val_mod.makeNumber(arena, @floatFromInt(s[i]));
+    const unit = cuUnitAt(s, i) orelse return val_mod.makeNumber(arena, std.math.nan(f64));
+    return val_mod.makeNumber(arena, @floatFromInt(unit));
 }
 
 /// Decode one WTF-8 code point starting at byte offset `i` in `s`.
@@ -281,35 +280,178 @@ pub fn decodeWtf8At(s: []const u8, i: usize) struct { cp: u21, len: usize } {
     return .{ .cp = b0, .len = 1 };
 }
 
-/// String.prototype.codePointAt(pos): the code point whose WTF-8 encoding begins
-/// at byte offset `pos` (this engine indexes strings by byte, consistent with
-/// charCodeAt). Returns undefined when `pos` is out of range.
+// ---------------------------------------------------------------------------
+// UTF-16 code-unit view over WTF-8 storage
+//
+// JSZ stores strings as WTF-8 bytes, but ECMAScript indexes strings by UTF-16
+// code unit. These helpers translate between the two without changing storage:
+// an astral code point occupies 2 code units, whether it is stored as a 4-byte
+// UTF-8 sequence (literal source) or as a surrogate pair of two 3-byte WTF-8
+// sequences (`\u`/`fromCodePoint`). Both decode identically via `decodeWtf8At`.
+// Pure-ASCII strings incur only a tight byte-walk (byte len == code-unit len).
+// ---------------------------------------------------------------------------
+
+/// UTF-16 code-unit length of WTF-8 string `s` (BMP cp → 1 unit, astral → 2).
+pub fn cuLen(s: []const u8) usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < s.len) {
+        const b = s[i];
+        if (b < 0x80) {
+            i += 1;
+            n += 1;
+            continue;
+        }
+        const dec = decodeWtf8At(s, i);
+        n += if (dec.cp > 0xFFFF) 2 else 1;
+        i += dec.len;
+    }
+    return n;
+}
+
+/// Where a UTF-16 code-unit index lands inside a WTF-8 string.
+pub const CuLoc = struct {
+    /// Byte offset of the code point containing the requested code unit.
+    byte: usize,
+    /// True when the index is the trailing (low-surrogate) half of a 4-byte
+    /// astral code point stored as a single UTF-8 sequence.
+    low_half: bool,
+    /// True when the index is at/after the string's code-unit length.
+    past: bool,
+};
+
+/// Locate UTF-16 code-unit index `idx` within WTF-8 string `s`.
+pub fn cuLocate(s: []const u8, idx: usize) CuLoc {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < s.len) {
+        const b = s[i];
+        if (b < 0x80) {
+            if (idx == n) return .{ .byte = i, .low_half = false, .past = false };
+            i += 1;
+            n += 1;
+            continue;
+        }
+        const dec = decodeWtf8At(s, i);
+        const units: usize = if (dec.cp > 0xFFFF) 2 else 1;
+        if (idx < n + units) return .{ .byte = i, .low_half = (units == 2 and idx == n + 1), .past = false };
+        n += units;
+        i += dec.len;
+    }
+    return .{ .byte = s.len, .low_half = false, .past = true };
+}
+
+/// Byte offset of code-unit index `idx`, clamped to `s.len` when out of range.
+/// A split-astral index resolves to the start of the astral code point.
+pub fn cuByteOf(s: []const u8, idx: usize) usize {
+    return cuLocate(s, idx).byte;
+}
+
+/// Code-unit index for byte offset `byte` (number of code units before it).
+pub fn cuIndexOfByte(s: []const u8, byte: usize) usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < byte and i < s.len) {
+        const b = s[i];
+        if (b < 0x80) {
+            i += 1;
+            n += 1;
+            continue;
+        }
+        const dec = decodeWtf8At(s, i);
+        n += if (dec.cp > 0xFFFF) 2 else 1;
+        i += dec.len;
+    }
+    return n;
+}
+
+/// The UTF-16 code unit at code-unit index `idx`, or null if out of range.
+pub fn cuUnitAt(s: []const u8, idx: usize) ?u16 {
+    const loc = cuLocate(s, idx);
+    if (loc.past) return null;
+    const dec = decodeWtf8At(s, loc.byte);
+    if (dec.cp > 0xFFFF) {
+        const v: u21 = dec.cp - 0x10000;
+        return if (loc.low_half) @intCast(0xDC00 + (v & 0x3FF)) else @intCast(0xD800 + (v >> 10));
+    }
+    return @intCast(dec.cp);
+}
+
+/// Encode one UTF-16 code unit as a 1-code-unit WTF-8 string (surrogates → 3B).
+pub fn cuToString(arena: std.mem.Allocator, unit: u16) ![]const u8 {
+    if (unit < 0x80) return arena.dupe(u8, &[_]u8{@intCast(unit)});
+    if (unit < 0x800) return arena.dupe(u8, &[_]u8{ @intCast(0xC0 | (unit >> 6)), @intCast(0x80 | (unit & 0x3F)) });
+    return arena.dupe(u8, &[_]u8{ @intCast(0xE0 | (unit >> 12)), @intCast(0x80 | ((unit >> 6) & 0x3F)), @intCast(0x80 | (unit & 0x3F)) });
+}
+
+/// Slice WTF-8 string `s` by UTF-16 code-unit range [start_cu, end_cu). When a
+/// boundary splits a 4-byte astral code point, the exposed half is re-encoded as
+/// a lone surrogate so the result has exact code-unit semantics.
+pub fn cuSliceAlloc(arena: std.mem.Allocator, s: []const u8, start_cu: usize, end_cu: usize) ![]const u8 {
+    if (start_cu >= end_cu) return "";
+    const a = cuLocate(s, start_cu);
+    if (a.past) return "";
+    const b = cuLocate(s, end_cu);
+    // Fast path: neither boundary splits an astral code point → raw byte slice
+    // (preserves the original 4-byte encoding).
+    if (!a.low_half and !b.low_half) return arena.dupe(u8, s[a.byte..b.byte]);
+    var buf = std.ArrayList(u8){};
+    var i = a.byte;
+    if (a.low_half) {
+        const dec = decodeWtf8At(s, i);
+        const v: u21 = dec.cp - 0x10000;
+        try encodeWtf8Cp(&buf, arena, @intCast(0xDC00 + (v & 0x3FF)));
+        i += dec.len;
+    }
+    if (b.byte > i) try buf.appendSlice(arena, s[i..b.byte]);
+    if (b.low_half) {
+        const dec = decodeWtf8At(s, b.byte);
+        const v: u21 = dec.cp - 0x10000;
+        try encodeWtf8Cp(&buf, arena, @intCast(0xD800 + (v >> 10)));
+    }
+    return arena.dupe(u8, buf.items);
+}
+
+/// String.prototype.codePointAt(pos): the code point at UTF-16 code-unit index
+/// `pos`. A leading surrogate followed by a trailing surrogate combines into the
+/// astral code point; a lone/low surrogate yields its own value. Returns
+/// undefined when `pos` is out of range.
 pub fn nativeCodePointAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
     const idx: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     if (idx < 0.0 or std.math.isNan(idx)) return val_mod.makeUndefined(arena);
-    const i: usize = @intCast(val_mod.f64ToI64Sat(idx));
-    if (i >= s.len) return val_mod.makeUndefined(arena);
-    const dec = decodeWtf8At(s, i);
-    return val_mod.makeNumber(arena, @floatFromInt(dec.cp));
+    const cu: usize = @intCast(val_mod.f64ToI64Sat(idx));
+    // CodePointAt (ES 21.1.3.4): read the code unit at `cu`; if it is a leading
+    // surrogate immediately followed by a trailing surrogate, combine them into
+    // the astral code point. Working through cuUnitAt makes this correct for both
+    // storage forms — a 4-byte UTF-8 astral char and a two-sequence surrogate
+    // pair both surface as a leading/trailing code-unit pair.
+    const first = cuUnitAt(s, cu) orelse return val_mod.makeUndefined(arena);
+    if (first < 0xD800 or first > 0xDBFF) return val_mod.makeNumber(arena, @floatFromInt(first));
+    const second = cuUnitAt(s, cu + 1) orelse return val_mod.makeNumber(arena, @floatFromInt(first));
+    if (second < 0xDC00 or second > 0xDFFF) return val_mod.makeNumber(arena, @floatFromInt(first));
+    const cp: u32 = (@as(u32, first - 0xD800) << 10) + (@as(u32, second - 0xDC00)) + 0x10000;
+    return val_mod.makeNumber(arena, @floatFromInt(cp));
 }
 
 pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
     const search = try argToString(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
+    const len = cuLen(s);
     const pos: f64 = if (args.len > 1) try argToInteger(arena, args[1]) else 0;
-    const from = clampToLen(pos, s.len);
+    const from_cu = clampToLen(pos, len);
+    const from = cuByteOf(s, from_cu);
 
-    if (from >= s.len and search.len > 0) return val_mod.makeNumber(arena, -1.0);
+    if (from_cu >= len and search.len > 0) return val_mod.makeNumber(arena, -1.0);
     if (std.mem.indexOf(u8, s[from..], search)) |p| {
-        return val_mod.makeNumber(arena, @floatFromInt(p + from));
+        return val_mod.makeNumber(arena, @floatFromInt(cuIndexOfByte(s, p + from)));
     }
     return val_mod.makeNumber(arena, -1.0);
 }
 
 pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const len = s.len;
+    const len = cuLen(s);
 
     const start_raw: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     const end_raw: f64 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
@@ -321,8 +463,7 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const end_ = normalizeIndex(end_raw, len);
 
     if (start >= end_) return val_mod.makeString(arena, "");
-    const slice = try arena.dupe(u8, s[start..end_]);
-    return val_mod.makeString(arena, slice);
+    return val_mod.makeString(arena, try cuSliceAlloc(arena, s, start, end_));
 }
 
 pub fn nativeToUpperCase(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -945,7 +1086,8 @@ pub fn nativeStartsWith(arena: std.mem.Allocator, this_val: Value, args: []const
     const s = try coerceThis(arena, this_val);
     if (args.len > 0) try rejectRegExp(arena, args[0]);
     const search = try argToString(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
-    const pos = if (args.len > 1) clampToLen(try argToInteger(arena, args[1]), s.len) else 0;
+    const pos_cu = if (args.len > 1) clampToLen(try argToInteger(arena, args[1]), cuLen(s)) else 0;
+    const pos = cuByteOf(s, pos_cu);
     if (pos + search.len > s.len) return val_mod.makeBool(arena, false);
     return val_mod.makeBool(arena, std.mem.eql(u8, s[pos .. pos + search.len], search));
 }
@@ -955,10 +1097,11 @@ pub fn nativeEndsWith(arena: std.mem.Allocator, this_val: Value, args: []const V
     const s = try coerceThis(arena, this_val);
     if (args.len > 0) try rejectRegExp(arena, args[0]);
     const search = try argToString(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
-    const end_: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
-        clampToLen(try argToInteger(arena, args[1]), s.len)
+    const end_cu: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
+        clampToLen(try argToInteger(arena, args[1]), cuLen(s))
     else
-        s.len;
+        cuLen(s);
+    const end_ = cuByteOf(s, end_cu);
     if (search.len > end_) return val_mod.makeBool(arena, false);
     return val_mod.makeBool(arena, std.mem.eql(u8, s[end_ - search.len .. end_], search));
 }
@@ -968,7 +1111,8 @@ pub fn nativeStringIncludes(arena: std.mem.Allocator, this_val: Value, args: []c
     const s = try coerceThis(arena, this_val);
     if (args.len > 0) try rejectRegExp(arena, args[0]);
     const search = try argToString(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
-    const pos = if (args.len > 1) clampToLen(try argToInteger(arena, args[1]), s.len) else 0;
+    const pos_cu = if (args.len > 1) clampToLen(try argToInteger(arena, args[1]), cuLen(s)) else 0;
+    const pos = cuByteOf(s, pos_cu);
     if (pos > s.len) return val_mod.makeBool(arena, false);
     return val_mod.makeBool(arena, std.mem.indexOf(u8, s[pos..], search) != null);
 }
@@ -1006,27 +1150,32 @@ fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
     return val_mod.formatNumber(arena, n);
 }
 
-/// Build a pad filler of `count` bytes by repeating `pad`.
+/// Build a pad filler of exactly `count` UTF-16 code units by repeating `pad`
+/// (truncating the final repeat at a code-unit boundary).
 fn buildFiller(arena: std.mem.Allocator, pad: []const u8, count: usize) ![]const u8 {
+    const pad_cu = cuLen(pad);
     var buf = std.ArrayList(u8){};
-    while (buf.items.len < count) {
-        const remaining = count - buf.items.len;
-        try buf.appendSlice(arena, if (pad.len <= remaining) pad else pad[0..remaining]);
+    var have: usize = 0;
+    while (have + pad_cu <= count) {
+        try buf.appendSlice(arena, pad);
+        have += pad_cu;
     }
+    if (have < count) try buf.appendSlice(arena, try cuSliceAlloc(arena, pad, 0, count - have));
     return buf.items;
 }
 
 fn padImpl(arena: std.mem.Allocator, this_val: Value, args: []const Value, at_start: bool) anyerror!Value {
     const s = try coerceThis(arena, this_val);
+    const s_cu = cuLen(s);
     const max_len = if (args.len > 0) try argToInteger(arena, args[0]) else 0;
     const target: usize = if (max_len <= 0) 0 else @intCast(val_mod.f64ToI64Sat(max_len));
-    if (target <= s.len) return val_mod.makeString(arena, s);
+    if (target <= s_cu) return val_mod.makeString(arena, s);
     const pad: []const u8 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
         try argToString(arena, args[1])
     else
         " ";
     if (pad.len == 0) return val_mod.makeString(arena, s);
-    const filler = try buildFiller(arena, pad, target - s.len);
+    const filler = try buildFiller(arena, pad, target - s_cu);
     var buf = std.ArrayList(u8){};
     if (at_start) {
         try buf.appendSlice(arena, filler);
@@ -1147,7 +1296,7 @@ pub fn nativeSup(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
 /// NaN/negatives → 0; clamped to [0, len]; min(a,b)..max(a,b).
 pub fn nativeSubstring(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const len = s.len;
+    const len = cuLen(s);
 
     const clampIdx = struct {
         fn f(n: f64, l: usize) usize {
@@ -1168,13 +1317,13 @@ pub fn nativeSubstring(arena: std.mem.Allocator, this_val: Value, args: []const 
 
     const from = if (a < b) a else b;
     const to = if (a < b) b else a;
-    return val_mod.makeString(arena, try arena.dupe(u8, s[from..to]));
+    return val_mod.makeString(arena, try cuSliceAlloc(arena, s, from, to));
 }
 
 /// String.prototype.substr(start, length) — legacy (Annex B).
 pub fn nativeSubstr(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const len = s.len;
+    const len = cuLen(s);
 
     const start_f: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     const int_start: i64 = if (std.math.isNan(start_f)) 0 else val_mod.f64ToI64Sat(start_f);
@@ -1198,18 +1347,19 @@ pub fn nativeSubstr(arena: std.mem.Allocator, this_val: Value, args: []const Val
     else
         len - start;
 
-    return val_mod.makeString(arena, try arena.dupe(u8, s[start .. start + size]));
+    return val_mod.makeString(arena, try cuSliceAlloc(arena, s, start, start + size));
 }
 
 /// String.prototype.at(index) — ES2022.
 pub fn nativeStringAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
+    const len = cuLen(s);
     const raw: f64 = if (args.len > 0) try argToInteger(arena, args[0]) else 0.0;
     var k: i64 = if (std.math.isNan(raw)) 0 else val_mod.f64ToI64Sat(raw);
-    if (k < 0) k = @as(i64, @intCast(s.len)) + k;
-    if (k < 0 or k >= @as(i64, @intCast(s.len))) return val_mod.makeUndefined(arena);
-    const idx: usize = @intCast(k);
-    return val_mod.makeString(arena, try arena.dupe(u8, s[idx .. idx + 1]));
+    if (k < 0) k = @as(i64, @intCast(len)) + k;
+    if (k < 0 or k >= @as(i64, @intCast(len))) return val_mod.makeUndefined(arena);
+    const unit = cuUnitAt(s, @intCast(k)) orelse return val_mod.makeUndefined(arena);
+    return val_mod.makeString(arena, try cuToString(arena, unit));
 }
 
 /// String.prototype.repeat(count) — ES2015.
@@ -1249,20 +1399,24 @@ pub fn nativeLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []cons
             pos = if (std.math.isInf(num_pos)) num_pos else std.math.trunc(num_pos);
         }
     }
-    const pos_limit: usize = clampToLen(pos, s.len);
+    const len_cu = cuLen(s);
+    const pos_limit_cu: usize = clampToLen(pos, len_cu);
 
     if (search.len == 0) {
-        return val_mod.makeNumber(arena, @floatFromInt(if (pos_limit > s.len) s.len else pos_limit));
+        return val_mod.makeNumber(arena, @floatFromInt(if (pos_limit_cu > len_cu) len_cu else pos_limit_cu));
     }
     if (s.len < search.len) return val_mod.makeNumber(arena, -1.0);
 
-    const max_start: usize = if (pos_limit > s.len - search.len) s.len - search.len else pos_limit;
+    // Match start must be at code-unit index <= pos_limit_cu; translate that
+    // ceiling to a byte offset, then search backwards over bytes.
+    const pos_limit_byte = cuByteOf(s, pos_limit_cu);
+    const max_start: usize = if (pos_limit_byte > s.len - search.len) s.len - search.len else pos_limit_byte;
 
     var i: usize = max_start + 1;
     while (i > 0) {
         i -= 1;
         if (std.mem.eql(u8, s[i .. i + search.len], search)) {
-            return val_mod.makeNumber(arena, @floatFromInt(i));
+            return val_mod.makeNumber(arena, @floatFromInt(cuIndexOfByte(s, i)));
         }
     }
     return val_mod.makeNumber(arena, -1.0);

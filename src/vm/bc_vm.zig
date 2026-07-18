@@ -2279,17 +2279,19 @@ pub const BcVm = struct {
                 return val_mod.makeUndefined(self.arena);
             },
             .string => |s| {
-                // Phase 4b: autoboxing for string primitives.
+                const string_proto = @import("../runtime/builtins/string_proto.zig");
+                // Phase 4b: autoboxing for string primitives. `length` is the UTF-16
+                // code-unit count (astral code points count as 2), not byte length.
                 if (std.mem.eql(u8, key, "length")) {
-                    return val_mod.makeNumber(self.arena, @floatFromInt(s.len));
+                    return val_mod.makeNumber(self.arena, @floatFromInt(string_proto.cuLen(s)));
                 }
                 // String exotic own indexed properties: a canonical integer index in
-                // [0, length) reads the code unit (byte) at that position as a
-                // 1-char string. ToString-round-trip ensures only canonical indices
-                // (no leading zeros / "+1" / "1.0") match.
+                // [0, length) reads the UTF-16 code unit at that position as a
+                // 1-code-unit string. ToString-round-trip ensures only canonical
+                // indices (no leading zeros / "+1" / "1.0") match.
                 if (asArrayIndex(key)) |i| {
-                    if (i < s.len) return val_mod.makeString(self.arena, s[i .. i + 1]);
-                    return val_mod.makeUndefined(self.arena);
+                    const unit = string_proto.cuUnitAt(s, i) orelse return val_mod.makeUndefined(self.arena);
+                    return val_mod.makeString(self.arena, try string_proto.cuToString(self.arena, unit));
                 }
                 // Delegate to String.prototype
                 const realm_mod = @import("../runtime/realm.zig");
