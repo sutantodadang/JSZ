@@ -24,6 +24,20 @@ const intrinsics = @import("intrinsics.zig");
 const coercion = @import("coercion.zig");
 const coll = @import("es2015_collections.zig");
 const string_proto_mod = @import("string_proto.zig");
+const promise_mod = @import("promise.zig");
+
+/// A parked Atomics.waitAsync waiter: an async waiter that matched its expected
+/// value (so it would have blocked) and is now waiting to be woken by
+/// Atomics.notify. Keyed by (backing store, absolute byte index). `handle` is an
+/// opaque pointer to the pending promise settled with "ok" when notified.
+const AsyncWaiter = struct {
+    ab: *ArrayBufferData,
+    byte_index: usize,
+    handle: *anyopaque,
+};
+/// Engine-lifetime waiter list (single agent; woken synchronously by notify).
+/// page_allocator so the list survives across native calls / arenas.
+var async_waiters: std.ArrayListUnmanaged(AsyncWaiter) = .empty;
 
 /// R1: install ArrayBuffer / %TypedArray% / per-kind ctors / DataView and bind globals.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -1277,8 +1291,9 @@ fn validateIntegerTA(arena: std.mem.Allocator, val: Value, waitable: bool) anyer
     return td;
 }
 
-/// Atomics.notify(typedArray, index, count) → number of agents woken. With no
-/// other agents this is always 0; validation still runs first.
+/// Atomics.notify(typedArray, index, count) → number of waiters woken. Wakes up
+/// to `count` async waiters (from Atomics.waitAsync) parked on the same backing
+/// store + byte index, resolving each parked promise with "ok".
 pub fn nativeAtomicsNotify(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const a0 = if (args.len > 0) args[0] else Value{};
     const td = try validateIntegerTA(arena, a0, true);
@@ -1286,9 +1301,29 @@ pub fn nativeAtomicsNotify(arena: std.mem.Allocator, _: Value, args: []const Val
     const idx = try toIndexThrowing(arena, if (args.len > 1) args[1] else Value{});
     if (idx >= td.length) return throwRangeError(arena, "Atomics.notify index out of range");
     // count: undefined → +∞ (all), else max(ToInteger, 0). Observed for coercion side effects.
+    var remaining: f64 = std.math.inf(f64);
     if (args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_)
-        _ = try toIntegerThrowing(arena, args[2]);
-    return val_mod.makeNumber(arena, 0);
+        remaining = @max(try toIntegerThrowing(arena, args[2]), 0);
+    // Shared, non-detached buffers only carry live waiters.
+    if (!td.ab.shared or td.ab.detached) return val_mod.makeNumber(arena, 0);
+
+    const elem_size: usize = if (td.kind == .i64big) 8 else 4;
+    const byte_index = td.byte_offset + idx * elem_size;
+    const ok = try val_mod.makeString(arena, "ok");
+    var woken: u32 = 0;
+    var i: usize = 0;
+    while (i < async_waiters.items.len and remaining > 0) {
+        const w = async_waiters.items[i];
+        if (w.ab == td.ab and w.byte_index == byte_index) {
+            _ = async_waiters.orderedRemove(i);
+            promise_mod.resolveInternalPromise(arena, w.handle, ok);
+            woken += 1;
+            remaining -= 1;
+            continue; // orderedRemove shifted the next waiter into slot i
+        }
+        i += 1;
+    }
+    return val_mod.makeNumber(arena, @floatFromInt(woken));
 }
 
 /// Atomics.wait(typedArray, index, value, timeout). No agent can ever signal
@@ -1315,9 +1350,13 @@ pub fn nativeAtomicsWait(arena: std.mem.Allocator, _: Value, args: []const Value
 }
 
 /// Atomics.waitAsync(typedArray, index, value, timeout) → { async, value }.
-/// Single-agent: compare stored value against expected; return "timed-out" when
-/// they match (would have blocked but timeout=0 fires immediately), "not-equal"
-/// otherwise. Full spec-exact argument validation runs before any read.
+/// Single-agent semantics: if the stored value does not match the expected value
+/// the waiter would not block → { async: false, value: "not-equal" }. If it
+/// matches and timeout is 0 → { async: false, value: "timed-out" } (would have
+/// waited, but the timeout fires immediately). If it matches and timeout > 0
+/// (including +∞) → { async: true, value: <promise> }; the promise is parked in
+/// the waiter list and settled with "ok" by a later Atomics.notify. Full
+/// spec-exact argument validation and coercion order runs before any read.
 pub fn nativeAtomicsWaitAsync(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const a0 = if (args.len > 0) args[0] else Value{};
     const td = try validateIntegerTA(arena, a0, true);
@@ -1335,22 +1374,38 @@ pub fn nativeAtomicsWaitAsync(arena: std.mem.Allocator, _: Value, args: []const 
     } else {
         v_num = try toIntegerThrowing(arena, val_arg);
     }
-    _ = try toNumberThrowing(arena, if (args.len > 3) args[3] else Value{});
-    // Compare stored value: "timed-out" if match (would have waited), else "not-equal".
-    const result_str: []const u8 = if (!td.ab.detached) blk: {
-        const matched = if (td.kind == .i64big)
-            atomicReadRaw64(td, idx) == v_big
-        else inner: {
-            const old = try taLoad(arena, td, idx);
-            break :inner wrapUnsigned(u32, toNum(old)) == wrapUnsigned(u32, v_num);
-        };
-        break :blk if (matched) "timed-out" else "not-equal";
-    } else "not-equal";
+    // q = ToNumber(timeout); NaN (incl. undefined) → +∞, else t = max(q, 0).
+    const q = try toNumberThrowing(arena, if (args.len > 3) args[3] else Value{});
+    const t: f64 = if (std.math.isNan(q)) std.math.inf(f64) else @max(q, 0);
+
+    const matched = !td.ab.detached and (if (td.kind == .i64big)
+        atomicReadRaw64(td, idx) == v_big
+    else blk: {
+        const old = try taLoad(arena, td, idx);
+        break :blk wrapUnsigned(u32, toNum(old)) == wrapUnsigned(u32, v_num);
+    });
+
+    // Value matches and the timeout is non-zero → would block. Park an async
+    // waiter and hand back a promise that Atomics.notify resolves with "ok".
+    if (matched and t > 0) {
+        const ip = try promise_mod.makeInternalPromise(arena);
+        const elem_size: usize = if (td.kind == .i64big) 8 else 4;
+        async_waiters.append(std.heap.page_allocator, .{
+            .ab = td.ab,
+            .byte_index = td.byte_offset + idx * elem_size,
+            .handle = ip.handle,
+        }) catch {};
+        const res = try JsObject.create(arena, realm_mod.active_object_proto);
+        _ = try res.defineOwnData("async", try val_mod.makeBool(arena, true), .{ .writable = true, .enumerable = true, .configurable = true });
+        _ = try res.defineOwnData("value", ip.promise, .{ .writable = true, .enumerable = true, .configurable = true });
+        return val_mod.makeObject(arena, res);
+    }
+
+    // Otherwise synchronous: "timed-out" if it matched (t == 0), else "not-equal".
+    const result_str: []const u8 = if (matched) "timed-out" else "not-equal";
     const res = try JsObject.create(arena, realm_mod.active_object_proto);
-    _ = try res.defineOwnData("async", try val_mod.makeBool(arena, false),
-        .{ .writable = true, .enumerable = true, .configurable = true });
-    _ = try res.defineOwnData("value", try val_mod.makeString(arena, result_str),
-        .{ .writable = true, .enumerable = true, .configurable = true });
+    _ = try res.defineOwnData("async", try val_mod.makeBool(arena, false), .{ .writable = true, .enumerable = true, .configurable = true });
+    _ = try res.defineOwnData("value", try val_mod.makeString(arena, result_str), .{ .writable = true, .enumerable = true, .configurable = true });
     return val_mod.makeObject(arena, res);
 }
 

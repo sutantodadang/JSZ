@@ -110,6 +110,26 @@ fn makePendingPromise(arena: std.mem.Allocator) !Value {
     return makePromise(arena, .pending, try val_mod.makeUndefined(arena));
 }
 
+/// Host/internal handle to a pending promise: the JS `promise` value plus an
+/// opaque handle to its internal state, so a native caller (e.g.
+/// Atomics.waitAsync) can settle it later via `resolveInternalPromise`.
+pub const InternalPromise = struct { promise: Value, handle: *anyopaque };
+
+/// Create a pending promise for internal use. The returned handle stays valid as
+/// long as the promise object is reachable from JS (it is the same arena/heap
+/// allocation), so keep the `promise` value rooted until it is settled.
+pub fn makeInternalPromise(arena: std.mem.Allocator) !InternalPromise {
+    const p = try makePendingPromise(arena);
+    return .{ .promise = p, .handle = @ptrCast(getData(p).?) };
+}
+
+/// Resolve an internal promise (from `makeInternalPromise`) with `v`, running the
+/// normal resolve semantics (thenable assimilation + reaction scheduling).
+pub fn resolveInternalPromise(arena: std.mem.Allocator, handle: *anyopaque, v: Value) void {
+    const d: *PromiseData = @ptrCast(@alignCast(handle));
+    promiseResolveData(arena, d, v);
+}
+
 fn settlePromise(data: *PromiseData, state: PromiseState, value: Value) void {
     if (data.state != .pending) return;
     data.state = state;

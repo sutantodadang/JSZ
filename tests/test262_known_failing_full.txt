@@ -799,10 +799,6 @@ built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/return-val.js
 built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/throw-rejected-return.js
 built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/throw-return-getter.js
 built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/throw-return.js
-built-ins/Atomics/waitAsync/bigint/undefined-for-timeout.js
-built-ins/Atomics/waitAsync/implicit-infinity-for-timeout.js
-built-ins/Atomics/waitAsync/returns-result-object-value-is-promise-resolves-to-ok.js
-built-ins/Atomics/waitAsync/undefined-for-timeout.js
 built-ins/BigInt/asIntN/arithmetic.js
 built-ins/BigInt/asIntN/asIntN.js
 built-ins/BigInt/asIntN/bigint-tobigint-errors.js
