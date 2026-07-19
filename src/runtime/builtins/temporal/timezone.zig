@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Wave 26: time-zone identifier machinery for Temporal.ZonedDateTime.
+//! Wave 27: time-zone identifier machinery for Temporal.ZonedDateTime.
 //!
 //! This test262 corpus targets the current Temporal proposal, in which
 //! `Temporal.TimeZone` and `Temporal.Calendar` are NO LONGER objects — time
@@ -7,17 +7,18 @@
 //! asserts `!("TimeZone" in Temporal)`.) So there is no exotic TimeZone type
 //! here; instead we parse/normalize identifier strings and compute UTC offsets.
 //!
-//! Supported zones: "UTC" and fixed numeric offsets ("+01:00", "-08:00", …) at
-//! minute precision. Named IANA zones (with DST rules) are not modeled — they
-//! are essentially absent from the corpus.
+//! Supported zones: "UTC", fixed numeric offsets ("+01:00", "-08:00", …) at
+//! minute precision, and named IANA zones (with DST rules) via embedded tzdata.
 const std = @import("std");
 const val_mod = @import("../../../value/value.zig");
 const Value = val_mod.Value;
 const realm_mod = @import("../../realm.zig");
 const shared = @import("shared.zig");
+const tzdata = @import("tzdata.zig");
 
-/// Result of resolving a time-zone identifier: its normalized id and its fixed
-/// UTC offset in nanoseconds.
+/// Result of resolving a time-zone identifier: its normalized id and its UTC
+/// offset in nanoseconds at the queried instant (may differ per instant for
+/// named IANA zones with DST).
 pub const Zone = struct {
     id: []const u8,
     offset_ns: i128,
@@ -91,8 +92,13 @@ fn extractBracket(s: []const u8) ?[]const u8 {
 /// Resolve a time-zone identifier string (from a ctor arg or property bag) into
 /// a Zone. Throws RangeError on an invalid string.
 ///
-/// Accepts: "UTC" (any case), a bare offset identifier ("+01:00", "-08", …), or
-/// a datetime string carrying a `[tz]` bracket / trailing offset / `Z`.
+/// Accepts: "UTC" (any case), a bare offset identifier ("+01:00", "-08", …), a
+/// named IANA zone ("America/New_York", …), or a datetime string carrying a
+/// `[tz]` bracket / trailing offset / `Z`.
+///
+/// For IANA zones the offset depends on the instant; use `toZoneAtInstant` when
+/// the epoch nanoseconds are known. This variant returns the standard (non-DST)
+/// offset for IANA zones.
 pub fn toZone(arena: std.mem.Allocator, s0: []const u8) !Zone {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     if (s.len == 0) return realm_mod.throwRangeError(arena, "invalid time zone");
@@ -100,25 +106,76 @@ pub fn toZone(arena: std.mem.Allocator, s0: []const u8) !Zone {
     // 1. Direct "UTC".
     if (eqIgnoreCase(s, "UTC")) return .{ .id = "UTC", .offset_ns = 0 };
 
-    // 2. Direct offset identifier.
+    // 2. Direct IANA zone name.
+    if (tzdata.isKnownZone(s)) {
+        const def = tzdata.lookupDef(s) orelse unreachable;
+        return .{ .id = def.name, .offset_ns = @as(i128, def.std_offset_sec) * shared.NS_PER_SECOND };
+    }
+
+    // 3. Direct offset identifier.
     var buf: [7]u8 = undefined;
     if (parseOffsetIdentifier(s, &buf)) |ns| {
         return .{ .id = try arena.dupe(u8, buf[0..6]), .offset_ns = ns };
     }
 
-    // 3. A datetime string. The whole datetime must still be valid (e.g. a
+    // 4. A datetime string. The whole datetime must still be valid (e.g. a
     //    negative-zero extended year is rejected even when a [tz] bracket is
     //    present); then the identifier comes from the [tz] bracket if present,
     //    else from the trailing offset / Z designator.
     _ = shared.parseISODateTime(s) catch return realm_mod.throwRangeError(arena, "invalid time zone string");
     if (extractBracket(s)) |inner| {
         if (eqIgnoreCase(inner, "UTC")) return .{ .id = "UTC", .offset_ns = 0 };
+        if (tzdata.isKnownZone(inner)) {
+            const def = tzdata.lookupDef(inner) orelse unreachable;
+            return .{ .id = def.name, .offset_ns = @as(i128, def.std_offset_sec) * shared.NS_PER_SECOND };
+        }
         if (parseOffsetIdentifier(inner, &buf)) |ns| {
             return .{ .id = try arena.dupe(u8, buf[0..6]), .offset_ns = ns };
         }
         return realm_mod.throwRangeError(arena, "invalid time zone annotation");
     }
     // No bracket: must be a datetime with a Z or minute-precision offset.
+    return zoneFromDateTimeOffset(arena, s);
+}
+
+/// Resolve a time-zone identifier at a given instant (epoch nanoseconds).
+/// Returns the correct UTC offset (DST-aware) for named IANA zones.
+pub fn toZoneAtInstant(arena: std.mem.Allocator, s0: []const u8, epoch_ns: i128) !Zone {
+    const s = std.mem.trim(u8, s0, " \t\n\r");
+    if (s.len == 0) return realm_mod.throwRangeError(arena, "invalid time zone");
+
+    // 1. Direct "UTC".
+    if (eqIgnoreCase(s, "UTC")) return .{ .id = "UTC", .offset_ns = 0 };
+
+    // 2. Direct IANA zone name → compute offset at instant.
+    if (tzdata.isKnownZone(s)) {
+        const def = tzdata.lookupDef(s) orelse unreachable;
+        const unix_sec: i64 = @intCast(@divFloor(epoch_ns, shared.NS_PER_SECOND));
+        const offset_sec = tzdata.offsetAt(def, unix_sec) orelse def.std_offset_sec;
+        return .{ .id = def.name, .offset_ns = @as(i128, offset_sec) * shared.NS_PER_SECOND };
+    }
+
+    // 3. Direct offset identifier.
+    var buf: [7]u8 = undefined;
+    if (parseOffsetIdentifier(s, &buf)) |ns| {
+        return .{ .id = try arena.dupe(u8, buf[0..6]), .offset_ns = ns };
+    }
+
+    // 4. Datetime string.
+    _ = shared.parseISODateTime(s) catch return realm_mod.throwRangeError(arena, "invalid time zone string");
+    if (extractBracket(s)) |inner| {
+        if (eqIgnoreCase(inner, "UTC")) return .{ .id = "UTC", .offset_ns = 0 };
+        if (tzdata.isKnownZone(inner)) {
+            const def = tzdata.lookupDef(inner) orelse unreachable;
+            const unix_sec: i64 = @intCast(@divFloor(epoch_ns, shared.NS_PER_SECOND));
+            const offset_sec = tzdata.offsetAt(def, unix_sec) orelse def.std_offset_sec;
+            return .{ .id = def.name, .offset_ns = @as(i128, offset_sec) * shared.NS_PER_SECOND };
+        }
+        if (parseOffsetIdentifier(inner, &buf)) |ns| {
+            return .{ .id = try arena.dupe(u8, buf[0..6]), .offset_ns = ns };
+        }
+        return realm_mod.throwRangeError(arena, "invalid time zone annotation");
+    }
     return zoneFromDateTimeOffset(arena, s);
 }
 
