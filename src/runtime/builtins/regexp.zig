@@ -361,6 +361,15 @@ pub const CompiledRegex = struct {
     group_names: []const NameIdx = &.{},
     /// arena allocator used for node storage
     alloc: std.mem.Allocator,
+    /// Wave 23: compiled Pike-VM program (non-backtracking, linear-time).
+    /// Non-null when the pattern is Pike-eligible (no top-level backreference).
+    /// When null, execution falls back to the recursive backtracking matcher.
+    program: ?*Program = null,
+    /// Lazily-initialized PikeVM execution state (reused across matches).
+    pike_vm: ?PikeVM = null,
+    /// Whether the pattern contains a backreference outside any lookaround.
+    /// Such patterns are NP-hard in general, so they keep the backtracker.
+    has_backref: bool = false,
 
     pub const Flags = struct {
         ignore_case: bool = false,
@@ -1066,8 +1075,11 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
     const names = try scanGroupNames(alloc, pattern);
     var pp = PatternParser.init(pattern, alloc, flags.unicode);
     pp.group_names = names;
-    const root = pp.parseAlt() catch return error.InvalidPattern;
+    const root = try pp.parseAlt();
     if (!pp.eof()) return error.InvalidPattern; // unconsumed chars
+
+    const br = hasBackref(&root);
+    const prog = if (!br) buildProgram(alloc, &root, pp.next_cap - 1) else null;
 
     return CompiledRegex{
         .root = root,
@@ -1075,6 +1087,8 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
         .num_captures = pp.next_cap - 1,
         .group_names = names,
         .alloc = alloc,
+        .has_backref = br,
+        .program = prog,
     };
 }
 
@@ -1152,6 +1166,15 @@ pub fn matchAt(
     input: []const u8,
     start: usize,
 ) ?MatchState {
+    // Use the Pike VM when a compiled program is available (non-backtracking).
+    if (regex.program) |prog| {
+        // Lazily initialize the PikeVM state (reused across matchAt calls).
+        const cr = @constCast(regex);
+        if (cr.pike_vm == null) {
+            cr.pike_vm = PikeVM.init(regex.alloc, prog) catch return null;
+        }
+        return cr.pike_vm.?.runAnchored(input, start, &regex.flags);
+    }
     var caps = [_]CaptureSpan{INVALID_CAP} ** MAX_CAPTURES;
     const end_pos = matchNode(&regex.root, input, start, &caps, &regex.flags) orelse return null;
     return MatchState{ .pos = end_pos, .captures = caps };
@@ -1236,6 +1259,102 @@ fn foldCaseCp(cp: u21) u21 {
     // Already lowercase or no simple fold: return as-is.
     return cp;
 }
+// --- Shared single-position primitives (used by both matchNode and the Pike VM)
+// so the two execution engines agree on every character-level semantic.
+
+/// Try to consume a single literal codepoint `ch` at `pos`. Returns the new
+/// position on success, or null. Honors `/u` (codepoint vs byte) and `/i`.
+fn consumeLiteral(input: []const u8, pos: usize, ch: u21, flags: *const CompiledRegex.Flags) ?usize {
+    if (pos >= input.len) return null;
+    if (flags.unicode) {
+        const dc = decodeUtf8At(input, pos);
+        const input_cp = dc.cp;
+        if (flags.ignore_case) {
+            if (foldCaseCp(input_cp) != foldCaseCp(ch)) return null;
+        } else {
+            if (input_cp != ch) return null;
+        }
+        return pos + dc.len;
+    } else {
+        if (ch > 255) return null; // BMP+ literal can't match in byte mode
+        const c = input[pos];
+        const cb: u8 = @intCast(ch);
+        if (flags.ignore_case) {
+            if (foldCase(c) != foldCase(cb)) return null;
+        } else {
+            if (c != cb) return null;
+        }
+        return pos + 1;
+    }
+}
+
+/// Try to consume one character matching char class `cc` at `pos`.
+fn consumeClass(input: []const u8, pos: usize, cc: *const CharClass, flags: *const CompiledRegex.Flags) ?usize {
+    if (pos >= input.len) return null;
+    if (flags.unicode) {
+        const dc = decodeUtf8At(input, pos);
+        var cp = dc.cp;
+        if (flags.ignore_case) cp = foldCaseCp(cp);
+        var hit = cc.matchesCp(cp);
+        if (flags.ignore_case and !hit) {
+            const alt: u21 = if (cp >= 'a' and cp <= 'z')
+                cp - 32
+            else if (cp >= 'A' and cp <= 'Z')
+                cp + 32
+            else
+                cp;
+            if (alt != cp) hit = cc.matchesCp(alt);
+        }
+        if (!hit) return null;
+        return pos + dc.len;
+    } else {
+        var c = input[pos];
+        if (flags.ignore_case) c = foldCase(c);
+        var hit = cc.bitmap[c];
+        if (flags.ignore_case and !hit) {
+            const alt = if (c >= 'a' and c <= 'z') c - 32 else if (c >= 'A' and c <= 'Z') c + 32 else c;
+            hit = cc.bitmap[alt];
+        }
+        const result = if (cc.negate) !hit else hit;
+        if (!result) return null;
+        return pos + 1;
+    }
+}
+
+/// Try to consume one character for `.` (dot) at `pos`.
+fn consumeDot(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) ?usize {
+    if (pos >= input.len) return null;
+    if (flags.unicode) {
+        const dc = decodeUtf8At(input, pos);
+        if (!flags.dotall and isUnicodeLineTerminator(dc.cp)) return null;
+        return pos + dc.len;
+    } else {
+        const c = input[pos];
+        if (!flags.dotall and isLineTerminator(c)) return null;
+        return pos + 1;
+    }
+}
+
+/// Zero-width `^` assertion test.
+fn testBol(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) bool {
+    if (pos == 0) return true;
+    if (flags.multiline and pos > 0 and isLineTerminator(input[pos - 1])) return true;
+    return false;
+}
+
+/// Zero-width `$` assertion test.
+fn testEol(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) bool {
+    if (pos == input.len) return true;
+    if (flags.multiline and pos < input.len and isLineTerminator(input[pos])) return true;
+    return false;
+}
+
+/// True at a word boundary (\b); its negation is \B.
+fn atWordBoundary(input: []const u8, pos: usize) bool {
+    const before = if (pos > 0) isWordChar(input[pos - 1]) else false;
+    const after = if (pos < input.len) isWordChar(input[pos]) else false;
+    return before != after;
+}
 
 fn matchNode(
     node: *const RegexNode,
@@ -1245,99 +1364,13 @@ fn matchNode(
     flags: *const CompiledRegex.Flags,
 ) ?usize {
     switch (node.*) {
-        .literal => |ch| {
-            if (pos >= input.len) return null;
-            if (flags.unicode) {
-                // Decode full codepoint from input and compare as u21.
-                const dc = decodeUtf8At(input, pos);
-                const input_cp = dc.cp;
-                if (flags.ignore_case) {
-                    if (foldCaseCp(input_cp) != foldCaseCp(ch)) return null;
-                } else {
-                    if (input_cp != ch) return null;
-                }
-                return pos + dc.len;
-            } else {
-                // Byte mode (non-unicode): compare single bytes.
-                if (ch > 255) return null; // BMP+ literal can't match in byte mode
-                const c = input[pos];
-                const cb: u8 = @intCast(ch);
-                if (flags.ignore_case) {
-                    if (foldCase(c) != foldCase(cb)) return null;
-                } else {
-                    if (c != cb) return null;
-                }
-                return pos + 1;
-            }
-        },
-        .char_class => |cc| {
-            if (pos >= input.len) return null;
-            if (flags.unicode) {
-                // Decode codepoint, match against bitmap + extra_ranges.
-                const dc = decodeUtf8At(input, pos);
-                var cp = dc.cp;
-                if (flags.ignore_case) cp = foldCaseCp(cp);
-                // For case-insensitive, also check folded lower/upper in the class.
-                var hit = cc.matchesCp(cp);
-                if (flags.ignore_case and !hit) {
-                    // Try the other case fold direction (lower -> upper, upper -> lower).
-                    const alt: u21 = if (cp >= 'a' and cp <= 'z')
-                        cp - 32
-                    else if (cp >= 'A' and cp <= 'Z')
-                        cp + 32
-                    else
-                        cp;
-                    if (alt != cp) hit = cc.matchesCp(alt);
-                }
-                if (!hit) return null;
-                return pos + dc.len;
-            } else {
-                var c = input[pos];
-                if (flags.ignore_case) c = foldCase(c);
-                var hit = cc.bitmap[c];
-                if (flags.ignore_case and !hit) {
-                    const alt = if (c >= 'a' and c <= 'z') c - 32 else if (c >= 'A' and c <= 'Z') c + 32 else c;
-                    hit = cc.bitmap[alt];
-                }
-                const result = if (cc.negate) !hit else hit;
-                if (!result) return null;
-                return pos + 1;
-            }
-        },
-        .dot => {
-            if (pos >= input.len) return null;
-            if (flags.unicode) {
-                const dc = decodeUtf8At(input, pos);
-                if (!flags.dotall and isUnicodeLineTerminator(dc.cp)) return null;
-                return pos + dc.len;
-            } else {
-                const c = input[pos];
-                if (!flags.dotall and isLineTerminator(c)) return null;
-                return pos + 1;
-            }
-        },
-        .anchor_start => {
-            if (pos == 0) return pos;
-            if (flags.multiline and pos > 0 and isLineTerminator(input[pos - 1])) return pos;
-            return null;
-        },
-        .anchor_end => {
-            if (pos == input.len) return pos;
-            if (flags.multiline and pos < input.len and isLineTerminator(input[pos])) return pos;
-            return null;
-        },
-        .word_boundary => {
-            const before = if (pos > 0) isWordChar(input[pos - 1]) else false;
-            const after = if (pos < input.len) isWordChar(input[pos]) else false;
-            if (before != after) return pos;
-            return null;
-        },
-        .non_word_boundary => {
-            const before = if (pos > 0) isWordChar(input[pos - 1]) else false;
-            const after = if (pos < input.len) isWordChar(input[pos]) else false;
-            if (before == after) return pos;
-            return null;
-        },
+        .literal => |ch| return consumeLiteral(input, pos, ch, flags),
+        .char_class => |cc| return consumeClass(input, pos, cc, flags),
+        .dot => return consumeDot(input, pos, flags),
+        .anchor_start => return if (testBol(input, pos, flags)) pos else null,
+        .anchor_end => return if (testEol(input, pos, flags)) pos else null,
+        .word_boundary => return if (atWordBoundary(input, pos)) pos else null,
+        .non_word_boundary => return if (!atWordBoundary(input, pos)) pos else null,
         .seq => |nodes| {
             var cur_pos = pos;
             for (nodes) |*child| {
@@ -1489,6 +1522,410 @@ fn matchQuant(
         return positions[if (count >= min) count else min];
     }
 }
+
+// ==================================================== Pike VM (non-backtracking)
+//
+// Wave 23: a Thompson-NFA / Pike-VM execution engine. The regex AST is compiled
+// once to a flat instruction array; matching is a BFS over NFA states with an
+// epsilon-closure at each input position. This guarantees O(program × input)
+// time per anchored match — no exponential blowup from overlapping alternations.
+//
+// Submatch (capture) priority is encoded by split ordering (greedy = body-first,
+// lazy = exit-first) plus first-writer-wins deduplication, reproducing JS
+// leftmost-first semantics. Lookarounds are zero-width assertions evaluated by
+// the recursive backtracking matcher (matchNode) — their inner captures are not
+// propagated, matching the pre-existing engine behaviour. Backreferences are
+// NP-hard, so any pattern containing one keeps the backtracking engine entirely.
+
+/// A single Pike-VM instruction. Consuming ops (char/class/any_char) advance the
+/// input; the rest are zero-width (epsilon) and are resolved during closure.
+const Inst = union(enum) {
+    char: u21, // consume one codepoint equal to this literal
+    class: *const CharClass, // consume one char in this class
+    any_char, // consume one char for `.`
+    match, // accept
+    jmp: usize, // epsilon: continue at target
+    split: struct { a: usize, b: usize }, // epsilon: fork; `a` is higher priority
+    save: usize, // epsilon: record current pos into capture slot
+    assert_bol, // ^
+    assert_eol, // $
+    assert_wb, // \b
+    assert_nwb, // \B
+    look: *const RegexNode, // (?=)/(?!)/(?<=)/(?<!) — a look_ahead/look_behind node
+};
+
+/// A compiled Pike-VM program: a flat instruction array plus the number of
+/// capture slots (2 per group, +2 for the whole match).
+pub const Program = struct {
+    insts: []const Inst,
+    num_slots: usize,
+};
+
+/// Upper bound on emitted instructions. Patterns whose bounded quantifiers would
+/// expand past this (e.g. `a{500000}`) fall back to the backtracking engine
+/// instead of blowing up compilation memory / addThread recursion depth.
+const MAX_PROG_LEN: usize = 1 << 15;
+
+/// Incremental builder for a Program's instruction stream, with split/jmp target
+/// back-patching and a hard size cap.
+const ProgBuilder = struct {
+    insts: std.ArrayListUnmanaged(Inst) = .{},
+    alloc: std.mem.Allocator,
+    failed: bool = false,
+
+    fn here(self: *const ProgBuilder) usize {
+        return self.insts.items.len;
+    }
+
+    fn emit(self: *ProgBuilder, inst: Inst) usize {
+        if (self.failed or self.insts.items.len >= MAX_PROG_LEN) {
+            self.failed = true;
+            return 0;
+        }
+        const idx = self.insts.items.len;
+        self.insts.append(self.alloc, inst) catch {
+            self.failed = true;
+            return 0;
+        };
+        return idx;
+    }
+
+    fn patch(self: *ProgBuilder, at: usize, inst: Inst) void {
+        if (self.failed or at >= self.insts.items.len) return;
+        self.insts.items[at] = inst;
+    }
+
+    /// Emit `inner`, then a greedy/lazy `?` (optional) around it.
+    fn compileQuest(self: *ProgBuilder, inner: *const RegexNode, lazy: bool) void {
+        const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
+        const body = self.here();
+        self.compileNode(inner);
+        const exit = self.here();
+        if (lazy) {
+            self.patch(split_at, .{ .split = .{ .a = exit, .b = body } });
+        } else {
+            self.patch(split_at, .{ .split = .{ .a = body, .b = exit } });
+        }
+    }
+
+    /// Emit a greedy/lazy `*` (Kleene star) around `inner`.
+    fn compileStar(self: *ProgBuilder, inner: *const RegexNode, lazy: bool) void {
+        const l1 = self.here();
+        const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
+        const body = self.here();
+        self.compileNode(inner);
+        _ = self.emit(.{ .jmp = l1 });
+        const exit = self.here();
+        if (lazy) {
+            self.patch(split_at, .{ .split = .{ .a = exit, .b = body } });
+        } else {
+            self.patch(split_at, .{ .split = .{ .a = body, .b = exit } });
+        }
+    }
+
+    fn compileQuant(self: *ProgBuilder, inner: *const RegexNode, min: u32, max: u32, lazy: bool) void {
+        // Reject expansions that would exceed the size cap before emitting them.
+        const inf = std.math.maxInt(u32);
+        if (min > MAX_PROG_LEN or (max != inf and (max - min) > MAX_PROG_LEN)) {
+            self.failed = true;
+            return;
+        }
+        var i: u32 = 0;
+        while (i < min) : (i += 1) {
+            self.compileNode(inner);
+            if (self.failed) return;
+        }
+        if (max == inf) {
+            // `{min,}` — the mandatory copies are done; a star covers the rest.
+            self.compileStar(inner, lazy);
+        } else {
+            // `{min,max}` — (max-min) greedy/lazy optional copies. Contiguous
+            // matching means flat optionals need no nesting to avoid gaps.
+            var k: u32 = min;
+            while (k < max) : (k += 1) {
+                self.compileQuest(inner, lazy);
+                if (self.failed) return;
+            }
+        }
+    }
+
+    fn compileAlt(self: *ProgBuilder, arms: []const RegexNode) void {
+        // e0 | e1 | ... : each non-last arm is `split armStart, next; arm; jmp END`.
+        var jmp_ends = std.ArrayListUnmanaged(usize){};
+        defer jmp_ends.deinit(self.alloc);
+        for (arms, 0..) |*arm, idx| {
+            if (idx + 1 < arms.len) {
+                const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
+                const arm_start = self.here();
+                self.compileNode(arm);
+                const jmp_at = self.emit(.{ .jmp = 0 });
+                jmp_ends.append(self.alloc, jmp_at) catch {
+                    self.failed = true;
+                    return;
+                };
+                const next = self.here();
+                self.patch(split_at, .{ .split = .{ .a = arm_start, .b = next } });
+            } else {
+                self.compileNode(arm);
+            }
+            if (self.failed) return;
+        }
+        const end = self.here();
+        for (jmp_ends.items) |at| self.patch(at, .{ .jmp = end });
+    }
+
+    fn compileNode(self: *ProgBuilder, node: *const RegexNode) void {
+        if (self.failed) return;
+        switch (node.*) {
+            .literal => |ch| _ = self.emit(.{ .char = ch }),
+            .char_class => |cc| _ = self.emit(.{ .class = cc }),
+            .dot => _ = self.emit(.any_char),
+            .anchor_start => _ = self.emit(.assert_bol),
+            .anchor_end => _ = self.emit(.assert_eol),
+            .word_boundary => _ = self.emit(.assert_wb),
+            .non_word_boundary => _ = self.emit(.assert_nwb),
+            .seq => |nodes| for (nodes) |*child| self.compileNode(child),
+            .alt => |arms| self.compileAlt(arms),
+            .group => |g| {
+                _ = self.emit(.{ .save = 2 * @as(usize, g.idx) });
+                self.compileNode(g.inner);
+                _ = self.emit(.{ .save = 2 * @as(usize, g.idx) + 1 });
+            },
+            .non_capturing => |inner| self.compileNode(inner),
+            .quant => |q| self.compileQuant(q.inner, q.min, q.max, q.lazy),
+            .look_ahead, .look_behind => _ = self.emit(.{ .look = node }),
+            // Backreference patterns never reach the Pike VM (has_backref gate).
+            .back_ref => self.failed = true,
+        }
+    }
+};
+
+/// True if the pattern contains any backreference (anywhere, including inside a
+/// lookaround). Such patterns are NP-hard and use the backtracking engine.
+fn hasBackref(node: *const RegexNode) bool {
+    return switch (node.*) {
+        .back_ref => true,
+        .seq => |nodes| blk: {
+            for (nodes) |*c| if (hasBackref(c)) break :blk true;
+            break :blk false;
+        },
+        .alt => |arms| blk: {
+            for (arms) |*c| if (hasBackref(c)) break :blk true;
+            break :blk false;
+        },
+        .group => |g| hasBackref(g.inner),
+        .non_capturing => |inner| hasBackref(inner),
+        .quant => |q| hasBackref(q.inner),
+        .look_ahead => |la| hasBackref(la.inner),
+        .look_behind => |lb| hasBackref(lb.inner),
+        else => false,
+    };
+}
+
+/// Compile a parsed AST root into a Pike-VM Program. Returns null if the pattern
+/// is not Pike-eligible (size cap exceeded or a backref slipped through), in
+/// which case the caller keeps the backtracking engine.
+fn buildProgram(alloc: std.mem.Allocator, root: *const RegexNode, num_captures: u32) ?*Program {
+    var b = ProgBuilder{ .alloc = alloc };
+    _ = b.emit(.{ .save = 0 }); // whole-match start
+    b.compileNode(root);
+    _ = b.emit(.{ .save = 1 }); // whole-match end
+    _ = b.emit(.match);
+    if (b.failed) {
+        b.insts.deinit(alloc);
+        return null;
+    }
+    const prog = alloc.create(Program) catch {
+        b.insts.deinit(alloc);
+        return null;
+    };
+    const ns = @min(2 * (@as(usize, num_captures) + 1), 2 * MAX_CAPTURES);
+    prog.* = .{
+        .insts = b.insts.toOwnedSlice(alloc) catch {
+            return null;
+        },
+        .num_slots = ns,
+    };
+    return prog;
+}
+
+/// Reusable Pike-VM execution state. Buffers are sized once per program and
+/// reused across every anchored run of a whole-string scan.
+const PikeVM = struct {
+    prog: *const Program,
+    ns: usize, // slots per thread
+    // Two thread lists (current / next), each a flat SoA of (pc, caps).
+    a_pcs: []usize,
+    a_caps: []isize,
+    a_n: usize = 0,
+    b_pcs: []usize,
+    b_caps: []isize,
+    b_n: usize = 0,
+    seen: []u64, // per-pc generation stamp for closure dedup
+    gen: u64 = 0,
+    work: []isize, // scratch capture vector during closure
+    matched: []isize, // captures of the best match so far
+    matched_valid: bool = false,
+
+    fn init(alloc: std.mem.Allocator, prog: *const Program) !PikeVM {
+        const plen = prog.insts.len;
+        const ns = prog.num_slots;
+        return .{
+            .prog = prog,
+            .ns = ns,
+            .a_pcs = try alloc.alloc(usize, plen),
+            .a_caps = try alloc.alloc(isize, plen * ns),
+            .b_pcs = try alloc.alloc(usize, plen),
+            .b_caps = try alloc.alloc(isize, plen * ns),
+            .seen = try alloc.alloc(u64, plen),
+            .work = try alloc.alloc(isize, ns),
+            .matched = try alloc.alloc(isize, ns),
+        };
+    }
+
+    /// Add a thread (and its epsilon closure) to a thread list. `list_pcs`/
+    /// `list_caps`/`n_ptr` select current or next; `caps` is the shared working
+    /// capture vector (mutated then restored across save/split recursion).
+    fn addThread(
+        self: *PikeVM,
+        list_pcs: []usize,
+        list_caps: []isize,
+        n_ptr: *usize,
+        pc: usize,
+        sp: usize,
+        caps: []isize,
+        input: []const u8,
+        flags: *const CompiledRegex.Flags,
+    ) void {
+        if (self.seen[pc] == self.gen) return;
+        self.seen[pc] = self.gen;
+        switch (self.prog.insts[pc]) {
+            .jmp => |t| self.addThread(list_pcs, list_caps, n_ptr, t, sp, caps, input, flags),
+            .split => |s| {
+                self.addThread(list_pcs, list_caps, n_ptr, s.a, sp, caps, input, flags);
+                self.addThread(list_pcs, list_caps, n_ptr, s.b, sp, caps, input, flags);
+            },
+            .save => |slot| {
+                if (slot < self.ns) {
+                    const old = caps[slot];
+                    caps[slot] = @intCast(sp);
+                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                    caps[slot] = old;
+                } else {
+                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                }
+            },
+            .assert_bol => if (testBol(input, sp, flags))
+                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
+            .assert_eol => if (testEol(input, sp, flags))
+                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
+            .assert_wb => if (atWordBoundary(input, sp))
+                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
+            .assert_nwb => if (!atWordBoundary(input, sp))
+                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
+            .look => |lnode| {
+                var tmp = [_]CaptureSpan{INVALID_CAP} ** MAX_CAPTURES;
+                if (matchNode(lnode, input, sp, &tmp, flags) != null)
+                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+            },
+            // Leaf: a consuming op or `match`. Snapshot caps into the list slot.
+            .char, .class, .any_char, .match => {
+                const idx = n_ptr.*;
+                @memcpy(list_caps[idx * self.ns .. idx * self.ns + self.ns], caps);
+                list_pcs[idx] = pc;
+                n_ptr.* = idx + 1;
+            },
+        }
+    }
+
+    /// Run the program anchored at `start`. Returns the whole-match end position
+    /// and captures, or null if no match begins exactly at `start`.
+    fn runAnchored(
+        self: *PikeVM,
+        input: []const u8,
+        start: usize,
+        flags: *const CompiledRegex.Flags,
+    ) ?MatchState {
+        @memset(self.seen, 0);
+        self.gen = 0;
+        self.matched_valid = false;
+
+        var cur_pcs = self.a_pcs;
+        var cur_caps = self.a_caps;
+        var cur_n: usize = 0;
+        var nxt_pcs = self.b_pcs;
+        var nxt_caps = self.b_caps;
+        var nxt_n: usize = 0;
+
+        // Seed the current list at `start`.
+        @memset(self.work, -1);
+        self.gen += 1;
+        self.addThread(cur_pcs, cur_caps, &cur_n, 0, start, self.work, input, flags);
+
+        var sp = start;
+        while (true) {
+            self.gen += 1;
+            nxt_n = 0;
+            var ti: usize = 0;
+            while (ti < cur_n) : (ti += 1) {
+                const pc = cur_pcs[ti];
+                const tcaps = cur_caps[ti * self.ns .. ti * self.ns + self.ns];
+                switch (self.prog.insts[pc]) {
+                    .char => |ch| {
+                        if (consumeLiteral(input, sp, ch, flags)) |np| {
+                            @memcpy(self.work, tcaps);
+                            self.addThread(nxt_pcs, nxt_caps, &nxt_n, pc + 1, np, self.work, input, flags);
+                        }
+                    },
+                    .class => |cc| {
+                        if (consumeClass(input, sp, cc, flags)) |np| {
+                            @memcpy(self.work, tcaps);
+                            self.addThread(nxt_pcs, nxt_caps, &nxt_n, pc + 1, np, self.work, input, flags);
+                        }
+                    },
+                    .any_char => {
+                        if (consumeDot(input, sp, flags)) |np| {
+                            @memcpy(self.work, tcaps);
+                            self.addThread(nxt_pcs, nxt_caps, &nxt_n, pc + 1, np, self.work, input, flags);
+                        }
+                    },
+                    .match => {
+                        @memcpy(self.matched, tcaps);
+                        self.matched_valid = true;
+                        // Threads after a match in priority order are lower
+                        // priority; discard them for leftmost-first semantics.
+                        break;
+                    },
+                    else => unreachable, // epsilon ops never enter a thread list
+                }
+            }
+            // Swap current <-> next.
+            const t_pcs = cur_pcs;
+            const t_caps = cur_caps;
+            cur_pcs = nxt_pcs;
+            cur_caps = nxt_caps;
+            cur_n = nxt_n;
+            nxt_pcs = t_pcs;
+            nxt_caps = t_caps;
+            if (cur_n == 0) break;
+            sp += 1;
+        }
+
+        if (!self.matched_valid) return null;
+        var out = MatchState{ .pos = 0, .captures = [_]CaptureSpan{INVALID_CAP} ** MAX_CAPTURES };
+        out.pos = @intCast(self.matched[1]);
+        var g: usize = 1;
+        const max_g = @min(self.ns / 2, MAX_CAPTURES);
+        while (g < max_g) : (g += 1) {
+            const s = self.matched[2 * g];
+            const e = self.matched[2 * g + 1];
+            if (s >= 0 and e >= 0) {
+                out.captures[g] = .{ .start = @intCast(s), .end = @intCast(e) };
+            }
+        }
+        return out;
+    }
+};
 
 // ============================================================= Runtime API ====
 
