@@ -881,6 +881,16 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
         break :blk name;
     } else synthetic_name;
 
+    // Capture the NamedEvaluation hint (`let x = class{}` / `export default
+    // class{}`) NOW, before parsing the heritage/body — otherwise a nested
+    // anonymous class/function expression inside a method or field initializer
+    // would consume it first and steal this class's name.
+    const anon_name_hint: ?[]const u8 = blk: {
+        const h = p.export_default_name_hint;
+        p.export_default_name_hint = null;
+        break :blk h;
+    };
+
     var super_name: ?[]const u8 = null;
     var heritage_expr: ?*Node = null;
     if (p.match(.kw_extends)) {
@@ -1016,12 +1026,13 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             fn_body.append(p.arena, hv) catch return null;
         }
 
-        // Named class → ctor name = class_name; anonymous with export-default hint → "default"; else null.
-        const ctor_fn_name: ?[]const u8 = if (has_name) class_name else blk: {
-            const hint = p.export_default_name_hint;
-            p.export_default_name_hint = null;
-            break :blk hint;
-        };
+        // Named class → ctor name = class_name; anonymous with a NamedEvaluation
+        // hint (`let x = class{}` binding, `export default`) → that name; else the
+        // empty string. The explicit "" is important: the ctor is desugared to
+        // `var __AnonClassExpr = <ctor fn>`, and without an explicit name the
+        // compiler's NamedEvaluation would otherwise leak that synthetic binding
+        // name onto a genuinely anonymous class (spec: its name is "").
+        const ctor_fn_name: ?[]const u8 = if (has_name) class_name else (anon_name_hint orelse "");
         const ctor_fn = p.makeNode(.function_expr, start, start, .{
             .function_expr = .{ .name = ctor_fn_name, .params = ctor_params, .body = ctor_body_effective, .is_arrow = false },
         }) orelse return null;

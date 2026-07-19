@@ -9174,7 +9174,6 @@ language/expressions/class/elements/async-gen-private-method/yield-star-next-the
 language/expressions/class/elements/async-gen-private-method/yield-star-sync-next.js
 language/expressions/class/elements/async-gen-private-method/yield-star-sync-return.js
 language/expressions/class/elements/async-gen-private-method/yield-star-sync-throw.js
-language/expressions/class/elements/class-name-static-initializer-anonymous.js
 language/expressions/class/elements/computed-name-toprimitive-symbol.js
 language/expressions/class/elements/computed-name-toprimitive.js
 language/expressions/class/elements/derived-cls-direct-eval-contains-superproperty-1.js
@@ -9296,7 +9295,6 @@ language/expressions/class/heritage-arrow-function.js
 language/expressions/class/method-length-dflt.js
 language/expressions/class/method-static/dflt-params-trailing-comma.js
 language/expressions/class/method/dflt-params-trailing-comma.js
-language/expressions/class/name.js
 language/expressions/class/private-getter-brand-check-multiple-evaluations-of-class-eval-indirect.js
 language/expressions/class/private-getter-brand-check-multiple-evaluations-of-class-eval.js
 language/expressions/class/private-getter-brand-check-multiple-evaluations-of-class-factory.js
@@ -10438,7 +10436,6 @@ language/statements/class/decorator/syntax/valid/decorator-member-expr-identifie
 language/statements/class/decorator/syntax/valid/decorator-parenthesized-expr-identifier-reference-yield.js
 language/statements/class/decorator/syntax/valid/decorator-parenthesized-expr-identifier-reference.js
 language/statements/class/definition/accessors.js
-language/statements/class/definition/basics.js
 language/statements/class/definition/constructor-property.js
 language/statements/class/definition/constructor-strict-by-default.js
 language/statements/class/definition/constructor.js

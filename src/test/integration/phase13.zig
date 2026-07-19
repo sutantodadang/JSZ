@@ -336,3 +336,40 @@ test "wave32: private getter reads through on own instance" {
     try std.testing.expectEqual(@as(f64, 5), v);
 }
 
+
+// ---- Wave 32: class-expression NamedEvaluation ----
+
+// `let x = class {}` names the anonymous class after the binding (NamedEvaluation).
+test "wave32: anonymous class expr takes binding name" {
+    const s = try dualString(std.testing.allocator, "let cls = class {}; cls.name");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("cls", s);
+}
+
+// A genuinely anonymous class expression has name "" (not a synthetic leak).
+test "wave32: bare anonymous class expr has empty name" {
+    const s = try dualString(std.testing.allocator, "(class {}).name");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("", s);
+}
+
+// A named class expression keeps its own name, and the binding hint must not
+// leak into a class nested inside its body.
+test "wave32: named class expr keeps its own name" {
+    const s = try dualString(std.testing.allocator, "var C = class cls {}; C.name");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("cls", s);
+}
+
+test "wave32: binding name hint does not leak into a nested class" {
+    const s = try dualString(std.testing.allocator, "var C = class { m(){ return (class {}).name; } }; new C().m()");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("", s);
+}
+
+test "wave32: anonymous derived class takes binding name" {
+    const s = try dualString(std.testing.allocator, "class B {}; const D = class extends B {}; D.name");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("D", s);
+}
+
