@@ -16,6 +16,8 @@ const plain_date = @import("plain_date.zig");
 const plain_time = @import("plain_time.zig");
 const plain_date_time = @import("plain_date_time.zig");
 const zoned_date_time = @import("zoned_date_time.zig");
+const plain_year_month = @import("plain_year_month.zig");
+const plain_month_day = @import("plain_month_day.zig");
 const now = @import("now.zig");
 
 var temporal_obj: ?*JsObject = null;
@@ -29,6 +31,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try plain_time.register(ctx);
     try plain_date_time.register(ctx);
     try zoned_date_time.register(ctx);
+    try plain_year_month.register(ctx);
+    try plain_month_day.register(ctx);
 
     const temporal = try JsObject.create(arena, ctx.object_proto);
     temporal_obj = temporal;
@@ -39,6 +43,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try installCtor(arena, temporal, "PlainTime", plain_time.ctor_obj);
     try installCtor(arena, temporal, "PlainDateTime", plain_date_time.ctor_obj);
     try installCtor(arena, temporal, "ZonedDateTime", zoned_date_time.ctor_obj);
+    try installCtor(arena, temporal, "PlainYearMonth", plain_year_month.ctor_obj);
+    try installCtor(arena, temporal, "PlainMonthDay", plain_month_day.ctor_obj);
 
     // Temporal.Now namespace (not a constructor).
     const now_ns = try now.create(ctx);
@@ -67,6 +73,8 @@ pub fn reparentObjectProto(old_proto: *JsObject, new_proto: *JsObject) void {
         plain_time.proto_obj,
         plain_date_time.proto_obj,
         zoned_date_time.proto_obj,
+        plain_year_month.proto_obj,
+        plain_month_day.proto_obj,
     };
     for (protos) |maybe| {
         if (maybe) |o| {
@@ -89,5 +97,7 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
     try plain_time.registerToStringTag(arena, tag);
     try plain_date_time.registerToStringTag(arena, tag);
     try zoned_date_time.registerToStringTag(arena, tag);
+    try plain_year_month.registerToStringTag(arena, tag);
+    try plain_month_day.registerToStringTag(arena, tag);
     try now.registerToStringTag(arena, tag);
 }

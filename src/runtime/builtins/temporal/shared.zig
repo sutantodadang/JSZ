@@ -339,6 +339,71 @@ pub fn parseISODateTime(s0: []const u8) ParseError!ISODateTime {
     return .{ .date = .{ .year = @intCast(year), .month = @intCast(month), .day = @intCast(day) }, .time = time };
 }
 
+/// Reference for a Temporal.PlainMonthDay: month/day plus an ISO reference year
+/// (1972 by default — a leap year so 02-29 is representable).
+pub const ISOMonthDay = struct {
+    month: u8,
+    day: u8,
+    ref_year: i32 = 1972,
+};
+
+/// Parse a Temporal year-month string. Accepts "YYYY-MM", "YYYYMM", expanded
+/// "±YYYYYY-MM", and full date/datetime forms (day ignored — the ISO reference
+/// day is always 1). Bracket annotations tolerated. Returns an ISODate whose day
+/// is 1.
+pub fn parseISOYearMonth(s0: []const u8) ParseError!ISODate {
+    const s = std.mem.trim(u8, s0, " \t\n\r");
+    var p = Parser{ .s = s };
+    var year: i64 = undefined;
+    if (p.peek() == '+' or p.peek() == '-') {
+        const neg = p.s[p.i] == '-';
+        p.i += 1;
+        year = p.digitsN(6) orelse return error.Invalid;
+        if (neg) year = -year;
+        if (neg and year == 0) return error.Invalid;
+    } else {
+        year = p.digitsN(4) orelse return error.Invalid;
+    }
+    const had_dash = p.eat('-');
+    const month = p.digitsN(2) orelse return error.Invalid;
+    // If a day or time part follows, it is a full datetime string; delegate so we
+    // reuse the full validation. For iso the day is discarded (reference is 1).
+    if (p.peek()) |c| {
+        if ((had_dash and c == '-') or c == 'T' or c == 't' or c == ' ' or (!had_dash and isDigit(c))) {
+            const dt = try parseISODateTime(s0);
+            return .{ .year = dt.date.year, .month = dt.date.month, .day = 1 };
+        }
+    }
+    skipAnnotations(&p);
+    if (!p.eof()) return error.Invalid;
+    if (year < -271821 or year > 275760) return error.Invalid;
+    if (month < 1 or month > 12) return error.Invalid;
+    return .{ .year = @intCast(year), .month = @intCast(month), .day = 1 };
+}
+
+/// Parse a Temporal month-day string. Accepts "--MM-DD", "--MMDD", "MM-DD",
+/// "MMDD", and full date/datetime forms (year ignored — reference year is 1972).
+/// Bracket annotations tolerated.
+pub fn parseISOMonthDay(s0: []const u8) ParseError!ISOMonthDay {
+    const s = std.mem.trim(u8, s0, " \t\n\r");
+    // Full date/datetime form: has a 4+ digit leading year.
+    if (looksLikeDate(s)) {
+        const dt = try parseISODateTime(s0);
+        return .{ .month = dt.date.month, .day = dt.date.day, .ref_year = 1972 };
+    }
+    var p = Parser{ .s = s };
+    _ = p.eat('-') and p.eat('-'); // optional "--" prefix
+    const month = p.digitsN(2) orelse return error.Invalid;
+    const had_dash = p.eat('-');
+    const day = p.digitsN(2) orelse return error.Invalid;
+    _ = had_dash;
+    skipAnnotations(&p);
+    if (!p.eof()) return error.Invalid;
+    if (month < 1 or month > 12) return error.Invalid;
+    if (day < 1 or day > isoDaysInMonth(1972, @intCast(month))) return error.Invalid;
+    return .{ .month = @intCast(month), .day = @intCast(day), .ref_year = 1972 };
+}
+
 /// Parse a time-only string "HH:MM:SS.sss" / "HHMMSS" / "HH". Also accepts a full
 /// datetime and extracts the time. Returns the ISOTime.
 pub fn parseISOTime(s0: []const u8) ParseError!ISOTime {
@@ -792,6 +857,49 @@ pub fn getOptionsObject(arena: std.mem.Allocator, v: ?Value) !?*JsObject {
         .function, .bc_function, .native_function => return null,
         else => return realm_mod.throwTypeError(arena, "options must be an object or undefined"),
     }
+}
+
+/// Case-insensitive check for the sole supported calendar, "iso8601".
+pub fn isIso8601(s: []const u8) bool {
+    if (s.len != 7) return false;
+    const lower = "iso8601";
+    for (s, 0..) |c, i| {
+        if (std.ascii.toLower(c) != lower[i]) return false;
+    }
+    return true;
+}
+
+/// Validate a calendar-slot argument (ToTemporalCalendarIdentifier). Undefined is
+/// accepted (means "iso8601"). A String must name the iso8601 calendar
+/// (RangeError otherwise). A calendar-bearing Temporal object is accepted (all use
+/// iso8601). Any other type is a TypeError.
+pub fn validateCalendarArg(arena: std.mem.Allocator, v: Value) !void {
+    if (v.bits == 0 or v.unbox() == .undefined_) return;
+    switch (v.unbox()) {
+        .string => |s| {
+            if (!isIso8601(s)) return realm_mod.throwRangeError(arena, "only the iso8601 calendar is supported");
+        },
+        .object => {
+            switch (v.toPtr().object.internal_kind) {
+                .temporal_plain_date, .temporal_plain_date_time, .temporal_zoned_date_time, .temporal_plain_year_month, .temporal_plain_month_day => {},
+                else => return realm_mod.throwTypeError(arena, "invalid calendar"),
+            }
+        },
+        else => return realm_mod.throwTypeError(arena, "invalid calendar"),
+    }
+}
+
+/// Read a "monthCode" field: it must be a String (TypeError otherwise), and match
+/// "MNN" for a month in 1..12 (RangeError otherwise). Returns null when absent.
+pub fn readMonthCode(arena: std.mem.Allocator, v: ?Value) !?u8 {
+    const val = v orelse return null;
+    if (val.bits == 0 or val.unbox() == .undefined_) return null;
+    if (val.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
+    const code = val.unbox().string;
+    if (code.len != 3 or code[0] != 'M') return realm_mod.throwRangeError(arena, "invalid monthCode");
+    const n = std.fmt.parseInt(u8, code[1..3], 10) catch return realm_mod.throwRangeError(arena, "invalid monthCode");
+    if (n < 1 or n > 12) return realm_mod.throwRangeError(arena, "invalid monthCode");
+    return n;
 }
 
 /// Coerce a Value to a string (ES ToString), returning an arena slice.

@@ -78,7 +78,7 @@ fn floatToI32(f: f64) i32 {
     return @intFromFloat(f);
 }
 
-fn isIsoCalendar(s: []const u8) bool {
+pub fn isIsoCalendar(s: []const u8) bool {
     // Case-insensitive "iso8601".
     if (s.len != 7) return false;
     const lower = "iso8601";
