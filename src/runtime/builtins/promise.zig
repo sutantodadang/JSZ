@@ -252,6 +252,12 @@ pub fn nativePromiseCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
             reject_obj.internal_slot = reject_data;
             try resolve_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativePromiseResolver));
             try reject_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativePromiseResolver));
+            // The resolving functions are anonymous unary functions (name "",
+            // length 1) per §27.2.1.3.
+            for ([_]*JsObject{ resolve_obj, reject_obj }) |ro| {
+                try ro.set("name", try val_mod.makeString(arena, ""));
+                try ro.set("length", try val_mod.makeNumber(arena, 1));
+            }
             const resolve_val = try val_mod.makeObject(arena, resolve_obj);
             const reject_val = try val_mod.makeObject(arena, reject_obj);
             _ = fn_proto.invokeCallback(arena, try val_mod.makeUndefined(arena), args[0], &[_]Value{ resolve_val, reject_val }) catch |e| {
@@ -293,21 +299,17 @@ pub fn nativePromiseWithResolvers(arena: std.mem.Allocator, this_val: Value, _: 
         realm_mod.pending_exception = try val_mod.makeObject(arena, err);
         return error.JsException;
     }
-    const p = try makePendingPromise(arena);
-    const data = getData(p) orelse return p;
-    const resolve_data = try arena.create(ResolverData);
-    const reject_data = try arena.create(ResolverData);
-    resolve_data.* = .{ .promise = data, .resolve_mode = true };
-    reject_data.* = .{ .promise = data, .resolve_mode = false };
-    const resolve_val = try makeResolverObject(arena, resolve_data);
-    const reject_val = try makeResolverObject(arena, reject_data);
+    // NewPromiseCapability(C) constructs via the receiver `this` (step 2), so
+    // `Promise.withResolvers.call(SubPromise)` yields a SubPromise instance whose
+    // resolve/reject are the ones the base executor was handed.
+    const cap = try newPromiseCapability(arena, this_val);
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
-    try obj.set("promise", p);
-    try obj.set("resolve", resolve_val);
-    try obj.set("reject", reject_val);
+    try obj.set("promise", cap.promise);
+    try obj.set("resolve", cap.resolve);
+    try obj.set("reject", cap.reject);
     return val_mod.makeObject(arena, obj);
 }
 
