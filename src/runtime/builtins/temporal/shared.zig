@@ -898,14 +898,17 @@ pub fn unitLengthNanos(u: Unit) ?i128 {
 
 /// Resolve the options argument: undefined -> null (empty), object -> itself,
 /// anything else -> TypeError. Per GetOptionsObject, *any* Object is accepted —
-/// including callables (functions), which carry no option properties here and so
-/// resolve to an empty options set.
+/// including callables (functions), whose own option properties must still be
+/// observably read via [[Get]] (resolve to the callable's backing object).
 pub fn getOptionsObject(arena: std.mem.Allocator, v: ?Value) !?*JsObject {
     const val = v orelse return null;
     if (val.bits == 0 or val.unbox() == .undefined_) return null;
     switch (val.unbox()) {
         .object => return val.toPtr().object,
-        .function, .bc_function, .native_function => return null,
+        .function, .bc_function, .native_function => return if (realm_mod.active_context) |ctx|
+            try ctx.backingObject(arena, val)
+        else
+            null,
         else => return realm_mod.throwTypeError(arena, "options must be an object or undefined"),
     }
 }
