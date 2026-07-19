@@ -1847,7 +1847,6 @@ built-ins/Promise/any/reject-element-function-length.js
 built-ins/Promise/any/reject-element-function-name.js
 built-ins/Promise/any/reject-element-function-property-order.js
 built-ins/Promise/any/reject-element-function-prototype.js
-built-ins/Promise/exec-args.js
 built-ins/Promise/executor-function-extensible.js
 built-ins/Promise/executor-function-length.js
 built-ins/Promise/executor-function-name.js
@@ -1907,7 +1906,6 @@ built-ins/Promise/prototype/then/resolve-settled-rejected-poisoned-then.js
 built-ins/Promise/prototype/then/resolve-settled-rejected-prms-cstm-then.js
 built-ins/Promise/prototype/then/resolve-settled-rejected-self.js
 built-ins/Promise/race/capability-executor-called-twice.js
-built-ins/Promise/race/invoke-then.js
 built-ins/Promise/race/iter-returns-false-reject.js
 built-ins/Promise/race/iter-returns-null-reject.js
 built-ins/Promise/race/iter-returns-number-reject.js
@@ -1968,8 +1966,6 @@ built-ins/Promise/try/prop-desc.js
 built-ins/Promise/try/return-value.js
 built-ins/Promise/try/throws.js
 built-ins/Promise/undefined-newtarget.js
-built-ins/Promise/withResolvers/ctx-ctor.js
-built-ins/Promise/withResolvers/resolvers.js
 built-ins/Proxy/construct/trap-is-undefined-proto-from-newtarget-realm.js
 built-ins/Proxy/create-target-is-not-a-constructor.js
 built-ins/Proxy/create-target-is-revoked-function-proxy.js
