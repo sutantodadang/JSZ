@@ -400,6 +400,13 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d} += ...R{d}", .{ rarr, riter });
         },
+        .ARRAY_APPEND_HOLE => {
+            const rarr = code[new_pc];
+            new_pc += 1;
+            const count = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} += {d} hole(s)", .{ rarr, count });
+        },
         .IN => {
             const rdst = code[new_pc];
             new_pc += 1;

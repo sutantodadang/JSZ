@@ -19,6 +19,16 @@ const proxy_mod = @import("../../runtime/builtins/proxy.zig");
 const namespace_mod = @import("../../runtime/builtins/namespace.zig");
 const typed_array = @import("../../runtime/builtins/typed_array.zig");
 
+/// A number Value → canonical array index (integer in [0, 2^32-2]), or null.
+/// Lets `a[i]` reads/writes hit the dense integer path without stringifying `i`.
+inline fn canonicalIndexFromValue(v: Value) ?u32 {
+    if (v.bits == 0 or v.unbox() != .number) return null;
+    const n = v.unbox().number;
+    // `n >= 0` also rejects NaN; the upper bound excludes 2^32-1 (not a valid index).
+    if (!(n >= 0) or n > 4294967294.0 or @trunc(n) != n) return null;
+    return @intFromFloat(n);
+}
+
 /// Raise the strict-mode TypeError for a failed property assignment ([[Set]]
 /// returned false). Returns a non-null RunOutcome only when the throw escapes
 /// the current frame uncaught; null means a handler caught it.
@@ -248,6 +258,17 @@ pub inline fn opGetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         };
         self.frames.items[fidx_sym].registers[rdst] = sym_res;
     } else {
+        // Numeric index on a dense array: return a present element with no key
+        // stringification. A hole / out-of-range index falls through to the
+        // proto-walking string path below (spec [[Get]]).
+        if (obj_val.bits != 0 and obj_val.unbox() == .object) {
+            if (canonicalIndexFromValue(key_val)) |idx| {
+                if (obj_val.toPtr().object.getIndexOwn(idx)) |v| {
+                    frame.registers[rdst] = v;
+                    return null;
+                }
+            }
+        }
         const frame_idx_dyn2 = self.frames.items.len - 1;
         const key = try bcv.valueToStringArena(self.arena, key_val);
         const result_dyn2 = self.getProp(obj_val, key) catch |e| {
@@ -357,6 +378,23 @@ pub inline fn opSetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             return null;
         };
     } else {
+        // Numeric index on a dense array: store by integer index, no key string.
+        // For a real Array, [[Set]] bottoms out in the same ordinary element
+        // store, and a dense array is always writable/extensible (it deopts
+        // otherwise), so the write always succeeds — no strict-throw path needed.
+        if (obj_val.bits != 0 and obj_val.unbox() == .object) {
+            const o = obj_val.toPtr().object;
+            if (o.is_array and o.usesDense()) {
+                if (canonicalIndexFromValue(key_val)) |idx| {
+                    o.setIndex(idx, val) catch |e| {
+                        if (e != error.JsException) return e;
+                        if (try self.raisePendingException("error in setter")) |oc| return oc;
+                        return null;
+                    };
+                    return null;
+                }
+            }
+        }
         const key = try bcv.valueToStringArena(self.arena, key_val);
         self.setProp(obj_val, key, val) catch |e| {
             if (e != error.JsException) return e;

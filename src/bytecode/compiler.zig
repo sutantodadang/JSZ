@@ -1126,8 +1126,8 @@ pub const FnCompiler = struct {
                 const elems = target.data.array_literal.elements;
                 for (elems, 0..) |elem, i| {
                     // Elision hole (`[, x] = rhs`): the parser models holes as
-                    // `undefined_literal` nodes — skip, advancing the index.
-                    if (elem.kind == .undefined_literal) continue;
+                    // `array_hole` nodes — skip, advancing the index.
+                    if (elem.kind == .array_hole) continue;
                     if (elem.kind == .spread_expr) {
                         // Rest element `...t = rhs`: assign `rsrc.slice(i)` to `t`.
                         // Must be the final element. Use a METHOD_CALL so `this`
@@ -1506,40 +1506,33 @@ pub const FnCompiler = struct {
     }
 
     pub fn compileArrayLiteral(self: *Self, al: ast.ArrayLiteral, line: u32) error{OutOfMemory}!u8 {
-        // Detect spread elements; without any, keep the fast static-index path.
-        var has_spread = false;
-        for (al.elements) |elem| {
-            if (elem.kind == .spread_expr) {
-                has_spread = true;
-                break;
-            }
-        }
-
         const len_hint: u8 = if (al.elements.len <= 255) @intCast(al.elements.len) else 255;
         const robj = self.allocReg();
         try self.emitOp(.NEW_ARRAY, line);
         try self.emitU8(robj);
         try self.emitU8(len_hint);
 
-        if (!has_spread) {
-            for (al.elements, 0..) |elem, i| {
-                const rval = try self.compileExpr(elem);
-                // Use static string key for the index.
-                const key_str = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return error.OutOfMemory;
-                const sv = try val_mod.makeString(self.arena, key_str);
-                const kidx = try self.addConstant(sv);
-                try self.emitOp(.SET_PROP, line);
-                try self.emitU8(robj);
-                try self.emitU16(kidx);
-                try self.emitU8(rval);
-                self.freeReg(); // free rval
+        // Append every element in source order. Elisions (`[1,,3]`) become real
+        // holes via ARRAY_APPEND_HOLE (length grows, no index created); spreads
+        // expand via ARRAY_SPREAD. Using the integer-index append opcodes avoids
+        // the per-element decimal-key string a SET_PROP path would allocate.
+        var i: usize = 0;
+        while (i < al.elements.len) {
+            const elem = al.elements[i];
+            if (elem.kind == .array_hole) {
+                // Coalesce a run of consecutive holes into count-bearing ops
+                // (a u8 count per op; a run longer than 255 emits several).
+                var run: usize = 0;
+                while (i < al.elements.len and al.elements[i].kind == .array_hole) : (i += 1) run += 1;
+                while (run > 0) {
+                    const c: u8 = if (run > 255) 255 else @intCast(run);
+                    try self.emitOp(.ARRAY_APPEND_HOLE, line);
+                    try self.emitU8(robj);
+                    try self.emitU8(c);
+                    run -= c;
+                }
+                continue;
             }
-            return robj;
-        }
-
-        // Spread path: indices are dynamic, so append element-by-element.
-        // `[a, ...iter, b]` -> NEW_ARRAY; APPEND a; SPREAD iter; APPEND b.
-        for (al.elements) |elem| {
             if (elem.kind == .spread_expr) {
                 const riter = try self.compileExpr(elem.data.spread_expr);
                 try self.emitOp(.ARRAY_SPREAD, line);
@@ -1553,6 +1546,7 @@ pub const FnCompiler = struct {
                 try self.emitU8(rval);
                 self.freeReg(); // free rval
             }
+            i += 1;
         }
         return robj;
     }

@@ -836,9 +836,23 @@ fn genLength(arena: std.mem.Allocator, this_val: Value) !usize {
     return 0;
 }
 
+/// A plain dense array `this` fast-path: returns the object when `this_val` is a
+/// real Array still on the dense element path (no Proxy/exotic/accessor concerns),
+/// so integer index access can skip decimal-key allocation and the ctx round-trip.
+inline fn denseArrayOf(this_val: Value) ?*JsObject {
+    if (!this_val.isHeapPtr() or this_val.toPtr().* != .object) return null;
+    const o = this_val.toPtr().object;
+    return if (o.is_array and o.usesDense()) o else null;
+}
+
 /// HasProperty(O, ToString(i)) — used to skip array holes (absent indices) in the
 /// intentionally-generic iteration methods.
 fn genHas(arena: std.mem.Allocator, this_val: Value, i: usize) !bool {
+    // A present dense element implies HasProperty true with no allocation. An
+    // absent index still needs the proto walk (string path below).
+    if (i <= std.math.maxInt(u32)) if (denseArrayOf(this_val)) |o| {
+        if (o.getIndexOwn(@intCast(i)) != null) return true;
+    };
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
     if (realm_mod.active_context) |ctx| return ctx.hasProp(arena, this_val, key);
     if (this_val.isHeapPtr() and this_val.toPtr().* == .object)
@@ -849,6 +863,11 @@ fn genHas(arena: std.mem.Allocator, this_val: Value, i: usize) !bool {
 /// ? Get(O, ToString(i)) firing exotic/accessor reads.
 fn genGet(arena: std.mem.Allocator, this_val: Value, i: usize) !Value {
     if (realm_mod.nativeDeadlineExceeded()) return error.OutOfMemory;
+    // Present dense element: return it directly. A hole falls through so the
+    // proto chain is consulted (spec [[Get]]), matching the string path.
+    if (i <= std.math.maxInt(u32)) if (denseArrayOf(this_val)) |o| {
+        if (o.getIndexOwn(@intCast(i))) |val| return val;
+    };
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
     if (realm_mod.active_context) |ctx| return ctx.getProp(arena, this_val, key);
     if (this_val.isHeapPtr() and this_val.toPtr().* == .object)
@@ -859,6 +878,12 @@ fn genGet(arena: std.mem.Allocator, this_val: Value, i: usize) !Value {
 /// ? Set(O, ToString(i), v, true) firing exotic/accessor writes.
 fn genSet(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
     if (realm_mod.nativeDeadlineExceeded()) return error.OutOfMemory;
+    // Dense array write: store by integer index, no decimal-key allocation. For a
+    // real Array, ctx.setProp bottoms out in the same ordinary [[Set]] anyway.
+    if (i <= std.math.maxInt(u32)) if (denseArrayOf(this_val)) |o| {
+        try o.setIndex(@intCast(i), v);
+        return;
+    };
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
     if (realm_mod.active_context) |ctx| {
         try ctx.setProp(arena, this_val, key, v);

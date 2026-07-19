@@ -287,6 +287,12 @@ pub const Op = enum(u8) {
     /// value (so `delete undeclared` does not throw). Declared last (ordinal
     /// stability for the pinned JIT contract).
     DELETE_NAME,
+    /// ARRAY_APPEND_HOLE | 3 | op, Rarr u8, countU8 u8. Extends the array R[Rarr]
+    /// by `countU8` trailing holes (array-literal elision `[1,,3]`): grows the
+    /// length without creating any own index, so the elided slots stay genuinely
+    /// absent (`n in arr` false). A run of >255 holes emits several ops. Declared
+    /// last (ordinal stability for the pinned JIT int-subset contract).
+    ARRAY_APPEND_HOLE,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -384,6 +390,7 @@ pub fn instrSize(op: Op) usize {
         .DEFINE_ACCESSOR_DYN => 5,
         .ARRAY_APPEND => 3,
         .ARRAY_SPREAD => 3,
+        .ARRAY_APPEND_HOLE => 3,
         .IN => 4,
         .DELETE_PROP => 4,
         .CALL_SPREAD => 5,

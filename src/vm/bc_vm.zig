@@ -1348,6 +1348,7 @@ pub const BcVm = struct {
                 .NEW_ARRAY => if (try object_ops.opNewArray(self, frame)) |o| return o,
                 .ARRAY_APPEND => if (try object_ops.opArrayAppend(self, frame)) |o| return o,
                 .ARRAY_SPREAD => if (try object_ops.opArraySpread(self, frame)) |o| return o,
+                .ARRAY_APPEND_HOLE => if (try object_ops.opArrayAppendHole(self, frame)) |o| return o,
                 .GET_PROP => if (try property_ops.opGetProp(self, frame)) |o| return o,
                 .GET_PROP_DYN => if (try property_ops.opGetPropDyn(self, frame)) |o| return o,
                 .SET_PROP => if (try property_ops.opSetProp(self, frame)) |o| return o,

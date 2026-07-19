@@ -38,6 +38,7 @@ pub inline fn opNewArray(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 }
 
 pub inline fn opArrayAppend(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    _ = self; // dense integer append uses the object's own arena
     const code = frame.func.chunk.code;
     const rarr = code[frame.pc];
     frame.pc += 1;
@@ -46,10 +47,23 @@ pub inline fn opArrayAppend(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const arr_val = frame.registers[rarr];
     const val = frame.registers[rval];
     if (arr_val.bits != 0 and arr_val.unbox() == .object) {
-        const arr = arr_val.toPtr().object;
-        const idx = arr.getArrayLength();
-        const key = try std.fmt.allocPrint(self.arena, "{d}", .{idx});
-        try arr.set(key, val);
+        // Integer-index append: no per-element decimal-key allocation.
+        try arr_val.toPtr().object.appendElement(val);
+    }
+    return null;
+}
+
+pub inline fn opArrayAppendHole(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    _ = self;
+    const code = frame.func.chunk.code;
+    const rarr = code[frame.pc];
+    frame.pc += 1;
+    const count = code[frame.pc];
+    frame.pc += 1;
+    const arr_val = frame.registers[rarr];
+    if (arr_val.bits != 0 and arr_val.unbox() == .object) {
+        // Array-literal elision (`[1,,3]`): grow length by `count` real holes.
+        arr_val.toPtr().object.appendHoles(count);
     }
     return null;
 }
@@ -80,9 +94,7 @@ pub inline fn opArraySpread(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             const done_v = step.toPtr().object.get("done") orelse break;
             if (bcv.isTruthy(done_v)) break;
             const v = step.toPtr().object.get("value") orelse try val_mod.makeUndefined(self.arena);
-            const idx = arr.getArrayLength();
-            const key = try std.fmt.allocPrint(self.arena, "{d}", .{idx});
-            try arr.set(key, v);
+            try arr.appendElement(v);
         }
     }
     return null;

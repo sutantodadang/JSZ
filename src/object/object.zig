@@ -265,6 +265,45 @@ pub const JsObject = struct {
         self.deoptDense() catch {};
     }
 
+    /// Store an element at integer index `idx` without allocating a decimal key
+    /// string on the dense fast path. Semantically identical to `set(itoa(idx),
+    /// value)` for an array: the dense buffer is written directly, and only a
+    /// deopt (sparse write) or an already-shape-path array falls back to the
+    /// string-keyed `set` (which owns the length / attribute bookkeeping). This
+    /// is the hot path for array-literal build, spread, push, and `a[i] = v`.
+    pub fn setIndex(self: *JsObject, idx: u32, value: Value) !void {
+        if (idx != std.math.maxInt(u32) and self.usesDense()) {
+            if (try self.denseSet(idx, value)) return;
+            // deopt occurred → store through the shape path below.
+        }
+        var buf: [12]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{d}", .{idx}) catch unreachable;
+        try self.set(key, value);
+    }
+
+    /// Append `value` at the current array length with no key-string allocation.
+    pub fn appendElement(self: *JsObject, value: Value) !void {
+        try self.setIndex(self.array_length, value);
+    }
+
+    /// Extend the array by `count` trailing holes — array-literal elision, e.g.
+    /// `[1,,3]`. No index becomes an own property (the dense buffer is untouched;
+    /// only `array_length` grows), so `n in arr` stays false for the elided slots
+    /// and `hasOwnProperty` reports false. Saturates at u32 max.
+    pub fn appendHoles(self: *JsObject, count: u32) void {
+        const room = std.math.maxInt(u32) - self.array_length;
+        self.array_length += @min(count, room);
+    }
+
+    /// Read a present own dense element by integer index with no key-string
+    /// allocation. Returns null when this is not a dense array, or `idx` is a hole
+    /// or out of range — the caller then takes the string-keyed path, which walks
+    /// the prototype chain (a bare dense element read never needs that).
+    pub fn getIndexOwn(self: *const JsObject, idx: u32) ?Value {
+        if (!self.usesDense()) return null;
+        return self.denseGet(idx);
+    }
+
     /// Get own property (no proto walk). Returns null for accessor slots so
     /// enumeration and the plain `get` path skip them (accessor dispatch happens
     /// in the VM via `findProperty`/`ownAccessorHolder`).
