@@ -350,7 +350,14 @@ pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value)
 
 pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const ins = try requireInstant(arena, this_val);
-    return val_mod.makeString(arena, try instantToString(arena, ins.*, null));
+    // toLocaleString for Instant formats as UTC date/time.
+    const total = ins.* + 0; // ns (UTC has offset 0)
+    const days: i64 = @intCast(@divFloor(total, shared.NS_PER_DAY));
+    const tod = total - @as(i128, days) * shared.NS_PER_DAY;
+    const tr = shared.nanosToTime(tod);
+    const date = shared.epochDaysToISODate(days + tr.days);
+    const s = try @import("intl_format.zig").dateTimeToLocaleString(arena, date, tr.time);
+    return val_mod.makeString(arena, s);
 }
 
 pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {

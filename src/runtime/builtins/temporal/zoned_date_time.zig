@@ -936,7 +936,8 @@ pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value)
 
 pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const s = try zonedToString(arena, z.ns, z.offset_ns, z.tz, null, .auto, .auto, .auto, null);
+    const wall = localDT(z);
+    const s = try @import("intl_format.zig").dateTimeToLocaleString(arena, wall.date, wall.time);
     return val_mod.makeString(arena, s);
 }
 

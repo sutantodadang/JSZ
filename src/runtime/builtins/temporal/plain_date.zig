@@ -412,7 +412,8 @@ pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value)
 
 pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const d = try requireDate(arena, this_val);
-    return val_mod.makeString(arena, try dateToString(arena, d.*, .auto));
+    const s = try @import("intl_format.zig").dateTimeToLocaleString(arena, d.*, .{});
+    return val_mod.makeString(arena, s);
 }
 
 pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
