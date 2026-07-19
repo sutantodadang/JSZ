@@ -34,6 +34,8 @@ const t_pdate = @import("temporal/plain_date.zig");
 const t_ptime = @import("temporal/plain_time.zig");
 const t_pdatetime = @import("temporal/plain_date_time.zig");
 const t_zdt = @import("temporal/zoned_date_time.zig");
+const t_pym = @import("temporal/plain_year_month.zig");
+const t_pmd = @import("temporal/plain_month_day.zig");
 
 fn getNum(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
@@ -462,6 +464,18 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
                     minute = "numeric";
                     second = "numeric";
                 },
+                .year_month => {
+                    weekday = "";
+                    year = "numeric";
+                    month = "numeric";
+                    day = "";
+                },
+                .month_day => {
+                    weekday = "";
+                    year = "";
+                    month = "numeric";
+                    day = "numeric";
+                },
             };
         }
     }
@@ -641,13 +655,21 @@ fn temporalEpochMs(v: Value) ?i64 {
             const z = t_zdt.getZoned(v) orelse return null;
             return @intCast(@divFloor(z.ns + z.offset_ns, t_shared.NS_PER_MILLI));
         },
+        .temporal_plain_year_month => {
+            const ym = t_pym.getYearMonth(v) orelse return null;
+            return t_shared.isoDateToEpochDays(ym.year, ym.month, ym.day) * 86_400_000;
+        },
+        .temporal_plain_month_day => {
+            const md = t_pmd.getMonthDay(v) orelse return null;
+            return t_shared.isoDateToEpochDays(md.ref_year, md.month, md.day) * 86_400_000;
+        },
         else => return null,
     }
 }
 
 /// Which Temporal type is calling toLocaleString — selects the default
 /// component set and which option families are permitted.
-pub const TemporalDTKind = enum { date, time, datetime, instant, zoned };
+pub const TemporalDTKind = enum { date, time, datetime, instant, zoned, year_month, month_day };
 
 /// Classify a Temporal date/time value for default-component selection.
 fn temporalKindOf(v: Value) ?TemporalDTKind {
@@ -658,6 +680,8 @@ fn temporalKindOf(v: Value) ?TemporalDTKind {
         .temporal_plain_date_time => .datetime,
         .temporal_instant => .instant,
         .temporal_zoned_date_time => .zoned,
+        .temporal_plain_year_month => .year_month,
+        .temporal_plain_month_day => .month_day,
         else => null,
     };
 }
@@ -705,15 +729,21 @@ pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: [
         .date => .date,
         .time => .time,
         .datetime, .instant, .zoned => .any,
+        .year_month => .date,
+        .month_day => .date,
     };
     const defaults: LocaleDefaults = switch (kind) {
         .date => .date,
         .time => .time,
         .datetime, .instant, .zoned => .datetime,
+        .year_month => .year_month,
+        .month_day => .month_day,
     };
     const restrict: Restrict = switch (kind) {
         .date => .date_only,
         .time => .time_only,
+        .year_month => .year_month_only,
+        .month_day => .month_day_only,
         else => .none,
     };
     // A ZonedDateTime carries its own zone; a `timeZone` option is disallowed.
@@ -728,11 +758,11 @@ pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: [
 pub const Required = enum { date, time, any };
 
 /// Default component set applied when no explicit component/style is requested.
-pub const LocaleDefaults = enum { date, time, datetime };
+pub const LocaleDefaults = enum { date, time, datetime, year_month, month_day };
 
 /// Per-receiver option rejection: Temporal date-only / time-only types reject
 /// the opposite family of options; legacy Date imposes no such restriction.
-pub const Restrict = enum { none, date_only, time_only };
+pub const Restrict = enum { none, date_only, time_only, year_month_only, month_day_only };
 
 /// Shared core of `Temporal.X.prototype.toLocaleString` and
 /// `Date.prototype.toLocale*String`: parse options, validate conflicts, resolve
@@ -768,6 +798,12 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
             return realm_mod.throwTypeError(arena, "this Temporal type cannot be formatted with time options"),
         .time_only => if (date_style != null or has_date_comp)
             return realm_mod.throwTypeError(arena, "this Temporal type cannot be formatted with date options"),
+        // PlainYearMonth: no time, no day/weekday. PlainMonthDay: no time, no
+        // year/weekday. (era is tolerated but never rendered for iso8601.)
+        .year_month_only => if (time_style != null or has_time_comp or day != null or weekday != null)
+            return realm_mod.throwTypeError(arena, "Temporal.PlainYearMonth cannot be formatted with these options"),
+        .month_day_only => if (time_style != null or has_time_comp or year != null or weekday != null)
+            return realm_mod.throwTypeError(arena, "Temporal.PlainMonthDay cannot be formatted with these options"),
         .none => {},
     }
 
@@ -810,6 +846,14 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
             if (h.len == 0) h = "numeric";
             if (mi.len == 0) mi = "numeric";
             if (se.len == 0) se = "numeric";
+        }
+        if (defaults == .year_month) {
+            if (y.len == 0) y = "numeric";
+            if (mo.len == 0) mo = "numeric";
+        }
+        if (defaults == .month_day) {
+            if (mo.len == 0) mo = "numeric";
+            if (d.len == 0) d = "numeric";
         }
     }
 

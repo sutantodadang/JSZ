@@ -92,7 +92,7 @@ pub const JsObject = struct {
     /// Arena-allocated; MUST NOT be traversed by markObject.
     internal_slot: ?*anyopaque = null,
     /// Phase 4c/4d: discriminator for internal_slot type.
-    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, weakref, finalization_registry, promise, generator, async_generator, return_completion, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function, mapped_arguments, map_iterator, set_iterator, array_iterator, iterator_helper, temporal_instant, temporal_duration, temporal_plain_date, temporal_plain_time, temporal_plain_date_time, temporal_zoned_date_time } = .none,
+    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, weakref, finalization_registry, promise, generator, async_generator, return_completion, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function, mapped_arguments, map_iterator, set_iterator, array_iterator, iterator_helper, temporal_instant, temporal_duration, temporal_plain_date, temporal_plain_time, temporal_plain_date_time, temporal_zoned_date_time, temporal_plain_year_month, temporal_plain_month_day } = .none,
     /// Allocator for property storage (the eval arena).
     arena: std.mem.Allocator,
     /// Phase 6 hidden class manager (shared globally).
