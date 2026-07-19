@@ -1927,16 +1927,6 @@ built-ins/Promise/resolve/ctx-non-object.js
 built-ins/Promise/resolve/resolve-from-promise-capability.js
 built-ins/Promise/resolve/resolve-poisoned-then.js
 built-ins/Promise/resolve/resolve-self.js
-built-ins/Promise/try/args.js
-built-ins/Promise/try/ctx-ctor-throws.js
-built-ins/Promise/try/ctx-ctor.js
-built-ins/Promise/try/length.js
-built-ins/Promise/try/name.js
-built-ins/Promise/try/not-a-constructor.js
-built-ins/Promise/try/promise.js
-built-ins/Promise/try/prop-desc.js
-built-ins/Promise/try/return-value.js
-built-ins/Promise/try/throws.js
 built-ins/Promise/undefined-newtarget.js
 built-ins/Proxy/construct/trap-is-undefined-proto-from-newtarget-realm.js
 built-ins/Proxy/create-target-is-not-a-constructor.js

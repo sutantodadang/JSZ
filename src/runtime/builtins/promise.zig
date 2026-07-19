@@ -27,6 +27,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !*JsObject {
     try promise_ctor_obj.set("race", try val_mod.makeNativeFunctionNamed(arena, nativePromiseRace, "race", 0));
     try promise_ctor_obj.set("any", try val_mod.makeNativeFunctionNamed(arena, nativePromiseAny, "any", 0));
     try promise_ctor_obj.set("withResolvers", try val_mod.makeNativeFunctionNamed(arena, nativePromiseWithResolvers, "withResolvers", 0));
+    try promise_ctor_obj.set("try", try val_mod.makeNativeFunctionNamed(arena, nativePromiseTry, "try", 1));
     try promise_proto.set("finally", try val_mod.makeNativeFunctionNamed(arena, nativePromiseFinally, "finally", 0));
     _ = try promise_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Promise"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try promise_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
@@ -324,6 +325,40 @@ pub fn nativePromiseResolve(arena: std.mem.Allocator, _: Value, args: []const Va
 pub fn nativePromiseReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     return makePromise(arena, .rejected, v);
+}
+
+/// Promise.try(callbackfn, ...args) (ES2025 §27.2.4.9): build a capability from
+/// `C = this`, call `callbackfn` synchronously with the extra args, then resolve
+/// the capability with its return value or reject with a thrown completion.
+pub fn nativePromiseTry(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Step 2: If C is not an Object, throw a TypeError. Callables (functions,
+    // classes) are Objects too, so accept every object-carrying tag here; the
+    // not-a-constructor case is caught by NewPromiseCapability below.
+    const is_object = this_val.bits != 0 and switch (this_val.unbox()) {
+        .object, .function, .bc_function, .native_function => true,
+        else => false,
+    };
+    if (!is_object)
+        return realm_mod.throwTypeError(arena, "Promise.try called on a non-object");
+    // Step 3: NewPromiseCapability(C).
+    const cap = try newPromiseCapability(arena, this_val);
+    const ctx = realm_mod.active_context orelse return realm_mod.throwTypeError(arena, "no active context");
+    const undef = try val_mod.makeUndefined(arena);
+    const cb = if (args.len > 0) args[0] else undef;
+    const rest: []const Value = if (args.len > 1) args[1..] else &[_]Value{};
+    // Step 4: status = Completion(Call(callbackfn, undefined, args)).
+    if (ctx.invokeJs(arena, undef, cb, rest)) |result| {
+        // Step 6: Call(cap.[[Resolve]], undefined, « result »).
+        _ = ctx.invokeJs(arena, undef, cap.resolve, &[_]Value{result}) catch {};
+    } else |e| {
+        if (e != error.JsException) return e;
+        const reason = realm_mod.pending_exception;
+        realm_mod.pending_exception = Value{};
+        // Step 5: Call(cap.[[Reject]], undefined, « status.[[Value]] »).
+        _ = ctx.invokeJs(arena, undef, cap.reject, &[_]Value{reason}) catch {};
+    }
+    // Step 7: return cap.[[Promise]].
+    return cap.promise;
 }
 
 // ---- ctx-on-this helpers ----
