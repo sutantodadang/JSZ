@@ -178,6 +178,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
     // Arrow function? (base must be a parenthesized sequence — handled via the normal parseAssignmentExprCore path).
     if (p.match(.arrow)) {
         const params = p.extractArrowParams(left) orelse return null;
+        const rest_param = p.arrow_rest_param;
         // Snapshot + detach the destructuring-param prelude before parsing the
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
@@ -205,7 +206,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
                 .name = null,
                 .params = params,
                 .param_defaults = &[_]?*Node{},
-                .rest_param = null,
+                .rest_param = rest_param,
                 .body = body_nodes,
                 .is_arrow = true,
                 .is_async = false,
@@ -323,6 +324,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
     // ES2015 arrow function: params => body
     if (p.match(.arrow)) {
         const params = p.extractArrowParams(left) orelse return null;
+        const rest_param = p.arrow_rest_param;
         // Snapshot + detach the destructuring-param prelude before parsing the
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
@@ -350,7 +352,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
                 .name = null,
                 .params = params,
                 .param_defaults = &[_]?*Node{},
-                .rest_param = null,
+                .rest_param = rest_param,
                 .body = body_nodes,
                 .is_arrow = true,
                 .is_async = is_async_arrow,
@@ -391,6 +393,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
 pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
     // Fresh prelude per extraction (snapshotted by the caller right after).
     p.arrow_prelude = .{};
+    p.arrow_rest_param = null;
     var params = std.ArrayList([]const u8){};
     switch (lhs.kind) {
         .identifier => {
@@ -402,7 +405,8 @@ pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
         // A single destructuring param: `([a]) => …` / `({x}) => …`. The
         // parenthesized pattern parsed as an array/object literal. A single
         // defaulted param `(x = d) => …` parses as an assignment expression.
-        .array_literal, .object_literal, .assignment_expr => {
+        // A lone rest param `(...r) => …` parses as a spread_expr.
+        .array_literal, .object_literal, .assignment_expr, .spread_expr => {
             if (!extractOneArrowParam(p, lhs, &params)) return null;
         },
         .sequence_expr => {
@@ -489,6 +493,21 @@ fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)
             };
             const src = p.makeNode(.identifier, e.start, e.start, .{ .identifier = tmp_name }) orelse return false;
             if (!bindPatternElement(p, e, src)) return false;
+        },
+        // Rest parameter `(...r) => …` / `(a, ...r) => …`. Only a plain
+        // BindingIdentifier rest is supported (destructuring rest patterns are
+        // rare); it must be the final parameter.
+        .spread_expr => {
+            if (p.arrow_rest_param != null) {
+                arrowParamError(p);
+                return false;
+            }
+            const target = e.data.spread_expr;
+            if (target.kind != .identifier) {
+                arrowParamError(p);
+                return false;
+            }
+            p.arrow_rest_param = target.data.identifier;
         },
         else => {
             arrowParamError(p);
@@ -1530,10 +1549,49 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
                     .sequence_expr = .{ .exprs = &[_]*Node{} },
                 });
             }
-            const expr = p.parseExpression() orelse return null;
+            // Cover grammar: a comma-separated list of assignment expressions with
+            // an optional trailing `...rest` element and optional trailing comma.
+            // Only a following `=>` turns this into an arrow parameter list; the
+            // `...rest` and trailing comma are otherwise invalid and error later.
+            var elems = std.ArrayList(*Node){};
+            var saw_rest = false;
+            while (true) {
+                if (p.check(.ellipsis)) {
+                    const rest_start = p.current.start;
+                    _ = p.advance();
+                    const rest_tgt = p.parseAssignmentExpr() orelse return null;
+                    const sp = p.makeNode(.spread_expr, rest_start, rest_tgt.end, .{
+                        .spread_expr = rest_tgt,
+                    }) orelse return null;
+                    elems.append(p.arena, sp) catch {
+                        p.had_error = true;
+                        return null;
+                    };
+                    saw_rest = true;
+                    break; // a rest element must be the last parameter
+                }
+                const e = p.parseAssignmentExpr() orelse return null;
+                elems.append(p.arena, e) catch {
+                    p.had_error = true;
+                    return null;
+                };
+                if (p.match(.comma)) {
+                    if (p.check(.right_paren)) break; // trailing comma
+                    continue;
+                }
+                break;
+            }
             _ = p.expect(.right_paren) orelse return null;
-            expr.paren = true;
-            return expr;
+            if (elems.items.len == 1 and !saw_rest) {
+                const only = elems.items[0];
+                only.paren = true;
+                return only;
+            }
+            const seq = p.makeNode(.sequence_expr, start, p.current.start, .{
+                .sequence_expr = .{ .exprs = elems.items },
+            }) orelse return null;
+            seq.paren = true;
+            return seq;
         },
         .kw_function => {
             return p.parseFunctionExpr(false);
