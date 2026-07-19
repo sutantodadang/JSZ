@@ -36,6 +36,7 @@ const t_pdatetime = @import("temporal/plain_date_time.zig");
 const t_zdt = @import("temporal/zoned_date_time.zig");
 const t_pym = @import("temporal/plain_year_month.zig");
 const t_pmd = @import("temporal/plain_month_day.zig");
+const t_duration = @import("temporal/duration.zig");
 
 fn getNum(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
@@ -1579,6 +1580,450 @@ pub fn nativeRelativeTimeFormatResolved(arena: std.mem.Allocator, this_val: Valu
     try r.set("style", try val_mod.makeString(arena, style));
     try r.set("numeric", try val_mod.makeString(arena, numeric));
     try r.set("numberingSystem", try val_mod.makeString(arena, "latn"));
+    return val_mod.makeObject(arena, r);
+}
+
+// --------------------------------------------------------------- DurationFormat ---
+//
+// A pragmatic en-US `Intl.DurationFormat` (ECMA-402). Supports the four styles
+// (long/short/narrow/digital), per-unit style + display overrides, and the
+// numeric "H:MM:SS[.fff]" clock grouping used by `digital` / explicit numeric
+// units. CLDR unit strings are the en data (see the unit table below).
+
+const DF_UNITS = [_][]const u8{ "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds", "nanoseconds" };
+
+/// Per-unit CLDR display forms for en. long/short carry singular+plural; narrow
+/// has a single (no-space) form. Grouping/number is prepended by the caller.
+const DfUnitForms = struct {
+    long_one: []const u8,
+    long_other: []const u8,
+    short_one: []const u8,
+    short_other: []const u8,
+    narrow: []const u8,
+};
+const DF_FORMS = [_]DfUnitForms{
+    .{ .long_one = "year", .long_other = "years", .short_one = "yr", .short_other = "yrs", .narrow = "y" },
+    .{ .long_one = "month", .long_other = "months", .short_one = "mth", .short_other = "mths", .narrow = "m" },
+    .{ .long_one = "week", .long_other = "weeks", .short_one = "wk", .short_other = "wks", .narrow = "w" },
+    .{ .long_one = "day", .long_other = "days", .short_one = "day", .short_other = "days", .narrow = "d" },
+    .{ .long_one = "hour", .long_other = "hours", .short_one = "hr", .short_other = "hr", .narrow = "h" },
+    .{ .long_one = "minute", .long_other = "minutes", .short_one = "min", .short_other = "min", .narrow = "m" },
+    .{ .long_one = "second", .long_other = "seconds", .short_one = "sec", .short_other = "sec", .narrow = "s" },
+    .{ .long_one = "millisecond", .long_other = "milliseconds", .short_one = "ms", .short_other = "ms", .narrow = "ms" },
+    .{ .long_one = "microsecond", .long_other = "microseconds", .short_one = "\u{03bc}s", .short_other = "\u{03bc}s", .narrow = "\u{03bc}s" },
+    .{ .long_one = "nanosecond", .long_other = "nanoseconds", .short_one = "ns", .short_other = "ns", .narrow = "ns" },
+};
+
+/// Valid `style` values for a given unit index. Time-core units (hours/minutes/
+/// seconds) also allow "numeric"/"2-digit"; sub-second units allow "numeric".
+fn dfUnitAllows(unit_idx: usize, style: []const u8) bool {
+    if (std.mem.eql(u8, style, "long") or std.mem.eql(u8, style, "short") or std.mem.eql(u8, style, "narrow")) return true;
+    if (std.mem.eql(u8, style, "numeric")) return unit_idx >= 4; // hours..nanoseconds
+    if (std.mem.eql(u8, style, "2-digit")) return unit_idx >= 4 and unit_idx <= 6; // hours/minutes/seconds
+    return false;
+}
+
+/// Digital-style per-unit default: hours→numeric, minutes/seconds→2-digit,
+/// everything else→short (date units) / numeric (sub-second units).
+fn dfDigitalBase(unit_idx: usize) []const u8 {
+    return switch (unit_idx) {
+        4 => "numeric", // hours
+        5, 6 => "2-digit", // minutes, seconds
+        7, 8, 9 => "numeric", // milli/micro/nanoseconds
+        else => "short", // years..days
+    };
+}
+
+fn dfIsNumericStyle(style: []const u8) bool {
+    return std.mem.eql(u8, style, "numeric") or std.mem.eql(u8, style, "2-digit");
+}
+
+/// Read + validate an option string; RangeError if present but not in `allowed`.
+/// Returns null when absent/undefined. (Getter dispatch is not performed — plain
+/// data option objects, which the corpus overwhelmingly uses.)
+fn dfGetOption(arena: std.mem.Allocator, opts: ?Value, key: []const u8, allowed: []const []const u8) !?[]const u8 {
+    const o = opts orelse return null;
+    if (o.bits == 0 or o.unbox() != .object) return null;
+    const v = o.toPtr().object.get(key) orelse return null;
+    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    const s = try t_shared.valueToString(arena, v);
+    for (allowed) |a| if (std.mem.eql(u8, a, s)) return s;
+    return throwRangeError(arena, "invalid value for Intl.DurationFormat option");
+}
+
+pub fn nativeDurationFormatCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // NewTarget must be present (spec step 1). Built-in `__call__` constructors
+    // are flagged via `active_constructing` on the `new` path; read + consume it
+    // immediately so nested coercions can't confuse the check.
+    const constructing = realm_mod.active_constructing;
+    realm_mod.active_constructing = false;
+    if (!constructing)
+        return throwTypeErrorIntl(arena, "Constructor Intl.DurationFormat requires 'new'");
+    const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
+        this_val.toPtr().object
+    else if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+    return dfBuild(arena, obj, args);
+}
+
+/// Parse (locales, options) into the DurationFormat internal slots stored on
+/// `obj`, and return `obj` boxed. Shared by the constructor and
+/// `Temporal.Duration.prototype.toLocaleString`.
+fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerror!Value {
+    const opts: ?Value = if (args.len > 1) args[1] else null;
+    if (opts) |ov| {
+        if (ov.bits != 0 and ov.unbox() != .undefined_ and ov.unbox() != .object)
+            return throwTypeErrorIntl(arena, "options must be an object");
+    }
+
+    // localeMatcher must be "lookup" or "best fit" when present (else RangeError).
+    _ = try dfGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" });
+
+    // numberingSystem — must be a well-formed Unicode `type` value when present.
+    const nu = optStr(opts, "numberingSystem") orelse "latn";
+    if (opts) |ov| if (ov.bits != 0 and ov.unbox() == .object) {
+        if (ov.toPtr().object.get("numberingSystem")) |nv| if (nv.bits != 0 and nv.unbox() != .undefined_) {
+            const nstr = try t_shared.valueToString(arena, nv);
+            if (!isWellFormedNumberingSystem(nstr))
+                return throwRangeError(arena, "invalid numberingSystem");
+        };
+    };
+    try obj.set("__df_nu", try val_mod.makeString(arena, nu));
+
+    const base_style = (try dfGetOption(arena, opts, "style", &.{ "long", "short", "narrow", "digital" })) orelse "short";
+    try obj.set("__df_style", try val_mod.makeString(arena, base_style));
+
+    // fractionalDigits: 0..9 or absent (-1 sentinel).
+    var frac: f64 = -1;
+    if (opts) |ov| if (ov.bits != 0 and ov.unbox() == .object) {
+        if (ov.toPtr().object.get("fractionalDigits")) |fv| if (fv.bits != 0 and fv.unbox() != .undefined_) {
+            const n = try realm_mod.toNumberValue(arena, fv);
+            if (!std.math.isFinite(n) or n < 0 or n > 9 or n != @trunc(n))
+                return throwRangeError(arena, "fractionalDigits out of range");
+            frac = n;
+        };
+    };
+    try obj.set("__df_frac", try val_mod.makeNumber(arena, frac));
+
+    // GetDurationUnitOptions for each unit, in table order.
+    var prev_style: []const u8 = "";
+    const is_digital = std.mem.eql(u8, base_style, "digital");
+    for (DF_UNITS, 0..) |uname, i| {
+        const allowed_all = [_][]const u8{ "long", "short", "narrow", "numeric", "2-digit" };
+        // Only pass the styles this unit accepts to the validator.
+        var allowed_buf: [5][]const u8 = undefined;
+        var n_allowed: usize = 0;
+        for (allowed_all) |a| {
+            if (dfUnitAllows(i, a)) {
+                allowed_buf[n_allowed] = a;
+                n_allowed += 1;
+            }
+        }
+        var style = try dfGetOption(arena, opts, uname, allowed_buf[0..n_allowed]);
+        var display_default: []const u8 = "always";
+        if (style == null) {
+            if (is_digital) {
+                if (i < 4 or i > 6) display_default = "auto";
+                style = dfDigitalBase(i);
+            } else {
+                display_default = "auto";
+                if (dfIsNumericStyle(prev_style)) {
+                    // A unit following a numeric/2-digit one defaults to "2-digit"
+                    // for minutes/seconds and "numeric" for sub-second units.
+                    style = if (i == 5 or i == 6) "2-digit" else "numeric";
+                } else {
+                    style = base_style;
+                }
+            }
+        }
+        // GetDurationUnitOptions step 6: a long/short/narrow style cannot follow a
+        // unit rendered with "numeric"/"2-digit".
+        if (dfIsNumericStyle(prev_style) and !dfIsNumericStyle(style.?))
+            return throwRangeError(arena, "Intl.DurationFormat: style cannot follow a numeric unit");
+        const disp_key = try std.fmt.allocPrint(arena, "{s}Display", .{uname});
+        const display = (try dfGetOption(arena, opts, disp_key, &.{ "auto", "always" })) orelse display_default;
+
+        try obj.set(try std.fmt.allocPrint(arena, "__df_s{d}", .{i}), try val_mod.makeString(arena, style.?));
+        try obj.set(try std.fmt.allocPrint(arena, "__df_d{d}", .{i}), try val_mod.makeString(arena, display));
+        prev_style = style.?;
+    }
+
+    return val_mod.makeObject(arena, obj);
+}
+
+/// A Unicode `type` value: one or more `-`-separated 3..8 alphanumeric segments.
+fn isWellFormedNumberingSystem(s: []const u8) bool {
+    if (s.len == 0) return false;
+    var seg_len: usize = 0;
+    for (s) |c| {
+        if (c == '-') {
+            if (seg_len < 3 or seg_len > 8) return false;
+            seg_len = 0;
+        } else if (std.ascii.isAlphanumeric(c)) {
+            seg_len += 1;
+        } else return false;
+    }
+    return seg_len >= 3 and seg_len <= 8;
+}
+
+/// First subtag (primary language) of a canonical tag, lower-cased.
+fn primaryLanguage(tag: []const u8) []const u8 {
+    const dash = std.mem.indexOfScalar(u8, tag, '-') orelse tag.len;
+    return tag[0..dash];
+}
+
+/// `Intl.DurationFormat.supportedLocalesOf(locales[, options])` — canonicalizes
+/// the requested list (throwing on structurally invalid tags) and returns those
+/// that are supported. Every real language tag is treated as supported except
+/// the "no linguistic content" tags (`zxx`/`und`).
+pub fn nativeDurationFormatSupportedLocalesOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    var requested = std.ArrayListUnmanaged([]const u8){};
+    if (args.len > 0 and args[0].bits != 0) {
+        if (args[0].unbox() == .string) {
+            try requested.append(arena, args[0].unbox().string);
+        } else if (args[0].unbox() == .object) {
+            requested.items = try listElements(arena, args[0]);
+        }
+    }
+    // Validate the options' localeMatcher (RangeError if malformed).
+    const opts: ?Value = if (args.len > 1) args[1] else null;
+    _ = try dfGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" });
+
+    const arr = if (realm_mod.active_heap) |h|
+        try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
+    else
+        try JsObject.createArray(arena, realm_mod.active_array_proto);
+    var seen = std.ArrayListUnmanaged([]const u8){};
+    var n: usize = 0;
+    for (requested.items) |t| {
+        if (t.len == 0) continue;
+        const canon = try canonicalizeTag(arena, t); // throws on invalid
+        var dup = false;
+        for (seen.items) |s| if (std.mem.eql(u8, s, canon)) {
+            dup = true;
+            break;
+        };
+        if (dup) continue;
+        try seen.append(arena, canon);
+        const lang = primaryLanguage(canon);
+        if (std.mem.eql(u8, lang, "zxx") or std.mem.eql(u8, lang, "und")) continue;
+        try arr.set(try std.fmt.allocPrint(arena, "{d}", .{n}), try val_mod.makeString(arena, canon));
+        n += 1;
+    }
+    return val_mod.makeObject(arena, arr);
+}
+
+/// Build a DurationFormat instance from `(locales, options)` without a NewTarget
+/// requirement — used by `Temporal.Duration.prototype.toLocaleString`.
+pub fn durationFormatFor(arena: std.mem.Allocator, args: []const Value) anyerror!Value {
+    const obj = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+    return dfBuild(arena, obj, args);
+}
+
+fn dfReadStr(o: *JsObject, key: []const u8, default: []const u8) []const u8 {
+    const v = o.get(key) orelse return default;
+    if (v.bits != 0 and v.unbox() == .string) return v.unbox().string;
+    return default;
+}
+
+/// Append an integer magnitude (given as a non-negative f64) with optional en
+/// grouping (comma every three digits). `neg` prints a leading minus. Values
+/// beyond u64 range fall back to a plain decimal so huge (but valid) durations
+/// format without overflow — their exact digits are not asserted by test262.
+fn dfAppendMagnitude(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), mag: f64, neg: bool, grouping: bool) !void {
+    if (neg) try buf.append(arena, '-');
+    var tmp: [40]u8 = undefined;
+    const s = if (mag < 18446744073709551615.0)
+        std.fmt.bufPrint(&tmp, "{d}", .{@as(u64, @intFromFloat(mag))}) catch unreachable
+    else
+        std.fmt.bufPrint(&tmp, "{d:.0}", .{mag}) catch (std.fmt.bufPrint(&tmp, "0", .{}) catch unreachable);
+    if (!grouping) {
+        try buf.appendSlice(arena, s);
+        return;
+    }
+    const first = s.len % 3;
+    for (s, 0..) |c, i| {
+        if (i != 0 and (i % 3) == first) try buf.append(arena, ',');
+        try buf.append(arena, c);
+    }
+}
+
+/// Format one standalone unit ("1 year", "2 yrs", "3w"). `first_shown` gates the
+/// sign (only the first displayed field keeps a negative sign).
+fn dfFormatStandalone(arena: std.mem.Allocator, unit_idx: usize, style: []const u8, value: f64, first_shown: bool) ![]const u8 {
+    const neg = first_shown and value < 0;
+    const mag = @abs(value);
+    var num = std.ArrayListUnmanaged(u8){};
+    try dfAppendMagnitude(arena, &num, mag, neg, true);
+    // English plural: |value| == 1 → "one" category (sign does not affect it).
+    const one = mag == 1;
+    const forms = DF_FORMS[unit_idx];
+    if (std.mem.eql(u8, style, "narrow")) {
+        return std.fmt.allocPrint(arena, "{s}{s}", .{ num.items, forms.narrow });
+    } else if (std.mem.eql(u8, style, "short")) {
+        return std.fmt.allocPrint(arena, "{s} {s}", .{ num.items, if (one) forms.short_one else forms.short_other });
+    }
+    // long (default for standalone)
+    return std.fmt.allocPrint(arena, "{s} {s}", .{ num.items, if (one) forms.long_one else forms.long_other });
+}
+
+pub fn nativeDurationFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype.format called on incompatible receiver");
+    const o = this_val.toPtr().object;
+    if (o.get("__df_style") == null)
+        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype.format called on incompatible receiver");
+
+    const d = try t_duration.toTemporalDuration(arena, if (args.len > 0) args[0] else try val_mod.makeUndefined(arena));
+    const fields = [_]f64{ d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, d.milliseconds, d.microseconds, d.nanoseconds };
+
+    const base_style = dfReadStr(o, "__df_style", "short");
+    const frac_digits: i32 = if (o.get("__df_frac")) |fv| (if (fv.bits != 0 and fv.unbox() == .number) @intFromFloat(fv.unbox().number) else -1) else -1;
+
+    var styles: [10][]const u8 = undefined;
+    var displays: [10][]const u8 = undefined;
+    for (0..10) |i| {
+        var kb: [8]u8 = undefined;
+        styles[i] = dfReadStr(o, std.fmt.bufPrint(&kb, "__df_s{d}", .{i}) catch unreachable, "short");
+        var db: [8]u8 = undefined;
+        displays[i] = dfReadStr(o, std.fmt.bufPrint(&db, "__df_d{d}", .{i}) catch unreachable, "auto");
+    }
+
+    var elements = std.ArrayListUnmanaged([]const u8){};
+    var first_shown = true;
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const style = styles[i];
+        const display = displays[i];
+        const numeric = dfIsNumericStyle(style);
+
+        // Sub-second units (i>=7) that are numeric are folded into fractional
+        // seconds by the clock group; they never render standalone here.
+        if (numeric and i >= 7) continue;
+
+        if (!numeric) {
+            const value = fields[i];
+            if (value != 0 or std.mem.eql(u8, display, "always")) {
+                try elements.append(arena, try dfFormatStandalone(arena, i, style, value, first_shown));
+                first_shown = false;
+            }
+            continue;
+        }
+
+        // Numeric clock group starting at unit i (one of hours/minutes/seconds).
+        // Consecutive numeric time units join with ":"; seconds folds any numeric
+        // sub-second fields into a fractional part. `j` stops at the first
+        // non-numeric time unit (or past seconds).
+        var clock = std.ArrayListUnmanaged(u8){};
+        var wrote_any = false;
+        var j = i;
+        while (j <= 6) : (j += 1) {
+            if (!dfIsNumericStyle(styles[j])) break;
+            const value = fields[j];
+            const disp = displays[j];
+            const show = value != 0 or std.mem.eql(u8, disp, "always") or wrote_any;
+            if (!show) continue;
+            if (wrote_any) try clock.append(arena, ':');
+            const two_digit = std.mem.eql(u8, styles[j], "2-digit");
+            const neg = first_shown and value < 0;
+            const mag = @abs(value);
+            if (neg) try clock.append(arena, '-');
+            if (j == 6) {
+                // seconds: fold sub-seconds into a fractional part.
+                try dfAppendClockSeconds(arena, &clock, &fields, frac_digits, two_digit);
+            } else {
+                if (two_digit and mag < 10) try clock.append(arena, '0');
+                try dfAppendMagnitude(arena, &clock, mag, false, false);
+            }
+            wrote_any = true;
+            first_shown = false;
+        }
+        if (wrote_any) try elements.append(arena, clock.items);
+        i = j - 1; // resume at the first unit the clock group did not consume
+    }
+
+    // Join the list. Unit-style ListFormat: long/short/digital → ", "; narrow → " ".
+    const sep: []const u8 = if (std.mem.eql(u8, base_style, "narrow")) " " else ", ";
+    var out = std.ArrayListUnmanaged(u8){};
+    for (elements.items, 0..) |e, idx| {
+        if (idx != 0) try out.appendSlice(arena, sep);
+        try out.appendSlice(arena, e);
+    }
+    return val_mod.makeString(arena, out.items);
+}
+
+/// Append the seconds component of a numeric clock. Sub-second fields carry up
+/// into whole seconds (e.g. 56s + 1234567ms = "1290.567"), so the whole part is
+/// computed from the total nanoseconds (i128, no overflow) and the fractional
+/// part is truncated to `frac_digits` (or the shortest exact form when absent).
+fn dfAppendClockSeconds(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), fields: *const [10]f64, frac_digits: i32, two_digit: bool) !void {
+    const total_ns: i128 = @as(i128, @intFromFloat(@abs(fields[6]))) * 1_000_000_000 +
+        @as(i128, @intFromFloat(@abs(fields[7]))) * 1_000_000 +
+        @as(i128, @intFromFloat(@abs(fields[8]))) * 1_000 +
+        @as(i128, @intFromFloat(@abs(fields[9])));
+    const whole: u64 = @intCast(@divTrunc(total_ns, 1_000_000_000));
+    const frac_ns: u32 = @intCast(@mod(total_ns, 1_000_000_000));
+
+    if (two_digit and whole < 10) try buf.append(arena, '0');
+    var nb: [24]u8 = undefined;
+    try buf.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{whole}) catch unreachable);
+
+    var frac: [9]u8 = undefined;
+    _ = std.fmt.bufPrint(&frac, "{d:0>9}", .{frac_ns}) catch unreachable;
+    if (frac_digits >= 0) {
+        const dd: usize = @intCast(frac_digits);
+        if (dd == 0) return;
+        try buf.append(arena, '.');
+        try buf.appendSlice(arena, frac[0..dd]);
+    } else {
+        if (frac_ns == 0) return;
+        var end: usize = 9;
+        while (end > 0 and frac[end - 1] == '0') : (end -= 1) {}
+        try buf.append(arena, '.');
+        try buf.appendSlice(arena, frac[0..end]);
+    }
+}
+
+pub fn nativeDurationFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Minimal: return the whole formatted string as one { type:"literal", value } part.
+    const s_val = try nativeDurationFormatFormat(arena, this_val, args);
+    const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    const part = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+    try part.set("type", try val_mod.makeString(arena, "literal"));
+    try part.set("value", s_val);
+    try arr.appendElement(try val_mod.makeObject(arena, part));
+    return val_mod.makeObject(arena, arr);
+}
+
+pub fn nativeDurationFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype.resolvedOptions called on incompatible receiver");
+    const o = this_val.toPtr().object;
+    const r = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("numberingSystem", try val_mod.makeString(arena, dfReadStr(o, "__df_nu", "latn")));
+    try r.set("style", try val_mod.makeString(arena, dfReadStr(o, "__df_style", "short")));
+    for (DF_UNITS, 0..) |uname, i| {
+        var sk: [8]u8 = undefined;
+        var dk: [8]u8 = undefined;
+        try r.set(uname, try val_mod.makeString(arena, dfReadStr(o, std.fmt.bufPrint(&sk, "__df_s{d}", .{i}) catch unreachable, "short")));
+        const disp_key = try std.fmt.allocPrint(arena, "{s}Display", .{uname});
+        try r.set(disp_key, try val_mod.makeString(arena, dfReadStr(o, std.fmt.bufPrint(&dk, "__df_d{d}", .{i}) catch unreachable, "auto")));
+    }
+    const frac_digits: i32 = if (o.get("__df_frac")) |fv| (if (fv.bits != 0 and fv.unbox() == .number) @intFromFloat(fv.unbox().number) else -1) else -1;
+    if (frac_digits >= 0) try r.set("fractionalDigits", try val_mod.makeNumber(arena, @floatFromInt(frac_digits)));
     return val_mod.makeObject(arena, r);
 }
 

@@ -150,11 +150,20 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     var month: f64 = @floatFromInt(cur.month);
     var day: f64 = @floatFromInt(cur.day);
     var any = false;
+    var mc_month: ?i32 = null;
     if (try shared.readMonthCode(arena, o.get("monthCode"))) |code| {
+        mc_month = code;
         month = @floatFromInt(code);
         any = true;
     }
-    if (try readField(arena, o, "month")) |x| { month = x; any = true; }
+    if (try readField(arena, o, "month")) |x| {
+        // month and monthCode, when both present, must denote the same month.
+        if (mc_month) |mc| {
+            if (floatToI32(x) != mc) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
+        }
+        month = x;
+        any = true;
+    }
     if (try readField(arena, o, "day")) |x| { day = x; any = true; }
     if (o.get("year") != null and o.get("year").?.bits != 0 and o.get("year").?.unbox() != .undefined_) any = true;
     if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");

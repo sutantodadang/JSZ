@@ -4481,6 +4481,21 @@ pub const Realm = struct {
             _ = try rtf_ctor.defineOwnData("name", try val_mod.makeString(arena, "RelativeTimeFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
             _ = try rtf_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
             try intl_obj.set("RelativeTimeFormat", try val_mod.makeObject(arena, rtf_ctor));
+            // Intl.DurationFormat
+            const df_proto = try JsObject.create(arena, object_proto);
+            _ = try df_proto.defineOwnData("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatFormat, "format", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+            _ = try df_proto.defineOwnData("formatToParts", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatFormatToParts, "formatToParts", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+            _ = try df_proto.defineOwnData("resolvedOptions", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatResolved, "resolvedOptions", 0), .{ .writable = true, .enumerable = false, .configurable = true });
+            if (active_sym_to_string_tag) |tag_sym|
+                _ = try df_proto.defineOwnDataSym(tag_sym, try val_mod.makeString(arena, "Intl.DurationFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
+            const df_ctor = try JsObject.create(arena, null);
+            try df_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDurationFormatCtor));
+            _ = try df_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, df_proto), .{ .writable = false, .enumerable = false, .configurable = false });
+            _ = try df_proto.defineOwnData("constructor", try val_mod.makeObject(arena, df_ctor), .{ .writable = true, .enumerable = false, .configurable = true });
+            _ = try df_ctor.defineOwnData("name", try val_mod.makeString(arena, "DurationFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
+            _ = try df_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+            _ = try df_ctor.defineOwnData("supportedLocalesOf", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatSupportedLocalesOf, "supportedLocalesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+            try intl_obj.set("DurationFormat", try val_mod.makeObject(arena, df_ctor));
             // Intl.getCanonicalLocales (static)
             _ = try intl_obj.defineOwnData("getCanonicalLocales", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeGetCanonicalLocales, "getCanonicalLocales", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             // Intl.supportedValuesOf (static)
