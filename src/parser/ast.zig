@@ -98,6 +98,10 @@ pub const NodeKind = enum {
     // Phase 3a: object and array literals
     object_literal,
     array_literal,
+    /// Elision hole in an array literal (`[1,,3]`). Distinct from
+    /// `undefined_literal`: it produces a genuinely absent index (a dense hole),
+    /// so `1 in [1,,3]` is false, whereas `[1,undefined,3]` has index 1 present.
+    array_hole,
     // Statements
     program,
     expr_stmt,
@@ -166,6 +170,7 @@ pub const Data = union(NodeKind) {
     function_expr: FuncExpr,
     object_literal: ObjectLiteral,
     array_literal: ArrayLiteral,
+    array_hole: void,
     program: Program,
     expr_stmt: *Node,
     block_stmt: BlockStmt,

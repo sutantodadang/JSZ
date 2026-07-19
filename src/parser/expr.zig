@@ -579,7 +579,7 @@ pub fn desugarParamPattern(p: *Parser, pattern: *Node, src: *Node) bool {
                 const it_ref = p.makeNode(.identifier, el.start, el.start, .{ .identifier = it_name }) orelse return false;
                 const box_ref = p.makeNode(.identifier, el.start, el.start, .{ .identifier = box_name }) orelse return false;
                 // Elision (`[, x]`): advance the iterator one step, discard.
-                if (el.kind == .undefined_literal) {
+                if (el.kind == .array_hole) {
                     const step = mkDestrCall(p, "__destrIterStep__", it_ref, box_ref) orelse return false;
                     const stmt = p.makeNode(.expr_stmt, el.start, el.start, .{ .expr_stmt = step }) orelse return false;
                     destructOut(p).append(p.arena, stmt) catch {
@@ -2020,11 +2020,11 @@ pub fn parseArrayLiteral(p: *Parser) ?*Node {
     _ = p.expect(.left_bracket) orelse return null;
     var elements = std.ArrayList(*Node){};
     while (!p.check(.right_bracket) and !p.check(.eof) and !p.had_error) {
-        // Elision: a hole reads as `undefined` (ToNumber → NaN), matching the
-        // observable value of a sparse-array hole. (We don't model true absence,
-        // so `index in arr` is true for a hole — but the value is spec-correct.)
+        // Elision (`[1,,3]`): a real hole — a genuinely absent index. Reading it
+        // yields `undefined`, but `index in arr` / hasOwnProperty are false (see
+        // `array_hole`). The compiler bumps the length without creating the index.
         if (p.check(.comma)) {
-            const hole_node = p.makeNode(.undefined_literal, p.current.start, p.current.start, .{ .undefined_literal = {} }) orelse return null;
+            const hole_node = p.makeNode(.array_hole, p.current.start, p.current.start, .{ .array_hole = {} }) orelse return null;
             elements.append(p.arena, hole_node) catch {
                 p.had_error = true;
                 return null;
