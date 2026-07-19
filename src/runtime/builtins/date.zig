@@ -66,9 +66,9 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "setUTCMinutes", nativeDateSetMinutes },
         .{ "setUTCSeconds", nativeDateSetSeconds },
         .{ "setUTCMilliseconds", nativeDateSetMilliseconds },
-        .{ "toLocaleString", nativeDateToString },
-        .{ "toLocaleDateString", nativeDateToDateString },
-        .{ "toLocaleTimeString", nativeDateToTimeString },
+        .{ "toLocaleString", nativeDateToLocaleString },
+        .{ "toLocaleDateString", nativeDateToLocaleDateString },
+        .{ "toLocaleTimeString", nativeDateToLocaleTimeString },
     });
     active_date_proto = date_proto;
 
@@ -762,6 +762,25 @@ pub fn nativeDateToString(arena: std.mem.Allocator, this_val: Value, _: []const 
         @as(u8, @intCast(f.sec)),
     });
     return val_mod.makeString(arena, s);
+}
+
+/// `Date.prototype.toLocaleString([locales[, options]])` — en-US date+time via
+/// Intl.DateTimeFormat (honors component/dateStyle/timeStyle options).
+pub fn nativeDateToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if ((try brandValidDate(arena, this_val)) == null) return val_mod.makeString(arena, "Invalid Date");
+    return @import("intl.zig").dateToLocaleString(arena, this_val, args, .datetime);
+}
+
+/// `Date.prototype.toLocaleDateString` — date-only default.
+pub fn nativeDateToLocaleDateString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if ((try brandValidDate(arena, this_val)) == null) return val_mod.makeString(arena, "Invalid Date");
+    return @import("intl.zig").dateToLocaleString(arena, this_val, args, .date);
+}
+
+/// `Date.prototype.toLocaleTimeString` — time-only default.
+pub fn nativeDateToLocaleTimeString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if ((try brandValidDate(arena, this_val)) == null) return val_mod.makeString(arena, "Invalid Date");
+    return @import("intl.zig").dateToLocaleString(arena, this_val, args, .time);
 }
 
 // ------------------------------------------------------------------ UTC getters ---

@@ -377,13 +377,9 @@ pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value)
     return val_mod.makeString(arena, try timeToString(arena, t.*, null));
 }
 
-pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const t = try requireTime(arena, this_val);
-    // Time-only format: h:mm:ss AM/PM
-    const hour12: u8 = if (t.hour == 0 or t.hour == 12) 12 else @mod(t.hour, 12);
-    const ampm = if (t.hour < 12) "AM" else "PM";
-    const s = try std.fmt.allocPrint(arena, "{d}:{d:0>2}:{d:0>2} {s}", .{ hour12, t.minute, t.second, ampm });
-    return val_mod.makeString(arena, s);
+pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    _ = try requireTime(arena, this_val);
+    return @import("../intl.zig").temporalToLocaleString(arena, this_val, args, .time);
 }
 
 pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {

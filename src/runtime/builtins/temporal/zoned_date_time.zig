@@ -934,11 +934,9 @@ pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value)
     return val_mod.makeString(arena, s);
 }
 
-pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const z = try requireZoned(arena, this_val);
-    const wall = localDT(z);
-    const s = try @import("intl_format.zig").dateTimeToLocaleString(arena, wall.date, wall.time);
-    return val_mod.makeString(arena, s);
+pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    _ = try requireZoned(arena, this_val);
+    return @import("../intl.zig").temporalToLocaleString(arena, this_val, args, .zoned);
 }
 
 pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
