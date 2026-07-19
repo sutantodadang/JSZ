@@ -2493,7 +2493,6 @@ built-ins/RegExp/prototype/toString/name.js
 built-ins/RegExp/prototype/unicode/cross-realm.js
 built-ins/RegExp/prototype/unicode/this-val-invalid-obj.js
 built-ins/RegExp/prototype/unicodeSets/cross-realm.js
-built-ins/RegExp/prototype/unicodeSets/this-val-invalid-obj.js
 built-ins/RegExp/prototype/unicodeSets/this-val-regexp.js
 built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-alternatives-outside.js
 built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-ignoreCase-flag.js
