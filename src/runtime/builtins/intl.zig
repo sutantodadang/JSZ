@@ -25,6 +25,16 @@ const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
 const coercion_mod = @import("coercion.zig");
 
+// Temporal integration: `Intl.DateTimeFormat.prototype.format` accepts Temporal
+// date/time objects, and `Temporal.X.prototype.toLocaleString` routes through
+// this module's en-US formatter (see temporalEpochMs / temporalToLocaleString).
+const t_shared = @import("temporal/shared.zig");
+const t_instant = @import("temporal/instant.zig");
+const t_pdate = @import("temporal/plain_date.zig");
+const t_ptime = @import("temporal/plain_time.zig");
+const t_pdatetime = @import("temporal/plain_date_time.zig");
+const t_zdt = @import("temporal/zoned_date_time.zig");
+
 fn getNum(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
     return switch (v.unbox()) {
@@ -337,6 +347,10 @@ pub fn nativeDateTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
         month = "numeric";
         day = "numeric";
     }
+    // A "bare" formatter (no explicit component / style) resolves to date-only
+    // for a legacy Date, but Temporal values pick their own default when
+    // formatted (see the per-kind adjustment in nativeDateTimeFormatFormat).
+    const is_bare = !has_any and (optStr(opts, "dateStyle") == null) and (optStr(opts, "timeStyle") == null);
     // hour12 defaults to true for en-US; an explicit false (or hourCycle h23/h24)
     // switches to 24-hour output.
     var hour12 = optBool(opts, "hour12") orelse true;
@@ -355,6 +369,7 @@ pub fn nativeDateTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
     try obj.set("__dtf_second", try val_mod.makeString(arena, second));
     try obj.set("__dtf_hour12", try val_mod.makeBool(arena, hour12));
     try obj.set("__dtf_tz", try val_mod.makeString(arena, tz));
+    try obj.set("__dtf_bare", try val_mod.makeBool(arena, is_bare));
     return val_mod.makeObject(arena, obj);
 }
 
@@ -379,109 +394,214 @@ fn appendField(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), val: 
     try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{val}));
 }
 
-/// `dtf.format(date)` → en-US pattern driven by the resolved component options
-/// (UTC fields, deterministic — no host time zone).
-pub fn nativeDateTimeFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+/// Resolve `this` formatter + `args[0]` value into the ordered list of typed
+/// parts. Shared by `format` and `formatToParts`. Never returns empty (falls
+/// back to the numeric date pattern).
+fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) !std.ArrayListUnmanaged(DTPart) {
     const date_mod = @import("date.zig");
     const ms: i64 = blk: {
         if (args.len > 0 and args[0].bits != 0) {
-            if (args[0].unbox() == .number) break :blk @intFromFloat(args[0].unbox().number);
+            if (args[0].unbox() == .number) {
+                const n = args[0].unbox().number;
+                // TimeClip: a non-finite or out-of-range time value is invalid.
+                if (!std.math.isFinite(n) or @abs(n) > 8.64e15) return realm_mod.throwRangeError(arena, "Invalid time value");
+                break :blk @intFromFloat(n);
+            }
             if (args[0].unbox() == .object) {
                 if (date_mod.getDateMs(args[0])) |m| break :blk m;
+                if (temporalEpochMs(args[0])) |m| break :blk m;
             }
         }
         break :blk std.time.milliTimestamp();
     };
     const f = date_mod.msToFieldsUtc(ms);
 
-    // No stored options (called on a bare object) → classic default.
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
-        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}/{d}/{d}", .{ f.month + 1, f.day, f.year }));
+    var weekday: []const u8 = "";
+    var year: []const u8 = "numeric";
+    var month: []const u8 = "numeric";
+    var day: []const u8 = "numeric";
+    var hour: []const u8 = "";
+    var minute: []const u8 = "";
+    var second: []const u8 = "";
+    var hour12: bool = true;
+
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
+        const o = this_val.toPtr().object;
+        weekday = readOpt(o, "__dtf_weekday");
+        year = readOpt(o, "__dtf_year");
+        month = readOpt(o, "__dtf_month");
+        day = readOpt(o, "__dtf_day");
+        hour = readOpt(o, "__dtf_hour");
+        minute = readOpt(o, "__dtf_minute");
+        second = readOpt(o, "__dtf_second");
+        hour12 = if (o.get("__dtf_hour12")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else true;
+
+        // A bare formatter (no explicit component) resolves to date-only for a
+        // legacy Date, but a Temporal value picks its own default: date for
+        // PlainDate, time for PlainTime, date+time for PlainDateTime/Instant/
+        // ZonedDateTime. This keeps `dtf.format(temporal)` in sync with the
+        // per-type defaults `Temporal.X.prototype.toLocaleString` applies.
+        const bare = if (o.get("__dtf_bare")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else false;
+        if (bare and args.len > 0) {
+            if (temporalKindOf(args[0])) |tk| switch (tk) {
+                .date => {},
+                .time => {
+                    weekday = "";
+                    year = "";
+                    month = "";
+                    day = "";
+                    hour = "numeric";
+                    minute = "numeric";
+                    second = "numeric";
+                },
+                .datetime, .instant, .zoned => {
+                    year = "numeric";
+                    month = "numeric";
+                    day = "numeric";
+                    hour = "numeric";
+                    minute = "numeric";
+                    second = "numeric";
+                },
+            };
+        }
     }
-    const o = this_val.toPtr().object;
-    const weekday = readOpt(o, "__dtf_weekday");
-    const year = readOpt(o, "__dtf_year");
-    const month = readOpt(o, "__dtf_month");
-    const day = readOpt(o, "__dtf_day");
-    const hour = readOpt(o, "__dtf_hour");
-    const minute = readOpt(o, "__dtf_minute");
-    const second = readOpt(o, "__dtf_second");
-    const hour12 = if (o.get("__dtf_hour12")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else true;
 
-    const named_month = month.len > 0 and !std.mem.eql(u8, month, "numeric") and !std.mem.eql(u8, month, "2-digit");
+    var parts = std.ArrayListUnmanaged(DTPart){};
+    try renderDateTimeParts(arena, f, weekday, year, month, day, hour, minute, second, hour12, &parts);
+    if (parts.items.len == 0) {
+        try renderDateTimeParts(arena, f, "", "numeric", "numeric", "numeric", "", "", "", hour12, &parts);
+    }
+    return parts;
+}
 
+/// `dtf.format(date)` → en-US pattern driven by the resolved component options
+/// (UTC fields, deterministic — no host time zone).
+pub fn nativeDateTimeFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const parts = try buildDTFParts(arena, this_val, args);
     var out = std.ArrayListUnmanaged(u8){};
+    for (parts.items) |p| try out.appendSlice(arena, p.value);
+    return val_mod.makeString(arena, out.items);
+}
 
-    // ---- date part ----
+/// `dtf.formatToParts(date)` → array of `{ type, value }` records.
+pub fn nativeDateTimeFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Brand check: reject a `this` that is not an initialized DateTimeFormat
+    // (our instances carry the internal `__dtf_hour12` marker).
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__dtf_hour12") == null)
+        return realm_mod.throwTypeError(arena, "Intl.DateTimeFormat.prototype.formatToParts called on incompatible receiver");
+    const parts = try buildDTFParts(arena, this_val, args);
+    const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    for (parts.items) |p| {
+        const o = if (realm_mod.active_heap) |h|
+            try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+        else
+            try JsObject.create(arena, realm_mod.active_object_proto);
+        try o.set("type", try val_mod.makeString(arena, p.type));
+        try o.set("value", try val_mod.makeString(arena, p.value));
+        try arr.appendElement(try val_mod.makeObject(arena, o));
+    }
+    return val_mod.makeObject(arena, arr);
+}
+
+/// One segment of a formatted date-time, as produced by `formatToParts`.
+const DTPart = struct { type: []const u8, value: []const u8 };
+
+fn fieldStr(arena: std.mem.Allocator, val: i64, style: []const u8) ![]const u8 {
+    var tmp = std.ArrayListUnmanaged(u8){};
+    try appendField(arena, &tmp, val, style);
+    return tmp.items;
+}
+
+fn yearStr(arena: std.mem.Allocator, year: i64, style: []const u8) ![]const u8 {
+    var tmp = std.ArrayListUnmanaged(u8){};
+    try appendYear(arena, &tmp, year, style);
+    return tmp.items;
+}
+
+/// Render the resolved components into typed parts (shared by `format` and
+/// `formatToParts`). Mirrors the en-US pattern: `Weekday, Month Day, Year,
+/// h:mm:ss AM/PM` with numeric fields joined by `/` and `:`.
+fn renderDateTimeParts(
+    arena: std.mem.Allocator,
+    f: @import("date.zig").DateFields,
+    weekday: []const u8,
+    year: []const u8,
+    month: []const u8,
+    day: []const u8,
+    hour: []const u8,
+    minute: []const u8,
+    second: []const u8,
+    hour12: bool,
+    parts: *std.ArrayListUnmanaged(DTPart),
+) !void {
+    const named_month = month.len > 0 and !std.mem.eql(u8, month, "numeric") and !std.mem.eql(u8, month, "2-digit");
+    var has_date = false;
+
     if (weekday.len > 0) {
         const idx: usize = @intCast(@mod(f.weekday, 7));
         const name = if (std.mem.eql(u8, weekday, "short")) weekday_short[idx] else if (std.mem.eql(u8, weekday, "narrow")) weekday_narrow[idx] else weekday_long[idx];
-        try out.appendSlice(arena, name);
+        try parts.append(arena, .{ .type = "weekday", .value = name });
+        has_date = true;
     }
 
     if (named_month) {
-        // Spelled-out form: "Month Day, Year".
-        if (out.items.len > 0) try out.appendSlice(arena, ", ");
+        if (has_date) try parts.append(arena, .{ .type = "literal", .value = ", " });
         const midx: usize = @intCast(@mod(f.month, 12));
         const mname = if (std.mem.eql(u8, month, "short")) month_short[midx] else if (std.mem.eql(u8, month, "narrow")) month_narrow[midx] else month_long[midx];
-        try out.appendSlice(arena, mname);
+        try parts.append(arena, .{ .type = "month", .value = mname });
         if (day.len > 0) {
-            try out.append(arena, ' ');
-            try appendField(arena, &out, f.day, day);
+            try parts.append(arena, .{ .type = "literal", .value = " " });
+            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, day) });
         }
         if (year.len > 0) {
-            try out.appendSlice(arena, ", ");
-            try appendYear(arena, &out, f.year, year);
+            try parts.append(arena, .{ .type = "literal", .value = ", " });
+            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, year) });
         }
-    } else if (month.len > 0 or (day.len > 0 and year.len > 0) or day.len > 0 or year.len > 0) {
-        // Numeric slash cluster of the present month/day/year fields.
-        if (weekday.len > 0 and (month.len > 0 or day.len > 0 or year.len > 0)) try out.appendSlice(arena, ", ");
+        has_date = true;
+    } else if (month.len > 0 or day.len > 0 or year.len > 0) {
+        if (weekday.len > 0) try parts.append(arena, .{ .type = "literal", .value = ", " });
         var first = true;
         if (month.len > 0) {
-            try appendField(arena, &out, f.month + 1, month);
+            try parts.append(arena, .{ .type = "month", .value = try fieldStr(arena, f.month + 1, month) });
             first = false;
         }
         if (day.len > 0) {
-            if (!first) try out.append(arena, '/');
-            try appendField(arena, &out, f.day, day);
+            if (!first) try parts.append(arena, .{ .type = "literal", .value = "/" });
+            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, day) });
             first = false;
         }
         if (year.len > 0) {
-            if (!first) try out.append(arena, '/');
-            try appendYear(arena, &out, f.year, year);
+            if (!first) try parts.append(arena, .{ .type = "literal", .value = "/" });
+            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, year) });
         }
+        has_date = true;
     }
 
-    const has_date = out.items.len > 0;
-
-    // ---- time part ----
     if (hour.len > 0 or minute.len > 0 or second.len > 0) {
-        if (has_date) try out.appendSlice(arena, ", ");
+        if (has_date) try parts.append(arena, .{ .type = "literal", .value = ", " });
         if (hour.len > 0) {
             var h: i64 = f.hour;
+            // en-US 24-hour clock (h23) always renders a 2-digit hour.
+            const hstyle = if (hour12) hour else "2-digit";
             if (hour12) {
                 h = @mod(f.hour, 12);
                 if (h == 0) h = 12;
             }
-            try appendField(arena, &out, h, hour);
+            try parts.append(arena, .{ .type = "hour", .value = try fieldStr(arena, h, hstyle) });
         }
         if (minute.len > 0) {
-            if (hour.len > 0) try out.append(arena, ':');
-            try appendField(arena, &out, f.min, if (hour.len > 0) "2-digit" else minute);
+            if (hour.len > 0) try parts.append(arena, .{ .type = "literal", .value = ":" });
+            try parts.append(arena, .{ .type = "minute", .value = try fieldStr(arena, f.min, if (hour.len > 0) "2-digit" else minute) });
         }
         if (second.len > 0) {
-            if (hour.len > 0 or minute.len > 0) try out.append(arena, ':');
-            try appendField(arena, &out, f.sec, if (hour.len > 0 or minute.len > 0) "2-digit" else second);
+            if (hour.len > 0 or minute.len > 0) try parts.append(arena, .{ .type = "literal", .value = ":" });
+            try parts.append(arena, .{ .type = "second", .value = try fieldStr(arena, f.sec, if (hour.len > 0 or minute.len > 0) "2-digit" else second) });
         }
         if (hour12 and hour.len > 0) {
-            try out.appendSlice(arena, if (f.hour < 12) " AM" else " PM");
+            try parts.append(arena, .{ .type = "literal", .value = " " });
+            try parts.append(arena, .{ .type = "dayPeriod", .value = if (f.hour < 12) "AM" else "PM" });
         }
     }
-
-    if (out.items.len == 0) {
-        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}/{d}/{d}", .{ f.month + 1, f.day, f.year }));
-    }
-    return val_mod.makeString(arena, out.items);
 }
 
 fn appendYear(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), year: i64, style: []const u8) !void {
@@ -491,6 +611,236 @@ fn appendYear(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), year: 
     } else {
         try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{year}));
     }
+}
+
+/// If `v` is a Temporal date/time-like object, return the epoch milliseconds of
+/// its wall-clock fields interpreted as UTC, so the UTC field-extraction in
+/// `format` yields the correct calendar components. Returns null otherwise.
+fn temporalEpochMs(v: Value) ?i64 {
+    if (v.bits == 0 or v.unbox() != .object) return null;
+    switch (v.toPtr().object.internal_kind) {
+        .temporal_instant => {
+            const ns = t_instant.getInstant(v) orelse return null;
+            return @intCast(@divFloor(ns.*, t_shared.NS_PER_MILLI));
+        },
+        .temporal_plain_date => {
+            const d = t_pdate.getDate(v) orelse return null;
+            return t_shared.isoDateToEpochDays(d.year, d.month, d.day) * 86_400_000;
+        },
+        .temporal_plain_time => {
+            const t = t_ptime.getTime(v) orelse return null;
+            return @intCast(@divFloor(t_shared.timeToNanos(t.*), t_shared.NS_PER_MILLI));
+        },
+        .temporal_plain_date_time => {
+            const dt = t_pdatetime.getDateTime(v) orelse return null;
+            const ns = @as(i128, t_shared.isoDateToEpochDays(dt.date.year, dt.date.month, dt.date.day)) *
+                t_shared.NS_PER_DAY + t_shared.timeToNanos(dt.time);
+            return @intCast(@divFloor(ns, t_shared.NS_PER_MILLI));
+        },
+        .temporal_zoned_date_time => {
+            const z = t_zdt.getZoned(v) orelse return null;
+            return @intCast(@divFloor(z.ns + z.offset_ns, t_shared.NS_PER_MILLI));
+        },
+        else => return null,
+    }
+}
+
+/// Which Temporal type is calling toLocaleString — selects the default
+/// component set and which option families are permitted.
+pub const TemporalDTKind = enum { date, time, datetime, instant, zoned };
+
+/// Classify a Temporal date/time value for default-component selection.
+fn temporalKindOf(v: Value) ?TemporalDTKind {
+    if (v.bits == 0 or v.unbox() != .object) return null;
+    return switch (v.toPtr().object.internal_kind) {
+        .temporal_plain_date => .date,
+        .temporal_plain_time => .time,
+        .temporal_plain_date_time => .datetime,
+        .temporal_instant => .instant,
+        .temporal_zoned_date_time => .zoned,
+        else => null,
+    };
+}
+
+fn applyDateStyle(ds: []const u8, w: *[]const u8, y: *[]const u8, mo: *[]const u8, d: *[]const u8) void {
+    if (std.mem.eql(u8, ds, "full")) {
+        w.* = "long";
+        y.* = "numeric";
+        mo.* = "long";
+        d.* = "numeric";
+    } else if (std.mem.eql(u8, ds, "long")) {
+        y.* = "numeric";
+        mo.* = "long";
+        d.* = "numeric";
+    } else if (std.mem.eql(u8, ds, "medium")) {
+        y.* = "numeric";
+        mo.* = "short";
+        d.* = "numeric";
+    } else { // "short"
+        y.* = "2-digit";
+        mo.* = "numeric";
+        d.* = "numeric";
+    }
+}
+
+fn applyTimeStyle(ts: []const u8, h: *[]const u8, mi: *[]const u8, se: *[]const u8) void {
+    h.* = "numeric";
+    mi.* = "2-digit";
+    // full/long/medium include seconds; short omits them.
+    if (!std.mem.eql(u8, ts, "short")) se.* = "2-digit";
+}
+
+/// `Temporal.X.prototype.toLocaleString([locales[, options]])`.
+///
+/// Resolves per-type default components and dateStyle/timeStyle, validates the
+/// option conflicts the spec requires (dateStyle/timeStyle may not combine with
+/// component options; a date-only type rejects time options and vice-versa),
+/// then formats `receiver` through the same en-US DateTimeFormat machinery
+/// `Intl.DateTimeFormat.prototype.format` uses — so the two agree by
+/// construction. Calendar (era/non-ISO) and time-zone-name output are not
+/// modelled (ISO calendar, UTC only).
+pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: []const Value, kind: TemporalDTKind) anyerror!Value {
+    const opts_v: ?Value = if (args.len > 1) args[1] else null;
+    const required: Required = switch (kind) {
+        .date => .date,
+        .time => .time,
+        .datetime, .instant, .zoned => .any,
+    };
+    const defaults: LocaleDefaults = switch (kind) {
+        .date => .date,
+        .time => .time,
+        .datetime, .instant, .zoned => .datetime,
+    };
+    const restrict: Restrict = switch (kind) {
+        .date => .date_only,
+        .time => .time_only,
+        else => .none,
+    };
+    // A ZonedDateTime carries its own zone; a `timeZone` option is disallowed.
+    if (kind == .zoned and optStr(opts_v, "timeZone") != null)
+        return realm_mod.throwTypeError(arena, "Temporal.ZonedDateTime.toLocaleString does not accept a timeZone option");
+    const dtf = try buildLocaleDTF(arena, opts_v, required, defaults, restrict);
+    return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
+}
+
+/// ToDateTimeOptions "required" families: which component family must be
+/// present for the caller to skip filling in defaults.
+pub const Required = enum { date, time, any };
+
+/// Default component set applied when no explicit component/style is requested.
+pub const LocaleDefaults = enum { date, time, datetime };
+
+/// Per-receiver option rejection: Temporal date-only / time-only types reject
+/// the opposite family of options; legacy Date imposes no such restriction.
+pub const Restrict = enum { none, date_only, time_only };
+
+/// Shared core of `Temporal.X.prototype.toLocaleString` and
+/// `Date.prototype.toLocale*String`: parse options, validate conflicts, resolve
+/// the effective component styles, and return a DateTimeFormat-like object ready
+/// for `nativeDateTimeFormatFormat`.
+fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, defaults: LocaleDefaults, restrict: Restrict) anyerror!Value {
+    const weekday = optStr(opts_v, "weekday");
+    const era = optStr(opts_v, "era");
+    const year = optStr(opts_v, "year");
+    const month = optStr(opts_v, "month");
+    const day = optStr(opts_v, "day");
+    const hour = optStr(opts_v, "hour");
+    const minute = optStr(opts_v, "minute");
+    const second = optStr(opts_v, "second");
+    const day_period = optStr(opts_v, "dayPeriod");
+    const frac_digits = optNum(opts_v, "fractionalSecondDigits");
+    const tz_name = optStr(opts_v, "timeZoneName");
+    const date_style = optStr(opts_v, "dateStyle");
+    const time_style = optStr(opts_v, "timeStyle");
+
+    const has_date_comp = weekday != null or era != null or year != null or month != null or day != null;
+    const has_time_comp = hour != null or minute != null or second != null or
+        day_period != null or frac_digits != null or tz_name != null;
+    const has_comp = has_date_comp or has_time_comp;
+
+    // dateStyle/timeStyle cannot be combined with explicit component options
+    // (GetDateTimeFormatPattern, Table "date-time component").
+    if ((date_style != null or time_style != null) and has_comp)
+        return realm_mod.throwTypeError(arena, "dateStyle/timeStyle may not be used with other date-time component options");
+
+    switch (restrict) {
+        .date_only => if (time_style != null or has_time_comp)
+            return realm_mod.throwTypeError(arena, "this Temporal type cannot be formatted with time options"),
+        .time_only => if (date_style != null or has_date_comp)
+            return realm_mod.throwTypeError(arena, "this Temporal type cannot be formatted with date options"),
+        .none => {},
+    }
+
+    var w = weekday orelse "";
+    var y = year orelse "";
+    var mo = month orelse "";
+    var d = day orelse "";
+    var h = hour orelse "";
+    var mi = minute orelse "";
+    var se = second orelse "";
+    // ISO calendar: era (used above only for conflict detection) is not rendered.
+
+    if (date_style) |ds| applyDateStyle(ds, &w, &y, &mo, &d);
+    if (time_style) |ts| applyTimeStyle(ts, &h, &mi, &se);
+
+    // ToDateTimeOptions: `needDefaults` is driven by the REQUIRED family only —
+    // e.g. toLocaleDateString (required "date") still fills in year/month/day
+    // even when the caller passed only time components. When set, the `defaults`
+    // family's fields are added (never overriding explicit user components).
+    // dateStyle/timeStyle suppress defaults entirely.
+    var need_defaults = date_style == null and time_style == null;
+    if (need_defaults) switch (required) {
+        .date => if (has_date_comp) {
+            need_defaults = false;
+        },
+        .time => if (has_time_comp) {
+            need_defaults = false;
+        },
+        .any => if (has_comp) {
+            need_defaults = false;
+        },
+    };
+    if (need_defaults) {
+        if (defaults == .date or defaults == .datetime) {
+            if (y.len == 0) y = "numeric";
+            if (mo.len == 0) mo = "numeric";
+            if (d.len == 0) d = "numeric";
+        }
+        if (defaults == .time or defaults == .datetime) {
+            if (h.len == 0) h = "numeric";
+            if (mi.len == 0) mi = "numeric";
+            if (se.len == 0) se = "numeric";
+        }
+    }
+
+    var hour12 = optBool(opts_v, "hour12") orelse true;
+    if (optStr(opts_v, "hourCycle")) |hc| {
+        if (std.mem.eql(u8, hc, "h23") or std.mem.eql(u8, hc, "h24")) hour12 = false;
+        if (std.mem.eql(u8, hc, "h11") or std.mem.eql(u8, hc, "h12")) hour12 = true;
+    }
+
+    const dtf = if (realm_mod.active_heap) |hp|
+        try JsObject.createOnHeap(hp, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+    try dtf.set("__dtf_weekday", try val_mod.makeString(arena, w));
+    try dtf.set("__dtf_year", try val_mod.makeString(arena, y));
+    try dtf.set("__dtf_month", try val_mod.makeString(arena, mo));
+    try dtf.set("__dtf_day", try val_mod.makeString(arena, d));
+    try dtf.set("__dtf_hour", try val_mod.makeString(arena, h));
+    try dtf.set("__dtf_minute", try val_mod.makeString(arena, mi));
+    try dtf.set("__dtf_second", try val_mod.makeString(arena, se));
+    try dtf.set("__dtf_hour12", try val_mod.makeBool(arena, hour12));
+    return val_mod.makeObject(arena, dtf);
+}
+
+/// `Date.prototype.{toLocaleString,toLocaleDateString,toLocaleTimeString}`:
+/// build a DateTimeFormat from (locales, options) with the method's default
+/// component set and format the Date through the shared en-US machinery.
+pub fn dateToLocaleString(arena: std.mem.Allocator, receiver: Value, args: []const Value, required: Required, defaults: LocaleDefaults) anyerror!Value {
+    const opts_v: ?Value = if (args.len > 1) args[1] else null;
+    const dtf = try buildLocaleDTF(arena, opts_v, required, defaults, .none);
+    return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
 }
 
 /// `dtf.resolvedOptions()` — en-US, UTC-based, Gregorian.

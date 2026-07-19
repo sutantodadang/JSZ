@@ -4424,6 +4424,7 @@ pub const Realm = struct {
             // Intl.DateTimeFormat
             const dtf_proto = try JsObject.create(arena, object_proto);
             try dtf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatFormat, "format", 0));
+            try dtf_proto.set("formatToParts", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatFormatToParts, "formatToParts", 1));
             try dtf_proto.set("resolvedOptions", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatResolved, "resolvedOptions", 0));
             const dtf_ctor = try JsObject.create(arena, null);
             try dtf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatCtor));
@@ -4802,6 +4803,13 @@ pub const Realm = struct {
                 if (child.proto == old_object_proto) child.proto = hp_proto;
             }
         }
+
+        // Nested namespace objects and per-type prototypes that are reachable
+        // only as properties (not global bindings) are missed by the pass above.
+        // Temporal.{Instant,Duration,…}.prototype and Temporal.Now fall in this
+        // bucket; reparent them explicitly so their [[Prototype]] resolves to the
+        // heap %Object.prototype%.
+        temporal_mod.reparentObjectProto(old_object_proto, hp_proto);
 
         // Phase 4b: update thread-locals to point to heap-migrated protos.
         active_array_proto = hp_array_proto;
