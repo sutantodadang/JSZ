@@ -26,6 +26,7 @@ const regexp_mod = @import("./builtins/regexp.zig");
 // Phase 4d
 const function_proto_mod = @import("./builtins/function_proto.zig");
 const date_mod = @import("./builtins/date.zig");
+const temporal_mod = @import("./builtins/temporal/temporal.zig");
 const es2015_collections_mod = @import("./builtins/es2015_collections.zig");
 const typed_array_mod = @import("./builtins/typed_array.zig");
 const intrinsics = @import("./builtins/intrinsics.zig");
@@ -4112,6 +4113,9 @@ pub const Realm = struct {
 
         try date_mod.register(&reg_ctx);
 
+        // ---- Wave 25: Temporal (Instant/Duration/PlainDate/PlainTime/PlainDateTime) ----
+        try temporal_mod.register(&reg_ctx);
+
         // ---- Phase 4b: Math object ----
         try math_mod.register(&reg_ctx);
 
@@ -4375,6 +4379,7 @@ pub const Realm = struct {
         // Wire @@toStringTag onto WeakMap.prototype and WeakSet.prototype.
         try es2015_collections_mod.registerSymbols(arena);
         try date_mod.registerSymbols(arena);
+        try temporal_mod.registerSymbols(arena);
 
         // Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain
         // now that @@iterator / @@toStringTag exist. Array + TypedArray iterators
