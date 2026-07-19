@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Wave 26: Temporal.ZonedDateTime — an exact instant (epoch nanoseconds) paired
+//! Wave 27: Temporal.ZonedDateTime — an exact instant (epoch nanoseconds) paired
 //! with a time-zone identifier and (ISO) calendar. In the current Temporal
 //! proposal the time zone and calendar are string identifiers, not objects.
 //!
 //! Storage: internal_kind = .temporal_zoned_date_time, internal_slot -> ZonedDT.
-//! Only fixed-offset zones ("UTC", "±HH:MM") are modeled, so every day is 24h
-//! and there are no DST transitions.
+//! Fixed-offset zones ("UTC", "±HH:MM") always have 24h days and no transitions.
+//! Named IANA zones ("America/New_York", …) resolve DST-aware offsets via the
+//! embedded tzdata: getTimeZoneTransition finds their DST transitions and
+//! hoursInDay yields 23h/25h on spring-forward / fall-back days.
 const std = @import("std");
 const val_mod = @import("../../../value/value.zig");
 const Value = val_mod.Value;
@@ -14,6 +16,7 @@ const realm_mod = @import("../../realm.zig");
 const intrinsics = @import("../intrinsics.zig");
 const shared = @import("shared.zig");
 const timezone = @import("timezone.zig");
+const tzdata = @import("tzdata.zig");
 const duration = @import("duration.zig");
 const instant = @import("instant.zig");
 const plain_date = @import("plain_date.zig");
@@ -92,10 +95,16 @@ fn wallNs(dt: ISODateTime) i128 {
 
 /// Read a time-zone-like value into a Zone. Only string identifiers are
 /// accepted (non-strings throw TypeError, matching the spec).
-fn toTimeZone(arena: std.mem.Allocator, v: Value) !timezone.Zone {
+/// When `epoch_ns` is provided, uses `toZoneAtInstant` for DST-aware lookup.
+fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128) !timezone.Zone {
     if (v.bits == 0) return realm_mod.throwTypeError(arena, "time zone must be a string");
     switch (v.unbox()) {
-        .string => |s| return timezone.toZone(arena, s),
+        .string => |s| {
+            if (epoch_ns) |ns| {
+                return timezone.toZoneAtInstant(arena, s, ns);
+            }
+            return timezone.toZone(arena, s);
+        },
         .undefined_, .null_, .boolean, .number, .bigint, .symbol => return realm_mod.throwTypeError(arena, "time zone must be a string"),
         else => return realm_mod.throwTypeError(arena, "time zone must be a string"),
     }
@@ -124,7 +133,7 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (ns_arg.bits == 0 or ns_arg.unbox() != .bigint) return realm_mod.throwTypeError(arena, "epochNanoseconds must be a BigInt");
     const ns = shared.bigIntToI128(ns_arg) orelse return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
     if (!isValidEpochNs(ns)) return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
-    const zone = try toTimeZone(arena, if (args.len > 1) args[1] else Value{});
+    const zone = try toTimeZone(arena, if (args.len > 1) args[1] else Value{}, ns);
     if (args.len > 2) try checkCalendar(arena, args[2]);
     const z = ZonedDT{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns };
     if (this_val.bits != 0 and this_val.unbox() == .object) return installInto(arena, this_val, z);
@@ -204,7 +213,7 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
     // timeZone is required.
     const tz_v = o.get("timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
     if (tz_v.bits != 0 and tz_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing timeZone");
-    const zone = try toTimeZone(arena, tz_v);
+    const zone = try toTimeZone(arena, tz_v, null);
     if (o.get("calendar")) |cv| try checkCalendar(arena, cv);
     const overflow = try shared.getOverflow(arena, opts);
     const offset_opt = try getOffsetOption(arena, opts, .reject);
@@ -491,8 +500,20 @@ fn getInLeapYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     return val_mod.makeBool(arena, shared.isLeapYear(localDT(z).date.year));
 }
 fn getHoursInDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    _ = try requireZoned(arena, this_val);
-    return val_mod.makeNumber(arena, 24); // fixed-offset zones: every day is 24h
+    const z = try requireZoned(arena, this_val);
+    // Fixed-offset / unknown zones: every day is 24h. Named IANA zones with DST
+    // may have 23h/25h days around a transition.
+    const def = tzdata.lookupDef(z.tz) orelse return val_mod.makeNumber(arena, 24);
+    if (def.dst_rule == null) return val_mod.makeNumber(arena, 24);
+
+    const day_start_ns = wallNs(.{ .date = localDT(z).date, .time = .{} }) - z.offset_ns;
+    const day_end_ns = day_start_ns + shared.NS_PER_DAY;
+    const start_sec: i64 = @intCast(@divFloor(day_start_ns, shared.NS_PER_SECOND));
+    const end_sec: i64 = @intCast(@divFloor(day_end_ns, shared.NS_PER_SECOND));
+    const offset_start = @as(i128, tzdata.offsetAt(def, start_sec) orelse def.std_offset_sec) * shared.NS_PER_SECOND;
+    const offset_end = @as(i128, tzdata.offsetAt(def, end_sec) orelse def.std_offset_sec) * shared.NS_PER_SECOND;
+    const day_length = (day_end_ns - offset_end) - (day_start_ns - offset_start);
+    return val_mod.makeNumber(arena, @as(f64, @floatFromInt(day_length)) / @as(f64, @floatFromInt(shared.NS_PER_HOUR)));
 }
 
 /// ISO week-numbering year for a date.
@@ -528,7 +549,7 @@ pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, _: []con
 
 pub fn nativeWithTimeZone(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const zone = try toTimeZone(arena, if (args.len > 0) args[0] else Value{});
+    const zone = try toTimeZone(arena, if (args.len > 0) args[0] else Value{}, z.ns);
     return makeZoned(arena, .{ .ns = z.ns, .tz = zone.id, .offset_ns = zone.offset_ns });
 }
 
@@ -815,7 +836,7 @@ pub fn nativeStartOfDay(arena: std.mem.Allocator, this_val: Value, _: []const Va
 }
 
 pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    _ = try requireZoned(arena, this_val);
+    const z = try requireZoned(arena, this_val);
     const arg = if (args.len > 0) args[0] else Value{};
     var dir: ?[]const u8 = null;
     if (arg.bits != 0 and arg.unbox() == .string) {
@@ -832,8 +853,13 @@ pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, ar
     }
     if (!std.mem.eql(u8, dir.?, "next") and !std.mem.eql(u8, dir.?, "previous"))
         return realm_mod.throwRangeError(arena, "direction must be 'next' or 'previous'");
-    // Fixed-offset zones have no transitions.
-    return val_mod.makeNull(arena);
+    // Fixed-offset / unknown zones have no transitions. Named IANA zones consult
+    // the embedded tzdata for their DST transitions.
+    const def = tzdata.lookupDef(z.tz) orelse return val_mod.makeNull(arena);
+    const unix_sec: i64 = @intCast(@divFloor(z.ns, shared.NS_PER_SECOND));
+    const trans_sec = tzdata.findTransition(def, unix_sec, if (std.mem.eql(u8, dir.?, "next")) .next else .previous) orelse
+        return val_mod.makeNull(arena);
+    return instant.makeInstant(arena, @as(i128, trans_sec) * shared.NS_PER_SECOND);
 }
 
 pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
