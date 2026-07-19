@@ -1749,6 +1749,71 @@ pub const BcVm = struct {
         return fp.invokeCallback(self.arena, this_val, fn_val, args);
     }
 
+    /// Resolve the ordinary object that backs `v` for the purpose of private
+    /// element lookup: plain objects are themselves; a bc_function receiver
+    /// (static private members `Class.#x`) resolves to its backing object.
+    /// Primitives / nullish return null (no private brand).
+    fn privateHolder(self: *BcVm, v: Value) !?*JsObject {
+        if (v.bits == 0) return null;
+        return switch (v.unbox()) {
+            .object => |o| o,
+            .bc_function => |c| try self.closureBackingObj(c),
+            else => null,
+        };
+    }
+
+    /// Throw the "no private brand" TypeError and surface it as error.JsException.
+    fn throwPrivateBrand(self: *BcVm, key: []const u8) anyerror!Value {
+        const realm_m = @import("../runtime/realm.zig");
+        const msg = try std.fmt.allocPrint(self.arena, "Cannot access private member {s} on an object whose class did not declare it", .{key});
+        realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", msg);
+        return error.JsException;
+    }
+
+    /// PrivateElement [[Get]] for a static-key `obj.#x` read. Unlike an ordinary
+    /// [[Get]], a missing brand is a TypeError (not `undefined`), and a private
+    /// accessor with no getter also throws. Private fields live as own slots on
+    /// the instance; private methods/accessors live on the class prototype, so a
+    /// prototype-chain walk (findProperty) resolves both.
+    pub fn privateGet(self: *BcVm, obj_val: Value, key: []const u8) anyerror!Value {
+        const root = (try self.privateHolder(obj_val)) orelse return self.throwPrivateBrand(key);
+        if (root.findProperty(key)) |loc| {
+            const a = loc.holder.attrAt(loc.slot);
+            const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+            if (a.is_accessor) {
+                const getter = accessorMember(raw, "get");
+                if (!isCallable(getter)) return self.throwPrivateBrand(key);
+                return try self.callAccessor(getter, obj_val, &[_]Value{});
+            }
+            if (raw.bits != 0) return raw;
+            return val_mod.makeUndefined(self.arena);
+        }
+        return self.throwPrivateBrand(key);
+    }
+
+    /// PrivateElement [[Set]] for a static-key `obj.#x = v` write, handling only
+    /// the cases the ordinary set path gets wrong: a private accessor (invoke its
+    /// setter, or TypeError when it has none). Returns true when handled here;
+    /// false to fall through to the ordinary set path (PrivateFieldAdd for a new
+    /// field, or a plain update of an existing writable data field).
+    pub fn privateSet(self: *BcVm, obj_val: Value, key: []const u8, val: Value) anyerror!bool {
+        const root = (try self.privateHolder(obj_val)) orelse return false;
+        if (root.findProperty(key)) |loc| {
+            const a = loc.holder.attrAt(loc.slot);
+            if (a.is_accessor) {
+                const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+                const setter = accessorMember(raw, "set");
+                if (!isCallable(setter)) {
+                    _ = try self.throwPrivateBrand(key);
+                    return true;
+                }
+                _ = try self.callAccessor(setter, obj_val, &[_]Value{val});
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Read a symbol-keyed property, walking the prototype chain (own first).
     pub fn getPropSym(self: *BcVm, obj_val: Value, sym_key: Value) !Value {
         if (obj_val.bits == 0) return val_mod.makeUndefined(self.arena);

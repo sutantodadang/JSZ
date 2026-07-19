@@ -75,6 +75,20 @@ pub inline fn opGetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const key_val = frame.func.chunk.constants[kidx];
     const key = key_val.toPtr().string;
     const obj_val = frame.registers[robj];
+    // A static-key `#x` member read is a PrivateElement [[Get]]: a missing brand
+    // is a TypeError (never `undefined`), so it bypasses the ordinary IC/getProp
+    // path entirely. (Computed `obj["#x"]` goes through opGetPropDyn and stays an
+    // ordinary string-property read.)
+    if (key.len > 0 and key[0] == '#') {
+        const frame_idx = self.frames.items.len - 1;
+        const result = self.privateGet(obj_val, key) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("private member access")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[frame_idx].registers[rdst] = result;
+        return null;
+    }
     // RequireObjectCoercible: `null.x` / `undefined.x` throws (non-optional read).
     if (obj_val.isNullish()) return nullishReadThrow(self, obj_val, key);
     const site_cache = &@constCast(frame.func.ic_table)[site_pc];
@@ -297,6 +311,22 @@ pub inline fn opSetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const key = key_val.toPtr().string;
     const obj_val = frame.registers[robj];
     const val = frame.registers[rval];
+    // A static-key `#x = v` write is a PrivateElement [[Set]]. Handle the private
+    // accessor case here (invoke its setter, or TypeError when it has none);
+    // everything else (a new field → PrivateFieldAdd, or updating an existing
+    // writable field) falls through to the ordinary set path below, which also
+    // flags the slot private via markPrivate.
+    if (key.len > 0 and key[0] == '#') {
+        // privateSet only runs user code (a setter) on its handled path, which
+        // returns immediately; the fallthrough path is pure, so `frame` stays
+        // valid below.
+        const handled = self.privateSet(obj_val, key, val) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("private member write")) |oc| return oc;
+            return null;
+        };
+        if (handled) return null;
+    }
     // Save func pointer/strictness before setProp: a setter dispatch via
     // bcInvokeJs may reallocate self.frames, invalidating the `frame` pointer.
     const set_func = frame.func;

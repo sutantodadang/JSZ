@@ -744,7 +744,14 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     }
     var init_node: ?*Node = null;
     if (p.match(.eq)) {
+        // NamedEvaluation: `let x = class {}` names the anonymous class after the
+        // binding. A class expression desugars to an IIFE, so the compiler's
+        // function name-hint can't reach the constructor; thread the name in via
+        // the parser's anonymous-name hint, which parseClassExpr consumes.
+        const set_class_hint = p.check(.kw_class) and p.export_default_name_hint == null;
+        if (set_class_hint) p.export_default_name_hint = name;
         init_node = p.parseAssignmentExpr();
+        if (set_class_hint) p.export_default_name_hint = null;
     }
     if (kind == .const_ and init_node == null) {
         if (!p.had_error) {
