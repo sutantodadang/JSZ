@@ -394,9 +394,10 @@ fn appendField(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), val: 
     try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{val}));
 }
 
-/// `dtf.format(date)` → en-US pattern driven by the resolved component options
-/// (UTC fields, deterministic — no host time zone).
-pub fn nativeDateTimeFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+/// Resolve `this` formatter + `args[0]` value into the ordered list of typed
+/// parts. Shared by `format` and `formatToParts`. Never returns empty (falls
+/// back to the numeric date pattern).
+fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) !std.ArrayListUnmanaged(DTPart) {
     const date_mod = @import("date.zig");
     const ms: i64 = blk: {
         if (args.len > 0 and args[0].bits != 0) {
@@ -410,123 +411,188 @@ pub fn nativeDateTimeFormatFormat(arena: std.mem.Allocator, this_val: Value, arg
     };
     const f = date_mod.msToFieldsUtc(ms);
 
-    // No stored options (called on a bare object) → classic default.
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
-        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}/{d}/{d}", .{ f.month + 1, f.day, f.year }));
+    var weekday: []const u8 = "";
+    var year: []const u8 = "numeric";
+    var month: []const u8 = "numeric";
+    var day: []const u8 = "numeric";
+    var hour: []const u8 = "";
+    var minute: []const u8 = "";
+    var second: []const u8 = "";
+    var hour12: bool = true;
+
+    if (this_val.bits != 0 and this_val.unbox() == .object) {
+        const o = this_val.toPtr().object;
+        weekday = readOpt(o, "__dtf_weekday");
+        year = readOpt(o, "__dtf_year");
+        month = readOpt(o, "__dtf_month");
+        day = readOpt(o, "__dtf_day");
+        hour = readOpt(o, "__dtf_hour");
+        minute = readOpt(o, "__dtf_minute");
+        second = readOpt(o, "__dtf_second");
+        hour12 = if (o.get("__dtf_hour12")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else true;
+
+        // A bare formatter (no explicit component) resolves to date-only for a
+        // legacy Date, but a Temporal value picks its own default: date for
+        // PlainDate, time for PlainTime, date+time for PlainDateTime/Instant/
+        // ZonedDateTime. This keeps `dtf.format(temporal)` in sync with the
+        // per-type defaults `Temporal.X.prototype.toLocaleString` applies.
+        const bare = if (o.get("__dtf_bare")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else false;
+        if (bare and args.len > 0) {
+            if (temporalKindOf(args[0])) |tk| switch (tk) {
+                .date => {},
+                .time => {
+                    weekday = "";
+                    year = "";
+                    month = "";
+                    day = "";
+                    hour = "numeric";
+                    minute = "numeric";
+                    second = "numeric";
+                },
+                .datetime, .instant, .zoned => {
+                    year = "numeric";
+                    month = "numeric";
+                    day = "numeric";
+                    hour = "numeric";
+                    minute = "numeric";
+                    second = "numeric";
+                },
+            };
+        }
     }
-    const o = this_val.toPtr().object;
-    var weekday = readOpt(o, "__dtf_weekday");
-    var year = readOpt(o, "__dtf_year");
-    var month = readOpt(o, "__dtf_month");
-    var day = readOpt(o, "__dtf_day");
-    var hour = readOpt(o, "__dtf_hour");
-    var minute = readOpt(o, "__dtf_minute");
-    var second = readOpt(o, "__dtf_second");
-    const hour12 = if (o.get("__dtf_hour12")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else true;
 
-    // A bare formatter (no explicit component) resolves to date-only for a
-    // legacy Date, but a Temporal value picks its own default: date for
-    // PlainDate, time for PlainTime, date+time for PlainDateTime/Instant/
-    // ZonedDateTime. This keeps `dtf.format(temporal)` in sync with the
-    // per-type defaults `Temporal.X.prototype.toLocaleString` applies.
-    const bare = if (o.get("__dtf_bare")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else false;
-    if (bare and args.len > 0) {
-        if (temporalKindOf(args[0])) |tk| switch (tk) {
-            .date => {},
-            .time => {
-                weekday = "";
-                year = "";
-                month = "";
-                day = "";
-                hour = "numeric";
-                minute = "numeric";
-                second = "numeric";
-            },
-            .datetime, .instant, .zoned => {
-                year = "numeric";
-                month = "numeric";
-                day = "numeric";
-                hour = "numeric";
-                minute = "numeric";
-                second = "numeric";
-            },
-        };
+    var parts = std.ArrayListUnmanaged(DTPart){};
+    try renderDateTimeParts(arena, f, weekday, year, month, day, hour, minute, second, hour12, &parts);
+    if (parts.items.len == 0) {
+        try renderDateTimeParts(arena, f, "", "numeric", "numeric", "numeric", "", "", "", hour12, &parts);
     }
+    return parts;
+}
 
-    const named_month = month.len > 0 and !std.mem.eql(u8, month, "numeric") and !std.mem.eql(u8, month, "2-digit");
-
+/// `dtf.format(date)` → en-US pattern driven by the resolved component options
+/// (UTC fields, deterministic — no host time zone).
+pub fn nativeDateTimeFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const parts = try buildDTFParts(arena, this_val, args);
     var out = std.ArrayListUnmanaged(u8){};
+    for (parts.items) |p| try out.appendSlice(arena, p.value);
+    return val_mod.makeString(arena, out.items);
+}
 
-    // ---- date part ----
+/// `dtf.formatToParts(date)` → array of `{ type, value }` records.
+pub fn nativeDateTimeFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const parts = try buildDTFParts(arena, this_val, args);
+    const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    for (parts.items) |p| {
+        const o = if (realm_mod.active_heap) |h|
+            try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+        else
+            try JsObject.create(arena, realm_mod.active_object_proto);
+        try o.set("type", try val_mod.makeString(arena, p.type));
+        try o.set("value", try val_mod.makeString(arena, p.value));
+        try arr.appendElement(try val_mod.makeObject(arena, o));
+    }
+    return val_mod.makeObject(arena, arr);
+}
+
+/// One segment of a formatted date-time, as produced by `formatToParts`.
+const DTPart = struct { type: []const u8, value: []const u8 };
+
+fn fieldStr(arena: std.mem.Allocator, val: i64, style: []const u8) ![]const u8 {
+    var tmp = std.ArrayListUnmanaged(u8){};
+    try appendField(arena, &tmp, val, style);
+    return tmp.items;
+}
+
+fn yearStr(arena: std.mem.Allocator, year: i64, style: []const u8) ![]const u8 {
+    var tmp = std.ArrayListUnmanaged(u8){};
+    try appendYear(arena, &tmp, year, style);
+    return tmp.items;
+}
+
+/// Render the resolved components into typed parts (shared by `format` and
+/// `formatToParts`). Mirrors the en-US pattern: `Weekday, Month Day, Year,
+/// h:mm:ss AM/PM` with numeric fields joined by `/` and `:`.
+fn renderDateTimeParts(
+    arena: std.mem.Allocator,
+    f: @import("date.zig").DateFields,
+    weekday: []const u8,
+    year: []const u8,
+    month: []const u8,
+    day: []const u8,
+    hour: []const u8,
+    minute: []const u8,
+    second: []const u8,
+    hour12: bool,
+    parts: *std.ArrayListUnmanaged(DTPart),
+) !void {
+    const named_month = month.len > 0 and !std.mem.eql(u8, month, "numeric") and !std.mem.eql(u8, month, "2-digit");
+    var has_date = false;
+
     if (weekday.len > 0) {
         const idx: usize = @intCast(@mod(f.weekday, 7));
         const name = if (std.mem.eql(u8, weekday, "short")) weekday_short[idx] else if (std.mem.eql(u8, weekday, "narrow")) weekday_narrow[idx] else weekday_long[idx];
-        try out.appendSlice(arena, name);
+        try parts.append(arena, .{ .type = "weekday", .value = name });
+        has_date = true;
     }
 
     if (named_month) {
-        // Spelled-out form: "Month Day, Year".
-        if (out.items.len > 0) try out.appendSlice(arena, ", ");
+        if (has_date) try parts.append(arena, .{ .type = "literal", .value = ", " });
         const midx: usize = @intCast(@mod(f.month, 12));
         const mname = if (std.mem.eql(u8, month, "short")) month_short[midx] else if (std.mem.eql(u8, month, "narrow")) month_narrow[midx] else month_long[midx];
-        try out.appendSlice(arena, mname);
+        try parts.append(arena, .{ .type = "month", .value = mname });
         if (day.len > 0) {
-            try out.append(arena, ' ');
-            try appendField(arena, &out, f.day, day);
+            try parts.append(arena, .{ .type = "literal", .value = " " });
+            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, day) });
         }
         if (year.len > 0) {
-            try out.appendSlice(arena, ", ");
-            try appendYear(arena, &out, f.year, year);
+            try parts.append(arena, .{ .type = "literal", .value = ", " });
+            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, year) });
         }
-    } else if (month.len > 0 or (day.len > 0 and year.len > 0) or day.len > 0 or year.len > 0) {
-        // Numeric slash cluster of the present month/day/year fields.
-        if (weekday.len > 0 and (month.len > 0 or day.len > 0 or year.len > 0)) try out.appendSlice(arena, ", ");
+        has_date = true;
+    } else if (month.len > 0 or day.len > 0 or year.len > 0) {
+        if (weekday.len > 0) try parts.append(arena, .{ .type = "literal", .value = ", " });
         var first = true;
         if (month.len > 0) {
-            try appendField(arena, &out, f.month + 1, month);
+            try parts.append(arena, .{ .type = "month", .value = try fieldStr(arena, f.month + 1, month) });
             first = false;
         }
         if (day.len > 0) {
-            if (!first) try out.append(arena, '/');
-            try appendField(arena, &out, f.day, day);
+            if (!first) try parts.append(arena, .{ .type = "literal", .value = "/" });
+            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, day) });
             first = false;
         }
         if (year.len > 0) {
-            if (!first) try out.append(arena, '/');
-            try appendYear(arena, &out, f.year, year);
+            if (!first) try parts.append(arena, .{ .type = "literal", .value = "/" });
+            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, year) });
         }
+        has_date = true;
     }
 
-    const has_date = out.items.len > 0;
-
-    // ---- time part ----
     if (hour.len > 0 or minute.len > 0 or second.len > 0) {
-        if (has_date) try out.appendSlice(arena, ", ");
+        if (has_date) try parts.append(arena, .{ .type = "literal", .value = ", " });
         if (hour.len > 0) {
             var h: i64 = f.hour;
+            // en-US 24-hour clock (h23) always renders a 2-digit hour.
+            const hstyle = if (hour12) hour else "2-digit";
             if (hour12) {
                 h = @mod(f.hour, 12);
                 if (h == 0) h = 12;
             }
-            try appendField(arena, &out, h, hour);
+            try parts.append(arena, .{ .type = "hour", .value = try fieldStr(arena, h, hstyle) });
         }
         if (minute.len > 0) {
-            if (hour.len > 0) try out.append(arena, ':');
-            try appendField(arena, &out, f.min, if (hour.len > 0) "2-digit" else minute);
+            if (hour.len > 0) try parts.append(arena, .{ .type = "literal", .value = ":" });
+            try parts.append(arena, .{ .type = "minute", .value = try fieldStr(arena, f.min, if (hour.len > 0) "2-digit" else minute) });
         }
         if (second.len > 0) {
-            if (hour.len > 0 or minute.len > 0) try out.append(arena, ':');
-            try appendField(arena, &out, f.sec, if (hour.len > 0 or minute.len > 0) "2-digit" else second);
+            if (hour.len > 0 or minute.len > 0) try parts.append(arena, .{ .type = "literal", .value = ":" });
+            try parts.append(arena, .{ .type = "second", .value = try fieldStr(arena, f.sec, if (hour.len > 0 or minute.len > 0) "2-digit" else second) });
         }
         if (hour12 and hour.len > 0) {
-            try out.appendSlice(arena, if (f.hour < 12) " AM" else " PM");
+            try parts.append(arena, .{ .type = "literal", .value = " " });
+            try parts.append(arena, .{ .type = "dayPeriod", .value = if (f.hour < 12) "AM" else "PM" });
         }
     }
-
-    if (out.items.len == 0) {
-        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}/{d}/{d}", .{ f.month + 1, f.day, f.year }));
-    }
-    return val_mod.makeString(arena, out.items);
 }
 
 fn appendYear(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), year: i64, style: []const u8) !void {

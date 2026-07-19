@@ -4424,6 +4424,7 @@ pub const Realm = struct {
             // Intl.DateTimeFormat
             const dtf_proto = try JsObject.create(arena, object_proto);
             try dtf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatFormat, "format", 0));
+            try dtf_proto.set("formatToParts", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatFormatToParts, "formatToParts", 1));
             try dtf_proto.set("resolvedOptions", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatResolved, "resolvedOptions", 0));
             const dtf_ctor = try JsObject.create(arena, null);
             try dtf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatCtor));
