@@ -485,6 +485,7 @@ built-ins/Array/from/proto-from-ctor-realm.js
 built-ins/Array/from/source-object-constructor.js
 built-ins/Array/from/source-object-length-set-elem-prop-err.js
 built-ins/Array/from/source-object-length-set-elem-prop-non-writable.js
+built-ins/Array/fromAsync/async-iterable-input-does-not-await-input.js
 built-ins/Array/fromAsync/asyncitems-array-add-to-singleton.js
 built-ins/Array/fromAsync/asyncitems-array-add.js
 built-ins/Array/fromAsync/asyncitems-array-mutate.js
@@ -790,15 +791,6 @@ built-ins/AsyncGeneratorPrototype/return/this-val-not-object.js
 built-ins/AsyncGeneratorPrototype/throw/request-queue-order-state-executing.js
 built-ins/AsyncGeneratorPrototype/throw/this-val-not-async-generator.js
 built-ins/AsyncGeneratorPrototype/throw/this-val-not-object.js
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/invokes-return.js
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/is-function.js
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/length.js
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/name.js
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/prop-desc.js
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/return-val.js
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/throw-rejected-return.js
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/throw-return-getter.js
-built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/throw-return.js
 built-ins/BigInt/asIntN/arithmetic.js
 built-ins/BigInt/asIntN/asIntN.js
 built-ins/BigInt/asIntN/bigint-tobigint-errors.js
@@ -2713,12 +2705,12 @@ built-ins/String/raw/template-raw-throws.js
 built-ins/String/symbol-wrapping.js
 built-ins/StringIteratorPrototype/Symbol.toStringTag.js
 built-ins/StringIteratorPrototype/next/next-missing-internal-slots.js
-built-ins/Symbol/asyncDispose/prop-desc.js
+built-ins/Symbol/asyncDispose/cross-realm.js
 built-ins/Symbol/asyncIterator/cross-realm.js
 built-ins/Symbol/auto-boxing-strict.js
 built-ins/Symbol/desc-to-string-symbol.js
 built-ins/Symbol/desc-to-string.js
-built-ins/Symbol/dispose/prop-desc.js
+built-ins/Symbol/dispose/cross-realm.js
 built-ins/Symbol/for/description.js
 built-ins/Symbol/for/to-string-err.js
 built-ins/Symbol/hasInstance/cross-realm.js
@@ -11929,4 +11921,3 @@ staging/sm/syntax/syntax-parsed-arrow-then-directive.js
 staging/sm/syntax/yield-as-identifier.js
 staging/sm/types/8.12.5-01.js
 staging/source-phase-imports/import-source-source-text-module.js
-built-ins/Array/fromAsync/async-iterable-input-does-not-await-input.js

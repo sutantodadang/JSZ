@@ -347,6 +347,44 @@ pub fn nativePromiseReject(arena: std.mem.Allocator, _: Value, args: []const Val
     return makePromise(arena, .rejected, v);
 }
 
+fn nativeUndefinedThunk(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    return val_mod.makeUndefined(arena);
+}
+
+/// %AsyncIteratorPrototype%[@@asyncDispose] (explicit-resource-management):
+/// GetMethod(O, "return"); if present, call it and return a promise that
+/// fulfills with undefined once the result settles (rejecting if `return`
+/// throws or its result rejects). If absent, fulfill with undefined.
+pub fn nativeAsyncIteratorAsyncDispose(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return realm_mod.throwTypeError(arena, "no active context");
+    // GetMethod(O, "return"): a throwing getter rejects the returned promise.
+    const ret = ctx.getProp(arena, this_val, "return") catch {
+        const reason = realm_mod.pending_exception;
+        realm_mod.pending_exception = Value{};
+        return nativePromiseReject(arena, Value{}, &[_]Value{reason});
+    };
+    var result: Value = undefined;
+    if (ret.bits == 0 or ret.isUndefined() or ret.isNull()) {
+        result = try val_mod.makeUndefined(arena);
+    } else if (!isCallable(ret)) {
+        const proto: ?*JsObject = realm_mod.error_proto_TypeError;
+        const eobj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
+        try eobj.set("name", try val_mod.makeString(arena, "TypeError"));
+        try eobj.set("message", try val_mod.makeString(arena, "return is not a function"));
+        return nativePromiseReject(arena, Value{}, &[_]Value{try val_mod.makeObject(arena, eobj)});
+    } else {
+        result = ctx.invokeJs(arena, this_val, ret, &[_]Value{}) catch {
+            const reason = realm_mod.pending_exception;
+            realm_mod.pending_exception = Value{};
+            return nativePromiseReject(arena, Value{}, &[_]Value{reason});
+        };
+    }
+    // resultWrapper = PromiseResolve(%Promise%, result); then map fulfillment to undefined.
+    const wrapper = try nativePromiseResolve(arena, Value{}, &[_]Value{result});
+    const on_ful = try val_mod.makeNativeFunctionNamed(arena, nativeUndefinedThunk, "", 1);
+    return nativePromiseThen(arena, wrapper, &[_]Value{on_ful});
+}
+
 /// Promise.try(callbackfn, ...args) (ES2025 §27.2.4.9): build a capability from
 /// `C = this`, call `callbackfn` synchronously with the extra args, then resolve
 /// the capability with its return value or reject with a thrown completion.
