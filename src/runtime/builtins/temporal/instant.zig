@@ -357,8 +357,14 @@ pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyer
     return realm_mod.throwTypeError(arena, "Called valueOf on a Temporal.Instant");
 }
 
-pub fn nativeToZonedDateTimeISO(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
-    return realm_mod.throwTypeError(arena, "Temporal.ZonedDateTime is not yet implemented (Wave 26)");
+pub fn nativeToZonedDateTimeISO(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const ins = try requireInstant(arena, this_val);
+    const timezone = @import("timezone.zig");
+    const zoned = @import("zoned_date_time.zig");
+    const v = if (args.len > 0) args[0] else Value{};
+    if (v.bits == 0 or v.unbox() != .string) return realm_mod.throwTypeError(arena, "time zone must be a string");
+    const zone = try timezone.toZone(arena, v.unbox().string);
+    return zoned.makeZoned(arena, .{ .ns = ins.*, .tz = zone.id, .offset_ns = zone.offset_ns });
 }
 
 fn instantToString(arena: std.mem.Allocator, ns: i128, digits: ?u8) ![]const u8 {

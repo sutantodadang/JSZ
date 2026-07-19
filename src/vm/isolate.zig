@@ -616,7 +616,14 @@ pub fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]
                     i += 1;
                 }
                 if (emitted_any) try out.appendSlice(arena, " + ");
-                try out.appendSlice(arena, "(");
+                // A template substitution is coerced with ToString (string hint:
+                // toString before valueOf, and a TypeError for Symbols), NOT with
+                // the `+` operator's default-hint ToPrimitive (valueOf first).
+                // `"".concat(expr)` is exactly ToString applied to each argument,
+                // so wrap the substitution in it rather than emitting a bare `+`
+                // operand — otherwise objects with a throwing/number valueOf (e.g.
+                // every Temporal type) would coerce incorrectly.
+                try out.appendSlice(arena, "\"\".concat((");
                 if (expr_end >= expr_start and expr_end <= source.len) {
                     // The substitution expression may itself contain template
                     // literals (e.g. `a${cond ? `x${y}` : ""}b`), so rewrite it
@@ -625,7 +632,7 @@ pub fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]
                     const inner = try rewriteTemplateLiterals(arena, source[expr_start..expr_end]);
                     try out.appendSlice(arena, inner);
                 }
-                try out.appendSlice(arena, ")");
+                try out.appendSlice(arena, "))");
                 emitted_any = true;
                 continue;
             }

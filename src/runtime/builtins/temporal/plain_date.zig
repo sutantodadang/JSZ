@@ -360,6 +360,32 @@ pub fn nativeEquals(arena: std.mem.Allocator, this_val: Value, args: []const Val
     return val_mod.makeBool(arena, compareISODate(d.*, other) == 0);
 }
 
+pub fn nativeToZonedDateTime(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const d = try requireDate(arena, this_val);
+    const timezone = @import("timezone.zig");
+    const zoned = @import("zoned_date_time.zig");
+    const pt = @import("plain_time.zig");
+    const item = if (args.len > 0) args[0] else Value{};
+    var zone: timezone.Zone = undefined;
+    var time = shared.ISOTime{};
+    if (item.bits != 0 and item.unbox() == .string) {
+        zone = try timezone.toZone(arena, item.unbox().string);
+    } else if (item.bits != 0 and item.unbox() == .object) {
+        const o = item.toPtr().object;
+        const tz_v = o.get("timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
+        if (tz_v.bits == 0 or tz_v.unbox() != .string) return realm_mod.throwTypeError(arena, "time zone must be a string");
+        zone = try timezone.toZone(arena, tz_v.unbox().string);
+        if (o.get("plainTime")) |ptv| {
+            if (ptv.bits != 0 and ptv.unbox() != .undefined_) {
+                time = try pt.toTemporalTime(arena, ptv, .constrain);
+            }
+        }
+    } else return realm_mod.throwTypeError(arena, "toZonedDateTime requires a time zone");
+    const wall = @as(i128, shared.isoDateToEpochDays(d.year, d.month, d.day)) * shared.NS_PER_DAY +
+        shared.timeToNanos(time);
+    return zoned.makeZoned(arena, .{ .ns = wall - zone.offset_ns, .tz = zone.id, .offset_ns = zone.offset_ns });
+}
+
 pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const d = try requireDate(arena, this_val);
     const pdt = @import("plain_date_time.zig");
@@ -483,6 +509,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.setMethod(arena, proto, "since", nativeSince);
     try intrinsics.setMethod(arena, proto, "equals", nativeEquals);
     try intrinsics.setMethod(arena, proto, "toPlainDateTime", nativeToPlainDateTime);
+    try intrinsics.setMethod(arena, proto, "toZonedDateTime", nativeToZonedDateTime);
     try intrinsics.setMethod(arena, proto, "toString", nativeToString);
     try intrinsics.setMethod(arena, proto, "toJSON", nativeToJSON);
     try intrinsics.setMethod(arena, proto, "toLocaleString", nativeToLocaleString);
