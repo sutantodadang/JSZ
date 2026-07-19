@@ -702,6 +702,9 @@ pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: [
         .time => .time_only,
         else => .none,
     };
+    // A ZonedDateTime carries its own zone; a `timeZone` option is disallowed.
+    if (kind == .zoned and optStr(opts_v, "timeZone") != null)
+        return realm_mod.throwTypeError(arena, "Temporal.ZonedDateTime.toLocaleString does not accept a timeZone option");
     const dtf = try buildLocaleDTF(arena, opts_v, defaults, restrict);
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
 }
