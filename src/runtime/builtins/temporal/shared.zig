@@ -330,7 +330,7 @@ pub fn parseISODateTime(s0: []const u8) ParseError!ISODateTime {
             skipOffset(&p);
         }
     }
-    skipAnnotations(&p);
+    try parseAnnotations(&p);
     if (!p.eof()) return error.Invalid;
 
     if (year < -271821 or year > 275760) return error.Invalid;
@@ -374,7 +374,7 @@ pub fn parseISOYearMonth(s0: []const u8) ParseError!ISODate {
             return .{ .year = dt.date.year, .month = dt.date.month, .day = 1 };
         }
     }
-    skipAnnotations(&p);
+    try parseAnnotations(&p);
     if (!p.eof()) return error.Invalid;
     if (year < -271821 or year > 275760) return error.Invalid;
     if (month < 1 or month > 12) return error.Invalid;
@@ -397,7 +397,7 @@ pub fn parseISOMonthDay(s0: []const u8) ParseError!ISOMonthDay {
     const had_dash = p.eat('-');
     const day = p.digitsN(2) orelse return error.Invalid;
     _ = had_dash;
-    skipAnnotations(&p);
+    try parseAnnotations(&p);
     if (!p.eof()) return error.Invalid;
     if (month < 1 or month > 12) return error.Invalid;
     if (day < 1 or day > isoDaysInMonth(1972, @intCast(month))) return error.Invalid;
@@ -417,7 +417,7 @@ pub fn parseISOTime(s0: []const u8) ParseError!ISOTime {
     }
     const t = try parseTimeInner(&p);
     skipOffset(&p);
-    skipAnnotations(&p);
+    try parseAnnotations(&p);
     if (!p.eof()) return error.Invalid;
     if (!isValidISOTime(t)) return error.Invalid;
     return t;
@@ -521,13 +521,64 @@ fn isDigit(c: ?u8) bool {
     return ch >= '0' and ch <= '9';
 }
 
-fn skipAnnotations(p: *Parser) void {
+/// A valid RFC 9557 `AnnotationKey`: a lowercase-leading identifier of
+/// `[a-z_][a-z0-9_-]*`.
+fn isValidAnnotationKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    const lead = key[0];
+    if (!((lead >= 'a' and lead <= 'z') or lead == '_')) return false;
+    for (key[1..]) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-' or c == '_')) return false;
+    }
+    return true;
+}
+
+/// Parse and validate the RFC 9557 annotation block (`[tz][key=value]…`). A
+/// time-zone annotation (no `=`) may appear at most once and must precede any
+/// key/value annotation; the `u-ca` calendar key may appear at most once; an
+/// unrecognised key carrying the critical flag (`!`) is rejected, as is a
+/// malformed key. Unknown non-critical annotations are ignored.
+fn parseAnnotations(p: *Parser) ParseError!void {
+    var tz_seen = false;
+    var kv_seen = false;
+    var ca_count: u32 = 0;
+    var ca_critical = false;
     while (p.peek() == '[') {
-        while (p.peek()) |c| {
+        p.i += 1; // consume '['
+        var critical = false;
+        if (p.peek() == '!') {
+            critical = true;
             p.i += 1;
+        }
+        const start = p.i;
+        while (p.peek()) |c| {
             if (c == ']') break;
+            p.i += 1;
+        }
+        if (p.peek() != ']') return error.Invalid; // unterminated annotation
+        const content = p.s[start..p.i];
+        p.i += 1; // consume ']'
+        if (content.len == 0) return error.Invalid;
+        if (std.mem.indexOfScalar(u8, content, '=')) |eq| {
+            const key = content[0..eq];
+            const value = content[eq + 1 ..];
+            if (!isValidAnnotationKey(key) or value.len == 0) return error.Invalid;
+            if (std.mem.eql(u8, key, "u-ca")) {
+                // Multiple calendar annotations are tolerated (only the first is
+                // used); but any critical flag among two-or-more is an error.
+                ca_count += 1;
+                if (critical) ca_critical = true;
+            } else if (critical) {
+                return error.Invalid; // unknown critical annotation
+            }
+            kv_seen = true;
+        } else {
+            // Time-zone annotation: single, and before any key/value annotation.
+            if (tz_seen or kv_seen) return error.Invalid;
+            tz_seen = true;
         }
     }
+    if (ca_count > 1 and ca_critical) return error.Invalid;
 }
 
 /// Parse an ISO 8601 duration string: [+-]PnYnMnWnDTnHnMnS with an optional

@@ -113,6 +113,10 @@ fn yearMonthFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.
     var month: f64 = undefined;
     if (month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_) {
         month = try shared.toIntegerWithTruncation(arena, month_v.?);
+        // month and monthCode, when both present, must agree.
+        if (mc) |code| {
+            if (floatToI32(month) != code) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
+        }
     } else if (mc) |code| {
         month = @floatFromInt(code);
     } else {
@@ -121,11 +125,12 @@ fn yearMonthFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.
     const year = try shared.toIntegerWithTruncation(arena, year_v.?);
     var mi = floatToI32(month);
     const yi = floatToI32(year);
-    if (overflow == .reject) {
-        if (mi < 1 or mi > 12) return realm_mod.throwRangeError(arena, "month out of range");
-    } else {
-        if (mi < 1) mi = 1;
-        if (mi > 12) mi = 12;
+    // A month below 1 is always out of range; the upper bound is constrained or
+    // rejected per the overflow option.
+    if (mi < 1) return realm_mod.throwRangeError(arena, "month out of range");
+    if (mi > 12) {
+        if (overflow == .reject) return realm_mod.throwRangeError(arena, "month out of range");
+        mi = 12;
     }
     return .{ .year = yi, .month = @intCast(mi), .day = 1 };
 }
@@ -225,8 +230,19 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var result = plain_date.differenceISODate(from, to, largest.?);
     result.weeks = 0;
     result.days = 0;
-    if (smallest.? == .month and inc != 1) {
-        result.months = shared.roundNumberToIncrement(result.months, inc, mode);
+
+    // Round the (years, months) difference to the requested smallestUnit. Work in
+    // total signed months; the increment is measured in months (12 per year).
+    var total_months = result.years * 12.0 + result.months;
+    const round_increment: f64 = if (smallest.? == .year) inc * 12.0 else inc;
+    total_months = shared.roundNumberToIncrement(total_months, round_increment, mode);
+    result.years = 0;
+    result.months = 0;
+    if (largest.? == .year) {
+        result.years = @trunc(total_months / 12.0);
+        result.months = total_months - result.years * 12.0;
+    } else {
+        result.months = total_months;
     }
     return duration.makeDuration(arena, result);
 }
@@ -259,20 +275,27 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     var year: f64 = @floatFromInt(cur.year);
     var month: f64 = @floatFromInt(cur.month);
     var any = false;
+    var mc_month: ?i32 = null;
     if (try readField(arena, o, "year")) |x| { year = x; any = true; }
     if (try shared.readMonthCode(arena, o.get("monthCode"))) |code| {
+        mc_month = code;
         month = @floatFromInt(code);
         any = true;
     }
-    if (try readField(arena, o, "month")) |x| { month = x; any = true; }
+    if (try readField(arena, o, "month")) |x| {
+        if (mc_month) |mc| {
+            if (floatToI32(x) != mc) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
+        }
+        month = x;
+        any = true;
+    }
     if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
     var mi = floatToI32(month);
     const yi = floatToI32(year);
-    if (overflow == .reject) {
-        if (mi < 1 or mi > 12) return realm_mod.throwRangeError(arena, "month out of range");
-    } else {
-        if (mi < 1) mi = 1;
-        if (mi > 12) mi = 12;
+    if (mi < 1) return realm_mod.throwRangeError(arena, "month out of range");
+    if (mi > 12) {
+        if (overflow == .reject) return realm_mod.throwRangeError(arena, "month out of range");
+        mi = 12;
     }
     return makeYearMonth(arena, .{ .year = yi, .month = @intCast(mi), .day = 1 });
 }
