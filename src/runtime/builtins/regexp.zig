@@ -381,6 +381,10 @@ pub const CompiledRegex = struct {
         sticky: bool = false,
         /// ES2015 `u` (unicode): full code-point semantics.
         unicode: bool = false,
+        /// ES2024 `v` (unicodeSets): extended character classes. Not yet parsed
+        /// (the ClassSetExpression grammar is unimplemented); tracked so the
+        /// `unicodeSets` getter reports correctly once `v` is accepted.
+        unicode_sets: bool = false,
     };
 };
 
@@ -2885,8 +2889,15 @@ pub fn nativeRegExpGetHasIndices(arena: std.mem.Allocator, this_val: Value, _: [
 pub fn nativeRegExpGetUnicodeSets(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object)
         return realm_mod.throwTypeError(arena, "RegExp.prototype.unicodeSets called on incompatible receiver");
-    if (getCompiledRegex(this_val) == null) return val_mod.makeUndefined(arena);
-    return val_mod.makeBool(arena, false);
+    if (getCompiledRegex(this_val) == null) {
+        // No [[OriginalFlags]]: only %RegExpPrototype% itself yields undefined;
+        // any other object is an incompatible receiver (ES §22.2.6.18 step 3).
+        if (realm_mod.active_regexp_proto) |proto| {
+            if (this_val.toPtr().object == proto) return val_mod.makeUndefined(arena);
+        }
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.unicodeSets called on incompatible receiver");
+    }
+    return val_mod.makeBool(arena, getCompiledRegex(this_val).?.flags.unicode_sets);
 }
 
 // ============================================================= Tests ==========
