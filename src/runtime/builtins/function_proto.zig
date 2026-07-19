@@ -36,6 +36,16 @@ pub fn invokeCallback(arena: std.mem.Allocator, this_val: Value, fn_val: Value, 
         return error.JsException;
     }
 
+    // A native constructor sets `active_constructing` (read at its entry for the
+    // requires-new check) and only clears it on return. When such a constructor
+    // re-enters JS mid-body to drive an iterator — `new Set(gen)`, `new Map(gen)`,
+    // `new Int8Array(gen)`, `new AggregateError(gen)` — that ordinary call must
+    // not observe the stale flag, or a generator's `next` is misread as a
+    // constructor call. Clear it for the duration of the callback and restore it.
+    const saved_constructing = realm_mod.active_constructing;
+    realm_mod.active_constructing = false;
+    defer realm_mod.active_constructing = saved_constructing;
+
     const inner = fn_val.unbox();
     switch (inner) {
         .native_function => |fn_ptr| {

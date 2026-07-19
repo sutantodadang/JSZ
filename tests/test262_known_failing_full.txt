@@ -5329,10 +5329,6 @@ built-ins/ThrowTypeError/unique-per-realm-unmapped-args.js
 built-ins/TypedArray/prototype/copyWithin/coerced-values-end-detached-prototype.js
 built-ins/TypedArray/prototype/copyWithin/coerced-values-end-detached.js
 built-ins/TypedArray/prototype/copyWithin/coerced-values-start-detached.js
-built-ins/TypedArrayConstructors/ctors-bigint/object-arg/as-generator-iterable-returns.js
-built-ins/TypedArrayConstructors/ctors-bigint/object-arg/iterating-throws.js
-built-ins/TypedArrayConstructors/ctors/object-arg/as-generator-iterable-returns.js
-built-ins/TypedArrayConstructors/ctors/object-arg/iterating-throws.js
 built-ins/Uint8Array/fromBase64/alphabet.js
 built-ins/Uint8Array/fromBase64/descriptor.js
 built-ins/Uint8Array/fromBase64/ignores-receiver.js
