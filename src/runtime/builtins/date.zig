@@ -768,19 +768,19 @@ pub fn nativeDateToString(arena: std.mem.Allocator, this_val: Value, _: []const 
 /// Intl.DateTimeFormat (honors component/dateStyle/timeStyle options).
 pub fn nativeDateToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if ((try brandValidDate(arena, this_val)) == null) return val_mod.makeString(arena, "Invalid Date");
-    return @import("intl.zig").dateToLocaleString(arena, this_val, args, .datetime);
+    return @import("intl.zig").dateToLocaleString(arena, this_val, args, .any, .datetime);
 }
 
 /// `Date.prototype.toLocaleDateString` — date-only default.
 pub fn nativeDateToLocaleDateString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if ((try brandValidDate(arena, this_val)) == null) return val_mod.makeString(arena, "Invalid Date");
-    return @import("intl.zig").dateToLocaleString(arena, this_val, args, .date);
+    return @import("intl.zig").dateToLocaleString(arena, this_val, args, .date, .date);
 }
 
 /// `Date.prototype.toLocaleTimeString` — time-only default.
 pub fn nativeDateToLocaleTimeString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if ((try brandValidDate(arena, this_val)) == null) return val_mod.makeString(arena, "Invalid Date");
-    return @import("intl.zig").dateToLocaleString(arena, this_val, args, .time);
+    return @import("intl.zig").dateToLocaleString(arena, this_val, args, .time, .time);
 }
 
 // ------------------------------------------------------------------ UTC getters ---

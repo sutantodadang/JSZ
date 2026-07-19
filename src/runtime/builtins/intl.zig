@@ -401,7 +401,12 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
     const date_mod = @import("date.zig");
     const ms: i64 = blk: {
         if (args.len > 0 and args[0].bits != 0) {
-            if (args[0].unbox() == .number) break :blk @intFromFloat(args[0].unbox().number);
+            if (args[0].unbox() == .number) {
+                const n = args[0].unbox().number;
+                // TimeClip: a non-finite or out-of-range time value is invalid.
+                if (!std.math.isFinite(n) or @abs(n) > 8.64e15) return realm_mod.throwRangeError(arena, "Invalid time value");
+                break :blk @intFromFloat(n);
+            }
             if (args[0].unbox() == .object) {
                 if (date_mod.getDateMs(args[0])) |m| break :blk m;
                 if (temporalEpochMs(args[0])) |m| break :blk m;
@@ -480,6 +485,10 @@ pub fn nativeDateTimeFormatFormat(arena: std.mem.Allocator, this_val: Value, arg
 
 /// `dtf.formatToParts(date)` → array of `{ type, value }` records.
 pub fn nativeDateTimeFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Brand check: reject a `this` that is not an initialized DateTimeFormat
+    // (our instances carry the internal `__dtf_hour12` marker).
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__dtf_hour12") == null)
+        return realm_mod.throwTypeError(arena, "Intl.DateTimeFormat.prototype.formatToParts called on incompatible receiver");
     const parts = try buildDTFParts(arena, this_val, args);
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
     for (parts.items) |p| {
@@ -692,6 +701,11 @@ fn applyTimeStyle(ts: []const u8, h: *[]const u8, mi: *[]const u8, se: *[]const 
 /// modelled (ISO calendar, UTC only).
 pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: []const Value, kind: TemporalDTKind) anyerror!Value {
     const opts_v: ?Value = if (args.len > 1) args[1] else null;
+    const required: Required = switch (kind) {
+        .date => .date,
+        .time => .time,
+        .datetime, .instant, .zoned => .any,
+    };
     const defaults: LocaleDefaults = switch (kind) {
         .date => .date,
         .time => .time,
@@ -705,9 +719,13 @@ pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: [
     // A ZonedDateTime carries its own zone; a `timeZone` option is disallowed.
     if (kind == .zoned and optStr(opts_v, "timeZone") != null)
         return realm_mod.throwTypeError(arena, "Temporal.ZonedDateTime.toLocaleString does not accept a timeZone option");
-    const dtf = try buildLocaleDTF(arena, opts_v, defaults, restrict);
+    const dtf = try buildLocaleDTF(arena, opts_v, required, defaults, restrict);
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
 }
+
+/// ToDateTimeOptions "required" families: which component family must be
+/// present for the caller to skip filling in defaults.
+pub const Required = enum { date, time, any };
 
 /// Default component set applied when no explicit component/style is requested.
 pub const LocaleDefaults = enum { date, time, datetime };
@@ -720,7 +738,7 @@ pub const Restrict = enum { none, date_only, time_only };
 /// `Date.prototype.toLocale*String`: parse options, validate conflicts, resolve
 /// the effective component styles, and return a DateTimeFormat-like object ready
 /// for `nativeDateTimeFormatFormat`.
-fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, defaults: LocaleDefaults, restrict: Restrict) anyerror!Value {
+fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, defaults: LocaleDefaults, restrict: Restrict) anyerror!Value {
     const weekday = optStr(opts_v, "weekday");
     const era = optStr(opts_v, "era");
     const year = optStr(opts_v, "year");
@@ -765,26 +783,33 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, defaults: LocaleDefa
     if (date_style) |ds| applyDateStyle(ds, &w, &y, &mo, &d);
     if (time_style) |ts| applyTimeStyle(ts, &h, &mi, &se);
 
-    if (date_style == null and time_style == null and !has_comp) {
-        switch (defaults) {
-            .date => {
-                y = "numeric";
-                mo = "numeric";
-                d = "numeric";
-            },
-            .time => {
-                h = "numeric";
-                mi = "numeric";
-                se = "numeric";
-            },
-            .datetime => {
-                y = "numeric";
-                mo = "numeric";
-                d = "numeric";
-                h = "numeric";
-                mi = "numeric";
-                se = "numeric";
-            },
+    // ToDateTimeOptions: `needDefaults` is driven by the REQUIRED family only —
+    // e.g. toLocaleDateString (required "date") still fills in year/month/day
+    // even when the caller passed only time components. When set, the `defaults`
+    // family's fields are added (never overriding explicit user components).
+    // dateStyle/timeStyle suppress defaults entirely.
+    var need_defaults = date_style == null and time_style == null;
+    if (need_defaults) switch (required) {
+        .date => if (has_date_comp) {
+            need_defaults = false;
+        },
+        .time => if (has_time_comp) {
+            need_defaults = false;
+        },
+        .any => if (has_comp) {
+            need_defaults = false;
+        },
+    };
+    if (need_defaults) {
+        if (defaults == .date or defaults == .datetime) {
+            if (y.len == 0) y = "numeric";
+            if (mo.len == 0) mo = "numeric";
+            if (d.len == 0) d = "numeric";
+        }
+        if (defaults == .time or defaults == .datetime) {
+            if (h.len == 0) h = "numeric";
+            if (mi.len == 0) mi = "numeric";
+            if (se.len == 0) se = "numeric";
         }
     }
 
@@ -812,9 +837,9 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, defaults: LocaleDefa
 /// `Date.prototype.{toLocaleString,toLocaleDateString,toLocaleTimeString}`:
 /// build a DateTimeFormat from (locales, options) with the method's default
 /// component set and format the Date through the shared en-US machinery.
-pub fn dateToLocaleString(arena: std.mem.Allocator, receiver: Value, args: []const Value, defaults: LocaleDefaults) anyerror!Value {
+pub fn dateToLocaleString(arena: std.mem.Allocator, receiver: Value, args: []const Value, required: Required, defaults: LocaleDefaults) anyerror!Value {
     const opts_v: ?Value = if (args.len > 1) args[1] else null;
-    const dtf = try buildLocaleDTF(arena, opts_v, defaults, .none);
+    const dtf = try buildLocaleDTF(arena, opts_v, required, defaults, .none);
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
 }
 
