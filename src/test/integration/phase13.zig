@@ -284,3 +284,55 @@ test "phase13: regex property escapes under /u" {
     try std.testing.expectEqualStrings("true,a#b#,true", s);
 }
 
+
+// ---- Wave 32: private-element brand checks ----
+
+// A valid private field / method read on an instance still resolves normally.
+test "wave32: private field read on own instance works" {
+    const v = try evalToF64(std.testing.allocator, "new (class C { #x = 42; read(){ return this.#x; } })().read()");
+    try std.testing.expectEqual(@as(f64, 42), v);
+}
+
+test "wave32: private method call on own instance works" {
+    const v = try evalToF64(std.testing.allocator, "new (class C { #m(){ return 7; } call(){ return this.#m(); } })().call()");
+    try std.testing.expectEqual(@as(f64, 7), v);
+}
+
+// Reading/calling a private element on an object that never received the brand
+// is a TypeError (PrivateFieldGet / PrivateBrandCheck), not `undefined`.
+test "wave32: private field read on foreign object throws TypeError" {
+    const s = try dualString(std.testing.allocator, "class C { #x = 1; static peek(o){ return o.#x; } } try{ C.peek({}); 'no' }catch(e){ e.name }");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("TypeError", s);
+}
+
+test "wave32: private method call on foreign object throws TypeError" {
+    const s = try dualString(std.testing.allocator, "class C { #m(){return 7;} static peek(o){ return o.#m(); } } try{ C.peek({}); 'no' }catch(e){ e.name }");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("TypeError", s);
+}
+
+test "wave32: private static field read on foreign object throws TypeError" {
+    const s = try dualString(std.testing.allocator, "class C { static #s=9; static peek(o){ return o.#s; } } try{ C.peek({}); 'no' }catch(e){ e.name }");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("TypeError", s);
+}
+
+// A private accessor with no getter throws on read; with no setter throws on write.
+test "wave32: private accessor missing getter throws on read" {
+    const s = try dualString(std.testing.allocator, "class C { set #a(v){} run(){ try{ return this.#a; }catch(e){ return e.name; } } } new C().run()");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("TypeError", s);
+}
+
+test "wave32: private accessor missing setter throws on write" {
+    const s = try dualString(std.testing.allocator, "class C { get #a(){return 5;} run(){ try{ this.#a=1; return 'no'; }catch(e){ return e.name; } } } new C().run()");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("TypeError", s);
+}
+
+test "wave32: private getter reads through on own instance" {
+    const v = try evalToF64(std.testing.allocator, "new (class C { get #a(){ return 5; } run(){ return this.#a; } })().run()");
+    try std.testing.expectEqual(@as(f64, 5), v);
+}
+
