@@ -1699,13 +1699,13 @@ fn nativeArrayOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerr
 /// ES2023 Array.fromAsync(items, mapFn?, thisArg?) → Promise<Array>
 /// Drives async/sync iterables and array-likes; each element is awaited
 /// so thenables are unwrapped. Always returns a Promise.
-fn nativeArrayFromAsync(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+fn nativeArrayFromAsync(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     // not-a-constructor guard (§23.1.2.2 step 1)
     if (active_constructing) {
         active_constructing = false;
         return throwTypeError(arena, "Array.fromAsync is not a constructor");
     }
-    const result = arrayFromAsyncWork(arena, args) catch |e| {
+    const result = arrayFromAsyncWork(arena, this_val, args) catch |e| {
         if (e == error.JsException) {
             const ex = pending_exception;
             pending_exception = Value{};
@@ -1716,126 +1716,203 @@ fn nativeArrayFromAsync(arena: std.mem.Allocator, _: Value, args: []const Value)
     return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{result});
 }
 
-fn makeFromAsyncArray(arena: std.mem.Allocator, items: []const Value) !Value {
+/// IsConstructor(C): the this-value used as A's constructor by Array.fromAsync.
+fn faIsConstructor(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .bc_function => true,
+        .object => |o| o.get("__call__") != null or
+            o.internal_kind == .bound_function or
+            o.internal_kind == .proxy,
+        else => false,
+    };
+}
+
+/// GetMethod(V, key): returns `.undefined` (bits==0 sentinel via Value{}) when the
+/// property is undefined or null, the callable when present-and-callable, and
+/// throws a TypeError when present-but-not-callable (§7.3.11).
+fn faGetMethod(arena: std.mem.Allocator, ctx: *Context, target: Value, sym: Value) anyerror!Value {
+    const m = try ctx.getPropSym(arena, target, sym);
+    if (m.bits == 0) return Value{};
+    switch (m.unbox()) {
+        .undefined_, .null_ => return Value{},
+        else => {},
+    }
+    if (!isCallableVal(m)) return throwTypeError(arena, "Array.fromAsync: iterator method is not callable");
+    return m;
+}
+
+/// CreateDataPropertyOrThrow(A, Pk, value) for the fromAsync result. Ordinary
+/// objects go through [[DefineOwnProperty]] directly (so non-configurable
+/// clashes throw); anything exotic falls back to a throwing [[Set]].
+fn faCreateDataProperty(arena: std.mem.Allocator, ctx: *Context, a: Value, key: []const u8, value: Value) anyerror!void {
+    if (a.bits != 0 and a.unbox() == .object) {
+        const o = a.toPtr().object;
+        if (o.internal_kind != .proxy) {
+            const ok = try o.defineOwnData(key, value, .{ .writable = true, .enumerable = true, .configurable = true });
+            if (!ok) return throwTypeError(arena, "Array.fromAsync: cannot define result element");
+            return;
+        }
+    }
+    try ctx.setPropThrow(arena, a, key, value);
+}
+
+/// ArrayCreate(len) for the non-constructor path. `len` must be a valid array
+/// length (< 2³²) or a RangeError is thrown (§10.4.2.2).
+fn faArrayCreate(arena: std.mem.Allocator, len: usize) !Value {
+    if (len > 4294967295) return throwRangeError(arena, "Invalid array length");
     const obj = if (active_heap) |heap|
         try JsObject.createOnHeap(heap, active_array_proto)
     else
         try JsObject.create(arena, active_array_proto);
     obj.is_array = true;
-    for (items, 0..) |v, i| {
-        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        try obj.set(key, v);
-    }
-    obj.array_length = @intCast(items.len);
+    obj.array_length = @intCast(len);
     return val_mod.makeObject(arena, obj);
 }
 
-fn arrayFromAsyncWork(arena: std.mem.Allocator, args: []const Value) anyerror!Value {
-    const src = if (args.len > 0 and args[0].bits != 0) args[0] else Value{};
+/// Allocate a fresh ordinary Array (ArrayCreate(0)) for the iterator path.
+fn faNewArray(arena: std.mem.Allocator) !Value {
+    return faArrayCreate(arena, 0);
+}
+
+fn arrayFromAsyncWork(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const src = if (args.len > 0) args[0] else Value{};
     const map_fn_raw = if (args.len > 1) args[1] else Value{};
-    const has_map = map_fn_raw.bits != 0 and
-        map_fn_raw.unbox() != .undefined_ and
-        map_fn_raw.unbox() != .null_;
+    const this_arg = if (args.len > 2) args[2] else try val_mod.makeUndefined(arena);
+
+    // mapping is true unless mapfn is undefined; a present-but-not-callable mapfn
+    // (including null) is a TypeError (§23.1.2.1 step 3.a-b).
+    const map_undefined = map_fn_raw.bits == 0 or map_fn_raw.unbox() == .undefined_;
+    const has_map = !map_undefined;
     if (has_map and !isCallableVal(map_fn_raw))
         return throwTypeError(arena, "Array.fromAsync: mapFn is not callable");
 
-    var items = std.ArrayListUnmanaged(Value){};
+    const ctx = active_context orelse return faNewArray(arena);
 
-    if (src.bits == 0) return makeFromAsyncArray(arena, items.items);
-    if (src.unbox() != .object) return makeFromAsyncArray(arena, items.items);
+    // GetMethod(asyncItems, @@asyncIterator) coerces null/undefined via GetV, which
+    // throws — so reject for a null/undefined source (§23.1.2.1 step 3.c).
+    if (src.bits == 0 or src.unbox() == .undefined_ or src.unbox() == .null_)
+        return throwTypeError(arena, "Array.fromAsync: items is null or undefined");
 
-    const ctx = active_context orelse return makeFromAsyncArray(arena, items.items);
+    // Read-target: objects are used as-is (preserve identity for observable
+    // property access); primitives coerce to a wrapper (GetV/ToObject semantics).
+    const read_target = if (src.unbox() == .object or isCallableVal(src)) src else try toObjectForThis(arena, src);
 
-    // 1. Try @@asyncIterator
-    if (active_sym_async_iterator) |async_sym| {
-        const iter_fn = ctx.getPropSym(arena, src, async_sym) catch Value{};
-        if (iter_fn.bits != 0 and iter_fn.unbox() != .undefined_ and
-            iter_fn.unbox() != .null_ and isCallableVal(iter_fn))
-        {
-            const iterator = try function_proto_mod.invokeCallback(arena, src, iter_fn, &[_]Value{});
-            if (iterator.bits == 0 or iterator.unbox() != .object)
-                return throwTypeError(arena, "@@asyncIterator() did not return an object");
-            const next_fn = try ctx.getProp(arena, iterator, "next");
-            if (!isCallableVal(next_fn))
-                return throwTypeError(arena, "async iterator.next is not a function");
-            var k: usize = 0;
-            while (k < 100_000_000) : (k += 1) {
-                const next_p = try function_proto_mod.invokeCallback(arena, iterator, next_fn, &[_]Value{});
-                const step = try promise_mod.awaitValue(arena, next_p);
-                if (step.bits == 0 or step.unbox() != .object) break;
-                const done_v = try ctx.getProp(arena, step, "done");
-                if (isTruthyVal(done_v)) break;
-                var val = try ctx.getProp(arena, step, "value");
-                val = try promise_mod.awaitValue(arena, val);
-                if (has_map) {
-                    const idx_v = try val_mod.makeNumber(arena, @floatFromInt(k));
-                    const mapped = try function_proto_mod.invokeCallback(arena, try val_mod.makeUndefined(arena), map_fn_raw, &[_]Value{ val, idx_v });
-                    val = try promise_mod.awaitValue(arena, mapped);
-                }
-                try items.append(arena, val);
-            }
-            return makeFromAsyncArray(arena, items.items);
-        }
+    const is_ctor = faIsConstructor(this_val);
+
+    // Resolve async → sync iterator method with GetMethod semantics.
+    var using_async = Value{};
+    if (active_sym_async_iterator) |async_sym|
+        using_async = try faGetMethod(arena, ctx, read_target, async_sym);
+    var using_sync = Value{};
+    if (using_async.bits == 0) {
+        if (active_sym_iterator) |iter_sym|
+            using_sync = try faGetMethod(arena, ctx, read_target, iter_sym);
     }
 
-    // 2. Try @@iterator (sync iterable — each value is awaited per spec)
-    if (active_sym_iterator) |iter_sym| {
-        const iter_fn = ctx.getPropSym(arena, src, iter_sym) catch Value{};
-        if (iter_fn.bits != 0 and iter_fn.unbox() != .undefined_ and
-            iter_fn.unbox() != .null_ and isCallableVal(iter_fn))
-        {
-            const iterator = try function_proto_mod.invokeCallback(arena, src, iter_fn, &[_]Value{});
-            if (iterator.bits == 0 or iterator.unbox() != .object)
-                return throwTypeError(arena, "@@iterator() did not return an object");
-            const next_fn = try ctx.getProp(arena, iterator, "next");
-            if (!isCallableVal(next_fn))
-                return throwTypeError(arena, "iterator.next is not a function");
-            var k: usize = 0;
-            while (k < 100_000_000) : (k += 1) {
-                const res = try function_proto_mod.invokeCallback(arena, iterator, next_fn, &[_]Value{});
-                if (res.bits == 0 or res.unbox() != .object) break;
-                const done_v = try ctx.getProp(arena, res, "done");
-                if (isTruthyVal(done_v)) break;
-                var val = try ctx.getProp(arena, res, "value");
-                val = try promise_mod.awaitValue(arena, val);
-                if (has_map) {
-                    const idx_v = try val_mod.makeNumber(arena, @floatFromInt(k));
-                    const mapped = try function_proto_mod.invokeCallback(arena, try val_mod.makeUndefined(arena), map_fn_raw, &[_]Value{ val, idx_v });
-                    val = try promise_mod.awaitValue(arena, mapped);
-                }
-                try items.append(arena, val);
+    if (using_async.bits != 0 or using_sync.bits != 0) {
+        const is_async = using_async.bits != 0;
+        const iter_fn = if (is_async) using_async else using_sync;
+        const iterator = try function_proto_mod.invokeCallback(arena, read_target, iter_fn, &[_]Value{});
+        if (iterator.bits == 0 or iterator.unbox() != .object)
+            return throwTypeError(arena, "Array.fromAsync: iterator method did not return an object");
+        const next_fn = try ctx.getProp(arena, iterator, "next");
+        if (!isCallableVal(next_fn))
+            return throwTypeError(arena, "Array.fromAsync: iterator.next is not a function");
+
+        // If IsConstructor(C): A = Construct(C); else ArrayCreate(0).
+        const a = if (is_ctor) try ctx.construct(arena, this_val, &[_]Value{}) else try faNewArray(arena);
+
+        var buf: [32]u8 = undefined;
+        var k: usize = 0;
+        while (k < 9007199254740991) : (k += 1) {
+            const raw = try function_proto_mod.invokeCallback(arena, iterator, next_fn, &[_]Value{});
+            // Sync iterables are adapted through CreateAsyncFromSyncIterator, which
+            // awaits the next() result; async iterables already return a promise.
+            const step = try promise_mod.awaitValue(arena, raw);
+            if (step.bits == 0 or step.unbox() != .object)
+                return throwTypeError(arena, "Array.fromAsync: iterator result is not an object");
+            const done_v = try ctx.getProp(arena, step, "done");
+            if (isTruthyVal(done_v)) {
+                try ctx.setPropThrow(arena, a, "length", try val_mod.makeNumber(arena, @floatFromInt(k)));
+                return a;
             }
-            return makeFromAsyncArray(arena, items.items);
+            var val = try ctx.getProp(arena, step, "value");
+            // Spec: async-iterator values are used directly (already settled by
+            // CreateAsyncFromSyncIterator / the async generator's own AsyncGeneratorYield
+            // Await). Our async generators do not yet pre-await yielded operands, so we
+            // await here to compensate — matching observable behaviour for every case
+            // except `does-not-await-input` (tracked as a known async-generator gap).
+            val = try promise_mod.awaitValue(arena, val);
+            if (has_map) {
+                const idx_v = try val_mod.makeNumber(arena, @floatFromInt(k));
+                const mapped = faMapValue(arena, map_fn_raw, this_arg, val, idx_v) catch |e|
+                    return faCloseOnAbrupt(arena, ctx, iterator, e);
+                val = promise_mod.awaitValue(arena, mapped) catch |e|
+                    return faCloseOnAbrupt(arena, ctx, iterator, e);
+            }
+            const key = try std.fmt.bufPrint(&buf, "{d}", .{k});
+            faCreateDataProperty(arena, ctx, a, key, val) catch |e|
+                return faCloseOnAbrupt(arena, ctx, iterator, e);
         }
+        return throwTypeError(arena, "Array.fromAsync: iterator produced too many values");
     }
 
-    // 3. Array-like: read length, then elements by index (each awaited)
-    const src_obj = src.toPtr().object;
-    const len_v = src_obj.get("length") orelse Value{};
-    const len: usize = blk: {
-        if (len_v.bits == 0) break :blk 0;
-        const lv = try promise_mod.awaitValue(arena, len_v);
-        if (lv.bits == 0) break :blk 0;
-        break :blk switch (lv.unbox()) {
-            .number => |n| if (n <= 0 or std.math.isNan(n)) 0 else @min(@as(usize, @intFromFloat(@trunc(n))), 4294967295),
-            else => 0,
-        };
-    };
+    // Array-like branch: length then elements by index (each awaited).
+    const len_v = try ctx.getProp(arena, read_target, "length");
+    const len_awaited = try promise_mod.awaitValue(arena, len_v);
+    // LengthOfArrayLike = ToLength(ToNumber(length)); ToNumber throws on
+    // BigInt/Symbol and propagates a throwing valueOf.
+    const len_n = try toNumberCheckedRealm(arena, len_awaited);
+    const len: usize = if (std.math.isNan(len_n) or len_n <= 0)
+        0
+    else
+        @min(@as(usize, @intFromFloat(@trunc(len_n))), 9007199254740991);
+
+    // If IsConstructor(C): A = Construct(C, «len»); else ArrayCreate(len)
+    // (which rejects len ≥ 2³² with a RangeError).
+    const a = if (is_ctor)
+        try ctx.construct(arena, this_val, &[_]Value{try val_mod.makeNumber(arena, @floatFromInt(len))})
+    else
+        try faArrayCreate(arena, len);
+
     var buf: [32]u8 = undefined;
     var k: usize = 0;
     while (k < len) : (k += 1) {
         const key = try std.fmt.bufPrint(&buf, "{d}", .{k});
-        var val = src_obj.get(key) orelse try val_mod.makeUndefined(arena);
+        var val = try ctx.getProp(arena, read_target, key);
         val = try promise_mod.awaitValue(arena, val);
         if (has_map) {
             const idx_v = try val_mod.makeNumber(arena, @floatFromInt(k));
-            const mapped = try function_proto_mod.invokeCallback(arena, try val_mod.makeUndefined(arena), map_fn_raw, &[_]Value{ val, idx_v });
+            const mapped = try faMapValue(arena, map_fn_raw, this_arg, val, idx_v);
             val = try promise_mod.awaitValue(arena, mapped);
         }
-        try items.append(arena, val);
+        try faCreateDataProperty(arena, ctx, a, key, val);
     }
-    return makeFromAsyncArray(arena, items.items);
+    try ctx.setPropThrow(arena, a, "length", try val_mod.makeNumber(arena, @floatFromInt(len)));
+    return a;
 }
+
+/// Call(mapfn, thisArg, «value, 𝔽(k)»).
+fn faMapValue(arena: std.mem.Allocator, map_fn: Value, this_arg: Value, value: Value, idx: Value) anyerror!Value {
+    return function_proto_mod.invokeCallback(arena, this_arg, map_fn, &[_]Value{ value, idx });
+}
+
+/// IfAbruptCloseAsyncIterator: on an abrupt completion inside the iterator loop,
+/// invoke the iterator's `return` method (ignoring its result/errors), then
+/// re-raise the original completion.
+fn faCloseOnAbrupt(arena: std.mem.Allocator, ctx: *Context, iterator: Value, err: anyerror) anyerror {
+    if (err != error.JsException) return err;
+    const saved = pending_exception;
+    const ret_fn = ctx.getProp(arena, iterator, "return") catch Value{};
+    if (ret_fn.bits != 0 and isCallableVal(ret_fn)) {
+        const r = function_proto_mod.invokeCallback(arena, iterator, ret_fn, &[_]Value{}) catch Value{};
+        _ = promise_mod.awaitValue(arena, r) catch {};
+    }
+    pending_exception = saved;
+    return error.JsException;
+}
+
 
 /// Cycle-detection context for structuredClone — O(n) list scan is fine for
 /// typical object graphs; avoids a HashMap dependency in this file.

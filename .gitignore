@@ -14,4 +14,4 @@ jit-native/target/
 .sisyphus/
 .omo/
 .hermes/
-.claude/
+.claude/.test262_shards/

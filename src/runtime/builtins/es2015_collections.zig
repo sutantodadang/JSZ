@@ -3066,15 +3066,24 @@ fn nativeIterTake(arena: std.mem.Allocator, this_val: Value, args: []const Value
 /// RangeError. Returns the integer limit (capped at 2^53-1 for ±Infinity).
 fn iterLimitArg(arena: std.mem.Allocator, this_val: Value, args: []const Value, comptime name: []const u8) anyerror!i64 {
     const limit_v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    const num = realm_mod.toNumberValue(arena, limit_v) catch |e| {
+    // ToNumber(limit): throws TypeError for BigInt/Symbol (must not become the
+    // NaN → RangeError path); abrupt completions close the iterator (§27.1.4.x).
+    const num = realm_mod.toNumberCheckedRealm(arena, limit_v) catch |e| {
         closeIterator(arena, this_val);
         return e;
     };
-    if (std.math.isNan(num) or num < 0) {
+    if (std.math.isNan(num)) {
         closeIterator(arena, this_val);
         return realm_mod.throwRangeError(arena, "Iterator.prototype." ++ name ++ ": limit must be a non-negative number");
     }
-    return if (num >= 9007199254740991.0) 9007199254740991 else @intFromFloat(@trunc(num));
+    // integerLimit = ToIntegerOrInfinity(numLimit): truncate toward zero, THEN
+    // reject negatives — so -0.9 → 0 (allowed) while -1 / -Infinity throw.
+    const integer = std.math.trunc(num);
+    if (integer < 0) {
+        closeIterator(arena, this_val);
+        return realm_mod.throwRangeError(arena, "Iterator.prototype." ++ name ++ ": limit must be a non-negative number");
+    }
+    return if (integer >= 9007199254740991.0) 9007199254740991 else @intFromFloat(integer);
 }
 
 fn nativeIterDrop(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {

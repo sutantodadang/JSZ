@@ -150,6 +150,10 @@ pub const Parser = struct {
     /// prepends the decls to the body. Cleared per extraction so nested arrows
     /// don't cross-contaminate.
     arrow_prelude: std.ArrayList(*Node),
+    /// Set by `extractArrowParams` when the cover list ends in a `...rest`
+    /// element, so the arrow builders can carry the rest binding onto the
+    /// `function_expr`. Reset at the start of each extraction.
+    arrow_rest_param: ?[]const u8 = null,
     /// Monotonic counter for synthetic destructuring-param names (`__param_N`).
     param_destruct_counter: u32,
     /// Var-decl / for-of-head pattern destructuring: when set, `desugarParamPattern`
