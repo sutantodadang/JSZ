@@ -521,6 +521,21 @@ fn closeIterator(arena: std.mem.Allocator, iter: Value) void {
     realm_mod.pending_exception = saved;
 }
 
+/// IteratorClose(iter, NormalCompletion) for the helper's own `.return()` method.
+/// GetMethod(iter, "return") observably (invokes a `return` getter and traverses
+/// the prototype chain via jsGet), and — unlike closeIterator's abrupt path —
+/// propagates any throw from the getter or the return() call to the caller.
+fn iteratorCloseThrowing(arena: std.mem.Allocator, iter: Value) anyerror!void {
+    if (iter.bits == 0 or iter.unbox() != .object) return;
+    const ret_fn = try jsGet(arena, iter, "return");
+    if (ret_fn.bits == 0 or ret_fn.unbox() == .undefined_ or ret_fn.unbox() == .null_) return;
+    if (!isCallable(ret_fn)) {
+        try setTypeError(arena, "iterator return is not callable");
+        unreachable;
+    }
+    _ = try function_proto.invokeCallback(arena, iter, ret_fn, &[_]Value{});
+}
+
 /// JS [[Get]] (runs accessors, proxy traps, traverses the prototype chain),
 /// falling back to the internal own-property get if there is no active context.
 fn jsGet(arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!Value {
@@ -2677,11 +2692,13 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
         },
 
         .take => {
+            // Spec §27.1.4.10: when remaining reaches 0 the *next* call returns
+            // ? IteratorClose(iterated, NormalCompletion) — the return() throw
+            // must surface on that call, so close lazily here (not eagerly after
+            // the final yield) and propagate any throw.
             if (d.limit <= 0) {
-                if (!d.done) {
-                    d.done = true;
-                    closeIterator(arena, d.source);
-                }
+                d.done = true;
+                try iteratorCloseThrowing(arena, d.source);
                 return makeIteratorResult(arena, undef, true);
             }
             const step = iterStep(arena, d.source, d.next_fn) catch |e| {
@@ -2693,10 +2710,6 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
                 return makeIteratorResult(arena, undef, true);
             };
             d.limit -= 1;
-            if (d.limit <= 0) {
-                d.done = true;
-                closeIterator(arena, d.source);
-            }
             return makeIteratorResult(arena, value, false);
         },
 
@@ -2760,14 +2773,20 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
                     d.done = true;
                     return e;
                 };
-                // GetIterator on the sub-iterable.
-                const inner_iter = nativeGetIterator(arena, Value{ .bits = 0 }, &[_]Value{sub_iterable}) catch |e| {
+                // GetIteratorFlattenable(sub, reject-primitives): a primitive
+                // mapper result (number/string/etc) throws TypeError even if its
+                // wrapper prototype defines @@iterator; only objects are flattened.
+                const inner_iter = getIterFlattenable(arena, sub_iterable) catch |e| {
                     closeIterator(arena, d.source);
                     d.done = true;
                     return e;
                 };
-                if (inner_iter.bits == 0 or inner_iter.unbox() != .object) continue;
-                const inner_next = inner_iter.toPtr().object.get("next") orelse continue;
+                // GetIteratorDirect: read `next` observably (may be an accessor).
+                const inner_next = jsGet(arena, inner_iter, "next") catch |e| {
+                    closeIterator(arena, d.source);
+                    d.done = true;
+                    return e;
+                };
                 d.inner_iter = inner_iter;
                 d.inner_next_fn = inner_next;
                 // Loop back to drain the new inner iterator.
@@ -3013,9 +3032,30 @@ fn nativeIterHelperReturn(arena: std.mem.Allocator, this_val: Value, _: []const 
                     d.done = true;
                     zipCloseIterators(arena, d, null, true, false) catch {};
                 }
+            } else if (d.kind == .flatMap) {
+                // flatMap: close the active inner (mapper-result) iterator first,
+                // then the source. Both closes propagate (yield* forwards return
+                // to the inner iterator, then the outer for-of closes the source).
+                if (!d.done) {
+                    d.done = true;
+                    if (d.running) {
+                        try setTypeError(arena, "Iterator helper is already running");
+                        unreachable;
+                    }
+                    d.running = true;
+                    defer d.running = false;
+                    if (d.inner_iter.bits != 0) {
+                        const inner = d.inner_iter;
+                        d.inner_iter = Value{ .bits = 0 };
+                        try iteratorCloseThrowing(arena, inner);
+                    }
+                    try iteratorCloseThrowing(arena, d.source);
+                }
             } else if (!d.done) {
+                // map / filter / take / drop: IteratorClose(source) with throw
+                // propagation (get-return-method-throws / return-method-throws).
                 d.done = true;
-                closeIterator(arena, d.source);
+                try iteratorCloseThrowing(arena, d.source);
             }
         }
     }
@@ -3407,12 +3447,14 @@ fn getIteratorSpec(arena: std.mem.Allocator, v: Value) anyerror!Value {
     return it;
 }
 
-/// GetIteratorFlattenable(obj, reject-strings): open an iterator for a sub-iterable.
-/// Prefers the object's @@iterator method; if absent, the object is its own
-/// iterator. Strings and non-objects throw a TypeError.
+/// GetIteratorFlattenable(obj, reject-primitives): open an iterator for a
+/// sub-iterable (shared by Iterator.zip/zipKeyed and Iterator.prototype.flatMap).
+/// GetMethod(obj, @@iterator): if undefined/null the object is its own iterator
+/// (fallback `obj.next`); if present-but-not-callable, throw. All non-objects
+/// (including strings and other primitives) throw a TypeError.
 fn getIterFlattenable(arena: std.mem.Allocator, obj_val: Value) anyerror!Value {
     if (obj_val.bits == 0 or obj_val.unbox() != .object) {
-        realm_mod.pending_exception = try makeTypeErrorVal(arena, "Iterator.zip: iterable is not an object");
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "flatMap/zip: value is not an object");
         return error.JsException;
     }
     var iterator = obj_val;
@@ -3429,7 +3471,7 @@ fn getIterFlattenable(arena: std.mem.Allocator, obj_val: Value) anyerror!Value {
         }
     }
     if (iterator.bits == 0 or iterator.unbox() != .object) {
-        realm_mod.pending_exception = try makeTypeErrorVal(arena, "Iterator.zip: [Symbol.iterator]() returned a non-object");
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "[Symbol.iterator]() returned a non-object");
         return error.JsException;
     }
     return iterator;
