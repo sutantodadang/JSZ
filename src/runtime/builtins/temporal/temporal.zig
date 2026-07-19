@@ -15,6 +15,8 @@ const duration = @import("duration.zig");
 const plain_date = @import("plain_date.zig");
 const plain_time = @import("plain_time.zig");
 const plain_date_time = @import("plain_date_time.zig");
+const zoned_date_time = @import("zoned_date_time.zig");
+const now = @import("now.zig");
 
 var temporal_obj: ?*JsObject = null;
 
@@ -26,6 +28,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try plain_date.register(ctx);
     try plain_time.register(ctx);
     try plain_date_time.register(ctx);
+    try zoned_date_time.register(ctx);
 
     const temporal = try JsObject.create(arena, ctx.object_proto);
     temporal_obj = temporal;
@@ -35,6 +38,11 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try installCtor(arena, temporal, "PlainDate", plain_date.ctor_obj);
     try installCtor(arena, temporal, "PlainTime", plain_time.ctor_obj);
     try installCtor(arena, temporal, "PlainDateTime", plain_date_time.ctor_obj);
+    try installCtor(arena, temporal, "ZonedDateTime", zoned_date_time.ctor_obj);
+
+    // Temporal.Now namespace (not a constructor).
+    const now_ns = try now.create(ctx);
+    _ = try temporal.defineOwnData("Now", try val_mod.makeObject(arena, now_ns), .{ .writable = true, .enumerable = false, .configurable = true });
 
     try ctx.defineGlobal("Temporal", temporal);
 }
@@ -56,4 +64,6 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
     try plain_date.registerToStringTag(arena, tag);
     try plain_time.registerToStringTag(arena, tag);
     try plain_date_time.registerToStringTag(arena, tag);
+    try zoned_date_time.registerToStringTag(arena, tag);
+    try now.registerToStringTag(arena, tag);
 }

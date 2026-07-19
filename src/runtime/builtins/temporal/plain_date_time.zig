@@ -494,6 +494,28 @@ pub fn nativeToPlainDate(arena: std.mem.Allocator, this_val: Value, _: []const V
     return plain_date.makeDate(arena, dt.date);
 }
 
+pub fn nativeToZonedDateTime(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const dt = try requireDT(arena, this_val);
+    const timezone = @import("timezone.zig");
+    const zoned = @import("zoned_date_time.zig");
+    const v = if (args.len > 0) args[0] else Value{};
+    if (v.bits == 0 or v.unbox() != .string) return realm_mod.throwTypeError(arena, "time zone must be a string");
+    const zone = try timezone.toZone(arena, v.unbox().string);
+    // disambiguation option is validated but irrelevant for fixed-offset zones.
+    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
+    _ = try getDisambiguation(arena, opts);
+    const wall = @as(i128, shared.isoDateToEpochDays(dt.date.year, dt.date.month, dt.date.day)) * shared.NS_PER_DAY +
+        shared.timeToNanos(dt.time);
+    return zoned.makeZoned(arena, .{ .ns = wall - zone.offset_ns, .tz = zone.id, .offset_ns = zone.offset_ns });
+}
+
+fn getDisambiguation(arena: std.mem.Allocator, opts: ?*JsObject) !void {
+    const s = (try shared.readStringOption(arena, opts, "disambiguation")) orelse return;
+    if (std.mem.eql(u8, s, "compatible") or std.mem.eql(u8, s, "earlier") or
+        std.mem.eql(u8, s, "later") or std.mem.eql(u8, s, "reject")) return;
+    return realm_mod.throwRangeError(arena, "invalid disambiguation");
+}
+
 pub fn nativeToPlainTime(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
     return plain_time.makeTime(arena, dt.time);
@@ -638,6 +660,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.setMethod(arena, proto, "equals", nativeEquals);
     try intrinsics.setMethod(arena, proto, "toPlainDate", nativeToPlainDate);
     try intrinsics.setMethod(arena, proto, "toPlainTime", nativeToPlainTime);
+    try intrinsics.setMethod(arena, proto, "toZonedDateTime", nativeToZonedDateTime);
     try intrinsics.setMethod(arena, proto, "toString", nativeToString);
     try intrinsics.setMethod(arena, proto, "toJSON", nativeToJSON);
     try intrinsics.setMethod(arena, proto, "toLocaleString", nativeToLocaleString);

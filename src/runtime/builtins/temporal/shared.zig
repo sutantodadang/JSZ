@@ -434,16 +434,26 @@ fn skipOffset(p: *Parser) void {
                 return;
             };
             _ = h;
-            _ = p.eat(':');
-            _ = p.digitsN(2);
-            // optional :SS.fraction
-            if (p.eat(':')) {
+            // Minutes: "±HH", "±HH:MM" and compact "±HHMM" are all valid, as is
+            // a further "±HH:MM:SS(.fff)" / "±HHMMSS(.fff)". Consume greedily.
+            const had_colon = p.eat(':');
+            if (isDigit(p.peek())) {
                 _ = p.digitsN(2);
-                var t = ISOTime{};
-                parseFraction(p, &t) catch {};
+                // Seconds (with matching separator style).
+                const sep = if (had_colon) p.eat(':') else !had_colon;
+                if (sep and isDigit(p.peek())) {
+                    _ = p.digitsN(2);
+                    var t = ISOTime{};
+                    parseFraction(p, &t) catch {};
+                }
             }
         }
     }
+}
+
+fn isDigit(c: ?u8) bool {
+    const ch = c orelse return false;
+    return ch >= '0' and ch <= '9';
 }
 
 fn skipAnnotations(p: *Parser) void {
@@ -771,12 +781,17 @@ pub fn unitLengthNanos(u: Unit) ?i128 {
 // -------------------------------------------------------------- option reading ---
 
 /// Resolve the options argument: undefined -> null (empty), object -> itself,
-/// anything else -> TypeError.
+/// anything else -> TypeError. Per GetOptionsObject, *any* Object is accepted —
+/// including callables (functions), which carry no option properties here and so
+/// resolve to an empty options set.
 pub fn getOptionsObject(arena: std.mem.Allocator, v: ?Value) !?*JsObject {
     const val = v orelse return null;
     if (val.bits == 0 or val.unbox() == .undefined_) return null;
-    if (val.unbox() != .object) return realm_mod.throwTypeError(arena, "options must be an object or undefined");
-    return val.toPtr().object;
+    switch (val.unbox()) {
+        .object => return val.toPtr().object,
+        .function, .bc_function, .native_function => return null,
+        else => return realm_mod.throwTypeError(arena, "options must be an object or undefined"),
+    }
 }
 
 /// Coerce a Value to a string (ES ToString), returning an arena slice.
