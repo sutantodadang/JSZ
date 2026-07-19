@@ -1067,18 +1067,28 @@ pub const FnCompiler = struct {
             .identifier => try self.emitStore(target.data.identifier, rsrc, line),
             .member_expr => try self.compileMemberWrite(target.data.member_expr, rsrc, line),
             .assignment_expr => {
-                // `pattern = default`: substitute `default` when `rsrc` is nullish.
+                // `pattern = default`: substitute `default` only when `rsrc` is
+                // `undefined` (a destructuring default does NOT apply to null).
                 const ae = target.data.assignment_expr;
                 if (ae.op != .assign) return; // only plain `=` is a valid default
                 const rt = self.allocReg();
                 try self.emitOp(.MOVE, line);
                 try self.emitU8(rt);
                 try self.emitU8(rsrc);
-                // Skip the default-load when `rt` is not nullish.
-                try self.emitOp(.JMP_IF_NOT_NULLISH, line);
+                // Compute `rt === undefined` and skip the default-load when false.
+                const rundef = self.allocReg();
+                try self.emitOp(.LOAD_UNDEF, line);
+                try self.emitU8(rundef);
+                const rcond = self.allocReg();
+                try self.emitOp(.SEQ, line);
+                try self.emitU8(rcond);
                 try self.emitU8(rt);
+                try self.emitU8(rundef);
+                try self.emitOp(.JMP_IF_FALSE, line);
+                try self.emitU8(rcond);
                 const patch = self.currentOffset();
                 try self.emitI16(0);
+                self.sp = rt + 1; // free rundef/rcond (already consumed) before default expr
                 // NamedEvaluation: `[a = function(){}] = rhs` names the anonymous
                 // default "a" (only when the target is a plain identifier).
                 if (ae.target.kind == .identifier and ae.value.kind == .function_expr)

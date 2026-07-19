@@ -8705,7 +8705,6 @@ language/expressions/assignment/destructuring/iterator-destructuring-property-re
 language/expressions/assignment/destructuring/keyed-destructuring-property-reference-target-evaluation-order-with-bindings.js
 language/expressions/assignment/destructuring/keyed-destructuring-property-reference-target-evaluation-order.js
 language/expressions/assignment/destructuring/target-assign-throws-iterator-return-get-throws.js
-language/expressions/assignment/dstr/array-elem-init-assignment.js
 language/expressions/assignment/dstr/array-elem-init-fn-name-class.js
 language/expressions/assignment/dstr/array-elem-iter-get-err.js
 language/expressions/assignment/dstr/array-elem-iter-nrml-close-err.js
@@ -8772,9 +8771,7 @@ language/expressions/assignment/dstr/array-rest-lref-err.js
 language/expressions/assignment/dstr/array-rest-lref.js
 language/expressions/assignment/dstr/array-rest-nested-array-iter-thrw-close-skip.js
 language/expressions/assignment/dstr/array-rest-put-prop-ref-user-err-iter-close-skip.js
-language/expressions/assignment/dstr/obj-id-init-assignment-null.js
 language/expressions/assignment/dstr/obj-id-init-fn-name-class.js
-language/expressions/assignment/dstr/obj-prop-elem-init-assignment-null.js
 language/expressions/assignment/dstr/obj-prop-elem-init-fn-name-class.js
 language/expressions/assignment/dstr/obj-rest-computed-property-no-strict.js
 language/expressions/assignment/dstr/obj-rest-computed-property.js
@@ -10989,7 +10986,6 @@ language/statements/for-of/body-dstr-assign-error.js
 language/statements/for-of/body-put-error.js
 language/statements/for-of/cptn-decl-abrupt-empty.js
 language/statements/for-of/cptn-expr-abrupt-empty.js
-language/statements/for-of/dstr/array-elem-init-assignment.js
 language/statements/for-of/dstr/array-elem-init-fn-name-class.js
 language/statements/for-of/dstr/array-elem-iter-get-err.js
 language/statements/for-of/dstr/array-elem-iter-nrml-close-err.js
@@ -11062,9 +11058,7 @@ language/statements/for-of/dstr/const-obj-ptrn-rest-getter.js
 language/statements/for-of/dstr/let-ary-ptrn-elem-id-init-fn-name-class.js
 language/statements/for-of/dstr/let-obj-ptrn-id-init-fn-name-class.js
 language/statements/for-of/dstr/let-obj-ptrn-rest-getter.js
-language/statements/for-of/dstr/obj-id-init-assignment-null.js
 language/statements/for-of/dstr/obj-id-init-fn-name-class.js
-language/statements/for-of/dstr/obj-prop-elem-init-assignment-null.js
 language/statements/for-of/dstr/obj-prop-elem-init-fn-name-class.js
 language/statements/for-of/dstr/obj-rest-computed-property-no-strict.js
 language/statements/for-of/dstr/obj-rest-computed-property.js
