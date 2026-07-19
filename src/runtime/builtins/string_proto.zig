@@ -1454,31 +1454,65 @@ pub fn nativeLocaleCompare(arena: std.mem.Allocator, this_val: Value, args: []co
 // ES2024 well-formed
 // ---------------------------------------------------------------------------
 
-/// String.prototype.isWellFormed() — true iff no lone surrogates in WTF-8.
+/// String.prototype.isWellFormed() — true iff no *lone* surrogates. A high (lead)
+/// surrogate immediately followed by a low (trail) surrogate forms a valid UTF-16
+/// pair even when the two are stored as separate 3-byte WTF-8 code units (e.g. the
+/// string built from `'\uD83D' + '\uDCA9'`), so only unpaired surrogates count.
 pub fn nativeIsWellFormed(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
     var i: usize = 0;
     while (i < s.len) {
         const dec = decodeWtf8At(s, i);
-        if (dec.cp >= 0xD800 and dec.cp <= 0xDFFF) return val_mod.makeBool(arena, false);
+        if (dec.cp >= 0xD800 and dec.cp <= 0xDBFF) {
+            // High surrogate — well-formed only when paired with a trailing low.
+            const next = i + dec.len;
+            if (next < s.len) {
+                const dec2 = decodeWtf8At(s, next);
+                if (dec2.cp >= 0xDC00 and dec2.cp <= 0xDFFF) {
+                    i = next + dec2.len;
+                    continue;
+                }
+            }
+            return val_mod.makeBool(arena, false);
+        }
+        if (dec.cp >= 0xDC00 and dec.cp <= 0xDFFF) return val_mod.makeBool(arena, false);
         i += dec.len;
     }
     return val_mod.makeBool(arena, true);
 }
 
-/// String.prototype.toWellFormed() — replace lone surrogates with U+FFFD.
+/// String.prototype.toWellFormed() — replace *lone* surrogates with U+FFFD, but
+/// leave a valid lead+trail pair (even one stored as two 3-byte WTF-8 units)
+/// untouched.
 pub fn nativeToWellFormed(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
     var buf = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < s.len) {
         const dec = decodeWtf8At(s, i);
-        if (dec.cp >= 0xD800 and dec.cp <= 0xDFFF) {
-            // U+FFFD encoded as EF BF BD in UTF-8/WTF-8
+        if (dec.cp >= 0xD800 and dec.cp <= 0xDBFF) {
+            const next = i + dec.len;
+            if (next < s.len) {
+                const dec2 = decodeWtf8At(s, next);
+                if (dec2.cp >= 0xDC00 and dec2.cp <= 0xDFFF) {
+                    // Valid surrogate pair — keep both code units verbatim.
+                    try buf.appendSlice(arena, s[i .. next + dec2.len]);
+                    i = next + dec2.len;
+                    continue;
+                }
+            }
+            // Lone high surrogate → U+FFFD (EF BF BD).
             try buf.appendSlice(arena, &[_]u8{ 0xEF, 0xBF, 0xBD });
-        } else {
-            try buf.appendSlice(arena, s[i .. i + dec.len]);
+            i += dec.len;
+            continue;
         }
+        if (dec.cp >= 0xDC00 and dec.cp <= 0xDFFF) {
+            // Lone low surrogate → U+FFFD.
+            try buf.appendSlice(arena, &[_]u8{ 0xEF, 0xBF, 0xBD });
+            i += dec.len;
+            continue;
+        }
+        try buf.appendSlice(arena, s[i .. i + dec.len]);
         i += dec.len;
     }
     return val_mod.makeString(arena, try arena.dupe(u8, buf.items));

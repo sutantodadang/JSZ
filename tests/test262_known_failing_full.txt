@@ -2819,7 +2819,6 @@ built-ins/String/prototype/endsWith/return-abrupt-from-searchstring-regexp-test.
 built-ins/String/prototype/includes/return-abrupt-from-searchstring-regexp-test.js
 built-ins/String/prototype/indexOf/position-tointeger-toprimitive.js
 built-ins/String/prototype/indexOf/searchstring-tostring-toprimitive.js
-built-ins/String/prototype/isWellFormed/returns-boolean.js
 built-ins/String/prototype/localeCompare/15.5.4.9_CE.js
 built-ins/String/prototype/localeCompare/S15.5.4.9_A1_T1.js
 built-ins/String/prototype/match/cstm-matcher-get-err.js
@@ -2860,7 +2859,6 @@ built-ins/String/prototype/toLowerCase/this-value-tostring-throws-toprimitive.js
 built-ins/String/prototype/toString/non-generic-realm.js
 built-ins/String/prototype/toUpperCase/special_casing.js
 built-ins/String/prototype/toUpperCase/supplementary_plane.js
-built-ins/String/prototype/toWellFormed/returns-well-formed-string.js
 built-ins/String/prototype/trim/15.5.4.20-2-51.js
 built-ins/String/prototype/trimEnd/this-value-object-cannot-convert-to-primitive-err.js
 built-ins/String/prototype/trimEnd/this-value-object-toprimitive-call-err.js
