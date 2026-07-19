@@ -52,6 +52,30 @@ fn installCtor(arena: std.mem.Allocator, ns: *JsObject, name: []const u8, ctor: 
     _ = try ns.defineOwnData(name, try val_mod.makeObject(arena, c), .{ .writable = true, .enumerable = false, .configurable = true });
 }
 
+/// After the GC migrates %Object.prototype% from the arena to the heap
+/// (Realm.activateHeap), the generic reparenting pass only walks *global*
+/// bindings. The Temporal per-type prototypes (Instant.prototype, …) and the
+/// nested `Temporal.Now` namespace are reachable only as properties, so they are
+/// missed and keep pointing at the stale arena %Object.prototype%. Reparent them
+/// here so identity checks like `Object.getPrototypeOf(Temporal.Now) ===
+/// Object.prototype` hold.
+pub fn reparentObjectProto(old_proto: *JsObject, new_proto: *JsObject) void {
+    const protos = [_]?*JsObject{
+        instant.proto_obj,
+        duration.proto_obj,
+        plain_date.proto_obj,
+        plain_time.proto_obj,
+        plain_date_time.proto_obj,
+        zoned_date_time.proto_obj,
+    };
+    for (protos) |maybe| {
+        if (maybe) |o| {
+            if (o.proto == old_proto) o.proto = new_proto;
+        }
+    }
+    now.reparentObjectProto(old_proto, new_proto);
+}
+
 /// Wire @@toStringTag on the namespace and each prototype (run once the
 /// well-known symbols exist).
 pub fn registerSymbols(arena: std.mem.Allocator) !void {

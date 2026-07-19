@@ -4803,6 +4803,13 @@ pub const Realm = struct {
             }
         }
 
+        // Nested namespace objects and per-type prototypes that are reachable
+        // only as properties (not global bindings) are missed by the pass above.
+        // Temporal.{Instant,Duration,…}.prototype and Temporal.Now fall in this
+        // bucket; reparent them explicitly so their [[Prototype]] resolves to the
+        // heap %Object.prototype%.
+        temporal_mod.reparentObjectProto(old_object_proto, hp_proto);
+
         // Phase 4b: update thread-locals to point to heap-migrated protos.
         active_array_proto = hp_array_proto;
         active_object_proto = hp_proto;

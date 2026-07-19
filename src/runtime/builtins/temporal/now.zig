@@ -84,6 +84,14 @@ pub fn create(ctx: *const intrinsics.Ctx) !*JsObject {
     return now;
 }
 
+/// Reparent the `Temporal.Now` namespace object after the GC migrates
+/// %Object.prototype% to the heap (see temporal.reparentObjectProto).
+pub fn reparentObjectProto(old_proto: *JsObject, new_proto: *JsObject) void {
+    if (now_obj) |o| {
+        if (o.proto == old_proto) o.proto = new_proto;
+    }
+}
+
 pub fn registerToStringTag(arena: std.mem.Allocator, tag_sym: Value) !void {
     const now = now_obj orelse return;
     try now.setSymAttr(tag_sym, try val_mod.makeString(arena, "Temporal.Now"), .{ .writable = false, .enumerable = false, .configurable = true });
