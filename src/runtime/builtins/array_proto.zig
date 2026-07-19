@@ -1124,16 +1124,17 @@ fn arraySpeciesCreate(arena: std.mem.Allocator, original: Value, length: usize) 
 pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireCoercible(arena, this_val);
     const len = try genLength(arena, this_val);
-    if (args.len < 2) return throwTypeError(arena, "Array.prototype.with requires an index and a value argument");
-    const value = args[1];
-    const idx_raw = toNumArg(args[0]);
-    const len_i: i64 = @intCast(len);
-    const k_signed: i64 = if (std.math.isNan(idx_raw)) len_i + 1 else val_mod.f64ToI64Sat(idx_raw);
-    const k: usize = if (k_signed < 0) blk: {
-        const r = len_i + k_signed;
-        break :blk if (r < 0) @intCast(len_i + 1) else @intCast(r);
-    } else @intCast(k_signed);
-    if (k >= len) return throwRangeError(arena, "Invalid index");
+    const index_arg = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const value = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    // ToIntegerOrInfinity(index): coerces strings/objects (calling valueOf and
+    // propagating any thrown completion) and maps NaN → 0.
+    const rel = try genInteger(arena, index_arg);
+    const flen: f64 = @floatFromInt(len);
+    const actual: f64 = if (rel >= 0) rel else flen + rel;
+    if (actual >= flen or actual < 0) return throwRangeError(arena, "Invalid index");
+    const k: usize = @intFromFloat(actual);
+    // ArrayCreate(len) throws RangeError when len > 2**32 - 1, before any element read.
+    if (len > 0xFFFFFFFF) return throwRangeError(arena, "Invalid array length");
     const new_arr = try newResultArray(arena);
     const arr_val = try val_mod.makeObject(arena, new_arr);
     var i: usize = 0;
@@ -1148,6 +1149,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
 pub fn nativeToReversed(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     try requireCoercible(arena, this_val);
     const len = try genLength(arena, this_val);
+    // ArrayCreate(len) throws RangeError when len > 2**32 - 1, before any element read.
+    if (len > 0xFFFFFFFF) return throwRangeError(arena, "Invalid array length");
     const new_arr = try newResultArray(arena);
     const arr_val = try val_mod.makeObject(arena, new_arr);
     var i: usize = 0;
@@ -1162,6 +1165,8 @@ pub fn nativeToSorted(arena: std.mem.Allocator, this_val: Value, args: []const V
     try requireCoercible(arena, this_val);
     if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_) try requireCallable(arena, args[0]);
     const len = try genLength(arena, this_val);
+    // ArrayCreate(len) throws RangeError when len > 2**32 - 1, before any element read.
+    if (len > 0xFFFFFFFF) return throwRangeError(arena, "Invalid array length");
     const new_arr = try newResultArray(arena);
     const arr_val = try val_mod.makeObject(arena, new_arr);
     var elems = try arena.alloc(Value, len);
@@ -1173,34 +1178,9 @@ pub fn nativeToSorted(arena: std.mem.Allocator, this_val: Value, args: []const V
         break :blk v;
     } else null;
 
-    var i: usize = 1;
-    while (i < len) : (i += 1) {
-        const cur = elems[i];
-        var j: usize = i;
-        while (j > 0) {
-            const prev = elems[j - 1];
-            const should_swap = blk: {
-                if (cmp_fn) |cfn| {
-                    const fpm = @import("../builtins/function_proto.zig");
-                    const cmp_args = [_]Value{ prev, cur };
-                    const cmp_res = fpm.invokeCallback(arena, try val_mod.makeUndefined(arena), cfn, &cmp_args) catch break :blk false;
-                    const n = switch (cmp_res.unbox()) {
-                        .number => |x| x,
-                        else => 0.0,
-                    };
-                    break :blk n > 0.0;
-                } else {
-                    const sa = try elemToString(arena, prev);
-                    const sb = try elemToString(arena, cur);
-                    break :blk std.mem.order(u8, sa, sb) == .gt;
-                }
-            };
-            if (!should_swap) break;
-            elems[j] = elems[j - 1];
-            j -= 1;
-        }
-        elems[j] = cur;
-    }
+    // Stable sort with spec SortCompare (undefined sorts last; a throwing
+    // comparator or ToString propagates out of toSorted).
+    try sortValues(arena, elems, cmp_fn);
 
     for (0..len) |k| {
         try genSet(arena, arr_val, k, elems[k]);
@@ -1212,16 +1192,24 @@ pub fn nativeToSorted(arena: std.mem.Allocator, this_val: Value, args: []const V
 pub fn nativeToSpliced(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireCoercible(arena, this_val);
     const len = try genLength(arena, this_val);
-    const start0 = if (args.len > 0) relIndex(toNumArg(args[0]), len) else 0;
-    const del_count: usize = if (args.len > 1) blk: {
-        const n = toNumArg(args[1]);
-        if (std.math.isNan(n)) break :blk 0;
-        const ni = val_mod.f64ToI64Sat(n);
-        if (ni < 0) break :blk 0;
-        break :blk @min(@as(usize, @intCast(ni)), len - start0);
-    } else len - start0;
+    const start0 = if (args.len > 0) genRelClamp(try genInteger(arena, args[0]), len) else 0;
+    // Spec §23.1.3.35: start absent → delete 0 (full copy); deleteCount absent
+    // (but start present) → delete to end; otherwise clamp deleteCount to [0, len-start].
+    const del_count: usize = if (args.len == 0)
+        0
+    else if (args.len == 1)
+        len - start0
+    else blk: {
+        const n = try genInteger(arena, args[1]);
+        if (n <= 0) break :blk 0;
+        break :blk @min(@as(usize, @intFromFloat(@min(n, @as(f64, @floatFromInt(len))))), len - start0);
+    };
     const items = if (args.len > 2) args[2..] else &[_]Value{};
     const new_len = len - del_count + items.len;
+    // §23.1.3.35 step 12: newLen > 2**53 - 1 is a TypeError (checked before
+    // ArrayCreate, which then throws RangeError for newLen > 2**32 - 1).
+    if (new_len > 9007199254740991) return throwTypeError(arena, "Invalid array length");
+    if (new_len > 0xFFFFFFFF) return throwRangeError(arena, "Invalid array length");
     const new_arr = try newResultArray(arena);
     const arr_val = try val_mod.makeObject(arena, new_arr);
     var j: usize = 0;

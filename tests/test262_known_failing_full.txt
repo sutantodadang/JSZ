@@ -652,15 +652,6 @@ built-ins/Array/prototype/splice/property-traps-order-with-species.js
 built-ins/Array/prototype/splice/target-array-non-extensible.js
 built-ins/Array/prototype/splice/target-array-with-non-configurable-property.js
 built-ins/Array/prototype/splice/target-array-with-non-writable-property.js
-built-ins/Array/prototype/toReversed/length-exceeding-array-length-limit.js
-built-ins/Array/prototype/toSorted/comparefn-called-after-get-elements.js
-built-ins/Array/prototype/toSorted/comparefn-stop-after-error.js
-built-ins/Array/prototype/toSorted/holes-not-preserved.js
-built-ins/Array/prototype/toSorted/length-decreased-while-iterating.js
-built-ins/Array/prototype/toSorted/length-exceeding-array-length-limit.js
-built-ins/Array/prototype/toSpliced/frozen-this-value.js
-built-ins/Array/prototype/toSpliced/length-exceeding-array-length-limit.js
-built-ins/Array/prototype/toSpliced/start-and-deleteCount-missing.js
 built-ins/Array/prototype/toString/call-with-boolean.js
 built-ins/Array/prototype/toString/non-callable-join-string-tag.js
 built-ins/Array/prototype/unshift/read-only-property.js
@@ -673,8 +664,6 @@ built-ins/Array/prototype/values/resizable-buffer-grow-mid-iteration.js
 built-ins/Array/prototype/values/resizable-buffer-shrink-mid-iteration.js
 built-ins/Array/prototype/values/resizable-buffer.js
 built-ins/Array/prototype/values/this-val-non-obj-coercible.js
-built-ins/Array/prototype/with/index-casted-to-number.js
-built-ins/Array/prototype/with/index-throw-completion.js
 built-ins/ArrayIteratorPrototype/next/non-own-slots.js
 built-ins/AsyncDisposableStack/constructor.js
 built-ins/AsyncDisposableStack/instance-extensible.js
