@@ -230,6 +230,16 @@ fn hasCalendarUnits(d: DurationFields) bool {
     return d.years != 0 or d.months != 0 or d.weeks != 0;
 }
 
+/// Whether a (possibly absent) unit is a calendar unit — year/month/week —
+/// which cannot be rounded without a relativeTo reference. `day` is a time-ish
+/// unit here (it balances with hours/etc.) and is allowed without relativeTo.
+fn isCalendarUnit(u: ?shared.Unit) bool {
+    return if (u) |uu| switch (uu) {
+        .year, .month, .week => true,
+        else => false,
+    } else false;
+}
+
 // ------------------------------------------------------------- prototype methods ---
 
 pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -406,7 +416,19 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const mode = try shared.getRoundingMode(arena, opts, .half_expand);
     const inc = try shared.getRoundingIncrement(arena, opts);
     if (smallest == null and largest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit or largestUnit");
+    // Calendar units in the receiver need a relativeTo reference to round; we do
+    // not support relativeTo rounding, so this is always a RangeError (which is
+    // also what the various invalid-relativeTo tests expect).
     if (hasCalendarUnits(d.*)) return realm_mod.throwRangeError(arena, "Duration.round with calendar units requires relativeTo");
+    // A calendar largestUnit/smallestUnit (year/month/week) also needs a
+    // relativeTo; without one it is a RangeError even for a purely time-based
+    // duration (e.g. `{days:400}.round({largestUnit:'years'})`).
+    const has_relative = if (opts) |o| blk: {
+        const rv = o.get("relativeTo") orelse break :blk false;
+        break :blk !(rv.bits == 0 or rv.isUndefined() or rv.isNull());
+    } else false;
+    if (!has_relative and (isCalendarUnit(smallest) or isCalendarUnit(largest)))
+        return realm_mod.throwRangeError(arena, "Duration.round to calendar units requires relativeTo");
 
     const small = smallest orelse shared.Unit.nanosecond;
     // Default largestUnit = the larger of the natural largest non-zero unit and
