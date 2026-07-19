@@ -70,11 +70,38 @@ pub fn isValidDuration(d: DurationFields) bool {
             }
         }
     }
-    // Range: years..days below 2^32 not strictly required; the normative check is
-    // that the total in seconds is below 2^53. Approximate with individual caps.
-    for (fields) |f| {
-        if (@abs(f) >= 9.007199254740992e15) return false;
-    }
+    // IsValidDuration (Temporal): years/months/weeks each below 2^32, and the
+    // combined time portion (days..nanoseconds, as seconds) below 2^53.
+    const two_pow_32: f64 = 4294967296.0; // 2^32
+    if (@abs(d.years) >= two_pow_32) return false;
+    if (@abs(d.months) >= two_pow_32) return false;
+    if (@abs(d.weeks) >= two_pow_32) return false;
+
+    // The normative comparison is against exact mathematical reals. A coarse f64
+    // estimate decides everything except a narrow band around 2^53, where f64
+    // rounding (products exceed the 53-bit mantissa) is not trustworthy; there we
+    // recompute the exact nanosecond total in i128 and compare against 2^53·10^9.
+    const two_53: f64 = 9007199254740992.0;
+    const normf = d.days * 86400.0 + d.hours * 3600.0 + d.minutes * 60.0 +
+        d.seconds + d.milliseconds * 1e-3 + d.microseconds * 1e-6 + d.nanoseconds * 1e-9;
+    const absn = @abs(normf);
+    if (absn < two_53 - 1024.0) return true;
+    if (absn > two_53 + 1024.0) return false;
+    // Near the boundary every field is bounded (contribution ≤ ~2^53 s), so the
+    // i128 products below cannot overflow.
+    const ns_per_day: i128 = 86_400_000_000_000;
+    const ns_per_hour: i128 = 3_600_000_000_000;
+    const ns_per_min: i128 = 60_000_000_000;
+    const total_ns: i128 =
+        @as(i128, @intFromFloat(@abs(d.days))) * ns_per_day +
+        @as(i128, @intFromFloat(@abs(d.hours))) * ns_per_hour +
+        @as(i128, @intFromFloat(@abs(d.minutes))) * ns_per_min +
+        @as(i128, @intFromFloat(@abs(d.seconds))) * 1_000_000_000 +
+        @as(i128, @intFromFloat(@abs(d.milliseconds))) * 1_000_000 +
+        @as(i128, @intFromFloat(@abs(d.microseconds))) * 1_000 +
+        @as(i128, @intFromFloat(@abs(d.nanoseconds)));
+    const limit_ns: i128 = @as(i128, 9007199254740992) * 1_000_000_000; // 2^53 · 10^9
+    if (total_ns >= limit_ns) return false;
     return true;
 }
 
@@ -388,7 +415,60 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const inc_ns = (shared.unitLengthNanos(small) orelse return realm_mod.throwRangeError(arena, "calendar smallestUnit needs relativeTo")) * @as(i128, @intFromFloat(inc));
     const total = timeDurationNanos(d.*);
     const rounded = shared.roundI128ToIncrement(total, inc_ns, mode);
+    // Each balanced component must be a float64-representable integer; a huge
+    // component (e.g. balancing to nanoseconds) that loses precision is out of
+    // range (TemporalDurationFromInternal).
+    if (!balancedComponentsFitF64(rounded, large))
+        return realm_mod.throwRangeError(arena, "rounded Duration component is out of range");
     return makeDuration(arena, balanceTimeDuration(rounded, large));
+}
+
+/// Whether every component produced by balancing `total_ns` up to `largest` is a
+/// float64-representable integer (i.e. survives the i128→f64→i128 round trip).
+fn balancedComponentsFitF64(total_ns: i128, largest: shared.Unit) bool {
+    var rem: i128 = if (total_ns < 0) -total_ns else total_ns;
+    var comps = [_]i128{0} ** 7; // days, hours, minutes, seconds, ms, µs, ns
+    switch (largest) {
+        .year, .month, .week, .day => {
+            comps[0] = @divTrunc(rem, shared.NS_PER_DAY);
+            rem = @mod(rem, shared.NS_PER_DAY);
+            comps[1] = @divTrunc(rem, shared.NS_PER_HOUR);
+            rem = @mod(rem, shared.NS_PER_HOUR);
+            comps[2] = @divTrunc(rem, shared.NS_PER_MINUTE);
+            rem = @mod(rem, shared.NS_PER_MINUTE);
+            comps[3] = @divTrunc(rem, shared.NS_PER_SECOND);
+            rem = @mod(rem, shared.NS_PER_SECOND);
+        },
+        .hour => {
+            comps[1] = @divTrunc(rem, shared.NS_PER_HOUR);
+            rem = @mod(rem, shared.NS_PER_HOUR);
+            comps[2] = @divTrunc(rem, shared.NS_PER_MINUTE);
+            rem = @mod(rem, shared.NS_PER_MINUTE);
+            comps[3] = @divTrunc(rem, shared.NS_PER_SECOND);
+            rem = @mod(rem, shared.NS_PER_SECOND);
+        },
+        .minute => {
+            comps[2] = @divTrunc(rem, shared.NS_PER_MINUTE);
+            rem = @mod(rem, shared.NS_PER_MINUTE);
+            comps[3] = @divTrunc(rem, shared.NS_PER_SECOND);
+            rem = @mod(rem, shared.NS_PER_SECOND);
+        },
+        .second => {
+            comps[3] = @divTrunc(rem, shared.NS_PER_SECOND);
+            rem = @mod(rem, shared.NS_PER_SECOND);
+        },
+        else => {},
+    }
+    comps[4] = @divTrunc(rem, shared.NS_PER_MILLI);
+    rem = @mod(rem, shared.NS_PER_MILLI);
+    comps[5] = @divTrunc(rem, shared.NS_PER_MICRO);
+    rem = @mod(rem, shared.NS_PER_MICRO);
+    comps[6] = rem;
+    for (comps) |c| {
+        const f: f64 = @floatFromInt(c);
+        if (@as(i128, @intFromFloat(f)) != c) return false;
+    }
+    return true;
 }
 
 fn durUnitRank(u: shared.Unit) u8 {
@@ -447,10 +527,12 @@ pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value)
     return val_mod.makeString(arena, s);
 }
 
-pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const d = try requireDuration(arena, this_val);
-    const s = try durationToString(arena, d.*, null);
-    return val_mod.makeString(arena, s);
+pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    _ = try requireDuration(arena, this_val);
+    // Route through Intl.DurationFormat for locale-aware output (en-US default).
+    const intl = @import("../intl.zig");
+    const df = try intl.durationFormatFor(arena, args);
+    return intl.nativeDurationFormatFormat(arena, df, &.{this_val});
 }
 
 pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {

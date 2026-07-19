@@ -598,7 +598,6 @@ pub fn parseISODuration(s0: []const u8) ParseError!DurationFields {
                 has_frac = true;
             }
             const whole = std.fmt.parseFloat(f64, sliceInt(p.s, start)) catch return error.Invalid;
-            const num = whole + frac;
             const unit = p.peek() orelse return error.Invalid;
             p.i += 1;
             switch (unit) {
@@ -612,13 +611,14 @@ pub fn parseISODuration(s0: []const u8) ParseError!DurationFields {
                     if (has_frac) cascadeFraction(&out, 'M', frac);
                 },
                 'S', 's' => {
-                    // Fractional seconds -> ms/us/ns.
-                    const total_ns = num * 1e9;
-                    out.seconds = @trunc(num);
-                    const sub = total_ns - out.seconds * 1e9;
+                    // Keep whole seconds exact (they can reach 2^53-1, beyond f64's
+                    // integer precision once a fraction is added) and derive the
+                    // ms/µs/ns sub-fields from the fractional part alone.
+                    out.seconds = whole;
+                    const sub = @round(frac * 1e9); // sub-second nanoseconds, 0..10^9
                     out.milliseconds = @trunc(sub / 1e6);
                     out.microseconds = @trunc((sub - out.milliseconds * 1e6) / 1e3);
-                    out.nanoseconds = @round(sub - out.milliseconds * 1e6 - out.microseconds * 1e3);
+                    out.nanoseconds = sub - out.milliseconds * 1e6 - out.microseconds * 1e3;
                 },
                 else => return error.Invalid,
             }
