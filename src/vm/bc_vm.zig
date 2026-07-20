@@ -3998,6 +3998,10 @@ pub const BcVm = struct {
         if (realm_m.active_sym_async_iterator) |it_sym|
             try async_iter_proto.setSymAttr(it_sym,
                 try val_mod.makeNativeFunctionNamed(self.arena, nativeGenSelfIter, "[Symbol.asyncIterator]", 0), wec);
+        // %AsyncIteratorPrototype%[@@asyncDispose] (explicit resource management).
+        if (realm_m.active_sym_async_dispose) |disp_sym|
+            try async_iter_proto.setSymAttr(disp_sym,
+                try val_mod.makeNativeFunctionNamed(self.arena, @import("../runtime/builtins/promise.zig").nativeAsyncIteratorAsyncDispose, "[Symbol.asyncDispose]", 0), wec);
 
         // %AsyncGeneratorPrototype%: [[Prototype]] = %AsyncIteratorPrototype%
         const async_gen_proto = try JsObject.create(self.arena, async_iter_proto);

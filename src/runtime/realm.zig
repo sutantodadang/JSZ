@@ -1259,6 +1259,9 @@ pub var active_sym_has_instance: ?Value = null;
 pub var active_sym_is_concat_spreadable: ?Value = null;
 /// ES2023 Symbol.asyncIterator well-known symbol value.
 pub var active_sym_async_iterator: ?Value = null;
+/// Symbol.asyncDispose (explicit resource management); used by
+/// %AsyncIteratorPrototype%[@@asyncDispose].
+pub var active_sym_async_dispose: ?Value = null;
 /// Well-known RegExp-related symbols (@@match/@@replace/@@search/@@split/@@matchAll).
 pub var active_sym_match: ?Value = null;
 pub var active_sym_replace: ?Value = null;
@@ -3709,6 +3712,7 @@ pub const ThreadLocalSnapshot = struct {
     symbol_proto: ?*JsObject,
     sym_iterator: ?val_mod.Value,
     sym_async_iterator: ?val_mod.Value,
+    sym_async_dispose: ?val_mod.Value,
     sym_to_primitive: ?val_mod.Value,
     sym_to_string_tag: ?val_mod.Value,
     sym_species: ?val_mod.Value,
@@ -3755,6 +3759,7 @@ pub const ThreadLocalSnapshot = struct {
             .symbol_proto = active_symbol_proto,
             .sym_iterator = active_sym_iterator,
             .sym_async_iterator = active_sym_async_iterator,
+            .sym_async_dispose = active_sym_async_dispose,
             .sym_to_primitive = active_sym_to_primitive,
             .sym_to_string_tag = active_sym_to_string_tag,
             .sym_species = active_sym_species,
@@ -3802,6 +3807,7 @@ pub const ThreadLocalSnapshot = struct {
         active_symbol_proto = self.symbol_proto;
         active_sym_iterator = self.sym_iterator;
         active_sym_async_iterator = self.sym_async_iterator;
+        active_sym_async_dispose = self.sym_async_dispose;
         active_sym_to_primitive = self.sym_to_primitive;
         active_sym_to_string_tag = self.sym_to_string_tag;
         active_sym_species = self.sym_species;
@@ -4373,7 +4379,7 @@ pub const Realm = struct {
         try symbol_ctor.set("for", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolFor, "for", 0));
         try symbol_ctor.set("keyFor", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolKeyFor, "keyFor", 0));
         // Well-known symbols (identity constants; inert in S1).
-        const wk_names = [_][]const u8{ "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable", "match", "matchAll", "replace", "search", "split", "species", "toPrimitive", "toStringTag", "unscopables" };
+        const wk_names = [_][]const u8{ "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable", "match", "matchAll", "replace", "search", "split", "species", "toPrimitive", "toStringTag", "unscopables", "dispose", "asyncDispose" };
         for (wk_names) |name| {
             const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
             // Well-known symbols are non-writable, non-enumerable, non-configurable.
@@ -4399,8 +4405,9 @@ pub const Realm = struct {
             // and deletable, so it is a writable/configurable own property).
             try string_proto.setSymAttr(symv, try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeStringValues, "[Symbol.iterator]", 0), .{ .writable = true, .enumerable = false, .configurable = true });
         }
-        // Capture Symbol.asyncIterator.
+        // Capture Symbol.asyncIterator and Symbol.asyncDispose.
         active_sym_async_iterator = symbol_ctor.getOwn("asyncIterator");
+        active_sym_async_dispose = symbol_ctor.getOwn("asyncDispose");
         // Capture Symbol.toPrimitive and give Date the spec-correct hook so
         // `date + x` coerces to a string (default hint) rather than a number.
         active_sym_to_primitive = symbol_ctor.getOwn("toPrimitive");

@@ -381,10 +381,15 @@ pub const CompiledRegex = struct {
         sticky: bool = false,
         /// ES2015 `u` (unicode): full code-point semantics.
         unicode: bool = false,
-        /// ES2024 `v` (unicodeSets): extended character classes. Not yet parsed
-        /// (the ClassSetExpression grammar is unimplemented); tracked so the
-        /// `unicodeSets` getter reports correctly once `v` is accepted.
+        /// ES2024 `v` (unicodeSets): extended character classes plus set
+        /// operations. Implies full code-point matching semantics like `u`.
         unicode_sets: bool = false,
+
+        /// Whether the matcher should advance by whole code points (true under
+        /// either `u` or `v`) rather than by single bytes.
+        pub fn cpMode(self: Flags) bool {
+            return self.unicode or self.unicode_sets;
+        }
     };
 };
 
@@ -483,7 +488,8 @@ const PatternParser = struct {
     pos: usize,
     alloc: std.mem.Allocator,
     next_cap: u32, // next capture group index (1-based)
-    unicode: bool, // `/u` flag
+    unicode: bool, // codepoint mode (`/u` or `/v`)
+    unicode_sets: bool = false, // `/v` flag: enables ClassSetExpression grammar
     group_names: []const NameIdx = &.{}, // pre-scanned names, for `\k<name>` resolution
 
     fn init(src: []const u8, alloc: std.mem.Allocator, unicode: bool) PatternParser {
@@ -733,6 +739,7 @@ const PatternParser = struct {
                 return RegexNode{ .group = .{ .idx = idx, .inner = inner_ptr } };
             },
             '[' => {
+                if (self.unicode_sets) return try self.parseClassSetExpr();
                 return try self.parseCharClass();
             },
             '.' => {
@@ -1045,6 +1052,450 @@ const PatternParser = struct {
             else => RegexNode{ .literal = @as(u21, c) },
         };
     }
+
+    // ================================================= v-flag ClassSetExpression
+
+    /// One parsed operand of a ClassSetExpression, plus (for union ranges) the
+    /// single codepoint it represents when it was a bare ClassSetCharacter.
+    const SetOperand = struct { set: ClassSet, single_cp: ?u21 };
+
+    /// Entry point for `[...]` under the `v` flag. Parses the whole class,
+    /// then lowers the resulting code-point set + string alternatives to an AST
+    /// node (a plain char_class when there are no strings, else an alternation).
+    fn parseClassSetExpr(self: *PatternParser) ParseError!RegexNode {
+        var negate = false;
+        var set = try self.parseNestedClassBody(&negate);
+        defer set.deinit(self.alloc);
+        return self.lowerClassSet(negate, &set);
+    }
+
+    /// Parse `[` [`^`] ClassSetInner `]` and return the resulting set, reporting
+    /// negation via `neg_out`. Used both at the top level and for nested `[...]`.
+    fn parseNestedClassBody(self: *PatternParser, neg_out: *bool) ParseError!ClassSet {
+        if (self.eof() or self.cur() != '[') return ParseError.InvalidPattern;
+        self.advance(); // [
+        if (!self.eof() and self.cur() == '^') {
+            neg_out.* = true;
+            self.advance();
+        }
+        var set = try self.parseClassSetInner();
+        errdefer set.deinit(self.alloc);
+        if (self.eof() or self.cur() != ']') return ParseError.InvalidPattern;
+        self.advance(); // ]
+        return set;
+    }
+
+    /// Parse the body of a class (up to but not consuming `]`): a union, an
+    /// intersection chain (`&&`), or a subtraction chain (`--`).
+    fn parseClassSetInner(self: *PatternParser) ParseError!ClassSet {
+        var first = try self.parseSetOperand();
+        errdefer first.set.deinit(self.alloc);
+
+        // Intersection: A && B && ...
+        if (self.cur() == '&' and self.peek() == @as(?u8, '&')) {
+            var acc = first.set;
+            while (self.cur() == '&' and self.peek() == @as(?u8, '&')) {
+                self.advance();
+                self.advance();
+                var rhs = try self.parseSetOperand();
+                defer rhs.set.deinit(self.alloc);
+                const next = try acc.intersect(self.alloc, &rhs.set);
+                acc.deinit(self.alloc);
+                acc = next;
+            }
+            return acc;
+        }
+        // Subtraction: A -- B -- ...
+        if (self.cur() == '-' and self.peek() == @as(?u8, '-')) {
+            var acc = first.set;
+            while (self.cur() == '-' and self.peek() == @as(?u8, '-')) {
+                self.advance();
+                self.advance();
+                var rhs = try self.parseSetOperand();
+                defer rhs.set.deinit(self.alloc);
+                const next = try acc.subtract(self.alloc, &rhs.set);
+                acc.deinit(self.alloc);
+                acc = next;
+            }
+            return acc;
+        }
+        // Union: operands (and ClassSetRanges) juxtaposed until `]`.
+        var acc = first.set;
+        var pending_lo: ?u21 = first.single_cp;
+        while (!self.eof() and self.cur() != ']') {
+            // ClassSetRange: `a-b` where the previous operand was a single char.
+            if (pending_lo != null and self.cur() == '-' and self.peek() != @as(?u8, '-') and
+                !(self.pos + 1 < self.src.len and self.src[self.pos + 1] == ']'))
+            {
+                self.advance(); // consume `-`
+                var hi_op = try self.parseSetOperand();
+                defer hi_op.set.deinit(self.alloc);
+                const hi = hi_op.single_cp orelse return ParseError.InvalidPattern;
+                if (hi < pending_lo.?) return ParseError.InvalidPattern;
+                try acc.addRange(self.alloc, pending_lo.?, hi);
+                pending_lo = null;
+                continue;
+            }
+            var op = try self.parseSetOperand();
+            const nlo = op.single_cp;
+            const merged = try acc.unionWith(self.alloc, &op.set);
+            acc.deinit(self.alloc);
+            op.set.deinit(self.alloc);
+            acc = merged;
+            pending_lo = nlo;
+        }
+        return acc;
+    }
+
+    /// Parse one ClassSetOperand: a nested `[...]`, `\q{...}`, `\p{}`/`\P{}`, a
+    /// class-escape (`\d` etc.), or a single ClassSetCharacter (possibly escaped).
+    fn parseSetOperand(self: *PatternParser) ParseError!SetOperand {
+        if (self.eof()) return ParseError.InvalidPattern;
+        const c = self.cur();
+        if (c == '[') {
+            var neg = false;
+            var set = try self.parseNestedClassBody(&neg);
+            if (neg) {
+                const comp = try set.complement(self.alloc);
+                set.deinit(self.alloc);
+                return .{ .set = comp, .single_cp = null };
+            }
+            return .{ .set = set, .single_cp = null };
+        }
+        if (c == '\\') {
+            self.advance();
+            if (self.eof()) return ParseError.InvalidPattern;
+            const esc = self.cur();
+            switch (esc) {
+                'q' => {
+                    self.advance();
+                    return .{ .set = try self.parseQStrings(), .single_cp = null };
+                },
+                'd', 'D', 'w', 'W', 's', 'S' => {
+                    self.advance();
+                    var set = ClassSet{};
+                    try set.addClassEscape(self.alloc, esc, self.unicode);
+                    return .{ .set = set, .single_cp = null };
+                },
+                'p', 'P' => {
+                    self.advance();
+                    return .{ .set = try self.parsePropSet(esc == 'P'), .single_cp = null };
+                },
+                else => {
+                    const cp = try self.parseUEscapeOrByte();
+                    var set = ClassSet{};
+                    try set.addRange(self.alloc, cp, cp);
+                    return .{ .set = set, .single_cp = cp };
+                },
+            }
+        }
+        // Bare ClassSetCharacter.
+        const cp = self.readCp();
+        var set = ClassSet{};
+        try set.addRange(self.alloc, cp, cp);
+        return .{ .set = set, .single_cp = cp };
+    }
+
+    /// Parse `\q{ alt | alt | ... }` string-literal alternatives into a ClassSet:
+    /// length-1 alternatives join the code-point set, others become string members.
+    fn parseQStrings(self: *PatternParser) ParseError!ClassSet {
+        if (self.eof() or self.cur() != '{') return ParseError.InvalidPattern;
+        self.advance(); // {
+        var set = ClassSet{};
+        errdefer set.deinit(self.alloc);
+        var cur_str = std.ArrayListUnmanaged(u21){};
+        defer cur_str.deinit(self.alloc);
+        while (true) {
+            if (self.eof()) return ParseError.InvalidPattern;
+            const ch = self.cur();
+            if (ch == '}' or ch == '|') {
+                // Flush the current alternative.
+                if (cur_str.items.len == 1) {
+                    const cp = cur_str.items[0];
+                    try set.addRange(self.alloc, cp, cp);
+                } else {
+                    const owned = try self.alloc.dupe(u21, cur_str.items);
+                    try set.strings.append(self.alloc, owned);
+                }
+                cur_str.clearRetainingCapacity();
+                self.advance();
+                if (ch == '}') break;
+                continue;
+            }
+            if (ch == '\\') {
+                self.advance();
+                const cp = try self.parseUEscapeOrByte();
+                try cur_str.append(self.alloc, cp);
+            } else {
+                try cur_str.append(self.alloc, self.readCp());
+            }
+        }
+        return set;
+    }
+
+    /// Parse the `{Name}` of a `\p`/`\P` escape in a class set. Handles both
+    /// code-point properties (via the shared tables) and properties of strings
+    /// (e.g. Emoji_Keycap_Sequence). `\P` of a string property is a Syntax error.
+    fn parsePropSet(self: *PatternParser, negated: bool) ParseError!ClassSet {
+        if (self.eof() or self.cur() != '{') return ParseError.InvalidPattern;
+        self.advance(); // {
+        const name_start = self.pos;
+        while (!self.eof() and self.cur() != '}') self.advance();
+        if (self.eof()) return ParseError.InvalidPattern;
+        const name = self.src[name_start..self.pos];
+        self.advance(); // }
+        var set = ClassSet{};
+        errdefer set.deinit(self.alloc);
+        if (uprop.lookup(name)) |table| {
+            for (table) |pair| try set.addRange(self.alloc, pair[0], pair[1]);
+            if (negated) {
+                const comp = try set.complement(self.alloc);
+                set.deinit(self.alloc);
+                return comp;
+            }
+            return set;
+        }
+        if (propertyOfStrings(name)) |seqs| {
+            if (negated) return ParseError.InvalidPattern; // \P of a string property
+            for (seqs) |s| {
+                if (s.len == 1) {
+                    try set.addRange(self.alloc, s[0], s[0]);
+                } else {
+                    try set.strings.append(self.alloc, s);
+                }
+            }
+            return set;
+        }
+        return ParseError.InvalidPattern;
+    }
+
+    /// Lower a finished ClassSet to an AST node. With no string members this is a
+    /// plain char_class; otherwise an alternation of each string (as a literal
+    /// sequence) plus the remaining code-point class. A negated class that
+    /// contains strings is a Syntax error (ES: MayContainStrings).
+    fn lowerClassSet(self: *PatternParser, negate: bool, set: *ClassSet) ParseError!RegexNode {
+        if (negate and set.strings.items.len > 0) return ParseError.InvalidPattern;
+
+        const cc = try self.alloc.create(CharClass);
+        cc.* = CharClass{};
+        cc.negate = negate;
+        for (set.ranges.items) |r| try cc.addCpRange(self.alloc, r.lo, r.hi);
+
+        if (set.strings.items.len == 0) return RegexNode{ .char_class = cc };
+
+        var arms = std.ArrayListUnmanaged(RegexNode){};
+        // Longest strings first so an alternation prefers the maximal munch.
+        const strs = try self.alloc.dupe([]const u21, set.strings.items);
+        std.sort.pdq([]const u21, strs, {}, cmpStrLenDesc);
+        for (strs) |s| {
+            if (s.len == 0) {
+                try arms.append(self.alloc, RegexNode{ .seq = &[_]RegexNode{} });
+                continue;
+            }
+            var seq = try self.alloc.alloc(RegexNode, s.len);
+            for (s, 0..) |cp, i| seq[i] = RegexNode{ .literal = cp };
+            if (s.len == 1) {
+                try arms.append(self.alloc, seq[0]);
+            } else {
+                try arms.append(self.alloc, RegexNode{ .seq = seq });
+            }
+        }
+        if (set.ranges.items.len > 0) try arms.append(self.alloc, RegexNode{ .char_class = cc });
+        if (arms.items.len == 1) return arms.items[0];
+        return RegexNode{ .alt = try arms.toOwnedSlice(self.alloc) };
+    }
+};
+
+fn cmpStrLenDesc(_: void, a: []const u21, b: []const u21) bool {
+    return a.len > b.len;
+}
+
+/// A code-point set plus string members, used while evaluating a v-mode
+/// ClassSetExpression. Ranges are kept sorted and disjoint after each op.
+const ClassSet = struct {
+    ranges: std.ArrayListUnmanaged(CharClass.CpRange) = .{},
+    strings: std.ArrayListUnmanaged([]const u21) = .{},
+
+    fn deinit(self: *ClassSet, alloc: std.mem.Allocator) void {
+        self.ranges.deinit(alloc);
+        self.strings.deinit(alloc);
+    }
+
+    fn addRange(self: *ClassSet, alloc: std.mem.Allocator, lo: u21, hi: u21) !void {
+        if (lo > hi) return;
+        try self.ranges.append(alloc, .{ .lo = lo, .hi = hi });
+        try normalizeRanges(alloc, &self.ranges);
+    }
+
+    fn addClassEscape(self: *ClassSet, alloc: std.mem.Allocator, esc: u8, unicode: bool) !void {
+        var cc = CharClass{};
+        const lower = if (esc >= 'A' and esc <= 'Z') esc + 32 else esc;
+        if (lower == 's' and unicode) {
+            try cc.addPredefinedUnicodeS(alloc);
+        } else {
+            cc.addPredefined(lower, false);
+        }
+        // Collect the code points the bitmap/extra ranges cover, then negate if uppercase.
+        var tmp = std.ArrayListUnmanaged(CharClass.CpRange){};
+        defer tmp.deinit(alloc);
+        var i: u21 = 0;
+        while (i <= 255) : (i += 1) {
+            if (cc.bitmap[i]) try tmp.append(alloc, .{ .lo = i, .hi = i });
+        }
+        for (cc.extra_ranges.items) |r| try tmp.append(alloc, r);
+        try normalizeRanges(alloc, &tmp);
+        if (esc == 'D' or esc == 'W' or esc == 'S') {
+            const comp = try complementRanges(alloc, tmp.items);
+            defer alloc.free(comp);
+            for (comp) |r| try self.addRange(alloc, r.lo, r.hi);
+        } else {
+            for (tmp.items) |r| try self.addRange(alloc, r.lo, r.hi);
+        }
+    }
+
+    fn hasString(self: *const ClassSet, s: []const u21) bool {
+        for (self.strings.items) |t| {
+            if (std.mem.eql(u21, t, s)) return true;
+        }
+        return false;
+    }
+
+    fn unionWith(self: *const ClassSet, alloc: std.mem.Allocator, other: *const ClassSet) !ClassSet {
+        var out = ClassSet{};
+        for (self.ranges.items) |r| try out.ranges.append(alloc, r);
+        for (other.ranges.items) |r| try out.ranges.append(alloc, r);
+        try normalizeRanges(alloc, &out.ranges);
+        for (self.strings.items) |s| try out.strings.append(alloc, s);
+        for (other.strings.items) |s| {
+            if (!out.hasString(s)) try out.strings.append(alloc, s);
+        }
+        return out;
+    }
+
+    fn intersect(self: *const ClassSet, alloc: std.mem.Allocator, other: *const ClassSet) !ClassSet {
+        var out = ClassSet{};
+        const inter = try intersectRanges(alloc, self.ranges.items, other.ranges.items);
+        defer alloc.free(inter);
+        for (inter) |r| try out.ranges.append(alloc, r);
+        for (self.strings.items) |s| {
+            if (other.hasString(s)) try out.strings.append(alloc, s);
+        }
+        return out;
+    }
+
+    fn subtract(self: *const ClassSet, alloc: std.mem.Allocator, other: *const ClassSet) !ClassSet {
+        var out = ClassSet{};
+        const diff = try subtractRanges(alloc, self.ranges.items, other.ranges.items);
+        defer alloc.free(diff);
+        for (diff) |r| try out.ranges.append(alloc, r);
+        for (self.strings.items) |s| {
+            if (!other.hasString(s)) try out.strings.append(alloc, s);
+        }
+        return out;
+    }
+
+    fn complement(self: *const ClassSet, alloc: std.mem.Allocator) !ClassSet {
+        var out = ClassSet{};
+        const comp = try complementRanges(alloc, self.ranges.items);
+        defer alloc.free(comp);
+        for (comp) |r| try out.ranges.append(alloc, r);
+        return out;
+    }
+};
+
+/// Sort and merge a range list in place so it is sorted and disjoint.
+fn normalizeRanges(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(CharClass.CpRange)) !void {
+    if (list.items.len <= 1) return;
+    std.sort.pdq(CharClass.CpRange, list.items, {}, cmpRangeLo);
+    var out = std.ArrayListUnmanaged(CharClass.CpRange){};
+    defer out.deinit(alloc);
+    var cur = list.items[0];
+    for (list.items[1..]) |r| {
+        if (r.lo <= cur.hi + 1 and cur.hi != std.math.maxInt(u21)) {
+            if (r.hi > cur.hi) cur.hi = r.hi;
+        } else if (r.lo <= cur.hi) {
+            if (r.hi > cur.hi) cur.hi = r.hi;
+        } else {
+            try out.append(alloc, cur);
+            cur = r;
+        }
+    }
+    try out.append(alloc, cur);
+    list.clearRetainingCapacity();
+    try list.appendSlice(alloc, out.items);
+}
+
+fn cmpRangeLo(_: void, a: CharClass.CpRange, b: CharClass.CpRange) bool {
+    return a.lo < b.lo;
+}
+
+const MAX_CP: u21 = 0x10FFFF;
+
+/// Complement of a sorted, disjoint range set over [0, 0x10FFFF].
+fn complementRanges(alloc: std.mem.Allocator, ranges: []const CharClass.CpRange) ![]CharClass.CpRange {
+    var out = std.ArrayListUnmanaged(CharClass.CpRange){};
+    var next: u32 = 0;
+    for (ranges) |r| {
+        if (r.lo > next) try out.append(alloc, .{ .lo = @intCast(next), .hi = @intCast(r.lo - 1) });
+        next = @as(u32, r.hi) + 1;
+    }
+    if (next <= MAX_CP) try out.append(alloc, .{ .lo = @intCast(next), .hi = MAX_CP });
+    return out.toOwnedSlice(alloc);
+}
+
+/// Intersection of two sorted, disjoint range sets.
+fn intersectRanges(alloc: std.mem.Allocator, a: []const CharClass.CpRange, b: []const CharClass.CpRange) ![]CharClass.CpRange {
+    var out = std.ArrayListUnmanaged(CharClass.CpRange){};
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a.len and j < b.len) {
+        const lo = @max(a[i].lo, b[j].lo);
+        const hi = @min(a[i].hi, b[j].hi);
+        if (lo <= hi) try out.append(alloc, .{ .lo = lo, .hi = hi });
+        if (a[i].hi < b[j].hi) i += 1 else j += 1;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// `a` minus `b`, both sorted and disjoint.
+fn subtractRanges(alloc: std.mem.Allocator, a: []const CharClass.CpRange, b: []const CharClass.CpRange) ![]CharClass.CpRange {
+    var out = std.ArrayListUnmanaged(CharClass.CpRange){};
+    for (a) |ra| {
+        var lo: u32 = ra.lo;
+        const hi: u32 = ra.hi;
+        for (b) |rb| {
+            if (rb.hi < lo or rb.lo > hi) continue;
+            if (rb.lo > lo) try out.append(alloc, .{ .lo = @intCast(lo), .hi = @intCast(rb.lo - 1) });
+            if (@as(u32, rb.hi) + 1 > lo) lo = @as(u32, rb.hi) + 1;
+            if (lo > hi) break;
+        }
+        if (lo <= hi) try out.append(alloc, .{ .lo = @intCast(lo), .hi = @intCast(hi) });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Properties of strings (ES2024). Returns the member sequences for the few
+/// tractable properties we support; null for unknown/unsupported names.
+fn propertyOfStrings(name: []const u8) ?[]const []const u21 {
+    if (std.mem.eql(u8, name, "Emoji_Keycap_Sequence")) return &emoji_keycap_sequences;
+    return null;
+}
+
+/// The 12 Emoji_Keycap_Sequence members: `#`, `*`, `0`-`9`, each followed by
+/// U+FE0F U+20E3.
+const emoji_keycap_sequences = [_][]const u21{
+    &.{ '#', 0xFE0F, 0x20E3 },
+    &.{ '*', 0xFE0F, 0x20E3 },
+    &.{ '0', 0xFE0F, 0x20E3 },
+    &.{ '1', 0xFE0F, 0x20E3 },
+    &.{ '2', 0xFE0F, 0x20E3 },
+    &.{ '3', 0xFE0F, 0x20E3 },
+    &.{ '4', 0xFE0F, 0x20E3 },
+    &.{ '5', 0xFE0F, 0x20E3 },
+    &.{ '6', 0xFE0F, 0x20E3 },
+    &.{ '7', 0xFE0F, 0x20E3 },
+    &.{ '8', 0xFE0F, 0x20E3 },
+    &.{ '9', 0xFE0F, 0x20E3 },
 };
 
 fn hexVal(c: u8) ?u8 {
@@ -1070,14 +1521,20 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
             's' => flags.dotall = true,
             'y' => flags.sticky = true,
             'u' => flags.unicode = true,
+            'v' => flags.unicode_sets = true,
             else => return error.InvalidPattern,
         }
     }
+    // `u` and `v` are mutually exclusive (ES §22.2.3.4 RegExpInitialize step 4).
+    if (flags.unicode and flags.unicode_sets) return error.InvalidPattern;
 
     // Pre-scan named groups so `\k<name>` (which may forward-reference a group
     // defined later) resolves to a capture index during parsing.
     const names = try scanGroupNames(alloc, pattern);
-    var pp = PatternParser.init(pattern, alloc, flags.unicode);
+    // `v` mode implies full code-point semantics like `u`, so the parser runs in
+    // codepoint mode; `unicode_sets` separately gates the ClassSetExpression grammar.
+    var pp = PatternParser.init(pattern, alloc, flags.unicode or flags.unicode_sets);
+    pp.unicode_sets = flags.unicode_sets;
     pp.group_names = names;
     const root = try pp.parseAlt();
     if (!pp.eof()) return error.InvalidPattern; // unconsumed chars
@@ -1197,7 +1654,7 @@ pub fn matchAnywhere(
         }
         if (i >= input.len) break;
         // Under /u, advance by full codepoint to stay on codepoint boundaries.
-        i += if (regex.flags.unicode) @as(usize, utf8ByteLenAt(input, i)) else 1;
+        i += if (regex.flags.cpMode()) @as(usize, utf8ByteLenAt(input, i)) else 1;
     }
     return null;
 }
@@ -1270,7 +1727,7 @@ fn foldCaseCp(cp: u21) u21 {
 /// position on success, or null. Honors `/u` (codepoint vs byte) and `/i`.
 fn consumeLiteral(input: []const u8, pos: usize, ch: u21, flags: *const CompiledRegex.Flags) ?usize {
     if (pos >= input.len) return null;
-    if (flags.unicode) {
+    if (flags.cpMode()) {
         const dc = decodeUtf8At(input, pos);
         const input_cp = dc.cp;
         if (flags.ignore_case) {
@@ -1295,7 +1752,7 @@ fn consumeLiteral(input: []const u8, pos: usize, ch: u21, flags: *const Compiled
 /// Try to consume one character matching char class `cc` at `pos`.
 fn consumeClass(input: []const u8, pos: usize, cc: *const CharClass, flags: *const CompiledRegex.Flags) ?usize {
     if (pos >= input.len) return null;
-    if (flags.unicode) {
+    if (flags.cpMode()) {
         const dc = decodeUtf8At(input, pos);
         var cp = dc.cp;
         if (flags.ignore_case) cp = foldCaseCp(cp);
@@ -1328,7 +1785,7 @@ fn consumeClass(input: []const u8, pos: usize, cc: *const CharClass, flags: *con
 /// Try to consume one character for `.` (dot) at `pos`.
 fn consumeDot(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) ?usize {
     if (pos >= input.len) return null;
-    if (flags.unicode) {
+    if (flags.cpMode()) {
         const dc = decodeUtf8At(input, pos);
         if (!flags.dotall and isUnicodeLineTerminator(dc.cp)) return null;
         return pos + dc.len;
@@ -1912,7 +2369,11 @@ const PikeVM = struct {
             nxt_pcs = t_pcs;
             nxt_caps = t_caps;
             if (cur_n == 0) break;
-            sp += 1;
+            // All live threads sit at the same input position, so advance by the
+            // width of the code point at `sp` under `u`/`v` — otherwise a
+            // consuming instruction after a multi-byte code point would read from
+            // the middle of a UTF-8 sequence.
+            sp += if (flags.cpMode() and sp < input.len) @as(usize, utf8ByteLenAt(input, sp)) else 1;
         }
 
         if (!self.matched_valid) return null;
@@ -2061,7 +2522,7 @@ fn throwRegExpSyntaxError(arena: std.mem.Allocator, pattern: []const u8, flags: 
 /// Reconstruct the canonical flag string (g,i,m,s,u,y order) from a compiled
 /// RegExp's flag set — used when `compile` copies flags from a RegExp pattern.
 fn flagsToString(arena: std.mem.Allocator, f: CompiledRegex.Flags) ![]const u8 {
-    var buf: [6]u8 = undefined;
+    var buf: [7]u8 = undefined;
     var n: usize = 0;
     if (f.global) {
         buf[n] = 'g';
@@ -2081,6 +2542,10 @@ fn flagsToString(arena: std.mem.Allocator, f: CompiledRegex.Flags) ![]const u8 {
     }
     if (f.unicode) {
         buf[n] = 'u';
+        n += 1;
+    }
+    if (f.unicode_sets) {
+        buf[n] = 'v';
         n += 1;
     }
     if (f.sticky) {
