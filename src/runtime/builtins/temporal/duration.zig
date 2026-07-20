@@ -189,8 +189,25 @@ pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyer
 pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const a = try toTemporalDuration(arena, if (args.len > 0) args[0] else Value{});
     const b = try toTemporalDuration(arena, if (args.len > 1) args[1] else Value{});
-    // Without relativeTo, calendar units require a reference; if any y/m/w present
-    // and differ we still approximate with a nominal 24h day and 30-day month.
+
+    // GetOptionsObject(options): undefined is fine, anything non-object throws.
+    const opts: Value = if (args.len > 2) args[2] else Value{};
+    var relative_to_present = false;
+    if (opts.bits != 0 and opts.unbox() != .undefined_) {
+        if (opts.unbox() != .object) return realm_mod.throwTypeError(arena, "options must be an object");
+        const rv = if (realm_mod.active_context) |c|
+            try c.getProp(arena, opts, "relativeTo")
+        else
+            (opts.toPtr().object.get("relativeTo") orelse Value{});
+        if (rv.bits != 0 and rv.unbox() != .undefined_) relative_to_present = true;
+    }
+    // Comparing durations whose calendar units (years/months/weeks) differ needs
+    // a relativeTo reference; without one it is a RangeError (§ Duration.compare).
+    if ((hasCalendarUnits(a) or hasCalendarUnits(b)) and !relative_to_present)
+        return realm_mod.throwRangeError(arena, "Duration.compare with calendar units requires relativeTo");
+
+    // With relativeTo (unsupported balancing) or purely time/day units we still
+    // approximate with a nominal 24h day and 30-day month.
     const na = totalNanosApprox(a);
     const nb = totalNanosApprox(b);
     const r: f64 = if (na < nb) -1 else if (na > nb) 1 else 0;

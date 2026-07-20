@@ -15,8 +15,91 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const parse_fn = try val_mod.makeNativeFunctionNamed(arena, nativeJsonParse, "parse", 2);
     try json_obj.set("stringify", stringify_fn);
     try json_obj.set("parse", parse_fn);
+    // ES2025 json-parse-with-source: JSON.rawJSON / JSON.isRawJSON — data
+    // properties with the standard { writable, !enumerable, configurable } shape.
+    const data_cfg: @import("../../object/object.zig").PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+    _ = try json_obj.defineOwnData("rawJSON", try val_mod.makeNativeFunctionNamed(arena, nativeJsonRawJSON, "rawJSON", 1), data_cfg);
+    _ = try json_obj.defineOwnData("isRawJSON", try val_mod.makeNativeFunctionNamed(arena, nativeJsonIsRawJSON, "isRawJSON", 1), data_cfg);
     const json_val = try val_mod.makeObject(arena, json_obj);
     try ctx.env.define("JSON", json_val);
+}
+
+/// ToString used by JSON.rawJSON: Symbol → TypeError, BigInt → decimal, objects
+/// via ToPrimitive(string). Mirrors the abstract ToString operation.
+fn rawJsonToString(arena: std.mem.Allocator, v_in: Value) anyerror![]const u8 {
+    const coercion = @import("coercion.zig");
+    var v = v_in;
+    if (coercion.isObjectValue(v)) {
+        v = (try coercion.toPrimitive(arena, v, .string)) orelse return "[object Object]";
+    }
+    if (v.bits == 0) return "undefined";
+    return switch (v.unbox()) {
+        .undefined_ => "undefined",
+        .null_ => "null",
+        .boolean => |b| if (b) "true" else "false",
+        .string => |s| s,
+        .number => |n| try formatNumber(arena, n),
+        .bigint => |b| try b.toConst().toStringAlloc(arena, 10, .lower),
+        .symbol => blk: {
+            _ = try throwTypeErrorMsg(arena, "Cannot convert a Symbol value to a string");
+            break :blk "";
+        },
+        else => "[object Object]",
+    };
+}
+
+/// JSON.rawJSON(text) (ES2025): validate `text` is a single JSON primitive and
+/// wrap it in a frozen null-prototype object carrying an [[IsRawJSON]] slot.
+pub fn nativeJsonRawJSON(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    const text = if (args.len > 0) args[0] else val_mod.makeUndefined(arena) catch unreachable;
+    const json_string = try rawJsonToString(arena, text);
+
+    // Empty, or leading/trailing JSON whitespace → SyntaxError.
+    if (json_string.len == 0) return throwSyntaxError(arena, "JSON.rawJSON: empty string");
+    const first = json_string[0];
+    const last = json_string[json_string.len - 1];
+    for ([_]u8{ ' ', '\t', '\n', '\r' }) |ws| {
+        if (first == ws or last == ws) return throwSyntaxError(arena, "JSON.rawJSON: leading or trailing whitespace");
+    }
+
+    // Must parse as a single JSON value whose outermost value is not object/array.
+    if (first == '{' or first == '[') return throwSyntaxError(arena, "JSON.rawJSON: value must not be an object or array");
+    var parser = JsonParser{ .src = json_string, .pos = 0, .arena = arena, .track = false };
+    parser.skipWs();
+    _ = parser.parseValue() catch |e| return e;
+    parser.skipWs();
+    if (parser.pos < parser.src.len) return throwSyntaxError(arena, "JSON.parse: unexpected trailing characters");
+
+    const obj = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, null)
+    else
+        try JsObject.create(arena, null);
+    _ = try obj.defineOwnData("rawJSON", try val_mod.makeString(arena, json_string), .{ .writable = false, .enumerable = true, .configurable = false });
+    _ = try obj.defineOwnData("[[IsRawJSON]]", try val_mod.makeBool(arena, true), .{ .writable = false, .enumerable = false, .configurable = false });
+    obj.freezeSelf();
+    return val_mod.makeObject(arena, obj);
+}
+
+/// JSON.isRawJSON(O) (ES2025): true iff O is an Object with an [[IsRawJSON]] slot.
+pub fn nativeJsonIsRawJSON(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
+        if (args[0].toPtr().object.getOwn("[[IsRawJSON]]") != null)
+            return val_mod.makeBool(arena, true);
+    }
+    return val_mod.makeBool(arena, false);
+}
+
+fn throwTypeErrorMsg(arena: std.mem.Allocator, msg: []const u8) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    const obj = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, realm_mod.error_proto_TypeError)
+    else
+        try JsObject.create(arena, realm_mod.error_proto_TypeError);
+    try obj.set("message", try val_mod.makeString(arena, msg));
+    try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
 }
 
 // ---------------------------------------------------------------- stringify ---
@@ -144,6 +227,15 @@ fn stringifyValue(
             try buf.append(arena, '"');
         },
         .object => |obj| {
+            // ES2025 json-parse-with-source: a rawJSON object serializes as its
+            // stored raw text, emitted verbatim (already valid JSON).
+            if (obj.getOwn("[[IsRawJSON]]") != null) {
+                if (obj.getOwn("rawJSON")) |raw| {
+                    if (raw.bits != 0 and raw.unbox() == .string)
+                        try buf.appendSlice(arena, raw.toPtr().string);
+                }
+                return;
+            }
             // §25.5.2.2 step 4: Number / String / Boolean / BigInt wrapper objects
             // serialize as their underlying primitive (a BigInt wrapper throws).
             if (obj.getOwn("[[PrimitiveValue]]")) |prim| {
@@ -325,14 +417,145 @@ pub fn nativeJsonParse(arena: std.mem.Allocator, _: Value, args: []const Value) 
     else
         return throwSyntaxError(arena, "JSON.parse: argument is not a string");
 
-    var parser = JsonParser{ .src = src, .pos = 0, .arena = arena };
+    // A callable reviver enables InternalizeJSONProperty (+ source tracking for
+    // the ES2025 json-parse-with-source `context.source` argument).
+    const reviver: ?Value = if (args.len > 1 and jsonIsCallable(args[1])) args[1] else null;
+
+    var parser = JsonParser{ .src = src, .pos = 0, .arena = arena, .track = reviver != null };
     parser.skipWs();
-    const result = parser.parseValue() catch |e| return e;
+    const vn = parser.parseValueN() catch |e| return e;
     parser.skipWs();
     if (parser.pos < parser.src.len) {
         return throwSyntaxError(arena, "JSON.parse: unexpected trailing characters");
     }
+    const result = vn.val;
+    if (reviver) |rev| {
+        // Root holder is a wrapper { "": value } so the reviver sees the root.
+        const wrapper = if (@import("../realm.zig").active_heap) |heap|
+            try JsObject.createOnHeap(heap, @import("../realm.zig").active_object_proto)
+        else
+            try JsObject.create(arena, @import("../realm.zig").active_object_proto);
+        try wrapper.set("", result);
+        return internalizeJSONProperty(arena, wrapper, "", rev, vn.node);
+    }
     return result;
+}
+
+/// Source-tracking parse record: for a primitive JSON value, `source` holds the
+/// exact input substring; container nodes carry their child records so the
+/// reviver can be handed the right `context.source` per InternalizeJSONProperty.
+const SrcNode = struct {
+    kind: enum { primitive, array, object },
+    source: []const u8 = "",
+    /// Original parsed value (primitive nodes only); `context.source` is offered
+    /// only while the holder still holds this exact value (SameValue).
+    value: Value = .{},
+    elements: []const *SrcNode = &.{},
+    entries: []const Entry = &.{},
+
+    const Entry = struct { key: []const u8, node: *SrcNode };
+};
+
+/// SameValue restricted to JSON primitives (number / string / boolean / null).
+fn jsonSameValue(a: Value, b: Value) bool {
+    if (a.bits == 0 or b.bits == 0) return a.bits == b.bits;
+    const ta = a.unbox();
+    const tb = b.unbox();
+    return switch (ta) {
+        .null_ => tb == .null_,
+        .boolean => |x| tb == .boolean and x == tb.boolean,
+        .number => |x| tb == .number and (x == tb.number or (x != x and tb.number != tb.number)),
+        .string => |x| tb == .string and std.mem.eql(u8, x, tb.string),
+        else => false,
+    };
+}
+
+/// Value + its parse record (null when source tracking is disabled).
+const VN = struct { val: Value, node: ?*SrcNode };
+
+/// Build the reviver's `context` argument: a plain object that owns a `source`
+/// property only when the corresponding JSON value was a primitive literal.
+fn makeReviverContext(arena: std.mem.Allocator, node: ?*SrcNode, cur_val: Value) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    const obj = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+    if (node) |n| {
+        // Source is offered only if the holder still holds the parsed primitive
+        // (a reviver that forward-modifies a sibling invalidates its source).
+        if (n.kind == .primitive and jsonSameValue(n.value, cur_val))
+            _ = try obj.defineOwnData("source", try val_mod.makeString(arena, n.source), .{ .writable = true, .enumerable = true, .configurable = true });
+    }
+    return val_mod.makeObject(arena, obj);
+}
+
+/// InternalizeJSONProperty (ES §25.5.1.1): recursively apply `reviver`, walking
+/// the parse record in lockstep to supply `context.source`.
+fn internalizeJSONProperty(arena: std.mem.Allocator, holder: *JsObject, name: []const u8, reviver: Value, node: ?*SrcNode) anyerror!Value {
+    const fpm = @import("function_proto.zig");
+    const realm_mod = @import("../realm.zig");
+    // [[Get]] honouring accessors / proxy traps (a reviver may have installed a
+    // getter on this key); fall back to a raw own-property read.
+    const holder_v = try val_mod.makeObject(arena, holder);
+    var val = if (realm_mod.active_context) |c|
+        try c.getProp(arena, holder_v, name)
+    else
+        holder.get(name) orelse val_mod.makeUndefined(arena) catch unreachable;
+    if (val.bits != 0 and val.unbox() == .object) {
+        const val_obj = val.toPtr().object;
+        if (val_obj.is_array) {
+            const len = val_obj.array_length;
+            var i: u32 = 0;
+            while (i < len) : (i += 1) {
+                const prop = try std.fmt.allocPrint(arena, "{d}", .{i});
+                const child: ?*SrcNode = if (node) |n|
+                    (if (n.kind == .array and i < n.elements.len) n.elements[i] else null)
+                else
+                    null;
+                const new_elem = try internalizeJSONProperty(arena, val_obj, prop, reviver, child);
+                if (new_elem.bits == 0 or new_elem.unbox() == .undefined_) {
+                    _ = try val_obj.deleteOwn(prop);
+                } else {
+                    try val_obj.set(prop, new_elem);
+                }
+            }
+        } else {
+            // Snapshot enumerable own keys before iterating (reviver may mutate).
+            var keys = std.ArrayList([]const u8){};
+            for (val_obj.ownKeys()) |k| {
+                if (val_obj.isEnumerable(k)) try keys.append(arena, k);
+            }
+            for (keys.items) |p| {
+                var child: ?*SrcNode = null;
+                if (node) |n| {
+                    if (n.kind == .object) {
+                        for (n.entries) |e| {
+                            if (std.mem.eql(u8, e.key, p)) {
+                                child = e.node;
+                                break;
+                            }
+                        }
+                    }
+                }
+                const new_elem = try internalizeJSONProperty(arena, val_obj, p, reviver, child);
+                if (new_elem.bits == 0 or new_elem.unbox() == .undefined_) {
+                    _ = try val_obj.deleteOwn(p);
+                } else {
+                    try val_obj.set(p, new_elem);
+                }
+            }
+        }
+    }
+    const name_v = try val_mod.makeString(arena, name);
+    const ctx = try makeReviverContext(arena, node, val);
+    return fpm.invokeCallback(arena, holder_v, reviver, &.{ name_v, val, ctx });
+}
+
+/// Error-only variant of throwSyntaxError, usable in any `!T` return context.
+fn jsonSynErr(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    _ = throwSyntaxError(arena, msg) catch {};
+    return error.JsException;
 }
 
 fn throwSyntaxError(arena: std.mem.Allocator, msg: []const u8) anyerror!Value {
@@ -357,6 +580,123 @@ const JsonParser = struct {
     src: []const u8,
     pos: usize,
     arena: std.mem.Allocator,
+    track: bool = false,
+
+    /// Allocate a primitive parse record spanning src[start..self.pos].
+    fn mkPrim(self: *JsonParser, start: usize, value: Value) anyerror!?*SrcNode {
+        if (!self.track) return null;
+        const n = try self.arena.create(SrcNode);
+        n.* = .{ .kind = .primitive, .source = self.src[start..self.pos], .value = value };
+        return n;
+    }
+
+    /// Source-tracking parse: returns the value paired with its parse record.
+    fn parseValueN(self: *JsonParser) anyerror!VN {
+        self.skipWs();
+        const start = self.pos;
+        const c = self.peek() orelse return jsonSynErr(self.arena, "JSON.parse: unexpected end of input");
+        switch (c) {
+            '{' => return self.parseObjectN(),
+            '[' => return self.parseArrayN(),
+            '"' => {
+                const v = try self.parseString();
+                return .{ .val = v, .node = try self.mkPrim(start, v) };
+            },
+            't', 'f', 'n', '-', '0'...'9' => {
+                const v = try self.parseValue();
+                return .{ .val = v, .node = try self.mkPrim(start, v) };
+            },
+            else => return jsonSynErr(self.arena, "JSON.parse: unexpected character"),
+        }
+    }
+
+    fn parseObjectN(self: *JsonParser) anyerror!VN {
+        const realm_mod = @import("../realm.zig");
+        try self.expectChar('{');
+        const obj = if (realm_mod.active_heap) |heap|
+            try JsObject.createOnHeap(heap, realm_mod.active_object_proto)
+        else
+            try JsObject.create(self.arena, realm_mod.active_object_proto);
+        var entries = std.ArrayList(SrcNode.Entry){};
+        self.skipWs();
+        if (self.peek() == '}') {
+            self.pos += 1;
+            return self.finishObj(obj, &entries);
+        }
+        while (true) {
+            self.skipWs();
+            if (self.peek() != '"') return jsonSynErr(self.arena, "JSON.parse: expected string key");
+            const key_val = try self.parseString();
+            const key_str = key_val.toPtr().string;
+            self.skipWs();
+            try self.expectChar(':');
+            const child = try self.parseValueN();
+            try obj.set(key_str, child.val);
+            if (self.track) {
+                if (child.node) |cn| try entries.append(self.arena, .{ .key = key_str, .node = cn });
+            }
+            self.skipWs();
+            const next = self.peek() orelse return jsonSynErr(self.arena, "JSON.parse: unexpected end of object");
+            if (next == '}') {
+                self.pos += 1;
+                break;
+            }
+            if (next != ',') return jsonSynErr(self.arena, "JSON.parse: expected ',' or '}'");
+            self.pos += 1;
+        }
+        return self.finishObj(obj, &entries);
+    }
+
+    fn finishObj(self: *JsonParser, obj: *JsObject, entries: *std.ArrayList(SrcNode.Entry)) anyerror!VN {
+        const v = try val_mod.makeObject(self.arena, obj);
+        if (!self.track) return .{ .val = v, .node = null };
+        const n = try self.arena.create(SrcNode);
+        n.* = .{ .kind = .object, .entries = entries.items };
+        return .{ .val = v, .node = n };
+    }
+
+    fn parseArrayN(self: *JsonParser) anyerror!VN {
+        const realm_mod = @import("../realm.zig");
+        try self.expectChar('[');
+        const arr = if (realm_mod.active_heap) |heap|
+            try JsObject.createArrayOnHeap(heap, realm_mod.active_array_proto)
+        else
+            try JsObject.createArray(self.arena, realm_mod.active_array_proto);
+        var elements = std.ArrayList(*SrcNode){};
+        self.skipWs();
+        if (self.peek() == ']') {
+            self.pos += 1;
+            return self.finishArr(arr, 0, &elements);
+        }
+        var idx: u32 = 0;
+        while (true) {
+            const child = try self.parseValueN();
+            const key = try std.fmt.allocPrint(self.arena, "{d}", .{idx});
+            try arr.set(key, child.val);
+            if (self.track) {
+                if (child.node) |cn| try elements.append(self.arena, cn);
+            }
+            idx += 1;
+            self.skipWs();
+            const next = self.peek() orelse return jsonSynErr(self.arena, "JSON.parse: unexpected end of array");
+            if (next == ']') {
+                self.pos += 1;
+                break;
+            }
+            if (next != ',') return jsonSynErr(self.arena, "JSON.parse: expected ',' or ']'");
+            self.pos += 1;
+        }
+        return self.finishArr(arr, idx, &elements);
+    }
+
+    fn finishArr(self: *JsonParser, arr: *JsObject, len: u32, elements: *std.ArrayList(*SrcNode)) anyerror!VN {
+        arr.array_length = len;
+        const v = try val_mod.makeObject(self.arena, arr);
+        if (!self.track) return .{ .val = v, .node = null };
+        const n = try self.arena.create(SrcNode);
+        n.* = .{ .kind = .array, .elements = elements.items };
+        return .{ .val = v, .node = n };
+    }
 
     fn peek(self: *JsonParser) ?u8 {
         if (self.pos >= self.src.len) return null;
