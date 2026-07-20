@@ -246,7 +246,9 @@ pub fn nativeObjectAssign(arena: std.mem.Allocator, _: Value, args: []const Valu
         for (src_obj.ownKeys()) |k| {
             if (!src_obj.isEnumerable(k)) continue;
             const v = if (ctx) |c| try c.getProp(arena, from_val, k) else (src_obj.getOwn(k) orelse continue);
-            if (ctx) |c| try c.setProp(arena, to_val, k, v) else try target_obj.set(k, v);
+            // Set(to, key, value, true): a read-only/frozen/non-extensible target
+            // raises TypeError (§20.1.2.1 step 5.c.iii).
+            if (ctx) |c| try c.setPropThrow(arena, to_val, k, v) else try target_obj.set(k, v);
         }
         // Copy enumerable symbol-keyed own properties.
         var si: usize = 0;
