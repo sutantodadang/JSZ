@@ -4141,6 +4141,15 @@ pub const Realm = struct {
             try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoValueOf, "valueOf", 0), meth_attr);
         _ = try object_proto.defineOwnData("toLocaleString",
             try val_mod.makeNativeFunctionNamed(arena, array_proto_mod.nativeObjectToLocaleString, "toLocaleString", 0), meth_attr);
+        // Annex B §B.2.2.2-5: legacy accessor helpers on Object.prototype.
+        _ = try object_proto.defineOwnData("__defineGetter__",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeDefineGetter, "__defineGetter__", 2), meth_attr);
+        _ = try object_proto.defineOwnData("__defineSetter__",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeDefineSetter, "__defineSetter__", 2), meth_attr);
+        _ = try object_proto.defineOwnData("__lookupGetter__",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeLookupGetter, "__lookupGetter__", 1), meth_attr);
+        _ = try object_proto.defineOwnData("__lookupSetter__",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeLookupSetter, "__lookupSetter__", 1), meth_attr);
         // Annex B §B.2.2.1: Object.prototype.__proto__ accessor (get/set the
         // receiver's [[Prototype]]). Enumerable:false, configurable:true.
         const proto_acc_holder = try JsObject.create(arena, null);

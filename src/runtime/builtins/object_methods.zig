@@ -626,6 +626,133 @@ fn descIsCallable(v: Value) bool {
     };
 }
 
+/// Build a one-shot descriptor object holding `{get|set: fn, enumerable:true,
+/// configurable:true}`, used by __defineGetter__/__defineSetter__.
+fn makeAccessorDescObj(arena: std.mem.Allocator, field: []const u8, fnv: Value) !Value {
+    const realm_mod = @import("../realm.zig");
+    const proto: ?*JsObject = realm_mod.active_object_proto;
+    const d = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, proto)
+    else
+        try JsObject.create(arena, proto);
+    try d.set(field, fnv);
+    try d.set("enumerable", try val_mod.makeBool(arena, true));
+    try d.set("configurable", try val_mod.makeBool(arena, true));
+    return val_mod.makeObject(arena, d);
+}
+
+/// Object.prototype.__defineGetter__(P, getter) — Annex B §B.2.2.2.
+pub fn nativeDefineGetter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return defineAccessorAnnexB(arena, this_val, args, "get");
+}
+
+/// Object.prototype.__defineSetter__(P, setter) — Annex B §B.2.2.3.
+pub fn nativeDefineSetter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return defineAccessorAnnexB(arena, this_val, args, "set");
+}
+
+fn defineAccessorAnnexB(arena: std.mem.Allocator, this_val: Value, args: []const Value, field: []const u8) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    // Step 1: ToObject(this) — null/undefined throw.
+    const o_val = try realm_mod.toObjectForThis(arena, this_val);
+    if (o_val.bits == 0 or o_val.unbox() != .object)
+        return throwTypeError(arena, "Object.prototype.__defineGetter__ called on null or undefined");
+    // Step 2: the getter/setter must be callable.
+    const fnv = if (args.len >= 2) args[1] else Value{};
+    if (!descIsCallable(fnv))
+        return throwTypeError(arena, "Object.prototype.__defineGetter__: Expecting a function");
+    const desc = try makeAccessorDescObj(arena, field, fnv);
+    const p = if (args.len >= 1) args[0] else Value{};
+    _ = try nativeObjectDefineProperty(arena, o_val, &[_]Value{ o_val, p, desc });
+    return val_mod.makeUndefined(arena);
+}
+
+/// Object.prototype.__lookupGetter__(P) — Annex B §B.2.2.4.
+pub fn nativeLookupGetter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return lookupAccessorAnnexB(arena, this_val, args, "get");
+}
+
+/// Object.prototype.__lookupSetter__(P) — Annex B §B.2.2.5.
+pub fn nativeLookupSetter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return lookupAccessorAnnexB(arena, this_val, args, "set");
+}
+
+fn lookupAccessorAnnexB(arena: std.mem.Allocator, this_val: Value, args: []const Value, field: []const u8) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    // Step 1: ToObject(this).
+    const o_val = try realm_mod.toObjectForThis(arena, this_val);
+    if (o_val.bits == 0 or o_val.unbox() != .object)
+        return throwTypeError(arena, "Object.prototype.__lookupGetter__ called on null or undefined");
+    // Step 2: ToPropertyKey(P) (may be a symbol).
+    const key_val = try toPropertyKeyValue(arena, if (args.len >= 1) args[0] else Value{});
+    const is_sym = key_val.bits != 0 and key_val.unbox() == .symbol;
+    const key_str: []const u8 = if (is_sym) "" else (try coerceKey(arena, key_val)) orelse "";
+
+    // Step 3: walk the prototype chain via [[GetOwnProperty]]/[[GetPrototypeOf]]
+    // (Proxy traps dispatched, so a throwing trap propagates); return the first
+    // own property's accessor handler, or undefined if that property is data.
+    var cur: ?*JsObject = o_val.toPtr().object;
+    var depth: usize = 0;
+    while (cur) |obj| {
+        if (depth >= 1000) break;
+        depth += 1;
+        // Own-property probe: a no-trap proxy forwards to its target (via `probe`),
+        // while the prototype step below still uses the original `obj`.
+        var probe = obj;
+        var guard: usize = 0;
+        inner: while (true) {
+            if (probe.internal_kind == .proxy) {
+                if (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, probe, key_val)) |d| {
+                    if (d.bits != 0 and d.unbox() == .object) {
+                        const dobj = d.toPtr().object;
+                        if (dobj.findProperty("get") != null or dobj.findProperty("set") != null)
+                            return dobj.getOwn(field) orelse val_mod.makeUndefined(arena);
+                        return val_mod.makeUndefined(arena);
+                    }
+                    break :inner; // undefined descriptor: not own at this level
+                } else {
+                    guard += 1;
+                    if (guard > 1000) break :inner;
+                    const t = proxy_mod.proxyTarget(probe) orelse break :inner;
+                    if (t.bits == 0 or t.unbox() != .object) break :inner;
+                    probe = t.toPtr().object;
+                    continue :inner;
+                }
+            } else if (is_sym) {
+                if (probe.getOwnSymEntry(key_val)) |ent| {
+                    if (ent.attr.is_accessor) {
+                        if (probe.ownAccessorHolderSym(key_val)) |hv|
+                            return hv.toPtr().object.getOwn(field) orelse val_mod.makeUndefined(arena);
+                    }
+                    return val_mod.makeUndefined(arena);
+                }
+                break :inner;
+            } else {
+                if (probe.ownAttr(key_str)) |a| {
+                    if (a.is_accessor) {
+                        if (probe.ownAccessorHolder(key_str)) |hv|
+                            return hv.toPtr().object.getOwn(field) orelse val_mod.makeUndefined(arena);
+                    }
+                    return val_mod.makeUndefined(arena);
+                }
+                break :inner;
+            }
+        }
+        // Advance to the prototype (Proxy [[GetPrototypeOf]] trap dispatched).
+        if (obj.internal_kind == .proxy) {
+            if (try proxy_mod.proxyGetPrototypeOf(arena, obj)) |p| {
+                cur = if (p.bits != 0 and p.unbox() == .object) p.toPtr().object else null;
+            } else {
+                const t = proxy_mod.proxyTarget(obj);
+                cur = if (t != null and t.?.bits != 0 and t.?.unbox() == .object) t.?.toPtr().object.proto else null;
+            }
+        } else {
+            cur = obj.proto;
+        }
+    }
+    return val_mod.makeUndefined(arena);
+}
+
 fn descTruthy(v: ?Value) bool {
     const val = v orelse return false;
     if (val.bits == 0) return false;
