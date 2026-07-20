@@ -2707,13 +2707,8 @@ built-ins/Symbol/toPrimitive/cross-realm.js
 built-ins/Symbol/unscopables/cross-realm.js
 built-ins/Temporal/Duration/basic.js
 built-ins/Temporal/Duration/compare/argument-duration-out-of-range.js
-built-ins/Temporal/Duration/compare/basic.js
-built-ins/Temporal/Duration/compare/calendar-possibly-required.js
 built-ins/Temporal/Duration/compare/duration-out-of-range-added-to-relativeto.js
 built-ins/Temporal/Duration/compare/instances-identical.js
-built-ins/Temporal/Duration/compare/options-read-before-algorithmic-validation.js
-built-ins/Temporal/Duration/compare/options-undefined.js
-built-ins/Temporal/Duration/compare/options-wrong-type.js
 built-ins/Temporal/Duration/compare/order-of-operations.js
 built-ins/Temporal/Duration/compare/relativeto-argument-propertybag-calendar-invalid-iso-string.js
 built-ins/Temporal/Duration/compare/relativeto-argument-string-calendar-invalid-iso-string.js
@@ -2732,7 +2727,6 @@ built-ins/Temporal/Duration/compare/relativeto-string-limits.js
 built-ins/Temporal/Duration/compare/relativeto-string-wrong-offset.js
 built-ins/Temporal/Duration/compare/relativeto-string.js
 built-ins/Temporal/Duration/compare/relativeto-sub-minute-offset.js
-built-ins/Temporal/Duration/compare/relativeto-undefined-throw-on-calendar-units.js
 built-ins/Temporal/Duration/compare/relativeto-year.js
 built-ins/Temporal/Duration/compare/throws-when-target-zoned-date-time-outside-valid-limits.js
 built-ins/Temporal/Duration/compare/year-zero.js
