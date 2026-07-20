@@ -3278,7 +3278,11 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
         // ES 20.1.3.6 steps 4-14: exotic internal slots select the builtin tag
         // before falling back to "Object". Array/Arguments/callable/Error/wrapper/
         // Date/RegExp each have a reserved tag.
-        .object => |obj| if (obj.is_array)
+        .object => |obj| if (obj.internal_kind == .proxy)
+            // Proxy of an array/callable is tagged as its (recursive) target
+            // (ES 20.1.3.6 steps 5-6 use IsArray/[[Call]], which unwrap proxies).
+            (if (proxyIsArrayDeep(obj)) "Array" else if (proxyIsCallableDeep(obj)) "Function" else "Object")
+        else if (obj.is_array)
             "Array"
         else if (obj.internal_kind == .mapped_arguments)
             "Arguments"
@@ -3306,10 +3310,13 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
     // Get that walks the prototype chain and invokes accessors (e.g.
     // %TypedArray%.prototype[@@toStringTag] is an inherited getter). A string
     // result overrides the builtin tag.
-    if (this_val.unbox() == .object) {
+    // ToObject(this) so a primitive receiver (e.g. a BigInt) reads @@toStringTag
+    // off its wrapper's prototype (BigInt.prototype[@@toStringTag] === "BigInt").
+    const recv = try toObjectForThis(arena, this_val);
+    if (recv.bits != 0 and recv.unbox() == .object) {
         if (active_sym_to_string_tag) |tag_sym| {
             if (active_context) |ctx| {
-                const tv = try ctx.getPropSym(arena, this_val, tag_sym);
+                const tv = try ctx.getPropSym(arena, recv, tag_sym);
                 if (tv.bits != 0 and tv.unbox() == .string) {
                     return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{tv.unbox().string}));
                 }
@@ -3317,6 +3324,45 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
         }
     }
     return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{builtin_tag}));
+}
+
+/// IsArray unwrapping proxies (ES §7.2.2): a proxy is an array iff its target is.
+fn proxyIsArrayDeep(obj: *JsObject) bool {
+    var cur = obj;
+    var depth: usize = 0;
+    while (depth < 1000) : (depth += 1) {
+        const t = proxy_mod.proxyTarget(cur) orelse return false;
+        if (t.bits == 0 or t.unbox() != .object) return false;
+        const to = t.toPtr().object;
+        if (to.internal_kind == .proxy) {
+            cur = to;
+            continue;
+        }
+        return to.is_array;
+    }
+    return false;
+}
+
+/// [[Call]] presence unwrapping proxies: a proxy is callable iff its target is.
+fn proxyIsCallableDeep(obj: *JsObject) bool {
+    var cur = obj;
+    var depth: usize = 0;
+    while (depth < 1000) : (depth += 1) {
+        const t = proxy_mod.proxyTarget(cur) orelse return false;
+        if (t.bits == 0) return false;
+        switch (t.unbox()) {
+            .function, .bc_function, .native_function => return true,
+            .object => |to| {
+                if (to.internal_kind == .proxy) {
+                    cur = to;
+                    continue;
+                }
+                return to.internal_kind == .bound_function or to.get("__call__") != null;
+            },
+            else => return false,
+        }
+    }
+    return false;
 }
 
 fn nativeObjectProtoValueOf(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -4441,6 +4487,10 @@ pub const Realm = struct {
         if (active_sym_to_string_tag) |symv| {
             // Symbol.prototype[@@toStringTag] = "Symbol" (non-writable/enumerable, configurable).
             _ = try symbol_proto.defineOwnDataSym(symv, try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
+            // BigInt.prototype[@@toStringTag] = "BigInt" (same attrs) so
+            // Object.prototype.toString.call(1n) yields "[object BigInt]".
+            if (active_bigint_proto) |bp|
+                _ = try bp.defineOwnDataSym(symv, try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
         }
         if (active_sym_to_string_tag) |symv| {
             // Math[@@toStringTag] = "Math", JSON[@@toStringTag] = "JSON"
