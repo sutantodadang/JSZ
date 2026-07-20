@@ -2177,10 +2177,14 @@ fn rawToStr(arena: std.mem.Allocator, v: Value) ![]const u8 {
         .boolean => |b| return if (b) "true" else "false",
         .null_ => return "null",
         .undefined_ => return "undefined",
+        .bigint => |b| return try val_mod.bigIntToString(arena, b),
+        // ToString(symbol) throws a TypeError (§7.1.17).
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a string"),
         else => {
             if (try coercion_mod.toPrimitive(arena, v, .string)) |prim| {
                 if (prim.bits != 0 and prim.unbox() == .string) return prim.toPtr().string;
-                if (prim.bits != 0 and prim.unbox() == .number) return try val_mod.formatNumber(arena, prim.unbox().number);
+                if (prim.bits != 0 and prim.unbox() == .symbol) return throwTypeError(arena, "Cannot convert a Symbol value to a string");
+                return try stringPrimitive(arena, prim);
             }
             return "[object Object]";
         },
@@ -2192,16 +2196,38 @@ fn rawToStr(arena: std.mem.Allocator, v: Value) ![]const u8 {
 fn nativeStringRaw(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object)
         return throwTypeError(arena, "String.raw called on non-object");
-    const raw_v = args[0].toPtr().object.get("raw") orelse return val_mod.makeString(arena, "");
+    // raw = ToObject(Get(cooked, "raw")); a getter's abrupt completion propagates
+    // and a non-object raw throws (ToObject on undefined/null/primitive).
+    const raw_v = if (active_context) |ctx| try ctx.getProp(arena, args[0], "raw") else (args[0].toPtr().object.get("raw") orelse Value{});
     if (raw_v.bits == 0 or raw_v.unbox() != .object)
-        return val_mod.makeString(arena, "");
+        return throwTypeError(arena, "String.raw: template.raw must be an object");
     const raw = raw_v.toPtr().object;
-    const seg_count = raw.array_length;
+    // literalSegments = LengthOfArrayLike(raw) = ToLength(Get(raw, "length")) —
+    // a generic array-like `raw` (not necessarily a real Array) is honored. Read
+    // through the context so an array's synthetic length and inherited/getter
+    // "length" (and its valueOf coercion) are resolved.
+    const len_v: Value = if (active_context) |ctx| try ctx.getProp(arena, raw_v, "length") else (raw.get("length") orelse Value{});
+    // ToLength(Get(raw,"length")) → ToNumber throws for a Symbol/BigInt length.
+    if (len_v.bits != 0) switch (len_v.unbox()) {
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+        .bigint => return throwTypeError(arena, "Cannot convert a BigInt value to a number"),
+        else => {},
+    };
+    const len_num = if (len_v.bits != 0 and len_v.unbox() == .object)
+        toNumberCoerce((try coercion_mod.toPrimitive(arena, len_v, .number)) orelse len_v)
+    else
+        toNumberCoerce(len_v);
+    const seg_count: usize = if (std.math.isNan(len_num) or len_num <= 0)
+        0
+    else if (len_num >= 9007199254740991.0)
+        9007199254740991
+    else
+        @intFromFloat(@trunc(len_num));
     var buf = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < seg_count) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const seg = raw.getOwn(key) orelse Value{};
+        const seg = if (active_context) |ctx| try ctx.getProp(arena, raw_v, key) else (raw.get(key) orelse Value{});
         try buf.appendSlice(arena, try rawToStr(arena, seg));
         // Interleave substitution i (args[i+1]) between segments, but not after last.
         if (i + 1 < seg_count and i + 1 < args.len) {
@@ -3278,7 +3304,11 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
         // ES 20.1.3.6 steps 4-14: exotic internal slots select the builtin tag
         // before falling back to "Object". Array/Arguments/callable/Error/wrapper/
         // Date/RegExp each have a reserved tag.
-        .object => |obj| if (obj.is_array)
+        .object => |obj| if (obj.internal_kind == .proxy)
+            // Proxy of an array/callable is tagged as its (recursive) target
+            // (ES 20.1.3.6 steps 5-6 use IsArray/[[Call]], which unwrap proxies).
+            (if (proxyIsArrayDeep(obj)) "Array" else if (proxyIsCallableDeep(obj)) "Function" else "Object")
+        else if (obj.is_array)
             "Array"
         else if (obj.internal_kind == .mapped_arguments)
             "Arguments"
@@ -3306,10 +3336,13 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
     // Get that walks the prototype chain and invokes accessors (e.g.
     // %TypedArray%.prototype[@@toStringTag] is an inherited getter). A string
     // result overrides the builtin tag.
-    if (this_val.unbox() == .object) {
+    // ToObject(this) so a primitive receiver (e.g. a BigInt) reads @@toStringTag
+    // off its wrapper's prototype (BigInt.prototype[@@toStringTag] === "BigInt").
+    const recv = try toObjectForThis(arena, this_val);
+    if (recv.bits != 0 and recv.unbox() == .object) {
         if (active_sym_to_string_tag) |tag_sym| {
             if (active_context) |ctx| {
-                const tv = try ctx.getPropSym(arena, this_val, tag_sym);
+                const tv = try ctx.getPropSym(arena, recv, tag_sym);
                 if (tv.bits != 0 and tv.unbox() == .string) {
                     return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{tv.unbox().string}));
                 }
@@ -3317,6 +3350,45 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
         }
     }
     return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "[object {s}]", .{builtin_tag}));
+}
+
+/// IsArray unwrapping proxies (ES §7.2.2): a proxy is an array iff its target is.
+fn proxyIsArrayDeep(obj: *JsObject) bool {
+    var cur = obj;
+    var depth: usize = 0;
+    while (depth < 1000) : (depth += 1) {
+        const t = proxy_mod.proxyTarget(cur) orelse return false;
+        if (t.bits == 0 or t.unbox() != .object) return false;
+        const to = t.toPtr().object;
+        if (to.internal_kind == .proxy) {
+            cur = to;
+            continue;
+        }
+        return to.is_array;
+    }
+    return false;
+}
+
+/// [[Call]] presence unwrapping proxies: a proxy is callable iff its target is.
+fn proxyIsCallableDeep(obj: *JsObject) bool {
+    var cur = obj;
+    var depth: usize = 0;
+    while (depth < 1000) : (depth += 1) {
+        const t = proxy_mod.proxyTarget(cur) orelse return false;
+        if (t.bits == 0) return false;
+        switch (t.unbox()) {
+            .function, .bc_function, .native_function => return true,
+            .object => |to| {
+                if (to.internal_kind == .proxy) {
+                    cur = to;
+                    continue;
+                }
+                return to.internal_kind == .bound_function or to.get("__call__") != null;
+            },
+            else => return false,
+        }
+    }
+    return false;
 }
 
 fn nativeObjectProtoValueOf(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -4098,6 +4170,7 @@ pub const Realm = struct {
                 const m_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
                 const StaticMethod = struct { name: []const u8, fn_ptr: val_mod.NativeFnPtr, len: u32 };
                 const static_methods = [_]StaticMethod{
+                    .{ .name = "create", .fn_ptr = nativeObjectCreate, .len = 2 },
                     .{ .name = "keys", .fn_ptr = obj_methods_mod.nativeObjectKeys, .len = 1 },
                     .{ .name = "values", .fn_ptr = obj_methods_mod.nativeObjectValues, .len = 1 },
                     .{ .name = "entries", .fn_ptr = obj_methods_mod.nativeObjectEntries, .len = 1 },
@@ -4140,6 +4213,15 @@ pub const Realm = struct {
             try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoValueOf, "valueOf", 0), meth_attr);
         _ = try object_proto.defineOwnData("toLocaleString",
             try val_mod.makeNativeFunctionNamed(arena, array_proto_mod.nativeObjectToLocaleString, "toLocaleString", 0), meth_attr);
+        // Annex B §B.2.2.2-5: legacy accessor helpers on Object.prototype.
+        _ = try object_proto.defineOwnData("__defineGetter__",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeDefineGetter, "__defineGetter__", 2), meth_attr);
+        _ = try object_proto.defineOwnData("__defineSetter__",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeDefineSetter, "__defineSetter__", 2), meth_attr);
+        _ = try object_proto.defineOwnData("__lookupGetter__",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeLookupGetter, "__lookupGetter__", 1), meth_attr);
+        _ = try object_proto.defineOwnData("__lookupSetter__",
+            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeLookupSetter, "__lookupSetter__", 1), meth_attr);
         // Annex B §B.2.2.1: Object.prototype.__proto__ accessor (get/set the
         // receiver's [[Prototype]]). Enumerable:false, configurable:true.
         const proto_acc_holder = try JsObject.create(arena, null);
@@ -4431,6 +4513,10 @@ pub const Realm = struct {
         if (active_sym_to_string_tag) |symv| {
             // Symbol.prototype[@@toStringTag] = "Symbol" (non-writable/enumerable, configurable).
             _ = try symbol_proto.defineOwnDataSym(symv, try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
+            // BigInt.prototype[@@toStringTag] = "BigInt" (same attrs) so
+            // Object.prototype.toString.call(1n) yields "[object BigInt]".
+            if (active_bigint_proto) |bp|
+                _ = try bp.defineOwnDataSym(symv, try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
         }
         if (active_sym_to_string_tag) |symv| {
             // Math[@@toStringTag] = "Math", JSON[@@toStringTag] = "JSON"

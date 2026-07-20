@@ -246,7 +246,9 @@ pub fn nativeObjectAssign(arena: std.mem.Allocator, _: Value, args: []const Valu
         for (src_obj.ownKeys()) |k| {
             if (!src_obj.isEnumerable(k)) continue;
             const v = if (ctx) |c| try c.getProp(arena, from_val, k) else (src_obj.getOwn(k) orelse continue);
-            if (ctx) |c| try c.setProp(arena, to_val, k, v) else try target_obj.set(k, v);
+            // Set(to, key, value, true): a read-only/frozen/non-extensible target
+            // raises TypeError (§20.1.2.1 step 5.c.iii).
+            if (ctx) |c| try c.setPropThrow(arena, to_val, k, v) else try target_obj.set(k, v);
         }
         // Copy enumerable symbol-keyed own properties.
         var si: usize = 0;
@@ -626,14 +628,142 @@ fn descIsCallable(v: Value) bool {
     };
 }
 
+/// Build a one-shot descriptor object holding `{get|set: fn, enumerable:true,
+/// configurable:true}`, used by __defineGetter__/__defineSetter__.
+fn makeAccessorDescObj(arena: std.mem.Allocator, field: []const u8, fnv: Value) !Value {
+    const realm_mod = @import("../realm.zig");
+    const proto: ?*JsObject = realm_mod.active_object_proto;
+    const d = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, proto)
+    else
+        try JsObject.create(arena, proto);
+    try d.set(field, fnv);
+    try d.set("enumerable", try val_mod.makeBool(arena, true));
+    try d.set("configurable", try val_mod.makeBool(arena, true));
+    return val_mod.makeObject(arena, d);
+}
+
+/// Object.prototype.__defineGetter__(P, getter) — Annex B §B.2.2.2.
+pub fn nativeDefineGetter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return defineAccessorAnnexB(arena, this_val, args, "get");
+}
+
+/// Object.prototype.__defineSetter__(P, setter) — Annex B §B.2.2.3.
+pub fn nativeDefineSetter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return defineAccessorAnnexB(arena, this_val, args, "set");
+}
+
+fn defineAccessorAnnexB(arena: std.mem.Allocator, this_val: Value, args: []const Value, field: []const u8) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    // Step 1: ToObject(this) — null/undefined throw.
+    const o_val = try realm_mod.toObjectForThis(arena, this_val);
+    if (o_val.bits == 0 or o_val.unbox() != .object)
+        return throwTypeError(arena, "Object.prototype.__defineGetter__ called on null or undefined");
+    // Step 2: the getter/setter must be callable.
+    const fnv = if (args.len >= 2) args[1] else Value{};
+    if (!descIsCallable(fnv))
+        return throwTypeError(arena, "Object.prototype.__defineGetter__: Expecting a function");
+    const desc = try makeAccessorDescObj(arena, field, fnv);
+    const p = if (args.len >= 1) args[0] else Value{};
+    _ = try nativeObjectDefineProperty(arena, o_val, &[_]Value{ o_val, p, desc });
+    return val_mod.makeUndefined(arena);
+}
+
+/// Object.prototype.__lookupGetter__(P) — Annex B §B.2.2.4.
+pub fn nativeLookupGetter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return lookupAccessorAnnexB(arena, this_val, args, "get");
+}
+
+/// Object.prototype.__lookupSetter__(P) — Annex B §B.2.2.5.
+pub fn nativeLookupSetter(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return lookupAccessorAnnexB(arena, this_val, args, "set");
+}
+
+fn lookupAccessorAnnexB(arena: std.mem.Allocator, this_val: Value, args: []const Value, field: []const u8) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
+    // Step 1: ToObject(this).
+    const o_val = try realm_mod.toObjectForThis(arena, this_val);
+    if (o_val.bits == 0 or o_val.unbox() != .object)
+        return throwTypeError(arena, "Object.prototype.__lookupGetter__ called on null or undefined");
+    // Step 2: ToPropertyKey(P) (may be a symbol).
+    const key_val = try toPropertyKeyValue(arena, if (args.len >= 1) args[0] else Value{});
+    const is_sym = key_val.bits != 0 and key_val.unbox() == .symbol;
+    const key_str: []const u8 = if (is_sym) "" else (try coerceKey(arena, key_val)) orelse "";
+
+    // Step 3: walk the prototype chain via [[GetOwnProperty]]/[[GetPrototypeOf]]
+    // (Proxy traps dispatched, so a throwing trap propagates); return the first
+    // own property's accessor handler, or undefined if that property is data.
+    var cur: ?*JsObject = o_val.toPtr().object;
+    var depth: usize = 0;
+    while (cur) |obj| {
+        if (depth >= 1000) break;
+        depth += 1;
+        // Own-property probe: a no-trap proxy forwards to its target (via `probe`),
+        // while the prototype step below still uses the original `obj`.
+        var probe = obj;
+        var guard: usize = 0;
+        inner: while (true) {
+            if (probe.internal_kind == .proxy) {
+                if (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, probe, key_val)) |d| {
+                    if (d.bits != 0 and d.unbox() == .object) {
+                        const dobj = d.toPtr().object;
+                        if (dobj.findProperty("get") != null or dobj.findProperty("set") != null)
+                            return dobj.getOwn(field) orelse val_mod.makeUndefined(arena);
+                        return val_mod.makeUndefined(arena);
+                    }
+                    break :inner; // undefined descriptor: not own at this level
+                } else {
+                    guard += 1;
+                    if (guard > 1000) break :inner;
+                    const t = proxy_mod.proxyTarget(probe) orelse break :inner;
+                    if (t.bits == 0 or t.unbox() != .object) break :inner;
+                    probe = t.toPtr().object;
+                    continue :inner;
+                }
+            } else if (is_sym) {
+                if (probe.getOwnSymEntry(key_val)) |ent| {
+                    if (ent.attr.is_accessor) {
+                        if (probe.ownAccessorHolderSym(key_val)) |hv|
+                            return hv.toPtr().object.getOwn(field) orelse val_mod.makeUndefined(arena);
+                    }
+                    return val_mod.makeUndefined(arena);
+                }
+                break :inner;
+            } else {
+                if (probe.ownAttr(key_str)) |a| {
+                    if (a.is_accessor) {
+                        if (probe.ownAccessorHolder(key_str)) |hv|
+                            return hv.toPtr().object.getOwn(field) orelse val_mod.makeUndefined(arena);
+                    }
+                    return val_mod.makeUndefined(arena);
+                }
+                break :inner;
+            }
+        }
+        // Advance to the prototype (Proxy [[GetPrototypeOf]] trap dispatched).
+        if (obj.internal_kind == .proxy) {
+            if (try proxy_mod.proxyGetPrototypeOf(arena, obj)) |p| {
+                cur = if (p.bits != 0 and p.unbox() == .object) p.toPtr().object else null;
+            } else {
+                const t = proxy_mod.proxyTarget(obj);
+                cur = if (t != null and t.?.bits != 0 and t.?.unbox() == .object) t.?.toPtr().object.proto else null;
+            }
+        } else {
+            cur = obj.proto;
+        }
+    }
+    return val_mod.makeUndefined(arena);
+}
+
 fn descTruthy(v: ?Value) bool {
     const val = v orelse return false;
     if (val.bits == 0) return false;
     return switch (val.unbox()) {
         .number => |n| n != 0 and !std.math.isNan(n),
         .string => |s| s.len != 0,
-        .object => true,
+        .object, .function, .native_function, .bc_function, .symbol => true,
         .boolean => |b| b,
+        .bigint => |b| !b.toConst().eqlZero(),
         else => false,
     };
 }
@@ -737,6 +867,96 @@ pub fn arraySetLengthThrowing(arena: std.mem.Allocator, obj: *JsObject, value: V
     if (@as(f64, @floatFromInt(u)) != num)
         return throwRangeError(arena, "Invalid array length");
     try obj.set("length", try val_mod.makeNumber(arena, @floatFromInt(u)));
+}
+
+/// ArraySetLength (ES §10.4.2.4) as a [[DefineOwnProperty]] on "length": enforces
+/// the length [[Writable]] attribute, the non-configurable/non-enumerable
+/// invariants, and the "shrink stops at the highest non-configurable element"
+/// rule (setting length to blocker+1 and throwing).
+fn arrayDefineLength(arena: std.mem.Allocator, obj: *JsObject, desc_val: Value, desc: *JsObject) anyerror!void {
+    // length is a data property: accessor descriptors are rejected.
+    if (descHas(desc, "get") or descHas(desc, "set"))
+        return throwTypeError(arena, "Invalid property descriptor for array length");
+
+    const old_len: u32 = obj.array_length;
+    const want_writable: ?bool = if (descHas(desc, "writable"))
+        descTruthy(try descGet(arena, desc_val, desc, "writable"))
+    else
+        null;
+
+    // §10.4.2.4 steps 3-6: when the descriptor has a [[Value]], coerce it to a
+    // Uint32 (running user valueOf/@@toPrimitive) and RangeError a value that is
+    // not a valid array length — BEFORE the configurable/enumerable invariant
+    // checks (Object.defineProperty([], "length", {value:-1, configurable:true})
+    // throws RangeError, not TypeError).
+    const new_len: ?u32 = if (descHas(desc, "value")) blk: {
+        const lv = try descGet(arena, desc_val, desc, "value");
+        var pv = lv;
+        if (pv.bits != 0 and pv.unbox() == .object)
+            pv = (try @import("coercion.zig").toPrimitive(arena, pv, .number)) orelse pv;
+        if (pv.bits != 0) switch (pv.unbox()) {
+            .bigint => return throwTypeError(arena, "Cannot convert a BigInt value to a number"),
+            .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+            else => {},
+        };
+        const num = try toNumberForLength(arena, pv);
+        const u = toUint32(num);
+        if (@as(f64, @floatFromInt(u)) != num)
+            return throwRangeError(arena, "Invalid array length");
+        break :blk u;
+    } else null;
+
+    // Non-configurable, non-enumerable: a descriptor requesting either throws.
+    if (descHas(desc, "configurable") and descTruthy(try descGet(arena, desc_val, desc, "configurable")))
+        return throwTypeError(arena, "cannot make array length configurable");
+    if (descHas(desc, "enumerable") and descTruthy(try descGet(arena, desc_val, desc, "enumerable")))
+        return throwTypeError(arena, "cannot make array length enumerable");
+
+    if (new_len == null) {
+        // No value change: only the writable attribute may move. A non-writable,
+        // non-configurable length can never be made writable again.
+        if (want_writable) |w| {
+            if (w and !obj.array_length_writable)
+                return throwTypeError(arena, "cannot redefine non-writable array length as writable");
+            obj.array_length_writable = w;
+        }
+        return;
+    }
+    const new_len_v = new_len.?;
+
+    if (new_len_v >= old_len) {
+        // Grow (or no-op): a non-writable length still rejects any actual change.
+        if (!obj.array_length_writable and new_len_v != old_len)
+            return throwTypeError(arena, "cannot change length of a non-writable array");
+        try obj.set("length", try val_mod.makeNumber(arena, @floatFromInt(new_len_v)));
+        if (want_writable) |w| obj.array_length_writable = w;
+        return;
+    }
+
+    // Shrink: a non-writable length rejects outright.
+    if (!obj.array_length_writable)
+        return throwTypeError(arena, "cannot change length of a non-writable array");
+
+    // Find the highest own, non-configurable index in [new_len, old_len): the
+    // shrink stops just above it (§10.4.2.4 step 17).
+    var blocker: ?u32 = null;
+    for (obj.ownKeys()) |k| {
+        if (k.len == 0) continue;
+        if (k.len > 1 and k[0] == '0') continue; // non-canonical index string
+        const idx = std.fmt.parseUnsigned(u32, k, 10) catch continue;
+        if (idx == std.math.maxInt(u32)) continue;
+        if (idx < new_len_v or idx >= old_len) continue;
+        if (obj.ownAttr(k)) |a| {
+            if (!a.configurable) {
+                if (blocker == null or idx > blocker.?) blocker = idx;
+            }
+        }
+    }
+    const target_len = if (blocker) |b| b + 1 else new_len_v;
+    try obj.set("length", try val_mod.makeNumber(arena, @floatFromInt(target_len)));
+    if (want_writable) |w| obj.array_length_writable = w;
+    if (blocker != null)
+        return throwTypeError(arena, "cannot delete non-configurable array element");
 }
 
 fn throwReferenceErrorObj(arena: std.mem.Allocator, name: []const u8) anyerror {
@@ -1241,7 +1461,7 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
         const obj_proto_len: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
         const dlen = try JsObject.create(arena, obj_proto_len);
         try dlen.set("value", try val_mod.makeNumber(arena, @floatFromInt(obj.getArrayLength())));
-        try dlen.set("writable", try val_mod.makeBool(arena, obj.extensible));
+        try dlen.set("writable", try val_mod.makeBool(arena, obj.array_length_writable));
         try dlen.set("enumerable", try val_mod.makeBool(arena, false));
         try dlen.set("configurable", try val_mod.makeBool(arena, false));
         return val_mod.makeObject(arena, dlen);
@@ -1318,7 +1538,10 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     const obj = try defineTarget(arena, if (args.len >= 1) args[0] else Value{}) orelse
         return throwTypeError(arena, "Object.defineProperty called on non-object");
 
-    const key_raw = if (args.len >= 2) args[1] else Value{};
+    // ToPropertyKey(P) (§20.1.2.4 step 2), before ToPropertyDescriptor: an object
+    // key (e.g. `[1,2]`) is ToPrimitive(string)→ToString ("1,2"); the result is a
+    // string or (via @@toPrimitive) a symbol.
+    const key_raw = try toPropertyKeyValue(arena, if (args.len >= 2) args[1] else Value{});
 
     // Symbol-keyed [[DefineOwnProperty]]: ordinary, never integer-indexed.
     if (key_raw.bits != 0 and key_raw.unbox() == .symbol) {
@@ -1465,16 +1688,18 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     // §10.4.2.4): the new length is ToUint32(value) and must equal ToNumber(value),
     // else a RangeError is thrown. Setting a smaller length truncates the array.
     if (obj.is_array and std.mem.eql(u8, key, "length")) {
-        if (descHas(desc, "get") or descHas(desc, "set"))
-            return throwTypeError(arena, "cannot redefine property: length");
-        if (descHas(desc, "value")) {
-            const lv = try descGet(arena, desc_val, desc, "value");
-            try arraySetLengthThrowing(arena, obj, lv);
-        }
+        try arrayDefineLength(arena, obj, desc_val, desc);
         return args[0];
     }
 
-    if (descHas(desc, "get") or descHas(desc, "set")) {
+    // Classify the descriptor (§6.2.6): a generic descriptor (no value/writable/
+    // get/set) applied to an EXISTING accessor must preserve it as an accessor
+    // — only its enumerable/configurable change. Otherwise it would clobber the
+    // getter/setter with a fresh `undefined` data property.
+    const desc_is_accessor = descHas(desc, "get") or descHas(desc, "set");
+    const desc_is_data = descHas(desc, "value") or descHas(desc, "writable");
+    const existing_is_accessor = if (obj.ownAttr(key)) |a| a.is_accessor else false;
+    if (desc_is_accessor or (!desc_is_data and existing_is_accessor)) {
         // Partial descriptor: omitted get/set/enumerable/configurable keep the
         // EXISTING accessor's handlers/attributes (redefine), else default
         // undefined/false (create). Preserving the absent handler is required by
@@ -1515,14 +1740,14 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     var has_own_data = false;
     var cur_val: ?Value = null;
     if (obj.ownAttr(key)) |a| { // dense-aware own-property attrs
-        {
-            if (!a.is_accessor) {
-                cur_w = a.writable;
-                cur_e = a.enumerable;
-                cur_c = a.configurable;
-                cur_val = obj.getOwn(key);
-                has_own_data = true;
-            }
+        // Converting an accessor → data preserves the existing enumerable/
+        // configurable and defaults writable/value (§10.1.6.3 step 4.b.i).
+        cur_e = a.enumerable;
+        cur_c = a.configurable;
+        if (!a.is_accessor) {
+            cur_w = a.writable;
+            cur_val = obj.getOwn(key);
+            has_own_data = true;
         }
     }
     const value = if (descHas(desc, "value"))
@@ -1547,22 +1772,47 @@ pub fn nativeObjectDefineProperties(arena: std.mem.Allocator, _: Value, args: []
         return throwTypeError(arena, "Object.defineProperties called on non-object");
     }
 
-    if (args.len < 2 or args[1].bits == 0 or args[1].unbox() != .object) {
+    // Step 2: props = ToObject(Properties). null/undefined throw TypeError;
+    // other primitives box (and expose no relevant enumerable own keys).
+    const props_val = if (args.len >= 2) args[1] else Value{};
+    if (props_val.bits == 0 or props_val.unbox() == .undefined_ or props_val.unbox() == .null_)
+        return throwTypeError(arena, "Object.defineProperties: Properties must be coercible to an object");
+    const props = (try resolveObject(arena, props_val)) orelse {
+        // ToObject(string) yields a String exotic whose indexed own properties are
+        // enumerable single-char strings; ToPropertyDescriptor of the first char
+        // throws TypeError (a non-object descriptor). Empty string is a no-op.
+        if (props_val.unbox() == .string and props_val.toPtr().string.len > 0)
+            return throwTypeError(arena, "Property description must be an object");
+        const realm_mod = @import("../realm.zig");
+        const boxed = try realm_mod.toObjectForThis(arena, props_val);
+        if (boxed.bits != 0 and boxed.unbox() == .object) {
+            return defineFromProps(arena, args[0], boxed, boxed.toPtr().object);
+        }
         return args[0];
-    }
-    const props = args[1].toPtr().object;
+    };
+    return defineFromProps(arena, args[0], props_val, props);
+}
 
+/// Shared body of Object.defineProperties: for each enumerable own key of `props`,
+/// ToPropertyDescriptor(Get(props, key)) then DefinePropertyOrThrow(O, key, desc).
+/// A non-object descriptor value makes ToPropertyDescriptor throw TypeError.
+fn defineFromProps(arena: std.mem.Allocator, target: Value, props_val: Value, props: *JsObject) anyerror!Value {
     // Delegate each property to Object.defineProperty so exotic [[DefineOwnProperty]]
     // (TypedArray integer-indexed elements, Proxy, module namespace) is honored
     // instead of writing straight to ordinary property storage.
     for (props.ownKeys()) |k| {
         if (!props.isEnumerable(k)) continue;
-        const desc_val = props.getOwn(k) orelse continue;
-        if (desc_val.bits == 0 or desc_val.unbox() != .object) continue;
+        // Get(props, k) — invokes getters (with props as the receiver), so an
+        // accessor-backed descriptor property is honored with its side effects.
+        const desc_val = try descGet(arena, props_val, props, k);
+        // ToPropertyDescriptor requires an object (functions count); a primitive
+        // descriptor value throws TypeError.
+        if ((try resolveObject(arena, desc_val)) == null)
+            return throwTypeError(arena, "Property description must be an object");
         const key_val = try val_mod.makeString(arena, k);
-        _ = try nativeObjectDefineProperty(arena, args[0], &[_]Value{ args[0], key_val, desc_val });
+        _ = try nativeObjectDefineProperty(arena, target, &[_]Value{ target, key_val, desc_val });
     }
-    return args[0];
+    return target;
 }
 
 /// Object.freeze(o): freeze the object (non-extensible, all props non-writable/non-configurable).

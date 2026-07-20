@@ -70,6 +70,9 @@ pub const JsObject = struct {
     is_error: bool = false,
     /// Cached length for array-backed objects.
     array_length: u32 = 0,
+    /// Array "length" [[Writable]] attribute (ES §10.4.2). Default writable;
+    /// set false by `Object.defineProperty(arr,"length",{writable:false})`.
+    array_length_writable: bool = true,
     /// Whether new properties can be added (Phase 3a: always true).
     extensible: bool = true,
     /// True when this object was allocated by Heap.allocateObject (has a
@@ -344,6 +347,9 @@ pub const JsObject = struct {
         // a shrink, delete the now-out-of-range indexed own properties. A `length`
         // assignment never creates an ordinary "length" data slot.
         if (self.is_array and std.mem.eql(u8, key, "length")) {
+            // A non-writable length silently ignores plain `arr.length = v` writes
+            // (the strict-mode throwing path is handled by the caller).
+            if (!self.array_length_writable) return;
             const new_len = arrayLengthFromValue(value) orelse return;
             if (self.usesDense()) {
                 // Dense shrink: drop the now-out-of-range trailing elements. A grow
@@ -699,6 +705,9 @@ pub const JsObject = struct {
     pub fn freezeSelf(self: *JsObject) void {
         self.deoptDenseBestEffort(); // materialize element attrs before freezing
         self.extensible = false;
+        // An array's synthetic "length" is a data property: freeze makes it
+        // non-writable (it is already non-configurable).
+        if (self.is_array) self.array_length_writable = false;
         for (self.attrs.items) |*a| {
             a.configurable = false;
             a.writable = false;
@@ -724,6 +733,8 @@ pub const JsObject = struct {
     /// Object.isFrozen: sealed and every own data prop non-writable.
     pub fn isFrozenSelf(self: *JsObject) bool {
         if (self.extensible) return false;
+        // A frozen array must have a non-writable "length".
+        if (self.is_array and self.array_length_writable) return false;
         for (self.attrs.items) |a| {
             if (a.configurable or a.writable) return false;
         }

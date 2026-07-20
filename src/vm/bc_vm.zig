@@ -2345,6 +2345,16 @@ pub const BcVm = struct {
                         // with the original receiver preserved.
                         if (pp.internal_kind == .proxy)
                             return try self.proxyGet(obj_val, pp, try val_mod.makeString(self.arena, key));
+                        // An inherited array in the proto chain exposes its synthetic
+                        // "length" and dense elements, which findProperty (shape slots
+                        // only) cannot see.
+                        if (pp.is_array and std.mem.eql(u8, key, "length"))
+                            return val_mod.makeNumber(self.arena, @floatFromInt(pp.getArrayLength()));
+                        if (pp.usesDense()) {
+                            if (JsObject.canonicalArrayIndex(key)) |_| {
+                                if (pp.getOwn(key)) |v| return v;
+                            }
+                        }
                         p = pp.proto;
                     }
                 }
@@ -2725,6 +2735,9 @@ pub const BcVm = struct {
                     const u = toUint32FromNumber(num);
                     if (@as(f64, @floatFromInt(u)) != num)
                         return self.throwRangeErr("Invalid array length");
+                    // [[Set]] of a non-writable data property always fails (§10.1.9.2),
+                    // even to the same value; the strict/throwing caller then throws.
+                    if (!obj.array_length_writable) return false;
                     try obj.set("length", try val_mod.makeNumber(self.arena, @floatFromInt(u)));
                     return true;
                 }
@@ -3651,12 +3664,13 @@ pub const BcVm = struct {
             }
             break :blk true;
         };
-        if (simple) {
-            const md = try self.arena.create(MappedArgsData);
-            md.* = .{ .env = env, .param_names = fn_ptr.param_names, .count = @min(args.len, fn_ptr.param_names.len) };
-            obj.internal_kind = .mapped_arguments;
-            obj.internal_slot = md;
-        }
+        // Every arguments object (mapped or unmapped) carries the [[ParameterMap]]
+        // internal slot so Object.prototype.toString tags it "[object Arguments]".
+        // `count` = 0 for unmapped lists, which disables index aliasing.
+        const md = try self.arena.create(MappedArgsData);
+        md.* = .{ .env = env, .param_names = fn_ptr.param_names, .count = if (simple) @min(args.len, fn_ptr.param_names.len) else 0 };
+        obj.internal_kind = .mapped_arguments;
+        obj.internal_slot = md;
         try env.define("arguments", try val_mod.makeObject(self.arena, obj));
     }
 
