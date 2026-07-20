@@ -291,6 +291,9 @@ pub fn asyncDoneSignaled() bool {
 /// only between fully-deinit'd isolates (no live object may reference a shape).
 pub fn resetGlobalShapes() void {
     @import("./value/shape.zig").resetGlobalManager();
+    // The dense-array index-string pool caches slices allocated from the shape
+    // arena just reset above; clear it so the stale pointers are not reused.
+    @import("./object/object.zig").resetIndexKeyPool();
 }
 
 /// EXPERIMENTAL (unstable, may change before 1.0).

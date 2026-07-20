@@ -32,6 +32,14 @@ const DENSE_MAX_GAP: usize = 1024;
 /// isolate, so no synchronization is needed.
 var index_key_pool: std.ArrayListUnmanaged([]const u8) = .empty;
 
+/// Drop the cached index strings. The pool's entries are allocated from the
+/// shape manager's arena, so it MUST be cleared whenever that arena is reset
+/// (resetGlobalShapes) — otherwise the retained slices dangle into freed memory
+/// and the next dense-key enumeration reads use-after-free.
+pub fn resetIndexKeyPool() void {
+    index_key_pool = .empty;
+}
+
 fn indexKeyString(alloc: std.mem.Allocator, i: u32) ![]const u8 {
     while (index_key_pool.items.len <= i) {
         const n: u32 = @intCast(index_key_pool.items.len);
@@ -95,7 +103,7 @@ pub const JsObject = struct {
     /// Arena-allocated; MUST NOT be traversed by markObject.
     internal_slot: ?*anyopaque = null,
     /// Phase 4c/4d: discriminator for internal_slot type.
-    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, weakref, finalization_registry, promise, generator, async_generator, return_completion, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function, mapped_arguments, map_iterator, set_iterator, array_iterator, iterator_helper, temporal_instant, temporal_duration, temporal_plain_date, temporal_plain_time, temporal_plain_date_time, temporal_zoned_date_time, temporal_plain_year_month, temporal_plain_month_day, promise_resolver } = .none,
+    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, weakref, finalization_registry, promise, generator, async_generator, return_completion, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function, mapped_arguments, map_iterator, set_iterator, array_iterator, iterator_helper, temporal_instant, temporal_duration, temporal_plain_date, temporal_plain_time, temporal_plain_date_time, temporal_zoned_date_time, temporal_plain_year_month, temporal_plain_month_day, promise_resolver, disposable_stack, async_disposable_stack } = .none,
     /// Allocator for property storage (the eval arena).
     arena: std.mem.Allocator,
     /// Phase 6 hidden class manager (shared globally).
@@ -623,6 +631,13 @@ pub const JsObject = struct {
     /// Returns false (caller should throw TypeError) when disallowed by
     /// non-configurability or non-extensibility. Honors lockstep growth.
     pub fn defineOwnData(self: *JsObject, key: []const u8, value: Value, attr: PropAttr) !bool {
+        // Array exotic [[DefineOwnProperty]]: an index at or beyond the current
+        // length cannot be added when "length" is non-writable (ES §10.4.2.1).
+        if (self.is_array and !self.array_length_writable) {
+            if (canonicalArrayIndex(key)) |idx| {
+                if (idx >= self.array_length) return false;
+            }
+        }
         if (self.usesDense()) {
             if (canonicalArrayIndex(key)) |idx| {
                 // A plain data descriptor with the default attributes is exactly a
@@ -778,8 +793,10 @@ pub const JsObject = struct {
             const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
             if (!cur.configurable) {
                 // Non-configurable: a redefine is rejected unless it makes no
-                // observable change — same accessor with identical get/set and
-                // unchanged enumerable (ValidateAndApplyPropertyDescriptor).
+                // observable change — cannot become configurable, same accessor
+                // with identical get/set and unchanged enumerable
+                // (ValidateAndApplyPropertyDescriptor).
+                if (attr.configurable) return false;
                 if (!cur.is_accessor or cur.enumerable != attr.enumerable) return false;
                 const cur_holder = if (slot < self.slots.items.len) self.slots.items[slot] else Value{};
                 if (!accessorHoldersEqual(cur_holder, holder)) return false;
@@ -996,12 +1013,19 @@ pub const JsObject = struct {
 /// numeric equality (pointer-boxed numbers may differ in bits while equal).
 fn sameValueRough(a: Value, b: Value) bool {
     if (a.bits == b.bits) return true;
-    if (a.bits == 0 or b.bits == 0) return false;
+    // `unbox` maps a bare bits==0 to `.undefined_`; a heap-boxed `.undefined_`
+    // (e.g. the global `undefined`, which reads as a fresh box each time) must
+    // still compare equal to it, so compare by unboxed tag rather than bits.
     const ua = a.unbox();
     const ub = b.unbox();
-    if (ua == .number and ub == .number) return ua.number == ub.number;
-    if (ua == .string and ub == .string) return std.mem.eql(u8, ua.string, ub.string);
-    return false;
+    return switch (ua) {
+        .undefined_ => ub == .undefined_,
+        .null_ => ub == .null_,
+        .boolean => |x| ub == .boolean and x == ub.boolean,
+        .number => |x| ub == .number and x == ub.number,
+        .string => |x| ub == .string and std.mem.eql(u8, x, ub.string),
+        else => false,
+    };
 }
 
 // ------------------------------------------------------------------- tests ---
