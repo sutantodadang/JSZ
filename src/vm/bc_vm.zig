@@ -2633,8 +2633,13 @@ pub const BcVm = struct {
         else
             try JsObject.create(self.arena, self.realm.object_prototype);
         const pv = try val_mod.makeObject(self.arena, proto_obj);
-        try proto_obj.set("constructor", fn_val);
-        try o.set("prototype", pv);
+        // §20.2.4.3: F.prototype.constructor is {writable:true, enumerable:false,
+        // configurable:true} — a plain `set` would make it enumerable, so it would
+        // wrongly show up in for-in / Object.keys of the prototype.
+        _ = try proto_obj.defineOwnData("constructor", fn_val, .{ .writable = true, .enumerable = false, .configurable = true });
+        // §20.2.4.2: a function's own `prototype` is {writable:true,
+        // enumerable:false, configurable:false}.
+        _ = try o.defineOwnData("prototype", pv, .{ .writable = true, .enumerable = false, .configurable = false });
         return pv;
     }
 
