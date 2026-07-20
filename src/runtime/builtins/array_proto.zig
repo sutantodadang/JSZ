@@ -72,8 +72,11 @@ fn getArray(this_val: Value) ?*JsObject {
 /// Set(O, "length", n): updates a real array's [[ArrayLength]] via the exotic
 /// [[Set]] path, or writes a plain "length" property on an array-like.
 fn setLength(arena: std.mem.Allocator, O: Value, n: usize) !void {
+    // Set(O, "length", n, true): the mutating array methods (push/pop/shift/
+    // unshift/splice/…) use the throwing form, so a non-writable/frozen length
+    // or an immutable receiver (a String) raises TypeError.
     if (realm_mod.active_context) |ctx| {
-        try ctx.setProp(arena, O, "length", try val_mod.makeNumber(arena, @floatFromInt(n)));
+        try ctx.setPropThrow(arena, O, "length", try val_mod.makeNumber(arena, @floatFromInt(n)));
     } else if (O.isHeapPtr() and O.toPtr().* == .object) {
         O.toPtr().object.array_length = @intCast(n);
     }

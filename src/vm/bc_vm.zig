@@ -2725,6 +2725,9 @@ pub const BcVm = struct {
                     const u = toUint32FromNumber(num);
                     if (@as(f64, @floatFromInt(u)) != num)
                         return self.throwRangeErr("Invalid array length");
+                    // [[Set]] of a non-writable data property always fails (§10.1.9.2),
+                    // even to the same value; the strict/throwing caller then throws.
+                    if (!obj.array_length_writable) return false;
                     try obj.set("length", try val_mod.makeNumber(self.arena, @floatFromInt(u)));
                     return true;
                 }
