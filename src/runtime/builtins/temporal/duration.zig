@@ -111,7 +111,11 @@ pub fn isValidDuration(d: DurationFields) bool {
 pub fn toTemporalDuration(arena: std.mem.Allocator, v: Value) !DurationFields {
     if (getDuration(v)) |d| return d.*;
     if (v.bits != 0 and v.unbox() == .string) {
-        return shared.parseISODuration(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid Duration string");
+        const d = shared.parseISODuration(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid Duration string");
+        // A parsed digit run may overflow to a non-finite / out-of-range value
+        // (e.g. "PT" + "1"×1000 + "S"); IsValidDuration rejects those.
+        if (!isValidDuration(d)) return realm_mod.throwRangeError(arena, "invalid Duration string");
+        return d;
     }
     if (v.bits != 0 and v.unbox() == .object) {
         return try toDurationFromFields(arena, v.toPtr().object, true);
@@ -449,15 +453,42 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
     // model per-day time-zone offset changes; correct for fixed-offset zones).
     const zdt = @import("zoned_date_time.zig");
     if (zdt.getZoned(rv)) |z| return zdt.localISODate(z);
-    // For a string, a UTC "Z" designator is only valid alongside a [time zone]
-    // annotation; a bare "…Z" is not a valid relativeTo.
+    // For a string, a UTC "Z" designator makes it a zoned relativeTo, which is
+    // only valid alongside a [time zone] annotation. We reduce a zoned reference
+    // to its local calendar date (fixed-offset accurate); a bare "…Z" without a
+    // time-zone annotation is not a valid relativeTo.
     if (rv.unbox() == .string) {
         const str = rv.unbox().string;
-        if (std.mem.indexOfScalar(u8, str, '[') == null and
-            (std.mem.indexOfScalar(u8, str, 'Z') != null or std.mem.indexOfScalar(u8, str, 'z') != null))
-            return realm_mod.throwRangeError(arena, "UTC designator without a time zone is not a valid relativeTo");
+        const bracket_start = std.mem.indexOfScalar(u8, str, '[');
+        const before_brackets = if (bracket_start) |b| str[0..b] else str;
+        const has_utc = std.mem.indexOfScalar(u8, before_brackets, 'Z') != null or
+            std.mem.indexOfScalar(u8, before_brackets, 'z') != null;
+        if (has_utc) {
+            if (!hasTimeZoneAnnotation(str))
+                return realm_mod.throwRangeError(arena, "UTC designator without a time zone is not a valid relativeTo");
+            // Zoned relativeTo string: `Z` is permitted; take the local date.
+            const dt = shared.parseISODateTimeOpts(str, .{ .validate_calendar = true, .reject_utc = false }) catch
+                return realm_mod.throwRangeError(arena, "invalid relativeTo string");
+            if (!shared.isValidISODate(dt.date.year, dt.date.month, dt.date.day) or dt.date.year < -271821 or dt.date.year > 275760)
+                return realm_mod.throwRangeError(arena, "relativeTo date out of range");
+            return dt.date;
+        }
     }
     return try pd.toTemporalDate(arena, rv, .constrain);
+}
+
+/// True if the string carries an RFC 9557 time-zone annotation — a `[...]`
+/// bracket whose contents are not a `key=value` pair (i.e. a bare zone id such
+/// as `[UTC]` or `[-07:00]`), as opposed to a `[u-ca=…]` calendar annotation.
+fn hasTimeZoneAnnotation(str: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, str, i, '[')) |open| {
+        const close = std.mem.indexOfScalarPos(u8, str, open + 1, ']') orelse return false;
+        const inner = str[open + 1 .. close];
+        if (std.mem.indexOfScalar(u8, inner, '=') == null) return true;
+        i = close + 1;
+    }
+    return false;
 }
 
 /// MaximumTemporalDurationRoundingIncrement: the dividend used to validate a

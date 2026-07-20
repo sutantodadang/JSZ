@@ -298,6 +298,23 @@ const Parser = struct {
 /// expanded "±YYYYYY-MM-DD", and datetime forms (time part ignored). Bracket
 /// suffixes like "[u-ca=iso8601]" are tolerated.
 pub fn parseISODateTime(s0: []const u8) ParseError!ISODateTime {
+    return parseISODateTimeOpts(s0, .{});
+}
+
+/// Options for `parseISODateTimeOpts`.
+///   * `validate_calendar` — a first `[u-ca=…]` annotation must name the
+///     iso8601 calendar. Calendar-bearing types (PlainDate, PlainDateTime,
+///     PlainYearMonth, PlainMonthDay, ZonedDateTime) set this; Instant,
+///     PlainTime and time zones ignore the calendar so leave it false.
+///   * `reject_utc` — a bare `Z` UTC designator makes the string invalid. The
+///     plain wall-clock types (PlainDate/DateTime/Time/YearMonth/MonthDay)
+///     reject it; Instant and ZonedDateTime accept `Z`.
+pub const IsoParseOpts = struct {
+    validate_calendar: bool = true,
+    reject_utc: bool = true,
+};
+
+pub fn parseISODateTimeOpts(s0: []const u8, opts: IsoParseOpts) ParseError!ISODateTime {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     var p = Parser{ .s = s };
 
@@ -326,11 +343,13 @@ pub fn parseISODateTime(s0: []const u8) ParseError!ISODateTime {
         if (c == 'T' or c == 't' or c == ' ') {
             p.i += 1;
             time = try parseTimeInner(&p);
-            // Optional offset / Z — tolerated but ignored for plain types.
-            skipOffset(&p);
+            // Optional offset / Z — the offset is ignored for plain types, but a
+            // bare `Z` UTC designator is rejected by wall-clock types.
+            const had_utc = skipOffset(&p);
+            if (had_utc and opts.reject_utc) return error.Invalid;
         }
     }
-    try parseAnnotations(&p);
+    try parseAnnotations(&p, opts.validate_calendar);
     if (!p.eof()) return error.Invalid;
 
     if (year < -271821 or year > 275760) return error.Invalid;
@@ -374,7 +393,7 @@ pub fn parseISOYearMonth(s0: []const u8) ParseError!ISODate {
             return .{ .year = dt.date.year, .month = dt.date.month, .day = 1 };
         }
     }
-    try parseAnnotations(&p);
+    try parseAnnotations(&p, true);
     if (!p.eof()) return error.Invalid;
     if (year < -271821 or year > 275760) return error.Invalid;
     if (month < 1 or month > 12) return error.Invalid;
@@ -397,7 +416,7 @@ pub fn parseISOMonthDay(s0: []const u8) ParseError!ISOMonthDay {
     const had_dash = p.eat('-');
     const day = p.digitsN(2) orelse return error.Invalid;
     _ = had_dash;
-    try parseAnnotations(&p);
+    try parseAnnotations(&p, true);
     if (!p.eof()) return error.Invalid;
     if (month < 1 or month > 12) return error.Invalid;
     if (day < 1 or day > isoDaysInMonth(1972, @intCast(month))) return error.Invalid;
@@ -412,12 +431,13 @@ pub fn parseISOTime(s0: []const u8) ParseError!ISOTime {
     // Try full datetime first if it looks like a date (has a '-' in first 6, or
     // 8 leading digits followed by 'T').
     if (looksLikeDate(s)) {
-        const dt = try parseISODateTime(s);
+        // PlainTime has no calendar but still rejects a bare `Z` UTC designator.
+        const dt = try parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = true });
         return dt.time;
     }
     const t = try parseTimeInner(&p);
-    skipOffset(&p);
-    try parseAnnotations(&p);
+    if (skipOffset(&p)) return error.Invalid; // bare `Z` invalid for PlainTime
+    try parseAnnotations(&p, false);
     if (!p.eof()) return error.Invalid;
     if (!isValidISOTime(t)) return error.Invalid;
     return t;
@@ -487,18 +507,20 @@ fn parseFraction(p: *Parser, t: *ISOTime) ParseError!void {
     }
 }
 
-fn skipOffset(p: *Parser) void {
+/// Consume an optional UTC offset / `Z` designator. Returns true iff a bare `Z`
+/// (UTC designator) was consumed — plain (calendar/wall-clock) types reject it.
+fn skipOffset(p: *Parser) bool {
     if (p.peek()) |c| {
         if (c == 'Z' or c == 'z') {
             p.i += 1;
-            return;
+            return true;
         }
         if (c == '+' or c == '-') {
             const save = p.i;
             p.i += 1;
             const h = p.digitsN(2) orelse {
                 p.i = save;
-                return;
+                return false;
             };
             _ = h;
             // Minutes: "±HH", "±HH:MM" and compact "±HHMM" are all valid, as is
@@ -516,6 +538,7 @@ fn skipOffset(p: *Parser) void {
             }
         }
     }
+    return false;
 }
 
 fn isDigit(c: ?u8) bool {
@@ -540,7 +563,7 @@ fn isValidAnnotationKey(key: []const u8) bool {
 /// key/value annotation; the `u-ca` calendar key may appear at most once; an
 /// unrecognised key carrying the critical flag (`!`) is rejected, as is a
 /// malformed key. Unknown non-critical annotations are ignored.
-fn parseAnnotations(p: *Parser) ParseError!void {
+fn parseAnnotations(p: *Parser, validate_calendar: bool) ParseError!void {
     var tz_seen = false;
     var kv_seen = false;
     var ca_count: u32 = 0;
@@ -566,13 +589,19 @@ fn parseAnnotations(p: *Parser) ParseError!void {
             const value = content[eq + 1 ..];
             if (!isValidAnnotationKey(key) or value.len == 0) return error.Invalid;
             if (std.mem.eql(u8, key, "u-ca")) {
-                // Only the ISO 8601 calendar is supported; any other calendar
-                // identifier (well-formed or not) is rejected.
-                if (!isIso8601(value)) return error.Invalid;
-                // Multiple calendar annotations are tolerated (only the first is
-                // used); but any critical flag among two-or-more is an error.
-                ca_count += 1;
+                // The value must be a well-formed RFC 9557 AnnotationValue.
+                if (!isValidAnnotationValue(value)) return error.Invalid;
+                // Only the first calendar annotation is the one actually used.
+                // Calendar-bearing types (PlainDate, PlainDateTime, etc.) require
+                // it to name the sole supported calendar; types without a calendar
+                // (Instant, PlainTime, time zones) ignore it entirely, so a
+                // non-iso value is tolerated for them. Subsequent annotations are
+                // ignored, but need not name a supported calendar.
+                if (ca_count == 0 and validate_calendar and !isIso8601(value)) return error.Invalid;
+                // If more than one calendar annotation is present and any of them
+                // carries the critical flag `!`, the string is rejected.
                 if (critical) ca_critical = true;
+                ca_count += 1;
             } else if (critical) {
                 return error.Invalid; // unknown critical annotation
             }
@@ -584,6 +613,23 @@ fn parseAnnotations(p: *Parser) ParseError!void {
         }
     }
     if (ca_count > 1 and ca_critical) return error.Invalid;
+}
+
+/// A valid RFC 9557 `AnnotationValue`: one or more alphanumeric components of
+/// length 1..8, separated by single '-' characters.
+fn isValidAnnotationValue(value: []const u8) bool {
+    if (value.len == 0) return false;
+    var comp_len: usize = 0;
+    for (value) |c| {
+        if (c == '-') {
+            if (comp_len == 0) return false; // empty component / leading dash
+            comp_len = 0;
+        } else if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')) {
+            comp_len += 1;
+            if (comp_len > 8) return false;
+        } else return false;
+    }
+    return comp_len != 0; // no trailing dash
 }
 
 /// Parse an ISO 8601 duration string: [+-]PnYnMnWnDTnHnMnS with an optional
@@ -928,15 +974,33 @@ pub fn isIso8601(s: []const u8) bool {
     return true;
 }
 
-/// Validate a calendar-slot argument (ToTemporalCalendarIdentifier). Undefined is
-/// accepted (means "iso8601"). A String must name the iso8601 calendar
-/// (RangeError otherwise). A calendar-bearing Temporal object is accepted (all use
-/// iso8601). Any other type is a TypeError.
-pub fn validateCalendarArg(arena: std.mem.Allocator, v: Value) !void {
+/// A calendar identifier String is valid iff it names the iso8601 calendar
+/// directly, or is any parseable ISO temporal string (date/datetime/year-month/
+/// month-day/time, optionally carrying an iso8601 `[u-ca=…]` annotation) — such a
+/// string contributes the iso8601 calendar per ParseTemporalCalendarString.
+pub fn calendarStringIsIso(s: []const u8) bool {
+    if (isIso8601(s)) return true;
+    // The date-bearing forms validate that a `[u-ca=…]` annotation names
+    // iso8601; a time-only form is intentionally not accepted here (PlainTime
+    // ignores its calendar, so its parser would let a non-iso annotation pass).
+    if (parseISODateTime(s)) |_| return true else |_| {}
+    if (parseISOYearMonth(s)) |_| return true else |_| {}
+    if (parseISOMonthDay(s)) |_| return true else |_| {}
+    return false;
+}
+
+/// Validate a calendar-slot argument. Undefined is accepted (means "iso8601").
+/// A calendar-bearing Temporal object is accepted (all use iso8601). Any other
+/// non-String is a TypeError. A String must denote iso8601 — when `lenient`
+/// (ToTemporalCalendarIdentifier, used for property-bag fields and relativeTo)
+/// an ISO temporal string is accepted; otherwise (CanonicalizeCalendar, used for
+/// constructors) only the bare "iso8601" identifier is.
+pub fn validateCalendarArgOpts(arena: std.mem.Allocator, v: Value, lenient: bool) !void {
     if (v.bits == 0 or v.unbox() == .undefined_) return;
     switch (v.unbox()) {
         .string => |s| {
-            if (!isIso8601(s)) return realm_mod.throwRangeError(arena, "only the iso8601 calendar is supported");
+            const ok = if (lenient) calendarStringIsIso(s) else isIso8601(s);
+            if (!ok) return realm_mod.throwRangeError(arena, "only the iso8601 calendar is supported");
         },
         .object => {
             switch (v.toPtr().object.internal_kind) {
@@ -946,6 +1010,16 @@ pub fn validateCalendarArg(arena: std.mem.Allocator, v: Value) !void {
         },
         else => return realm_mod.throwTypeError(arena, "invalid calendar"),
     }
+}
+
+/// ToTemporalCalendarIdentifier form (lenient — ISO temporal strings accepted).
+pub fn validateCalendarArg(arena: std.mem.Allocator, v: Value) !void {
+    return validateCalendarArgOpts(arena, v, true);
+}
+
+/// CanonicalizeCalendar form (strict — only the bare "iso8601" identifier).
+pub fn validateCalendarArgCanonical(arena: std.mem.Allocator, v: Value) !void {
+    return validateCalendarArgOpts(arena, v, false);
 }
 
 /// Read a "monthCode" field: it must be a String (TypeError otherwise), and match

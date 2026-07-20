@@ -69,8 +69,8 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (!realm_mod.active_constructing) return realm_mod.throwTypeError(arena, "Temporal.PlainYearMonth requires new");
     const y = try shared.toIntegerWithTruncation(arena, if (args.len > 0) args[0] else Value{});
     const m = try shared.toIntegerWithTruncation(arena, if (args.len > 1) args[1] else Value{});
-    // args[2] is calendar; only "iso8601" supported.
-    if (args.len > 2) try shared.validateCalendarArg(arena, args[2]);
+    // args[2] is calendar; constructor → CanonicalizeCalendar (bare id only).
+    if (args.len > 2) try shared.validateCalendarArgCanonical(arena, args[2]);
     // args[3] is referenceISODay (default 1).
     var ref_day: f64 = 1;
     if (args.len > 3 and args[3].bits != 0 and args[3].unbox() != .undefined_) {
