@@ -3666,13 +3666,17 @@ pub const BcVm = struct {
             const key = try std.fmt.allocPrint(self.arena, "{d}", .{i});
             try obj.set(key, a);
         }
-        try obj.set("length", try val_mod.makeNumber(self.arena, @floatFromInt(args.len)));
+        // "length" is a data property: writable + configurable but NON-enumerable
+        // (else Object.keys(arguments) surfaces it and, e.g., defineProperties
+        // treats it as a descriptor). Indices stay enumerable (plain `set`).
+        _ = try obj.defineOwnData("length", try val_mod.makeNumber(self.arena, @floatFromInt(args.len)), .{ .writable = true, .enumerable = false, .configurable = true });
         // for-of over arguments: the Array iterator works on any array-like
-        // (reads length + indexed). Install it under the real @@iterator symbol.
+        // (reads length + indexed). Install it under the real @@iterator symbol
+        // (non-enumerable, matching the spec's @@iterator on %Array.prototype%).
         const realm_mod = @import("../runtime/realm.zig");
         if (realm_mod.active_sym_iterator) |symv| {
             const coll = @import("../runtime/builtins/es2015_collections.zig");
-            try obj.setSym(symv, try val_mod.makeNativeFunction(self.arena, coll.nativeArrayValues));
+            try obj.setSymAttr(symv, try val_mod.makeNativeFunction(self.arena, coll.nativeArrayValues), .{ .writable = true, .enumerable = false, .configurable = true });
         }
         // Mapped arguments (sloppy mode + simple parameter list): indices alias the
         // parameter bindings both ways (`arguments[0] = v` writes param 0; reading
