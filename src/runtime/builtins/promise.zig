@@ -157,6 +157,22 @@ fn isCallable(v: Value) bool {
     };
 }
 
+/// SameValue for reference types (constructors): compare the underlying object /
+/// closure pointer, since each `makeObject` boxes a fresh Value handle (so raw
+/// `.bits` equality is unreliable for two handles to the same object).
+fn sameRef(a: Value, b: Value) bool {
+    if (a.bits == 0 or b.bits == 0) return false;
+    const ta = a.unbox();
+    const tb = b.unbox();
+    if (@as(val_mod.JsValue.Tag, ta) != @as(val_mod.JsValue.Tag, tb)) return false;
+    return switch (ta) {
+        .object => ta.object == tb.object,
+        .bc_function => ta.bc_function == tb.bc_function,
+        .function => ta.function == tb.function,
+        else => a.bits == b.bits,
+    };
+}
+
 fn getData(this_val: Value) ?*PromiseData {
     if (this_val.bits == 0 or this_val.unbox() != .object) return null;
     const o = this_val.toPtr().object;
@@ -346,17 +362,66 @@ pub fn nativePromiseWithResolvers(arena: std.mem.Allocator, this_val: Value, _: 
     return val_mod.makeObject(arena, obj);
 }
 
-pub fn nativePromiseResolve(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    if (getData(v) != null) return v;
-    const p = try makePendingPromise(arena);
-    if (getData(p)) |d| promiseResolveData(arena, d, v);
-    return p;
+/// Resolve the constructor `C` for Promise.resolve/reject: the receiver `this`
+/// (which must be an Object — §27.2.4.7 step 2), or the realm %Promise% when an
+/// internal caller passes an empty receiver.
+fn resolveTargetC(arena: std.mem.Allocator, this_val: Value) !Value {
+    if (this_val.bits == 0) {
+        const proto = realm_mod.active_promise_proto orelse return realm_mod.throwTypeError(arena, "no Promise constructor");
+        return proto.get("constructor") orelse realm_mod.throwTypeError(arena, "no Promise constructor");
+    }
+    const is_obj = switch (this_val.unbox()) {
+        .object, .function, .bc_function, .native_function => true,
+        else => false,
+    };
+    if (!is_obj) return realm_mod.throwTypeError(arena, "Promise.resolve called on a non-object");
+    return this_val;
 }
 
-pub fn nativePromiseReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+/// PromiseResolve(C, x) (§27.2.4.7.1): return x when it is already a promise
+/// whose `constructor` is C; otherwise build C's capability and resolve it with x.
+fn promiseResolveWithC(arena: std.mem.Allocator, c: Value, x: Value) !Value {
+    if (getData(x) != null) {
+        const ctx = realm_mod.active_context orelse return x;
+        const xctor = try ctx.getProp(arena, x, "constructor");
+        if (sameRef(xctor, c)) return x; // SameValue(x.constructor, C)
+    }
+    const cap = try newPromiseCapability(arena, c);
+    const ctx = realm_mod.active_context.?;
+    _ = try ctx.invokeJs(arena, try val_mod.makeUndefined(arena), cap.resolve, &[_]Value{x});
+    return cap.promise;
+}
+
+/// True when `this_val` is empty (internal caller) or the intrinsic %Promise%.
+/// The intrinsic case keeps the fast engine-internal path (identical observable
+/// behavior, no extra capability construction / microtask tick).
+fn isIntrinsicPromiseC(this_val: Value) bool {
+    if (this_val.bits == 0) return true;
+    const intrinsic = if (realm_mod.active_promise_proto) |p| p.get("constructor") else null;
+    return intrinsic != null and sameRef(this_val, intrinsic.?);
+}
+
+pub fn nativePromiseResolve(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    return makePromise(arena, .rejected, v);
+    if (isIntrinsicPromiseC(this_val)) {
+        // Default %Promise%: engine-internal fast path.
+        if (getData(v) != null) return v;
+        const p = try makePendingPromise(arena);
+        if (getData(p)) |d| promiseResolveData(arena, d, v);
+        return p;
+    }
+    const c = try resolveTargetC(arena, this_val);
+    return promiseResolveWithC(arena, c, v);
+}
+
+pub fn nativePromiseReject(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (isIntrinsicPromiseC(this_val)) return makePromise(arena, .rejected, v);
+    const c = try resolveTargetC(arena, this_val);
+    const cap = try newPromiseCapability(arena, c);
+    const ctx = realm_mod.active_context.?;
+    _ = try ctx.invokeJs(arena, try val_mod.makeUndefined(arena), cap.reject, &[_]Value{v});
+    return cap.promise;
 }
 
 fn nativeUndefinedThunk(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
@@ -972,30 +1037,19 @@ pub fn nativePromiseThen(arena: std.mem.Allocator, this_val: Value, args: []cons
     const on_rejected = if (args.len > 1) args[1] else Value{};
 
     // C = SpeciesConstructor(promise, %Promise%). The `.constructor` / `@@species`
-    // gets are observable, so this runs even for a default promise.
+    // gets are observable, so this runs even for a default promise. PerformPromiseThen
+    // then settles the result through NewPromiseCapability(C)'s resolve/reject — so
+    // the result promise (and its microtask timing) is produced the spec way.
     const c = try promiseSpeciesConstructor(arena, this_val);
-    const default_ctor: ?Value = if (realm_mod.active_promise_proto) |p| p.get("constructor") else null;
-    const is_default = default_ctor != null and c.bits == default_ctor.?.bits;
-
-    var reaction = Reaction{
+    const cap = try newPromiseCapability(arena, c);
+    const reaction = Reaction{
         .on_fulfilled = on_fulfilled,
         .on_rejected = on_rejected,
-        .next_data = undefined,
+        .next_data = @constCast(&dummy_promise_data),
+        .cap_resolve = cap.resolve,
+        .cap_reject = cap.reject,
     };
-    var result_promise: Value = undefined;
-    if (is_default) {
-        // Fast path: settle an engine-internal result promise directly.
-        const next_promise = try makePendingPromise(arena);
-        reaction.next_data = getData(next_promise) orelse return next_promise;
-        result_promise = next_promise;
-    } else {
-        // Subclass/custom species: route through NewPromiseCapability(C).
-        const cap = try newPromiseCapability(arena, c);
-        reaction.cap_resolve = cap.resolve;
-        reaction.cap_reject = cap.reject;
-        reaction.next_data = @constCast(&dummy_promise_data);
-        result_promise = cap.promise;
-    }
+    const result_promise: Value = cap.promise;
 
     if (d.state == .pending) {
         try d.reactions.append(arena, reaction);
@@ -1159,6 +1213,7 @@ pub fn settleResult(arena: std.mem.Allocator, promise: Value, v: Value, fulfill:
 /// driver to resume the coroutine when the awaited value settles. The throwaway
 /// chained promise is ignored.
 pub fn subscribeAwait(arena: std.mem.Allocator, awaited: Value, on_fulfilled: Value, on_rejected: Value) !void {
-    const p = try nativePromiseResolve(arena, try val_mod.makeUndefined(arena), &[_]Value{awaited});
+    // Empty receiver → default %Promise% (internal caller, not a user Promise.resolve).
+    const p = try nativePromiseResolve(arena, Value{}, &[_]Value{awaited});
     _ = try nativePromiseThen(arena, p, &[_]Value{ on_fulfilled, on_rejected });
 }
