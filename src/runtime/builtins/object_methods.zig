@@ -740,6 +740,88 @@ pub fn arraySetLengthThrowing(arena: std.mem.Allocator, obj: *JsObject, value: V
     try obj.set("length", try val_mod.makeNumber(arena, @floatFromInt(u)));
 }
 
+/// ArraySetLength (ES §10.4.2.4) as a [[DefineOwnProperty]] on "length": enforces
+/// the length [[Writable]] attribute, the non-configurable/non-enumerable
+/// invariants, and the "shrink stops at the highest non-configurable element"
+/// rule (setting length to blocker+1 and throwing).
+fn arrayDefineLength(arena: std.mem.Allocator, obj: *JsObject, desc_val: Value, desc: *JsObject) anyerror!void {
+    // length is a data property: accessor descriptors are rejected.
+    if (descHas(desc, "get") or descHas(desc, "set"))
+        return throwTypeError(arena, "Invalid property descriptor for array length");
+    // Non-configurable, non-enumerable: a descriptor requesting either throws.
+    if (descHas(desc, "configurable") and descTruthy(try descGet(arena, desc_val, desc, "configurable")))
+        return throwTypeError(arena, "cannot make array length configurable");
+    if (descHas(desc, "enumerable") and descTruthy(try descGet(arena, desc_val, desc, "enumerable")))
+        return throwTypeError(arena, "cannot make array length enumerable");
+
+    const old_len: u32 = obj.array_length;
+    const want_writable: ?bool = if (descHas(desc, "writable"))
+        descTruthy(try descGet(arena, desc_val, desc, "writable"))
+    else
+        null;
+
+    if (!descHas(desc, "value")) {
+        // No value change: only the writable attribute may move. A non-writable,
+        // non-configurable length can never be made writable again.
+        if (want_writable) |w| {
+            if (w and !obj.array_length_writable)
+                return throwTypeError(arena, "cannot redefine non-writable array length as writable");
+            obj.array_length_writable = w;
+        }
+        return;
+    }
+
+    // Coerce the new length (ToUint32 must equal ToNumber, else RangeError). This
+    // runs user valueOf/@@toPrimitive, which happens before the writability check.
+    const lv = try descGet(arena, desc_val, desc, "value");
+    var pv = lv;
+    if (pv.bits != 0 and pv.unbox() == .object)
+        pv = (try @import("coercion.zig").toPrimitive(arena, pv, .number)) orelse pv;
+    if (pv.bits != 0) switch (pv.unbox()) {
+        .bigint => return throwTypeError(arena, "Cannot convert a BigInt value to a number"),
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+        else => {},
+    };
+    const num = try toNumberForLength(arena, pv);
+    const new_len = toUint32(num);
+    if (@as(f64, @floatFromInt(new_len)) != num)
+        return throwRangeError(arena, "Invalid array length");
+
+    if (new_len >= old_len) {
+        // Grow (or no-op): a non-writable length still rejects any actual change.
+        if (!obj.array_length_writable and new_len != old_len)
+            return throwTypeError(arena, "cannot change length of a non-writable array");
+        try obj.set("length", try val_mod.makeNumber(arena, @floatFromInt(new_len)));
+        if (want_writable) |w| obj.array_length_writable = w;
+        return;
+    }
+
+    // Shrink: a non-writable length rejects outright.
+    if (!obj.array_length_writable)
+        return throwTypeError(arena, "cannot change length of a non-writable array");
+
+    // Find the highest own, non-configurable index in [new_len, old_len): the
+    // shrink stops just above it (§10.4.2.4 step 17).
+    var blocker: ?u32 = null;
+    for (obj.ownKeys()) |k| {
+        if (k.len == 0) continue;
+        if (k.len > 1 and k[0] == '0') continue; // non-canonical index string
+        const idx = std.fmt.parseUnsigned(u32, k, 10) catch continue;
+        if (idx == std.math.maxInt(u32)) continue;
+        if (idx < new_len or idx >= old_len) continue;
+        if (obj.ownAttr(k)) |a| {
+            if (!a.configurable) {
+                if (blocker == null or idx > blocker.?) blocker = idx;
+            }
+        }
+    }
+    const target_len = if (blocker) |b| b + 1 else new_len;
+    try obj.set("length", try val_mod.makeNumber(arena, @floatFromInt(target_len)));
+    if (want_writable) |w| obj.array_length_writable = w;
+    if (blocker != null)
+        return throwTypeError(arena, "cannot delete non-configurable array element");
+}
+
 fn throwReferenceErrorObj(arena: std.mem.Allocator, name: []const u8) anyerror {
     const realm_mod = @import("../realm.zig");
     realm_mod.pending_exception = try makeReferenceErrorObj(arena, name);
@@ -1242,7 +1324,7 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
         const obj_proto_len: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
         const dlen = try JsObject.create(arena, obj_proto_len);
         try dlen.set("value", try val_mod.makeNumber(arena, @floatFromInt(obj.getArrayLength())));
-        try dlen.set("writable", try val_mod.makeBool(arena, obj.extensible));
+        try dlen.set("writable", try val_mod.makeBool(arena, obj.array_length_writable));
         try dlen.set("enumerable", try val_mod.makeBool(arena, false));
         try dlen.set("configurable", try val_mod.makeBool(arena, false));
         return val_mod.makeObject(arena, dlen);
@@ -1466,12 +1548,7 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     // §10.4.2.4): the new length is ToUint32(value) and must equal ToNumber(value),
     // else a RangeError is thrown. Setting a smaller length truncates the array.
     if (obj.is_array and std.mem.eql(u8, key, "length")) {
-        if (descHas(desc, "get") or descHas(desc, "set"))
-            return throwTypeError(arena, "cannot redefine property: length");
-        if (descHas(desc, "value")) {
-            const lv = try descGet(arena, desc_val, desc, "value");
-            try arraySetLengthThrowing(arena, obj, lv);
-        }
+        try arrayDefineLength(arena, obj, desc_val, desc);
         return args[0];
     }
 
