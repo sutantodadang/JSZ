@@ -616,6 +616,16 @@ pub fn nativePropertyIsEnumerable(arena: std.mem.Allocator, this_val: Value, arg
 // ------------------------------------------------------------------ ES5.1 meta-protocol ---
 
 /// Truthiness for descriptor flag values (absent/empty → false).
+/// IsCallable(v) — used by ToPropertyDescriptor's get/set validation.
+fn descIsCallable(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .function, .native_function, .bc_function => true,
+        .object => |o| o.internal_kind == .bound_function or o.get("__call__") != null,
+        else => false,
+    };
+}
+
 fn descTruthy(v: ?Value) bool {
     const val = v orelse return false;
     if (val.bits == 0) return false;
@@ -1433,6 +1443,23 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     const desc_val = if (args.len >= 3) args[2] else Value{};
     const desc = (try resolveObject(arena, desc_val)) orelse
         return throwTypeError(arena, "Property description must be an object");
+
+    // ToPropertyDescriptor validation (§6.2.6.5): a get/set must be callable or
+    // undefined, and a descriptor cannot be both an accessor and a data descriptor.
+    {
+        if (descHas(desc, "get")) {
+            const g = try descGet(arena, desc_val, desc, "get");
+            if (g.bits != 0 and g.unbox() != .undefined_ and !descIsCallable(g))
+                return throwTypeError(arena, "Getter must be a function");
+        }
+        if (descHas(desc, "set")) {
+            const s = try descGet(arena, desc_val, desc, "set");
+            if (s.bits != 0 and s.unbox() != .undefined_ and !descIsCallable(s))
+                return throwTypeError(arena, "Setter must be a function");
+        }
+        if ((descHas(desc, "get") or descHas(desc, "set")) and (descHas(desc, "value") or descHas(desc, "writable")))
+            return throwTypeError(arena, "Invalid property descriptor: cannot specify both accessors and a value or writable");
+    }
 
     // Array exotic [[DefineOwnProperty]] on "length" (ES §10.4.2.1 → ArraySetLength
     // §10.4.2.4): the new length is ToUint32(value) and must equal ToNumber(value),
