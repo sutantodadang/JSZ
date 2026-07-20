@@ -85,6 +85,12 @@ fn localDT(z: *const ZonedDT) ISODateTime {
     return .{ .date = date, .time = tr.time };
 }
 
+/// The local (wall-clock) ISO date of a ZonedDateTime — used as a PlainDate-style
+/// relativeTo reference by Duration rounding.
+pub fn localISODate(z: *const ZonedDT) shared.ISODate {
+    return localDT(z).date;
+}
+
 /// Wall nanoseconds (epoch days*NS_PER_DAY + time) for a local datetime.
 fn wallNs(dt: ISODateTime) i128 {
     return @as(i128, shared.isoDateToEpochDays(dt.date.year, dt.date.month, dt.date.day)) * shared.NS_PER_DAY +
