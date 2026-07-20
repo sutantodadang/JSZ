@@ -2177,10 +2177,14 @@ fn rawToStr(arena: std.mem.Allocator, v: Value) ![]const u8 {
         .boolean => |b| return if (b) "true" else "false",
         .null_ => return "null",
         .undefined_ => return "undefined",
+        .bigint => |b| return try val_mod.bigIntToString(arena, b),
+        // ToString(symbol) throws a TypeError (§7.1.17).
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a string"),
         else => {
             if (try coercion_mod.toPrimitive(arena, v, .string)) |prim| {
                 if (prim.bits != 0 and prim.unbox() == .string) return prim.toPtr().string;
-                if (prim.bits != 0 and prim.unbox() == .number) return try val_mod.formatNumber(arena, prim.unbox().number);
+                if (prim.bits != 0 and prim.unbox() == .symbol) return throwTypeError(arena, "Cannot convert a Symbol value to a string");
+                return try stringPrimitive(arena, prim);
             }
             return "[object Object]";
         },
@@ -2192,16 +2196,38 @@ fn rawToStr(arena: std.mem.Allocator, v: Value) ![]const u8 {
 fn nativeStringRaw(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object)
         return throwTypeError(arena, "String.raw called on non-object");
-    const raw_v = args[0].toPtr().object.get("raw") orelse return val_mod.makeString(arena, "");
+    // raw = ToObject(Get(cooked, "raw")); a getter's abrupt completion propagates
+    // and a non-object raw throws (ToObject on undefined/null/primitive).
+    const raw_v = if (active_context) |ctx| try ctx.getProp(arena, args[0], "raw") else (args[0].toPtr().object.get("raw") orelse Value{});
     if (raw_v.bits == 0 or raw_v.unbox() != .object)
-        return val_mod.makeString(arena, "");
+        return throwTypeError(arena, "String.raw: template.raw must be an object");
     const raw = raw_v.toPtr().object;
-    const seg_count = raw.array_length;
+    // literalSegments = LengthOfArrayLike(raw) = ToLength(Get(raw, "length")) —
+    // a generic array-like `raw` (not necessarily a real Array) is honored. Read
+    // through the context so an array's synthetic length and inherited/getter
+    // "length" (and its valueOf coercion) are resolved.
+    const len_v: Value = if (active_context) |ctx| try ctx.getProp(arena, raw_v, "length") else (raw.get("length") orelse Value{});
+    // ToLength(Get(raw,"length")) → ToNumber throws for a Symbol/BigInt length.
+    if (len_v.bits != 0) switch (len_v.unbox()) {
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+        .bigint => return throwTypeError(arena, "Cannot convert a BigInt value to a number"),
+        else => {},
+    };
+    const len_num = if (len_v.bits != 0 and len_v.unbox() == .object)
+        toNumberCoerce((try coercion_mod.toPrimitive(arena, len_v, .number)) orelse len_v)
+    else
+        toNumberCoerce(len_v);
+    const seg_count: usize = if (std.math.isNan(len_num) or len_num <= 0)
+        0
+    else if (len_num >= 9007199254740991.0)
+        9007199254740991
+    else
+        @intFromFloat(@trunc(len_num));
     var buf = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < seg_count) : (i += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const seg = raw.getOwn(key) orelse Value{};
+        const seg = if (active_context) |ctx| try ctx.getProp(arena, raw_v, key) else (raw.get(key) orelse Value{});
         try buf.appendSlice(arena, try rawToStr(arena, seg));
         // Interleave substitution i (args[i+1]) between segments, but not after last.
         if (i + 1 < seg_count and i + 1 < args.len) {
