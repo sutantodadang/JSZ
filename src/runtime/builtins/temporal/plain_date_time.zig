@@ -68,6 +68,7 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const us = try argIntTrunc(arena, args, 7);
     const ns = try argIntTrunc(arena, args, 8);
     if (args.len > 9 and args[9].bits != 0 and args[9].unbox() != .undefined_) {
+        // Constructor calendar → CanonicalizeCalendar (bare identifier only).
         const cal = try shared.valueToString(arena, args[9]);
         if (!plainDateIsIso(cal)) return realm_mod.throwRangeError(arena, "only iso8601 calendar supported");
     }
@@ -131,10 +132,7 @@ pub fn toTemporalDateTime(arena: std.mem.Allocator, v: Value, overflow: shared.O
 
 fn dtFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISODateTime {
     if (o.get("calendar")) |cv| {
-        if (cv.bits != 0 and cv.unbox() != .undefined_) {
-            const cal = try shared.valueToString(arena, cv);
-            if (!plainDateIsIso(cal)) return realm_mod.throwRangeError(arena, "only iso8601 calendar supported");
-        }
+        try shared.validateCalendarArg(arena, cv);
     }
     // Date fields (required: year, day, month|monthCode).
     const year_v = o.get("year");

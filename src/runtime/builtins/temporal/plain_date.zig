@@ -59,6 +59,8 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const d = try shared.toIntegerWithTruncation(arena, if (args.len > 2) args[2] else Value{});
     // args[3] is calendar; only "iso8601" supported.
     if (args.len > 3 and args[3].bits != 0 and args[3].unbox() != .undefined_) {
+        // The constructor's calendar goes through CanonicalizeCalendar, which
+        // accepts only a bare calendar identifier (not an ISO date string).
         const cal = try shared.valueToString(arena, args[3]);
         if (!isIsoCalendar(cal)) return realm_mod.throwRangeError(arena, "only the iso8601 calendar is supported");
     }
@@ -115,17 +117,9 @@ pub fn toTemporalDate(arena: std.mem.Allocator, v: Value, overflow: shared.Overf
 }
 
 fn dateFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISODate {
-    // Read calendar (must be iso8601 if present).
+    // Read calendar (ToTemporalCalendarIdentifier; only iso8601 supported).
     if (o.get("calendar")) |cv| {
-        if (cv.bits != 0 and cv.unbox() != .undefined_) {
-            // A Temporal object supplied as the calendar contributes its
-            // [[Calendar]] internal slot (always iso8601 here); otherwise coerce
-            // to a string and require iso8601.
-            if (!isTemporalCalendarObject(cv)) {
-                const cal = try shared.valueToString(arena, cv);
-                if (!isIsoCalendar(cal)) return realm_mod.throwRangeError(arena, "only iso8601 calendar supported");
-            }
-        }
+        try shared.validateCalendarArg(arena, cv);
     }
     const year_v = o.get("year");
     const month_v = o.get("month");

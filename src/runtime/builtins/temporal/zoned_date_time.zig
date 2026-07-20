@@ -116,6 +116,7 @@ fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128) !timezone.Zon
     }
 }
 
+/// Constructor calendar (CanonicalizeCalendar): a bare identifier only.
 fn checkCalendar(arena: std.mem.Allocator, v: Value) !void {
     if (v.bits == 0 or v.unbox() == .undefined_) return;
     if (v.unbox() != .string) return realm_mod.throwTypeError(arena, "calendar must be a string");
@@ -220,7 +221,8 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
     const tz_v = o.get("timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
     if (tz_v.bits != 0 and tz_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing timeZone");
     const zone = try toTimeZone(arena, tz_v, null);
-    if (o.get("calendar")) |cv| try checkCalendar(arena, cv);
+    // Property-bag calendar → ToTemporalCalendarIdentifier (ISO strings ok).
+    if (o.get("calendar")) |cv| try shared.validateCalendarArg(arena, cv);
     const overflow = try shared.getOverflow(arena, opts);
     const offset_opt = try getOffsetOption(arena, opts, .reject);
 

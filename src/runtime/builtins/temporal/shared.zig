@@ -974,15 +974,33 @@ pub fn isIso8601(s: []const u8) bool {
     return true;
 }
 
-/// Validate a calendar-slot argument (ToTemporalCalendarIdentifier). Undefined is
-/// accepted (means "iso8601"). A String must name the iso8601 calendar
-/// (RangeError otherwise). A calendar-bearing Temporal object is accepted (all use
-/// iso8601). Any other type is a TypeError.
-pub fn validateCalendarArg(arena: std.mem.Allocator, v: Value) !void {
+/// A calendar identifier String is valid iff it names the iso8601 calendar
+/// directly, or is any parseable ISO temporal string (date/datetime/year-month/
+/// month-day/time, optionally carrying an iso8601 `[u-ca=…]` annotation) — such a
+/// string contributes the iso8601 calendar per ParseTemporalCalendarString.
+pub fn calendarStringIsIso(s: []const u8) bool {
+    if (isIso8601(s)) return true;
+    // The date-bearing forms validate that a `[u-ca=…]` annotation names
+    // iso8601; a time-only form is intentionally not accepted here (PlainTime
+    // ignores its calendar, so its parser would let a non-iso annotation pass).
+    if (parseISODateTime(s)) |_| return true else |_| {}
+    if (parseISOYearMonth(s)) |_| return true else |_| {}
+    if (parseISOMonthDay(s)) |_| return true else |_| {}
+    return false;
+}
+
+/// Validate a calendar-slot argument. Undefined is accepted (means "iso8601").
+/// A calendar-bearing Temporal object is accepted (all use iso8601). Any other
+/// non-String is a TypeError. A String must denote iso8601 — when `lenient`
+/// (ToTemporalCalendarIdentifier, used for property-bag fields and relativeTo)
+/// an ISO temporal string is accepted; otherwise (CanonicalizeCalendar, used for
+/// constructors) only the bare "iso8601" identifier is.
+pub fn validateCalendarArgOpts(arena: std.mem.Allocator, v: Value, lenient: bool) !void {
     if (v.bits == 0 or v.unbox() == .undefined_) return;
     switch (v.unbox()) {
         .string => |s| {
-            if (!isIso8601(s)) return realm_mod.throwRangeError(arena, "only the iso8601 calendar is supported");
+            const ok = if (lenient) calendarStringIsIso(s) else isIso8601(s);
+            if (!ok) return realm_mod.throwRangeError(arena, "only the iso8601 calendar is supported");
         },
         .object => {
             switch (v.toPtr().object.internal_kind) {
@@ -992,6 +1010,16 @@ pub fn validateCalendarArg(arena: std.mem.Allocator, v: Value) !void {
         },
         else => return realm_mod.throwTypeError(arena, "invalid calendar"),
     }
+}
+
+/// ToTemporalCalendarIdentifier form (lenient — ISO temporal strings accepted).
+pub fn validateCalendarArg(arena: std.mem.Allocator, v: Value) !void {
+    return validateCalendarArgOpts(arena, v, true);
+}
+
+/// CanonicalizeCalendar form (strict — only the bare "iso8601" identifier).
+pub fn validateCalendarArgCanonical(arena: std.mem.Allocator, v: Value) !void {
+    return validateCalendarArgOpts(arena, v, false);
 }
 
 /// Read a "monthCode" field: it must be a String (TypeError otherwise), and match
