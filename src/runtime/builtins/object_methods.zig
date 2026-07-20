@@ -1561,6 +1561,11 @@ pub fn nativeObjectDefineProperties(arena: std.mem.Allocator, _: Value, args: []
     if (props_val.bits == 0 or props_val.unbox() == .undefined_ or props_val.unbox() == .null_)
         return throwTypeError(arena, "Object.defineProperties: Properties must be coercible to an object");
     const props = (try resolveObject(arena, props_val)) orelse {
+        // ToObject(string) yields a String exotic whose indexed own properties are
+        // enumerable single-char strings; ToPropertyDescriptor of the first char
+        // throws TypeError (a non-object descriptor). Empty string is a no-op.
+        if (props_val.unbox() == .string and props_val.toPtr().string.len > 0)
+            return throwTypeError(arena, "Property description must be an object");
         const realm_mod = @import("../realm.zig");
         const boxed = try realm_mod.toObjectForThis(arena, props_val);
         if (boxed.bits != 0 and boxed.unbox() == .object) {

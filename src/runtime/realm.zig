@@ -4098,6 +4098,7 @@ pub const Realm = struct {
                 const m_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
                 const StaticMethod = struct { name: []const u8, fn_ptr: val_mod.NativeFnPtr, len: u32 };
                 const static_methods = [_]StaticMethod{
+                    .{ .name = "create", .fn_ptr = nativeObjectCreate, .len = 2 },
                     .{ .name = "keys", .fn_ptr = obj_methods_mod.nativeObjectKeys, .len = 1 },
                     .{ .name = "values", .fn_ptr = obj_methods_mod.nativeObjectValues, .len = 1 },
                     .{ .name = "entries", .fn_ptr = obj_methods_mod.nativeObjectEntries, .len = 1 },

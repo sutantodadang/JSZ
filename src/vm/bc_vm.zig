@@ -3651,12 +3651,13 @@ pub const BcVm = struct {
             }
             break :blk true;
         };
-        if (simple) {
-            const md = try self.arena.create(MappedArgsData);
-            md.* = .{ .env = env, .param_names = fn_ptr.param_names, .count = @min(args.len, fn_ptr.param_names.len) };
-            obj.internal_kind = .mapped_arguments;
-            obj.internal_slot = md;
-        }
+        // Every arguments object (mapped or unmapped) carries the [[ParameterMap]]
+        // internal slot so Object.prototype.toString tags it "[object Arguments]".
+        // `count` = 0 for unmapped lists, which disables index aliasing.
+        const md = try self.arena.create(MappedArgsData);
+        md.* = .{ .env = env, .param_names = fn_ptr.param_names, .count = if (simple) @min(args.len, fn_ptr.param_names.len) else 0 };
+        obj.internal_kind = .mapped_arguments;
+        obj.internal_slot = md;
         try env.define("arguments", try val_mod.makeObject(self.arena, obj));
     }
 
