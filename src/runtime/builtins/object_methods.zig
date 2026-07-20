@@ -1401,7 +1401,10 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     const obj = try defineTarget(arena, if (args.len >= 1) args[0] else Value{}) orelse
         return throwTypeError(arena, "Object.defineProperty called on non-object");
 
-    const key_raw = if (args.len >= 2) args[1] else Value{};
+    // ToPropertyKey(P) (§20.1.2.4 step 2), before ToPropertyDescriptor: an object
+    // key (e.g. `[1,2]`) is ToPrimitive(string)→ToString ("1,2"); the result is a
+    // string or (via @@toPrimitive) a symbol.
+    const key_raw = try toPropertyKeyValue(arena, if (args.len >= 2) args[1] else Value{});
 
     // Symbol-keyed [[DefineOwnProperty]]: ordinary, never integer-indexed.
     if (key_raw.bits != 0 and key_raw.unbox() == .symbol) {
