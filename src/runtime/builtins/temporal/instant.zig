@@ -85,7 +85,7 @@ fn parseInstantString(arena: std.mem.Allocator, s0: []const u8) !i128 {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     // Find the offset: 'Z'/'z' or a +/- after the time. We parse the datetime and
     // separately extract the offset.
-    const dt = shared.parseISODateTimeOpts(s, false) catch return realm_mod.throwRangeError(arena, "invalid Instant string");
+    const dt = shared.parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = false }) catch return realm_mod.throwRangeError(arena, "invalid Instant string");
     const offset_ns = extractOffsetNs(s) orelse return realm_mod.throwRangeError(arena, "Instant string requires a UTC offset or Z");
     const days = shared.isoDateToEpochDays(dt.date.year, dt.date.month, dt.date.day);
     var ns: i128 = @as(i128, days) * shared.NS_PER_DAY + shared.timeToNanos(dt.time);

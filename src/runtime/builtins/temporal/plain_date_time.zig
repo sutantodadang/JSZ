@@ -147,7 +147,8 @@ fn dtFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflo
     if (month_v != null and month_v.?.unbox() != .undefined_) {
         month = try shared.toIntegerWithTruncation(arena, month_v.?);
     } else if (mc_v != null and mc_v.?.unbox() != .undefined_) {
-        const code = try shared.valueToString(arena, mc_v.?);
+        if (mc_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
+        const code = mc_v.?.unbox().string;
         if (code.len < 3 or code[0] != 'M') return realm_mod.throwRangeError(arena, "invalid monthCode");
         month = @floatFromInt(std.fmt.parseInt(u8, code[1..3], 10) catch return realm_mod.throwRangeError(arena, "invalid monthCode"));
     } else return realm_mod.throwTypeError(arena, "missing month or monthCode");

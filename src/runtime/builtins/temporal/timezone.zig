@@ -122,7 +122,7 @@ pub fn toZone(arena: std.mem.Allocator, s0: []const u8) !Zone {
     //    negative-zero extended year is rejected even when a [tz] bracket is
     //    present); then the identifier comes from the [tz] bracket if present,
     //    else from the trailing offset / Z designator.
-    _ = shared.parseISODateTimeOpts(s, false) catch return realm_mod.throwRangeError(arena, "invalid time zone string");
+    _ = shared.parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = false }) catch return realm_mod.throwRangeError(arena, "invalid time zone string");
     if (extractBracket(s)) |inner| {
         if (eqIgnoreCase(inner, "UTC")) return .{ .id = "UTC", .offset_ns = 0 };
         if (tzdata.isKnownZone(inner)) {
@@ -162,7 +162,7 @@ pub fn toZoneAtInstant(arena: std.mem.Allocator, s0: []const u8, epoch_ns: i128)
     }
 
     // 4. Datetime string.
-    _ = shared.parseISODateTimeOpts(s, false) catch return realm_mod.throwRangeError(arena, "invalid time zone string");
+    _ = shared.parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = false }) catch return realm_mod.throwRangeError(arena, "invalid time zone string");
     if (extractBracket(s)) |inner| {
         if (eqIgnoreCase(inner, "UTC")) return .{ .id = "UTC", .offset_ns = 0 };
         if (tzdata.isKnownZone(inner)) {
@@ -182,7 +182,7 @@ pub fn toZoneAtInstant(arena: std.mem.Allocator, s0: []const u8, epoch_ns: i128)
 /// For a bracket-less datetime string, derive the zone from its trailing offset.
 fn zoneFromDateTimeOffset(arena: std.mem.Allocator, s: []const u8) !Zone {
     // The string must parse as an ISO datetime (validates the date/time part).
-    _ = shared.parseISODateTimeOpts(s, false) catch return realm_mod.throwRangeError(arena, "invalid time zone string");
+    _ = shared.parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = false }) catch return realm_mod.throwRangeError(arena, "invalid time zone string");
     // Find the offset portion after the 'T'.
     const t_idx = std.mem.indexOfAny(u8, s, "Tt") orelse return realm_mod.throwRangeError(arena, "invalid time zone string");
     var i = t_idx + 1;

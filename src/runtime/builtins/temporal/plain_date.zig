@@ -137,7 +137,8 @@ fn dateFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overf
     if (month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_) {
         month = try shared.toIntegerWithTruncation(arena, month_v.?);
     } else if (monthcode_v != null and monthcode_v.?.bits != 0 and monthcode_v.?.unbox() != .undefined_) {
-        month = @floatFromInt(try monthFromCode(arena, try shared.valueToString(arena, monthcode_v.?)));
+        if (monthcode_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
+        month = @floatFromInt(try monthFromCode(arena, monthcode_v.?.unbox().string));
     } else {
         return realm_mod.throwTypeError(arena, "missing month or monthCode");
     }

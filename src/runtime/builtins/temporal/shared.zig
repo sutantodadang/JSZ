@@ -298,13 +298,23 @@ const Parser = struct {
 /// expanded "±YYYYYY-MM-DD", and datetime forms (time part ignored). Bracket
 /// suffixes like "[u-ca=iso8601]" are tolerated.
 pub fn parseISODateTime(s0: []const u8) ParseError!ISODateTime {
-    return parseISODateTimeOpts(s0, true);
+    return parseISODateTimeOpts(s0, .{});
 }
 
-/// As `parseISODateTime`, but `validate_calendar` selects whether a first
-/// `[u-ca=…]` annotation must name the iso8601 calendar. Types without a
-/// calendar (Instant, PlainTime, time zones) pass `false`.
-pub fn parseISODateTimeOpts(s0: []const u8, validate_calendar: bool) ParseError!ISODateTime {
+/// Options for `parseISODateTimeOpts`.
+///   * `validate_calendar` — a first `[u-ca=…]` annotation must name the
+///     iso8601 calendar. Calendar-bearing types (PlainDate, PlainDateTime,
+///     PlainYearMonth, PlainMonthDay, ZonedDateTime) set this; Instant,
+///     PlainTime and time zones ignore the calendar so leave it false.
+///   * `reject_utc` — a bare `Z` UTC designator makes the string invalid. The
+///     plain wall-clock types (PlainDate/DateTime/Time/YearMonth/MonthDay)
+///     reject it; Instant and ZonedDateTime accept `Z`.
+pub const IsoParseOpts = struct {
+    validate_calendar: bool = true,
+    reject_utc: bool = true,
+};
+
+pub fn parseISODateTimeOpts(s0: []const u8, opts: IsoParseOpts) ParseError!ISODateTime {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     var p = Parser{ .s = s };
 
@@ -333,11 +343,13 @@ pub fn parseISODateTimeOpts(s0: []const u8, validate_calendar: bool) ParseError!
         if (c == 'T' or c == 't' or c == ' ') {
             p.i += 1;
             time = try parseTimeInner(&p);
-            // Optional offset / Z — tolerated but ignored for plain types.
-            skipOffset(&p);
+            // Optional offset / Z — the offset is ignored for plain types, but a
+            // bare `Z` UTC designator is rejected by wall-clock types.
+            const had_utc = skipOffset(&p);
+            if (had_utc and opts.reject_utc) return error.Invalid;
         }
     }
-    try parseAnnotations(&p, validate_calendar);
+    try parseAnnotations(&p, opts.validate_calendar);
     if (!p.eof()) return error.Invalid;
 
     if (year < -271821 or year > 275760) return error.Invalid;
@@ -419,11 +431,12 @@ pub fn parseISOTime(s0: []const u8) ParseError!ISOTime {
     // Try full datetime first if it looks like a date (has a '-' in first 6, or
     // 8 leading digits followed by 'T').
     if (looksLikeDate(s)) {
-        const dt = try parseISODateTimeOpts(s, false);
+        // PlainTime has no calendar but still rejects a bare `Z` UTC designator.
+        const dt = try parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = true });
         return dt.time;
     }
     const t = try parseTimeInner(&p);
-    skipOffset(&p);
+    if (skipOffset(&p)) return error.Invalid; // bare `Z` invalid for PlainTime
     try parseAnnotations(&p, false);
     if (!p.eof()) return error.Invalid;
     if (!isValidISOTime(t)) return error.Invalid;
@@ -494,18 +507,20 @@ fn parseFraction(p: *Parser, t: *ISOTime) ParseError!void {
     }
 }
 
-fn skipOffset(p: *Parser) void {
+/// Consume an optional UTC offset / `Z` designator. Returns true iff a bare `Z`
+/// (UTC designator) was consumed — plain (calendar/wall-clock) types reject it.
+fn skipOffset(p: *Parser) bool {
     if (p.peek()) |c| {
         if (c == 'Z' or c == 'z') {
             p.i += 1;
-            return;
+            return true;
         }
         if (c == '+' or c == '-') {
             const save = p.i;
             p.i += 1;
             const h = p.digitsN(2) orelse {
                 p.i = save;
-                return;
+                return false;
             };
             _ = h;
             // Minutes: "±HH", "±HH:MM" and compact "±HHMM" are all valid, as is
@@ -523,6 +538,7 @@ fn skipOffset(p: *Parser) void {
             }
         }
     }
+    return false;
 }
 
 fn isDigit(c: ?u8) bool {

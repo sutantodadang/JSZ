@@ -253,7 +253,8 @@ fn readDateTimeFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.O
     if (month_v != null and month_v.?.unbox() != .undefined_) {
         month = try shared.toIntegerWithTruncation(arena, month_v.?);
     } else if (mc_v != null and mc_v.?.unbox() != .undefined_) {
-        const code = try shared.valueToString(arena, mc_v.?);
+        if (mc_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
+        const code = mc_v.?.unbox().string;
         if (code.len < 3 or code[0] != 'M') return realm_mod.throwRangeError(arena, "invalid monthCode");
         month = @floatFromInt(std.fmt.parseInt(u8, code[1..3], 10) catch return realm_mod.throwRangeError(arena, "invalid monthCode"));
     } else return realm_mod.throwTypeError(arena, "missing month or monthCode");
@@ -331,7 +332,8 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
     // A single [tz] bracket is mandatory; validate all annotations in one pass.
     const bracket = try extractAnnotations(arena, s);
     const zone = try timezone.toZone(arena, bracket);
-    const dt = shared.parseISODateTime(s) catch return realm_mod.throwRangeError(arena, "invalid ZonedDateTime string");
+    // ZonedDateTime accepts a `Z` UTC designator (unlike the plain types).
+    const dt = shared.parseISODateTimeOpts(s, .{ .validate_calendar = true, .reject_utc = false }) catch return realm_mod.throwRangeError(arena, "invalid ZonedDateTime string");
     const str_off = extractStringOffset(arena, s) catch |e| return e;
     const offset_opt = try getOffsetOption(arena, opts, .reject);
     const ns = try interpretOffset(arena, dt, zone.offset_ns, str_off, offset_opt);
