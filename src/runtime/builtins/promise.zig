@@ -518,9 +518,17 @@ fn makeCtxHandler(arena: std.mem.Allocator, native_fn: Value, ctx_ptr: *anyopaqu
     } else &[_]Value{};
     const bd = try arena.create(fn_proto.BoundData);
     bd.* = .{ .target = native_fn, .this_val = carrier_val, .prefix = prefix };
-    const bound_obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    const bound_obj = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_function_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_function_proto);
     bound_obj.internal_kind = .bound_function;
     bound_obj.internal_slot = bd;
+    // These are anonymous 1-ary built-in functions (Promise resolve/reject element
+    // closures, the capability executor, finally handlers): length before name,
+    // both non-writable/non-enumerable/configurable.
+    _ = try bound_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try bound_obj.defineOwnData("name", try val_mod.makeString(arena, ""), .{ .writable = false, .enumerable = false, .configurable = true });
     return val_mod.makeObject(arena, bound_obj);
 }
 
@@ -548,10 +556,17 @@ const Capability = struct {
 /// the capability; a second invocation (either slot already set) is a TypeError.
 fn nativeCapabilityExecutor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const cap = ctxFromThis(Capability, this_val) orelse return val_mod.makeUndefined(arena);
-    if (cap.slots_set) return realm_mod.throwTypeError(arena, "Promise executor already invoked");
-    cap.slots_set = true;
-    if (args.len > 0) cap.resolve = args[0];
-    if (args.len > 1) cap.reject = args[1];
+    // §27.2.1.5.1: throw only if a *non-undefined* resolve/reject is already
+    // recorded (so calling the executor with undefined args, then real ones, is OK).
+    const has = struct {
+        fn set(v: Value) bool {
+            return v.bits != 0 and v.unbox() != .undefined_;
+        }
+    };
+    if (has.set(cap.resolve)) return realm_mod.throwTypeError(arena, "Promise resolve function already set");
+    if (has.set(cap.reject)) return realm_mod.throwTypeError(arena, "Promise reject function already set");
+    cap.resolve = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    cap.reject = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
     return val_mod.makeUndefined(arena);
 }
 

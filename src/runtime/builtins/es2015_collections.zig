@@ -2350,6 +2350,17 @@ pub fn nativeObjSpreadInto(arena: std.mem.Allocator, _: Value, args: []const Val
 }
 
 /// __getIterator__(x): obtain an iterator (object with next()) for `x`.
+/// Call an @@iterator method and enforce GetIterator's requirement that the
+/// result is an Object (a non-object iterator throws a TypeError — §7.4.2).
+fn callIteratorMethod(arena: std.mem.Allocator, recv: Value, method: Value) anyerror!Value {
+    const it = try function_proto.invokeCallback(arena, recv, method, &[_]Value{});
+    if (it.bits == 0 or it.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator method did not return an object");
+        return error.JsException;
+    }
+    return it;
+}
+
 pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const x = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     if (x.bits != 0 and x.unbox() == .object) {
@@ -2360,11 +2371,11 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
         }
         // ES2015: obtain the iterator via the object's Symbol.iterator method.
         if (iteratorMethod(obj)) |itf| {
-            if (isCallable(itf)) return function_proto.invokeCallback(arena, x, itf, &[_]Value{});
+            if (isCallable(itf)) return callIteratorMethod(arena, x, itf);
         }
         // Iterable — call its @@iterator method.
         if (obj.get("@@iterator")) |itf| {
-            if (isCallable(itf)) return function_proto.invokeCallback(arena, x, itf, &[_]Value{});
+            if (isCallable(itf)) return callIteratorMethod(arena, x, itf);
         }
         // Observable @@iterator lookup through the prototype chain (fires a getter
         // / Proxy trap, finds an inherited `Array.prototype[Symbol.iterator]`). This
@@ -2379,7 +2390,7 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
                         realm_mod.pending_exception = try makeTypeErrorVal(arena, "Symbol.iterator is not a function");
                         return error.JsException;
                     }
-                    return function_proto.invokeCallback(arena, x, m, &[_]Value{});
+                    return callIteratorMethod(arena, x, m);
                 }
             }
         }
