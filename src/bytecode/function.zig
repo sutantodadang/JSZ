@@ -51,6 +51,10 @@ pub const BcFunction = struct {
     /// binding: the VM uses the `this` captured into the closure at NEW_CLOSURE
     /// time instead of any caller-provided value.
     is_arrow: bool = false,
+    /// Whether this is a concise method (object/class method shorthand, getter,
+    /// or setter). Concise methods are not constructors: a non-generator method
+    /// has no own `prototype` property (spec MethodDefinitionEvaluation).
+    is_method: bool = false,
     /// M16: this top-level function compiles ES-module code. Used so the VM binds
     /// the module's top-level `this` to undefined (a Script binds it to the global
     /// object). Only meaningful on a program/module top-level function.

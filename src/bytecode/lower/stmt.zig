@@ -56,9 +56,20 @@ pub fn lowerVarDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
             if (init_node.kind == .function_expr) self.name_hint = vd.name;
             const r = try self.compileExpr(init_node);
             self.name_hint = null; // defensive clear (no-op if consumed inside)
-            // Phase 4d: var declarations always define (not assign) — use DEFINE_GLOBAL
-            // so strict-mode functions don't throw ReferenceError for var bindings.
-            try self.emitDefine(vd.name, r, line);
+            if (self.with_depth > 0) {
+                // Inside a `with`, the `var x = init` initializer is an ordinary
+                // assignment whose ResolveBinding("x") crosses the with-object
+                // environment: if the with-object HasProperty "x", PutValue writes
+                // there, not to the hoisted var binding. SET_GLOBAL consults the
+                // with-stack; the var name was already hoisted at scope entry, so
+                // env.assign finds the binding when no with-object shadows it.
+                try self.emitStore(vd.name, r, line);
+            } else {
+                // Phase 4d: var declarations always define (not assign) — use
+                // DEFINE_GLOBAL so strict-mode functions don't throw ReferenceError
+                // for var bindings.
+                try self.emitDefine(vd.name, r, line);
+            }
             self.freeReg();
         } else if (vd.kind != .var_) {
             // Phase 7 baseline: emit explicit undefined initialization for let.
@@ -1061,7 +1072,9 @@ pub fn lowerWithStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{
     try self.emitOp(.PUSH_WITH, line);
     try self.emitU8(robj);
     self.sp = robj;
+    self.with_depth += 1;
     try self.compileStmt(ws.body, last_expr_reg);
+    self.with_depth -= 1;
     try self.emitOp(.POP_WITH, line);
 }
 

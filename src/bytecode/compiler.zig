@@ -127,6 +127,11 @@ pub const FnCompiler = struct {
     /// Number of block scopes (ENTER_SCOPE) currently open in the bytecode being
     /// emitted. Used so `break`/`continue` emit matching EXIT_SCOPE ops.
     block_scope_depth: u32 = 0,
+    /// Number of enclosing `with` statements whose body is currently being
+    /// compiled. When >0, a `var x = init` initializer must route its store
+    /// through the with-object environment (SET_GLOBAL) rather than a direct
+    /// DEFINE_GLOBAL, since ResolveBinding("x") crosses the with-object env.
+    with_depth: u32 = 0,
     /// ES2020 optional chaining: while compiling an `optional_chain`, this points
     /// to the list of JMP_IF_NULLISH patch offsets emitted by optional links.
     /// They are all patched to the chain's short-circuit landing pad. null when
@@ -2089,6 +2094,11 @@ pub const FnCompiler = struct {
             fe.param_defaults,
             fe.source_text,
         );
+
+        // Concise methods (object/class method shorthand, getters, setters) are
+        // not constructors: propagate the flag so the VM omits the `prototype`
+        // property for non-generator methods.
+        child_fn.is_method = fe.is_method;
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
         try self.child_functions.append(self.arena, child_fn);

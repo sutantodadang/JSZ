@@ -1990,10 +1990,13 @@ pub const BcVm = struct {
                     if (o.hasOwn(key)) return true;
                 }
                 if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "length")) return true;
-                // Async (non-generator) functions have no own "prototype"; every
-                // other bc function does (getProp materializes one on demand).
+                // Only constructor-capable bc functions have an own "prototype":
+                // generators (incl. generator methods) always do; arrows, concise
+                // non-generator methods, and plain async functions never do; a
+                // normal function does (getProp materializes one on demand).
                 if (std.mem.eql(u8, key, "prototype"))
-                    return !(closure.func.is_async and !closure.func.is_generator);
+                    return closure.func.is_generator or
+                        (!closure.func.is_arrow and !closure.func.is_method and !closure.func.is_async);
             } else {
                 if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "length")) return true;
             }
@@ -2611,6 +2614,10 @@ pub const BcVm = struct {
         // `hasOwnProperty('prototype')`.
         if (closure.func.is_async and !closure.func.is_generator)
             return val_mod.makeUndefined(self.arena);
+        // Arrow functions and concise (non-generator) methods are not constructors
+        // and carry no own `prototype`. Generator methods DO (handled below).
+        if ((closure.func.is_arrow or closure.func.is_method) and !closure.func.is_generator)
+            return val_mod.makeUndefined(self.arena);
         if (closure.func.is_generator) {
             const gr: *Realm = if (closure.realm) |ro| @ptrCast(@alignCast(ro)) else self.realm;
             try self.ensureGeneratorChain(gr);
@@ -2626,8 +2633,13 @@ pub const BcVm = struct {
         else
             try JsObject.create(self.arena, self.realm.object_prototype);
         const pv = try val_mod.makeObject(self.arena, proto_obj);
-        try proto_obj.set("constructor", fn_val);
-        try o.set("prototype", pv);
+        // §20.2.4.3: F.prototype.constructor is {writable:true, enumerable:false,
+        // configurable:true} — a plain `set` would make it enumerable, so it would
+        // wrongly show up in for-in / Object.keys of the prototype.
+        _ = try proto_obj.defineOwnData("constructor", fn_val, .{ .writable = true, .enumerable = false, .configurable = true });
+        // §20.2.4.2: a function's own `prototype` is {writable:true,
+        // enumerable:false, configurable:false}.
+        _ = try o.defineOwnData("prototype", pv, .{ .writable = true, .enumerable = false, .configurable = false });
         return pv;
     }
 

@@ -1266,6 +1266,9 @@ pub var active_sym_async_dispose: ?Value = null;
 /// Symbol.dispose (explicit resource management); used by DisposableStack and
 /// `using` declarations.
 pub var active_sym_dispose: ?Value = null;
+/// Symbol.unscopables well-known symbol; a `with`-object's @@unscopables map
+/// hides listed names from the with-scope (HasBinding returns false for them).
+pub var active_sym_unscopables: ?Value = null;
 /// Well-known RegExp-related symbols (@@match/@@replace/@@search/@@split/@@matchAll).
 pub var active_sym_match: ?Value = null;
 pub var active_sym_replace: ?Value = null;
@@ -4505,6 +4508,23 @@ pub const Realm = struct {
         active_sym_async_iterator = symbol_ctor.getOwn("asyncIterator");
         active_sym_async_dispose = symbol_ctor.getOwn("asyncDispose");
         active_sym_dispose = symbol_ctor.getOwn("dispose");
+        active_sym_unscopables = symbol_ctor.getOwn("unscopables");
+        // Array.prototype[@@unscopables]: a null-proto list whose truthy keys are
+        // hidden from `with(array)` scopes (spec 23.1.3.35). The property itself
+        // is non-writable/non-enumerable/configurable; each entry is a plain
+        // writable/enumerable/configurable data property with value `true`.
+        if (active_sym_unscopables) |unsym| {
+            const unsc_list = try JsObject.create(arena, null);
+            const unsc_names = [_][]const u8{
+                "copyWithin", "entries",  "fill",       "find",     "findIndex",
+                "findLast",   "flat",     "flatMap",    "includes", "keys",
+                "toReversed", "toSorted", "toSpliced",  "values",   "findLastIndex",
+            };
+            for (unsc_names) |nm| {
+                _ = try unsc_list.defineOwnData(nm, try val_mod.makeBool(arena, true), .{ .writable = true, .enumerable = true, .configurable = true });
+            }
+            try array_proto.setSymAttr(unsym, try val_mod.makeObject(arena, unsc_list), .{ .writable = false, .enumerable = false, .configurable = true });
+        }
         // Capture Symbol.toPrimitive and give Date the spec-correct hook so
         // `date + x` coerces to a string (default hint) rather than a number.
         active_sym_to_primitive = symbol_ctor.getOwn("toPrimitive");

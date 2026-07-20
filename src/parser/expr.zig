@@ -235,7 +235,13 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         }
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
+        // NamedEvaluation: `x = class {}` names the anonymous class after the
+        // target (see parseAssignmentExprCore for the mirror case).
+        const set_class_hint = op == .assign and left.kind == .identifier and
+            p.check(.kw_class) and p.export_default_name_hint == null;
+        if (set_class_hint) p.export_default_name_hint = left.data.identifier;
         const right = p.parseAssignmentExpr() orelse return null;
+        if (set_class_hint) p.export_default_name_hint = null;
         if (p.rewriteSuperPropAssign(op, left, right, left.start, p.current.start)) |sp| {
             left = sp;
         } else {
@@ -381,7 +387,14 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         }
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
+        // NamedEvaluation: `x = class {}` (simple `=` to an IdentifierReference)
+        // names the anonymous class after the target. Threaded to parseClassExpr
+        // via the parser hint since the class desugars to an IIFE.
+        const set_class_hint = op == .assign and left.kind == .identifier and
+            p.check(.kw_class) and p.export_default_name_hint == null;
+        if (set_class_hint) p.export_default_name_hint = left.data.identifier;
         const right = p.parseAssignmentExpr() orelse return null; // right-assoc
+        if (set_class_hint) p.export_default_name_hint = null;
         if (p.rewriteSuperPropAssign(op, left, right, start, p.current.start)) |sp| return sp;
         return p.makeNode(.assignment_expr, start, p.current.start, .{
             .assignment_expr = .{ .op = op, .target = left, .value = right },
@@ -1965,7 +1978,14 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             continue;
         }
         _ = p.expect(.colon) orelse return null;
+        // NamedEvaluation: `{ key: class {} }` names the anonymous class after the
+        // property key. A class expression desugars to an IIFE, so the compiler's
+        // function name-hint can't reach the constructor; thread the name in via
+        // the parser's anonymous-name hint, which parseClassExpr consumes.
+        const set_class_hint = p.check(.kw_class) and p.export_default_name_hint == null;
+        if (set_class_hint) p.export_default_name_hint = key;
         const val_node = p.parseAssignmentExpr() orelse return null;
+        if (set_class_hint) p.export_default_name_hint = null;
         props.append(p.arena, ast.ObjectProp{ .key = key, .value = val_node, .kind = .init }) catch {
             p.had_error = true;
             return null;
