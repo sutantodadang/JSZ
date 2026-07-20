@@ -130,7 +130,7 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     var ni: usize = 0;
     var i: usize = start;
     while (i < end_) : (i += 1) {
-        if (try genHas(arena, O, i)) try genSet(arena, A, ni, try genGet(arena, O, i));
+        if (try genHas(arena, O, i)) try genCreate(arena, A, ni, try genGet(arena, O, i));
         ni += 1;
     }
     try setLength(arena, A, count);
@@ -444,11 +444,11 @@ pub fn nativeConcat(arena: std.mem.Allocator, this_val: Value, args: []const Val
             const len = try genLength(arena, E);
             var i: usize = 0;
             while (i < len) : (i += 1) {
-                if (try genHas(arena, E, i)) try genSet(arena, A, ni, try genGet(arena, E, i));
+                if (try genHas(arena, E, i)) try genCreate(arena, A, ni, try genGet(arena, E, i));
                 ni += 1;
             }
         } else {
-            try genSet(arena, A, ni, E);
+            try genCreate(arena, A, ni, E);
             ni += 1;
         }
     }
@@ -500,7 +500,7 @@ pub fn nativeMap(arena: std.mem.Allocator, this_val: Value, args: []const Value)
         if (!try genHas(arena, O, i)) continue; // map preserves holes
         const elem = try genGet(arena, O, i);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
-        try genSet(arena, A, i, result);
+        try genCreate(arena, A, i, result);
     }
     return A;
 }
@@ -520,7 +520,7 @@ pub fn nativeFilter(arena: std.mem.Allocator, this_val: Value, args: []const Val
         const elem = try genGet(arena, O, i);
         const result = try callCb(arena, cb, cb_this, elem, @floatFromInt(i), O);
         if (isTruthy(result)) {
-            try genSet(arena, A, ni, elem);
+            try genCreate(arena, A, ni, elem);
             ni += 1;
         }
     }
@@ -666,21 +666,15 @@ pub fn nativeFindIndex(arena: std.mem.Allocator, this_val: Value, args: []const 
 
 /// ES2022 Array.prototype.at — negative indices count from the end.
 pub fn nativeAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // §23.1.3.1: O = ToObject(this); len = LengthOfArrayLike(O);
+    // relativeIndex = ToIntegerOrInfinity(index) (coerces objects via valueOf).
     try requireCoercible(arena, this_val);
-    const arr = getArray(this_val) orelse return val_mod.makeUndefined(arena);
-    const len = arr.array_length;
-    if (len == 0) return val_mod.makeUndefined(arena);
-    const idx_raw: f64 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .number => |n| n,
-            else => 0.0,
-        }
-    else
-        0.0;
-    const k = relativeIndex(idx_raw, len);
-    if (k >= len) return val_mod.makeUndefined(arena);
-    const key = try std.fmt.allocPrint(arena, "{d}", .{k});
-    return arr.getOwn(key) orelse try val_mod.makeUndefined(arena);
+    const O = try toObject(arena, this_val);
+    const len = try genLength(arena, this_val);
+    const rel = try genInteger(arena, if (args.len > 0) args[0] else try val_mod.makeUndefined(arena));
+    const k: f64 = if (rel >= 0) rel else @as(f64, @floatFromInt(len)) + rel;
+    if (k < 0 or k >= @as(f64, @floatFromInt(len))) return val_mod.makeUndefined(arena);
+    return genGet(arena, O, @intFromFloat(k));
 }
 
 /// ES2022 Array.prototype.findLast — like find, scans from the end.
@@ -891,6 +885,33 @@ fn genSet(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
     }
     if (this_val.isHeapPtr() and this_val.toPtr().* == .object)
         try this_val.toPtr().object.set(key, v);
+}
+
+/// CreateDataPropertyOrThrow(O, ToString(i), v) — define a fresh { value,
+/// writable, enumerable, configurable: true } data property, throwing TypeError
+/// if [[DefineOwnProperty]] fails (non-configurable existing prop, non-extensible
+/// target, exotic rejection). Used by concat/map/filter/splice/… which the spec
+/// defines with CreateDataProperty, not [[Set]].
+fn genCreate(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
+    if (realm_mod.nativeDeadlineExceeded()) return error.OutOfMemory;
+    // Fast path: dense real array (elements are always configurable/writable and
+    // the array is extensible, so CreateDataProperty always succeeds).
+    if (i <= std.math.maxInt(u32)) if (denseArrayOf(this_val)) |o| {
+        try o.setIndex(@intCast(i), v);
+        return;
+    };
+    const obj_methods = @import("object_methods.zig");
+    const proto: ?*JsObject = realm_mod.active_object_proto;
+    const d = if (realm_mod.active_heap) |heap|
+        try JsObject.createOnHeap(heap, proto)
+    else
+        try JsObject.create(arena, proto);
+    try d.set("value", v);
+    try d.set("writable", try val_mod.makeBool(arena, true));
+    try d.set("enumerable", try val_mod.makeBool(arena, true));
+    try d.set("configurable", try val_mod.makeBool(arena, true));
+    const key_val = try val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}", .{i}));
+    _ = try obj_methods.nativeObjectDefineProperty(arena, this_val, &[_]Value{ this_val, key_val, val_mod.makeObject(arena, d) catch this_val });
 }
 
 /// DeletePropertyOrThrow(O, ToString(i)) — best-effort own-property delete.
@@ -1258,7 +1279,7 @@ pub fn nativeSplice(arena: std.mem.Allocator, this_val: Value, args: []const Val
         var r: usize = 0;
         while (r < del_count) : (r += 1) {
             if (try genHas(arena, O, start + r))
-                try genSet(arena, removed, r, try genGet(arena, O, start + r));
+                try genCreate(arena, removed, r, try genGet(arena, O, start + r));
         }
         try setLength(arena, removed, del_count);
     }
