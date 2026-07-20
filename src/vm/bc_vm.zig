@@ -1880,6 +1880,30 @@ pub const BcVm = struct {
             realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot set property on module namespace object");
             return error.JsException;
         }
+        // OrdinarySet: walk the prototype chain for a symbol-keyed accessor. An
+        // accessor (own or inherited) routes the write through its setter; an own
+        // data property (or none) is created/overwritten directly on the receiver.
+        var cur: ?*JsObject = obj;
+        var depth: usize = 0;
+        while (cur) |o| {
+            if (depth >= 64) break;
+            depth += 1;
+            if (o.internal_kind == .proxy and o != obj) {
+                _ = try self.proxySet(obj_val, o, sym_key, value, obj_val);
+                return;
+            }
+            if (o.getOwnSymEntry(sym_key)) |sp| {
+                if (sp.attr.is_accessor) {
+                    const setter = accessorMember(sp.value, "set");
+                    if (isCallable(setter)) _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
+                    return;
+                }
+                // A data property found on `obj` itself is overwritten in place;
+                // one inherited from a prototype is shadowed by a new own property.
+                break;
+            }
+            cur = o.proto;
+        }
         try obj.setSym(sym_key, value);
     }
 

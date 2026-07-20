@@ -1627,6 +1627,11 @@ fn nativeArrayFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anye
             try items.append(arena, cv);
             i += byte_len;
         }
+    } else if (src_unboxed != .null_ and src_unboxed != .undefined_) {
+        // Non-string primitive (number/boolean/symbol/bigint): GetMethod(items,
+        // @@iterator) coerces via ToObject, so a wrapper-prototype @@iterator
+        // (e.g. a custom Number.prototype[@@iterator]) is honoured.
+        _ = try arrayFromIterate(arena, src, &items);
     }
 
     // Apply mapFn if provided.

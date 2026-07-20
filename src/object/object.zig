@@ -32,6 +32,14 @@ const DENSE_MAX_GAP: usize = 1024;
 /// isolate, so no synchronization is needed.
 var index_key_pool: std.ArrayListUnmanaged([]const u8) = .empty;
 
+/// Drop the cached index strings. The pool's entries are allocated from the
+/// shape manager's arena, so it MUST be cleared whenever that arena is reset
+/// (resetGlobalShapes) — otherwise the retained slices dangle into freed memory
+/// and the next dense-key enumeration reads use-after-free.
+pub fn resetIndexKeyPool() void {
+    index_key_pool = .empty;
+}
+
 fn indexKeyString(alloc: std.mem.Allocator, i: u32) ![]const u8 {
     while (index_key_pool.items.len <= i) {
         const n: u32 = @intCast(index_key_pool.items.len);

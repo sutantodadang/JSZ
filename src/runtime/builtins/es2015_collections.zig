@@ -1961,6 +1961,96 @@ fn nativeIterSelf(_: std.mem.Allocator, this_val: Value, _: []const Value) anyer
     return this_val;
 }
 
+/// Getter for %IteratorPrototype%.constructor — returns %Iterator%.
+fn nativeIterCtorGet(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    if (active_iterator_ctor) |c| return val_mod.makeObject(arena, c);
+    return val_mod.makeUndefined(arena);
+}
+
+/// Getter for %IteratorPrototype%[@@toStringTag] — returns "Iterator".
+fn nativeIterTagGet(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    return val_mod.makeString(arena, "Iterator");
+}
+
+/// SetterThatIgnoresPrototypeProperties(this, %Iterator.prototype%, p, v): a
+/// shared accessor setter that lets subclasses install their own `constructor`
+/// / @@toStringTag but forbids mutating the shared %Iterator.prototype%.
+fn iterProtoIgnoringSetter(arena: std.mem.Allocator, this_val: Value, v: Value, is_tag: bool) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        try setTypeError(arena, "Iterator.prototype setter called on non-object");
+        unreachable;
+    }
+    const obj = this_val.toPtr().object;
+    if (active_iterator_proto) |home| {
+        if (obj == home) {
+            try setTypeError(arena, "Cannot assign to read-only property of %Iterator.prototype%");
+            unreachable;
+        }
+    }
+    const all: PropAttr = .{ .writable = true, .enumerable = true, .configurable = true };
+    if (is_tag) {
+        const sym = realm_mod.active_sym_to_string_tag orelse return val_mod.makeUndefined(arena);
+        if (obj.hasOwnSym(sym)) {
+            try obj.setSym(sym, v);
+        } else {
+            if (!obj.extensible) {
+                try setTypeError(arena, "Cannot define property on non-extensible object");
+                unreachable;
+            }
+            _ = try obj.defineOwnDataSym(sym, v, all);
+        }
+    } else {
+        if (obj.hasOwn("constructor")) {
+            try obj.set("constructor", v);
+        } else {
+            if (!obj.extensible) {
+                try setTypeError(arena, "Cannot define property on non-extensible object");
+                unreachable;
+            }
+            _ = try obj.defineOwnData("constructor", v, all);
+        }
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+fn nativeIterCtorSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return iterProtoIgnoringSetter(arena, this_val, if (args.len > 0) args[0] else try val_mod.makeUndefined(arena), false);
+}
+
+fn nativeIterTagSet(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return iterProtoIgnoringSetter(arena, this_val, if (args.len > 0) args[0] else try val_mod.makeUndefined(arena), true);
+}
+
+/// Define a get/set accessor pair (string key) on `obj`.
+fn defineAccessorPair(arena: std.mem.Allocator, obj: *JsObject, key: []const u8, getter: val_mod.NativeFnPtr, setter: val_mod.NativeFnPtr) !void {
+    const holder = try JsObject.create(arena, null);
+    const gname = try std.fmt.allocPrint(arena, "get {s}", .{key});
+    const sname = try std.fmt.allocPrint(arena, "set {s}", .{key});
+    try holder.set("get", try val_mod.makeNativeFunctionNamed(arena, getter, gname, 0));
+    try holder.set("set", try val_mod.makeNativeFunctionNamed(arena, setter, sname, 1));
+    _ = try obj.defineOwnAccessor(key, try val_mod.makeObject(arena, holder), .{ .enumerable = false, .configurable = true, .writable = false });
+}
+
+/// Define a get/set accessor pair (symbol key) on `obj`.
+fn defineAccessorPairSym(arena: std.mem.Allocator, obj: *JsObject, sym: Value, getter: val_mod.NativeFnPtr, setter: val_mod.NativeFnPtr, name: []const u8) !void {
+    const holder = try JsObject.create(arena, null);
+    const gname = try std.fmt.allocPrint(arena, "get {s}", .{name});
+    const sname = try std.fmt.allocPrint(arena, "set {s}", .{name});
+    try holder.set("get", try val_mod.makeNativeFunctionNamed(arena, getter, gname, 0));
+    try holder.set("set", try val_mod.makeNativeFunctionNamed(arena, setter, sname, 1));
+    _ = try obj.defineOwnAccessorSym(sym, try val_mod.makeObject(arena, holder), .{ .enumerable = false, .configurable = true, .writable = false });
+}
+
+/// %IteratorPrototype%[@@dispose] (ES2025 explicit resource management): call the
+/// iterator's `return` method (if any) and return undefined.
+fn nativeIterDispose(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const ret_fn = try jsGet(arena, this_val, "return");
+    if (!(ret_fn.bits == 0 or ret_fn.unbox() == .undefined_ or ret_fn.unbox() == .null_)) {
+        _ = try function_proto.invokeCallback(arena, this_val, ret_fn, &[_]Value{});
+    }
+    return try val_mod.makeUndefined(arena);
+}
+
 /// Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain, attach
 /// all ES2024 Iterator Helper methods, and build %IteratorHelperPrototype%.
 /// Call once at realm init, after @@iterator / @@toStringTag are resolved.
@@ -1972,8 +2062,10 @@ pub fn initArrayIteratorProto(arena: std.mem.Allocator, object_proto: *JsObject)
     const iter_proto = try JsObject.create(arena, object_proto);
     if (realm_mod.active_sym_iterator) |sym|
         try iter_proto.setSymAttr(sym, try val_mod.makeNativeFunctionNamed(arena, nativeIterSelf, "[Symbol.iterator]", 0), cfg);
+    // @@toStringTag is an accessor pair (get "Iterator", weird setter) — same
+    // anti-monkey-patching rationale as `constructor`.
     if (realm_mod.active_sym_to_string_tag) |tag|
-        try iter_proto.setSymAttr(tag, try val_mod.makeString(arena, "Iterator"), tag_cfg);
+        try defineAccessorPairSym(arena, iter_proto, tag, nativeIterTagGet, nativeIterTagSet, "[Symbol.toStringTag]");
 
     // ES2024 Iterator Helper methods — all live on %IteratorPrototype%.
     _ = try iter_proto.defineOwnData("map",     try val_mod.makeNativeFunctionNamed(arena, nativeIterMap,     "map",     1), cfg);
@@ -1987,6 +2079,9 @@ pub fn initArrayIteratorProto(arena: std.mem.Allocator, object_proto: *JsObject)
     _ = try iter_proto.defineOwnData("some",    try val_mod.makeNativeFunctionNamed(arena, nativeIterSome,    "some",    1), cfg);
     _ = try iter_proto.defineOwnData("every",   try val_mod.makeNativeFunctionNamed(arena, nativeIterEvery,   "every",   1), cfg);
     _ = try iter_proto.defineOwnData("find",    try val_mod.makeNativeFunctionNamed(arena, nativeIterFind,    "find",    1), cfg);
+    // %IteratorPrototype%[@@dispose] — closes the iterator via its `return` method.
+    if (realm_mod.active_sym_dispose) |sym|
+        try iter_proto.setSymAttr(sym, try val_mod.makeNativeFunctionNamed(arena, nativeIterDispose, "[Symbol.dispose]", 0), cfg);
 
     // %ArrayIteratorPrototype%: { next, [@@toStringTag]: "Array Iterator" }.
     const aip = try JsObject.create(arena, iter_proto);
@@ -3266,7 +3361,9 @@ fn nativeIterSome(arena: std.mem.Allocator, this_val: Value, args: []const Value
             return e;
         };
         if (isTruthy(passed)) {
-            closeIterator(arena, it.source);
+            // Early exit is a NORMAL completion: IteratorClose propagates a throw
+            // from the `return` getter or method (unlike the abrupt path above).
+            try iteratorCloseThrowing(arena, it.source);
             return val_mod.makeBool(arena, true);
         }
     }
@@ -3293,7 +3390,7 @@ fn nativeIterEvery(arena: std.mem.Allocator, this_val: Value, args: []const Valu
             return e;
         };
         if (!isTruthy(passed)) {
-            closeIterator(arena, it.source);
+            try iteratorCloseThrowing(arena, it.source);
             return val_mod.makeBool(arena, false);
         }
     }
@@ -3320,7 +3417,7 @@ fn nativeIterFind(arena: std.mem.Allocator, this_val: Value, args: []const Value
             return e;
         };
         if (isTruthy(passed)) {
-            closeIterator(arena, it.source);
+            try iteratorCloseThrowing(arena, it.source);
             return value;
         }
     }
@@ -3685,6 +3782,9 @@ pub fn registerIteratorGlobal(ctx: *const intrinsics.Ctx) !void {
     _ = try iter_ctor.defineOwnData("zipKeyed", try val_mod.makeNativeFunctionNamed(arena, nativeIteratorZipKeyed, "zipKeyed", 1), cfg);
     try iter_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeIteratorCtor));
     active_iterator_ctor = iter_ctor;
-    _ = try iter_proto.defineOwnData("constructor", try val_mod.makeObject(arena, iter_ctor), cfg);
+    // %Iterator.prototype%.constructor is an accessor pair (get %Iterator%, weird
+    // setter) so the shared prototype cannot be monkey-patched but subclasses can
+    // install their own `constructor`.
+    try defineAccessorPair(arena, iter_proto, "constructor", nativeIterCtorGet, nativeIterCtorSet);
     try ctx.env.define("Iterator", try val_mod.makeObject(arena, iter_ctor));
 }

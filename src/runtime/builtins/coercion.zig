@@ -130,7 +130,13 @@ pub fn ordinaryToPrimitive(arena: std.mem.Allocator, v: Value, string_first: boo
         .{ "valueOf", "toString" };
     var had_callable = false;
     for (names) |name| {
-        const method = obj.get(name) orelse continue;
+        // [[Get]](obj, name): fire accessor getters / proxy traps and walk the
+        // prototype chain (a plain `obj.get` returns the raw accessor holder,
+        // never invoking a `get valueOf(){…}`). Getter throws propagate.
+        const method = if (realm_mod.active_context) |ctx|
+            try ctx.getProp(arena, v, name)
+        else
+            (obj.get(name) orelse continue);
         if (!isCallable(method)) continue;
         had_callable = true;
         const res = try function_proto.invokeCallback(arena, v, method, &[_]Value{});
