@@ -2521,7 +2521,8 @@ pub fn makeRegExpObject(arena: std.mem.Allocator, cr: *CompiledRegex, source: []
     try obj.set("[[OriginalSource]]", source_val);
 
     const li_val = try val_mod.makeNumber(arena, 0.0);
-    try obj.set("lastIndex", li_val);
+    // lastIndex is { writable, non-enumerable, non-configurable } (§22.2.7.2).
+    _ = try obj.defineOwnData("lastIndex", li_val, .{ .writable = true, .enumerable = false, .configurable = false });
 
     obj.internal_slot = @ptrCast(cr);
     obj.internal_kind = .regexp;
@@ -2620,7 +2621,8 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         const source_val = try val_mod.makeString(arena, pattern_str);
         try this_obj.set("[[OriginalSource]]", source_val);
         const li_val = try val_mod.makeNumber(arena, 0.0);
-        try this_obj.set("lastIndex", li_val);
+        // lastIndex is { writable, non-enumerable, non-configurable } (§22.2.7.2).
+        _ = try this_obj.defineOwnData("lastIndex", li_val, .{ .writable = true, .enumerable = false, .configurable = false });
         this_obj.internal_slot = @ptrCast(cr);
         this_obj.internal_kind = .regexp;
         return this_val;
@@ -2725,7 +2727,7 @@ pub fn nativeRegExpCompile(arena: std.mem.Allocator, this_val: Value, args: []co
         return throwRegExpSyntaxError(arena, pattern_str, flags_str);
 
     try this_obj.set("[[OriginalSource]]", try val_mod.makeString(arena, pattern_str));
-    try this_obj.set("lastIndex", try val_mod.makeNumber(arena, 0.0));
+    _ = try this_obj.defineOwnData("lastIndex", try val_mod.makeNumber(arena, 0.0), .{ .writable = true, .enumerable = false, .configurable = false });
     this_obj.internal_slot = @ptrCast(cr);
     this_obj.internal_kind = .regexp;
     return this_val;

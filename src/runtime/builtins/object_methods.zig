@@ -632,8 +632,9 @@ fn descTruthy(v: ?Value) bool {
     return switch (val.unbox()) {
         .number => |n| n != 0 and !std.math.isNan(n),
         .string => |s| s.len != 0,
-        .object => true,
+        .object, .function, .native_function, .bc_function, .symbol => true,
         .boolean => |b| b,
+        .bigint => |b| !b.toConst().eqlZero(),
         else => false,
     };
 }
@@ -1474,7 +1475,14 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         return args[0];
     }
 
-    if (descHas(desc, "get") or descHas(desc, "set")) {
+    // Classify the descriptor (§6.2.6): a generic descriptor (no value/writable/
+    // get/set) applied to an EXISTING accessor must preserve it as an accessor
+    // — only its enumerable/configurable change. Otherwise it would clobber the
+    // getter/setter with a fresh `undefined` data property.
+    const desc_is_accessor = descHas(desc, "get") or descHas(desc, "set");
+    const desc_is_data = descHas(desc, "value") or descHas(desc, "writable");
+    const existing_is_accessor = if (obj.ownAttr(key)) |a| a.is_accessor else false;
+    if (desc_is_accessor or (!desc_is_data and existing_is_accessor)) {
         // Partial descriptor: omitted get/set/enumerable/configurable keep the
         // EXISTING accessor's handlers/attributes (redefine), else default
         // undefined/false (create). Preserving the absent handler is required by
@@ -1515,14 +1523,14 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     var has_own_data = false;
     var cur_val: ?Value = null;
     if (obj.ownAttr(key)) |a| { // dense-aware own-property attrs
-        {
-            if (!a.is_accessor) {
-                cur_w = a.writable;
-                cur_e = a.enumerable;
-                cur_c = a.configurable;
-                cur_val = obj.getOwn(key);
-                has_own_data = true;
-            }
+        // Converting an accessor → data preserves the existing enumerable/
+        // configurable and defaults writable/value (§10.1.6.3 step 4.b.i).
+        cur_e = a.enumerable;
+        cur_c = a.configurable;
+        if (!a.is_accessor) {
+            cur_w = a.writable;
+            cur_val = obj.getOwn(key);
+            has_own_data = true;
         }
     }
     const value = if (descHas(desc, "value"))
@@ -1547,22 +1555,42 @@ pub fn nativeObjectDefineProperties(arena: std.mem.Allocator, _: Value, args: []
         return throwTypeError(arena, "Object.defineProperties called on non-object");
     }
 
-    if (args.len < 2 or args[1].bits == 0 or args[1].unbox() != .object) {
+    // Step 2: props = ToObject(Properties). null/undefined throw TypeError;
+    // other primitives box (and expose no relevant enumerable own keys).
+    const props_val = if (args.len >= 2) args[1] else Value{};
+    if (props_val.bits == 0 or props_val.unbox() == .undefined_ or props_val.unbox() == .null_)
+        return throwTypeError(arena, "Object.defineProperties: Properties must be coercible to an object");
+    const props = (try resolveObject(arena, props_val)) orelse {
+        const realm_mod = @import("../realm.zig");
+        const boxed = try realm_mod.toObjectForThis(arena, props_val);
+        if (boxed.bits != 0 and boxed.unbox() == .object) {
+            return defineFromProps(arena, args[0], boxed, boxed.toPtr().object);
+        }
         return args[0];
-    }
-    const props = args[1].toPtr().object;
+    };
+    return defineFromProps(arena, args[0], props_val, props);
+}
 
+/// Shared body of Object.defineProperties: for each enumerable own key of `props`,
+/// ToPropertyDescriptor(Get(props, key)) then DefinePropertyOrThrow(O, key, desc).
+/// A non-object descriptor value makes ToPropertyDescriptor throw TypeError.
+fn defineFromProps(arena: std.mem.Allocator, target: Value, props_val: Value, props: *JsObject) anyerror!Value {
     // Delegate each property to Object.defineProperty so exotic [[DefineOwnProperty]]
     // (TypedArray integer-indexed elements, Proxy, module namespace) is honored
     // instead of writing straight to ordinary property storage.
     for (props.ownKeys()) |k| {
         if (!props.isEnumerable(k)) continue;
-        const desc_val = props.getOwn(k) orelse continue;
-        if (desc_val.bits == 0 or desc_val.unbox() != .object) continue;
+        // Get(props, k) — invokes getters (with props as the receiver), so an
+        // accessor-backed descriptor property is honored with its side effects.
+        const desc_val = try descGet(arena, props_val, props, k);
+        // ToPropertyDescriptor requires an object (functions count); a primitive
+        // descriptor value throws TypeError.
+        if ((try resolveObject(arena, desc_val)) == null)
+            return throwTypeError(arena, "Property description must be an object");
         const key_val = try val_mod.makeString(arena, k);
-        _ = try nativeObjectDefineProperty(arena, args[0], &[_]Value{ args[0], key_val, desc_val });
+        _ = try nativeObjectDefineProperty(arena, target, &[_]Value{ target, key_val, desc_val });
     }
-    return args[0];
+    return target;
 }
 
 /// Object.freeze(o): freeze the object (non-extensible, all props non-writable/non-configurable).
