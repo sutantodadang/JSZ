@@ -13,6 +13,7 @@ const RunOutcome = bcv.RunOutcome;
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const Environment = @import("../../runtime/execution_context.zig").Environment;
+const realm_mod = @import("../../runtime/realm.zig");
 
 /// Resolve `name` as an own property of the running scope's global object
 /// (`globalThis`). This backs the global-environment-record semantics: a binding
@@ -291,11 +292,25 @@ pub inline fn opPopWith(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+/// Object Environment Record HasBinding(N) for a `with`-object (spec 9.1.1.2.1):
+/// HasProperty(obj, N) AND, unless the @@unscopables map lists N as truthy, the
+/// binding applies. A with-object whose `obj[@@unscopables][N]` is truthy hides
+/// N from the with-scope so resolution falls through to the outer environment.
+/// Note: both HasProperty and the @@unscopables Get can run user code.
+pub fn withHasBinding(self: *BcVm, wobj: Value, key: Value, name: []const u8) !bool {
+    if (!try self.hasProperty(wobj, key)) return false;
+    const unsym = realm_mod.active_sym_unscopables orelse return true;
+    const unsc = try self.getPropSym(wobj, unsym);
+    if (unsc.bits == 0 or unsc.unbox() != .object) return true;
+    const blocked = try self.getProp(unsc, name);
+    return !val_mod.toBoolean(blocked);
+}
+
 /// `with`-scope resolution: search the frame's with-object stack (innermost
-/// last) for the first object that HasProperty(name); return its value via
-/// [[Get]]. Returns null when no with-object provides the binding (the caller
-/// then falls back to the lexical/global scope). Only the HasProperty/Get of a
-/// matching object runs user code.
+/// last) for the first object that provides a binding for `name` (HasBinding);
+/// return its value via [[Get]]. Returns null when no with-object provides the
+/// binding (the caller then falls back to the lexical/global scope). Only the
+/// HasProperty/@@unscopables/Get of a matching object runs user code.
 inline fn withLookup(self: *BcVm, frame: *BcCallFrame, name: []const u8) !?Value {
     if (frame.with_stack.items.len == 0) return null;
     const key = try val_mod.makeString(self.arena, name);
@@ -304,7 +319,7 @@ inline fn withLookup(self: *BcVm, frame: *BcCallFrame, name: []const u8) !?Value
         i -= 1;
         const wobj = frame.with_stack.items[i];
         if (wobj.bits == 0 or wobj.unbox() != .object) continue;
-        if (try self.hasProperty(wobj, key)) {
+        if (try withHasBinding(self, wobj, key, name)) {
             return try self.getProp(wobj, name);
         }
     }
@@ -332,7 +347,7 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             i -= 1;
             const wobj = frame.with_stack.items[i];
             if (wobj.bits == 0 or wobj.unbox() != .object) continue;
-            if (try self.hasProperty(wobj, key)) {
+            if (try withHasBinding(self, wobj, key, name)) {
                 try self.setProp(wobj, name, value);
                 return null;
             }
@@ -448,7 +463,7 @@ pub inline fn opDeleteName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             i -= 1;
             const wobj = self.frames.items[frame_idx].with_stack.items[i];
             if (wobj.bits == 0 or wobj.unbox() != .object) continue;
-            if (try self.hasProperty(wobj, key)) {
+            if (try withHasBinding(self, wobj, key, name)) {
                 const res = self.deleteProperty(wobj, key) catch |e| {
                     if (e != error.JsException) return e;
                     if (try self.raisePendingException("error in deleteProperty trap")) |oc| return oc;
