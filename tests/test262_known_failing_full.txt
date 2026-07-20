@@ -1064,7 +1064,6 @@ built-ins/Iterator/prototype/Symbol.toStringTag/weird-setter.js
 built-ins/Iterator/prototype/constructor/prop-desc.js
 built-ins/Iterator/prototype/constructor/weird-setter.js
 built-ins/Iterator/prototype/drop/argument-validation-failure-closes-underlying.js
-built-ins/Iterator/prototype/drop/limit-rangeerror.js
 built-ins/Iterator/prototype/every/get-return-method-throws.js
 built-ins/Iterator/prototype/every/iterator-return-method-throws.js
 built-ins/Iterator/prototype/find/get-return-method-throws.js
@@ -1073,7 +1072,6 @@ built-ins/Iterator/prototype/flatMap/iterable-primitives-are-not-flattened.js
 built-ins/Iterator/prototype/some/get-return-method-throws.js
 built-ins/Iterator/prototype/some/iterator-return-method-throws.js
 built-ins/Iterator/prototype/take/argument-validation-failure-closes-underlying.js
-built-ins/Iterator/prototype/take/limit-rangeerror.js
 built-ins/Iterator/zip/basic-longest.js
 built-ins/Iterator/zip/iterables-iteration-get-iterator-flattenable-abrupt-completion.js
 built-ins/Iterator/zip/iterables-iteration-iterator-step-value-abrupt-completion.js
@@ -1095,6 +1093,7 @@ built-ins/Iterator/zipKeyed/iterator-zip-iteration-longest-iterator-close-abrupt
 built-ins/Iterator/zipKeyed/iterator-zip-iteration-strict-iterator-step-abrupt-completion.js
 built-ins/Iterator/zipKeyed/options-padding.js
 built-ins/Iterator/zipKeyed/padding-iteration-get-abrupt-completion.js
+built-ins/Iterator/zipKeyed/results-object-from-array.js
 built-ins/JSON/isRawJSON/basic.js
 built-ins/JSON/isRawJSON/builtin.js
 built-ins/JSON/isRawJSON/length.js
