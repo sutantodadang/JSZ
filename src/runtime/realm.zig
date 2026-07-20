@@ -42,6 +42,7 @@ const coercion_mod = @import("./builtins/coercion.zig");
 const proxy_mod = @import("./builtins/proxy.zig");
 // M16 Phase 4 ShadowRealm
 const shadow_realm_mod = @import("./builtins/shadow_realm.zig");
+const disposable_stack_mod = @import("./builtins/disposable_stack.zig");
 // Phase 13 Intl
 const intl_mod = @import("./builtins/intl.zig");
 const builtinLength = @import("./builtins/builtin_lengths.zig").builtinLength;
@@ -1262,6 +1263,9 @@ pub var active_sym_async_iterator: ?Value = null;
 /// Symbol.asyncDispose (explicit resource management); used by
 /// %AsyncIteratorPrototype%[@@asyncDispose].
 pub var active_sym_async_dispose: ?Value = null;
+/// Symbol.dispose (explicit resource management); used by DisposableStack and
+/// `using` declarations.
+pub var active_sym_dispose: ?Value = null;
 /// Well-known RegExp-related symbols (@@match/@@replace/@@search/@@split/@@matchAll).
 pub var active_sym_match: ?Value = null;
 pub var active_sym_replace: ?Value = null;
@@ -3785,6 +3789,7 @@ pub const ThreadLocalSnapshot = struct {
     sym_iterator: ?val_mod.Value,
     sym_async_iterator: ?val_mod.Value,
     sym_async_dispose: ?val_mod.Value,
+    sym_dispose: ?val_mod.Value,
     sym_to_primitive: ?val_mod.Value,
     sym_to_string_tag: ?val_mod.Value,
     sym_species: ?val_mod.Value,
@@ -3832,6 +3837,7 @@ pub const ThreadLocalSnapshot = struct {
             .sym_iterator = active_sym_iterator,
             .sym_async_iterator = active_sym_async_iterator,
             .sym_async_dispose = active_sym_async_dispose,
+            .sym_dispose = active_sym_dispose,
             .sym_to_primitive = active_sym_to_primitive,
             .sym_to_string_tag = active_sym_to_string_tag,
             .sym_species = active_sym_species,
@@ -3880,6 +3886,7 @@ pub const ThreadLocalSnapshot = struct {
         active_sym_iterator = self.sym_iterator;
         active_sym_async_iterator = self.sym_async_iterator;
         active_sym_async_dispose = self.sym_async_dispose;
+        active_sym_dispose = self.sym_dispose;
         active_sym_to_primitive = self.sym_to_primitive;
         active_sym_to_string_tag = self.sym_to_string_tag;
         active_sym_species = self.sym_species;
@@ -4298,6 +4305,8 @@ pub const Realm = struct {
 
         // ---- Phase 7 baseline: Promise ----
         active_promise_proto = try promise_mod.register(&reg_ctx);
+
+        try disposable_stack_mod.register(&reg_ctx);
         const require_cache_obj = try JsObject.create(arena, object_proto);
         try env.define("__require_cache__", try val_mod.makeObject(arena, require_cache_obj));
         const require_obj = try JsObject.create(arena, function_proto);
@@ -4490,6 +4499,7 @@ pub const Realm = struct {
         // Capture Symbol.asyncIterator and Symbol.asyncDispose.
         active_sym_async_iterator = symbol_ctor.getOwn("asyncIterator");
         active_sym_async_dispose = symbol_ctor.getOwn("asyncDispose");
+        active_sym_dispose = symbol_ctor.getOwn("dispose");
         // Capture Symbol.toPrimitive and give Date the spec-correct hook so
         // `date + x` coerces to a string (default hint) rather than a number.
         active_sym_to_primitive = symbol_ctor.getOwn("toPrimitive");
@@ -4548,6 +4558,7 @@ pub const Realm = struct {
         try typed_array_mod.registerSymbols(arena);
         // Wire @@toStringTag onto WeakMap.prototype and WeakSet.prototype.
         try es2015_collections_mod.registerSymbols(arena);
+        try disposable_stack_mod.registerSymbols(arena);
         try date_mod.registerSymbols(arena);
         try temporal_mod.registerSymbols(arena);
 

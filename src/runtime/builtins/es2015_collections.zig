@@ -924,6 +924,9 @@ pub fn gcStrongTrace(heap: *Heap, obj: *JsObject) void {
             for (d.padding) |v| heap.markValueLive(v);
             for (d.keys) |v| heap.markValueLive(v);
         },
+        .disposable_stack, .async_disposable_stack => {
+            @import("disposable_stack.zig").gcTrace(heap, obj);
+        },
         else => {},
     }
 }

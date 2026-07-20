@@ -1212,6 +1212,16 @@ pub fn newPendingPromise(arena: std.mem.Allocator) !Value {
     return makePendingPromise(arena);
 }
 
+/// An already-fulfilled promise with value `v` (%Promise% intrinsic proto).
+pub fn makeResolvedPromise(arena: std.mem.Allocator, v: Value) !Value {
+    return makePromise(arena, .fulfilled, v);
+}
+
+/// An already-rejected promise with reason `v` (%Promise% intrinsic proto).
+pub fn makeRejectedPromise(arena: std.mem.Allocator, v: Value) !Value {
+    return makePromise(arena, .rejected, v);
+}
+
 /// Settle an async function's result promise. `fulfill` true resolves with `v`
 /// (adopting it if it is a thenable/promise — this is `return await`/`return p`
 /// semantics); false rejects with `v`.
