@@ -3444,8 +3444,48 @@ pub fn nativeRegExpGetSource(arena: std.mem.Allocator, this_val: Value, _: []con
     // any other non-RegExp object is an incompatible receiver → TypeError.
     _ = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeString(arena, "(?:)");
     const obj = this_val.toPtr().object;
-    if (obj.getOwn("[[OriginalSource]]")) |sv| return sv;
+    if (obj.getOwn("[[OriginalSource]]")) |sv| {
+        if (sv.bits != 0 and sv.unbox() == .string)
+            return val_mod.makeString(arena, try escapeRegExpPattern(arena, sv.toPtr().string));
+        return sv;
+    }
     return val_mod.makeString(arena, "(?:)");
+}
+
+/// EscapeRegExpPattern (ES §22.2.6.13.1): produce a source string that is a valid
+/// pattern between "/…/" — empty → "(?:)"; an unescaped "/" → "\/"; a raw line
+/// terminator → its backslash escape. Preserves already-escaped sequences.
+fn escapeRegExpPattern(arena: std.mem.Allocator, src: []const u8) ![]const u8 {
+    if (src.len == 0) return "(?:)";
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    var escaped = false; // preceding char was an unescaped backslash
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '\\') {
+            try buf.append(arena, '\\');
+            escaped = !escaped;
+            i += 1;
+            continue;
+        }
+        if (c == '/' and !escaped) {
+            try buf.appendSlice(arena, "\\/");
+        } else if (c == '\n') {
+            try buf.appendSlice(arena, "\\n");
+        } else if (c == '\r') {
+            try buf.appendSlice(arena, "\\r");
+        } else if (c == 0xE2 and i + 2 < src.len and src[i + 1] == 0x80 and (src[i + 2] == 0xA8 or src[i + 2] == 0xA9)) {
+            try buf.appendSlice(arena, if (src[i + 2] == 0xA8) "\\u2028" else "\\u2029");
+            i += 3;
+            escaped = false;
+            continue;
+        } else {
+            try buf.append(arena, c);
+        }
+        escaped = false;
+        i += 1;
+    }
+    return buf.toOwnedSlice(arena);
 }
 
 /// flags getter (ES §22.2.6.4): a generic accessor that reads each flag
