@@ -298,6 +298,13 @@ const Parser = struct {
 /// expanded "±YYYYYY-MM-DD", and datetime forms (time part ignored). Bracket
 /// suffixes like "[u-ca=iso8601]" are tolerated.
 pub fn parseISODateTime(s0: []const u8) ParseError!ISODateTime {
+    return parseISODateTimeOpts(s0, true);
+}
+
+/// As `parseISODateTime`, but `validate_calendar` selects whether a first
+/// `[u-ca=…]` annotation must name the iso8601 calendar. Types without a
+/// calendar (Instant, PlainTime, time zones) pass `false`.
+pub fn parseISODateTimeOpts(s0: []const u8, validate_calendar: bool) ParseError!ISODateTime {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     var p = Parser{ .s = s };
 
@@ -330,7 +337,7 @@ pub fn parseISODateTime(s0: []const u8) ParseError!ISODateTime {
             skipOffset(&p);
         }
     }
-    try parseAnnotations(&p);
+    try parseAnnotations(&p, validate_calendar);
     if (!p.eof()) return error.Invalid;
 
     if (year < -271821 or year > 275760) return error.Invalid;
@@ -374,7 +381,7 @@ pub fn parseISOYearMonth(s0: []const u8) ParseError!ISODate {
             return .{ .year = dt.date.year, .month = dt.date.month, .day = 1 };
         }
     }
-    try parseAnnotations(&p);
+    try parseAnnotations(&p, true);
     if (!p.eof()) return error.Invalid;
     if (year < -271821 or year > 275760) return error.Invalid;
     if (month < 1 or month > 12) return error.Invalid;
@@ -397,7 +404,7 @@ pub fn parseISOMonthDay(s0: []const u8) ParseError!ISOMonthDay {
     const had_dash = p.eat('-');
     const day = p.digitsN(2) orelse return error.Invalid;
     _ = had_dash;
-    try parseAnnotations(&p);
+    try parseAnnotations(&p, true);
     if (!p.eof()) return error.Invalid;
     if (month < 1 or month > 12) return error.Invalid;
     if (day < 1 or day > isoDaysInMonth(1972, @intCast(month))) return error.Invalid;
@@ -412,12 +419,12 @@ pub fn parseISOTime(s0: []const u8) ParseError!ISOTime {
     // Try full datetime first if it looks like a date (has a '-' in first 6, or
     // 8 leading digits followed by 'T').
     if (looksLikeDate(s)) {
-        const dt = try parseISODateTime(s);
+        const dt = try parseISODateTimeOpts(s, false);
         return dt.time;
     }
     const t = try parseTimeInner(&p);
     skipOffset(&p);
-    try parseAnnotations(&p);
+    try parseAnnotations(&p, false);
     if (!p.eof()) return error.Invalid;
     if (!isValidISOTime(t)) return error.Invalid;
     return t;
@@ -540,7 +547,7 @@ fn isValidAnnotationKey(key: []const u8) bool {
 /// key/value annotation; the `u-ca` calendar key may appear at most once; an
 /// unrecognised key carrying the critical flag (`!`) is rejected, as is a
 /// malformed key. Unknown non-critical annotations are ignored.
-fn parseAnnotations(p: *Parser) ParseError!void {
+fn parseAnnotations(p: *Parser, validate_calendar: bool) ParseError!void {
     var tz_seen = false;
     var kv_seen = false;
     var ca_count: u32 = 0;
@@ -566,13 +573,19 @@ fn parseAnnotations(p: *Parser) ParseError!void {
             const value = content[eq + 1 ..];
             if (!isValidAnnotationKey(key) or value.len == 0) return error.Invalid;
             if (std.mem.eql(u8, key, "u-ca")) {
-                // Only the ISO 8601 calendar is supported; any other calendar
-                // identifier (well-formed or not) is rejected.
-                if (!isIso8601(value)) return error.Invalid;
-                // Multiple calendar annotations are tolerated (only the first is
-                // used); but any critical flag among two-or-more is an error.
-                ca_count += 1;
+                // The value must be a well-formed RFC 9557 AnnotationValue.
+                if (!isValidAnnotationValue(value)) return error.Invalid;
+                // Only the first calendar annotation is the one actually used.
+                // Calendar-bearing types (PlainDate, PlainDateTime, etc.) require
+                // it to name the sole supported calendar; types without a calendar
+                // (Instant, PlainTime, time zones) ignore it entirely, so a
+                // non-iso value is tolerated for them. Subsequent annotations are
+                // ignored, but need not name a supported calendar.
+                if (ca_count == 0 and validate_calendar and !isIso8601(value)) return error.Invalid;
+                // If more than one calendar annotation is present and any of them
+                // carries the critical flag `!`, the string is rejected.
                 if (critical) ca_critical = true;
+                ca_count += 1;
             } else if (critical) {
                 return error.Invalid; // unknown critical annotation
             }
@@ -584,6 +597,23 @@ fn parseAnnotations(p: *Parser) ParseError!void {
         }
     }
     if (ca_count > 1 and ca_critical) return error.Invalid;
+}
+
+/// A valid RFC 9557 `AnnotationValue`: one or more alphanumeric components of
+/// length 1..8, separated by single '-' characters.
+fn isValidAnnotationValue(value: []const u8) bool {
+    if (value.len == 0) return false;
+    var comp_len: usize = 0;
+    for (value) |c| {
+        if (c == '-') {
+            if (comp_len == 0) return false; // empty component / leading dash
+            comp_len = 0;
+        } else if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')) {
+            comp_len += 1;
+            if (comp_len > 8) return false;
+        } else return false;
+    }
+    return comp_len != 0; // no trailing dash
 }
 
 /// Parse an ISO 8601 duration string: [+-]PnYnMnWnDTnHnMnS with an optional
