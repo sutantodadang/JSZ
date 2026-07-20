@@ -2949,6 +2949,51 @@ fn sameValueNum(a: Value, b: Value) bool {
     return a.bits == b.bits;
 }
 
+/// Set(obj, key, val, true) — throwing form (Symbol.search/replace/split etc.).
+fn ctxSetPropThrow(arena: std.mem.Allocator, obj: Value, key: []const u8, v: Value) !void {
+    if (realm_mod.active_context) |ctx| try ctx.setPropThrow(arena, obj, key, v);
+}
+
+/// SameValue for the values `lastIndex` carries: numbers compare with NaN==NaN
+/// and +0≠-0; everything else by identity.
+fn sameValueStrict(a: Value, b: Value) bool {
+    const an = a.bits != 0 and a.unbox() == .number;
+    const bn = b.bits != 0 and b.unbox() == .number;
+    if (an and bn) {
+        const x = a.unbox().number;
+        const y = b.unbox().number;
+        if (std.math.isNan(x) and std.math.isNan(y)) return true;
+        if (x == 0 and y == 0) return std.math.signbit(x) == std.math.signbit(y);
+        return x == y;
+    }
+    return a.bits == b.bits;
+}
+
+/// ToString(v) with the Symbol → TypeError guard (spec ToString).
+fn toStringArg(arena: std.mem.Allocator, v: Value) ![]const u8 {
+    if (v.bits != 0 and v.unbox() == .symbol)
+        return realm_mod.throwTypeError(arena, "Cannot convert a Symbol value to a string");
+    return realm_mod.stringPrimitive(arena, v);
+}
+
+/// ToNumber(v) with the Symbol/BigInt → TypeError guards the shared helper omits
+/// (object valueOf/toString throws already propagate through toNumberValue).
+fn toNumberArg(arena: std.mem.Allocator, v: Value) !f64 {
+    if (v.bits != 0) switch (v.unbox()) {
+        .symbol => return realm_mod.throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+        .bigint => return realm_mod.throwTypeError(arena, "Cannot convert a BigInt value to a number"),
+        else => {},
+    };
+    return realm_mod.toNumberValue(arena, v);
+}
+
+/// ToLength(v) via the checked ToNumber (Symbol/BigInt throw).
+fn toLengthArg(arena: std.mem.Allocator, v: Value) !usize {
+    const n = try toNumberArg(arena, v);
+    if (std.math.isNan(n) or n <= 0) return 0;
+    return @intFromFloat(@min(std.math.trunc(n), 9007199254740991.0));
+}
+
 /// ToString(Get(obj, key)).
 fn getStrProp(arena: std.mem.Allocator, obj: Value, key: []const u8) ![]const u8 {
     const v = try ctxGetProp(arena, obj, key);
@@ -2988,14 +3033,14 @@ fn requireObject(arena: std.mem.Allocator, v: Value, comptime what: []const u8) 
 /// RegExp.prototype[@@search] (ES §22.2.6.13).
 pub fn nativeRegExpSymbolSearch(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireObject(arena, this_val, "RegExp.prototype[Symbol.search]");
-    const s_str = if (args.len > 0) try realm_mod.stringPrimitive(arena, args[0]) else "undefined";
+    const s_str = if (args.len > 0) try toStringArg(arena, args[0]) else "undefined";
     const s_val = try val_mod.makeString(arena, s_str);
     const prev = try ctxGetProp(arena, this_val, "lastIndex");
-    if (!sameValueNum(prev, try val_mod.makeNumber(arena, 0)))
-        try ctxSetProp(arena, this_val, "lastIndex", try val_mod.makeNumber(arena, 0));
+    if (!sameValueStrict(prev, try val_mod.makeNumber(arena, 0)))
+        try ctxSetPropThrow(arena, this_val, "lastIndex", try val_mod.makeNumber(arena, 0));
     const result = try regExpExec(arena, this_val, s_val);
     const cur = try ctxGetProp(arena, this_val, "lastIndex");
-    if (!sameValueNum(cur, prev)) try ctxSetProp(arena, this_val, "lastIndex", prev);
+    if (!sameValueStrict(cur, prev)) try ctxSetPropThrow(arena, this_val, "lastIndex", prev);
     if (result.bits == 0 or result.unbox() == .null_) return val_mod.makeNumber(arena, -1);
     return ctxGetProp(arena, result, "index");
 }
@@ -3003,14 +3048,14 @@ pub fn nativeRegExpSymbolSearch(arena: std.mem.Allocator, this_val: Value, args:
 /// RegExp.prototype[@@match] (ES §22.2.6.8).
 pub fn nativeRegExpSymbolMatch(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireObject(arena, this_val, "RegExp.prototype[Symbol.match]");
-    const s_str = if (args.len > 0) try realm_mod.stringPrimitive(arena, args[0]) else "undefined";
+    const s_str = if (args.len > 0) try toStringArg(arena, args[0]) else "undefined";
     const s_val = try val_mod.makeString(arena, s_str);
     const flags = try getStrProp(arena, this_val, "flags");
     const global = std.mem.indexOfScalar(u8, flags, 'g') != null;
     if (!global) return regExpExec(arena, this_val, s_val);
 
     const unicode = std.mem.indexOfScalar(u8, flags, 'u') != null;
-    try ctxSetProp(arena, this_val, "lastIndex", try val_mod.makeNumber(arena, 0));
+    try ctxSetPropThrow(arena, this_val, "lastIndex", try val_mod.makeNumber(arena, 0));
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
     var n: u32 = 0;
     while (true) {
@@ -3025,8 +3070,8 @@ pub fn nativeRegExpSymbolMatch(arena: std.mem.Allocator, this_val: Value, args: 
         try arr.set(key, try val_mod.makeString(arena, match_str));
         n += 1;
         if (match_str.len == 0) {
-            const li = try realm_mod.toLengthValue(arena, try ctxGetProp(arena, this_val, "lastIndex"));
-            try ctxSetProp(arena, this_val, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(advanceStringIndex(s_str, li, unicode))));
+            const li = try toLengthArg(arena, try ctxGetProp(arena, this_val, "lastIndex"));
+            try ctxSetPropThrow(arena, this_val, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(advanceStringIndex(s_str, li, unicode))));
         }
     }
 }
@@ -3182,6 +3227,10 @@ pub fn nativeRegExpSymbolReplace(arena: std.mem.Allocator, this_val: Value, args
             const rv = try fp.invokeCallback(arena, try val_mod.makeUndefined(arena), replace_val, call_args.items);
             replacement = try realm_mod.stringPrimitive(arena, rv);
         } else {
+            // Non-functional branch performs ToObject(namedCaptures) when present
+            // (§22.2.6.11), so a non-undefined null `groups` throws a TypeError.
+            if (has_named and named_captures.unbox() == .null_)
+                return realm_mod.throwTypeError(arena, "Cannot convert null groups to object");
             // `$<name>` looks up the (defined) `groups`; ctxGetProp autoboxes a
             // primitive receiver, so no explicit ToObject step is needed here.
             replacement = try getSubstitution(arena, matched, s_str, position, captures.items, repl_str, named_captures);
@@ -3229,7 +3278,7 @@ fn speciesConstructor(arena: std.mem.Allocator, o: Value, default_ctor: Value) !
 /// RegExp.prototype[@@split] (ES §22.2.6.14).
 pub fn nativeRegExpSymbolSplit(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireObject(arena, this_val, "RegExp.prototype[Symbol.split]");
-    const s_str = if (args.len > 0) try realm_mod.stringPrimitive(arena, args[0]) else "undefined";
+    const s_str = if (args.len > 0) try toStringArg(arena, args[0]) else "undefined";
     const s_val = try val_mod.makeString(arena, s_str);
 
     // SpeciesConstructor(rx, %RegExp%), then build the sticky splitter.
@@ -3246,7 +3295,7 @@ pub fn nativeRegExpSymbolSplit(arena: std.mem.Allocator, this_val: Value, args: 
     // limit = limit === undefined ? 2^32-1 : ToUint32(limit).
     const lim: u64 = blk: {
         if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_) {
-            const n = try realm_mod.toNumberValue(arena, args[1]);
+            const n = try toNumberArg(arena, args[1]);
             if (std.math.isNan(n)) break :blk 0;
             const m = @mod(std.math.trunc(n), 4294967296.0);
             break :blk @intFromFloat(if (m < 0) m + 4294967296.0 else m);
@@ -3269,13 +3318,13 @@ pub fn nativeRegExpSymbolSplit(arena: std.mem.Allocator, this_val: Value, args: 
     var p: usize = 0; // start of current segment
     var q: usize = 0; // scan position
     while (q < s_str.len) {
-        try ctxSetProp(arena, splitter, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(q)));
+        try ctxSetPropThrow(arena, splitter, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(q)));
         const z = try regExpExec(arena, splitter, s_val);
         if (z.bits == 0 or z.unbox() == .null_) {
             q = advanceStringIndex(s_str, q, unicode);
             continue;
         }
-        var e = try realm_mod.toLengthValue(arena, try ctxGetProp(arena, splitter, "lastIndex"));
+        var e = try toLengthArg(arena, try ctxGetProp(arena, splitter, "lastIndex"));
         if (e > s_str.len) e = s_str.len;
         if (e == p) {
             q = advanceStringIndex(s_str, q, unicode);
@@ -3291,7 +3340,7 @@ pub fn nativeRegExpSymbolSplit(arena: std.mem.Allocator, this_val: Value, args: 
         }
         p = e;
         // Captures 1..numberOfCaptures from z.
-        const z_len = try realm_mod.toLengthValue(arena, try ctxGetProp(arena, z, "length"));
+        const z_len = try toLengthArg(arena, try ctxGetProp(arena, z, "length"));
         const n_caps = if (z_len == 0) 0 else z_len - 1;
         var gi: usize = 1;
         while (gi <= n_caps) : (gi += 1) {
