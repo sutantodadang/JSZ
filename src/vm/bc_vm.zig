@@ -2345,6 +2345,16 @@ pub const BcVm = struct {
                         // with the original receiver preserved.
                         if (pp.internal_kind == .proxy)
                             return try self.proxyGet(obj_val, pp, try val_mod.makeString(self.arena, key));
+                        // An inherited array in the proto chain exposes its synthetic
+                        // "length" and dense elements, which findProperty (shape slots
+                        // only) cannot see.
+                        if (pp.is_array and std.mem.eql(u8, key, "length"))
+                            return val_mod.makeNumber(self.arena, @floatFromInt(pp.getArrayLength()));
+                        if (pp.usesDense()) {
+                            if (JsObject.canonicalArrayIndex(key)) |_| {
+                                if (pp.getOwn(key)) |v| return v;
+                            }
+                        }
                         p = pp.proto;
                     }
                 }

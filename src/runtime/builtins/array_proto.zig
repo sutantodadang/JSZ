@@ -223,7 +223,9 @@ fn flattenInto(
         } else {
             if (@as(f64, @floatFromInt(ni.*)) >= 9007199254740991.0)
                 return throwTypeError(arena, "Array length exceeds 2^53 - 1");
-            try genSet(arena, target, ni.*, elem);
+            // FlattenIntoArray uses CreateDataPropertyOrThrow (§23.1.3.11.1 step
+            // 8.d.iii): a non-extensible/non-configurable target slot throws.
+            try genCreate(arena, target, ni.*, elem);
             ni.* += 1;
         }
     }
