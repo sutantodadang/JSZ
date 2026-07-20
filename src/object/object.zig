@@ -705,6 +705,9 @@ pub const JsObject = struct {
     pub fn freezeSelf(self: *JsObject) void {
         self.deoptDenseBestEffort(); // materialize element attrs before freezing
         self.extensible = false;
+        // An array's synthetic "length" is a data property: freeze makes it
+        // non-writable (it is already non-configurable).
+        if (self.is_array) self.array_length_writable = false;
         for (self.attrs.items) |*a| {
             a.configurable = false;
             a.writable = false;
@@ -730,6 +733,8 @@ pub const JsObject = struct {
     /// Object.isFrozen: sealed and every own data prop non-writable.
     pub fn isFrozenSelf(self: *JsObject) bool {
         if (self.extensible) return false;
+        // A frozen array must have a non-writable "length".
+        if (self.is_array and self.array_length_writable) return false;
         for (self.attrs.items) |a| {
             if (a.configurable or a.writable) return false;
         }
