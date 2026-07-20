@@ -1044,9 +1044,19 @@ fn isConstructorVal(v: Value) bool {
     return switch (v.unbox()) {
         .bc_function => true,
         .native_function => false,
-        .object => |o| o.get("__call__") != null or
-            o.internal_kind == .bound_function or
-            o.internal_kind == .proxy,
+        .object => |o| blk: {
+            // A bound function is a constructor iff its target is (§10.4.1.2).
+            if (o.internal_kind == .bound_function) {
+                if (o.internal_slot) |slot| {
+                    const bd: *fp.BoundData = @ptrCast(@alignCast(slot));
+                    break :blk isConstructorVal(bd.target);
+                }
+                break :blk false;
+            }
+            // A Promise resolving function is callable but not a constructor.
+            if (o.internal_kind == .promise_resolver) break :blk false;
+            break :blk o.get("__call__") != null or o.internal_kind == .proxy;
+        },
         else => false,
     };
 }

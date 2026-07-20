@@ -432,6 +432,10 @@ fn isRunnableFull(source: []const u8) bool {
     // atomicsHelper.js / atomics-helpers.js: require $262.agent.* (multi-agent
     // coordinator). Single-agent runner has no $262.agent → skip.
     if (std.mem.indexOf(u8, yaml, "atomicsHelper.js") != null) return false;
+    // Unimplemented TC39 proposals gated by a `features:` tag. `await-dictionary`
+    // (Promise.allKeyed / allSettledKeyed) is Stage 1 and out of scope — skip
+    // rather than count as failing, matching how real runners gate features.
+    if (std.mem.indexOf(u8, yaml, "await-dictionary") != null) return false;
     return true;
 }
 
