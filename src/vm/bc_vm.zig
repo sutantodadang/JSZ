@@ -1551,6 +1551,12 @@ pub const BcVm = struct {
                     self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
                     return null;
                 }
+                // Promise resolving functions are callable but not constructors —
+                // `new resolve()` must throw (they carry no [[Construct]]).
+                if (obj.internal_kind == .promise_resolver) {
+                    self.last_exception_value = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                    return "__js_exception__";
+                }
                 // Error constructor object: has __call__ and prototype.
                 if (obj.get("__call__")) |call_val| {
                     if (call_val.bits != 0 and call_val.unbox() == .native_function) {

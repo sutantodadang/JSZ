@@ -71,9 +71,18 @@ fn getThenMethod(v: Value) ?Value {
 }
 
 fn makeResolverObject(arena: std.mem.Allocator, data: *ResolverData) !Value {
-    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    // A resolving function: an anonymous, non-constructor built-in with
+    // %Function.prototype% as its prototype, length 1 and name "" (in that
+    // property order), per CreateResolvingFunctions.
+    const obj = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_function_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_function_proto);
     obj.internal_slot = data;
+    obj.internal_kind = .promise_resolver;
     try obj.set("__call__", try val_mod.makeNativeFunction(arena, nativePromiseResolver));
+    _ = try obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try obj.defineOwnData("name", try val_mod.makeString(arena, ""), .{ .writable = false, .enumerable = false, .configurable = true });
     return val_mod.makeObject(arena, obj);
 }
 
@@ -263,24 +272,14 @@ pub fn nativePromiseCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
         o.internal_kind = .promise;
         o.internal_slot = d;
         if (args.len > 0 and isCallable(args[0])) {
-            const resolve_obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
-            const reject_obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
             const resolve_data = try arena.create(ResolverData);
             const reject_data = try arena.create(ResolverData);
             resolve_data.* = .{ .promise = d, .resolve_mode = true };
             reject_data.* = .{ .promise = d, .resolve_mode = false };
-            resolve_obj.internal_slot = resolve_data;
-            reject_obj.internal_slot = reject_data;
-            try resolve_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativePromiseResolver));
-            try reject_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativePromiseResolver));
-            // The resolving functions are anonymous unary functions (name "",
-            // length 1) per §27.2.1.3.
-            for ([_]*JsObject{ resolve_obj, reject_obj }) |ro| {
-                try ro.set("name", try val_mod.makeString(arena, ""));
-                try ro.set("length", try val_mod.makeNumber(arena, 1));
-            }
-            const resolve_val = try val_mod.makeObject(arena, resolve_obj);
-            const reject_val = try val_mod.makeObject(arena, reject_obj);
+            // Anonymous unary non-constructor built-ins (name "", length 1) with
+            // %Function.prototype% as prototype, per §27.2.1.3.
+            const resolve_val = try makeResolverObject(arena, resolve_data);
+            const reject_val = try makeResolverObject(arena, reject_data);
             _ = fn_proto.invokeCallback(arena, try val_mod.makeUndefined(arena), args[0], &[_]Value{ resolve_val, reject_val }) catch |e| {
                 if (e == error.JsException) {
                     promiseRejectData(arena, d, realm_mod.pending_exception);

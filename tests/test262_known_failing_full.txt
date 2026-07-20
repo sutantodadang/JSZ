@@ -1769,11 +1769,6 @@ built-ins/Promise/race/iter-returns-true-reject.js
 built-ins/Promise/race/iter-returns-undefined-reject.js
 built-ins/Promise/race/resolve-poisoned-then.js
 built-ins/Promise/race/resolve-self.js
-built-ins/Promise/reject-function-length.js
-built-ins/Promise/reject-function-name.js
-built-ins/Promise/reject-function-nonconstructor.js
-built-ins/Promise/reject-function-property-order.js
-built-ins/Promise/reject-function-prototype.js
 built-ins/Promise/reject/S25.4.4.4_A3.1_T1.js
 built-ins/Promise/reject/capability-executor-called-twice.js
 built-ins/Promise/reject/capability-executor-not-callable.js
@@ -1783,11 +1778,6 @@ built-ins/Promise/reject/ctx-ctor-throws.js
 built-ins/Promise/reject/ctx-ctor.js
 built-ins/Promise/reject/ctx-non-ctor.js
 built-ins/Promise/reject/ctx-non-object.js
-built-ins/Promise/resolve-function-length.js
-built-ins/Promise/resolve-function-name.js
-built-ins/Promise/resolve-function-nonconstructor.js
-built-ins/Promise/resolve-function-property-order.js
-built-ins/Promise/resolve-function-prototype.js
 built-ins/Promise/resolve-poisoned-then-deferred.js
 built-ins/Promise/resolve-poisoned-then-immed.js
 built-ins/Promise/resolve-prms-cstm-then-deferred.js
