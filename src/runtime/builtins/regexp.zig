@@ -34,11 +34,11 @@ const fp = @import("function_proto.zig");
 pub fn register(ctx: *const intrinsics.Ctx) !void {
     const arena = ctx.arena;
     const regexp_proto = try JsObject.create(arena, ctx.object_proto);
-    const re_test_fn = try val_mod.makeNativeFunction(arena, nativeRegExpTest);
-    const re_exec_fn = try val_mod.makeNativeFunction(arena, nativeRegExpExec);
+    const re_test_fn = try val_mod.makeNativeFunctionNamed(arena, nativeRegExpTest, "test", 1);
+    const re_exec_fn = try val_mod.makeNativeFunctionNamed(arena, nativeRegExpExec, "exec", 1);
     try regexp_proto.set("test", re_test_fn);
     try regexp_proto.set("exec", re_exec_fn);
-    try regexp_proto.set("toString", try val_mod.makeNativeFunction(arena, nativeRegExpToString));
+    try regexp_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeRegExpToString, "toString", 0));
     // Annex B RegExp.prototype.compile — a proper method (name "compile", length 2).
     _ = try regexp_proto.defineOwnData("compile", try val_mod.makeNativeFunctionNamed(arena, nativeRegExpCompile, "compile", 2), .{ .writable = true, .enumerable = false, .configurable = true });
 
@@ -2559,6 +2559,17 @@ pub fn setLastIndex(arena: std.mem.Allocator, v: Value, idx: usize) !void {
     try obj.set("lastIndex", li_val);
 }
 
+/// Set(R, "lastIndex", idx, true) — the throwing form RegExpBuiltinExec uses; a
+/// non-writable lastIndex must raise TypeError rather than being silently ignored.
+fn setLastIndexThrow(arena: std.mem.Allocator, v: Value, idx: usize) !void {
+    const li_val = try val_mod.makeNumber(arena, @floatFromInt(idx));
+    if (realm_mod.active_context) |ctx| {
+        try ctx.setPropThrow(arena, v, "lastIndex", li_val);
+    } else if (v.bits != 0 and v.unbox() == .object) {
+        try v.toPtr().object.set("lastIndex", li_val);
+    }
+}
+
 pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const pattern_str: []const u8 = if (args.len > 0 and args[0].bits != 0)
         switch (args[0].unbox()) {
@@ -2749,16 +2760,16 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
 
     // An out-of-bounds lastIndex fails immediately (and resets when g/y).
     if (from > s.len) {
-        if (use_li) try setLastIndex(arena, this_val, 0);
+        if (use_li) try setLastIndexThrow(arena, this_val, 0);
         return val_mod.makeNull(arena);
     }
 
     const result = findMatch(cr, s, from) orelse {
-        if (use_li) try setLastIndex(arena, this_val, 0);
+        if (use_li) try setLastIndexThrow(arena, this_val, 0);
         return val_mod.makeNull(arena);
     };
 
-    if (use_li) try setLastIndex(arena, this_val, result.state.pos);
+    if (use_li) try setLastIndexThrow(arena, this_val, result.state.pos);
 
     const arr_proto = realm_mod.active_array_proto;
     const arr = try JsObject.createArray(arena, arr_proto);
