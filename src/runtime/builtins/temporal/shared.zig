@@ -463,6 +463,8 @@ fn parseTimeInner(p: *Parser) ParseError!ISOTime {
             }
         }
     }
+    // A leap-second designator (:60) is accepted and constrained to :59.
+    if (t.second == 60) t.second = 59;
     return t;
 }
 
@@ -564,6 +566,9 @@ fn parseAnnotations(p: *Parser) ParseError!void {
             const value = content[eq + 1 ..];
             if (!isValidAnnotationKey(key) or value.len == 0) return error.Invalid;
             if (std.mem.eql(u8, key, "u-ca")) {
+                // Only the ISO 8601 calendar is supported; any other calendar
+                // identifier (well-formed or not) is rejected.
+                if (!isIso8601(value)) return error.Invalid;
                 // Multiple calendar annotations are tolerated (only the first is
                 // used); but any critical flag among two-or-more is an error.
                 ca_count += 1;

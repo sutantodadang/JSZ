@@ -78,6 +78,16 @@ fn floatToI32(f: f64) i32 {
     return @intFromFloat(f);
 }
 
+/// Whether `v` is a Temporal object that carries an ISO [[Calendar]] slot and so
+/// can stand in for a calendar identifier (GetTemporalCalendar fast path).
+fn isTemporalCalendarObject(v: Value) bool {
+    if (v.bits == 0 or v.unbox() != .object) return false;
+    return switch (v.toPtr().object.internal_kind) {
+        .temporal_plain_date, .temporal_plain_date_time, .temporal_zoned_date_time, .temporal_plain_year_month, .temporal_plain_month_day => true,
+        else => false,
+    };
+}
+
 pub fn isIsoCalendar(s: []const u8) bool {
     // Case-insensitive "iso8601".
     if (s.len != 7) return false;
@@ -108,8 +118,13 @@ fn dateFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overf
     // Read calendar (must be iso8601 if present).
     if (o.get("calendar")) |cv| {
         if (cv.bits != 0 and cv.unbox() != .undefined_) {
-            const cal = try shared.valueToString(arena, cv);
-            if (!isIsoCalendar(cal)) return realm_mod.throwRangeError(arena, "only iso8601 calendar supported");
+            // A Temporal object supplied as the calendar contributes its
+            // [[Calendar]] internal slot (always iso8601 here); otherwise coerce
+            // to a string and require iso8601.
+            if (!isTemporalCalendarObject(cv)) {
+                const cal = try shared.valueToString(arena, cv);
+                if (!isIsoCalendar(cal)) return realm_mod.throwRangeError(arena, "only iso8601 calendar supported");
+            }
         }
     }
     const year_v = o.get("year");
