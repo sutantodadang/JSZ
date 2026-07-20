@@ -1990,10 +1990,13 @@ pub const BcVm = struct {
                     if (o.hasOwn(key)) return true;
                 }
                 if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "length")) return true;
-                // Async (non-generator) functions have no own "prototype"; every
-                // other bc function does (getProp materializes one on demand).
+                // Only constructor-capable bc functions have an own "prototype":
+                // generators (incl. generator methods) always do; arrows, concise
+                // non-generator methods, and plain async functions never do; a
+                // normal function does (getProp materializes one on demand).
                 if (std.mem.eql(u8, key, "prototype"))
-                    return !(closure.func.is_async and !closure.func.is_generator);
+                    return closure.func.is_generator or
+                        (!closure.func.is_arrow and !closure.func.is_method and !closure.func.is_async);
             } else {
                 if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "length")) return true;
             }
@@ -2610,6 +2613,10 @@ pub const BcVm = struct {
         // plain-async case, where materializing one would be observable via
         // `hasOwnProperty('prototype')`.
         if (closure.func.is_async and !closure.func.is_generator)
+            return val_mod.makeUndefined(self.arena);
+        // Arrow functions and concise (non-generator) methods are not constructors
+        // and carry no own `prototype`. Generator methods DO (handled below).
+        if ((closure.func.is_arrow or closure.func.is_method) and !closure.func.is_generator)
             return val_mod.makeUndefined(self.arena);
         if (closure.func.is_generator) {
             const gr: *Realm = if (closure.realm) |ro| @ptrCast(@alignCast(ro)) else self.realm;

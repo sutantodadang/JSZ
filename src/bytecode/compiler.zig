@@ -2095,6 +2095,11 @@ pub const FnCompiler = struct {
             fe.source_text,
         );
 
+        // Concise methods (object/class method shorthand, getters, setters) are
+        // not constructors: propagate the flag so the VM omits the `prototype`
+        // property for non-generator methods.
+        child_fn.is_method = fe.is_method;
+
         const child_idx: u16 = @intCast(self.child_functions.items.len);
         try self.child_functions.append(self.arena, child_fn);
 

@@ -481,13 +481,25 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         }
     }
 
+    // The method function's `.name` property is the property key (SetFunctionName
+    // in MethodDefinitionEvaluation). Set it directly and mark is_method so the
+    // name is NOT self-bound inside the body (unlike a named function expression),
+    // and so the descriptor object-literal's NamedEvaluation ({ value: fn }) does
+    // not misname it "value". Computed keys are named at runtime (left null here).
+    // Accessors get a "get "/"set " prefix, applied in the accessor branch below.
+    const method_name: ?[]const u8 = if (m.computed_key != null) null else switch (m.accessor) {
+        .none => m.name,
+        .get => std.fmt.allocPrint(p.arena, "get {s}", .{m.name}) catch return null,
+        .set => std.fmt.allocPrint(p.arena, "set {s}", .{m.name}) catch return null,
+    };
     const fn_expr = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
-        .name = null,
+        .name = method_name,
         .params = m.params,
         .param_defaults = m.param_defaults,
         .rest_param = m.rest_param,
         .body = body,
         .is_arrow = false,
+        .is_method = true,
         .is_generator = m.is_generator,
         .is_async = m.is_async,
         .source_text = p.sourceSlice(m.src_start, m.src_end),
