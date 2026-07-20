@@ -212,6 +212,38 @@ pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Valu
 }
 
 /// ES2015 Object.assign(target, ...sources): copy enumerable own properties.
+/// OrdinarySet(obj, sym, v, obj) with Throw=true for a symbol key: mirrors the
+/// string-keyed setPropThrow so Object.assign onto a frozen/sealed/non-extensible
+/// target raises the required TypeError (the bare `setSym` never does).
+fn ordinarySetSymThrow(arena: std.mem.Allocator, obj: *JsObject, sym: Value, v: Value) anyerror!void {
+    var cur: ?*JsObject = obj;
+    var depth: usize = 0;
+    while (cur) |o| {
+        if (depth >= 64) break;
+        depth += 1;
+        if (o.getOwnSymEntry(sym)) |sp| {
+            if (sp.attr.is_accessor) {
+                var setter: Value = Value{};
+                if (sp.value.bits != 0 and sp.value.unbox() == .object)
+                    setter = sp.value.toPtr().object.getOwn("set") orelse Value{};
+                if (setter.bits == 0 or setter.unbox() == .undefined_ or setter.unbox() == .null_)
+                    return throwTypeError(arena, "Cannot assign to read-only accessor property");
+                _ = try @import("function_proto.zig").invokeCallback(arena, try val_mod.makeObject(arena, obj), setter, &[_]Value{v});
+                return;
+            }
+            if (!sp.attr.writable) return throwTypeError(arena, "Cannot assign to read-only property");
+            if (o == obj) {
+                try obj.setSym(sym, v);
+                return;
+            }
+            break; // inherited writable data property: shadow with a new own one
+        }
+        cur = o.proto;
+    }
+    if (!obj.extensible) return throwTypeError(arena, "Cannot add property, object is not extensible");
+    _ = try obj.defineOwnDataSym(sym, v, .{ .writable = true, .enumerable = true, .configurable = true });
+}
+
 pub fn nativeObjectAssign(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
     const target = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
@@ -242,6 +274,28 @@ pub fn nativeObjectAssign(arena: std.mem.Allocator, _: Value, args: []const Valu
         if (from_val.bits == 0 or from_val.unbox() != .object) continue;
         const src_obj = from_val.toPtr().object;
 
+        // Proxy source: drive [[OwnPropertyKeys]] then [[GetOwnProperty]] through
+        // the traps (order preserved, missing/non-enumerable keys skipped, trap
+        // throws propagate) — a raw own-key scan would bypass the handler.
+        if (src_obj.internal_kind == .proxy) {
+            const keys = (try proxy_mod.proxyOwnKeys(arena, src_obj)) orelse continue;
+            for (keys) |kv| {
+                const desc = (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, src_obj, kv)) orelse continue;
+                const enumerable = desc.bits != 0 and desc.unbox() == .object and
+                    descTruthy(desc.toPtr().object.getOwn("enumerable") orelse Value{});
+                if (!enumerable) continue;
+                if (kv.bits != 0 and kv.unbox() == .symbol) {
+                    const v = if (ctx) |c| try c.getPropSym(arena, from_val, kv) else continue;
+                    try ordinarySetSymThrow(arena, target_obj, kv, v);
+                } else {
+                    const ks = if (kv.bits != 0 and kv.unbox() == .string) kv.toPtr().string else continue;
+                    const v = if (ctx) |c| try c.getProp(arena, from_val, ks) else continue;
+                    if (ctx) |c| try c.setPropThrow(arena, to_val, ks, v) else try target_obj.set(ks, v);
+                }
+            }
+            continue;
+        }
+
         // String property keys in own order, then symbol keys (per OwnPropertyKeys).
         for (src_obj.ownKeys()) |k| {
             if (!src_obj.isEnumerable(k)) continue;
@@ -256,7 +310,7 @@ pub fn nativeObjectAssign(arena: std.mem.Allocator, _: Value, args: []const Valu
             const sp = src_obj.sym_props.items[si];
             if (!sp.attr.enumerable) continue;
             const v = if (ctx) |c| try c.getPropSym(arena, from_val, sp.key) else sp.value;
-            try target_obj.setSym(sp.key, v);
+            try ordinarySetSymThrow(arena, target_obj, sp.key, v);
         }
     }
     return to_val;
