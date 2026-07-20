@@ -57,9 +57,22 @@ fn coerceThis(arena: std.mem.Allocator, this_val: Value) anyerror![]const u8 {
                     return try coerceThis(arena, prim);
                 }
             }
-            return "[object Object]";
+            // ToPrimitive could not produce a primitive (toString/valueOf/
+            // @@toPrimitive all non-callable) → ToString throws TypeError.
+            return throwTypeErrorStr(arena, "Cannot convert object to primitive value");
         },
-        else => return "[object Object]",
+        // Callable receivers: ToString invokes their "toString" (with the callable
+        // itself as `this`, so Function.prototype.toString's brand check passes).
+        .function, .bc_function, .native_function => {
+            if (realm_mod.active_context) |ctx| {
+                const ts = try ctx.getProp(arena, this_val, "toString");
+                if (isCallable(ts)) {
+                    const r = try function_proto_mod.invokeCallback(arena, this_val, ts, &[_]Value{});
+                    if (coercion_mod.isPrimitive(r)) return try coerceThis(arena, r);
+                }
+            }
+            return throwTypeErrorStr(arena, "Cannot convert object to primitive value");
+        },
     }
 }
 
