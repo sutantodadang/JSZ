@@ -1067,6 +1067,38 @@ pub const FnCompiler = struct {
         self.sp = save_sp;
     }
 
+    /// Emit a call to a named global helper with one or two register arguments,
+    /// writing the result into `dst` (which the caller has already allocated and
+    /// keeps live below the scratch area). Drives the iterator-protocol
+    /// destructuring helpers (__getIterator__ / __destrIterStep__ /
+    /// __destrIterRest__ / __destrIterClose__) from the assignment-pattern path,
+    /// mirroring the binding-pattern desugar in the parser.
+    fn emitDestrCall(self: *Self, name: []const u8, r_a: u8, r_b: ?u8, dst: u8, line: u32) error{OutOfMemory}!void {
+        const save_sp = self.sp;
+        const callee = self.allocReg();
+        const gi = try self.addConstant(try val_mod.makeString(self.arena, name));
+        try self.emitOp(.GET_GLOBAL, line);
+        try self.emitU8(callee);
+        try self.emitU16(@intCast(gi));
+        const a0 = self.allocReg(); // == callee + 1
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(a0);
+        try self.emitU8(r_a);
+        var argc: u8 = 1;
+        if (r_b) |rb| {
+            const a1 = self.allocReg(); // == callee + 2
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(a1);
+            try self.emitU8(rb);
+            argc = 2;
+        }
+        try self.emitOp(.CALL, line);
+        try self.emitU8(callee);
+        try self.emitU8(argc);
+        try self.emitU8(dst); // result register (below callee, stays live)
+        self.sp = save_sp;
+    }
+
     pub fn compileDestructure(self: *Self, target: *Node, rsrc: u8, line: u32) error{OutOfMemory}!void {
         switch (target.kind) {
             .identifier => try self.emitStore(target.data.identifier, rsrc, line),
@@ -1135,55 +1167,54 @@ pub const FnCompiler = struct {
                 }
             },
             .array_literal => {
-                // `[a] = null` / `for ([a] of [null])`: array destructuring does
-                // GetIterator first, which throws a TypeError on null/undefined.
-                try self.emitRequireCoercible(rsrc, line);
+                // ES ArrayAssignmentPattern: destructure through the iterator
+                // protocol (GetIterator → IteratorStep per element → IteratorClose
+                // when the pattern finishes before the iterator is exhausted),
+                // reusing the shared runtime helpers so custom @@iterator methods,
+                // non-array iterables, holes, defaults and `...rest` all behave per
+                // spec rather than via positional index reads. A nullish `rsrc`
+                // throws a TypeError inside __getIterator__ (GetIterator does the
+                // RequireObjectCoercible check), so no separate guard is needed.
+                // `__box` ({}) tracks done-ness across the helper calls, matching
+                // the binding-pattern desugar's straight-line lowering.
                 const elems = target.data.array_literal.elements;
-                for (elems, 0..) |elem, i| {
-                    // Elision hole (`[, x] = rhs`): the parser models holes as
-                    // `array_hole` nodes — skip, advancing the index.
-                    if (elem.kind == .array_hole) continue;
+                const rit = self.allocReg();
+                try self.emitDestrCall("__getIterator__", rsrc, null, rit, line);
+                const rbox = self.allocReg();
+                try self.emitOp(.NEW_OBJECT, line);
+                try self.emitU8(rbox);
+                var saw_rest = false;
+                for (elems) |elem| {
+                    // Elision hole (`[, x] = rhs`): advance one step, discard.
+                    if (elem.kind == .array_hole) {
+                        const scratch = self.allocReg();
+                        try self.emitDestrCall("__destrIterStep__", rit, rbox, scratch, line);
+                        self.sp = scratch; // free scratch
+                        continue;
+                    }
                     if (elem.kind == .spread_expr) {
-                        // Rest element `...t = rhs`: assign `rsrc.slice(i)` to `t`.
-                        // Must be the final element. Use a METHOD_CALL so `this`
-                        // is `rsrc` (R[base]=this, R[base+1]=fn, R[base+2]=arg).
-                        const base = self.allocReg();
-                        try self.emitOp(.MOVE, line);
-                        try self.emitU8(base);
-                        try self.emitU8(rsrc);
-                        const fslot = self.allocReg();
-                        const slice_sv = try val_mod.makeString(self.arena, "slice");
-                        const slice_k = try self.addConstant(slice_sv);
-                        try self.emitOp(.GET_PROP, line);
-                        try self.emitU8(fslot);
-                        try self.emitU8(base);
-                        try self.emitU16(slice_k);
-                        const argslot = self.allocReg();
-                        const idx_v = try val_mod.makeNumber(self.arena, @floatFromInt(i));
-                        const idx_k = try self.addConstant(idx_v);
-                        try self.emitOp(.LOAD_K, line);
-                        try self.emitU8(argslot);
-                        try self.emitU16(idx_k);
-                        try self.emitOp(.METHOD_CALL, line);
-                        try self.emitU8(base);
-                        try self.emitU8(1);
-                        try self.emitU8(base);
-                        self.sp = base + 1;
-                        try self.compileDestructure(elem.data.spread_expr, base, line);
-                        self.sp = base; // free base
+                        // Rest `...t = rhs`: collect the remaining values into a
+                        // fresh Array. Must be final; no IteratorClose follows.
+                        const rrest = self.allocReg();
+                        try self.emitDestrCall("__destrIterRest__", rit, rbox, rrest, line);
+                        try self.compileDestructure(elem.data.spread_expr, rrest, line);
+                        self.sp = rrest; // free rrest
+                        saw_rest = true;
                         break;
                     }
-                    const rval = self.allocReg();
-                    const key_str = std.fmt.allocPrint(self.arena, "{d}", .{i}) catch return error.OutOfMemory;
-                    const sv = try val_mod.makeString(self.arena, key_str);
-                    const kidx = try self.addConstant(sv);
-                    try self.emitOp(.GET_PROP, line);
-                    try self.emitU8(rval);
-                    try self.emitU8(rsrc);
-                    try self.emitU16(kidx);
-                    try self.compileDestructure(elem, rval, line);
-                    self.sp = rval; // free rval
+                    // Normal element: one IteratorStep into a temp, then assign
+                    // (handles identifier / member / default / nested sub-pattern).
+                    const rstep = self.allocReg();
+                    try self.emitDestrCall("__destrIterStep__", rit, rbox, rstep, line);
+                    try self.compileDestructure(elem, rstep, line);
+                    self.sp = rstep; // free rstep
                 }
+                if (!saw_rest) {
+                    const scratch = self.allocReg();
+                    try self.emitDestrCall("__destrIterClose__", rit, rbox, scratch, line);
+                    self.sp = scratch; // free scratch
+                }
+                self.sp = rit; // free rit + rbox
             },
             else => {}, // unsupported pattern element: leave unassigned
         }
