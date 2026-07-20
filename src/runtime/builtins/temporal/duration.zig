@@ -111,7 +111,11 @@ pub fn isValidDuration(d: DurationFields) bool {
 pub fn toTemporalDuration(arena: std.mem.Allocator, v: Value) !DurationFields {
     if (getDuration(v)) |d| return d.*;
     if (v.bits != 0 and v.unbox() == .string) {
-        return shared.parseISODuration(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid Duration string");
+        const d = shared.parseISODuration(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid Duration string");
+        // A parsed digit run may overflow to a non-finite / out-of-range value
+        // (e.g. "PT" + "1"×1000 + "S"); IsValidDuration rejects those.
+        if (!isValidDuration(d)) return realm_mod.throwRangeError(arena, "invalid Duration string");
+        return d;
     }
     if (v.bits != 0 and v.unbox() == .object) {
         return try toDurationFromFields(arena, v.toPtr().object, true);
