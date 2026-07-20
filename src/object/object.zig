@@ -631,6 +631,13 @@ pub const JsObject = struct {
     /// Returns false (caller should throw TypeError) when disallowed by
     /// non-configurability or non-extensibility. Honors lockstep growth.
     pub fn defineOwnData(self: *JsObject, key: []const u8, value: Value, attr: PropAttr) !bool {
+        // Array exotic [[DefineOwnProperty]]: an index at or beyond the current
+        // length cannot be added when "length" is non-writable (ES §10.4.2.1).
+        if (self.is_array and !self.array_length_writable) {
+            if (canonicalArrayIndex(key)) |idx| {
+                if (idx >= self.array_length) return false;
+            }
+        }
         if (self.usesDense()) {
             if (canonicalArrayIndex(key)) |idx| {
                 // A plain data descriptor with the default attributes is exactly a
@@ -786,8 +793,10 @@ pub const JsObject = struct {
             const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
             if (!cur.configurable) {
                 // Non-configurable: a redefine is rejected unless it makes no
-                // observable change — same accessor with identical get/set and
-                // unchanged enumerable (ValidateAndApplyPropertyDescriptor).
+                // observable change — cannot become configurable, same accessor
+                // with identical get/set and unchanged enumerable
+                // (ValidateAndApplyPropertyDescriptor).
+                if (attr.configurable) return false;
                 if (!cur.is_accessor or cur.enumerable != attr.enumerable) return false;
                 const cur_holder = if (slot < self.slots.items.len) self.slots.items[slot] else Value{};
                 if (!accessorHoldersEqual(cur_holder, holder)) return false;
@@ -1004,12 +1013,19 @@ pub const JsObject = struct {
 /// numeric equality (pointer-boxed numbers may differ in bits while equal).
 fn sameValueRough(a: Value, b: Value) bool {
     if (a.bits == b.bits) return true;
-    if (a.bits == 0 or b.bits == 0) return false;
+    // `unbox` maps a bare bits==0 to `.undefined_`; a heap-boxed `.undefined_`
+    // (e.g. the global `undefined`, which reads as a fresh box each time) must
+    // still compare equal to it, so compare by unboxed tag rather than bits.
     const ua = a.unbox();
     const ub = b.unbox();
-    if (ua == .number and ub == .number) return ua.number == ub.number;
-    if (ua == .string and ub == .string) return std.mem.eql(u8, ua.string, ub.string);
-    return false;
+    return switch (ua) {
+        .undefined_ => ub == .undefined_,
+        .null_ => ub == .null_,
+        .boolean => |x| ub == .boolean and x == ub.boolean,
+        .number => |x| ub == .number and x == ub.number,
+        .string => |x| ub == .string and std.mem.eql(u8, x, ub.string),
+        else => false,
+    };
 }
 
 // ------------------------------------------------------------------- tests ---
