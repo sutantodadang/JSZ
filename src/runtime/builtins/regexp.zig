@@ -3440,10 +3440,9 @@ pub fn nativeRegExpToString(arena: std.mem.Allocator, this_val: Value, _: []cons
 }
 
 pub fn nativeRegExpGetSource(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object)
-        return realm_mod.throwTypeError(arena, "RegExp.prototype.source called on incompatible receiver");
-    if (getCompiledRegex(this_val) == null)
-        return val_mod.makeString(arena, "(?:)");
+    // §22.2.6.13: only %RegExp.prototype% may lack [[OriginalSource]] (→ "(?:)");
+    // any other non-RegExp object is an incompatible receiver → TypeError.
+    _ = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeString(arena, "(?:)");
     const obj = this_val.toPtr().object;
     if (obj.getOwn("[[OriginalSource]]")) |sv| return sv;
     return val_mod.makeString(arena, "(?:)");
@@ -3478,53 +3477,52 @@ pub fn nativeRegExpGetFlags(arena: std.mem.Allocator, this_val: Value, _: []cons
     return val_mod.makeString(arena, owned);
 }
 
-pub fn nativeRegExpGetGlobal(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+/// Brand guard shared by the flag getters (ES §22.2.6): the receiver must be an
+/// Object; if it lacks a [[RegExpMatcher]] slot, only %RegExp.prototype% itself is
+/// tolerated (→ null, so the caller returns undefined) — any other object throws.
+fn regexpFlagBrand(arena: std.mem.Allocator, this_val: Value) anyerror!?*CompiledRegex {
     if (this_val.bits == 0 or this_val.unbox() != .object)
-        return realm_mod.throwTypeError(arena, "RegExp.prototype.global called on incompatible receiver");
-    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+        return realm_mod.throwTypeError(arena, "RegExp flag getter called on incompatible receiver");
+    if (getCompiledRegex(this_val)) |cr| return cr;
+    if (realm_mod.active_regexp_proto) |proto| {
+        if (this_val.toPtr().object == proto) return null;
+    }
+    return realm_mod.throwTypeError(arena, "RegExp flag getter called on incompatible receiver");
+}
+
+pub fn nativeRegExpGetGlobal(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const cr = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeUndefined(arena);
     return val_mod.makeBool(arena, cr.flags.global);
 }
 
 pub fn nativeRegExpGetIgnoreCase(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object)
-        return realm_mod.throwTypeError(arena, "RegExp.prototype.ignoreCase called on incompatible receiver");
-    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    const cr = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeUndefined(arena);
     return val_mod.makeBool(arena, cr.flags.ignore_case);
 }
 
 pub fn nativeRegExpGetMultiline(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object)
-        return realm_mod.throwTypeError(arena, "RegExp.prototype.multiline called on incompatible receiver");
-    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    const cr = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeUndefined(arena);
     return val_mod.makeBool(arena, cr.flags.multiline);
 }
 
 pub fn nativeRegExpGetDotAll(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object)
-        return realm_mod.throwTypeError(arena, "RegExp.prototype.dotAll called on incompatible receiver");
-    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    const cr = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeUndefined(arena);
     return val_mod.makeBool(arena, cr.flags.dotall);
 }
 
 pub fn nativeRegExpGetSticky(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object)
-        return realm_mod.throwTypeError(arena, "RegExp.prototype.sticky called on incompatible receiver");
-    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    const cr = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeUndefined(arena);
     return val_mod.makeBool(arena, cr.flags.sticky);
 }
 
 pub fn nativeRegExpGetUnicode(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object)
-        return realm_mod.throwTypeError(arena, "RegExp.prototype.unicode called on incompatible receiver");
-    const cr = getCompiledRegex(this_val) orelse return val_mod.makeUndefined(arena);
+    const cr = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeUndefined(arena);
     return val_mod.makeBool(arena, cr.flags.unicode);
 }
 
 pub fn nativeRegExpGetHasIndices(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object)
-        return realm_mod.throwTypeError(arena, "RegExp.prototype.hasIndices called on incompatible receiver");
-    if (getCompiledRegex(this_val) == null) return val_mod.makeUndefined(arena);
-    return val_mod.makeBool(arena, false);
+    _ = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, false); // `d` flag not tracked; always false
 }
 
 pub fn nativeRegExpGetUnicodeSets(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
