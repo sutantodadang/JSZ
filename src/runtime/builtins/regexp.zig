@@ -54,6 +54,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try ctx.env.define("RegExp", regexp_ctor_val);
 
     realm_mod.active_regexp_proto = regexp_proto;
+    // ES2025 RegExp.escape static — writable, non-enumerable, configurable.
+    _ = try regexp_ctor_obj.defineOwnData("escape", try val_mod.makeNativeFunctionNamed(arena, nativeRegExpEscape, "escape", 1), .{ .writable = true, .enumerable = false, .configurable = true });
     // Annex B legacy static accessors (RegExp.$1..$9 / input / lastMatch / …).
     active_regexp_ctor = regexp_ctor_obj;
     try registerLegacyAccessors(arena, regexp_ctor_obj);
@@ -69,6 +71,118 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.defineGetter(arena, regexp_proto, "unicode", nativeRegExpGetUnicode);
     try intrinsics.defineGetter(arena, regexp_proto, "hasIndices", nativeRegExpGetHasIndices);
     try intrinsics.defineGetter(arena, regexp_proto, "unicodeSets", nativeRegExpGetUnicodeSets);
+}
+
+// ================================================================ RegExp.escape ==
+
+/// SyntaxCharacter :: one of ^ $ \ . * + ? ( ) [ ] { } |
+fn isSyntaxChar(c: u21) bool {
+    return switch (c) {
+        '^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|' => true,
+        else => false,
+    };
+}
+
+/// otherPunctuators (§EncodeForRegExpEscape): , - = < > # & ! % : ; @ ~ ' ` "
+fn isOtherPunctuator(c: u21) bool {
+    return switch (c) {
+        ',', '-', '=', '<', '>', '#', '&', '!', '%', ':', ';', '@', '~', '\'', '`', '"' => true,
+        else => false,
+    };
+}
+
+/// WhiteSpace ∪ LineTerminator, minus the ControlEscape members (\t\v\f handled
+/// earlier). Covers the Unicode Space_Separator (Zs) set plus BOM/LS/PS.
+fn isEscapeWhiteSpace(c: u21) bool {
+    return switch (c) {
+        0x0020, 0x00A0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF => true,
+        0x2000...0x200A => true,
+        else => false,
+    };
+}
+
+/// Append the lowercase hex escape `\xHH` (2 digits) for a code point ≤ 0xFF.
+fn appendHex2(arena: std.mem.Allocator, out: *std.ArrayList(u8), c: u21) !void {
+    try out.appendSlice(arena, "\\x");
+    var buf: [2]u8 = undefined;
+    _ = std.fmt.bufPrint(&buf, "{x:0>2}", .{@as(u8, @intCast(c))}) catch unreachable;
+    try out.appendSlice(arena, &buf);
+}
+
+/// Append the lowercase Unicode escape `\uHHHH` for a single UTF-16 code unit.
+fn appendUnicodeEscape(arena: std.mem.Allocator, out: *std.ArrayList(u8), cu: u16) !void {
+    try out.appendSlice(arena, "\\u");
+    var buf: [4]u8 = undefined;
+    _ = std.fmt.bufPrint(&buf, "{x:0>4}", .{cu}) catch unreachable;
+    try out.appendSlice(arena, &buf);
+}
+
+/// EncodeForRegExpEscape(c) — append the escaped form of a single code point.
+/// `raw` is the source's raw bytes for `c` (used for the identity case so astral
+/// / multibyte code points round-trip without re-encoding).
+fn encodeForRegExpEscape(arena: std.mem.Allocator, out: *std.ArrayList(u8), c: u21, raw: []const u8) !void {
+    if (isSyntaxChar(c) or c == '/') {
+        try out.append(arena, '\\');
+        try out.append(arena, @intCast(c)); // all ASCII single bytes
+        return;
+    }
+    switch (c) {
+        0x09 => return out.appendSlice(arena, "\\t"),
+        0x0A => return out.appendSlice(arena, "\\n"),
+        0x0B => return out.appendSlice(arena, "\\v"),
+        0x0C => return out.appendSlice(arena, "\\f"),
+        0x0D => return out.appendSlice(arena, "\\r"),
+        else => {},
+    }
+    const is_surrogate = c >= 0xD800 and c <= 0xDFFF;
+    if (isOtherPunctuator(c) or isEscapeWhiteSpace(c) or is_surrogate) {
+        if (c <= 0xFF) {
+            try appendHex2(arena, out, c);
+        } else if (c <= 0xFFFF) {
+            try appendUnicodeEscape(arena, out, @intCast(c));
+        } else {
+            // Astral: emit the surrogate pair (UTF16EncodeCodePoint).
+            const v = c - 0x10000;
+            try appendUnicodeEscape(arena, out, @intCast(0xD800 + (v >> 10)));
+            try appendUnicodeEscape(arena, out, @intCast(0xDC00 + (v & 0x3FF)));
+        }
+        return;
+    }
+    // Identity: copy the source's raw bytes verbatim.
+    try out.appendSlice(arena, raw);
+}
+
+/// RegExp.escape ( S ) — ES2025. Escapes `S` so it matches literally in a pattern.
+pub fn nativeRegExpEscape(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    _ = this_val;
+    const s: []const u8 = switch (if (args.len > 0) args[0].unbox() else .undefined_) {
+        .string => |str| str,
+        else => return realm_mod.throwTypeError(arena, "RegExp.escape requires a string argument"),
+    };
+    var out = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < s.len) {
+        const dec = decodeUtf8At(s, i);
+        var len = if (dec.len == 0) 1 else dec.len;
+        var c = dec.cp;
+        // Combine a high+low WTF-8 surrogate pair into one astral code point so it
+        // round-trips as an identity char (StringToCodePoints semantics).
+        if (c >= 0xD800 and c <= 0xDBFF and i + len < s.len) {
+            const nxt = decodeUtf8At(s, i + len);
+            if (nxt.len != 0 and nxt.cp >= 0xDC00 and nxt.cp <= 0xDFFF) {
+                c = 0x10000 + ((c - 0xD800) << 10) + (nxt.cp - 0xDC00);
+                len += nxt.len;
+            }
+        }
+        if (i == 0 and ((c >= '0' and c <= '9') or (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z'))) {
+            // Leading digit/ASCII-letter: force `\xHH` so it can't extend a prior escape.
+            try appendHex2(arena, &out, c);
+        } else {
+            try encodeForRegExpEscape(arena, &out, c, s[i .. i + len]);
+        }
+        i += len;
+    }
+    return val_mod.makeString(arena, out.items);
 }
 
 // ============================================================= UTF-8 helpers ==
