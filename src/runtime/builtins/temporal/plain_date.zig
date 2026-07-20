@@ -301,7 +301,8 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
     if (smallest == null) smallest = .day;
-    if (largest == null) largest = .day;
+    // largestUnit defaults to "auto" = the larger of "day" and smallestUnit.
+    if (largest == null) largest = if (unitRank(smallest.?) < unitRank(.day)) smallest.? else .day;
     // Only date units allowed.
     if (unitRank(smallest.?) > unitRank(.day) or unitRank(largest.?) > unitRank(.day))
         return realm_mod.throwRangeError(arena, "PlainDate difference units must be year..day");
@@ -311,14 +312,103 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
     const from = if (since) other else d.*;
     const to = if (since) d.* else other;
-    var result = differenceISODate(from, to, largest.?);
-    // Rounding for day/week smallestUnit with increment; year/month rounding
-    // needs relativeTo-style re-balancing which we approximate for day.
-    if (smallest.? == .day and inc != 1) {
-        const days_rounded = shared.roundNumberToIncrement(result.days, inc, mode);
-        result.days = days_rounded;
+
+    var result: shared.DurationFields = undefined;
+    if (largest.? == smallest.?) {
+        // Result is a single calendar unit: round the exact difference to that
+        // unit, using `from` as the calendar anchor for month/year fractions.
+        result = try roundDateDifferenceToUnit(arena, from, to, smallest.?, inc, mode);
+    } else {
+        result = differenceISODate(from, to, largest.?);
+        // Only day-granularity rounding is supported when the result spans
+        // multiple units (a larger largestUnit than smallestUnit).
+        if (smallest.? == .day and inc != 1) {
+            result.days = shared.roundNumberToIncrement(result.days, inc, mode);
+        }
     }
     return duration.makeDuration(arena, result);
+}
+
+/// Round the exact date difference `from`→`to` to a whole (incremented) count of
+/// a single calendar `unit`, returning a DurationFields carrying only that unit.
+/// Month/year fractions are nominal: measured against the calendar length of the
+/// month/year straddling `to` (relativeTo = `from`).
+fn roundDateDifferenceToUnit(arena: std.mem.Allocator, from: ISODate, to: ISODate, unit: shared.Unit, inc: f64, mode: shared.RoundingMode) !shared.DurationFields {
+    var out = shared.DurationFields{};
+    const cmp = compareISODate(from, to);
+    if (cmp == 0) return out;
+    const sign: f64 = if (cmp < 0) 1 else -1; // from<to → positive difference
+    const total: f64 = switch (unit) {
+        .day => @floatFromInt(shared.isoDateToEpochDays(to.year, to.month, to.day) - shared.isoDateToEpochDays(from.year, from.month, from.day)),
+        .week => blk: {
+            const days = shared.isoDateToEpochDays(to.year, to.month, to.day) - shared.isoDateToEpochDays(from.year, from.month, from.day);
+            break :blk @as(f64, @floatFromInt(days)) / 7.0;
+        },
+        .month => blk: {
+            const dm = differenceISODate(from, to, .month);
+            const whole: i64 = @intFromFloat(dm.months);
+            const anchor = addMonthsConstrain(from, whole);
+            const next = addMonthsConstrain(from, whole + @as(i64, @intFromFloat(sign)));
+            const rem = shared.isoDateToEpochDays(to.year, to.month, to.day) - shared.isoDateToEpochDays(anchor.year, anchor.month, anchor.day);
+            const denom = shared.isoDateToEpochDays(next.year, next.month, next.day) - shared.isoDateToEpochDays(anchor.year, anchor.month, anchor.day);
+            break :blk dm.months + sign * (@as(f64, @floatFromInt(rem)) / @as(f64, @floatFromInt(denom)));
+        },
+        .year => blk: {
+            const dy = differenceISODate(from, to, .year);
+            const whole: i64 = @intFromFloat(dy.years);
+            const anchor = addMonthsConstrain(from, whole * 12);
+            const next = addMonthsConstrain(from, (whole + @as(i64, @intFromFloat(sign))) * 12);
+            const rem = shared.isoDateToEpochDays(to.year, to.month, to.day) - shared.isoDateToEpochDays(anchor.year, anchor.month, anchor.day);
+            const denom = shared.isoDateToEpochDays(next.year, next.month, next.day) - shared.isoDateToEpochDays(anchor.year, anchor.month, anchor.day);
+            break :blk dy.years + sign * (@as(f64, @floatFromInt(rem)) / @as(f64, @floatFromInt(denom)));
+        },
+        else => unreachable,
+    };
+    // For the irregular-length calendar units (year/month/week), spec
+    // NudgeToCalendarUnit range-checks the away-from-zero increment candidate
+    // (r2 = one increment beyond the toward-zero multiple) by adding it to the
+    // relativeTo date: if the resulting date is outside the representable ISO
+    // range, throw. Day differences use NudgeToDayOrTime and are not checked
+    // (a Duration may hold an arbitrarily large day count).
+    if (unit != .day) {
+        const r2_units = (@floor(@abs(total) / inc) + 1) * inc;
+        const in_range = switch (unit) {
+            .year => monthsOffsetYearInRange(from, sign * r2_units * 12),
+            .month => monthsOffsetYearInRange(from, sign * r2_units),
+            .week => epochDayOffsetInRange(from, sign * r2_units * 7),
+            else => true,
+        };
+        if (!in_range) return realm_mod.throwRangeError(arena, "rounded date is outside the valid ISO range");
+    }
+    const rounded = shared.roundNumberToIncrement(total, inc, mode);
+    switch (unit) {
+        .year => out.years = rounded,
+        .month => out.months = rounded,
+        .week => out.weeks = rounded,
+        .day => out.days = rounded,
+        else => {},
+    }
+    return out;
+}
+
+/// True iff `from` shifted by `off_months` whole months stays within the
+/// representable ISO year range. Computed in i64 to avoid i32 overflow when the
+/// probe offset is astronomically large.
+fn monthsOffsetYearInRange(from: ISODate, off_months: f64) bool {
+    if (!std.math.isFinite(off_months) or @abs(off_months) > 9.0e15) return false;
+    const m: i64 = @intFromFloat(off_months);
+    const mtotal: i64 = @as(i64, from.month) + m;
+    const y: i64 = @as(i64, from.year) + @divFloor(mtotal - 1, 12);
+    return y >= -271821 and y <= 275760;
+}
+
+/// True iff `from` shifted by `off_days` days stays within the representable ISO
+/// range (~±1e8 epoch days).
+fn epochDayOffsetInRange(from: ISODate, off_days: f64) bool {
+    if (!std.math.isFinite(off_days) or @abs(off_days) > 9.0e15) return false;
+    const base: f64 = @floatFromInt(shared.isoDateToEpochDays(from.year, from.month, from.day));
+    const end = base + off_days;
+    return end >= -100_000_001 and end <= 100_000_001;
 }
 
 fn unitRank(u: shared.Unit) u8 {
