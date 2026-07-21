@@ -30,7 +30,7 @@ fn requireDate(arena: std.mem.Allocator, v: Value) !*ISODate {
 
 pub fn makeDate(arena: std.mem.Allocator, d: ISODate) !Value {
     if (!shared.isValidISODate(d.year, d.month, d.day)) return realm_mod.throwRangeError(arena, "invalid PlainDate");
-    if (d.year < -271821 or d.year > 275760) return realm_mod.throwRangeError(arena, "PlainDate year out of range");
+    if (!shared.isoDateWithinLimits(d.year, d.month, d.day)) return realm_mod.throwRangeError(arena, "PlainDate out of range");
     const slot = try arena.create(ISODate);
     slot.* = d;
     const obj = if (realm_mod.active_heap) |h|
@@ -44,6 +44,7 @@ pub fn makeDate(arena: std.mem.Allocator, d: ISODate) !Value {
 
 fn installInto(arena: std.mem.Allocator, this_val: Value, d: ISODate) !Value {
     if (!shared.isValidISODate(d.year, d.month, d.day)) return realm_mod.throwRangeError(arena, "invalid PlainDate");
+    if (!shared.isoDateWithinLimits(d.year, d.month, d.day)) return realm_mod.throwRangeError(arena, "PlainDate out of range");
     const slot = try arena.create(ISODate);
     slot.* = d;
     this_val.toPtr().object.internal_kind = .temporal_plain_date;

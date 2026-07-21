@@ -205,8 +205,15 @@ fn nativeAddSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, 
     });
     const cal = ym.calendar;
     const f = calendar.fields(cal, ym.*);
-    const anchor_day: u8 = if (sign < 0) calendar.daysInMonth(cal, f.year, f.month) else 1;
-    const anchor = ISODate{ .year = ym.year, .month = ym.month, .day = anchor_day, .calendar = cal };
+    // The stored ISO date is already day 1 of the calendar month; the last day
+    // has to be resolved through the calendar, since the calendar month does not
+    // line up with the ISO one.
+    var anchor = ym.*;
+    if (sign < 0) {
+        anchor = calendar.toIso(cal, f.year, f.month, calendar.daysInMonth(cal, f.year, f.month), .constrain) catch
+            return realm_mod.throwRangeError(arena, "year-month out of range");
+        anchor.calendar = cal;
+    }
     const result = try plain_date.addISODate(anchor, dur.years, dur.months, dur.weeks, total_days, overflow, arena);
     // Renormalize onto the first day of the resulting *calendar* month.
     const rf = calendar.fields(cal, result);
@@ -226,44 +233,37 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const ym = try requireYM(arena, this_val);
     const other = try toTemporalYearMonth(arena, if (args.len > 0) args[0] else Value{}, .constrain);
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
-    if (smallest == null) smallest = .month;
-    if (largest == null) largest = .year;
-    // Only year/month units allowed.
-    if (unitRank(smallest.?) > 1 or unitRank(largest.?) > 1)
-        return realm_mod.throwRangeError(arena, "PlainYearMonth difference units must be year or month");
-    if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    var mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
-
     // `since` negates `until` rather than swapping the operands, and both keep
     // the receiver's calendar: rebuilding these as bare literals would silently
     // measure a non-ISO year-month difference in the ISO calendar.
-    if (since) mode = shared.negateRoundingMode(mode);
-    var result = plain_date.differenceISODate(ym.*, other, largest.?);
+    const o = try shared.getDiffOptions(arena, opts, since);
+    const smallest = o.smallest orelse .month;
+    const largest = o.largest orelse .year;
+    // Only year/month units allowed.
+    if (unitRank(smallest) > 1 or unitRank(largest) > 1)
+        return realm_mod.throwRangeError(arena, "PlainYearMonth difference units must be year or month");
+    if (unitRank(largest) > unitRank(smallest)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
+
+    var result = plain_date.differenceISODate(ym.*, other, largest);
     result.weeks = 0;
     result.days = 0;
-
-    // differenceISODate already split years/months using the calendar's own
-    // months-per-year, so only re-derive the split when rounding disturbs it.
-    // The total-months form assumes 12 months per year and is reached only for
-    // year-granularity or multi-month increments.
-    if (inc != 1 or smallest.? == .year) {
-        var total_months = result.years * 12.0 + result.months;
-        const round_increment: f64 = if (smallest.? == .year) inc * 12.0 else inc;
-        total_months = shared.roundNumberToIncrement(total_months, round_increment, mode);
-        result.years = 0;
-        result.months = 0;
-        if (largest.? == .year) {
-            result.years = @trunc(total_months / 12.0);
-            result.months = total_months - result.years * 12.0;
-        } else {
-            result.months = total_months;
-        }
-    } else if (largest.? == .month) {
-        result.months = result.years * 12.0 + result.months;
-        result.years = 0;
+    if (smallest != .month or o.inc != 1) {
+        const dest_ns: i128 = @as(i128, shared.isoDateToEpochDays(other.year, other.month, other.day) -
+            shared.isoDateToEpochDays(ym.year, ym.month, ym.day)) * shared.NS_PER_DAY;
+        const rr = try duration.roundRelativeBalanced(
+            arena,
+            result,
+            ym.*,
+            dest_ns,
+            smallest,
+            largest,
+            o.inc,
+            o.mode,
+            if (dest_ns < 0) -1 else 1,
+        );
+        result = rr.d;
+        result.weeks = 0;
+        result.days = 0;
     }
     if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
@@ -350,8 +350,18 @@ pub fn nativeToPlainDate(arena: std.mem.Allocator, this_val: Value, args: []cons
     if (day_v.bits != 0 and day_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing day");
     const day = try shared.toIntegerWithTruncation(arena, day_v);
     const di = floatToI32(day);
-    if (!shared.isValidISODate(ym.year, ym.month, di)) return realm_mod.throwRangeError(arena, "invalid day for PlainDate");
-    return plain_date.makeDate(arena, .{ .year = ym.year, .month = ym.month, .day = @intCast(di) });
+    // The receiver's stored ISO date is day 1 of its *calendar* month, which is
+    // not day 1 of an ISO month outside iso8601 — so the day has to be resolved
+    // through the calendar rather than pasted onto the ISO year/month. Overflow
+    // is "constrain": Feb 29 of a common year lands on Feb 28.
+    const cal = ym.calendar;
+    const f = calendar.fields(cal, ym.*);
+    if (di < 1) return realm_mod.throwRangeError(arena, "invalid day for PlainDate");
+    var out = calendar.toIsoFromCode(cal, f.year, f.code_num, f.code_leap, di, .constrain) catch
+        return realm_mod.throwRangeError(arena, "invalid day for PlainDate");
+    if (!shared.isValidISODate(out.year, out.month, out.day)) return realm_mod.throwRangeError(arena, "invalid day for PlainDate");
+    out.calendar = cal;
+    return plain_date.makeDate(arena, out);
 }
 
 // ------------------------------------------------------------------ strings ---

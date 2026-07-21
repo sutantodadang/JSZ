@@ -215,6 +215,15 @@ pub fn isValidISODate(year: i32, month: i32, day: i32) bool {
     return true;
 }
 
+/// ISODateWithinLimits: a PlainDate is representable iff noon on that day falls
+/// inside the instant range (±8.64e21 ns) widened by one day — that is,
+/// -271821-04-19 through +275760-09-13 inclusive.
+pub fn isoDateWithinLimits(year: i32, month: i32, day: i32) bool {
+    if (year < -271822 or year > 275761) return false;
+    const ed = isoDateToEpochDays(year, month, day);
+    return ed >= -100_000_001 and ed <= 100_000_000;
+}
+
 pub fn isValidISOTime(t: ISOTime) bool {
     return t.hour < 24 and t.minute < 60 and t.second < 60 and
         t.millisecond < 1000 and t.microsecond < 1000 and t.nanosecond < 1000;
