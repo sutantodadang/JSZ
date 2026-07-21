@@ -10,6 +10,7 @@ const realm_mod = @import("../../realm.zig");
 const intrinsics = @import("../intrinsics.zig");
 const shared = @import("shared.zig");
 const duration = @import("duration.zig");
+const plain_time = @import("plain_time.zig");
 
 pub var proto_obj: ?*JsObject = null;
 pub var ctor_obj: ?*JsObject = null;
@@ -353,9 +354,14 @@ fn getEpochNanoseconds(arena: std.mem.Allocator, this_val: Value, _: []const Val
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const ins = try requireInstant(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
+    // Option read order is fixed by the spec: digits, then mode, then unit.
     const digits = try shared.getFractionalDigits(arena, opts);
-    // timeZone option ignored (UTC).
-    const s = try instantToString(arena, ins.*, digits);
+    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
+    // timeZone option ignored (UTC). Rounding is on the epoch nanoseconds, so
+    // a carry past midnight moves the date for free.
+    const ns = shared.roundI128ToIncrement(ins.*, prec.increment, mode);
+    const s = try instantToStringPrec(arena, ns, prec);
     return val_mod.makeString(arena, s);
 }
 
@@ -384,6 +390,10 @@ pub fn nativeToZonedDateTimeISO(arena: std.mem.Allocator, this_val: Value, args:
 }
 
 fn instantToString(arena: std.mem.Allocator, ns: i128, digits: ?u8) ![]const u8 {
+    return instantToStringPrec(arena, ns, .{ .digits = digits });
+}
+
+fn instantToStringPrec(arena: std.mem.Allocator, ns: i128, prec: shared.SecondsPrecision) ![]const u8 {
     const days: i64 = @intCast(@divFloor(ns, shared.NS_PER_DAY));
     const time_of_day: i128 = ns - @as(i128, days) * shared.NS_PER_DAY;
     const date = shared.epochDaysToISODate(days);
@@ -395,12 +405,7 @@ fn instantToString(arena: std.mem.Allocator, ns: i128, digits: ?u8) ![]const u8 
     try buf.append(arena, '-');
     try shared.appendPadded(arena, &buf, date.day, 2);
     try buf.append(arena, 'T');
-    try shared.appendPadded(arena, &buf, tr.time.hour, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, tr.time.minute, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, tr.time.second, 2);
-    try shared.appendFraction(arena, &buf, tr.time, digits);
+    try buf.appendSlice(arena, try plain_time.timeToStringPrec(arena, tr.time, prec));
     try buf.append(arena, 'Z');
     return buf.items;
 }

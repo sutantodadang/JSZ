@@ -241,7 +241,10 @@ pub fn timeToNanos(t: ISOTime) i128 {
 
 /// Decompose a nanosecond-of-day count (may be >= NS_PER_DAY or negative) into
 /// day-overflow + wall-clock time.
-pub fn nanosToTime(total: i128) struct { days: i64, time: ISOTime } {
+/// A wall-clock time plus the number of whole days that overflowed out of it.
+pub const DayAndTime = struct { days: i64, time: ISOTime };
+
+pub fn nanosToTime(total: i128) DayAndTime {
     const days: i128 = @divFloor(total, NS_PER_DAY);
     var ns = total - days * NS_PER_DAY; // [0, NS_PER_DAY)
     const hour: u8 = @intCast(@divTrunc(ns, NS_PER_HOUR));
@@ -993,6 +996,24 @@ fn roundHalfDown(q: f64) f64 {
     return fl;
 }
 
+/// Negate every Duration field. Adding 0.0 normalizes the -0.0 that negating a
+/// zero field would otherwise produce: a Duration field that is zero must read
+/// as +0 regardless of the duration's overall sign.
+pub fn negateFields(d: DurationFields) DurationFields {
+    return .{
+        .years = -d.years + 0.0,
+        .months = -d.months + 0.0,
+        .weeks = -d.weeks + 0.0,
+        .days = -d.days + 0.0,
+        .hours = -d.hours + 0.0,
+        .minutes = -d.minutes + 0.0,
+        .seconds = -d.seconds + 0.0,
+        .milliseconds = -d.milliseconds + 0.0,
+        .microseconds = -d.microseconds + 0.0,
+        .nanoseconds = -d.nanoseconds + 0.0,
+    };
+}
+
 pub fn negateRoundingMode(mode: RoundingMode) RoundingMode {
     return switch (mode) {
         .ceil => .floor,
@@ -1214,9 +1235,31 @@ pub fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
 
 /// Read a string-valued option; returns null if the property is absent/undefined.
 /// Throws if present but coerces to a value not in `allowed` (when allowed given).
+/// True when a `from` argument is a string. Such an argument is parsed *before*
+/// the options bag is consulted, so an ISO-invalid string throws RangeError
+/// without `overflow` ever being read (it is still read and validated after a
+/// successful parse, then ignored).
+pub fn isStringArg(v: Value) bool {
+    return v.bits != 0 and v.unbox() == .string;
+}
+
+/// Read one option through the real [[Get]] so accessor properties and
+/// Proxy traps on the options bag are observed. `JsObject.get` returns raw
+/// data-property slots, which silently skips getters — and test262 checks the
+/// exact sequence of option reads. Falls back to the raw slot when no VM
+/// context is active (option bags built internally by native code).
+pub fn optionGet(arena: std.mem.Allocator, o: *JsObject, key: []const u8) !?Value {
+    if (realm_mod.active_context) |ctx| {
+        const v = try ctx.getProp(arena, try val_mod.makeObject(arena, o), key);
+        if (v.bits == 0 or v.unbox() == .undefined_) return null;
+        return v;
+    }
+    return o.get(key);
+}
+
 pub fn readStringOption(arena: std.mem.Allocator, opts: ?*JsObject, key: []const u8) !?[]const u8 {
     const o = opts orelse return null;
-    const v = o.get(key) orelse return null;
+    const v = (try optionGet(arena, o, key)) orelse return null;
     if (v.bits == 0 or v.unbox() == .undefined_) return null;
     return try valueToString(arena, v);
 }
@@ -1251,7 +1294,7 @@ pub fn toNumberOption(arena: std.mem.Allocator, v: Value) !f64 {
 
 pub fn getRoundingIncrement(arena: std.mem.Allocator, opts: ?*JsObject) !f64 {
     const o = opts orelse return 1;
-    const v = o.get("roundingIncrement") orelse return 1;
+    const v = (try optionGet(arena, o, "roundingIncrement")) orelse return 1;
     if (v.bits == 0 or v.unbox() == .undefined_) return 1;
     const n = try toNumberOption(arena, v);
     if (!std.math.isFinite(n)) return realm_mod.throwRangeError(arena, "roundingIncrement must be finite");
@@ -1333,6 +1376,35 @@ pub fn appendFraction(a: std.mem.Allocator, buf: *Buf, t: ISOTime, digits: ?u8) 
     }
 }
 
+/// ToSecondsStringPrecisionRecord: how many fractional-second digits to print,
+/// and the nanosecond increment the time must be rounded to first.
+pub const SecondsPrecision = struct {
+    /// Fractional digits to print; null means "auto" (trim trailing zeros).
+    digits: ?u8 = null,
+    /// smallestUnit was "minute": omit the seconds component entirely.
+    minute: bool = false,
+    /// Rounding increment in nanoseconds.
+    increment: i128 = 1,
+};
+
+/// ToSecondsStringPrecisionRecord. `digits` is the already-read
+/// fractionalSecondDigits option — the spec reads it, then roundingMode, then
+/// smallestUnit, and callers must preserve that order. smallestUnit wins when
+/// both are present.
+pub fn getSecondsStringPrecision(arena: std.mem.Allocator, opts: ?*JsObject, digits: ?u8) !SecondsPrecision {
+    if (try getTemporalUnit(arena, opts, "smallestUnit")) |u| return switch (u) {
+        .minute => .{ .minute = true, .increment = NS_PER_MINUTE },
+        .second => .{ .digits = 0, .increment = NS_PER_SECOND },
+        .millisecond => .{ .digits = 3, .increment = NS_PER_MILLI },
+        .microsecond => .{ .digits = 6, .increment = NS_PER_MICRO },
+        .nanosecond => .{ .digits = 9, .increment = 1 },
+        else => realm_mod.throwRangeError(arena, "smallestUnit must be one of minute, second, millisecond, microsecond, nanosecond"),
+    };
+    const d = digits orelse return .{}; // auto: full precision, no rounding
+    // Printing d digits means rounding away everything below 10^(9-d) ns.
+    return .{ .digits = d, .increment = std.math.pow(i128, 10, 9 - @as(i128, d)) };
+}
+
 /// "auto" | "always" | "never" | "critical" for calendarName; we only need the
 /// three behaviors relevant to ISO output.
 pub const ShowCalendar = enum { auto, always, never, critical };
@@ -1348,14 +1420,18 @@ pub fn getShowCalendar(arena: std.mem.Allocator, opts: ?*JsObject) !ShowCalendar
 /// Parse fractionalSecondDigits option: null = auto, else 0..9.
 pub fn getFractionalDigits(arena: std.mem.Allocator, opts: ?*JsObject) !?u8 {
     const o = opts orelse return null;
-    const v = o.get("fractionalSecondDigits") orelse return null;
+    const v = (try optionGet(arena, o, "fractionalSecondDigits")) orelse return null;
     if (v.bits == 0 or v.unbox() == .undefined_) return null;
-    if (v.unbox() == .string) {
-        if (std.mem.eql(u8, v.unbox().string, "auto")) return null;
+    // Anything that is not a Number is stringified and must read "auto"; it is
+    // never coerced to a digit count, so `null` and `false` are RangeErrors
+    // rather than 0.
+    if (v.unbox() != .number) {
+        const s = try valueToString(arena, v);
+        if (std.mem.eql(u8, s, "auto")) return null;
         return realm_mod.throwRangeError(arena, "invalid fractionalSecondDigits");
     }
     const n = try realm_mod.toNumberValue(arena, v);
-    if (std.math.isNan(n)) return realm_mod.throwRangeError(arena, "invalid fractionalSecondDigits");
+    if (std.math.isNan(n) or std.math.isInf(n)) return realm_mod.throwRangeError(arena, "invalid fractionalSecondDigits");
     const t = @floor(n);
     if (t < 0 or t > 9) return realm_mod.throwRangeError(arena, "fractionalSecondDigits out of range");
     return @intFromFloat(t);

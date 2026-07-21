@@ -174,8 +174,11 @@ fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
 pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else Value{};
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    const overflow = try shared.getOverflow(arena, opts);
+    // A string argument is parsed before the options bag is consulted.
+    const parse_first = shared.isStringArg(v);
+    const overflow = if (parse_first) .constrain else try shared.getOverflow(arena, opts);
     const dt = try toTemporalDateTime(arena, v, overflow);
+    if (parse_first) _ = try shared.getOverflow(arena, opts);
     return makeDateTime(arena, dt);
 }
 
@@ -252,11 +255,15 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     if (smallest == null) smallest = .nanosecond;
     if (largest == null) largest = if (unitRank(smallest.?) < unitRank(.day)) smallest.? else .day;
     if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    var mode = try shared.getRoundingMode(arena, opts, .trunc);
     const inc = try shared.getRoundingIncrement(arena, opts);
 
-    const from = if (since) other else dt.*;
-    const to = if (since) dt.* else other;
+    // `since` negates `until` rather than swapping the operands: both anchor
+    // their calendar walk on the receiver, and calendar arithmetic is not
+    // symmetric. Rounding runs mirrored, so the mode is negated too.
+    if (since) mode = shared.negateRoundingMode(mode);
+    const from = dt.*;
+    const to = other;
 
     var result: shared.DurationFields = undefined;
     // Rank 0 is `year`, so "day or larger" is a *lower* rank.
@@ -272,6 +279,7 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     }
     // Rounding: only for time-unit / day smallestUnit (approximate).
     result = roundResult(result, smallest.?, inc, mode, largest.?);
+    if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
 }
 
@@ -495,9 +503,21 @@ pub fn nativeToPlainTime(arena: std.mem.Allocator, this_val: Value, _: []const V
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
+    // Option read order is fixed by the spec: digits, then mode, then unit.
     const digits = try shared.getFractionalDigits(arena, opts);
     const show = try shared.getShowCalendar(arena, opts);
-    const s = try dtToString(arena, dt.*, digits, show);
+    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
+    // Rounding up past midnight carries into the date.
+    const r = plain_time.roundTimeToIncrement(dt.time, prec, mode);
+    var out = dt.*;
+    out.time = r.time;
+    if (r.days != 0) {
+        const cal = out.date.calendar;
+        out.date = shared.balanceISODate(out.date.year, out.date.month, @as(i32, out.date.day) + @as(i32, @intCast(r.days)));
+        out.date.calendar = cal;
+    }
+    const s = try dtToStringPrec(arena, out, prec, show);
     return val_mod.makeString(arena, s);
 }
 
@@ -516,6 +536,10 @@ pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyer
 }
 
 fn dtToString(arena: std.mem.Allocator, dt: ISODateTime, digits: ?u8, show: shared.ShowCalendar) ![]const u8 {
+    return dtToStringPrec(arena, dt, .{ .digits = digits }, show);
+}
+
+fn dtToStringPrec(arena: std.mem.Allocator, dt: ISODateTime, prec: shared.SecondsPrecision, show: shared.ShowCalendar) ![]const u8 {
     var buf = shared.Buf{};
     try shared.appendISOYear(arena, &buf, dt.date.year);
     try buf.append(arena, '-');
@@ -523,12 +547,7 @@ fn dtToString(arena: std.mem.Allocator, dt: ISODateTime, digits: ?u8, show: shar
     try buf.append(arena, '-');
     try shared.appendPadded(arena, &buf, dt.date.day, 2);
     try buf.append(arena, 'T');
-    try shared.appendPadded(arena, &buf, dt.time.hour, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, dt.time.minute, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, dt.time.second, 2);
-    try shared.appendFraction(arena, &buf, dt.time, digits);
+    try buf.appendSlice(arena, try plain_time.timeToStringPrec(arena, dt.time, prec));
     try plain_date.appendCalendar(arena, &buf, show, dt.date.calendar);
     return buf.items;
 }
