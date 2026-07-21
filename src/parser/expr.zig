@@ -1429,6 +1429,13 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
             return p.makeNode(.this_expr, start, end, .{ .this_expr = {} });
         },
         .kw_super => {
+            // `super` is only legal where the running execution context has a
+            // [[HomeObject]] / super constructor — which eval code never inherits
+            // here (an eval body is compiled as its own Script closure over the
+            // global environment). Both `super()` and `super.x` are therefore
+            // early SyntaxErrors in eval code, matching indirect eval in the spec
+            // and the derived-class-field-initializer cases that reach here.
+            if (p.eval_code) return p.fail("'super' keyword unexpected here");
             _ = p.advance();
             p.super_used = true;
             return p.makeNode(.identifier, start, end, .{ .identifier = "super" });
