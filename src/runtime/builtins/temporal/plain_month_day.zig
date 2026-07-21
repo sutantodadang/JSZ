@@ -10,6 +10,8 @@ const JsObject = @import("../../../object/object.zig").JsObject;
 const realm_mod = @import("../../realm.zig");
 const intrinsics = @import("../intrinsics.zig");
 const shared = @import("shared.zig");
+const calendar = @import("calendar.zig");
+const ISODate = shared.ISODate;
 const plain_date = @import("plain_date.zig");
 const ISOMonthDay = shared.ISOMonthDay;
 
@@ -57,8 +59,9 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (!realm_mod.active_constructing) return realm_mod.throwTypeError(arena, "Temporal.PlainMonthDay requires new");
     const m = try shared.toIntegerWithTruncation(arena, if (args.len > 0) args[0] else Value{});
     const d = try shared.toIntegerWithTruncation(arena, if (args.len > 1) args[1] else Value{});
-    // Constructor → CanonicalizeCalendar (bare identifier only).
-    if (args.len > 2) try shared.validateCalendarArgCanonical(arena, args[2]);
+    // Constructor → CanonicalizeCalendar (bare identifier only). The
+    // constructor's month/day and reference year are ISO, whatever the calendar.
+    const cal = if (args.len > 2) try shared.resolveCalendarArgCanonical(arena, args[2]) else .iso8601;
     var ref_year: f64 = 1972;
     if (args.len > 3 and args[3].bits != 0 and args[3].unbox() != .undefined_) {
         ref_year = try shared.toIntegerWithTruncation(arena, args[3]);
@@ -67,7 +70,7 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const di = floatToI32(d);
     const yi = floatToI32(ref_year);
     if (!shared.isValidISODate(yi, mi, di)) return realm_mod.throwRangeError(arena, "invalid month-day");
-    const md = ISOMonthDay{ .month = @intCast(mi), .day = @intCast(di), .ref_year = yi };
+    const md = ISOMonthDay{ .month = @intCast(mi), .day = @intCast(di), .ref_year = yi, .calendar = cal };
     if (this_val.bits != 0 and this_val.unbox() == .object) return installInto(arena, this_val, md);
     return makeMonthDay(arena, md);
 }
@@ -92,38 +95,54 @@ pub fn toTemporalMonthDay(arena: std.mem.Allocator, v: Value, overflow: shared.O
 }
 
 fn monthDayFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISOMonthDay {
-    if (o.get("calendar")) |cv| try shared.validateCalendarArg(arena, cv);
+    const cal = if (o.get("calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
     const day_v = o.get("day");
-    const month_v = o.get("month");
-    const mc = try shared.readMonthCode(arena, o.get("monthCode"));
-    const year_v = o.get("year");
     if (day_v == null or (day_v.?.bits != 0 and day_v.?.unbox() == .undefined_)) return realm_mod.throwTypeError(arena, "missing day");
-    var month: f64 = undefined;
-    var has_monthcode = false;
-    if (mc) |code| {
-        month = @floatFromInt(code);
-        has_monthcode = true;
-    } else if (month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_) {
-        month = try shared.toIntegerWithTruncation(arena, month_v.?);
+    const day = floatToI32(try shared.toIntegerWithTruncation(arena, day_v.?));
+
+    const month_v = o.get("month");
+    const mc_v = o.get("monthCode");
+    const has_month = month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_;
+    const has_code = mc_v != null and mc_v.?.bits != 0 and mc_v.?.unbox() != .undefined_;
+    var code = shared.MonthCode{ .num = 0 };
+    if (has_code) {
+        if (mc_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
+        code = try shared.parseMonthCode(arena, mc_v.?.unbox().string, calendar.hasLeapMonths(cal));
+    } else if (has_month) {
+        const m = floatToI32(try shared.toIntegerWithTruncation(arena, month_v.?));
+        if (m < 1 or m > 255) return realm_mod.throwRangeError(arena, "month out of range");
+        code = .{ .num = @intCast(m) };
     } else {
         return realm_mod.throwTypeError(arena, "missing month or monthCode");
     }
-    const day = try shared.toIntegerWithTruncation(arena, day_v.?);
-    // If a year is supplied (with a numeric month, not monthCode) the day is
-    // regulated against that year; otherwise validate against the leap-safe
-    // reference year 1972.
-    var year: i32 = 1972;
-    if (!has_monthcode and year_v != null and year_v.?.bits != 0 and year_v.?.unbox() != .undefined_) {
-        year = floatToI32(try shared.toIntegerWithTruncation(arena, year_v.?));
+
+    // A year (directly or via era/eraYear) pins the month/day to a specific
+    // year, which both validates the year's range and — for a numeric month —
+    // resolves which month code it names.
+    const year_v = o.get("year");
+    const has_year = (year_v != null and year_v.?.bits != 0 and year_v.?.unbox() != .undefined_) or
+        (calendar.hasEras(cal) and o.get("era") != null and o.get("era").?.bits != 0 and o.get("era").?.unbox() != .undefined_);
+    if (has_year) {
+        const cal_year = try plain_date.readCalendarYear(arena, o, cal);
+        const iso = calendar.toIso(cal, cal_year, code.num, day, overflow) catch
+            return realm_mod.throwRangeError(arena, "month-day out of range");
+        const f = calendar.fields(cal, iso);
+        code = .{ .num = f.code_num, .leap = f.code_leap };
+        if (has_month and has_code) {
+            const m = floatToI32(try shared.toIntegerWithTruncation(arena, month_v.?));
+            if (m != f.month) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
+        }
+        return .{ .month = iso.month, .day = iso.day, .ref_year = iso.year, .calendar = cal };
     }
-    const mi = floatToI32(month);
-    const di = floatToI32(day);
-    if (overflow == .reject) {
-        if (!shared.isValidISODate(year, mi, di)) return realm_mod.throwRangeError(arena, "month-day out of range");
-        return .{ .month = @intCast(mi), .day = @intCast(di), .ref_year = 1972 };
+
+    // month and monthCode, when both present, must name the same month.
+    if (has_month and has_code) {
+        const m = floatToI32(try shared.toIntegerWithTruncation(arena, month_v.?));
+        if (m != code.num or code.leap) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
     }
-    const reg = shared.regulateISODateConstrain(year, mi, di);
-    return .{ .month = reg.month, .day = reg.day, .ref_year = 1972 };
+    const iso = calendar.monthDayReference(cal, code.num, code.leap, day, overflow) catch
+        return realm_mod.throwRangeError(arena, "month-day out of range");
+    return .{ .month = iso.month, .day = iso.day, .ref_year = iso.year, .calendar = cal };
 }
 
 // ------------------------------------------------------------- static methods ---
@@ -148,34 +167,41 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (o.get("timeZone") != null and o.get("timeZone").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
-    var month: f64 = @floatFromInt(cur.month);
-    var day: f64 = @floatFromInt(cur.day);
+    // Merge over the receiver's own calendar fields, then recompute the ISO
+    // reference date for the resulting month code + day.
+    const cal = cur.calendar;
+    const base = calendar.fields(cal, .{ .year = cur.ref_year, .month = cur.month, .day = cur.day, .calendar = cal });
+    var code = shared.MonthCode{ .num = base.code_num, .leap = base.code_leap };
+    var day: i32 = base.day;
     var any = false;
     var mc_month: ?i32 = null;
-    if (try shared.readMonthCode(arena, o.get("monthCode"))) |code| {
-        mc_month = code;
-        month = @floatFromInt(code);
+    const mc_v = o.get("monthCode");
+    if (mc_v != null and mc_v.?.bits != 0 and mc_v.?.unbox() != .undefined_) {
+        if (mc_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
+        code = try shared.parseMonthCode(arena, mc_v.?.unbox().string, calendar.hasLeapMonths(cal));
+        mc_month = code.num;
         any = true;
     }
     if (try readField(arena, o, "month")) |x| {
         // month and monthCode, when both present, must denote the same month.
         if (mc_month) |mc| {
             if (floatToI32(x) != mc) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
+        } else {
+            const m = floatToI32(x);
+            if (m < 1 or m > 255) return realm_mod.throwRangeError(arena, "month out of range");
+            code = .{ .num = @intCast(m) };
         }
-        month = x;
         any = true;
     }
-    if (try readField(arena, o, "day")) |x| { day = x; any = true; }
+    if (try readField(arena, o, "day")) |x| {
+        day = floatToI32(x);
+        any = true;
+    }
     if (o.get("year") != null and o.get("year").?.bits != 0 and o.get("year").?.unbox() != .undefined_) any = true;
     if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
-    const mi = floatToI32(month);
-    const di = floatToI32(day);
-    if (overflow == .reject) {
-        if (!shared.isValidISODate(1972, mi, di)) return realm_mod.throwRangeError(arena, "month-day out of range");
-        return makeMonthDay(arena, .{ .month = @intCast(mi), .day = @intCast(di), .ref_year = 1972 });
-    }
-    const reg = shared.regulateISODateConstrain(1972, mi, di);
-    return makeMonthDay(arena, .{ .month = reg.month, .day = reg.day, .ref_year = 1972 });
+    const iso = calendar.monthDayReference(cal, code.num, code.leap, day, overflow) catch
+        return realm_mod.throwRangeError(arena, "month-day out of range");
+    return makeMonthDay(arena, .{ .month = iso.month, .day = iso.day, .ref_year = iso.year, .calendar = cal });
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
@@ -187,7 +213,9 @@ fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
 pub fn nativeEquals(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const md = try requireMD(arena, this_val);
     const other = try toTemporalMonthDay(arena, if (args.len > 0) args[0] else Value{}, .constrain);
-    return val_mod.makeBool(arena, md.month == other.month and md.day == other.day and md.ref_year == other.ref_year);
+    // Equality is on the full ISO reference date *and* the calendar.
+    return val_mod.makeBool(arena, md.month == other.month and md.day == other.day and
+        md.ref_year == other.ref_year and md.calendar == other.calendar);
 }
 
 pub fn nativeToPlainDate(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -197,11 +225,14 @@ pub fn nativeToPlainDate(arena: std.mem.Allocator, this_val: Value, args: []cons
     const o = arg.toPtr().object;
     const year_v = o.get("year") orelse return realm_mod.throwTypeError(arena, "missing year");
     if (year_v.bits != 0 and year_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing year");
-    const year = try shared.toIntegerWithTruncation(arena, year_v);
-    const yi = floatToI32(year);
+    const cal = md.calendar;
+    const ref = ISODate{ .year = md.ref_year, .month = md.month, .day = md.day, .calendar = cal };
+    const f = calendar.fields(cal, ref);
+    const cal_year = try plain_date.readCalendarYear(arena, o, cal);
     // Constrain the day to the target year's month length (leap-day handling).
-    const reg = shared.regulateISODateConstrain(yi, md.month, md.day);
-    return plain_date.makeDate(arena, reg);
+    const iso = calendar.toIsoFromCode(cal, cal_year, f.code_num, f.code_leap, f.day, .constrain) catch
+        return realm_mod.throwRangeError(arena, "date out of range");
+    return plain_date.makeDate(arena, iso);
 }
 
 // ------------------------------------------------------------------ strings ---
@@ -229,22 +260,19 @@ pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyer
 
 fn monthDayToString(arena: std.mem.Allocator, md: ISOMonthDay, show: shared.ShowCalendar) ![]const u8 {
     var buf = shared.Buf{};
-    // The reference year is emitted only when the calendar annotation shows.
-    switch (show) {
-        .never, .auto => {},
-        .always, .critical => {
-            try shared.appendISOYear(arena, &buf, md.ref_year);
-            try buf.append(arena, '-');
-        },
+    // The reference year is emitted only when the calendar annotation shows —
+    // which includes a non-ISO calendar under `auto`, since it would otherwise
+    // be lost in the round-trip.
+    const shows_calendar = show == .always or show == .critical or
+        (show == .auto and md.calendar != .iso8601);
+    if (shows_calendar) {
+        try shared.appendISOYear(arena, &buf, md.ref_year);
+        try buf.append(arena, '-');
     }
     try shared.appendPadded(arena, &buf, md.month, 2);
     try buf.append(arena, '-');
     try shared.appendPadded(arena, &buf, md.day, 2);
-    switch (show) {
-        .never, .auto => {},
-        .always => try buf.appendSlice(arena, "[u-ca=iso8601]"),
-        .critical => try buf.appendSlice(arena, "[!u-ca=iso8601]"),
-    }
+    try plain_date.appendCalendar(arena, &buf, show, md.calendar);
     return buf.items;
 }
 
@@ -252,17 +280,17 @@ fn monthDayToString(arena: std.mem.Allocator, md: ISOMonthDay, show: shared.Show
 
 fn getMonthCode(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const md = try requireMD(arena, this_val);
-    var buf: [4]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "M{d:0>2}", .{md.month}) catch unreachable;
-    return val_mod.makeString(arena, try arena.dupe(u8, s));
+    const ref = ISODate{ .year = md.ref_year, .month = md.month, .day = md.day, .calendar = md.calendar };
+    return val_mod.makeString(arena, try shared.formatMonthCode(arena, calendar.fields(md.calendar, ref)));
 }
 fn getDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const md = try requireMD(arena, this_val);
-    return val_mod.makeNumber(arena, @floatFromInt(md.day));
+    const ref = ISODate{ .year = md.ref_year, .month = md.month, .day = md.day, .calendar = md.calendar };
+    return val_mod.makeNumber(arena, @floatFromInt(calendar.fields(md.calendar, ref).day));
 }
 fn getCalendarId(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    _ = try requireMD(arena, this_val);
-    return val_mod.makeString(arena, "iso8601");
+    const md = try requireMD(arena, this_val);
+    return val_mod.makeString(arena, md.calendar.str());
 }
 
 // ------------------------------------------------------------- registration ---
