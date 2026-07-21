@@ -792,8 +792,14 @@ pub fn nativeTotal(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const d = try requireDuration(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
+    // Option read order is fixed by the spec: digits, then mode, then unit.
     const digits = try shared.getFractionalDigits(arena, opts);
-    const s = try durationToString(arena, d.*, digits);
+    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
+    // A Duration has no clock to truncate to, so unlike the time types it
+    // accepts only second..nanosecond.
+    if (prec.minute) return realm_mod.throwRangeError(arena, "smallestUnit must be one of second, millisecond, microsecond, nanosecond");
+    const s = try durationToStringPrec(arena, d.*, prec, mode);
     return val_mod.makeString(arena, s);
 }
 
@@ -817,6 +823,11 @@ pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyer
 
 /// TemporalDurationToString (ES 7.5.15), with optional fixed fractional digits.
 fn durationToString(arena: std.mem.Allocator, d: DurationFields, digits: ?u8) ![]const u8 {
+    return durationToStringPrec(arena, d, .{ .digits = digits }, .trunc);
+}
+
+fn durationToStringPrec(arena: std.mem.Allocator, d: DurationFields, prec: shared.SecondsPrecision, mode: shared.RoundingMode) ![]const u8 {
+    const digits = prec.digits;
     var buf = shared.Buf{};
     const sign = d.sign();
     if (sign < 0) try buf.append(arena, '-');
@@ -831,10 +842,16 @@ fn durationToString(arena: std.mem.Allocator, d: DurationFields, digits: ?u8) ![
     // seconds) into one decimal.
     const has_h = d.hours != 0;
     const has_m = d.minutes != 0;
-    const total_sec_ns: i128 = @as(i128, @intFromFloat(@abs(d.seconds))) * 1_000_000_000 +
+    var total_sec_ns: i128 = @as(i128, @intFromFloat(@abs(d.seconds))) * 1_000_000_000 +
         @as(i128, @intFromFloat(@abs(d.milliseconds))) * 1_000_000 +
         @as(i128, @intFromFloat(@abs(d.microseconds))) * 1000 +
         @as(i128, @intFromFloat(@abs(d.nanoseconds)));
+    if (prec.increment > 1) {
+        // Round the signed value: the mode's direction is about the duration,
+        // not about the magnitude we happen to be accumulating here.
+        const r = shared.roundI128ToIncrement(if (sign < 0) -total_sec_ns else total_sec_ns, prec.increment, mode);
+        total_sec_ns = if (r < 0) -r else r;
+    }
     const sec_whole: i64 = @intCast(@divTrunc(total_sec_ns, 1_000_000_000));
     const frac_ns: u32 = @intCast(@mod(total_sec_ns, 1_000_000_000));
     const has_s = total_sec_ns != 0 or (digits != null and digits.? > 0);

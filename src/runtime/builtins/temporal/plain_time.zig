@@ -163,8 +163,11 @@ fn regulateTime(arena: std.mem.Allocator, h: f64, min: f64, s: f64, ms: f64, us:
 pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else Value{};
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    const overflow = try shared.getOverflow(arena, opts);
+    // A string argument is parsed before the options bag is consulted.
+    const parse_first = shared.isStringArg(v);
+    const overflow = if (parse_first) .constrain else try shared.getOverflow(arena, opts);
     const t = try toTemporalTime(arena, v, overflow);
+    if (parse_first) _ = try shared.getOverflow(arena, opts);
     return makeTime(arena, t);
 }
 
@@ -370,8 +373,13 @@ pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, args: []
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const t = try requireTime(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
+    // Option read order is fixed by the spec: digits, then mode, then unit.
     const digits = try shared.getFractionalDigits(arena, opts);
-    const s = try timeToString(arena, t.*, digits);
+    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
+    // A PlainTime has no date to carry into, so rounding past midnight wraps.
+    const r = roundTimeToIncrement(t.*, prec, mode);
+    const s = try timeToStringPrec(arena, r.time, prec);
     return val_mod.makeString(arena, s);
 }
 
@@ -390,14 +398,28 @@ pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyer
 }
 
 pub fn timeToString(arena: std.mem.Allocator, t: ISOTime, digits: ?u8) ![]const u8 {
+    return timeToStringPrec(arena, t, .{ .digits = digits });
+}
+
+/// FormatTimeString. A "minute" precision drops the seconds component entirely.
+pub fn timeToStringPrec(arena: std.mem.Allocator, t: ISOTime, prec: shared.SecondsPrecision) ![]const u8 {
     var buf = shared.Buf{};
     try shared.appendPadded(arena, &buf, t.hour, 2);
     try buf.append(arena, ':');
     try shared.appendPadded(arena, &buf, t.minute, 2);
+    if (prec.minute) return buf.items;
     try buf.append(arena, ':');
     try shared.appendPadded(arena, &buf, t.second, 2);
-    try shared.appendFraction(arena, &buf, t, digits);
+    try shared.appendFraction(arena, &buf, t, prec.digits);
     return buf.items;
+}
+
+/// RoundTime: round a wall-clock time to a nanosecond increment, returning the
+/// rounded time plus any day carry (a time can round up past midnight).
+pub fn roundTimeToIncrement(t: ISOTime, prec: shared.SecondsPrecision, mode: shared.RoundingMode) shared.DayAndTime {
+    if (prec.increment <= 1) return .{ .days = 0, .time = t };
+    const ns = shared.roundI128ToIncrement(shared.timeToNanos(t), prec.increment, mode);
+    return shared.nanosToTime(ns);
 }
 
 // ------------------------------------------------------------------ getters ---

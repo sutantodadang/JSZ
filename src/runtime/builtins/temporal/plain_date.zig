@@ -191,8 +191,11 @@ fn monthFieldsToIso(arena: std.mem.Allocator, o: *JsObject, cal: calendar.Calend
 pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else Value{};
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    const overflow = try shared.getOverflow(arena, opts);
+    // A string argument is parsed before the options bag is consulted.
+    const parse_first = shared.isStringArg(v);
+    const overflow = if (parse_first) .constrain else try shared.getOverflow(arena, opts);
     const d = try toTemporalDate(arena, v, overflow);
+    if (parse_first) _ = try shared.getOverflow(arena, opts);
     return makeDate(arena, d);
 }
 
