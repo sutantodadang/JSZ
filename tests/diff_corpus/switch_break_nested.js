@@ -103,4 +103,39 @@ switch (1) {
 tb.push("after");
 RES.push(tb.join(","));
 
+// a directly labeled switch: `break L` from inside it exits the switch
+var dls = [];
+L2: switch (1) {
+  case 1:
+    dls.push("a");
+    if (true) { break L2; }
+    dls.push("bad");
+}
+dls.push("after");
+RES.push(dls.join(","));
+
+// `break L` from a loop nested inside a labeled switch exits the switch
+var lsl = [];
+M: switch (1) {
+  case 1:
+    for (var m = 0; m < 3; m++) {
+      if (m === 1) { break M; }
+      lsl.push(m);
+    }
+    lsl.push("bad");
+}
+RES.push(lsl.join(","));
+
+// a plain break inside a loop inside a switch breaks the loop, not the switch
+var lis = [];
+switch (1) {
+  case 1:
+    for (var n = 0; n < 3; n++) {
+      if (n === 1) { break; }
+      lis.push(n);
+    }
+    lis.push("after-loop");
+}
+RES.push(lis.join(","));
+
 RES.join(" | ")

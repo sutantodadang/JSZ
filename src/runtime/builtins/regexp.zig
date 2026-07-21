@@ -480,8 +480,8 @@ pub const RegexNode = union(enum) {
     /// Phase 4d: backreference \1..\9
     back_ref: u8, // group index 1-9
     /// ES2025 RegExp modifiers `(?ims-ims: ... )`: rebinds the i/m/s flags for
-    /// the enclosed disjunction only. `add` wins over `remove` never overlaps
-    /// (the parser rejects a modifier listed on both sides).
+    /// the enclosed disjunction only. `add` and `remove` can never overlap --
+    /// the parser rejects a modifier listed on both sides.
     modifier: struct {
         inner: *RegexNode,
         add: ModifierSet,
