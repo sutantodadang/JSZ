@@ -38,6 +38,19 @@ pub const LabelEntry = struct {
 /// `bcEval` reads it after compiling so `eval("break L")` throws a SyntaxError.
 pub var last_label_error: ?[]const u8 = null;
 
+/// One entry of `finally_stack`: work an abrupt completion (`return`/`break`/
+/// `continue`, or a caught throw) must perform on its way out of a region that
+/// has a live PUSH_TRY handler. Every entry owns exactly one PUSH_TRY, so
+/// unwinding always emits a POP_TRY for it.
+pub const Cleanup = union(enum) {
+    /// A `try` statement's finalizer, or null for a `try`/`catch` with none —
+    /// the entry still exists so its handler gets popped on the way out.
+    finalizer: ?*ast.Node,
+    /// `for-of`/`for-await-of`: IteratorClose the iterator held in this
+    /// register, so leaving the loop early runs the iterator's `return()`.
+    close_iter: u8,
+};
+
 /// Per-loop compilation context for unlabeled (and labeled) `break`/`continue`.
 /// Each `while`/`do-while`/`for` pushes one before compiling its body; `break`
 /// and `continue` register their JMP patch offsets here, resolved when the loop
@@ -55,6 +68,11 @@ pub const LoopCtx = struct {
     /// `finally_stack` length at loop entry. `break`/`continue` run (and POP_TRY)
     /// each try-block opened inside the loop before jumping out of it.
     finally_depth: usize = 0,
+    /// Floor for `continue`, which re-enters the loop rather than leaving it.
+    /// Identical to `finally_depth` except for `for-of`, whose own
+    /// IteratorClose cleanup sits between the two: leaving the loop closes the
+    /// iterator, looping again must not.
+    continue_finally_depth: usize = 0,
     /// True for the context a `switch` pushes. A switch is a `break` target but
     /// NOT a `continue` target, so unlabeled `continue` skips these entries and
     /// keeps unwinding to the innermost real loop.
@@ -122,7 +140,7 @@ pub const FnCompiler = struct {
     /// innermost-first, before the RETURN — ES try/finally on a return
     /// completion. Popped before a finalizer's own body is compiled so a
     /// `return` within `finally` does not re-run that same finalizer.
-    finally_stack: std.ArrayListUnmanaged(?*ast.Node) = .empty,
+    finally_stack: std.ArrayListUnmanaged(Cleanup) = .empty,
     /// Number of block scopes (ENTER_SCOPE) currently open in the bytecode being
     /// emitted. Used so `break`/`continue` emit matching EXIT_SCOPE ops.
     block_scope_depth: u32 = 0,
@@ -1060,7 +1078,7 @@ pub const FnCompiler = struct {
     /// destructuring helpers (__getIterator__ / __destrIterStep__ /
     /// __destrIterRest__ / __destrIterClose__) from the assignment-pattern path,
     /// mirroring the binding-pattern desugar in the parser.
-    fn emitDestrCall(self: *Self, name: []const u8, r_a: u8, r_b: ?u8, dst: u8, line: u32) error{OutOfMemory}!void {
+    pub fn emitDestrCall(self: *Self, name: []const u8, r_a: u8, r_b: ?u8, dst: u8, line: u32) error{OutOfMemory}!void {
         const save_sp = self.sp;
         const callee = self.allocReg();
         const gi = try self.addConstant(try val_mod.makeString(self.arena, name));

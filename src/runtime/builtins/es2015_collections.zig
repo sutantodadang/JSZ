@@ -2491,6 +2491,38 @@ pub fn nativeDestrObjRest(arena: std.mem.Allocator, _: Value, args: []const Valu
     // OwnPropertyKeys order (integer indices, then insertion order, then symbols).
     const src_obj = src.toPtr().object;
     const ctx = realm_mod.active_context;
+
+    // Proxy source: drive [[OwnPropertyKeys]] then [[GetOwnProperty]] through the
+    // traps in trap order (strings and symbols interleaved exactly as ownKeys
+    // returned them) — a raw own-key scan would bypass the handler. Excluded keys
+    // are filtered BEFORE the descriptor trap runs, so `{a, ...rest}` never calls
+    // getOwnPropertyDescriptor for "a".
+    if (src_obj.internal_kind == .proxy) {
+        const proxy_mod = @import("proxy.zig");
+        const keys = (try proxy_mod.proxyOwnKeys(arena, src_obj)) orelse return val_mod.makeObject(arena, out);
+        keys: for (keys) |kv| {
+            const is_sym = kv.bits != 0 and kv.unbox() == .symbol;
+            if (is_sym) {
+                for (excl_sym.items) |e| if (e == kv.toPtr().symbol) continue :keys;
+            } else {
+                const ks_pre = try toPropertyKeyString(arena, kv);
+                for (excl_str.items) |e| if (std.mem.eql(u8, e, ks_pre)) continue :keys;
+            }
+            const desc = (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, src_obj, kv)) orelse continue;
+            if (desc.bits == 0 or desc.unbox() != .object) continue;
+            const en = desc.toPtr().object.getOwn("enumerable") orelse Value{};
+            if (!(en.bits != 0 and isTruthy(en))) continue;
+            const c = ctx orelse continue;
+            if (is_sym) {
+                try out.setSym(kv, try c.getPropSym(arena, src, kv));
+            } else {
+                const ks = try toPropertyKeyString(arena, kv);
+                try out.set(ks, try c.getProp(arena, src, ks));
+            }
+        }
+        return val_mod.makeObject(arena, out);
+    }
+
     outer: for (src_obj.ownKeys()) |k| {
         if (!src_obj.isEnumerable(k)) continue;
         for (excl_str.items) |e| if (std.mem.eql(u8, e, k)) continue :outer;
