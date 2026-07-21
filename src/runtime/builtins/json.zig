@@ -109,166 +109,376 @@ fn jsonIsCallable(v: Value) bool {
     return @import("../builtins/function_proto.zig").isCallableFn(v);
 }
 
-/// SerializeJSONProperty transform (ES §25.5.2.2 partial): call value.toJSON(key)
-/// if present, then apply a function `replacer` as replacer(holder, key, value).
-fn applyProp(arena: std.mem.Allocator, replacer: Value, holder: *JsObject, key: []const u8, value_in: Value) anyerror!Value {
-    const fpm = @import("function_proto.zig");
-    var value = value_in;
-    if (value.bits != 0 and value.unbox() == .object) {
-        if (value.toPtr().object.get("toJSON")) |tj| {
-            if (jsonIsCallable(tj)) {
-                const kv = try val_mod.makeString(arena, key);
-                value = try fpm.invokeCallback(arena, value, tj, &.{kv});
+const rt = @import("../realm.zig");
+const co = @import("coercion.zig");
+const px = @import("proxy.zig");
+const su = @import("string_proto.zig");
+const fp = @import("function_proto.zig");
+
+/// Serialization state threaded through SerializeJSON* (spec §25.5.2).
+const SerState = struct {
+    arena: std.mem.Allocator,
+    /// A callable ReplacerFunction, or `.{}` (bits==0) when absent.
+    replacer: Value,
+    /// PropertyList (array-replacer allowlist), or null.
+    property_list: ?[]const []const u8,
+    /// Indentation unit (empty when no pretty-printing).
+    gap: []const u8,
+    /// Ancestor object stack for cycle detection.
+    seen: *std.ArrayList(*JsObject),
+};
+
+fn isObj(v: Value) bool {
+    return v.bits != 0 and v.unbox() == .object;
+}
+
+/// [[Get]](holder, key) via the active context so getters / proxy traps fire.
+fn getV(arena: std.mem.Allocator, holder: Value, key: []const u8) anyerror!Value {
+    if (rt.active_context) |c| return c.getProp(arena, holder, key);
+    if (isObj(holder)) return holder.toPtr().object.get(key) orelse (val_mod.makeUndefined(arena) catch unreachable);
+    return val_mod.makeUndefined(arena);
+}
+
+/// IsArray(v): unwraps proxy layers to their target (spec IsArray recursion).
+fn isArrayValue(v: Value) bool {
+    if (!isObj(v)) return false;
+    var obj = v.toPtr().object;
+    var depth: usize = 0;
+    while (obj.internal_kind == .proxy and depth < 64) : (depth += 1) {
+        const t = px.proxyTarget(obj) orelse return false;
+        if (!isObj(t)) return false;
+        obj = t.toPtr().object;
+    }
+    return obj.is_array;
+}
+
+/// SerializeJSONProperty step 4 wrapper unboxing: Number/String wrappers coerce
+/// via ToNumber/ToString (honouring a user valueOf/toString — so we bypass the
+/// [[PrimitiveValue]] fast path in ToPrimitive); Boolean/BigInt read the slot.
+fn unwrapWrapper(arena: std.mem.Allocator, v: Value) anyerror!Value {
+    const obj = v.toPtr().object;
+    const prim = obj.get("[[PrimitiveValue]]") orelse return v;
+    if (prim.bits == 0) return v;
+    switch (prim.unbox()) {
+        .number => {
+            const p = (try co.ordinaryToPrimitive(arena, v, false)) orelse prim;
+            return val_mod.makeNumber(arena, try rt.toNumberValue(arena, p));
+        },
+        .string => {
+            const p = (try co.ordinaryToPrimitive(arena, v, true)) orelse prim;
+            return val_mod.makeString(arena, try rt.stringPrimitive(arena, p));
+        },
+        .boolean, .bigint => return prim,
+        else => return v,
+    }
+}
+
+fn appendUEsc(arena: std.mem.Allocator, buf: *std.ArrayList(u8), unit: u16) anyerror!void {
+    const hex = "0123456789abcdef";
+    try buf.appendSlice(arena, "\\u");
+    try buf.append(arena, hex[(unit >> 12) & 0xF]);
+    try buf.append(arena, hex[(unit >> 8) & 0xF]);
+    try buf.append(arena, hex[(unit >> 4) & 0xF]);
+    try buf.append(arena, hex[unit & 0xF]);
+}
+
+/// QuoteJSONString (spec §25.5.2.3) over WTF-8 storage: escapes control chars,
+/// emits lone surrogates as `\uXXXX`, and combines a stored high+low surrogate
+/// pair back into the astral character it represents.
+fn appendQuoted(arena: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) anyerror!void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const dec = su.decodeWtf8At(s, i);
+        const cp = dec.cp;
+        if (cp >= 0xD800 and cp <= 0xDBFF) {
+            const next_i = i + dec.len;
+            if (next_i < s.len) {
+                const dec2 = su.decodeWtf8At(s, next_i);
+                if (dec2.cp >= 0xDC00 and dec2.cp <= 0xDFFF) {
+                    const astral: u21 = 0x10000 + ((@as(u21, @intCast(cp - 0xD800)) << 10) | @as(u21, @intCast(dec2.cp - 0xDC00)));
+                    var enc: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(astral, &enc) catch 0;
+                    try buf.appendSlice(arena, enc[0..n]);
+                    i = next_i + dec2.len;
+                    continue;
+                }
+            }
+            try appendUEsc(arena, buf, @intCast(cp));
+            i += dec.len;
+            continue;
+        }
+        if (cp >= 0xDC00 and cp <= 0xDFFF) {
+            try appendUEsc(arena, buf, @intCast(cp));
+            i += dec.len;
+            continue;
+        }
+        switch (cp) {
+            '"' => try buf.appendSlice(arena, "\\\""),
+            '\\' => try buf.appendSlice(arena, "\\\\"),
+            0x08 => try buf.appendSlice(arena, "\\b"),
+            0x09 => try buf.appendSlice(arena, "\\t"),
+            0x0A => try buf.appendSlice(arena, "\\n"),
+            0x0C => try buf.appendSlice(arena, "\\f"),
+            0x0D => try buf.appendSlice(arena, "\\r"),
+            else => {
+                if (cp < 0x20) {
+                    try appendUEsc(arena, buf, @intCast(cp));
+                } else {
+                    try buf.appendSlice(arena, s[i .. i + dec.len]);
+                }
+            },
+        }
+        i += dec.len;
+    }
+}
+
+/// QuoteJSONString: the escaped code unit sequence wrapped in double quotes.
+fn quotedString(arena: std.mem.Allocator, s: []const u8) anyerror![]const u8 {
+    var buf = std.ArrayList(u8){};
+    try buf.append(arena, '"');
+    try appendQuoted(arena, &buf, s);
+    try buf.append(arena, '"');
+    return buf.items;
+}
+
+/// EnumerableOwnPropertyNames (string keys) — honours a proxy's [[OwnPropertyKeys]]
+/// and per-key [[GetOwnProperty]] enumerable filter.
+fn enumOwnStringKeys(arena: std.mem.Allocator, v: Value) anyerror![]const []const u8 {
+    var list = std.ArrayList([]const u8){};
+    const obj = v.toPtr().object;
+    if (obj.internal_kind == .proxy) {
+        if (try px.proxyOwnKeys(arena, obj)) |keys| {
+            for (keys) |kv| {
+                if (kv.bits == 0 or kv.unbox() != .string) continue;
+                const desc = (try px.proxyGetOwnPropertyDescriptor(arena, obj, kv)) orelse continue;
+                if (!isObj(desc)) continue;
+                const en = desc.toPtr().object.getOwn("enumerable") orelse continue;
+                if (en.bits != 0 and en.unbox() == .boolean and en.unbox().boolean)
+                    try list.append(arena, kv.unbox().string);
             }
         }
+        return list.items;
     }
-    if (jsonIsCallable(replacer)) {
+    for (obj.ownKeys()) |k| {
+        if (!obj.isEnumerable(k)) continue;
+        try list.append(arena, k);
+    }
+    return list.items;
+}
+
+/// Build the PropertyList from an array replacer: each String/Number element
+/// (or String/Number wrapper) is ToString'd; duplicates are dropped.
+fn buildPropertyList(arena: std.mem.Allocator, arr_val: Value) anyerror![]const []const u8 {
+    var list = std.ArrayList([]const u8){};
+    const len = try rt.toLengthValue(arena, try getV(arena, arr_val, "length"));
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const e = try getV(arena, arr_val, key);
+        var item: ?[]const u8 = null;
+        if (e.bits != 0) switch (e.unbox()) {
+            .string => |s| item = s,
+            .number => |n| item = try val_mod.formatNumber(arena, n),
+            .object => {
+                if (e.toPtr().object.get("[[PrimitiveValue]]")) |p| {
+                    if (p.bits != 0 and (p.unbox() == .string or p.unbox() == .number)) {
+                        // ToString(v): ToPrimitive with the "string" hint (toString
+                        // before valueOf), honouring a custom toString.
+                        const prim = (try co.ordinaryToPrimitive(arena, e, true)) orelse e;
+                        item = try rt.stringPrimitive(arena, prim);
+                    }
+                }
+            },
+            else => {},
+        };
+        if (item) |nm| {
+            var dup = false;
+            for (list.items) |ex| {
+                if (std.mem.eql(u8, ex, nm)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) try list.append(arena, nm);
+        }
+    }
+    return list.items;
+}
+
+/// SerializeJSONProperty (spec §25.5.2.2): returns the serialized text, or null
+/// when the value serializes to nothing (undefined / callable / symbol).
+fn serializeProperty(st: *SerState, holder: Value, key: []const u8, indent: []const u8) anyerror!?[]const u8 {
+    const arena = st.arena;
+    var value = try getV(arena, holder, key);
+    // toJSON — looked up for an Object or a BigInt (spec §25.5.2.2 step 2).
+    if (isObj(value) or (value.bits != 0 and value.unbox() == .bigint)) {
+        const tj = try getV(arena, value, "toJSON");
+        if (jsonIsCallable(tj)) {
+            const kv = try val_mod.makeString(arena, key);
+            value = try fp.invokeCallback(arena, value, tj, &.{kv});
+        }
+    }
+    // ReplacerFunction.
+    if (jsonIsCallable(st.replacer)) {
         const kv = try val_mod.makeString(arena, key);
-        const holder_v = try val_mod.makeObject(arena, holder);
-        value = try fpm.invokeCallback(arena, holder_v, replacer, &.{ kv, value });
+        value = try fp.invokeCallback(arena, holder, st.replacer, &.{ kv, value });
     }
-    return value;
+    // Wrapper unboxing.
+    if (isObj(value)) value = try unwrapWrapper(arena, value);
+
+    if (value.bits == 0) return null;
+    switch (value.unbox()) {
+        .undefined_ => return null,
+        .null_ => return "null",
+        .boolean => |b| return if (b) "true" else "false",
+        .number => |n| return try formatNumber(arena, n),
+        .string => |s| return try quotedString(arena, s),
+        .bigint => {
+            try throwStringifyTypeErrorMsg(arena, "Do not know how to serialize a BigInt");
+            unreachable;
+        },
+        .object => |obj| {
+            // ES2025 json-parse-with-source: a rawJSON object emits its raw text.
+            if (obj.getOwn("[[IsRawJSON]]") != null) {
+                if (obj.getOwn("rawJSON")) |raw| {
+                    if (raw.bits != 0 and raw.unbox() == .string) return raw.toPtr().string;
+                }
+                return null;
+            }
+            if (jsonIsCallable(value)) return null;
+            if (isArrayValue(value)) return try serializeArray(st, value, indent);
+            return try serializeObject(st, value, indent);
+        },
+        .function, .bc_function, .native_function, .symbol => return null,
+    }
+}
+
+/// Assemble a `{…}`/`[…]` container from its already-serialized members, applying
+/// the current gap-based indentation.
+fn joinContainer(arena: std.mem.Allocator, open: u8, close: u8, members: []const []const u8, indent: []const u8, indent2: []const u8, pretty: bool) anyerror![]const u8 {
+    if (members.len == 0) return arena.dupe(u8, &[_]u8{ open, close });
+    var out = std.ArrayList(u8){};
+    try out.append(arena, open);
+    if (!pretty) {
+        for (members, 0..) |m, i| {
+            if (i > 0) try out.append(arena, ',');
+            try out.appendSlice(arena, m);
+        }
+    } else {
+        for (members, 0..) |m, i| {
+            try out.appendSlice(arena, if (i == 0) "\n" else ",\n");
+            try out.appendSlice(arena, indent2);
+            try out.appendSlice(arena, m);
+        }
+        try out.append(arena, '\n');
+        try out.appendSlice(arena, indent);
+    }
+    try out.append(arena, close);
+    return out.items;
+}
+
+fn checkCycle(st: *SerState, obj: *JsObject) anyerror!void {
+    for (st.seen.items) |a| {
+        if (a == obj) {
+            try throwStringifyTypeErrorMsg(st.arena, "Converting circular structure to JSON");
+            unreachable;
+        }
+    }
+}
+
+/// SerializeJSONObject (spec §25.5.2.4).
+fn serializeObject(st: *SerState, v: Value, indent: []const u8) anyerror![]const u8 {
+    const arena = st.arena;
+    const obj = v.toPtr().object;
+    try checkCycle(st, obj);
+    try st.seen.append(arena, obj);
+    defer _ = st.seen.pop();
+
+    const indent2 = try std.mem.concat(arena, u8, &.{ indent, st.gap });
+    const keys = if (st.property_list) |pl| pl else try enumOwnStringKeys(arena, v);
+
+    var members = std.ArrayList([]const u8){};
+    for (keys) |P| {
+        const strP = (try serializeProperty(st, v, P, indent2)) orelse continue;
+        var m = std.ArrayList(u8){};
+        try m.appendSlice(arena, try quotedString(arena, P));
+        try m.append(arena, ':');
+        if (st.gap.len > 0) try m.append(arena, ' ');
+        try m.appendSlice(arena, strP);
+        try members.append(arena, m.items);
+    }
+    return joinContainer(arena, '{', '}', members.items, indent, indent2, st.gap.len > 0);
+}
+
+/// SerializeJSONArray (spec §25.5.2.5).
+fn serializeArray(st: *SerState, v: Value, indent: []const u8) anyerror![]const u8 {
+    const arena = st.arena;
+    const obj = v.toPtr().object;
+    try checkCycle(st, obj);
+    try st.seen.append(arena, obj);
+    defer _ = st.seen.pop();
+
+    const indent2 = try std.mem.concat(arena, u8, &.{ indent, st.gap });
+    const len = try rt.toLengthValue(arena, try getV(arena, v, "length"));
+
+    var members = std.ArrayList([]const u8){};
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const strP = (try serializeProperty(st, v, key, indent2)) orelse "null";
+        try members.append(arena, strP);
+    }
+    return joinContainer(arena, '[', ']', members.items, indent, indent2, st.gap.len > 0);
 }
 
 pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0) {
-        return val_mod.makeUndefined(arena);
-    }
+    const value0 = if (args.len > 0) args[0] else (val_mod.makeUndefined(arena) catch unreachable);
 
     // Replacer (args[1]): a callable is a function replacer; an array is a
     // property-name allowlist (each element ToString'd, in order).
     var replacer: Value = Value{};
-    var key_filter: ?[]const []const u8 = null;
+    var property_list: ?[]const []const u8 = null;
     if (args.len > 1 and args[1].bits != 0) {
         if (jsonIsCallable(args[1])) {
             replacer = args[1];
-        } else if (args[1].unbox() == .object and args[1].toPtr().object.is_array) {
-            const arr = args[1].toPtr().object;
-            var list = std.ArrayList([]const u8){};
-            var i: usize = 0;
-            while (i < arr.array_length) : (i += 1) {
-                const k = try std.fmt.allocPrint(arena, "{d}", .{i});
-                const e = arr.getOwn(k) orelse continue;
-                if (e.bits == 0) continue;
-                const name: ?[]const u8 = switch (e.unbox()) {
-                    .string => |s| s,
-                    .number => |n| try formatNumber(arena, n),
-                    else => null,
-                };
-                if (name) |nm| {
-                    // Dedup: JSON.stringify allowlist ignores repeat entries.
-                    var dup = false;
-                    for (list.items) |ex| {
-                        if (std.mem.eql(u8, ex, nm)) {
-                            dup = true;
-                            break;
-                        }
-                    }
-                    if (!dup) try list.append(arena, nm);
-                }
-            }
-            key_filter = list.items;
+        } else if (isArrayValue(args[1])) {
+            property_list = try buildPropertyList(arena, args[1]);
         }
     }
 
-    const indent: usize = if (args.len > 2 and args[2].bits != 0)
-        switch (args[2].unbox()) {
-            .number => |n| blk: {
-                if (n < 0.0) break :blk 0;
-                const u: usize = @intCast(val_mod.f64ToI64Sat(n));
-                break :blk if (u > 10) 10 else u;
+    // Space (args[2]) → the gap string. A Number/String wrapper coerces via
+    // ToNumber/ToString; a Number gives that many (≤10) spaces; a String gives
+    // its first 10 code units; anything else gives no indentation.
+    var gap: []const u8 = "";
+    if (args.len > 2) {
+        var space = args[2];
+        if (isObj(space)) space = try unwrapWrapper(arena, space);
+        if (space.bits != 0) switch (space.unbox()) {
+            .number => {
+                const n = try rt.toNumberValue(arena, space);
+                const trunc = std.math.trunc(n);
+                var count: usize = if (std.math.isNan(n) or trunc < 1) 0 else @intFromFloat(@min(trunc, 10));
+                var g = std.ArrayList(u8){};
+                while (count > 0) : (count -= 1) try g.append(arena, ' ');
+                gap = g.items;
             },
-            else => 0,
-        }
-    else
-        0;
+            .string => |s| {
+                gap = if (su.cuLen(s) <= 10) s else try su.cuSliceAlloc(arena, s, 0, 10);
+            },
+            else => {},
+        };
+    }
 
     // Top-level: holder is a wrapper { "": value } so a function replacer sees it.
-    const wrapper = try JsObject.create(arena, null);
-    try wrapper.set("", args[0]);
-    const top = try applyProp(arena, replacer, wrapper, "", args[0]);
+    const wrapper = try JsObject.create(arena, rt.active_object_proto);
+    try wrapper.set("", value0);
+    const wrapper_v = try val_mod.makeObject(arena, wrapper);
 
-    var buf = std.ArrayList(u8){};
-    // Ancestor stack for circular-reference detection (throws TypeError on a cycle).
     var seen = std.ArrayList(*JsObject){};
-    try stringifyValue(arena, &buf, top, indent, 0, &seen, replacer, key_filter);
-    // If result is empty (e.g. function top-level), return undefined
-    if (buf.items.len == 0) return val_mod.makeUndefined(arena);
-    return val_mod.makeString(arena, buf.items);
-}
-
-fn stringifyValue(
-    arena: std.mem.Allocator,
-    buf: *std.ArrayList(u8),
-    v: Value,
-    indent: usize,
-    depth: usize,
-    seen: *std.ArrayList(*JsObject),
-    replacer: Value,
-    key_filter: ?[]const []const u8,
-) anyerror!void {
-    if (v.bits == 0) {
-        try buf.appendSlice(arena, "undefined");
-        return;
-    }
-    switch (v.unbox()) {
-        .undefined_ => {
-            try buf.appendSlice(arena, "undefined");
-        },
-        .null_ => try buf.appendSlice(arena, "null"),
-        .boolean => |b| try buf.appendSlice(arena, if (b) "true" else "false"),
-        .number => |n| {
-            const s = try formatNumber(arena, n);
-            try buf.appendSlice(arena, s);
-        },
-        .string => |s| {
-            try buf.append(arena, '"');
-            try appendJsonString(arena, buf, s);
-            try buf.append(arena, '"');
-        },
-        .object => |obj| {
-            // ES2025 json-parse-with-source: a rawJSON object serializes as its
-            // stored raw text, emitted verbatim (already valid JSON).
-            if (obj.getOwn("[[IsRawJSON]]") != null) {
-                if (obj.getOwn("rawJSON")) |raw| {
-                    if (raw.bits != 0 and raw.unbox() == .string)
-                        try buf.appendSlice(arena, raw.toPtr().string);
-                }
-                return;
-            }
-            // §25.5.2.2 step 4: Number / String / Boolean / BigInt wrapper objects
-            // serialize as their underlying primitive (a BigInt wrapper throws).
-            if (obj.getOwn("[[PrimitiveValue]]")) |prim| {
-                if (prim.bits != 0) switch (prim.unbox()) {
-                    .number, .string, .boolean => return stringifyValue(arena, buf, prim, indent, depth, seen, replacer, key_filter),
-                    .bigint => return throwStringifyTypeErrorMsg(arena, "Do not know how to serialize a BigInt"),
-                    else => {},
-                };
-            }
-            // Circular-structure guard: a value currently being stringified that
-            // re-references an ancestor → TypeError (per spec SerializeJSONProperty).
-            for (seen.items) |a| {
-                if (a == obj) return throwStringifyTypeError(arena);
-            }
-            // A callable object (function) produces nothing (caller emits null in arrays).
-            if (obj.get("__call__") != null) return;
-            try seen.append(arena, obj);
-            defer _ = seen.pop();
-            if (obj.is_array) {
-                try stringifyArray(arena, buf, obj, indent, depth, seen, replacer, key_filter);
-            } else {
-                try stringifyObject(arena, buf, obj, indent, depth, seen, replacer, key_filter);
-            }
-        },
-        // A BigInt value cannot be serialized (§25.5.2.2 step 10) → TypeError.
-        .bigint => return throwStringifyTypeErrorMsg(arena, "Do not know how to serialize a BigInt"),
-        // functions, native_function, symbol: produce nothing (caller uses "null" for arrays)
-        .function, .bc_function, .native_function, .symbol => {},
-    }
-}
-
-fn throwStringifyTypeError(arena: std.mem.Allocator) anyerror!void {
-    return throwStringifyTypeErrorMsg(arena, "Converting circular structure to JSON");
+    var st = SerState{ .arena = arena, .replacer = replacer, .property_list = property_list, .gap = gap, .seen = &seen };
+    const result = try serializeProperty(&st, wrapper_v, "", "");
+    if (result) |s| return val_mod.makeString(arena, s);
+    return val_mod.makeUndefined(arena);
 }
 
 fn throwStringifyTypeErrorMsg(arena: std.mem.Allocator, msg: []const u8) anyerror!void {
@@ -283,123 +493,6 @@ fn throwStringifyTypeErrorMsg(arena: std.mem.Allocator, msg: []const u8) anyerro
     return error.JsException;
 }
 
-fn stringifyObject(
-    arena: std.mem.Allocator,
-    buf: *std.ArrayList(u8),
-    obj: *JsObject,
-    indent: usize,
-    depth: usize,
-    seen: *std.ArrayList(*JsObject),
-    replacer: Value,
-    key_filter: ?[]const []const u8,
-) anyerror!void {
-    try buf.append(arena, '{');
-    var first = true;
-    // With an array replacer, iterate the allowlist order; otherwise own enumerable keys.
-    const keys: []const []const u8 = if (key_filter) |kf| kf else obj.ownKeys();
-    for (keys) |k| {
-        if (key_filter == null and !obj.isEnumerable(k)) continue;
-        const raw = obj.getOwn(k) orelse continue;
-        // SerializeJSONProperty: toJSON then function replacer.
-        const val = try applyProp(arena, replacer, obj, k, raw);
-        // Skip functions and undefined values (per JSON spec), post-transform.
-        if (val.bits != 0) {
-            const tag = val.unbox();
-            if (tag == .function or tag == .bc_function or tag == .native_function or tag == .undefined_ or tag == .symbol) continue;
-            if (tag == .object and val.toPtr().object.get("__call__") != null) continue;
-        } else {
-            continue; // zero = undefined
-        }
-
-        if (!first) try buf.append(arena, ',');
-        first = false;
-
-        if (indent > 0) {
-            try buf.append(arena, '\n');
-            try appendIndent(arena, buf, indent, depth + 1);
-        }
-        try buf.append(arena, '"');
-        try appendJsonString(arena, buf, k);
-        try buf.append(arena, '"');
-        try buf.append(arena, ':');
-        if (indent > 0) try buf.append(arena, ' ');
-
-        try stringifyValue(arena, buf, val, indent, depth + 1, seen, replacer, key_filter);
-    }
-    if (indent > 0 and !first) {
-        try buf.append(arena, '\n');
-        try appendIndent(arena, buf, indent, depth);
-    }
-    try buf.append(arena, '}');
-}
-
-fn stringifyArray(
-    arena: std.mem.Allocator,
-    buf: *std.ArrayList(u8),
-    arr: *JsObject,
-    indent: usize,
-    depth: usize,
-    seen: *std.ArrayList(*JsObject),
-    replacer: Value,
-    key_filter: ?[]const []const u8,
-) anyerror!void {
-    try buf.append(arena, '[');
-    const len = arr.array_length;
-    var i: usize = 0;
-    while (i < len) : (i += 1) {
-        if (i > 0) try buf.append(arena, ',');
-        if (indent > 0) {
-            try buf.append(arena, '\n');
-            try appendIndent(arena, buf, indent, depth + 1);
-        }
-        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        // An array replacer (key_filter) does NOT filter array indices; apply
-        // toJSON + function replacer per element (holder=arr, key=index string).
-        const raw = arr.getOwn(key) orelse Value{};
-        const elem = try applyProp(arena, replacer, arr, key, raw);
-        // Functions/undefined/symbol in arrays become "null"
-        if (elem.bits != 0) {
-            const tag = elem.unbox();
-            if (tag == .function or tag == .bc_function or tag == .native_function or tag == .undefined_ or tag == .symbol or
-                (tag == .object and elem.toPtr().object.get("__call__") != null))
-            {
-                try buf.appendSlice(arena, "null");
-                continue;
-            }
-        } else {
-            try buf.appendSlice(arena, "null");
-            continue;
-        }
-        try stringifyValue(arena, buf, elem, indent, depth + 1, seen, replacer, key_filter);
-    }
-    if (indent > 0 and len > 0) {
-        try buf.append(arena, '\n');
-        try appendIndent(arena, buf, indent, depth);
-    }
-    try buf.append(arena, ']');
-}
-
-fn appendIndent(arena: std.mem.Allocator, buf: *std.ArrayList(u8), spaces: usize, depth: usize) anyerror!void {
-    const total = spaces * depth;
-    var i: usize = 0;
-    while (i < total) : (i += 1) try buf.append(arena, ' ');
-}
-
-fn appendJsonString(arena: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) anyerror!void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(arena, "\\\""),
-            '\\' => try buf.appendSlice(arena, "\\\\"),
-            '\n' => try buf.appendSlice(arena, "\\n"),
-            '\r' => try buf.appendSlice(arena, "\\r"),
-            '\t' => try buf.appendSlice(arena, "\\t"),
-            0x08 => try buf.appendSlice(arena, "\\b"),
-            0x0C => try buf.appendSlice(arena, "\\f"),
-            else => try buf.append(arena, c),
-        }
-    }
-}
-
 fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
     if (std.math.isNan(n) or std.math.isInf(n)) return "null"; // JSON spec
     return val_mod.formatNumber(arena, n);
@@ -409,13 +502,13 @@ fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
 
 /// JSON.parse: recursive descent. Throws SyntaxError on invalid JSON.
 pub fn nativeJsonParse(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0) {
-        return throwSyntaxError(arena, "JSON.parse: missing argument");
-    }
-    const src: []const u8 = if (args[0].bits != 0 and args[0].unbox() == .string)
-        args[0].toPtr().string
-    else
-        return throwSyntaxError(arena, "JSON.parse: argument is not a string");
+    // JSON.parse(text[, reviver]): text is coerced via ToString (§25.5.1 step 1),
+    // so a Number/Boolean/null/object argument parses its string form, and a
+    // Symbol throws a TypeError.
+    const arg0 = if (args.len > 0) args[0] else (val_mod.makeUndefined(arena) catch unreachable);
+    if (arg0.bits != 0 and arg0.unbox() == .symbol)
+        return throwTypeErrorMsg(arena, "Cannot convert a Symbol value to a string");
+    const src: []const u8 = try rt.stringPrimitive(arena, arg0);
 
     // A callable reviver enables InternalizeJSONProperty (+ source tracking for
     // the ES2025 json-parse-with-source `context.source` argument).
@@ -760,6 +853,9 @@ const JsonParser = struct {
         while (true) {
             const c = self.consume() orelse return throwSyntaxError(self.arena, "JSON.parse: unterminated string");
             if (c == '"') break;
+            // The JSON string grammar forbids unescaped control characters
+            // U+0000..U+001F (§25.5.1 JSONString production).
+            if (c < 0x20) return throwSyntaxError(self.arena, "JSON.parse: unescaped control character in string");
             if (c == '\\') {
                 const esc = self.consume() orelse return throwSyntaxError(self.arena, "JSON.parse: unterminated escape");
                 switch (esc) {

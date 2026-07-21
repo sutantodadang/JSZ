@@ -1145,20 +1145,23 @@ pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
-    try obj.set("language", try val_mod.makeString(arena, language));
-    try obj.set("script", try val_mod.makeString(arena, script));
-    try obj.set("region", try val_mod.makeString(arena, region));
-    try obj.set("baseName", try val_mod.makeString(arena, base_name));
+    // Locale fields live in hidden `[[loc_*]]` internal slots (spec exposes them
+    // via prototype accessor getters, registered by registerLocaleAccessors).
+    try obj.set("[[loc_language]]", try val_mod.makeString(arena, language));
+    try obj.set("[[loc_script]]", try val_mod.makeString(arena, script));
+    try obj.set("[[loc_region]]", try val_mod.makeString(arena, region));
+    try obj.set("[[loc_baseName]]", try val_mod.makeString(arena, base_name));
     try obj.set("__locale_tag", try val_mod.makeString(arena, base_name));
     // Unicode extension keyword options (spec §14.1 ApplyOptionsToTag +
     // ApplyUnicodeExtensionToTag): reflect ca/co/nu/hourCycle/caseFirst when
     // supplied so `new Intl.Locale(tag, {calendar}).calendar` round-trips. The
     // value is lower-cased (canonical `type` form). Absent options stay absent.
-    if (optStr(opts, "calendar")) |s| try obj.set("calendar", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "collation")) |s| try obj.set("collation", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "numberingSystem")) |s| try obj.set("numberingSystem", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "hourCycle")) |s| try obj.set("hourCycle", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "caseFirst")) |s| try obj.set("caseFirst", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "calendar")) |s| try obj.set("[[loc_calendar]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "collation")) |s| try obj.set("[[loc_collation]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "numberingSystem")) |s| try obj.set("[[loc_numberingSystem]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "hourCycle")) |s| try obj.set("[[loc_hourCycle]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "caseFirst")) |s| try obj.set("[[loc_caseFirst]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    try obj.set("[[loc_numeric]]", try val_mod.makeBool(arena, optBool(opts, "numeric") orelse false));
     return val_mod.makeObject(arena, obj);
 }
 
@@ -1304,11 +1307,47 @@ pub fn nativeLocaleToString(arena: std.mem.Allocator, this_val: Value, _: []cons
         if (this_val.toPtr().object.get("__locale_tag")) |v| {
             if (v.bits != 0 and v.unbox() == .string) return val_mod.makeString(arena, v.unbox().string);
         }
-        if (this_val.toPtr().object.get("baseName")) |v| {
+        if (this_val.toPtr().object.get("[[loc_baseName]]")) |v| {
             if (v.bits != 0 and v.unbox() == .string) return val_mod.makeString(arena, v.unbox().string);
         }
     }
     return val_mod.makeString(arena, "");
+}
+
+/// Build a Locale prototype accessor getter for internal slot `slot`. When
+/// `optional` is set an empty stored string reads back as `undefined` (e.g. an
+/// absent script/region).
+fn locGetterFn(comptime slot: []const u8, comptime optional: bool) val_mod.NativeFnPtr {
+    return struct {
+        fn f(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+            if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("[[loc_baseName]]") == null)
+                return throwTypeErrorIntl(arena, "Intl.Locale.prototype getter called on an incompatible receiver");
+            const v = this_val.toPtr().object.getOwn(slot) orelse return val_mod.makeUndefined(arena);
+            if (optional and v.bits != 0 and v.unbox() == .string and v.unbox().string.len == 0)
+                return val_mod.makeUndefined(arena);
+            return v;
+        }
+    }.f;
+}
+
+fn locAccessor(arena: std.mem.Allocator, proto: *JsObject, comptime key: []const u8, comptime slot: []const u8, comptime optional: bool) !void {
+    const holder = try JsObject.create(arena, realm_mod.active_object_proto);
+    try holder.set("get", try val_mod.makeNativeFunctionNamed(arena, locGetterFn(slot, optional), "get " ++ key, 0));
+    _ = try proto.defineOwnAccessor(key, try val_mod.makeObject(arena, holder), .{ .enumerable = false, .configurable = true, .writable = false });
+}
+
+/// Register Intl.Locale.prototype's scalar accessor getters (§14.3).
+pub fn registerLocaleAccessors(arena: std.mem.Allocator, proto: *JsObject) !void {
+    try locAccessor(arena, proto, "baseName", "[[loc_baseName]]", false);
+    try locAccessor(arena, proto, "language", "[[loc_language]]", false);
+    try locAccessor(arena, proto, "script", "[[loc_script]]", true);
+    try locAccessor(arena, proto, "region", "[[loc_region]]", true);
+    try locAccessor(arena, proto, "calendar", "[[loc_calendar]]", true);
+    try locAccessor(arena, proto, "collation", "[[loc_collation]]", true);
+    try locAccessor(arena, proto, "hourCycle", "[[loc_hourCycle]]", true);
+    try locAccessor(arena, proto, "caseFirst", "[[loc_caseFirst]]", true);
+    try locAccessor(arena, proto, "numberingSystem", "[[loc_numberingSystem]]", true);
+    try locAccessor(arena, proto, "numeric", "[[loc_numeric]]", false);
 }
 
 // ------------------------------------------------------------------- ListFormat ---
@@ -1537,7 +1576,9 @@ pub fn nativeRelativeTimeFormatFormat(arena: std.mem.Allocator, this_val: Value,
             numeric = v.unbox().string;
         };
     }
-    const value = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
+    // ToNumber the value; a non-finite result is a RangeError (spec step 3).
+    const value = if (args.len > 0) try realm_mod.toNumberValue(arena, args[0]) else std.math.nan(f64);
+    if (!std.math.isFinite(value)) return throwRangeError(arena, "Intl.RelativeTimeFormat.prototype.format: value must be finite");
     const unit_raw = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .string) args[1].unbox().string else "second";
     const u = singularUnit(unit_raw);
 
@@ -1545,13 +1586,13 @@ pub fn nativeRelativeTimeFormatFormat(arena: std.mem.Allocator, this_val: Value,
         if (try rtfAutoForm(arena, value, unit_raw)) |form| return val_mod.makeString(arena, form);
     }
 
-    // Numeric form: "N unit(s) ago" (past) / "in N unit(s)" (future, incl. 0).
+    // Numeric form: "N unit(s) ago" (past) / "in N unit(s)" (future, incl. 0),
+    // with grouped thousands separators on the integer magnitude.
     const av = @abs(value);
     const unit_name = if (av == 1) u else try std.fmt.allocPrint(arena, "{s}s", .{u});
-    // Only cast to i64 for finite integral magnitudes; NaN/Inf would panic.
-    const is_int = std.math.isFinite(av) and av == @trunc(av) and av < 9.007199254740992e15;
+    const is_int = av == @trunc(av) and av < 9.007199254740992e15;
     const num_str = if (is_int)
-        try std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(av))})
+        try groupInteger(arena, @as(u64, @intFromFloat(av)), true)
     else
         try std.fmt.allocPrint(arena, "{d}", .{av});
     if (value < 0) {
@@ -1580,6 +1621,179 @@ pub fn nativeRelativeTimeFormatResolved(arena: std.mem.Allocator, this_val: Valu
     try r.set("style", try val_mod.makeString(arena, style));
     try r.set("numeric", try val_mod.makeString(arena, numeric));
     try r.set("numberingSystem", try val_mod.makeString(arena, "latn"));
+    return val_mod.makeObject(arena, r);
+}
+
+// ----------------------------------------------------------------- DisplayNames ---
+
+fn dnEmptyObj(arena: std.mem.Allocator) !*JsObject {
+    return if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, realm_mod.active_object_proto);
+}
+
+/// GetOptionsObject (ES §9.2.13): undefined → a fresh empty object; an object →
+/// itself; any other value → TypeError.
+fn dnGetOptionsObject(arena: std.mem.Allocator, options: ?Value) anyerror!Value {
+    const o = options orelse return val_mod.makeObject(arena, try dnEmptyObj(arena));
+    if (o.bits == 0 or o.unbox() == .undefined_) return val_mod.makeObject(arena, try dnEmptyObj(arena));
+    if (o.unbox() == .object) return o;
+    return throwTypeErrorIntl(arena, "options must be an object");
+}
+
+/// GetOption(options, key, string, allowed, default): reads through the active
+/// context so a throwing getter propagates, ToString-coerces the value, and
+/// validates it against `allowed` (empty = accept any). Absent/undefined →
+/// `default`.
+fn dnGetOption(arena: std.mem.Allocator, options: Value, key: []const u8, allowed: []const []const u8, default: ?[]const u8) anyerror!?[]const u8 {
+    const v = if (realm_mod.active_context) |c|
+        try c.getProp(arena, options, key)
+    else if (options.bits != 0 and options.unbox() == .object)
+        (options.toPtr().object.get(key) orelse Value{})
+    else
+        Value{};
+    if (v.bits == 0 or v.unbox() == .undefined_) return default;
+    const s = try t_shared.valueToString(arena, v);
+    if (allowed.len == 0) return s;
+    for (allowed) |a| if (std.mem.eql(u8, a, s)) return s;
+    return throwRangeError(arena, "invalid option value for Intl.DisplayNames");
+}
+
+fn dnAllAlpha(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!std.ascii.isAlphabetic(c)) return false;
+    return true;
+}
+fn dnAllDigit(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+fn dnAllAlnum(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!std.ascii.isAlphanumeric(c)) return false;
+    return true;
+}
+fn dnIsLangSubtag(s: []const u8) bool {
+    return ((s.len >= 2 and s.len <= 3) or (s.len >= 5 and s.len <= 8)) and dnAllAlpha(s);
+}
+fn dnIsScript(s: []const u8) bool {
+    return s.len == 4 and dnAllAlpha(s);
+}
+fn dnIsRegion(s: []const u8) bool {
+    return (s.len == 2 and dnAllAlpha(s)) or (s.len == 3 and dnAllDigit(s));
+}
+fn dnIsVariant(s: []const u8) bool {
+    return (s.len >= 5 and s.len <= 8 and dnAllAlnum(s)) or (s.len == 4 and std.ascii.isDigit(s[0]) and dnAllAlnum(s));
+}
+
+/// IsStructurallyValidLanguageTag for a `unicode_language_id` (no extensions):
+/// a language subtag, optional script, optional region, then unique variants.
+fn dnValidLanguageId(s: []const u8) bool {
+    if (s.len == 0) return false;
+    var it = std.mem.splitScalar(u8, s, '-');
+    const first = it.next() orelse return false;
+    if (!dnIsLangSubtag(first)) return false;
+    var seg = it.next();
+    if (seg) |g| {
+        if (dnIsScript(g)) seg = it.next();
+    }
+    if (seg) |g| {
+        if (dnIsRegion(g)) seg = it.next();
+    }
+    var variants: [16][]const u8 = undefined;
+    var nv: usize = 0;
+    while (seg) |g| {
+        if (!dnIsVariant(g)) return false;
+        for (variants[0..nv]) |ev| if (std.ascii.eqlIgnoreCase(ev, g)) return false; // duplicate variant
+        if (nv < variants.len) {
+            variants[nv] = g;
+            nv += 1;
+        }
+        seg = it.next();
+    }
+    return true;
+}
+
+/// CanonicalCodeForDisplayNames validation: throws RangeError when `code` is not
+/// a structurally valid identifier for `typ`.
+fn dnValidateCode(arena: std.mem.Allocator, typ: []const u8, code: []const u8) anyerror!void {
+    const ok = if (std.mem.eql(u8, typ, "language"))
+        dnValidLanguageId(code)
+    else if (std.mem.eql(u8, typ, "region"))
+        dnIsRegion(code)
+    else if (std.mem.eql(u8, typ, "script"))
+        dnIsScript(code)
+    else if (std.mem.eql(u8, typ, "currency"))
+        (code.len == 3 and dnAllAlpha(code))
+    else if (std.mem.eql(u8, typ, "calendar"))
+        isWellFormedNumberingSystem(code)
+    else if (std.mem.eql(u8, typ, "dateTimeField")) blk: {
+        const fields = [_][]const u8{ "era", "year", "quarter", "month", "weekOfYear", "weekday", "day", "dayPeriod", "hour", "minute", "second", "timeZoneName" };
+        for (fields) |f| if (std.mem.eql(u8, f, code)) break :blk true;
+        break :blk false;
+    } else false;
+    if (!ok) return throwRangeError(arena, "invalid code for Intl.DisplayNames.prototype.of");
+}
+
+pub fn nativeDisplayNamesCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const constructing = realm_mod.active_constructing;
+    realm_mod.active_constructing = false;
+    if (!constructing)
+        return throwTypeErrorIntl(arena, "Constructor Intl.DisplayNames requires 'new'");
+    const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
+        this_val.toPtr().object
+    else
+        try dnEmptyObj(arena);
+
+    // CanonicalizeLocaleList(locales): walk via HasProperty/[[Get]] (poisoned
+    // length/getters and non-String/Object elements throw) and validate tags.
+    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
+        _ = try canonicalizeTag(arena, t);
+
+    // options is required: GetOptionsObject then a required `type`.
+    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+    const style = (try dnGetOption(arena, options, "style", &.{ "narrow", "short", "long" }, "long")).?;
+    const typ = (try dnGetOption(arena, options, "type", &.{ "language", "region", "script", "currency", "calendar", "dateTimeField" }, null)) orelse
+        return throwTypeErrorIntl(arena, "Intl.DisplayNames: the `type` option is required");
+    const fallback = (try dnGetOption(arena, options, "fallback", &.{ "code", "none" }, "code")).?;
+    const lang_display = (try dnGetOption(arena, options, "languageDisplay", &.{ "dialect", "standard" }, "dialect")).?;
+
+    try obj.set("__dn_style", try val_mod.makeString(arena, style));
+    try obj.set("__dn_type", try val_mod.makeString(arena, typ));
+    try obj.set("__dn_fallback", try val_mod.makeString(arena, fallback));
+    try obj.set("__dn_langdisplay", try val_mod.makeString(arena, lang_display));
+    return val_mod.makeObject(arena, obj);
+}
+
+pub fn nativeDisplayNamesOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__dn_type") == null)
+        return throwTypeErrorIntl(arena, "Intl.DisplayNames.prototype.of called on an incompatible receiver");
+    const o = this_val.toPtr().object;
+    const typ = o.getOwn("__dn_type").?.unbox().string;
+    const fallback: []const u8 = if (o.getOwn("__dn_fallback")) |v| v.unbox().string else "code";
+    const code = try t_shared.valueToString(arena, if (args.len > 0) args[0] else Value{});
+    try dnValidateCode(arena, typ, code);
+    // No CLDR name data: with fallback "code" the (validated) code is returned;
+    // with "none" the absent name yields undefined. Both satisfy `typeof`.
+    if (std.mem.eql(u8, fallback, "none")) return val_mod.makeUndefined(arena);
+    return val_mod.makeString(arena, code);
+}
+
+pub fn nativeDisplayNamesResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__dn_type") == null)
+        return throwTypeErrorIntl(arena, "Intl.DisplayNames.prototype.resolvedOptions called on an incompatible receiver");
+    const o = this_val.toPtr().object;
+    const r = try dnEmptyObj(arena);
+    const typ = o.getOwn("__dn_type").?.unbox().string;
+    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("style", o.getOwn("__dn_style") orelse try val_mod.makeString(arena, "long"));
+    try r.set("type", try val_mod.makeString(arena, typ));
+    try r.set("fallback", o.getOwn("__dn_fallback") orelse try val_mod.makeString(arena, "code"));
+    if (std.mem.eql(u8, typ, "language"))
+        try r.set("languageDisplay", o.getOwn("__dn_langdisplay") orelse try val_mod.makeString(arena, "dialect"));
     return val_mod.makeObject(arena, r);
 }
 
@@ -1778,15 +1992,47 @@ fn primaryLanguage(tag: []const u8) []const u8 {
 /// the requested list (throwing on structurally invalid tags) and returns those
 /// that are supported. Every real language tag is treated as supported except
 /// the "no linguistic content" tags (`zxx`/`und`).
-pub fn nativeDurationFormatSupportedLocalesOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    var requested = std.ArrayListUnmanaged([]const u8){};
-    if (args.len > 0 and args[0].bits != 0) {
-        if (args[0].unbox() == .string) {
-            try requested.append(arena, args[0].unbox().string);
-        } else if (args[0].unbox() == .object) {
-            requested.items = try listElements(arena, args[0]);
+/// CanonicalizeLocaleList (ES §9.2.1), returning the raw ToString'd tags (the
+/// caller canonicalizes/dedups). A String argument is a single-element list; an
+/// array-like is walked via HasProperty + [[Get]] so a poisoned length/getter
+/// propagates, and a present element that is neither a String nor an Object is a
+/// TypeError.
+fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror![][]const u8 {
+    var out = std.ArrayListUnmanaged([]const u8){};
+    if (locales.bits == 0 or locales.unbox() == .undefined_) return out.items;
+    // ToObject(null) is a TypeError; other primitives box to a wrapper with no
+    // "length" (→ empty list). A String is a single-element list.
+    if (locales.unbox() == .null_) return throwTypeErrorIntl(arena, "Cannot convert null locales to object");
+    if (locales.unbox() == .string) {
+        try out.append(arena, locales.unbox().string);
+        return out.items;
+    }
+    if (locales.unbox() != .object) return out.items;
+    const ctx = realm_mod.active_context;
+    const len_v = if (ctx) |c| try c.getProp(arena, locales, "length") else Value{};
+    // ToLength → ToNumber: a Symbol or BigInt length is a TypeError.
+    if (len_v.bits != 0 and (len_v.unbox() == .symbol or len_v.unbox() == .bigint))
+        return throwTypeErrorIntl(arena, "Cannot convert length to a number");
+    const len = try realm_mod.toLengthValue(arena, len_v);
+    var k: usize = 0;
+    while (k < len) : (k += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{k});
+        const present = if (ctx) |c| try c.hasProp(arena, locales, key) else false;
+        if (!present) continue;
+        const kv = if (ctx) |c| try c.getProp(arena, locales, key) else Value{};
+        if (kv.bits != 0 and kv.unbox() == .string) {
+            try out.append(arena, kv.unbox().string);
+        } else if (kv.bits != 0 and kv.unbox() == .object) {
+            try out.append(arena, try t_shared.valueToString(arena, kv));
+        } else {
+            return throwTypeErrorIntl(arena, "locale list element must be a String or Object");
         }
     }
+    return out.items;
+}
+
+pub fn nativeDurationFormatSupportedLocalesOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const requested = try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{});
     // Validate the options' localeMatcher (RangeError if malformed).
     const opts: ?Value = if (args.len > 1) args[1] else null;
     _ = try dfGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" });
@@ -1797,7 +2043,7 @@ pub fn nativeDurationFormatSupportedLocalesOf(arena: std.mem.Allocator, _: Value
         try JsObject.createArray(arena, realm_mod.active_array_proto);
     var seen = std.ArrayListUnmanaged([]const u8){};
     var n: usize = 0;
-    for (requested.items) |t| {
+    for (requested) |t| {
         if (t.len == 0) continue;
         const canon = try canonicalizeTag(arena, t); // throws on invalid
         var dup = false;
