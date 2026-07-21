@@ -214,6 +214,13 @@ pub fn hasLeapMonths(cal: CalendarId) bool {
     return false;
 }
 
+/// Whether `cal` numbers its years by era. Calendars that do not (ISO 8601)
+/// have no "era"/"eraYear" fields at all, so those properties are ignored
+/// rather than validated when they appear in a property bag.
+pub fn hasEras(cal: CalendarId) bool {
+    return cal != .iso8601;
+}
+
 /// Map a month code onto its ordinal position in `cal_year`, or null when the
 /// year has no such month.
 pub fn monthFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bool) ?u8 {

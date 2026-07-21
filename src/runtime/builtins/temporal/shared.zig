@@ -381,7 +381,7 @@ pub fn parseISODateTimeOpts(s0: []const u8, opts: IsoParseOpts) ParseError!ISODa
         }
     }
     if (opts.require_time and !had_time) return error.Invalid;
-    try parseAnnotations(&p, opts.validate_calendar);
+    try parseAnnotations(&p, if (opts.validate_calendar) .any_known else .ignore);
     if (!p.eof()) return error.Invalid;
 
     if (year < -271821 or year > 275760) return error.Invalid;
@@ -426,7 +426,7 @@ pub fn parseISOYearMonth(s0: []const u8) ParseError!ISODate {
             return .{ .year = dt.date.year, .month = dt.date.month, .day = 1, .calendar = dt.date.calendar };
         }
     }
-    try parseAnnotations(&p, true);
+    try parseAnnotations(&p, .iso_only);
     if (!p.eof()) return error.Invalid;
     if (year < -271821 or year > 275760) return error.Invalid;
     if (month < 1 or month > 12) return error.Invalid;
@@ -449,7 +449,7 @@ pub fn parseISOMonthDay(s0: []const u8) ParseError!ISOMonthDay {
     const had_dash = p.eat('-');
     const day = p.digitsN(2) orelse return error.Invalid;
     _ = had_dash;
-    try parseAnnotations(&p, true);
+    try parseAnnotations(&p, .iso_only);
     if (!p.eof()) return error.Invalid;
     if (month < 1 or month > 12) return error.Invalid;
     if (day < 1 or day > isoDaysInMonth(1972, @intCast(month))) return error.Invalid;
@@ -483,7 +483,7 @@ pub fn parseISOTime(s0: []const u8) ParseError!ISOTime {
     }
     const t = try parseTimeInner(&p);
     if (try skipOffset(&p)) return error.Invalid; // bare `Z` invalid for PlainTime
-    try parseAnnotations(&p, false);
+    try parseAnnotations(&p, .ignore);
     if (!p.eof()) return error.Invalid;
     if (!isValidISOTime(t)) return error.Invalid;
     return t;
@@ -656,7 +656,13 @@ fn isValidAnnotationKey(key: []const u8) bool {
 /// key/value annotation; the `u-ca` calendar key may appear at most once; an
 /// unrecognised key carrying the critical flag (`!`) is rejected, as is a
 /// malformed key. Unknown non-critical annotations are ignored.
-fn parseAnnotations(p: *Parser, validate_calendar: bool) ParseError!void {
+/// How a `[u-ca=…]` annotation is treated: ignored entirely (types with no
+/// calendar), restricted to iso8601 (year-month and month-day strings, whose
+/// bare forms cannot pin down a reference day/year in another calendar), or any
+/// calendar this engine implements.
+const CalendarAnnotation = enum { ignore, iso_only, any_known };
+
+fn parseAnnotations(p: *Parser, ca_mode: CalendarAnnotation) ParseError!void {
     var tz_seen = false;
     var kv_seen = false;
     var ca_count: u32 = 0;
@@ -691,9 +697,12 @@ fn parseAnnotations(p: *Parser, validate_calendar: bool) ParseError!void {
                 // unknown value is tolerated for them. Subsequent annotations are
                 // ignored, but need not name a supported calendar.
                 if (ca_count == 0) {
-                    if (calendar_mod.canonicalize(value)) |c| {
-                        p.calendar = c;
-                    } else if (validate_calendar) return error.Invalid;
+                    const known = calendar_mod.canonicalize(value);
+                    switch (ca_mode) {
+                        .ignore => {},
+                        .iso_only => if (known != .iso8601) return error.Invalid,
+                        .any_known => p.calendar = known orelse return error.Invalid,
+                    }
                 }
                 // If more than one calendar annotation is present and any of them
                 // carries the critical flag `!`, the string is rejected.

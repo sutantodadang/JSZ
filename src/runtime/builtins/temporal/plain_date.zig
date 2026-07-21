@@ -122,7 +122,10 @@ pub fn toTemporalDate(arena: std.mem.Allocator, v: Value, overflow: shared.Overf
     return realm_mod.throwTypeError(arena, "cannot convert to Temporal.PlainDate");
 }
 
-fn dateFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISODate {
+/// CalendarDateFromFields: read {calendar, era/eraYear|year, month|monthCode,
+/// day} off a property bag. Shared with PlainDateTime and ZonedDateTime, whose
+/// date portion uses exactly these fields.
+pub fn dateFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISODate {
     const cal = if (o.get("calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
     const day_v = o.get("day");
     if (day_v == null or (day_v.?.bits != 0 and day_v.?.unbox() == .undefined_)) return realm_mod.throwTypeError(arena, "missing day");
@@ -133,11 +136,13 @@ fn dateFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overf
 
 /// Resolve the calendar-space year from either a "year" field or an
 /// {era, eraYear} pair. Exactly one of the two forms must be present.
-fn readCalendarYear(arena: std.mem.Allocator, o: *JsObject, cal: calendar.CalendarId) !i32 {
+pub fn readCalendarYear(arena: std.mem.Allocator, o: *JsObject, cal: calendar.CalendarId) !i32 {
     const year_v = o.get("year");
     const has_year = year_v != null and year_v.?.bits != 0 and year_v.?.unbox() != .undefined_;
-    const era_v = o.get("era");
-    const era_year_v = o.get("eraYear");
+    // A calendar without eras has no era/eraYear fields, so any such properties
+    // on the bag are ignored; an era-bearing calendar needs both or neither.
+    const era_v = if (calendar.hasEras(cal)) o.get("era") else null;
+    const era_year_v = if (calendar.hasEras(cal)) o.get("eraYear") else null;
     const has_era = era_v != null and era_v.?.bits != 0 and era_v.?.unbox() != .undefined_;
     const has_era_year = era_year_v != null and era_year_v.?.bits != 0 and era_year_v.?.unbox() != .undefined_;
     if (has_era != has_era_year) return realm_mod.throwTypeError(arena, "era and eraYear must be provided together");
@@ -463,17 +468,26 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (o.get("timeZone") != null and o.get("timeZone").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
+    const merged = try withDateFields(arena, cur.*, o, overflow);
+    if (!merged.any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
+    return makeDate(arena, merged.date);
+}
+
+/// Merge the date fields present on `o` over `cur`'s own calendar fields and
+/// reconstitute. Per CalendarMergeFields a supplied "month" displaces the
+/// receiver's monthCode and vice versa, so only the un-supplied side falls back
+/// to the base date. `any` reports whether the bag carried any date field at all
+/// (callers combine it with their own field sets before raising a TypeError).
+pub fn withDateFields(arena: std.mem.Allocator, cur: ISODate, o: *JsObject, overflow: shared.Overflow) !struct { date: ISODate, any: bool } {
     const cal = cur.calendar;
-    // Merge the supplied fields over the receiver's own calendar fields. Per
-    // CalendarMergeFields a supplied "month" displaces the receiver's monthCode
-    // and vice versa, so only the un-supplied side falls back to the base date.
-    const base = calendar.fields(cal, cur.*);
+    const base = calendar.fields(cal, cur);
     var year: i32 = base.year;
     var day: i32 = base.day;
     var any = false;
 
-    const era_v = o.get("era");
-    const era_year_v = o.get("eraYear");
+    // Era fields only exist on calendars that number years by era.
+    const era_v = if (calendar.hasEras(cal)) o.get("era") else null;
+    const era_year_v = if (calendar.hasEras(cal)) o.get("eraYear") else null;
     const has_era = era_v != null and era_v.?.bits != 0 and era_v.?.unbox() != .undefined_;
     const has_era_year = era_year_v != null and era_year_v.?.bits != 0 and era_year_v.?.unbox() != .undefined_;
     if (has_era != has_era_year) return realm_mod.throwTypeError(arena, "era and eraYear must be provided together");
@@ -497,7 +511,6 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const has_month = month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_;
     const has_code = monthcode_v != null and monthcode_v.?.bits != 0 and monthcode_v.?.unbox() != .undefined_;
     if (has_month or has_code) any = true;
-    if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
 
     var nd: ISODate = undefined;
     if (has_code) {
@@ -517,7 +530,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
         nd = calendar.toIsoFromCode(cal, year, base.code_num, base.code_leap, day, overflow) catch
             return realm_mod.throwRangeError(arena, "date out of range");
     }
-    return makeDate(arena, nd);
+    return .{ .date = nd, .any = any };
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
