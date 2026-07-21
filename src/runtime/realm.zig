@@ -1682,7 +1682,7 @@ fn nativeArrayFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anye
 /// Consume `src` via the @@iterator protocol into `items`. Returns false when
 /// `src` is not iterable (no callable @@iterator) so the caller can fall back to
 /// the array-like path. Used by Array.from for Set/Map/generators/custom iterables.
-fn arrayFromIterate(arena: std.mem.Allocator, src: Value, items: *std.ArrayList(Value)) anyerror!bool {
+pub fn arrayFromIterate(arena: std.mem.Allocator, src: Value, items: *std.ArrayList(Value)) anyerror!bool {
     // Drive the @@iterator protocol via the hardened re-entrant invoke bridge
     // (the same one TA.map/sort use). Returns false (→ array-like fallback) only
     // when the source is not iterable.
@@ -4740,7 +4740,13 @@ pub const Realm = struct {
             };
             // Intl.NumberFormat
             const nf_proto = try JsObject.create(arena, object_proto);
-            try IntlReg.method(arena, nf_proto, "format", intl_mod.nativeNumberFormatFormat, 0);
+            {
+                // §15.3.3: `format` is an accessor returning a bound function, not
+                // a plain method.
+                const holder = try JsObject.create(arena, object_proto);
+                try holder.set("get", try val_mod.makeNativeFunctionNamedLen(arena, intl_mod.nativeNumberFormatFormatGetter, "get format", 0));
+                _ = try nf_proto.defineOwnAccessor("format", try val_mod.makeObject(arena, holder), .{ .enumerable = false, .configurable = true, .writable = false });
+            }
             try IntlReg.method(arena, nf_proto, "formatToParts", intl_mod.nativeNumberFormatFormatToParts, 1);
             try IntlReg.method(arena, nf_proto, "formatRange", intl_mod.nativeNumberFormatFormatRange, 2);
             try IntlReg.method(arena, nf_proto, "formatRangeToParts", intl_mod.nativeNumberFormatFormatRangeToParts, 2);
@@ -4751,8 +4757,15 @@ pub const Realm = struct {
             try intl_obj.set("NumberFormat", try val_mod.makeObject(arena, nf_ctor));
             // Intl.DateTimeFormat
             const dtf_proto = try JsObject.create(arena, object_proto);
-            try IntlReg.method(arena, dtf_proto, "format", intl_mod.nativeDateTimeFormatFormat, 0);
+            {
+                // §11.3.3: `format` is an accessor returning a bound function.
+                const holder = try JsObject.create(arena, object_proto);
+                try holder.set("get", try val_mod.makeNativeFunctionNamedLen(arena, intl_mod.nativeDateTimeFormatFormatGetter, "get format", 0));
+                _ = try dtf_proto.defineOwnAccessor("format", try val_mod.makeObject(arena, holder), .{ .enumerable = false, .configurable = true, .writable = false });
+            }
             try IntlReg.method(arena, dtf_proto, "formatToParts", intl_mod.nativeDateTimeFormatFormatToParts, 1);
+            try IntlReg.method(arena, dtf_proto, "formatRange", intl_mod.nativeDateTimeFormatFormatRange, 2);
+            try IntlReg.method(arena, dtf_proto, "formatRangeToParts", intl_mod.nativeDateTimeFormatFormatRangeToParts, 2);
             try IntlReg.method(arena, dtf_proto, "resolvedOptions", intl_mod.nativeDateTimeFormatResolved, 0);
             const dtf_ctor = try JsObject.create(arena, function_proto);
             try dtf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatCtor));
@@ -4766,6 +4779,9 @@ pub const Realm = struct {
             try col_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeCollatorCtor));
             try IntlReg.finish(arena, col_ctor, col_proto, "Collator", "Intl.Collator", 0, true);
             try intl_obj.set("Collator", try val_mod.makeObject(arena, col_ctor));
+            // The three legacy services keep working when called without `new`,
+            // which needs their prototypes.
+            intl_mod.registerLegacyServiceProtos(nf_proto, dtf_proto, col_proto);
             // Intl.Locale (no supportedLocalesOf; ctor length 1)
             const loc_proto = try JsObject.create(arena, object_proto);
             try IntlReg.method(arena, loc_proto, "toString", intl_mod.nativeLocaleToString, 0);

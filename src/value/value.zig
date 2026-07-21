@@ -747,6 +747,14 @@ pub fn makeNativeFunctionData(arena: std.mem.Allocator, fn_ptr: NativeFnPtr, dat
     return Value.fromPtr(v);
 }
 
+/// As `makeNativeFunctionData`, with an explicit `.length` and no name — the
+/// shape ECMA-402's bound `format`/`compare` functions require (`name` is "").
+pub fn makeNativeFunctionDataLen(arena: std.mem.Allocator, fn_ptr: NativeFnPtr, data: ?*anyopaque, length: u8) !Value {
+    const v = try arena.create(JsValue);
+    v.* = .{ .native_function = .{ .call = fn_ptr, .data = data, .length = length } };
+    return Value.fromPtr(v);
+}
+
 // ------------------------------------------------------------------- tests ---
 
 test "Value default zero" {
