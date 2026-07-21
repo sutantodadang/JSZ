@@ -1667,6 +1667,7 @@ pub const FnCompiler = struct {
             try self.emitOp(.TO_PROPERTY_KEY, line);
             try self.emitU8(rkey);
             try self.emitU8(rkey);
+            try self.emitU8(robj);
         }
         return .{ .robj = robj, .rkey = rkey };
     }
@@ -1965,6 +1966,7 @@ pub const FnCompiler = struct {
                 try self.emitOp(.TO_PROPERTY_KEY, line);
                 try self.emitU8(rkey);
                 try self.emitU8(rkey);
+                try self.emitU8(robj);
                 const rval = try self.compileExpr(prop.value);
                 // NamedEvaluation with a runtime key: `{ [k]: function(){} }`,
                 // `{ get [k]() {} }`.

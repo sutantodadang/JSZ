@@ -263,7 +263,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d} R{d} R{d}", .{ rdst, rlhs, rrhs });
         },
-        .NEG, .BIT_NOT, .NOT, .TYPEOF, .TO_NUMBER, .TO_NUMERIC, .TO_PROPERTY_KEY => {
+        .NEG, .BIT_NOT, .NOT, .TYPEOF, .TO_NUMBER, .TO_NUMERIC => {
             const rdst = code[new_pc];
             new_pc += 1;
             const rsrc = code[new_pc];
@@ -480,6 +480,15 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             } else {
                 try writer.print(" R{d} = R{d}[K{d}]", .{ rdst, robj, kidx });
             }
+        },
+        .TO_PROPERTY_KEY => {
+            const rdst = code[new_pc];
+            new_pc += 1;
+            const rsrc = code[new_pc];
+            new_pc += 1;
+            const rbase = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} = ToPropertyKey(R{d}) base R{d}", .{ rdst, rsrc, rbase });
         },
         .SET_FN_NAME => {
             const rfn = code[new_pc];

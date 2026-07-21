@@ -1485,6 +1485,10 @@ pub const Parser = struct {
         return expr_mod.rewriteSuperCall(self, call_node);
     }
 
+    pub fn rewriteSuperPropRead(self: *Parser, node: *Node) ?*Node {
+        return expr_mod.rewriteSuperPropRead(self, node);
+    }
+
     pub fn rewriteSuperPropAssign(self: *Parser, op: ast.AssignOp, target: *Node, value: *Node, start: u32, end: u32) ?*Node {
         return expr_mod.rewriteSuperPropAssign(self, op, target, value, start, end);
     }

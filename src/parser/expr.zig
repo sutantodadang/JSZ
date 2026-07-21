@@ -404,7 +404,44 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
             .assignment_expr = .{ .op = op, .target = left, .value = right },
         });
     }
+    // Not an assignment target — a bare `super.x` here is a read.
+    if (p.rewriteSuperPropRead(left)) |sp| return sp;
     return left;
+}
+
+/// Rewrite a super-property READ into `Reflect.get(super, key, __superthis)`.
+///
+/// The desugar binds `super` to the home object's prototype, so a plain member
+/// read would invoke a `get x()` accessor with the *prototype* as the receiver.
+/// The spec's Super Reference carries `actualThis` as the Receiver
+/// (§13.3.7.3 MakeSuperPropertyReference + GetValue step 5.b), which is exactly
+/// `Reflect.get`'s third argument. Returns null when `node` is not a super
+/// member read. Callers must skip assignment/update targets — those go through
+/// rewriteSuperPropAssign / the ordinary member-write path.
+pub fn rewriteSuperPropRead(p: *Parser, node: *Node) ?*Node {
+    if (node.kind != .member_expr) return null;
+    const me = node.data.member_expr;
+    if (!(me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super"))) return null;
+    const s = node.start;
+    const e = node.end;
+    const key = if (me.computed)
+        me.property
+    else if (me.property.kind == .identifier)
+        (p.makeNode(.string_literal, s, e, .{ .string_literal = me.property.data.identifier }) orelse return null)
+    else
+        return null;
+    const id_reflect = p.makeNode(.identifier, s, e, .{ .identifier = "Reflect" }) orelse return null;
+    const id_get = p.makeNode(.identifier, s, e, .{ .identifier = "get" }) orelse return null;
+    const callee = p.makeNode(.member_expr, s, e, .{
+        .member_expr = .{ .object = id_reflect, .property = id_get, .computed = false },
+    }) orelse return null;
+    const id_base = p.makeNode(.identifier, s, e, .{ .identifier = "super" }) orelse return null;
+    const id_recv = p.makeNode(.identifier, s, e, .{ .identifier = "__superthis" }) orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, id_base) catch return null;
+    args.append(p.arena, key) catch return null;
+    args.append(p.arena, id_recv) catch return null;
+    return p.makeNode(.call_expr, s, e, .{ .call_expr = .{ .callee = callee, .args = args.items } });
 }
 
 pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {

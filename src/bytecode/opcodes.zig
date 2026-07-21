@@ -326,12 +326,16 @@ pub const Op = enum(u8) {
     /// declaration or a parameter between the block and the var scope gets no
     /// var binding and no sync. Declared last (JIT ordinal stability).
     SYNC_ANNEXB_FN,
-    /// TO_PROPERTY_KEY | 3 | op, Rdst u8, Rsrc u8. Rdst = ToPropertyKey(R[Rsrc])
+    /// TO_PROPERTY_KEY | 4 | op, Rdst u8, Rsrc u8, Rbase u8. Rdst =
+    /// ToPropertyKey(R[Rsrc])
     /// — an object key runs its @@toPrimitive/toString (observable, may throw);
     /// primitives pass through unchanged so the dyn get/set fast paths still
     /// see numbers as numbers. Emitted once per member Reference whose key is
     /// read *and* written (`o[k] += v`, `o[k]++`), so the user coercion runs
-    /// exactly once. Declared last (JIT ordinal stability).
+    /// exactly once. R[Rbase] is the Reference's base: PutValue/GetValue do
+    /// ToObject(base) *before* ToPropertyKey, so a nullish base throws a
+    /// TypeError here without running the key's `toString`. Declared last (JIT
+    /// ordinal stability).
     TO_PROPERTY_KEY,
     /// SET_FN_NAME | 4 | op, Rfn u8, Rkey u8, prefix u8 (0 none / 1 get / 2 set).
     /// SetFunctionName for a NamedEvaluation whose name is only known at runtime
@@ -442,7 +446,7 @@ pub fn instrSize(op: Op) usize {
         .MARK_DIRECT_EVAL => 1,
         .DEFINE_LOCAL => 4,
         .SYNC_ANNEXB_FN => 3,
-        .TO_PROPERTY_KEY => 3,
+        .TO_PROPERTY_KEY => 4,
         .SET_FN_NAME => 4,
         .IN => 4,
         .DELETE_PROP => 4,

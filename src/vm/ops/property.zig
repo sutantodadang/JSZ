@@ -53,7 +53,13 @@ pub inline fn opToPropertyKey(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const rsrc = code[frame.pc];
     frame.pc += 1;
+    const rbase = code[frame.pc];
+    frame.pc += 1;
     const sv = frame.registers[rsrc];
+    // GetValue/PutValue do ToObject(base) before ToPropertyKey, so a nullish
+    // base throws without ever running the key's `toString`.
+    const base_val = frame.registers[rbase];
+    if (base_val.isNullish()) return nullishReadThrow(self, base_val, "");
     if (!(sv.bits != 0 and bcv.isObjectOperand(sv))) {
         frame.registers[rdst] = sv;
         return null;
