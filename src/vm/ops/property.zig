@@ -18,6 +18,7 @@ const ic_mod = @import("../ic.zig");
 const proxy_mod = @import("../../runtime/builtins/proxy.zig");
 const namespace_mod = @import("../../runtime/builtins/namespace.zig");
 const typed_array = @import("../../runtime/builtins/typed_array.zig");
+const string_proto = @import("../../runtime/builtins/string_proto.zig");
 
 /// A number Value → canonical array index (integer in [0, 2^32-2]), or null.
 /// Lets `a[i]` reads/writes hit the dense integer path without stringifying `i`.
@@ -706,13 +707,37 @@ pub inline fn opGetKeys(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                         }
                     }
                 }
-                for (iv.object.ownKeys()) |k| {
-                    if (!iv.object.isEnumerable(k)) continue;
-                    const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
-                    const key_val2 = try val_mod.makeString(self.arena, k);
-                    arr_obj.set(idx_str, key_val2) catch {};
-                    count += 1;
+                // EnumerateObjectProperties (ES §14.7.5.10) walks the whole
+                // prototype chain, not just own keys. A key already seen lower
+                // down is skipped even when it was non-enumerable there, so a
+                // non-enumerable own property shadows an enumerable inherited
+                // one rather than letting it through.
+                var visited = std.StringHashMap(void).init(self.arena);
+                defer visited.deinit();
+                var cur: ?*JsObject = iv.object;
+                while (cur) |o| : (cur = o.proto) {
+                    for (o.ownKeys()) |k| {
+                        if (JsObject.isInternalSlotKey(k)) continue;
+                        const gop = try visited.getOrPut(k);
+                        if (gop.found_existing) continue;
+                        if (!o.isEnumerable(k)) continue;
+                        const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
+                        const key_val2 = try val_mod.makeString(self.arena, k);
+                        arr_obj.set(idx_str, key_val2) catch {};
+                        count += 1;
+                    }
                 }
+            }
+        } else if (iv == .string) {
+            // for-in applies ToObject to its operand, so a primitive string
+            // enumerates the index keys its String wrapper would expose.
+            const units = string_proto.cuLen(iv.string);
+            var i: usize = 0;
+            while (i < units) : (i += 1) {
+                const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
+                const key_val2 = try std.fmt.allocPrint(self.arena, "{d}", .{i});
+                arr_obj.set(idx_str, try val_mod.makeString(self.arena, key_val2)) catch {};
+                count += 1;
             }
         }
     }

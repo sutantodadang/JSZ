@@ -667,6 +667,51 @@ fn nodeMember(p: *Parser, obj: *Node, prop: []const u8) ?*Node {
     return p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = obj, .property = pid, .computed = false } });
 }
 
+/// `Object.defineProperty(<Cls>.prototype, "constructor",
+///      { value: <Cls>, writable: true, enumerable: false, configurable: true })`
+///
+/// A plain `Cls.prototype.constructor = Cls` is enough for a BASE class: the
+/// function's auto-created prototype already carries a non-enumerable
+/// `constructor`, and assigning to an existing data property keeps its
+/// attributes. A DERIVED class replaces `prototype` with a fresh
+/// `Object.create(Super.prototype)` that has no such slot, so the same
+/// assignment would create an enumerable one and leak `constructor` into
+/// for-in over every instance. Defining it explicitly makes both paths agree.
+fn makeCtorBackLink(p: *Parser, class_name: []const u8) ?*Node {
+    const s = p.current.start;
+    const id_class = nodeIdent(p, class_name) orelse return null;
+    const target = nodeMember(p, id_class, "prototype") orelse return null;
+    const key_val = p.makeNode(.string_literal, s, s, .{ .string_literal = "constructor" }) orelse return null;
+
+    var props = std.ArrayList(ast.ObjectProp){};
+    props.append(p.arena, .{
+        .key = "value",
+        .value = nodeIdent(p, class_name) orelse return null,
+    }) catch return null;
+    props.append(p.arena, .{
+        .key = "writable",
+        .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null,
+    }) catch return null;
+    props.append(p.arena, .{
+        .key = "enumerable",
+        .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = false }) orelse return null,
+    }) catch return null;
+    props.append(p.arena, .{
+        .key = "configurable",
+        .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null,
+    }) catch return null;
+    const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
+
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, target) catch return null;
+    args.append(p.arena, key_val) catch return null;
+    args.append(p.arena, desc) catch return null;
+    const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
+    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
+}
+
 /// Desugar one class member into a single statement (a property assignment for
 /// methods, or `Object.defineProperty(target, key, { get|set, configurable,
 /// enumerable })` for accessors). `target` is the constructor for static members
@@ -1055,21 +1100,8 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         out.append(p.arena, stmt_proto) catch return null;
     }
 
-    // ClassName.prototype.constructor = ClassName
-    const id_class_ctor = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-    const id_proto_ctor = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
-    const class_proto_ctor = p.makeNode(.member_expr, start, start, .{
-        .member_expr = .{ .object = id_class_ctor, .property = id_proto_ctor, .computed = false },
-    }) orelse return null;
-    const id_ctor_name = p.makeNode(.identifier, start, start, .{ .identifier = "constructor" }) orelse return null;
-    const ctor_slot = p.makeNode(.member_expr, start, start, .{
-        .member_expr = .{ .object = class_proto_ctor, .property = id_ctor_name, .computed = false },
-    }) orelse return null;
-    const id_class_value = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-    const assign_ctor = p.makeNode(.assignment_expr, start, start, .{
-        .assignment_expr = .{ .op = .assign, .target = ctor_slot, .value = id_class_value },
-    }) orelse return null;
-    const stmt_ctor = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign_ctor }) orelse return null;
+    // Constructor back-link, defined non-enumerable (see makeCtorBackLink).
+    const stmt_ctor = makeCtorBackLink(p, class_name) orelse return null;
     out.append(p.arena, stmt_ctor) catch return null;
 
     // prototype + static methods/accessors
@@ -1328,24 +1360,8 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             fn_body.append(p.arena, stmt_proto) catch return null;
         }
 
-        // Constructor back-link: ClassName.prototype.constructor = ClassName
-        {
-            const id_class_ctor = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-            const id_proto_ctor = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
-            const class_proto_ctor = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = id_class_ctor, .property = id_proto_ctor, .computed = false },
-            }) orelse return null;
-            const id_ctor_name = p.makeNode(.identifier, start, start, .{ .identifier = "constructor" }) orelse return null;
-            const ctor_slot = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = class_proto_ctor, .property = id_ctor_name, .computed = false },
-            }) orelse return null;
-            const id_class_value = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-            const assign_ctor = p.makeNode(.assignment_expr, start, start, .{
-                .assignment_expr = .{ .op = .assign, .target = ctor_slot, .value = id_class_value },
-            }) orelse return null;
-            const stmt_ctor = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign_ctor }) orelse return null;
-            fn_body.append(p.arena, stmt_ctor) catch return null;
-        }
+        // Constructor back-link, defined non-enumerable (see makeCtorBackLink).
+        fn_body.append(p.arena, makeCtorBackLink(p, class_name) orelse return null) catch return null;
 
         for (members) |m| {
             const stmt = emitClassMember(p, class_name, super_name, m) orelse return null;
