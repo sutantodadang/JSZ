@@ -479,6 +479,31 @@ pub const RegexNode = union(enum) {
     },
     /// Phase 4d: backreference \1..\9
     back_ref: u8, // group index 1-9
+    /// ES2025 RegExp modifiers `(?ims-ims: ... )`: rebinds the i/m/s flags for
+    /// the enclosed disjunction only. `add` wins over `remove` never overlaps
+    /// (the parser rejects a modifier listed on both sides).
+    modifier: struct {
+        inner: *RegexNode,
+        add: ModifierSet,
+        remove: ModifierSet,
+    },
+};
+
+/// The three flags a `(?ims-ims:...)` group may rebind.
+pub const ModifierSet = struct {
+    ignore_case: bool = false,
+    multiline: bool = false,
+    dotall: bool = false,
+
+    fn empty(self: ModifierSet) bool {
+        return !self.ignore_case and !self.multiline and !self.dotall;
+    }
+
+    fn overlaps(self: ModifierSet, other: ModifierSet) bool {
+        return (self.ignore_case and other.ignore_case) or
+            (self.multiline and other.multiline) or
+            (self.dotall and other.dotall);
+    }
 };
 
 /// A named capture group's name → 1-based capture index mapping.
@@ -778,6 +803,55 @@ const PatternParser = struct {
         return q;
     }
 
+    /// Parse `(?ims:...)` / `(?ims-ims:...)` after `(` has been consumed and the
+    /// non-capturing / lookaround forms have been ruled out. Every other `(?`
+    /// spelling is a modifier group, so anything malformed here is a genuine
+    /// Syntax Error rather than a fallthrough to some other production.
+    fn parseModifierGroup(self: *PatternParser) ParseError!RegexNode {
+        self.advance(); // '?'
+        var add: ModifierSet = .{};
+        var remove: ModifierSet = .{};
+        try self.parseModifierList(&add);
+        if (!self.eof() and self.cur() == '-') {
+            self.advance();
+            try self.parseModifierList(&remove);
+        }
+        // `(?-:a)` names no flags at all; `(?i-i:a)` both adds and removes one.
+        if (add.empty() and remove.empty()) return ParseError.InvalidPattern;
+        if (add.overlaps(remove)) return ParseError.InvalidPattern;
+        if (self.eof() or self.cur() != ':') return ParseError.InvalidPattern;
+        self.advance(); // ':'
+        const inner = try self.parseAlt();
+        if (self.eof() or self.cur() != ')') return ParseError.InvalidPattern;
+        self.advance();
+        const inner_ptr = try self.alloc.create(RegexNode);
+        inner_ptr.* = inner;
+        return RegexNode{ .modifier = .{ .inner = inner_ptr, .add = add, .remove = remove } };
+    }
+
+    /// Consume a run of distinct `i`/`m`/`s` modifier letters. Stops at the
+    /// first character that is not one; a repeat (`(?ii:a)`) is a Syntax Error.
+    fn parseModifierList(self: *PatternParser, set: *ModifierSet) ParseError!void {
+        while (!self.eof()) {
+            switch (self.cur()) {
+                'i' => {
+                    if (set.ignore_case) return ParseError.InvalidPattern;
+                    set.ignore_case = true;
+                },
+                'm' => {
+                    if (set.multiline) return ParseError.InvalidPattern;
+                    set.multiline = true;
+                },
+                's' => {
+                    if (set.dotall) return ParseError.InvalidPattern;
+                    set.dotall = true;
+                },
+                else => return,
+            }
+            self.advance();
+        }
+    }
+
     fn parseUint(self: *PatternParser) ParseError!u32 {
         if (self.eof() or self.cur() < '0' or self.cur() > '9') return ParseError.InvalidPattern;
         var n: u64 = 0;
@@ -859,6 +933,11 @@ const PatternParser = struct {
                     const ninner_ptr = try self.alloc.create(RegexNode);
                     ninner_ptr.* = ninner;
                     return RegexNode{ .group = .{ .idx = nidx, .inner = ninner_ptr } };
+                }
+                // ES2025 modifier group `(?ims:...)` / `(?ims-ims:...)`. Every
+                // other `(?` form was handled above, so this is the last one.
+                if (!self.eof() and self.cur() == '?') {
+                    return try self.parseModifierGroup();
                 }
                 // Capturing group
                 const idx = self.next_cap;
@@ -1672,7 +1751,7 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
     if (!pp.eof()) return error.InvalidPattern; // unconsumed chars
 
     const br = hasBackref(&root);
-    const prog = if (!br) buildProgram(alloc, &root, pp.next_cap - 1) else null;
+    const prog = if (!br and !hasModifier(&root)) buildProgram(alloc, &root, pp.next_cap - 1) else null;
 
     return CompiledRegex{
         .root = root,
@@ -1994,6 +2073,18 @@ fn matchNode(
         .non_capturing => |inner| {
             return matchNode(inner, input, pos, caps, flags);
         },
+        .modifier => |m| {
+            // Rebind i/m/s for the enclosed disjunction only. The copy lives on
+            // this frame, so the original flags are restored on return.
+            var scoped = flags.*;
+            if (m.add.ignore_case) scoped.ignore_case = true;
+            if (m.add.multiline) scoped.multiline = true;
+            if (m.add.dotall) scoped.dotall = true;
+            if (m.remove.ignore_case) scoped.ignore_case = false;
+            if (m.remove.multiline) scoped.multiline = false;
+            if (m.remove.dotall) scoped.dotall = false;
+            return matchNode(m.inner, input, pos, caps, &scoped);
+        },
         .quant => |q| {
             return matchQuant(q.inner, q.min, q.max, q.lazy, input, pos, caps, flags);
         },
@@ -2289,6 +2380,10 @@ const ProgBuilder = struct {
             .look_ahead, .look_behind => _ = self.emit(.{ .look = node }),
             // Backreference patterns never reach the Pike VM (has_backref gate).
             .back_ref => self.failed = true,
+            // Flag decisions are baked into the emitted instructions, so a
+            // mid-pattern rebind cannot be expressed; fall back to the
+            // backtracker (compileRegex also gates on hasModifier).
+            .modifier => self.failed = true,
         }
     }
 };
@@ -2311,6 +2406,30 @@ fn hasBackref(node: *const RegexNode) bool {
         .quant => |q| hasBackref(q.inner),
         .look_ahead => |la| hasBackref(la.inner),
         .look_behind => |lb| hasBackref(lb.inner),
+        .modifier => |m| hasBackref(m.inner),
+        else => false,
+    };
+}
+
+/// Whether the pattern contains a `(?ims-ims:...)` modifier group. The Pike VM
+/// compiles flag decisions into its instructions, so it cannot express a
+/// mid-pattern flag rebind; such patterns stay on the backtracking engine.
+fn hasModifier(node: *const RegexNode) bool {
+    return switch (node.*) {
+        .modifier => true,
+        .seq => |nodes| blk: {
+            for (nodes) |*c| if (hasModifier(c)) break :blk true;
+            break :blk false;
+        },
+        .alt => |arms| blk: {
+            for (arms) |*c| if (hasModifier(c)) break :blk true;
+            break :blk false;
+        },
+        .group => |g| hasModifier(g.inner),
+        .non_capturing => |inner| hasModifier(inner),
+        .quant => |q| hasModifier(q.inner),
+        .look_ahead => |la| hasModifier(la.inner),
+        .look_behind => |lb| hasModifier(lb.inner),
         else => false,
     };
 }
