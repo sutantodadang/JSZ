@@ -359,10 +359,20 @@ pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const V
     const digits = try shared.getFractionalDigits(arena, opts);
     const mode = try shared.getRoundingMode(arena, opts, .trunc);
     const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
-    // timeZone option ignored (UTC). Rounding is on the epoch nanoseconds, so
-    // a carry past midnight moves the date for free.
+    // The timeZone option projects the instant onto a local wall clock; without
+    // it the output is UTC with a `Z` designator.
+    const tz_v = if (opts) |o| (o.get("timeZone") orelse Value{}) else Value{};
+    var offset_ns: ?i128 = null;
+    if (tz_v.bits != 0 and tz_v.unbox() != .undefined_) {
+        const tzm = @import("timezone.zig");
+        if (tz_v.unbox() != .string) return realm_mod.throwTypeError(arena, "timeZone must be a string");
+        const zone = try tzm.toZoneAtInstant(arena, tz_v.unbox().string, ins.*);
+        offset_ns = zone.offset_ns;
+    }
+    // Rounding is on the epoch nanoseconds, so a carry past midnight moves the
+    // date for free.
     const ns = shared.roundI128ToIncrement(ins.*, prec.increment, mode);
-    const s = try instantToStringPrec(arena, ns, prec);
+    const s = try instantToStringPrec(arena, ns, prec, offset_ns);
     return val_mod.makeString(arena, s);
 }
 
@@ -391,10 +401,11 @@ pub fn nativeToZonedDateTimeISO(arena: std.mem.Allocator, this_val: Value, args:
 }
 
 fn instantToString(arena: std.mem.Allocator, ns: i128, digits: ?u8) ![]const u8 {
-    return instantToStringPrec(arena, ns, .{ .digits = digits });
+    return instantToStringPrec(arena, ns, .{ .digits = digits }, null);
 }
 
-fn instantToStringPrec(arena: std.mem.Allocator, ns: i128, prec: shared.SecondsPrecision) ![]const u8 {
+fn instantToStringPrec(arena: std.mem.Allocator, ns0: i128, prec: shared.SecondsPrecision, offset_ns: ?i128) ![]const u8 {
+    const ns = ns0 + (offset_ns orelse 0);
     const days: i64 = @intCast(@divFloor(ns, shared.NS_PER_DAY));
     const time_of_day: i128 = ns - @as(i128, days) * shared.NS_PER_DAY;
     const date = shared.epochDaysToISODate(days);
@@ -407,7 +418,11 @@ fn instantToStringPrec(arena: std.mem.Allocator, ns: i128, prec: shared.SecondsP
     try shared.appendPadded(arena, &buf, date.day, 2);
     try buf.append(arena, 'T');
     try buf.appendSlice(arena, try plain_time.timeToStringPrec(arena, tr.time, prec));
-    try buf.append(arena, 'Z');
+    if (offset_ns) |off| {
+        try buf.appendSlice(arena, try @import("timezone.zig").formatOffset(arena, off));
+    } else {
+        try buf.append(arena, 'Z');
+    }
     return buf.items;
 }
 

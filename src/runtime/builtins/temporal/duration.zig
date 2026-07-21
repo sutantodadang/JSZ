@@ -741,6 +741,31 @@ pub fn roundRelativeBalanced(
     return .{ .d = out, .total = value };
 }
 
+/// TotalRelativeDuration. Unlike round(), total() does *not* re-difference the
+/// span first: it nudges from the duration's own year/month/week/day fields, so
+/// P1M measured in months against Jan 31 spans Feb 29 → Mar 31, not the 29 days
+/// that re-balancing P1M into "29 days" would suggest.
+fn totalRelative(arena: std.mem.Allocator, d0: DurationFields, R: ISODate, u: shared.Unit) !f64 {
+    const DAY = shared.NS_PER_DAY;
+    const time_ns = timePartNanos(d0);
+    const extra_days = @divTrunc(time_ns, DAY);
+    const time_rem = time_ns - extra_days * DAY;
+    const days = d0.days + @as(f64, @floatFromInt(extra_days));
+    const dest_date = try pd.addISODate(R, d0.years, d0.months, d0.weeks, days, .constrain, arena);
+    const dest_ns: i128 = @as(i128, epochDaysOf(dest_date) - epochDaysOf(R)) * DAY + time_rem;
+
+    // A day and anything smaller has a fixed length here (no time zone), so the
+    // total is a plain division.
+    if (durUnitRank(u) >= durUnitRank(.day)) {
+        const per = shared.unitLengthNanos(u).?;
+        return @as(f64, @floatFromInt(dest_ns)) / @as(f64, @floatFromInt(per));
+    }
+    const bal = DurationFields{ .years = d0.years, .months = d0.months, .weeks = d0.weeks, .days = days };
+    const s = d0.sign();
+    const rr = try roundRelativeBalanced(arena, bal, R, dest_ns, u, u, 1, .trunc, if (s < 0) -1 else 1);
+    return rr.total;
+}
+
 pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const d = try requireDuration(arena, this_val);
     // Parse options: a bare string is shorthand for { smallestUnit }.
@@ -882,8 +907,7 @@ pub fn nativeTotal(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     if (hasCalendarUnits(d.*) or isCalendarUnit(u)) {
         const R = (try readRelativeDate(arena, opts)) orelse
             return realm_mod.throwRangeError(arena, "Duration.total with calendar units requires relativeTo");
-        const res = try roundRelative(arena, d.*, R, u, u, 1, .trunc);
-        return val_mod.makeNumber(arena, res.total);
+        return val_mod.makeNumber(arena, try totalRelative(arena, d.*, R, u));
     }
     const per = shared.unitLengthNanos(u) orelse return realm_mod.throwRangeError(arena, "calendar unit needs relativeTo");
     const total = timeDurationNanos(d.*);

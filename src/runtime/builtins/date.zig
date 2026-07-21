@@ -69,6 +69,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "toLocaleString", nativeDateToLocaleString },
         .{ "toLocaleDateString", nativeDateToLocaleDateString },
         .{ "toLocaleTimeString", nativeDateToLocaleTimeString },
+        .{ "toTemporalInstant", nativeDateToTemporalInstant },
     });
     active_date_proto = date_proto;
 
@@ -615,6 +616,15 @@ pub fn nativeDateCtor(arena: std.mem.Allocator, this_val: Value, args: []const V
 }
 
 // ------------------------------------------------------------------ prototype methods ---
+
+/// Date.prototype.toTemporalInstant: the same point in time as a
+/// Temporal.Instant. An Invalid Date has no instant to name.
+pub fn nativeDateToTemporalInstant(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return realm_mod.throwRangeError(arena, "Invalid Date has no Temporal.Instant");
+    const instant = @import("temporal/instant.zig");
+    return instant.makeInstant(arena, @as(i128, dd.ms) * 1_000_000);
+}
 
 pub fn nativeDateGetTime(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const dd = try requireDate(arena, this_val);
