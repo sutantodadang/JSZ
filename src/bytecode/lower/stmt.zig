@@ -275,7 +275,7 @@ pub fn lowerWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     const patch_exit = self.currentOffset();
     try self.emitI16(0);
 
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
     try self.compileStmt(ws.body, last_expr_reg);
 
     // Jump back to loop start (continue lands here too: re-eval cond).
@@ -297,7 +297,7 @@ pub fn lowerDoWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) err
     try self.resetCompletion(line);
     const loop_start = self.currentOffset();
 
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
     try self.compileStmt(dw.body, last_expr_reg);
 
     // continue in a do-while jumps to the condition test.
@@ -355,7 +355,7 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         try self.emitI16(0);
     }
 
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
     try self.compileStmt(fs.body, last_expr_reg);
 
     // continue in a for-loop runs the update expression, then re-tests.
@@ -469,7 +469,7 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         // A `return`/`break`/`continue` inside the try body must POP_TRY this
         // handler on the way out (null = no finalizer to run). The catch body is
         // not protected by it, so it is popped before the catch compiles.
-        try self.finally_stack.append(self.arena, null);
+        try self.finally_stack.append(self.arena, .{ .finalizer = null });
         self.sp = saved_sp;
         try self.compileStmt(ts.block, last_expr_reg);
         self.sp = saved_sp;
@@ -521,7 +521,7 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     const k_normal = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 0));
     const k_throw = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 2));
 
-    try self.finally_stack.append(self.arena, fin);
+    try self.finally_stack.append(self.arena, .{ .finalizer = fin });
 
     // An exception in the try body lands in rcv.
     try self.emitOp(.PUSH_TRY, line);
@@ -623,19 +623,30 @@ pub fn runPendingFinally(self: *FnCompiler, rv_reg: ?u8, floor: usize, line: u32
     var i = self.finally_stack.items.len;
     while (i > floor) {
         i -= 1;
-        const fin = self.finally_stack.items[i];
-        // Remove this try's runtime handler; the finalizer (and the completion)
+        // Remove this region's runtime handler; the cleanup (and the completion)
         // run outside its protection.
         try self.emitOp(.POP_TRY, line);
-        if (fin) |fnode| {
-            const saved_len = self.finally_stack.items.len;
-            self.finally_stack.items.len = i; // only outer try-blocks stay active
-            const saved_sp = self.sp;
-            if (rv_reg) |r| self.sp = r + 1; // pin the return value
-            var dummy: ?u8 = null;
-            try self.compileStmt(fnode, &dummy);
-            self.sp = saved_sp;
-            self.finally_stack.items.len = saved_len;
+        switch (self.finally_stack.items[i]) {
+            .finalizer => |fin| if (fin) |fnode| {
+                const saved_len = self.finally_stack.items.len;
+                self.finally_stack.items.len = i; // only outer try-blocks stay active
+                const saved_sp = self.sp;
+                if (rv_reg) |r| self.sp = r + 1; // pin the return value
+                var dummy: ?u8 = null;
+                try self.compileStmt(fnode, &dummy);
+                self.sp = saved_sp;
+                self.finally_stack.items.len = saved_len;
+            },
+            // Leaving a for-of early (`break`/`continue L`/`return`) closes its
+            // iterator. This is a non-throw completion, so IteratorClose's own
+            // errors — a throwing or non-Object `return()` — propagate.
+            .close_iter => |riter| {
+                const saved_sp = self.sp;
+                if (rv_reg) |r| self.sp = @max(self.sp, r + 1); // pin the return value
+                const scratch = self.allocReg();
+                try self.emitDestrCall("__destrIterClose__", riter, null, scratch, line);
+                self.sp = saved_sp;
+            },
         }
     }
 }
@@ -736,7 +747,10 @@ pub fn lowerContinueStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
     // Run (and POP_TRY) any try-blocks opened inside the loop, then unwind block
     // scopes, before jumping to the loop's continue target.
     if (target_idx) |ti| {
-        try runPendingFinally(self, null, self.loop_stack.items[ti].finally_depth, line);
+        // `continue` re-enters the target loop, so its own for-of IteratorClose
+        // cleanup must NOT run (any *inner* for-of between here and the target
+        // still does, since those loops are being left).
+        try runPendingFinally(self, null, self.loop_stack.items[ti].continue_finally_depth, line);
         try self.emitExitScopesTo(self.loop_stack.items[ti].scope_depth, line);
     }
     try self.emitOp(.JMP, line);
@@ -783,10 +797,33 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         // Completion value: a loop's value starts fresh at `undefined`. No-op
         // outside implicit-return (completion-value) compilation.
         try self.resetCompletion(line);
-        // Permanent registers (riter, rstep) sit below iter_sp; the
+        // Any abrupt exit from the loop must run IteratorClose (ECMA-262 7.4.5
+        // ForIn/OfBodyEvaluation): a throw or generator `.return()` lands in the
+        // handler below, while `break` / `return` / a `continue` targeting an
+        // OUTER loop unwind through the `close_iter` cleanup. Only exhausting
+        // the iterator, or a `continue` back into this same loop, skips it.
+        //
+        // The protected region starts AFTER `next()` and the `done`/`value`
+        // reads: those set [[Done]] before their abrupt return, so a throwing
+        // `next()` must NOT be followed by a close. The region therefore opens
+        // per-iteration, and this leading PUSH_TRY is the counterpart of the
+        // POP_TRY that `loop_start` runs before every step (including the very
+        // first one and every `continue`), which keeps the try stack balanced.
+        const rexc = self.allocReg();
+        self.freeReg(); // PUSH_TRY reserves it
+        var handler_patches = std.ArrayList(usize){};
+        try self.emitOp(.PUSH_TRY, line);
+        try self.emitU8(rexc);
+        try handler_patches.append(self.arena, self.currentOffset());
+        try self.emitI16(0);
+        // Recorded BEFORE the cleanup is pushed, so `break` unwinds through it.
+        const break_finally_depth = self.finally_stack.items.len;
+        try self.finally_stack.append(self.arena, .{ .close_iter = riter });
+        // Permanent registers (riter, rstep, rexc) sit below iter_sp; the
         // per-iteration temporaries above it are reclaimed each pass.
         const iter_sp = self.sp;
         const loop_start = self.currentOffset();
+        try self.emitOp(.POP_TRY, line);
         {
             const b = self.allocReg();
             const si = try self.builder.addConstant(try val_mod.makeString(self.arena, if (fo.is_await) "__asyncIterStep__" else "__iterStep__"));
@@ -830,6 +867,12 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         try self.emitU8(rval);
         try self.emitU8(rstep);
         try self.emitU16(@intCast(vi));
+        // From here on the iterator is live and un-exhausted: re-arm the handler
+        // so a failing binding/destructuring or a throwing body closes it.
+        try self.emitOp(.PUSH_TRY, line);
+        try self.emitU8(rexc);
+        try handler_patches.append(self.arena, self.currentOffset());
+        try self.emitI16(0);
         const loop_decl_kind: ?VarKind = switch (fo.left.kind) {
             .var_decl => fo.left.data.var_decl.kind,
             else => null,
@@ -871,7 +914,14 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         // it; `continue` jumps to loop_start, which advances the iterator (re-calls
         // __iterStep__) before the next done-check. scope_depth is the depth
         // *outside* the per-iteration scope so break/continue unwind it.
-        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = outer_depth, .finally_depth = self.finally_stack.items.len });
+        try self.loop_stack.append(self.arena, LoopCtx{
+            .label = loop_lbl,
+            .scope_depth = outer_depth,
+            // `break` leaves the loop, so it unwinds the IteratorClose cleanup;
+            // `continue` re-enters it, so it stops just above.
+            .finally_depth = break_finally_depth,
+            .continue_finally_depth = self.finally_stack.items.len,
+        });
         try self.compileStmt(fo.body, last_expr_reg);
         if (is_lexical_loopvar) {
             try self.emitOp(.EXIT_SCOPE, line);
@@ -881,8 +931,43 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         const back = self.currentOffset();
         try self.emitI16(0);
         self.patchJump(back, loop_start);
+        _ = self.finally_stack.pop(); // out of the protected region
+        // Iterator exhausted (or its `next()`/`done`/`value` threw): the handler
+        // was already popped at `loop_start`, and the iterator completed on its
+        // own, so nothing to close.
+        self.patchJump(patch_exit, self.currentOffset());
+        try self.emitOp(.JMP, line);
+        const jmp_after = self.currentOffset();
+        try self.emitI16(0);
+        // Handler: the completion is in `rexc`, so every call here allocates
+        // above it. A throw completion wins outright (IteratorClose's own errors
+        // are discarded); a generator return-completion is not a throw, so a
+        // throwing or non-Object `return()` replaces it.
+        for (handler_patches.items) |hp| self.patchJump(hp, self.currentOffset());
+        self.sp = rexc + 1;
+        try self.emitOp(.JMP_IF_RET_COMPL, line);
+        try self.emitU8(rexc);
+        const ret_compl_patch = self.currentOffset();
+        try self.emitI16(0);
+        {
+            const scratch = self.allocReg();
+            try self.emitDestrCall("__destrIterCloseThrow__", riter, null, scratch, line);
+            self.sp = rexc + 1;
+        }
+        try self.emitOp(.THROW, line);
+        try self.emitU8(rexc);
+        self.patchJump(ret_compl_patch, self.currentOffset());
+        {
+            const scratch = self.allocReg();
+            try self.emitDestrCall("__destrIterClose__", riter, null, scratch, line);
+            self.sp = rexc + 1;
+        }
+        try self.emitOp(.THROW, line);
+        try self.emitU8(rexc);
+        // `break` targets land here: each already emitted its own POP_TRY and
+        // IteratorClose while unwinding.
         const exit_offset = self.currentOffset();
-        self.patchJump(patch_exit, exit_offset);
+        self.patchJump(jmp_after, exit_offset);
         self.resolveLoop(loop_start, exit_offset);
         self.sp = base_sp;
         return;
@@ -1075,6 +1160,7 @@ pub fn lowerSwitchStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
         .label = null,
         .scope_depth = self.block_scope_depth,
         .finally_depth = self.finally_stack.items.len,
+        .continue_finally_depth = self.finally_stack.items.len,
         .is_switch = true,
     });
 

@@ -351,6 +351,7 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__destrIterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeDestrIterStep));
         try realm.global_env.define("__destrIterRest__", try val_mod.makeNativeFunction(arena, es2015.nativeDestrIterRest));
         try realm.global_env.define("__destrIterClose__", try val_mod.makeNativeFunction(arena, es2015.nativeDestrIterClose));
+        try realm.global_env.define("__destrIterCloseThrow__", try val_mod.makeNativeFunction(arena, es2015.nativeDestrIterCloseThrow));
         try realm.global_env.define("__destrObjRest__", try val_mod.makeNativeFunction(arena, es2015.nativeDestrObjRest));
         try realm.global_env.define("__objSpreadInto__", try val_mod.makeNativeFunction(arena, es2015.nativeObjSpreadInto));
         try realm.global_env.define("__makeNamespace__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeNamespace));

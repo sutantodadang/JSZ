@@ -2307,17 +2307,37 @@ pub fn nativeDestrIterStep(arena: std.mem.Allocator, _: Value, args: []const Val
     if (box) |b| {
         if (b.get("done")) |dv| if (isTruthy(dv)) return val_mod.makeUndefined(arena);
     }
-    const r = try nativeIterStep(arena, Value{}, &[_]Value{it});
+    // Every abrupt exit below leaves the iterator [[Done]] — a throwing `next()`,
+    // a bad result object, or a throwing done/value getter all set [[Done]] to
+    // true before propagating (7.4.6/7.4.7), which is what suppresses the
+    // IteratorClose that would otherwise follow.
+    const r = nativeIterStep(arena, Value{}, &[_]Value{it}) catch |e| {
+        try markDone(arena, box);
+        return e;
+    };
     if (r.bits == 0 or r.unbox() != .object) {
+        try markDone(arena, box);
         realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
         return error.JsException;
     }
-    const done = try ctx.getProp(arena, r, "done");
+    const done = ctx.getProp(arena, r, "done") catch |e| {
+        try markDone(arena, box);
+        return e;
+    };
     if (isTruthy(done)) {
-        if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
+        try markDone(arena, box);
         return val_mod.makeUndefined(arena);
     }
-    return try ctx.getProp(arena, r, "value");
+    return ctx.getProp(arena, r, "value") catch |e| {
+        try markDone(arena, box);
+        return e;
+    };
+}
+
+/// Mark the destructuring done-box exhausted, so a later `__destrIterClose__`
+/// call is a no-op (the spec's `iteratorRecord.[[Done]] = true`).
+fn markDone(arena: std.mem.Allocator, box: ?*JsObject) !void {
+    if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
 }
 
 /// __destrIterRest__(iterator, box): collect the remaining iterator values into a
@@ -2334,17 +2354,29 @@ pub fn nativeDestrIterRest(arena: std.mem.Allocator, _: Value, args: []const Val
     var n: usize = 0;
     while (true) {
         if (box) |b| if (b.get("done")) |dv| if (isTruthy(dv)) break;
-        const r = try nativeIterStep(arena, Value{}, &[_]Value{it});
+        // As in __destrIterStep__, any abrupt exit leaves the iterator [[Done]],
+        // which suppresses the IteratorClose that would otherwise follow.
+        const r = nativeIterStep(arena, Value{}, &[_]Value{it}) catch |e| {
+            try markDone(arena, box);
+            return e;
+        };
         if (r.bits == 0 or r.unbox() != .object) {
+            try markDone(arena, box);
             realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
             return error.JsException;
         }
-        const done = try ctx.getProp(arena, r, "done");
+        const done = ctx.getProp(arena, r, "done") catch |e| {
+            try markDone(arena, box);
+            return e;
+        };
         if (isTruthy(done)) {
-            if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
+            try markDone(arena, box);
             break;
         }
-        const v = try ctx.getProp(arena, r, "value");
+        const v = ctx.getProp(arena, r, "value") catch |e| {
+            try markDone(arena, box);
+            return e;
+        };
         const key = try std.fmt.allocPrint(arena, "{d}", .{n});
         try arr.set(key, v);
         n += 1;
@@ -2365,9 +2397,41 @@ pub fn nativeDestrIterClose(arena: std.mem.Allocator, _: Value, args: []const Va
     if (it.bits == 0 or it.unbox() != .object) return val_mod.makeUndefined(arena);
     const ret = try ctx.getProp(arena, it, "return");
     if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_) return val_mod.makeUndefined(arena);
-    if (!isCallable(ret)) return val_mod.makeUndefined(arena);
-    _ = try function_proto.invokeCallback(arena, it, ret, &[_]Value{});
+    // GetMethod: a present-but-uncallable `return` is a TypeError.
+    if (!isCallable(ret)) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'return' is not a function");
+        return error.JsException;
+    }
+    const inner = try function_proto.invokeCallback(arena, it, ret, &[_]Value{});
+    // IteratorClose step 6: after a NORMAL completion, `return()` must yield an
+    // Object. (On an abrupt completion the original error wins and this check is
+    // skipped — that path runs through `__destrIterCloseThrow__`.)
+    if (inner.bits == 0 or inner.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'return' did not return an object");
+        return error.JsException;
+    }
     return val_mod.makeUndefined(arena);
+}
+
+/// __destrIterCloseThrow__(iterator, box): IteratorClose for an ABRUPT (throw)
+/// completion of an array destructuring pattern — the element's target reference
+/// or its assignment threw, so the iterator must still be closed, but any error
+/// from `return()` (including a non-Object result) is DISCARDED so the original
+/// exception is what propagates (ECMA-262 7.4.9 step 5). Never throws.
+pub fn nativeDestrIterCloseThrow(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const undef = try val_mod.makeUndefined(arena);
+    const ctx = realm_mod.active_context orelse return undef;
+    const it = if (args.len > 0) args[0] else return undef;
+    const box = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    if (box) |b| if (b.get("done")) |dv| if (isTruthy(dv)) return undef;
+    if (it.bits == 0 or it.unbox() != .object) return undef;
+    const saved = realm_mod.pending_exception;
+    defer realm_mod.pending_exception = saved;
+    const ret = ctx.getProp(arena, it, "return") catch return undef;
+    if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_) return undef;
+    if (!isCallable(ret)) return undef;
+    _ = function_proto.invokeCallback(arena, it, ret, &[_]Value{}) catch return undef;
+    return undef;
 }
 
 /// __destrObjRest__(src, excludeKeys): CopyDataProperties into a fresh plain
@@ -2384,46 +2448,99 @@ pub fn nativeDestrIterClose(arena: std.mem.Allocator, _: Value, args: []const Va
 ///
 /// `src` is non-object (e.g. a primitive) only via unusual call sites — the
 /// pattern desugar always runs `__requireObjectCoercible__` first, but that
-/// only rejects null/undefined, not other primitives — so a non-object `src`
-/// yields an empty result rather than a crash.
+/// only rejects null/undefined, not other primitives — so a primitive `src` is
+/// treated as ToObject(src): a String contributes its indexed code units, every
+/// other wrapper has no own enumerable properties and yields an empty result.
 pub fn nativeDestrObjRest(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const out = try JsObject.create(arena, realm_mod.active_object_proto);
     const src = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    if (src.bits == 0 or src.unbox() != .object) return val_mod.makeObject(arena, out);
-    const src_obj = src.toPtr().object;
-    const excl_list: ?*JsObject = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
-    const ctx = realm_mod.active_context;
-    // The exclusion list is an ordinary array built by the desugar; snapshot it
-    // once instead of re-reading a decimal key per (key, exclusion) pair.
-    var excluded: []const Value = &[_]Value{};
-    if (excl_list) |ex| {
-        const n: usize = ex.array_length;
-        const buf = try arena.alloc(Value, n);
+    if (src.bits == 0 or src.unbox() == .undefined_ or src.unbox() == .null_)
+        return val_mod.makeObject(arena, out);
+
+    // Normalize the exclusion list once: each entry goes through ToPropertyKey,
+    // so a computed key like `{[1.]: b, ...rest}` excludes "1" and a Symbol key
+    // excludes that symbol (compared by SymbolData identity, not description).
+    var excl_str = std.ArrayList([]const u8){};
+    var excl_sym = std.ArrayList(*val_mod.SymbolData){};
+    if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) {
+        const ex = args[1].toPtr().object;
         var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
-            buf[i] = ex.getOwn(ek) orelse try val_mod.makeUndefined(arena);
+        while (i < ex.array_length) : (i += 1) {
+            const ev = ex.getIndexOwn(@intCast(i)) orelse continue;
+            if (ev.bits != 0 and ev.unbox() == .symbol) {
+                try excl_sym.append(arena, ev.toPtr().symbol);
+            } else {
+                try excl_str.append(arena, try toPropertyKeyString(arena, ev));
+            }
         }
-        excluded = buf;
     }
+
+    // ToObject(src) for primitives: only a String has own enumerable properties
+    // (its indexed code units); Number/Boolean/Symbol/BigInt wrappers have none,
+    // so they simply yield an empty object rather than throwing.
+    if (src.unbox() == .string) {
+        const s = src.unbox().string;
+        var i: usize = 0;
+        outer_str: while (i < s.len) : (i += 1) {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            for (excl_str.items) |e| if (std.mem.eql(u8, e, idx_key)) continue :outer_str;
+            const ch = try val_mod.makeString(arena, try arena.dupe(u8, s[i .. i + 1]));
+            try out.set(idx_key, ch);
+        }
+        return val_mod.makeObject(arena, out);
+    }
+    if (src.unbox() != .object) return val_mod.makeObject(arena, out);
+
+    // CopyDataProperties: read each own enumerable key through [[Get]] (so
+    // getters run and their VALUE is copied) and write it as a plain data
+    // property — the copy is always writable/enumerable/configurable regardless
+    // of the source descriptor. String keys precede symbol keys, matching
+    // OwnPropertyKeys order (integer indices, then insertion order, then symbols).
+    const src_obj = src.toPtr().object;
+    const ctx = realm_mod.active_context;
+
+    // Proxy source: drive [[OwnPropertyKeys]] then [[GetOwnProperty]] through the
+    // traps in trap order (strings and symbols interleaved exactly as ownKeys
+    // returned them) — a raw own-key scan would bypass the handler. Excluded keys
+    // are filtered BEFORE the descriptor trap runs, so `{a, ...rest}` never calls
+    // getOwnPropertyDescriptor for "a".
+    if (src_obj.internal_kind == .proxy) {
+        const proxy_mod = @import("proxy.zig");
+        const keys = (try proxy_mod.proxyOwnKeys(arena, src_obj)) orelse return val_mod.makeObject(arena, out);
+        keys: for (keys) |kv| {
+            const is_sym = kv.bits != 0 and kv.unbox() == .symbol;
+            if (is_sym) {
+                for (excl_sym.items) |e| if (e == kv.toPtr().symbol) continue :keys;
+            } else {
+                const ks_pre = try toPropertyKeyString(arena, kv);
+                for (excl_str.items) |e| if (std.mem.eql(u8, e, ks_pre)) continue :keys;
+            }
+            const desc = (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, src_obj, kv)) orelse continue;
+            if (desc.bits == 0 or desc.unbox() != .object) continue;
+            const en = desc.toPtr().object.getOwn("enumerable") orelse Value{};
+            if (!(en.bits != 0 and isTruthy(en))) continue;
+            const c = ctx orelse continue;
+            if (is_sym) {
+                try out.setSym(kv, try c.getPropSym(arena, src, kv));
+            } else {
+                const ks = try toPropertyKeyString(arena, kv);
+                try out.set(ks, try c.getProp(arena, src, ks));
+            }
+        }
+        return val_mod.makeObject(arena, out);
+    }
+
     outer: for (src_obj.ownKeys()) |k| {
         if (!src_obj.isEnumerable(k)) continue;
-        for (excluded) |ev| {
-            // A computed key's value is compared as a *property key*, so
-            // `{[1]: a, ...rest}` excludes the key "1".
-            if (ev.bits == 0 or ev.unbox() == .symbol) continue;
-            const ek = toPropertyKeyString(arena, ev) catch continue;
-            if (std.mem.eql(u8, ek, k)) continue :outer;
-        }
+        for (excl_str.items) |e| if (std.mem.eql(u8, e, k)) continue :outer;
         const v = if (ctx) |c| try c.getProp(arena, src, k) else (src_obj.getOwn(k) orelse continue);
         try out.set(k, v);
     }
     outer_sym: for (src_obj.symKeys()) |sp| {
         if (!sp.attr.enumerable) continue;
-        for (excluded) |ev| {
-            if (ev.bits == 0 or ev.unbox() != .symbol) continue;
-            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and
-                ev.toPtr().symbol == sp.key.toPtr().symbol) continue :outer_sym;
+        if (sp.key.bits != 0 and sp.key.unbox() == .symbol) {
+            const sd = sp.key.toPtr().symbol;
+            for (excl_sym.items) |e| if (e == sd) continue :outer_sym;
         }
         const v = if (ctx) |c| try c.getPropSym(arena, src, sp.key) else sp.value;
         try out.setSym(sp.key, v);
@@ -2576,8 +2693,24 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
 pub fn nativeIterStep(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const it = if (args.len > 0) args[0] else return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     if (it.bits == 0 or it.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
-    const nx = it.toPtr().object.get("next") orelse return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
-    return function_proto.invokeCallback(arena, it, nx, &[_]Value{});
+    // Observable [[Get]] so an accessor or a Proxy `get` trap supplies `next`
+    // (a raw own-slot read finds nothing on a Proxy). Falls back to the raw
+    // read when no Context is active, and an absent `next` still ends the
+    // iteration rather than throwing — internal call sites rely on that.
+    const nx = if (realm_mod.active_context) |ctx| blk: {
+        const m = try ctx.getProp(arena, it, "next");
+        if (m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)
+            return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+        break :blk m;
+    } else it.toPtr().object.get("next") orelse
+        return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const r = try function_proto.invokeCallback(arena, it, nx, &[_]Value{});
+    // IteratorNext step 3: a non-Object iterator result is a TypeError.
+    if (r.bits == 0 or r.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
+        return error.JsException;
+    }
+    return r;
 }
 
 /// __getAsyncIterator__(x): obtain an async iterator for `for await`. Uses the
@@ -2612,7 +2745,52 @@ pub fn nativeGetAsyncIterator(arena: std.mem.Allocator, _: Value, args: []const 
         try JsObject.create(arena, null);
     try wrap.set("__syncit__", sync_it);
     try wrap.set("next", try val_mod.makeNativeFunctionNamed(arena, nativeAsyncFromSyncNext, "next", 0));
+    // %AsyncFromSyncIteratorPrototype%.return forwards to the wrapped sync
+    // iterator, so `break`/`throw` out of a `for await` over a sync iterable
+    // still runs its `return()`.
+    try wrap.set("return", try val_mod.makeNativeFunctionNamed(arena, nativeAsyncFromSyncReturn, "return", 1));
     return val_mod.makeObject(arena, wrap);
+}
+
+/// return() of an AsyncFromSyncIterator: IteratorClose the wrapped sync
+/// iterator and hand back a settled promise of the result. A sync iterator with
+/// no `return` method completes with `{value, done: true}`.
+fn nativeAsyncFromSyncReturn(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const promise_mod = @import("promise.zig");
+    const p = try promise_mod.newPendingPromise(arena);
+    const arg = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const done_result = try makeIteratorResult(arena, arg, true);
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        promise_mod.settleResult(arena, p, done_result, true);
+        return p;
+    }
+    const sync_it = this_val.toPtr().object.get("__syncit__") orelse Value{};
+    if (sync_it.bits == 0 or sync_it.unbox() != .object) {
+        promise_mod.settleResult(arena, p, done_result, true);
+        return p;
+    }
+    const ctx = realm_mod.active_context orelse {
+        promise_mod.settleResult(arena, p, done_result, true);
+        return p;
+    };
+    const ret = ctx.getProp(arena, sync_it, "return") catch {
+        promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+        return p;
+    };
+    if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_ or !isCallable(ret)) {
+        promise_mod.settleResult(arena, p, done_result, true);
+        return p;
+    }
+    const r = function_proto.invokeCallback(arena, sync_it, ret, &[_]Value{arg}) catch {
+        promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+        return p;
+    };
+    if (r.bits == 0 or r.unbox() != .object) {
+        promise_mod.settleResult(arena, p, try makeTypeErrorVal(arena, "iterator 'return' did not return an object"), false);
+        return p;
+    }
+    promise_mod.settleResult(arena, p, r, true);
+    return p;
 }
 
 /// next() of an AsyncFromSyncIterator: step the underlying sync iterator and

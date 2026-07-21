@@ -886,9 +886,10 @@ pub fn parseObjectPattern(p: *Parser) ?*Node {
             target = p.makeNode(.identifier, start, start, .{ .identifier = key }) orelse return null;
         }
         if (p.match(.eq)) {
-            // NamedEvaluation: `{ cls = class {} }` names the anonymous class
-            // after the binding it initializes. Classes are named at parse time,
-            // so the hint is set here rather than in the compiler.
+            // NamedEvaluation: `var { cls = class {} } = x` names the anonymous
+            // class after the binding it initializes. The class desugars to an
+            // IIFE the compiler's name-hint cannot reach, so the name travels
+            // via the parser hint instead.
             const set_class_hint = target.kind == .identifier and
                 p.check(.kw_class) and p.export_default_name_hint == null;
             if (set_class_hint) p.export_default_name_hint = target.data.identifier;
@@ -1979,8 +1980,10 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
         // using this form is a refinement error we currently accept.
         if (p.check(.eq)) {
             _ = p.advance();
-            // NamedEvaluation: the default names an anonymous class after the
-            // binding, same as `{ key: class {} }` below.
+            // NamedEvaluation: `{ cls = class {} } = x` names the anonymous class
+            // after the target binding, same as `{ key: class {} }` below — the
+            // class desugars to an IIFE, so the name must travel via the parser
+            // hint rather than the compiler's function name-hint.
             const set_init_class_hint = p.check(.kw_class) and p.export_default_name_hint == null;
             if (set_init_class_hint) p.export_default_name_hint = key;
             const def = p.parseAssignmentExpr() orelse return null;
