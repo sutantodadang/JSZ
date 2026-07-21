@@ -235,8 +235,11 @@ pub fn addISODate(date: ISODate, years: f64, months: f64, weeks: f64, days: f64,
     // is inserted ahead of it.
     var base_month = f.month;
     if (years != 0) {
-        const anchor_y = calendar.toIsoFromCode(cal, @intCast(y0), f.code_num, f.code_leap, 1, .constrain) catch
-            return realm_mod.throwRangeError(arena, "date out of range");
+        // The destination year may not have the month code at all — a Chinese
+        // leap month exists only in the years that interpolate it — which
+        // "reject" treats as an error rather than collapsing onto a neighbour.
+        const anchor_y = calendar.toIsoFromCode(cal, @intCast(y0), f.code_num, f.code_leap, 1, overflow) catch
+            return realm_mod.throwRangeError(arena, "no such month in the target year");
         base_month = calendar.fields(cal, anchor_y).month;
     }
     const ym = calendar.addMonths(cal, @intCast(y0), base_month, @intFromFloat(months)) catch
