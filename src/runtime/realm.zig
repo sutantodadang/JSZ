@@ -4687,6 +4687,9 @@ pub const Realm = struct {
             // Intl.NumberFormat
             const nf_proto = try JsObject.create(arena, object_proto);
             try IntlReg.method(arena, nf_proto, "format", intl_mod.nativeNumberFormatFormat, 0);
+            try IntlReg.method(arena, nf_proto, "formatToParts", intl_mod.nativeNumberFormatFormatToParts, 1);
+            try IntlReg.method(arena, nf_proto, "formatRange", intl_mod.nativeNumberFormatFormatRange, 2);
+            try IntlReg.method(arena, nf_proto, "formatRangeToParts", intl_mod.nativeNumberFormatFormatRangeToParts, 2);
             try IntlReg.method(arena, nf_proto, "resolvedOptions", intl_mod.nativeNumberFormatResolved, 0);
             const nf_ctor = try JsObject.create(arena, function_proto);
             try nf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeNumberFormatCtor));
