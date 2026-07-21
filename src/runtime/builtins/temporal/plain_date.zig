@@ -222,7 +222,15 @@ pub fn addISODate(date: ISODate, years: f64, months: f64, weeks: f64, days: f64,
     const f = calendar.fields(cal, date);
     const y0: i128 = @as(i128, f.year) + @as(i128, @intFromFloat(years));
     if (y0 > 300_000 or y0 < -300_000) return realm_mod.throwRangeError(arena, "date out of range");
-    const ym = calendar.addMonths(cal, @intCast(y0), f.month, @intFromFloat(months)) catch
+    // Years move in *month-code* space, not ordinal space: on a lunisolar
+    // calendar the same code sits at a different ordinal in a leap year, and a
+    // leap code may not exist in the target year at all — which `reject` must
+    // surface rather than silently landing on a neighbouring month.
+    if (overflow == .reject and calendar.monthFromCode(cal, @intCast(y0), f.code_num, f.code_leap) == null) {
+        return realm_mod.throwRangeError(arena, "month code does not exist in that year");
+    }
+    const m0 = calendar.monthFromCodeConstrained(cal, @intCast(y0), f.code_num, f.code_leap);
+    const ym = calendar.addMonths(cal, @intCast(y0), m0, @intFromFloat(months)) catch
         return realm_mod.throwRangeError(arena, "date out of range");
 
     const dim = calendar.daysInMonth(cal, ym.year, ym.month);
@@ -294,40 +302,118 @@ pub fn differenceISODate(d1: ISODate, d2: ISODate, largest: shared.Unit) shared.
             return out;
         },
         else => {
-            // year / month: order earlier→later, compute, then re-sign.
-            const sign: i8 = cmp; // -1 if d1<d2, +1 if d1>d2
-            const a = if (sign < 0) d1 else d2;
-            const b = if (sign < 0) d2 else d1;
-            // Whole months between a and b, measured in the receiver's calendar.
+            // Years and months are counted by advancing a candidate date one
+            // unit at a time and asking whether it has passed the target. The
+            // test deliberately keeps the *unclamped* start day, which is what
+            // makes Jan 29th → Feb 28th "30 days" rather than "one month": a
+            // step that only lands on the target because the day had to be
+            // clamped into a shorter month has not really covered a month.
+            const sign: i8 = -cmp; // +1 when d1 is the earlier date
             const cal = d1.calendar;
-            const fa = calendar.fields(cal, a);
-            const fb = calendar.fields(cal, b);
-            var total_months: i64 = calendar.absoluteMonth(cal, fb.year, fb.month) -
-                calendar.absoluteMonth(cal, fa.year, fa.month);
-            var cand = addMonthsConstrain(a, total_months);
-            if (compareISODate(cand, b) > 0) {
-                total_months -= 1;
-                cand = addMonthsConstrain(a, total_months);
-            }
-            const days = shared.isoDateToEpochDays(b.year, b.month, b.day) - shared.isoDateToEpochDays(cand.year, cand.month, cand.day);
+            const f1 = calendar.fields(cal, d1);
+            const f2 = calendar.fields(cal, d2);
+
             var years: i64 = 0;
-            var months: i64 = total_months;
             if (largest == .year) {
-                // Split into whole years by walking back whole years from b,
-                // since a calendar year is not always a fixed number of months.
-                years = @divTrunc(total_months, calendar.monthsInYear(cal, fa.year));
-                while (years != 0 and @abs(calendar.absoluteMonth(cal, fa.year + @as(i32, @intCast(years)), fa.month) -
-                    calendar.absoluteMonth(cal, fa.year, fa.month)) > @abs(total_months)) years -= 1;
-                months = total_months - (calendar.absoluteMonth(cal, fa.year + @as(i32, @intCast(years)), fa.month) -
-                    calendar.absoluteMonth(cal, fa.year, fa.month));
+                var candidate: i64 = @as(i64, f2.year) - @as(i64, f1.year);
+                if (candidate != 0) candidate -= sign;
+                while (!yearShiftSurpasses(cal, f1, candidate, f2, sign)) {
+                    years = candidate;
+                    candidate += sign;
+                }
             }
-            const dir: f64 = if (sign < 0) 1 else -1;
-            out.years = @as(f64, @floatFromInt(years)) * dir;
-            out.months = @as(f64, @floatFromInt(months)) * dir;
-            out.days = @as(f64, @floatFromInt(days)) * dir;
+            // The month walk starts from the month `years` whole years away,
+            // resolved by month *code*: on a lunisolar calendar the same code
+            // sits at a different ordinal in a leap year.
+            const base_year: i32 = @intCast(@as(i64, f1.year) + years);
+            const base_month = calendar.monthFromCodeConstrained(cal, base_year, f1.code_num, f1.code_leap);
+            var months: i64 = 0;
+            var candidate_months: i64 = sign;
+            // For a month-only difference the walk would otherwise crawl over
+            // the whole span one month at a time, so seed it near the answer.
+            if (largest != .year) {
+                const span = calendar.absoluteMonth(cal, f2.year, f2.month) -
+                    calendar.absoluteMonth(cal, base_year, base_month);
+                if (@abs(span) > 1) candidate_months = span - sign;
+            }
+            while (calendar.addMonths(cal, base_year, base_month, candidate_months) catch null) |ym| {
+                if (surpasses(ym.year, ym.month, f1.day, f2, sign)) break;
+                months = candidate_months;
+                candidate_months += sign;
+            }
+
+            const start = calendar.addMonths(cal, base_year, base_month, months) catch
+                return out;
+            const intermediate = calendar.toIso(cal, start.year, start.month, f1.day, .constrain) catch
+                return out;
+            const days = shared.isoDateToEpochDays(d2.year, d2.month, d2.day) -
+                shared.isoDateToEpochDays(intermediate.year, intermediate.month, intermediate.day);
+            out.years = signedField(years, false);
+            out.months = signedField(months, false);
+            out.days = signedField(days, false);
             return out;
         },
     }
+}
+
+/// Whether the start date shifted by `n` whole calendar years has moved past
+/// `target` in the `sign` direction.
+fn yearShiftSurpasses(
+    cal: calendar.CalendarId,
+    from: calendar.CalFields,
+    n: i64,
+    target: calendar.CalFields,
+    sign: i8,
+) bool {
+    const y: i64 = @as(i64, from.year) + n;
+    if (y > 300_000 or y < -300_000) return true;
+    const yi: i32 = @intCast(y);
+    const m = calendar.monthFromCodeConstrained(cal, yi, from.code_num, from.code_leap);
+    // A leap month code the shifted year does not have gets constrained onto a
+    // neighbour, and which neighbour decides whether the shift covered a whole
+    // year. Constraining *backwards* (the Chinese M06L → M06) lands short of
+    // where a year would reach, so the shifted date counts as already past its
+    // target; constraining *forwards* (Hebrew's Adar I → Adar) lands exactly on
+    // it, leaving the day to decide.
+    const overshoots = from.code_leap and
+        calendar.monthFromCode(cal, yi, from.code_num, from.code_leap) == null and
+        calendar.constrainedCodeNum(cal, from.code_num) <= from.code_num;
+    const order: i8 = if (yi != target.year)
+        (if (yi < target.year) -1 else 1)
+    else if (m != target.month)
+        (if (m < target.month) -1 else 1)
+    else if (overshoots)
+        1
+    else if (from.day != target.day)
+        (if (from.day < target.day) -1 else 1)
+    else
+        0;
+    return if (sign > 0) order > 0 else order < 0;
+}
+
+/// ISODateSurpasses: whether {y, m, d} lies beyond `target` in the `sign`
+/// direction. The day may exceed its month's length; it is compared as a plain
+/// field, never clamped.
+fn surpasses(y: i32, m: u8, d: u8, target: calendar.CalFields, sign: i8) bool {
+    const order: i8 = if (y != target.year)
+        (if (y < target.year) -1 else 1)
+    else if (m != target.month)
+        (if (m < target.month) -1 else 1)
+    else if (d != target.day)
+        (if (d < target.day) -1 else 1)
+    else
+        0;
+    return if (sign > 0) order > 0 else order < 0;
+}
+
+/// A Duration component, optionally negated. Negating a zero magnitude has to
+/// stay `+0`: Duration fields are observable through `Object.is`, and a
+/// backwards difference whose year component happens to be empty reports 0, not
+/// -0.
+fn signedField(magnitude: i64, negate: bool) f64 {
+    if (magnitude == 0) return 0;
+    const f: f64 = @floatFromInt(magnitude);
+    return if (negate) -f else f;
 }
 
 /// Shift `a` by `n` calendar months, clamping the day into the target month.
@@ -353,11 +439,16 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (unitRank(smallest.?) > unitRank(.day) or unitRank(largest.?) > unitRank(.day))
         return realm_mod.throwRangeError(arena, "PlainDate difference units must be year..day");
     if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    var mode = try shared.getRoundingMode(arena, opts, .trunc);
     const inc = try shared.getRoundingIncrement(arena, opts);
 
-    const from = if (since) other else d.*;
-    const to = if (since) d.* else other;
+    // `since` is `until` run backwards and negated — not the difference from
+    // the argument to the receiver. The distinction matters because the whole
+    // year/month walk is anchored on its starting date, so anchoring on the
+    // argument instead would give different (and unsymmetric) components.
+    if (since) mode = shared.negateRoundingMode(mode);
+    const from = d.*;
+    const to = other;
 
     var result: shared.DurationFields = undefined;
     if (largest.? == smallest.?) {
@@ -372,6 +463,7 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
             result.days = shared.roundNumberToIncrement(result.days, inc, mode);
         }
     }
+    if (since) result = duration.negate(result);
     return duration.makeDuration(arena, result);
 }
 

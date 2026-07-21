@@ -296,7 +296,7 @@ pub fn nativeAbs(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     return makeDuration(arena, r);
 }
 
-fn negate(d: DurationFields) DurationFields {
+pub fn negate(d: DurationFields) DurationFields {
     // Preserve -0 as 0: multiply then add 0.0 to normalize.
     return .{
         .years = -d.years + 0.0,
