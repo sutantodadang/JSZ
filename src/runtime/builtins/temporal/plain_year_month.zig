@@ -107,7 +107,7 @@ pub fn toTemporalYearMonth(arena: std.mem.Allocator, v: Value, overflow: shared.
 }
 
 fn yearMonthFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISODate {
-    const cal = if (o.get("calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
+    const cal = if (try shared.optionGet(arena, o, "calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
     const cal_year = try plain_date.readCalendarYear(arena, o, cal);
     // The stored ISO date is the first day of the calendar month.
     return resolveMonth(arena, o, cal, cal_year, overflow);
@@ -116,8 +116,8 @@ fn yearMonthFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.
 /// Turn whichever of "month" / "monthCode" is present into the ISO date of the
 /// first day of that calendar month.
 fn resolveMonth(arena: std.mem.Allocator, o: *JsObject, cal: calendar.CalendarId, cal_year: i32, overflow: shared.Overflow) !ISODate {
-    const month_v = o.get("month");
-    const mc_v = o.get("monthCode");
+    const month_v = try shared.optionGet(arena, o, "month");
+    const mc_v = try shared.optionGet(arena, o, "monthCode");
     const has_month = month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_;
     const has_code = mc_v != null and mc_v.?.bits != 0 and mc_v.?.unbox() != .undefined_;
     if (has_code) {
@@ -290,8 +290,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "with() requires an object");
     if (getYearMonth(arg) != null) return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
     const o = arg.toPtr().object;
-    if (o.get("calendar") != null and o.get("calendar").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set calendar");
-    if (o.get("timeZone") != null and o.get("timeZone").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
+    if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
     const cal = cur.calendar;
@@ -299,8 +299,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     // Merge over the receiver's own calendar fields.
     var year: i32 = base.year;
     var any = false;
-    const era_v = if (calendar.hasEras(cal)) o.get("era") else null;
-    const era_year_v = if (calendar.hasEras(cal)) o.get("eraYear") else null;
+    const era_v = if (calendar.hasEras(cal)) try shared.optionGet(arena, o, "era") else null;
+    const era_year_v = if (calendar.hasEras(cal)) try shared.optionGet(arena, o, "eraYear") else null;
     const has_era = era_v != null and era_v.?.bits != 0 and era_v.?.unbox() != .undefined_;
     const has_era_year = era_year_v != null and era_year_v.?.bits != 0 and era_year_v.?.unbox() != .undefined_;
     if (has_era != has_era_year) return realm_mod.throwTypeError(arena, "era and eraYear must be provided together");
@@ -314,8 +314,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
         year = floatToI32(x);
         any = true;
     }
-    const month_v = o.get("month");
-    const mc_v = o.get("monthCode");
+    const month_v = try shared.optionGet(arena, o, "month");
+    const mc_v = try shared.optionGet(arena, o, "monthCode");
     const has_month = month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_;
     const has_code = mc_v != null and mc_v.?.bits != 0 and mc_v.?.unbox() != .undefined_;
     if (has_month or has_code) any = true;
@@ -329,8 +329,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
-    const v = o.get(name) orelse return null;
-    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    const v = (try shared.optionGet(arena, o, name)) orelse return null;
     return try shared.toIntegerWithTruncation(arena, v);
 }
 
@@ -347,7 +346,7 @@ pub fn nativeToPlainDate(arena: std.mem.Allocator, this_val: Value, args: []cons
     const arg = if (args.len > 0) args[0] else Value{};
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "toPlainDate requires an object with a day");
     const o = arg.toPtr().object;
-    const day_v = o.get("day") orelse return realm_mod.throwTypeError(arena, "missing day");
+    const day_v = try shared.optionGet(arena, o, "day") orelse return realm_mod.throwTypeError(arena, "missing day");
     if (day_v.bits != 0 and day_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing day");
     const day = try shared.toIntegerWithTruncation(arena, day_v);
     const di = floatToI32(day);

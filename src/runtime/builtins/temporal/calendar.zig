@@ -14,11 +14,13 @@
 //! from the start of the year — so adding a calendar means adding those two
 //! rules and its era labels, not another pair of conversion formulas.
 //!
-//! Not implemented: the astronomical lunisolar calendars (chinese, dangi) and
-//! islamic-umalqura, which need observational or tabulated month data rather
-//! than a closed-form year start.
+//! Three calendars have no such closed form — the astronomical lunisolar pair
+//! (chinese, dangi) and islamic-umalqura — so they read their year starts and
+//! month lengths out of `calendar_data.zig` instead. They plug into exactly the
+//! same two functions, and nothing outside this module can tell the difference.
 const std = @import("std");
 const shared = @import("shared.zig");
+const data = @import("calendar_data.zig");
 const ISODate = shared.ISODate;
 
 pub const CalendarId = enum(u8) {
@@ -40,6 +42,11 @@ pub const CalendarId = enum(u8) {
     indian,
     // Lunisolar: 12 or 13 months, with a leap month interpolated after M05.
     hebrew,
+    // Table-driven (see calendar_data.zig).
+    islamic_umalqura,
+    // Lunisolar with a leap month that can follow any month of the year.
+    chinese,
+    dangi,
 
     /// The canonical BCP-47 `-u-ca-` identifier, as reported by `calendarId`.
     pub fn str(self: CalendarId) []const u8 {
@@ -57,6 +64,9 @@ pub const CalendarId = enum(u8) {
             .persian => "persian",
             .indian => "indian",
             .hebrew => "hebrew",
+            .islamic_umalqura => "islamic-umalqura",
+            .chinese => "chinese",
+            .dangi => "dangi",
         };
     }
 };
@@ -133,10 +143,58 @@ fn isGregorianFamily(cal: CalendarId) bool {
     };
 }
 
+// -------------------------------------------------------- tabulated years ---
+
+/// The generated year table backing `cal`, or null when its year shape is
+/// computed rather than looked up.
+fn yearTable(cal: CalendarId) ?struct { min: i32, starts: []const i32, shapes: []const u32 } {
+    return switch (cal) {
+        .chinese => .{ .min = data.chinese_year_min, .starts = &data.chinese_starts, .shapes = &data.chinese_shapes },
+        .dangi => .{ .min = data.dangi_year_min, .starts = &data.dangi_starts, .shapes = &data.dangi_shapes },
+        .islamic_umalqura => .{ .min = data.umalqura_year_min, .starts = &data.umalqura_starts, .shapes = &data.umalqura_shapes },
+        else => null,
+    };
+}
+
+/// The shape word for `year`, or null when the year falls outside the table.
+fn yearShape(cal: CalendarId, year: i32) ?u32 {
+    const t = yearTable(cal) orelse return null;
+    const idx = @as(i64, year) - t.min;
+    if (idx < 0 or idx >= t.shapes.len) return null;
+    return t.shapes[@intCast(idx)];
+}
+
+/// Mean year length in days, scaled by 10000, used to extrapolate past the ends
+/// of a table. Only the monotonicity of the result matters there: every caller
+/// either corrects the estimate against `yearStartDays` or is already operating
+/// on a date the range gates have rejected.
+fn meanYearLength(cal: CalendarId) i64 {
+    return switch (cal) {
+        .chinese, .dangi => 3652425,
+        else => 3543670, // 12 lunations
+    };
+}
+
+/// `yearStartDays` for a tabulated calendar, extrapolating linearly outside the
+/// table so the year-search loops still terminate on absurd inputs.
+fn tabulatedYearStart(cal: CalendarId, year: i32) ?i64 {
+    const t = yearTable(cal) orelse return null;
+    const idx = @as(i64, year) - t.min;
+    if (idx >= 0 and idx < t.starts.len) return t.starts[@intCast(idx)];
+    // islamic-umalqura is only tabulated where it diverges from the tabular
+    // civil calendar; elsewhere the two agree exactly.
+    if (cal == .islamic_umalqura) return yearStartDays(.islamic_civil, year);
+    const edge: i64 = if (idx < 0) 0 else @as(i64, @intCast(t.starts.len)) - 1;
+    const edge_year = t.min + edge;
+    return t.starts[@intCast(edge)] +
+        @divFloor((@as(i64, year) - edge_year) * meanYearLength(cal), 10000);
+}
+
 // -------------------------------------------------------------- year shape ---
 
 /// Epoch day on which `year` of `cal` begins.
 fn yearStartDays(cal: CalendarId, year: i32) i64 {
+    if (tabulatedYearStart(cal, year)) |d| return d;
     if (isGregorianFamily(cal)) {
         return shared.isoDateToEpochDays(year + gregorianOffset(cal), 1, 1);
     }
@@ -232,32 +290,23 @@ fn hebrewDaysInMonth(year: i32, month: u8) u8 {
     };
 }
 
-/// Hebrew month codes are year-dependent: the leap month Adar I sits at ordinal
-/// 6 and carries the code "M05L", pushing Adar..Elul one ordinal later.
-fn hebrewCodeFromMonth(year: i32, month: u8) shared.MonthCode {
-    if (!hebrewIsLeap(year)) return .{ .num = month };
-    if (month <= 5) return .{ .num = month };
-    if (month == 6) return .{ .num = 5, .leap = true };
-    return .{ .num = month - 1 };
-}
-
-fn hebrewMonthFromCode(year: i32, code_num: u8, code_leap: bool) ?u8 {
-    const leap = hebrewIsLeap(year);
-    if (code_leap) {
-        // Adar I exists only in a leap year.
-        if (!leap or code_num != 5) return null;
-        return 6;
-    }
-    if (code_num < 1 or code_num > 12) return null;
-    if (!leap) return code_num;
-    return if (code_num <= 5) code_num else code_num + 1;
+/// Ordinal position of `cal_year`'s leap month, or 0 when it has none. This is
+/// the whole of a lunisolar calendar's irregularity: every other month-code and
+/// month-count question follows from it.
+pub fn leapMonthOrdinal(cal: CalendarId, cal_year: i32) u8 {
+    return switch (cal) {
+        // Hebrew always interpolates Adar I at the same place, after M05.
+        .hebrew => if (hebrewIsLeap(cal_year)) 6 else 0,
+        .chinese, .dangi => if (yearShape(cal, cal_year)) |s| data.leapOrdinal(s) else 0,
+        else => 0,
+    };
 }
 
 pub fn monthsInYear(cal: CalendarId, cal_year: i32) u8 {
     return switch (cal) {
         .coptic, .ethiopic, .ethioaa => 13,
-        // A Hebrew leap year interpolates Adar I, giving 13 months.
-        .hebrew => if (hebrewIsLeap(cal_year)) 13 else 12,
+        // A lunisolar leap year interpolates a 13th month.
+        .hebrew, .chinese, .dangi => if (leapMonthOrdinal(cal, cal_year) != 0) 13 else 12,
         else => 12,
     };
 }
@@ -271,14 +320,23 @@ pub fn inLeapYear(cal: CalendarId, cal_year: i32) bool {
         .islamic_civil, .islamic_tbla => @mod(14 + 11 * @as(i64, cal_year), 30) < 11,
         // Both are simply "the year is 366 days long".
         .persian, .indian => daysInYear(cal, cal_year) == 366,
-        .hebrew => hebrewIsLeap(cal_year),
+        .hebrew, .chinese, .dangi => leapMonthOrdinal(cal, cal_year) != 0,
+        // Umm al-Qura's tabulated years have no leap rule of their own; a year
+        // is "leap" when it runs the extra day the civil calendar's rule adds.
+        .islamic_umalqura => daysInYear(cal, cal_year) == 355,
         else => unreachable,
     };
 }
 
 pub fn daysInMonth(cal: CalendarId, cal_year: i32, month: u8) u8 {
     if (isGregorianFamily(cal)) return shared.isoDaysInMonth(cal_year + gregorianOffset(cal), month);
+    if (yearShape(cal, cal_year)) |s| return data.monthLength(s, month);
     return switch (cal) {
+        // Outside its table Umm al-Qura is the tabular civil calendar.
+        .islamic_umalqura => daysInMonth(.islamic_civil, cal_year, month),
+        // Beyond the tabulated range the lunisolar pair alternates, which keeps
+        // the month walk consistent with the extrapolated year starts.
+        .chinese, .dangi => if (month % 2 == 1) 30 else 29,
         // Twelve 30-day months plus a short epagomenal 13th.
         .coptic, .ethiopic, .ethioaa => if (month <= 12)
             30
@@ -328,6 +386,25 @@ fn ymdFromEpochDays(cal: CalendarId, days: i64) YMD {
 fn estimateYear(cal: CalendarId, days: i64) i32 {
     if (isGregorianFamily(cal)) {
         return shared.epochDaysToISODate(days).year - gregorianOffset(cal);
+    }
+    // Outside its short table Umm al-Qura is the civil calendar, so estimating
+    // through that rule keeps far-away dates a single correction step away.
+    if (cal == .islamic_umalqura and
+        (days < data.umalqura_starts[0] or days > data.umalqura_starts[data.umalqura_starts.len - 1]))
+    {
+        return estimateYear(.islamic_civil, days);
+    }
+    if (yearTable(cal)) |t| {
+        // Binary search for the last tabulated year that starts on or before
+        // `days`; the caller's correction loops handle days outside the table.
+        if (days < t.starts[0]) return t.min;
+        var lo: usize = 0;
+        var hi: usize = t.starts.len - 1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) / 2;
+            if (t.starts[mid] <= days) lo = mid else hi = mid - 1;
+        }
+        return t.min + @as(i32, @intCast(lo));
     }
     return switch (cal) {
         .coptic => @intCast(@divFloor(days - coptic_epoch, 365) + 1),
@@ -392,7 +469,10 @@ pub fn fields(cal: CalendarId, d: ISODate) CalFields {
             out.era = "aa";
             out.era_year = y;
         },
-        .islamic_civil, .islamic_tbla => setEra(&out, y > 0, "ah", y, "bh", 1 - y),
+        .islamic_civil, .islamic_tbla, .islamic_umalqura => setEra(&out, y > 0, "ah", y, "bh", 1 - y),
+        // The lunisolar pair numbers years by the Gregorian year the year
+        // starts in, and has no eras at all.
+        .chinese, .dangi => {},
         .persian => {
             out.era = "ap";
             out.era_year = y;
@@ -453,12 +533,13 @@ pub fn yearFromEra(cal: CalendarId, era: []const u8, era_year: i32) ?i32 {
             era_year
         else if (eq(u8, era, "aa")) era_year - ethioaa_offset else null,
         .ethioaa => if (eq(u8, era, "aa")) era_year else null,
-        .islamic_civil, .islamic_tbla => if (eq(u8, era, "ah"))
+        .islamic_civil, .islamic_tbla, .islamic_umalqura => if (eq(u8, era, "ah"))
             era_year
         else if (eq(u8, era, "bh")) 1 - era_year else null,
         .persian => if (eq(u8, era, "ap")) era_year else null,
         .indian => if (eq(u8, era, "shaka")) era_year else null,
         .hebrew => if (eq(u8, era, "am")) era_year else null,
+        .chinese, .dangi => null,
     };
 }
 
@@ -466,21 +547,52 @@ pub fn yearFromEra(cal: CalendarId, era: []const u8, era_year: i32) ?i32 {
 /// have no "era"/"eraYear" fields at all, so those properties are ignored
 /// rather than validated when they appear in a property bag.
 pub fn hasEras(cal: CalendarId) bool {
-    return cal != .iso8601;
+    return switch (cal) {
+        .iso8601, .chinese, .dangi => false,
+        else => true,
+    };
 }
 
 /// Whether `cal` can have leap months (i.e. month codes with an "L" suffix).
 pub fn hasLeapMonths(cal: CalendarId) bool {
-    return cal == .hebrew;
+    return switch (cal) {
+        .hebrew, .chinese, .dangi => true,
+        else => false,
+    };
 }
 
 /// Map a month code onto its ordinal position in `cal_year`, or null when the
 /// year has no such month.
 pub fn monthFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bool) ?u8 {
-    if (cal == .hebrew) return hebrewMonthFromCode(cal_year, code_num, code_leap);
-    if (code_leap) return null;
-    if (code_num < 1 or code_num > monthsInYear(cal, cal_year)) return null;
-    return code_num;
+    const leap_ord = leapMonthOrdinal(cal, cal_year);
+    if (code_leap) {
+        // "MnnL" is the month interpolated *after* Mnn, so it exists only in a
+        // year whose leap month sits at ordinal nn+1.
+        if (leap_ord == 0 or code_num + 1 != leap_ord) return null;
+        return leap_ord;
+    }
+    if (code_num < 1 or code_num > monthsInYear(cal, cal_year) - @intFromBool(leap_ord != 0)) return null;
+    return if (leap_ord != 0 and code_num >= leap_ord) code_num + 1 else code_num;
+}
+
+/// The plain month code that a year without leap month "MnnL" constrains it to.
+pub fn constrainedCodeNum(cal: CalendarId, code_num: u8) u8 {
+    return if (cal == .hebrew) code_num + 1 else code_num;
+}
+
+/// `monthFromCode`, falling back to the ordinal a year without that month
+/// constrains it to.
+///
+/// Which neighbour a missing leap month collapses onto is a property of what
+/// the calendar means by it. A Chinese leap month repeats the month before it,
+/// so "M03L" constrains back onto M03; Hebrew's Adar I is an insertion *before*
+/// the real Adar, so "M05L" constrains forward onto M06.
+pub fn monthFromCodeConstrained(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bool) u8 {
+    if (monthFromCode(cal, cal_year, code_num, code_leap)) |m| return m;
+    const target: u8 = if (code_leap) constrainedCodeNum(cal, code_num) else code_num;
+    if (monthFromCode(cal, cal_year, target, false)) |m| return m;
+    const per_year = monthsInYear(cal, cal_year);
+    return if (target < 1) 1 else if (target > per_year) per_year else target;
 }
 
 /// Whether `cal` ever has this month code, in any year. A code that is merely
@@ -489,8 +601,13 @@ pub fn monthFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bo
 /// the overflow option says.
 pub fn isValidCode(cal: CalendarId, code_num: u8, code_leap: bool) bool {
     if (code_leap) {
-        // Hebrew's sole leap month is Adar I, which follows M05.
-        return cal == .hebrew and code_num == 5;
+        return switch (cal) {
+            // Hebrew's sole leap month is Adar I, which follows M05.
+            .hebrew => code_num == 5,
+            // The lunisolar pair can interpolate after any month of the year.
+            .chinese, .dangi => code_num >= 1 and code_num <= 12,
+            else => false,
+        };
     }
     return switch (cal) {
         // The epagomenal 13th month is an ordinary M13.
@@ -502,8 +619,10 @@ pub fn isValidCode(cal: CalendarId, code_num: u8, code_leap: bool) bool {
 /// The month code of an ordinal month position — the inverse of
 /// `monthFromCode`. Only lunisolar calendars make this year-dependent.
 fn codeFromMonth(cal: CalendarId, cal_year: i32, month: u8) shared.MonthCode {
-    if (cal == .hebrew) return hebrewCodeFromMonth(cal_year, month);
-    return .{ .num = month };
+    const leap_ord = leapMonthOrdinal(cal, cal_year);
+    if (leap_ord == 0 or month < leap_ord) return .{ .num = month };
+    if (month == leap_ord) return .{ .num = month - 1, .leap = true };
+    return .{ .num = month - 1 };
 }
 
 /// The ISO year holding `cal_year`'s first month. Only meaningful for the
@@ -588,10 +707,42 @@ pub fn absoluteMonth(cal: CalendarId, cal_year: i32, month: u8) i64 {
         // per 19 years.
         .hebrew => @divFloor(235 * y - 234, 19),
         .coptic, .ethiopic, .ethioaa => (y - 1) * 13,
+        // The lunisolar pair also averages 235 months per 19 years, but its
+        // leap years are placed astronomically, so the running total has to be
+        // accumulated from the table rather than derived from the cycle.
+        .chinese, .dangi => tabulatedMonthsBefore(cal, cal_year),
         else => (y - 1) * 12,
     };
     return before + month;
 }
+
+/// Prefix sums of `monthsInYear` over a tabulated calendar, extrapolated by the
+/// Metonic average past the ends of the table.
+fn tabulatedMonthsBefore(cal: CalendarId, cal_year: i32) i64 {
+    const bases: []const i32 = switch (cal) {
+        .chinese => &chinese_month_base,
+        else => &dangi_month_base,
+    };
+    const min = data.chinese_year_min;
+    const idx = @as(i64, cal_year) - min;
+    if (idx >= 0 and idx < bases.len) return bases[@intCast(idx)];
+    const edge: i64 = if (idx < 0) 0 else @as(i64, @intCast(bases.len)) - 1;
+    return bases[@intCast(edge)] + @divFloor((idx - edge) * 235, 19);
+}
+
+fn monthBaseTable(comptime shapes: []const u32) [shapes.len]i32 {
+    @setEvalBranchQuota(shapes.len * 20);
+    var arr: [shapes.len]i32 = undefined;
+    var acc: i32 = 0;
+    for (shapes, 0..) |s, i| {
+        arr[i] = acc;
+        acc += if (data.leapOrdinal(s) != 0) 13 else 12;
+    }
+    return arr;
+}
+
+const chinese_month_base = monthBaseTable(&data.chinese_shapes);
+const dangi_month_base = monthBaseTable(&data.dangi_shapes);
 
 /// Reconstitute an ISO date from calendar-space fields, applying `overflow`.
 /// Under `.constrain` the month is clamped into the year and the day into the
@@ -635,10 +786,7 @@ pub fn toIsoFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bo
     if (!isValidCode(cal, code_num, code_leap)) return error.OutOfRange;
     const m = monthFromCode(cal, cal_year, code_num, code_leap) orelse {
         if (overflow == .reject) return error.OutOfRange;
-        // Constrain: drop the leap flag and clamp into the year.
-        const per_year = monthsInYear(cal, cal_year);
-        const fallback: i32 = if (code_num < 1) 1 else if (code_num > per_year) per_year else code_num;
-        return toIso(cal, cal_year, fallback, day, .constrain);
+        return toIso(cal, cal_year, monthFromCodeConstrained(cal, cal_year, code_num, code_leap), day, .constrain);
     };
     return toIso(cal, cal_year, m, day, overflow);
 }
@@ -658,9 +806,12 @@ pub fn monthDayReference(cal: CalendarId, code_num: u8, code_leap: bool, day: i3
         if (pass == 1 and overflow == .reject) return error.OutOfRange;
         var y = start_year;
         // A month/day recurs at least once per leap cycle; the Islamic 30-year
-        // cycle is the longest among the implemented calendars.
+        // cycle is the longest among the arithmetic calendars. A lunisolar leap
+        // month is far rarer — some (M12L in the Chinese calendar) skip
+        // centuries — so those get a much longer look-back.
+        const limit_years: u32 = if (hasLeapMonths(cal) and code_leap) 400 else 40;
         var tries: u32 = 0;
-        while (tries < 40) : (tries += 1) {
+        while (tries < limit_years) : (tries += 1) {
             if (monthFromCode(cal, y, code_num, code_leap)) |m| {
                 const dim = daysInMonth(cal, y, m);
                 const use_day = if (pass == 1 and day > dim) dim else day;

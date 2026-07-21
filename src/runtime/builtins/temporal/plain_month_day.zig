@@ -96,13 +96,13 @@ pub fn toTemporalMonthDay(arena: std.mem.Allocator, v: Value, overflow: shared.O
 }
 
 fn monthDayFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISOMonthDay {
-    const cal = if (o.get("calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
-    const day_v = o.get("day");
+    const cal = if (try shared.optionGet(arena, o, "calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
+    const day_v = try shared.optionGet(arena, o, "day");
     if (day_v == null or (day_v.?.bits != 0 and day_v.?.unbox() == .undefined_)) return realm_mod.throwTypeError(arena, "missing day");
     const day = floatToI32(try shared.toIntegerWithTruncation(arena, day_v.?));
 
-    const month_v = o.get("month");
-    const mc_v = o.get("monthCode");
+    const month_v = try shared.optionGet(arena, o, "month");
+    const mc_v = try shared.optionGet(arena, o, "monthCode");
     const has_month = month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_;
     const has_code = mc_v != null and mc_v.?.bits != 0 and mc_v.?.unbox() != .undefined_;
     var code = shared.MonthCode{ .num = 0 };
@@ -120,9 +120,9 @@ fn monthDayFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.O
     // A year (directly or via era/eraYear) pins the month/day to a specific
     // year, which both validates the year's range and — for a numeric month —
     // resolves which month code it names.
-    const year_v = o.get("year");
-    const has_year = (year_v != null and year_v.?.bits != 0 and year_v.?.unbox() != .undefined_) or
-        (calendar.hasEras(cal) and o.get("era") != null and o.get("era").?.bits != 0 and o.get("era").?.unbox() != .undefined_);
+    const year_v = try shared.optionGet(arena, o, "year");
+    const era_v = if (calendar.hasEras(cal)) try shared.optionGet(arena, o, "era") else null;
+    const has_year = year_v != null or era_v != null;
     var resolved_day = day;
     if (has_year) {
         const cal_year = try plain_date.readCalendarYear(arena, o, cal);
@@ -177,8 +177,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "with() requires an object");
     if (getMonthDay(arg) != null) return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
     const o = arg.toPtr().object;
-    if (o.get("calendar") != null and o.get("calendar").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set calendar");
-    if (o.get("timeZone") != null and o.get("timeZone").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
+    if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
     // Merge over the receiver's own calendar fields, then recompute the ISO
@@ -189,7 +189,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     var day: i32 = base.day;
     var any = false;
     var mc_month: ?i32 = null;
-    const mc_v = o.get("monthCode");
+    const mc_v = try shared.optionGet(arena, o, "monthCode");
     if (mc_v != null and mc_v.?.bits != 0 and mc_v.?.unbox() != .undefined_) {
         if (mc_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
         code = try shared.parseMonthCode(arena, mc_v.?.unbox().string, calendar.hasLeapMonths(cal));
@@ -211,7 +211,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
         day = floatToI32(x);
         any = true;
     }
-    if (o.get("year") != null and o.get("year").?.bits != 0 and o.get("year").?.unbox() != .undefined_) any = true;
+    if (try shared.optionGet(arena, o, "year") != null) any = true;
     if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
     const iso = calendar.monthDayReference(cal, code.num, code.leap, day, overflow) catch
         return realm_mod.throwRangeError(arena, "month-day out of range");
@@ -219,8 +219,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
-    const v = o.get(name) orelse return null;
-    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    const v = (try shared.optionGet(arena, o, name)) orelse return null;
     return try shared.toIntegerWithTruncation(arena, v);
 }
 
@@ -237,7 +236,7 @@ pub fn nativeToPlainDate(arena: std.mem.Allocator, this_val: Value, args: []cons
     const arg = if (args.len > 0) args[0] else Value{};
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "toPlainDate requires an object with a year");
     const o = arg.toPtr().object;
-    const year_v = o.get("year") orelse return realm_mod.throwTypeError(arena, "missing year");
+    const year_v = try shared.optionGet(arena, o, "year") orelse return realm_mod.throwTypeError(arena, "missing year");
     if (year_v.bits != 0 and year_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing year");
     const cal = md.calendar;
     const ref = ISODate{ .year = md.ref_year, .month = md.month, .day = md.day, .calendar = cal };
