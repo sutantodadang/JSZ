@@ -34,9 +34,10 @@ fn globalObjectOwn(frame: *BcCallFrame, name: []const u8) ?Value {
 /// sloppy implicit global assignment) at the top level of a Script becomes an
 /// own property of the global object, observable as `globalThis.name`. We keep a
 /// separate environment record for global bindings, so mirror the value onto the
-/// `globalThis` object here. Only runs at true global scope (`parent == null`),
-/// which naturally excludes block/catch/function-local bindings (those execute
-/// in a child environment). Internal `__`-prefixed names are never exposed.
+/// `globalThis` object here. Only runs when the frame's *variable* environment is
+/// the global one, which naturally excludes function-local bindings while still
+/// covering a `var` inside a block/catch and a sloppy direct eval nested in global
+/// code. Internal `__`-prefixed names are never exposed.
 fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value, configurable: bool) void {
     mirrorGlobalBindingOpts(frame, name, value, configurable, false);
 }
@@ -45,7 +46,7 @@ fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value, conf
 /// exists, leave it (and its value) alone" clause — used by HOIST_VAR, which
 /// only has to *reserve* the name at scope entry.
 fn mirrorGlobalBindingOpts(frame: *BcCallFrame, name: []const u8, value: Value, configurable: bool, declare_only: bool) void {
-    if (frame.env.parent != null) return;
+    if (frame.env.varScope().parent != null) return;
     // ES module top-level declarations live in the Module Environment Record
     // and must NOT become own-properties of the global object (spec §16.2.1.6).
     if (frame.func.is_module) return;
@@ -237,7 +238,28 @@ pub inline fn opHoistVar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name = frame.func.chunk.constants[kidx].toPtr().string;
     const undef = try val_mod.makeUndefined(self.arena);
-    frame.env.hoistVar(name, undef) catch return error.OutOfMemory;
+    // ES §19.2.1.3 EvalDeclarationInstantiation: eval's top-level `var`/function
+    // names are created in the *calling* context's VariableEnvironment, not in
+    // eval's own (lexical-only) scope. `varScope()` walks past eval's declarative
+    // env — which is marked `is_var_scope` only for strict eval, whose vars stay
+    // confined — to the enclosing function or global var scope. Non-eval frames
+    // already run their hoist prologue with `frame.env` == their var scope.
+    const target = if (frame.func.is_eval) frame.env.varScope() else frame.env;
+    // In the global environment record a "binding" is an own property of the
+    // global object, so CreateGlobalVarBinding leaves an existing one — and its
+    // value — alone. Our split record would otherwise shadow the property with a
+    // fresh `undefined` declarative binding, so seed it from the property.
+    const seed = if (target.parent == null and !target.bindings.contains(name))
+        (globalObjectOwn(frame, name) orelse undef)
+    else
+        undef;
+    // A binding eval introduces into a *function* var scope is deletable; a
+    // global one is deleted through the global object's [[Delete]] instead
+    // (mirrorGlobalBindingOpts makes that property configurable for eval).
+    if (frame.func.is_eval and target.parent != null)
+        target.hoistVarDeletable(name, seed) catch return error.OutOfMemory
+    else
+        target.hoistVar(name, seed) catch return error.OutOfMemory;
     // ES §9.1.1.4.17 CreateGlobalVarBinding: a top-level `var`/function name in
     // Script or eval code reserves an own property of the global object at
     // declaration-instantiation time, even when it is never assigned (`var x;`
@@ -571,8 +593,8 @@ pub inline fn opDeleteName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     //    non-deletable (false). A global object-record binding (var/function/
     //    implicit/builtin) defers to the global object's [[Delete]] below.
     const classify = frame.env.deleteName(name);
-    if (classify == .not_deletable) {
-        frame.registers[rdst] = try val_mod.makeBool(self.arena, false);
+    if (classify == .not_deletable or classify == .deleted) {
+        frame.registers[rdst] = try val_mod.makeBool(self.arena, classify == .deleted);
         return null;
     }
     // No declarative binding: an object environment record inherited from this
