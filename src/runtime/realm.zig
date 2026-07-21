@@ -3350,7 +3350,18 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
     // result overrides the builtin tag.
     // ToObject(this) so a primitive receiver (e.g. a BigInt) reads @@toStringTag
     // off its wrapper's prototype (BigInt.prototype[@@toStringTag] === "BigInt").
-    const recv = try toObjectForThis(arena, this_val);
+    // Callables are objects too, but toObjectForThis passes them through as
+    // .function/.bc_function; resolve them to their backing object so an own
+    // @@toStringTag on a function is honoured (ES 20.1.3.6 step 15).
+    var recv = try toObjectForThis(arena, this_val);
+    switch (recv.unbox()) {
+        .function, .bc_function, .native_function => {
+            if (active_context) |ctx| {
+                if (try ctx.backingObject(arena, recv)) |bo| recv = try val_mod.makeObject(arena, bo);
+            }
+        },
+        else => {},
+    }
     if (recv.bits != 0 and recv.unbox() == .object) {
         if (active_sym_to_string_tag) |tag_sym| {
             if (active_context) |ctx| {
@@ -3403,9 +3414,13 @@ fn proxyIsCallableDeep(obj: *JsObject) bool {
     return false;
 }
 
-fn nativeObjectProtoValueOf(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    // ES 20.1.3.7: ToObject(this); for our purposes return `this` unchanged.
-    return this_val;
+fn nativeObjectProtoValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    // ES 20.1.3.7: return ToObject(this). A primitive receiver must come back as
+    // its wrapper object (so `typeof valueOf.call(true)` is "object"), and
+    // undefined/null throw rather than passing through.
+    if (this_val.bits == 0 or this_val.unbox() == .undefined_ or this_val.unbox() == .null_)
+        return throwTypeError(arena, "Object.prototype.valueOf called on null or undefined");
+    return toObjectForThis(arena, this_val);
 }
 
 // ---- Function constructor (minimal) ----
@@ -4586,6 +4601,12 @@ pub const Realm = struct {
         try disposable_stack_mod.registerSymbols(arena);
         try date_mod.registerSymbols(arena);
         try temporal_mod.registerSymbols(arena);
+        // Promise.prototype[@@toStringTag] = "Promise" (ES §27.2.5.5), so
+        // Object.prototype.toString tags a promise "[object Promise]".
+        if (active_sym_to_string_tag) |tag_sym| {
+            if (active_promise_proto) |p|
+                try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "Promise"), .{ .writable = false, .enumerable = false, .configurable = true });
+        }
 
         // Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain
         // now that @@iterator / @@toStringTag exist. Array + TypedArray iterators

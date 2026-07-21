@@ -602,11 +602,14 @@ fn resolveObject(arena: std.mem.Allocator, v: Value) anyerror!?*JsObject {
 /// if V is not an object return false; otherwise return true iff O (ToObject(this))
 /// appears anywhere in V's [[Prototype]] chain.
 pub fn nativeObjectIsPrototypeOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Step 1 runs BEFORE ToObject(this): a non-object V returns false even when
+    // `this` is null/undefined, which would otherwise throw in step 2.
+    const v = if (args.len > 0) args[0] else Value{};
+    const v_obj = (try resolveObject(arena, v)) orelse return val_mod.makeBool(arena, false);
+    // Step 2: ToObject(this).
     if (this_val.bits == 0 or this_val.unbox() == .undefined_ or this_val.unbox() == .null_)
         return throwTypeError(arena, "Cannot convert undefined or null to object");
     const O = (try resolveObject(arena, this_val)) orelse return val_mod.makeBool(arena, false);
-    const v = if (args.len > 0) args[0] else Value{};
-    const v_obj = (try resolveObject(arena, v)) orelse return val_mod.makeBool(arena, false);
     var cur: ?*JsObject = v_obj.proto;
     while (cur) |c| {
         if (c == O) return val_mod.makeBool(arena, true);

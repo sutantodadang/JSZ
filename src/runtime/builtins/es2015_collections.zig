@@ -18,6 +18,7 @@ const InternalKind = @TypeOf((@as(JsObject, undefined)).internal_kind);
 /// init (after the well-known symbols resolve). Its [[Prototype]] is the
 /// %IteratorPrototype%.
 pub var active_array_iter_proto: ?*JsObject = null;
+pub var active_string_iter_proto: ?*JsObject = null;
 /// WeakMap.prototype — stored so registerSymbols can attach @@toStringTag.
 pub var active_weakmap_proto: ?*JsObject = null;
 /// WeakSet.prototype — stored so registerSymbols can attach @@toStringTag.
@@ -2091,6 +2092,16 @@ pub fn initArrayIteratorProto(arena: std.mem.Allocator, object_proto: *JsObject)
     active_array_iter_proto = aip;
     active_iterator_proto = iter_proto;
 
+    // %StringIteratorPrototype% (ES §22.1.5): a sibling of %ArrayIteratorPrototype%,
+    // not the same object — `Object.prototype.toString` on a string iterator must
+    // report "[object String Iterator]". `next` is the shared sequence stepper,
+    // which already branches on SeqIterData.is_string.
+    const sip = try JsObject.create(arena, iter_proto);
+    _ = try sip.defineOwnData("next", try val_mod.makeNativeFunctionNamed(arena, nativeSeqIterNext, "next", 0), cfg);
+    if (realm_mod.active_sym_to_string_tag) |tag|
+        try sip.setSymAttr(tag, try val_mod.makeString(arena, "String Iterator"), tag_cfg);
+    active_string_iter_proto = sip;
+
     // %IteratorHelperPrototype%: parent = %IteratorPrototype%, own next + return.
     const ihp = try JsObject.create(arena, iter_proto);
     _ = try ihp.defineOwnData("next",   try val_mod.makeNativeFunctionNamed(arena, nativeIterHelperNext,   "next",   0), cfg);
@@ -2171,7 +2182,7 @@ pub fn nativeStringValues(arena: std.mem.Allocator, this_val: Value, _: []const 
 /// Wrap iterator state in an object whose [[Prototype]] is the shared
 /// %ArrayIteratorPrototype% (so `next` is inherited, not own).
 pub fn makeSeqIterator(arena: std.mem.Allocator, d: *SeqIterData) !Value {
-    const proto = active_array_iter_proto;
+    const proto = if (d.is_string) (active_string_iter_proto orelse active_array_iter_proto) else active_array_iter_proto;
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
     obj.internal_slot = d;
     // Brand so the GC traces `d.seq` (the array/string being iterated) via
