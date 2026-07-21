@@ -1145,20 +1145,23 @@ pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
-    try obj.set("language", try val_mod.makeString(arena, language));
-    try obj.set("script", try val_mod.makeString(arena, script));
-    try obj.set("region", try val_mod.makeString(arena, region));
-    try obj.set("baseName", try val_mod.makeString(arena, base_name));
+    // Locale fields live in hidden `[[loc_*]]` internal slots (spec exposes them
+    // via prototype accessor getters, registered by registerLocaleAccessors).
+    try obj.set("[[loc_language]]", try val_mod.makeString(arena, language));
+    try obj.set("[[loc_script]]", try val_mod.makeString(arena, script));
+    try obj.set("[[loc_region]]", try val_mod.makeString(arena, region));
+    try obj.set("[[loc_baseName]]", try val_mod.makeString(arena, base_name));
     try obj.set("__locale_tag", try val_mod.makeString(arena, base_name));
     // Unicode extension keyword options (spec §14.1 ApplyOptionsToTag +
     // ApplyUnicodeExtensionToTag): reflect ca/co/nu/hourCycle/caseFirst when
     // supplied so `new Intl.Locale(tag, {calendar}).calendar` round-trips. The
     // value is lower-cased (canonical `type` form). Absent options stay absent.
-    if (optStr(opts, "calendar")) |s| try obj.set("calendar", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "collation")) |s| try obj.set("collation", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "numberingSystem")) |s| try obj.set("numberingSystem", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "hourCycle")) |s| try obj.set("hourCycle", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "caseFirst")) |s| try obj.set("caseFirst", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "calendar")) |s| try obj.set("[[loc_calendar]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "collation")) |s| try obj.set("[[loc_collation]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "numberingSystem")) |s| try obj.set("[[loc_numberingSystem]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "hourCycle")) |s| try obj.set("[[loc_hourCycle]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    if (optStr(opts, "caseFirst")) |s| try obj.set("[[loc_caseFirst]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
+    try obj.set("[[loc_numeric]]", try val_mod.makeBool(arena, optBool(opts, "numeric") orelse false));
     return val_mod.makeObject(arena, obj);
 }
 
@@ -1304,11 +1307,47 @@ pub fn nativeLocaleToString(arena: std.mem.Allocator, this_val: Value, _: []cons
         if (this_val.toPtr().object.get("__locale_tag")) |v| {
             if (v.bits != 0 and v.unbox() == .string) return val_mod.makeString(arena, v.unbox().string);
         }
-        if (this_val.toPtr().object.get("baseName")) |v| {
+        if (this_val.toPtr().object.get("[[loc_baseName]]")) |v| {
             if (v.bits != 0 and v.unbox() == .string) return val_mod.makeString(arena, v.unbox().string);
         }
     }
     return val_mod.makeString(arena, "");
+}
+
+/// Build a Locale prototype accessor getter for internal slot `slot`. When
+/// `optional` is set an empty stored string reads back as `undefined` (e.g. an
+/// absent script/region).
+fn locGetterFn(comptime slot: []const u8, comptime optional: bool) val_mod.NativeFnPtr {
+    return struct {
+        fn f(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+            if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("[[loc_baseName]]") == null)
+                return throwTypeErrorIntl(arena, "Intl.Locale.prototype getter called on an incompatible receiver");
+            const v = this_val.toPtr().object.getOwn(slot) orelse return val_mod.makeUndefined(arena);
+            if (optional and v.bits != 0 and v.unbox() == .string and v.unbox().string.len == 0)
+                return val_mod.makeUndefined(arena);
+            return v;
+        }
+    }.f;
+}
+
+fn locAccessor(arena: std.mem.Allocator, proto: *JsObject, comptime key: []const u8, comptime slot: []const u8, comptime optional: bool) !void {
+    const holder = try JsObject.create(arena, realm_mod.active_object_proto);
+    try holder.set("get", try val_mod.makeNativeFunctionNamed(arena, locGetterFn(slot, optional), "get " ++ key, 0));
+    _ = try proto.defineOwnAccessor(key, try val_mod.makeObject(arena, holder), .{ .enumerable = false, .configurable = true, .writable = false });
+}
+
+/// Register Intl.Locale.prototype's scalar accessor getters (§14.3).
+pub fn registerLocaleAccessors(arena: std.mem.Allocator, proto: *JsObject) !void {
+    try locAccessor(arena, proto, "baseName", "[[loc_baseName]]", false);
+    try locAccessor(arena, proto, "language", "[[loc_language]]", false);
+    try locAccessor(arena, proto, "script", "[[loc_script]]", true);
+    try locAccessor(arena, proto, "region", "[[loc_region]]", true);
+    try locAccessor(arena, proto, "calendar", "[[loc_calendar]]", true);
+    try locAccessor(arena, proto, "collation", "[[loc_collation]]", true);
+    try locAccessor(arena, proto, "hourCycle", "[[loc_hourCycle]]", true);
+    try locAccessor(arena, proto, "caseFirst", "[[loc_caseFirst]]", true);
+    try locAccessor(arena, proto, "numberingSystem", "[[loc_numberingSystem]]", true);
+    try locAccessor(arena, proto, "numeric", "[[loc_numeric]]", false);
 }
 
 // ------------------------------------------------------------------- ListFormat ---

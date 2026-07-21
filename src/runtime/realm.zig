@@ -4665,6 +4665,7 @@ pub const Realm = struct {
             // Intl.Locale (no supportedLocalesOf; ctor length 1)
             const loc_proto = try JsObject.create(arena, object_proto);
             try IntlReg.method(arena, loc_proto, "toString", intl_mod.nativeLocaleToString, 0);
+            try intl_mod.registerLocaleAccessors(arena, loc_proto);
             const loc_ctor = try JsObject.create(arena, function_proto);
             try loc_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeLocaleCtor));
             try IntlReg.finish(arena, loc_ctor, loc_proto, "Locale", "Intl.Locale", 1, false);
