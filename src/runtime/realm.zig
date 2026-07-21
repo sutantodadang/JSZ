@@ -4777,6 +4777,7 @@ pub const Realm = struct {
             // Intl.ListFormat
             const lf_proto = try JsObject.create(arena, object_proto);
             try IntlReg.method(arena, lf_proto, "format", intl_mod.nativeListFormatFormat, 1);
+            try IntlReg.method(arena, lf_proto, "formatToParts", intl_mod.nativeListFormatFormatToParts, 1);
             try IntlReg.method(arena, lf_proto, "resolvedOptions", intl_mod.nativeListFormatResolved, 0);
             const lf_ctor = try JsObject.create(arena, function_proto);
             try lf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeListFormatCtor));
@@ -4785,6 +4786,7 @@ pub const Realm = struct {
             // Intl.PluralRules
             const pr_proto = try JsObject.create(arena, object_proto);
             try IntlReg.method(arena, pr_proto, "select", intl_mod.nativePluralRulesSelect, 1);
+            try IntlReg.method(arena, pr_proto, "selectRange", intl_mod.nativePluralRulesSelectRange, 2);
             try IntlReg.method(arena, pr_proto, "resolvedOptions", intl_mod.nativePluralRulesResolved, 0);
             const pr_ctor = try JsObject.create(arena, function_proto);
             try pr_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativePluralRulesCtor));
@@ -4793,6 +4795,7 @@ pub const Realm = struct {
             // Intl.RelativeTimeFormat
             const rtf_proto = try JsObject.create(arena, object_proto);
             try IntlReg.method(arena, rtf_proto, "format", intl_mod.nativeRelativeTimeFormatFormat, 2);
+            try IntlReg.method(arena, rtf_proto, "formatToParts", intl_mod.nativeRelativeTimeFormatFormatToParts, 2);
             try IntlReg.method(arena, rtf_proto, "resolvedOptions", intl_mod.nativeRelativeTimeFormatResolved, 0);
             const rtf_ctor = try JsObject.create(arena, function_proto);
             try rtf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeRelativeTimeFormatCtor));
@@ -4821,6 +4824,15 @@ pub const Realm = struct {
             _ = try df_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
             _ = try df_ctor.defineOwnData("supportedLocalesOf", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatSupportedLocalesOf, "supportedLocalesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             try intl_obj.set("DurationFormat", try val_mod.makeObject(arena, df_ctor));
+            // Intl.Segmenter (+ the unreachable %Segments%/%SegmentIterator% protos)
+            try intl_mod.registerSegmenterPrototypes(arena, object_proto, es2015_collections_mod.active_iterator_proto);
+            const seg_proto = try JsObject.create(arena, object_proto);
+            try IntlReg.method(arena, seg_proto, "segment", intl_mod.nativeSegmenterSegment, 1);
+            try IntlReg.method(arena, seg_proto, "resolvedOptions", intl_mod.nativeSegmenterResolved, 0);
+            const seg_ctor = try JsObject.create(arena, function_proto);
+            try seg_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeSegmenterCtor));
+            try IntlReg.finish(arena, seg_ctor, seg_proto, "Segmenter", "Intl.Segmenter", 0, true);
+            try intl_obj.set("Segmenter", try val_mod.makeObject(arena, seg_ctor));
             // Intl.getCanonicalLocales (static)
             _ = try intl_obj.defineOwnData("getCanonicalLocales", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeGetCanonicalLocales, "getCanonicalLocales", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             // Intl.supportedValuesOf (static)

@@ -1240,17 +1240,27 @@ pub fn nativeDateTimeFormatResolved(arena: std.mem.Allocator, this_val: Value, _
 // ------------------------------------------------------------------- Collator ---
 
 pub fn nativeCollatorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const opts: ?Value = if (args.len > 1) args[1] else null;
+    // Intl.Collator is one of the three legacy services callable without `new`
+    // (§10.1.1 ChainCollator), so no NewTarget guard here.
+    realm_mod.active_constructing = false;
     const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
         this_val.toPtr().object
-    else if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
-        try JsObject.create(arena, realm_mod.active_object_proto);
-    const usage = optStr(opts, "usage") orelse "sort";
-    const sensitivity = optStr(opts, "sensitivity") orelse "variant";
-    const numeric = optBool(opts, "numeric") orelse false;
-    const caseFirst = optStr(opts, "caseFirst") orelse "false";
+        try dnEmptyObj(arena);
+    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
+        _ = try canonicalizeTag(arena, t);
+    // InitializeCollator (§10.1.2) reads the options in this exact order.
+    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    const usage = (try dnGetOption(arena, options, "usage", &.{ "sort", "search" }, "sort")).?;
+    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+    if (try dnGetOption(arena, options, "collation", &.{}, null)) |c| {
+        if (!isWellFormedNumberingSystem(c)) return throwRangeError(arena, "invalid collation");
+    }
+    const numeric = (try dnGetBoolOption(arena, options, "numeric")) orelse false;
+    const caseFirst = (try dnGetOption(arena, options, "caseFirst", &.{ "upper", "lower", "false" }, "false")).?;
+    const sensitivity = (try dnGetOption(arena, options, "sensitivity", &.{ "base", "accent", "case", "variant" }, "variant")).?;
+    const ignore_punct = (try dnGetBoolOption(arena, options, "ignorePunctuation")) orelse false;
+    try obj.set("__col_ignorePunctuation", try val_mod.makeBool(arena, ignore_punct));
     try obj.set("__col_usage", try val_mod.makeString(arena, usage));
     try obj.set("__col_sensitivity", try val_mod.makeString(arena, sensitivity));
     try obj.set("__col_numeric", try val_mod.makeBool(arena, numeric));
@@ -1360,6 +1370,7 @@ pub fn nativeCollatorResolved(arena: std.mem.Allocator, this_val: Value, _: []co
     var sensitivity: []const u8 = "variant";
     var numeric = false;
     var caseFirst: []const u8 = "false";
+    var ignore_punct = false;
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const o = this_val.toPtr().object;
         if (o.get("__col_usage")) |v| if (v.bits != 0 and v.unbox() == .string) {
@@ -1374,11 +1385,14 @@ pub fn nativeCollatorResolved(arena: std.mem.Allocator, this_val: Value, _: []co
         if (o.get("__col_caseFirst")) |v| if (v.bits != 0 and v.unbox() == .string) {
             caseFirst = v.unbox().string;
         };
+        if (o.get("__col_ignorePunctuation")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
+            ignore_punct = v.unbox().boolean;
+        };
     }
     try r.set("locale", try val_mod.makeString(arena, "en-US"));
     try r.set("usage", try val_mod.makeString(arena, usage));
     try r.set("sensitivity", try val_mod.makeString(arena, sensitivity));
-    try r.set("ignorePunctuation", try val_mod.makeBool(arena, false));
+    try r.set("ignorePunctuation", try val_mod.makeBool(arena, ignore_punct));
     try r.set("collation", try val_mod.makeString(arena, "default"));
     try r.set("numeric", try val_mod.makeBool(arena, numeric));
     try r.set("caseFirst", try val_mod.makeString(arena, caseFirst));
@@ -1651,8 +1665,149 @@ fn locAccessor(arena: std.mem.Allocator, proto: *JsObject, comptime key: []const
     _ = try proto.defineOwnAccessor(key, try val_mod.makeObject(arena, holder), .{ .enumerable = false, .configurable = true, .writable = false });
 }
 
+/// %Intl.Locale.prototype%, captured at realm setup so `maximize`/`minimize` can
+/// hand back a fresh Locale rather than a plain object.
+var active_locale_proto: ?*JsObject = null;
+
+/// Brand check shared by every Intl.Locale.prototype method: the receiver must be
+/// an object carrying the `[[InitializedLocale]]` slot (%Locale.prototype% itself
+/// does not).
+fn requireLocale(arena: std.mem.Allocator, this_val: Value) anyerror!*JsObject {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("[[loc_baseName]]") == null)
+        return throwTypeErrorIntl(arena, "Intl.Locale.prototype method called on an incompatible receiver");
+    return this_val.toPtr().object;
+}
+
+/// AddLikelySubtags, restricted to the languages a dependency-free build can
+/// carry. Unlisted languages fall back to a Latin script and a region derived
+/// from the language subtag, which keeps `maximize()` total.
+fn likelySubtags(lang: []const u8) struct { script: []const u8, region: []const u8 } {
+    const table = [_]struct { l: []const u8, s: []const u8, r: []const u8 }{
+        .{ .l = "en", .s = "Latn", .r = "US" }, .{ .l = "und", .s = "Latn", .r = "US" },
+        .{ .l = "fr", .s = "Latn", .r = "FR" }, .{ .l = "de", .s = "Latn", .r = "DE" },
+        .{ .l = "es", .s = "Latn", .r = "ES" }, .{ .l = "it", .s = "Latn", .r = "IT" },
+        .{ .l = "pt", .s = "Latn", .r = "BR" }, .{ .l = "nl", .s = "Latn", .r = "NL" },
+        .{ .l = "sv", .s = "Latn", .r = "SE" }, .{ .l = "pl", .s = "Latn", .r = "PL" },
+        .{ .l = "tr", .s = "Latn", .r = "TR" }, .{ .l = "ru", .s = "Cyrl", .r = "RU" },
+        .{ .l = "uk", .s = "Cyrl", .r = "UA" }, .{ .l = "el", .s = "Grek", .r = "GR" },
+        .{ .l = "he", .s = "Hebr", .r = "IL" }, .{ .l = "ar", .s = "Arab", .r = "EG" },
+        .{ .l = "fa", .s = "Arab", .r = "IR" }, .{ .l = "hi", .s = "Deva", .r = "IN" },
+        .{ .l = "th", .s = "Thai", .r = "TH" }, .{ .l = "ko", .s = "Kore", .r = "KR" },
+        .{ .l = "ja", .s = "Jpan", .r = "JP" }, .{ .l = "zh", .s = "Hans", .r = "CN" },
+    };
+    for (table) |e| if (std.mem.eql(u8, e.l, lang)) return .{ .script = e.s, .region = e.r };
+    return .{ .script = "Latn", .region = "US" };
+}
+
+/// Build a new Intl.Locale from already-canonical subtags, carrying the
+/// receiver's Unicode-extension slots across (§14.3.3/§14.3.4 re-run the
+/// constructor on the transformed tag).
+fn makeLocaleFrom(arena: std.mem.Allocator, src: *JsObject, language: []const u8, script: []const u8, region: []const u8) anyerror!Value {
+    const obj = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, active_locale_proto orelse realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, active_locale_proto orelse realm_mod.active_object_proto);
+    var bn = std.ArrayListUnmanaged(u8){};
+    try bn.appendSlice(arena, language);
+    if (script.len > 0) {
+        try bn.append(arena, '-');
+        try bn.appendSlice(arena, script);
+    }
+    if (region.len > 0) {
+        try bn.append(arena, '-');
+        try bn.appendSlice(arena, region);
+    }
+    try obj.set("[[loc_language]]", try val_mod.makeString(arena, language));
+    try obj.set("[[loc_script]]", try val_mod.makeString(arena, script));
+    try obj.set("[[loc_region]]", try val_mod.makeString(arena, region));
+    try obj.set("[[loc_baseName]]", try val_mod.makeString(arena, bn.items));
+    try obj.set("__locale_tag", try val_mod.makeString(arena, bn.items));
+    for ([_][]const u8{ "[[loc_calendar]]", "[[loc_collation]]", "[[loc_numberingSystem]]", "[[loc_hourCycle]]", "[[loc_caseFirst]]", "[[loc_numeric]]" }) |slot| {
+        if (src.getOwn(slot)) |v| try obj.set(slot, v);
+    }
+    return val_mod.makeObject(arena, obj);
+}
+
+pub fn nativeLocaleMaximize(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const o = try requireLocale(arena, this_val);
+    const lang = if (o.getOwn("[[loc_language]]")) |v| v.unbox().string else "und";
+    var script = if (o.getOwn("[[loc_script]]")) |v| v.unbox().string else "";
+    var region = if (o.getOwn("[[loc_region]]")) |v| v.unbox().string else "";
+    const likely = likelySubtags(lang);
+    if (script.len == 0) script = likely.script;
+    if (region.len == 0) region = likely.region;
+    return makeLocaleFrom(arena, o, if (std.mem.eql(u8, lang, "und")) "en" else lang, script, region);
+}
+
+pub fn nativeLocaleMinimize(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const o = try requireLocale(arena, this_val);
+    const lang0 = if (o.getOwn("[[loc_language]]")) |v| v.unbox().string else "und";
+    const lang = if (std.mem.eql(u8, lang0, "und")) "en" else lang0;
+    const script = if (o.getOwn("[[loc_script]]")) |v| v.unbox().string else "";
+    const region = if (o.getOwn("[[loc_region]]")) |v| v.unbox().string else "";
+    // RemoveLikelySubtags: drop a subtag exactly when AddLikelySubtags would put
+    // it back.
+    const likely = likelySubtags(lang);
+    const keep_script = script.len > 0 and !std.mem.eql(u8, script, likely.script);
+    const keep_region = region.len > 0 and !std.mem.eql(u8, region, likely.region);
+    return makeLocaleFrom(arena, o, lang, if (keep_script) script else "", if (keep_region) region else "");
+}
+
+/// Build the `getX()` list methods (§14.3.5-§14.3.9): a brand check plus a fresh
+/// Array of the values this build supports for the receiver's locale.
+fn locListFn(comptime values: []const []const u8) val_mod.NativeFnPtr {
+    return struct {
+        fn f(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+            _ = try requireLocale(arena, this_val);
+            const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+            for (values) |v| try arr.appendElement(try val_mod.makeString(arena, v));
+            return val_mod.makeObject(arena, arr);
+        }
+    }.f;
+}
+
+/// §14.3.10 getWeekInfo: `{firstDay, weekend, minimalDays}` on %Object.prototype%.
+pub fn nativeLocaleGetWeekInfo(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    _ = try requireLocale(arena, this_val);
+    const r = try dnEmptyObj(arena);
+    try r.set("firstDay", try val_mod.makeNumber(arena, 7));
+    const weekend = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    try weekend.appendElement(try val_mod.makeNumber(arena, 6));
+    try weekend.appendElement(try val_mod.makeNumber(arena, 7));
+    try r.set("weekend", try val_mod.makeObject(arena, weekend));
+    try r.set("minimalDays", try val_mod.makeNumber(arena, 1));
+    return val_mod.makeObject(arena, r);
+}
+
+/// §14.3.11 getTextInfo: `{direction}` on %Object.prototype%.
+pub fn nativeLocaleGetTextInfo(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const o = try requireLocale(arena, this_val);
+    const script = if (o.getOwn("[[loc_script]]")) |v| v.unbox().string else "";
+    const lang = if (o.getOwn("[[loc_language]]")) |v| v.unbox().string else "";
+    const rtl = std.mem.eql(u8, script, "Arab") or std.mem.eql(u8, script, "Hebr") or
+        std.mem.eql(u8, lang, "ar") or std.mem.eql(u8, lang, "he") or std.mem.eql(u8, lang, "fa");
+    const r = try dnEmptyObj(arena);
+    try r.set("direction", try val_mod.makeString(arena, if (rtl) "rtl" else "ltr"));
+    return val_mod.makeObject(arena, r);
+}
+
 /// Register Intl.Locale.prototype's scalar accessor getters (§14.3).
 pub fn registerLocaleAccessors(arena: std.mem.Allocator, proto: *JsObject) !void {
+    active_locale_proto = proto;
+    const M = struct {
+        fn add(a: std.mem.Allocator, p: *JsObject, name: []const u8, f: val_mod.NativeFnPtr) !void {
+            _ = try p.defineOwnData(name, try val_mod.makeNativeFunctionNamed(a, f, name, 0), .{ .writable = true, .enumerable = false, .configurable = true });
+        }
+    };
+    try M.add(arena, proto, "maximize", nativeLocaleMaximize);
+    try M.add(arena, proto, "minimize", nativeLocaleMinimize);
+    try M.add(arena, proto, "getCalendars", locListFn(&.{"gregory"}));
+    try M.add(arena, proto, "getCollations", locListFn(&.{"emoji"}));
+    try M.add(arena, proto, "getHourCycles", locListFn(&.{"h12"}));
+    try M.add(arena, proto, "getNumberingSystems", locListFn(&.{"latn"}));
+    try M.add(arena, proto, "getTimeZones", locListFn(&.{"UTC"}));
+    try M.add(arena, proto, "getWeekInfo", nativeLocaleGetWeekInfo);
+    try M.add(arena, proto, "getTextInfo", nativeLocaleGetTextInfo);
     try locAccessor(arena, proto, "baseName", "[[loc_baseName]]", false);
     try locAccessor(arena, proto, "language", "[[loc_language]]", false);
     try locAccessor(arena, proto, "script", "[[loc_script]]", true);
@@ -1668,6 +1823,19 @@ pub fn registerLocaleAccessors(arena: std.mem.Allocator, proto: *JsObject) !void
 // ------------------------------------------------------------------- ListFormat ---
 
 /// Collect the string elements of an array-like `list` argument.
+/// Shared constructor prologue for the Intl service constructors: every one of
+/// them is `new`-only (§9.2 "If NewTarget is undefined, throw a TypeError"), and
+/// the object to install the internal slots on is the one OrdinaryCreateFromConstructor
+/// already handed us as `this` (so subclassing keeps the subclass prototype).
+fn intlNewTarget(arena: std.mem.Allocator, this_val: Value, comptime name: []const u8) anyerror!*JsObject {
+    const constructing = realm_mod.active_constructing;
+    realm_mod.active_constructing = false;
+    if (!constructing)
+        return throwTypeErrorIntl(arena, "Constructor " ++ name ++ " requires 'new'");
+    if (this_val.bits != 0 and this_val.unbox() == .object) return this_val.toPtr().object;
+    return dnEmptyObj(arena);
+}
+
 fn listElements(arena: std.mem.Allocator, v: Value) ![][]const u8 {
     var out = std.ArrayListUnmanaged([]const u8){};
     if (v.bits == 0 or v.unbox() != .object) return out.items;
@@ -1692,51 +1860,74 @@ fn listElements(arena: std.mem.Allocator, v: Value) ![][]const u8 {
 }
 
 pub fn nativeListFormatCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const opts: ?Value = if (args.len > 1) args[1] else null;
-    const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
-        this_val.toPtr().object
-    else if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
-    else
-        try JsObject.create(arena, realm_mod.active_object_proto);
-    try obj.set("__lf_type", try val_mod.makeString(arena, optStr(opts, "type") orelse "conjunction"));
-    try obj.set("__lf_style", try val_mod.makeString(arena, optStr(opts, "style") orelse "long"));
+    const obj = try intlNewTarget(arena, this_val, "Intl.ListFormat");
+    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
+        _ = try canonicalizeTag(arena, t);
+    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+    const typ = (try dnGetOption(arena, options, "type", &.{ "conjunction", "disjunction", "unit" }, "conjunction")).?;
+    const style = (try dnGetOption(arena, options, "style", &.{ "long", "short", "narrow" }, "long")).?;
+    try obj.set("__lf_type", try val_mod.makeString(arena, typ));
+    try obj.set("__lf_style", try val_mod.makeString(arena, style));
     return val_mod.makeObject(arena, obj);
 }
 
-pub fn nativeListFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+/// CreatePartsFromList for en-US; `format` concatenates these, so the two forms
+/// stay consistent. `type` is "element" for a list item and "literal" for the
+/// separators the pattern inserts between them.
+fn lfBuildParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) ![]NumberPart {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.get("__lf_type") == null)
+        return throwTypeErrorIntl(arena, "Intl.ListFormat.prototype method called on an incompatible receiver");
     var typ: []const u8 = "conjunction";
-    if (this_val.bits != 0 and this_val.unbox() == .object) {
-        if (this_val.toPtr().object.get("__lf_type")) |v| if (v.bits != 0 and v.unbox() == .string) {
-            typ = v.unbox().string;
-        };
-    }
+    if (this_val.toPtr().object.get("__lf_type")) |v| if (v.bits != 0 and v.unbox() == .string) {
+        typ = v.unbox().string;
+    };
     const items = try listElements(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
-    if (items.len == 0) return val_mod.makeString(arena, "");
-    if (items.len == 1) return val_mod.makeString(arena, items[0]);
+    var parts: std.ArrayList(NumberPart) = .empty;
+    if (items.len == 0) return parts.items;
+    if (items.len == 1) {
+        try parts.append(arena, .{ .type = "element", .value = items[0] });
+        return parts.items;
+    }
 
     // en-US last-item conjunction word ("unit" style just uses commas).
     const conj: []const u8 = if (std.mem.eql(u8, typ, "disjunction")) "or" else "and";
     const is_unit = std.mem.eql(u8, typ, "unit");
-
-    var out = std.ArrayListUnmanaged(u8){};
     if (items.len == 2 and !is_unit) {
-        try out.appendSlice(arena, items[0]);
-        try out.append(arena, ' ');
-        try out.appendSlice(arena, conj);
-        try out.append(arena, ' ');
-        try out.appendSlice(arena, items[1]);
-        return val_mod.makeString(arena, out.items);
+        try parts.append(arena, .{ .type = "element", .value = items[0] });
+        try parts.append(arena, .{ .type = "literal", .value = try std.fmt.allocPrint(arena, " {s} ", .{conj}) });
+        try parts.append(arena, .{ .type = "element", .value = items[1] });
+        return parts.items;
     }
     for (items, 0..) |it, i| {
-        if (i > 0) try out.appendSlice(arena, ", ");
-        if (i == items.len - 1 and !is_unit) {
-            try out.appendSlice(arena, conj);
-            try out.append(arena, ' ');
-        }
-        try out.appendSlice(arena, it);
+        if (i > 0) try parts.append(arena, .{
+            .type = "literal",
+            .value = if (i == items.len - 1 and !is_unit)
+                try std.fmt.allocPrint(arena, ", {s} ", .{conj})
+            else
+                ", ",
+        });
+        try parts.append(arena, .{ .type = "element", .value = it });
     }
+    return parts.items;
+}
+
+pub fn nativeListFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    var out = std.ArrayListUnmanaged(u8){};
+    for (try lfBuildParts(arena, this_val, args)) |p| try out.appendSlice(arena, p.value);
     return val_mod.makeString(arena, out.items);
+}
+
+pub fn nativeListFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const parts = try lfBuildParts(arena, this_val, args);
+    const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    for (parts) |p| {
+        const o = try dnEmptyObj(arena);
+        try o.set("type", try val_mod.makeString(arena, p.type));
+        try o.set("value", try val_mod.makeString(arena, p.value));
+        try arr.appendElement(try val_mod.makeObject(arena, o));
+    }
+    return val_mod.makeObject(arena, arr);
 }
 
 pub fn nativeListFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -1780,14 +1971,13 @@ fn pluralCategory(n: f64, ordinal: bool) []const u8 {
 }
 
 pub fn nativePluralRulesCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const opts: ?Value = if (args.len > 1) args[1] else null;
-    const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
-        this_val.toPtr().object
-    else if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
-    else
-        try JsObject.create(arena, realm_mod.active_object_proto);
-    try obj.set("__pr_type", try val_mod.makeString(arena, optStr(opts, "type") orelse "cardinal"));
+    const obj = try intlNewTarget(arena, this_val, "Intl.PluralRules");
+    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
+        _ = try canonicalizeTag(arena, t);
+    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+    const typ = (try dnGetOption(arena, options, "type", &.{ "cardinal", "ordinal" }, "cardinal")).?;
+    try obj.set("__pr_type", try val_mod.makeString(arena, typ));
     return val_mod.makeObject(arena, obj);
 }
 
@@ -1800,6 +1990,24 @@ pub fn nativePluralRulesSelect(arena: std.mem.Allocator, this_val: Value, args: 
     }
     const n = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
     return val_mod.makeString(arena, pluralCategory(n, ordinal));
+}
+
+/// §16.3.3 selectRange(start, end): both ends are ToNumber'd (NaN is a RangeError)
+/// and en-US resolves every range to the plural form of the end value.
+pub fn nativePluralRulesSelectRange(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.get("__pr_type") == null)
+        return throwTypeErrorIntl(arena, "Intl.PluralRules.prototype.selectRange called on an incompatible receiver");
+    if (args.len < 2 or args[0].bits == 0 or args[0].unbox() == .undefined_ or args[1].bits == 0 or args[1].unbox() == .undefined_)
+        return throwTypeErrorIntl(arena, "Intl.PluralRules.prototype.selectRange: start and end are required");
+    const start = try realm_mod.toNumberValue(arena, args[0]);
+    const end = try realm_mod.toNumberValue(arena, args[1]);
+    if (std.math.isNan(start) or std.math.isNan(end))
+        return throwRangeError(arena, "Intl.PluralRules.prototype.selectRange: start and end must not be NaN");
+    var ordinal = false;
+    if (this_val.toPtr().object.get("__pr_type")) |v| if (v.bits != 0 and v.unbox() == .string) {
+        ordinal = std.mem.eql(u8, v.unbox().string, "ordinal");
+    };
+    return val_mod.makeString(arena, pluralCategory(end, ordinal));
 }
 
 pub fn nativePluralRulesResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -1818,22 +2026,14 @@ pub fn nativePluralRulesResolved(arena: std.mem.Allocator, this_val: Value, _: [
     try r.set("minimumIntegerDigits", try val_mod.makeNumber(arena, 1));
     try r.set("minimumFractionDigits", try val_mod.makeNumber(arena, 0));
     try r.set("maximumFractionDigits", try val_mod.makeNumber(arena, 3));
-    // pluralCategories: en-US ordinal has one/two/few/other; cardinal one/other.
-    const cats = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.active_array_proto)
+    // pluralCategories: a real Array — en-US ordinal has one/two/few/other,
+    // cardinal one/other.
+    const cats = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    const names: []const []const u8 = if (ordinal)
+        &.{ "one", "two", "few", "other" }
     else
-        try JsObject.create(arena, realm_mod.active_array_proto);
-    if (ordinal) {
-        try cats.set("0", try val_mod.makeString(arena, "one"));
-        try cats.set("1", try val_mod.makeString(arena, "two"));
-        try cats.set("2", try val_mod.makeString(arena, "few"));
-        try cats.set("3", try val_mod.makeString(arena, "other"));
-        try cats.set("length", try val_mod.makeNumber(arena, 4));
-    } else {
-        try cats.set("0", try val_mod.makeString(arena, "one"));
-        try cats.set("1", try val_mod.makeString(arena, "other"));
-        try cats.set("length", try val_mod.makeNumber(arena, 2));
-    }
+        &.{ "one", "other" };
+    for (names) |n| try cats.appendElement(try val_mod.makeString(arena, n));
     try r.set("pluralCategories", try val_mod.makeObject(arena, cats));
     return val_mod.makeObject(arena, r);
 }
@@ -1847,15 +2047,18 @@ fn singularUnit(unit: []const u8) []const u8 {
 }
 
 pub fn nativeRelativeTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const opts: ?Value = if (args.len > 1) args[1] else null;
-    const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
-        this_val.toPtr().object
-    else if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
-    else
-        try JsObject.create(arena, realm_mod.active_object_proto);
-    try obj.set("__rtf_numeric", try val_mod.makeString(arena, optStr(opts, "numeric") orelse "always"));
-    try obj.set("__rtf_style", try val_mod.makeString(arena, optStr(opts, "style") orelse "long"));
+    const obj = try intlNewTarget(arena, this_val, "Intl.RelativeTimeFormat");
+    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
+        _ = try canonicalizeTag(arena, t);
+    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+    if (try dnGetOption(arena, options, "numberingSystem", &.{}, null)) |ns| {
+        if (!isWellFormedNumberingSystem(ns)) return throwRangeError(arena, "invalid numberingSystem");
+    }
+    const style = (try dnGetOption(arena, options, "style", &.{ "long", "short", "narrow" }, "long")).?;
+    const numeric = (try dnGetOption(arena, options, "numeric", &.{ "always", "auto" }, "always")).?;
+    try obj.set("__rtf_numeric", try val_mod.makeString(arena, numeric));
+    try obj.set("__rtf_style", try val_mod.makeString(arena, style));
     return val_mod.makeObject(arena, obj);
 }
 
@@ -1884,36 +2087,74 @@ fn rtfAutoForm(arena: std.mem.Allocator, value: f64, unit: []const u8) !?[]const
     return null;
 }
 
-pub fn nativeRelativeTimeFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+/// The units `format`/`formatToParts` accept, singular form (plurals are folded
+/// by `singularUnit` first); anything else is a RangeError.
+fn rtfValidUnit(u: []const u8) bool {
+    const units = [_][]const u8{ "second", "minute", "hour", "day", "week", "month", "quarter", "year" };
+    for (units) |v| if (std.mem.eql(u8, v, u)) return true;
+    return false;
+}
+
+/// FormatRelativeTimePattern as a part list; `format` is the concatenation of the
+/// values, so the two can't drift. Parts carry `unit` on everything but the
+/// surrounding literals (`NumberPart.source` doubles as the `unit` field here).
+fn rtfBuildParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) ![]NumberPart {
     var numeric: []const u8 = "always";
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         if (this_val.toPtr().object.get("__rtf_numeric")) |v| if (v.bits != 0 and v.unbox() == .string) {
             numeric = v.unbox().string;
         };
-    }
+    } else return throwTypeErrorIntl(arena, "Intl.RelativeTimeFormat.prototype method called on an incompatible receiver");
     // ToNumber the value; a non-finite result is a RangeError (spec step 3).
     const value = if (args.len > 0) try realm_mod.toNumberValue(arena, args[0]) else std.math.nan(f64);
     if (!std.math.isFinite(value)) return throwRangeError(arena, "Intl.RelativeTimeFormat.prototype.format: value must be finite");
-    const unit_raw = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .string) args[1].unbox().string else "second";
+    const unit_raw = try t_shared.valueToString(arena, if (args.len > 1) args[1] else Value{});
     const u = singularUnit(unit_raw);
+    if (!rtfValidUnit(u)) return throwRangeError(arena, "Intl.RelativeTimeFormat.prototype.format: invalid unit");
 
+    var parts: std.ArrayList(NumberPart) = .empty;
     if (std.mem.eql(u8, numeric, "auto")) {
-        if (try rtfAutoForm(arena, value, unit_raw)) |form| return val_mod.makeString(arena, form);
+        if (try rtfAutoForm(arena, value, unit_raw)) |form| {
+            try parts.append(arena, .{ .type = "literal", .value = form });
+            return parts.items;
+        }
     }
 
-    // Numeric form: "N unit(s) ago" (past) / "in N unit(s)" (future, incl. 0),
-    // with grouped thousands separators on the integer magnitude.
+    // Numeric form: "N unit(s) ago" (past) / "in N unit(s)" (future). -0 counts
+    // as past (ECMA-402 treats it as a negative value).
+    const past = std.math.signbit(value);
     const av = @abs(value);
     const unit_name = if (av == 1) u else try std.fmt.allocPrint(arena, "{s}s", .{u});
-    const is_int = av == @trunc(av) and av < 9.007199254740992e15;
-    const num_str = if (is_int)
-        try groupInteger(arena, @as(u64, @intFromFloat(av)), true)
-    else
-        try std.fmt.allocPrint(arena, "{d}", .{av});
-    if (value < 0) {
-        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{s} {s} ago", .{ num_str, unit_name }));
+    if (!past) try parts.append(arena, .{ .type = "literal", .value = "in " });
+    for (try formatNumberParts(arena, av, .{})) |np|
+        try parts.append(arena, .{ .type = np.type, .value = np.value, .source = u });
+    try parts.append(arena, .{
+        .type = "literal",
+        .value = if (past)
+            try std.fmt.allocPrint(arena, " {s} ago", .{unit_name})
+        else
+            try std.fmt.allocPrint(arena, " {s}", .{unit_name}),
+    });
+    return parts.items;
+}
+
+pub fn nativeRelativeTimeFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    var out = std.ArrayListUnmanaged(u8){};
+    for (try rtfBuildParts(arena, this_val, args)) |p| try out.appendSlice(arena, p.value);
+    return val_mod.makeString(arena, out.items);
+}
+
+pub fn nativeRelativeTimeFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const parts = try rtfBuildParts(arena, this_val, args);
+    const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    for (parts) |p| {
+        const o = try dnEmptyObj(arena);
+        try o.set("type", try val_mod.makeString(arena, p.type));
+        try o.set("value", try val_mod.makeString(arena, p.value));
+        if (p.source) |unit| try o.set("unit", try val_mod.makeString(arena, unit));
+        try arr.appendElement(try val_mod.makeObject(arena, o));
     }
-    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "in {s} {s}", .{ num_str, unit_name }));
+    return val_mod.makeObject(arena, arr);
 }
 
 pub fn nativeRelativeTimeFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -1949,8 +2190,8 @@ fn dnEmptyObj(arena: std.mem.Allocator) !*JsObject {
 }
 
 /// GetOptionsObject (ES §9.2.13): undefined → a fresh empty object; an object →
-/// itself; any other value → TypeError.
-fn dnGetOptionsObject(arena: std.mem.Allocator, options: ?Value) anyerror!Value {
+/// itself; any other value → TypeError. Shared by every Intl service constructor.
+pub fn dnGetOptionsObject(arena: std.mem.Allocator, options: ?Value) anyerror!Value {
     const o = options orelse return val_mod.makeObject(arena, try dnEmptyObj(arena));
     if (o.bits == 0 or o.unbox() == .undefined_) return val_mod.makeObject(arena, try dnEmptyObj(arena));
     if (o.unbox() == .object) return o;
@@ -1973,6 +2214,19 @@ fn dnGetOption(arena: std.mem.Allocator, options: Value, key: []const u8, allowe
     if (allowed.len == 0) return s;
     for (allowed) |a| if (std.mem.eql(u8, a, s)) return s;
     return throwRangeError(arena, "invalid option value for Intl.DisplayNames");
+}
+
+/// GetOption(options, key, boolean, empty, undefined): reads through the active
+/// context (a throwing getter propagates) and applies ToBoolean.
+fn dnGetBoolOption(arena: std.mem.Allocator, options: Value, key: []const u8) anyerror!?bool {
+    const v = if (realm_mod.active_context) |c|
+        try c.getProp(arena, options, key)
+    else if (options.bits != 0 and options.unbox() == .object)
+        (options.toPtr().object.get(key) orelse Value{})
+    else
+        Value{};
+    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    return val_mod.toBoolean(v);
 }
 
 fn dnAllAlpha(s: []const u8) bool {
@@ -2588,7 +2842,232 @@ pub fn nativeDurationFormatResolved(arena: std.mem.Allocator, this_val: Value, _
     return val_mod.makeObject(arena, r);
 }
 
+// -------------------------------------------------------------------- Segmenter ---
+
+const str_proto = @import("string_proto.zig");
+
+/// One segment of a segmented string: a half-open range in both UTF-16 code
+/// units (what the JS-visible `index` uses) and WTF-8 bytes (what slices use).
+const Segment = struct {
+    cu_start: usize,
+    cu_end: usize,
+    byte_start: usize,
+    byte_end: usize,
+    word_like: bool,
+};
+
+/// Code points that count as "word-like" for `granularity: "word"`: letters,
+/// digits and the connectors that keep a word together. Approximated with
+/// ranges rather than a full UAX-29 word-break table — enough that segments
+/// still reassemble to the input and `isWordLike` is stable per segment.
+fn segIsWordChar(cp: u21) bool {
+    if (cp < 128) return std.ascii.isAlphanumeric(@intCast(cp)) or cp == '_';
+    return switch (cp) {
+        0xA0, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => false, // spaces
+        0x2010...0x2027, 0x2030...0x205E, 0x3001...0x3003, 0x3008...0x3020 => false, // punctuation
+        0xFF01...0xFF0F, 0xFF1A...0xFF20, 0xFF3B...0xFF40, 0xFF5B...0xFF65 => false, // fullwidth punctuation
+        else => true,
+    };
+}
+
+/// Sentence terminators recognized by `granularity: "sentence"`.
+fn segIsSentenceEnd(cp: u21) bool {
+    return switch (cp) {
+        '.', '!', '?', 0x3002, 0xFF01, 0xFF1F, 0x061F, 0x06D4, 0x0964, 0x0965 => true,
+        else => false,
+    };
+}
+
+/// Split `s` into segments for `granularity`. "grapheme" yields one code point
+/// per segment (a base-plus-combining-mark cluster is not merged); "word" and
+/// "sentence" group runs as described above. Segments always tile the input, so
+/// concatenating them reproduces it exactly.
+fn segmentString(arena: std.mem.Allocator, s: []const u8, granularity: []const u8) ![]Segment {
+    var out: std.ArrayList(Segment) = .empty;
+    const is_word = std.mem.eql(u8, granularity, "word");
+    const is_sentence = std.mem.eql(u8, granularity, "sentence");
+    var byte: usize = 0;
+    var cu: usize = 0;
+    var cur: ?Segment = null;
+    var seen_end = false; // sentence: a terminator was passed, break after trailing spaces
+    while (byte < s.len) {
+        var dec = str_proto.decodeWtf8At(s, byte);
+        // A surrogate pair stored as two WTF-8 halves is one code point, not two
+        // segments (`cuLen` counts it as two units either way).
+        if (dec.cp >= 0xD800 and dec.cp <= 0xDBFF and byte + dec.len < s.len) {
+            const lo = str_proto.decodeWtf8At(s, byte + dec.len);
+            if (lo.cp >= 0xDC00 and lo.cp <= 0xDFFF)
+                dec = .{ .cp = 0x10000 + ((dec.cp - 0xD800) << 10) + (lo.cp - 0xDC00), .len = dec.len + lo.len };
+        }
+        const cu_w: usize = if (dec.cp > 0xFFFF) 2 else 1;
+        const wordish = segIsWordChar(dec.cp);
+        const start_new = blk: {
+            if (cur == null) break :blk true;
+            if (is_word) break :blk wordish != cur.?.word_like or !wordish;
+            if (is_sentence) break :blk seen_end and !segIsSentenceEnd(dec.cp) and dec.cp != ' ';
+            break :blk true; // grapheme: one code point per segment
+        };
+        if (start_new) {
+            if (cur) |c| try out.append(arena, c);
+            cur = .{ .cu_start = cu, .cu_end = cu, .byte_start = byte, .byte_end = byte, .word_like = wordish };
+            seen_end = false;
+        }
+        cur.?.cu_end = cu + cu_w;
+        cur.?.byte_end = byte + dec.len;
+        if (is_sentence and segIsSentenceEnd(dec.cp)) seen_end = true;
+        byte += dec.len;
+        cu += cu_w;
+    }
+    if (cur) |c| try out.append(arena, c);
+    return out.items;
+}
+
+/// %SegmentsPrototype% and %SegmentIteratorPrototype%, captured at realm setup.
+var active_segments_proto: ?*JsObject = null;
+var active_segment_iterator_proto: ?*JsObject = null;
+
+pub fn nativeSegmenterCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const obj = try intlNewTarget(arena, this_val, "Intl.Segmenter");
+    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
+        _ = try canonicalizeTag(arena, t);
+    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+    const gran = (try dnGetOption(arena, options, "granularity", &.{ "grapheme", "word", "sentence" }, "grapheme")).?;
+    try obj.set("__seg_granularity", try val_mod.makeString(arena, gran));
+    return val_mod.makeObject(arena, obj);
+}
+
+fn segGranularityOf(arena: std.mem.Allocator, this_val: Value, comptime what: []const u8) anyerror![]const u8 {
+    if (this_val.bits == 0 or this_val.unbox() != .object) return throwTypeErrorIntl(arena, what);
+    const v = this_val.toPtr().object.getOwn("__seg_granularity") orelse return throwTypeErrorIntl(arena, what);
+    if (v.bits == 0 or v.unbox() != .string) return throwTypeErrorIntl(arena, what);
+    return v.unbox().string;
+}
+
+pub fn nativeSegmenterResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const gran = try segGranularityOf(arena, this_val, "Intl.Segmenter.prototype.resolvedOptions called on an incompatible receiver");
+    const r = try dnEmptyObj(arena);
+    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("granularity", try val_mod.makeString(arena, gran));
+    return val_mod.makeObject(arena, r);
+}
+
+pub fn nativeSegmenterSegment(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const gran = try segGranularityOf(arena, this_val, "Intl.Segmenter.prototype.segment called on an incompatible receiver");
+    const s = try t_shared.valueToString(arena, if (args.len > 0) args[0] else Value{});
+    const segs = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, active_segments_proto orelse realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, active_segments_proto orelse realm_mod.active_object_proto);
+    try segs.set("__segments_string", try val_mod.makeString(arena, s));
+    try segs.set("__segments_granularity", try val_mod.makeString(arena, gran));
+    return val_mod.makeObject(arena, segs);
+}
+
+/// CreateSegmentDataObject: `{segment, index, input}` plus `isWordLike` for
+/// word granularity, in that property order.
+fn segDataObject(arena: std.mem.Allocator, s: []const u8, seg: Segment, word_granularity: bool) !Value {
+    const o = try dnEmptyObj(arena);
+    try o.set("segment", try val_mod.makeString(arena, s[seg.byte_start..seg.byte_end]));
+    try o.set("index", try val_mod.makeNumber(arena, @floatFromInt(seg.cu_start)));
+    try o.set("input", try val_mod.makeString(arena, s));
+    if (word_granularity) try o.set("isWordLike", try val_mod.makeBool(arena, seg.word_like));
+    return val_mod.makeObject(arena, o);
+}
+
+fn segSegmentsSlots(arena: std.mem.Allocator, this_val: Value) anyerror!struct { s: []const u8, gran: []const u8, obj: *JsObject } {
+    const msg = "%Segments.prototype% method called on an incompatible receiver";
+    if (this_val.bits == 0 or this_val.unbox() != .object) return throwTypeErrorIntl(arena, msg);
+    const o = this_val.toPtr().object;
+    const sv = o.getOwn("__segments_string") orelse return throwTypeErrorIntl(arena, msg);
+    const gv = o.getOwn("__segments_granularity") orelse return throwTypeErrorIntl(arena, msg);
+    return .{ .s = sv.unbox().string, .gran = gv.unbox().string, .obj = o };
+}
+
+/// %Segments.prototype%.containing(index): the segment covering `index`, or
+/// undefined when the (ToInteger-coerced) index falls outside the string.
+pub fn nativeSegmentsContaining(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const slots = try segSegmentsSlots(arena, this_val);
+    const n = try realm_mod.toNumberValue(arena, if (args.len > 0) args[0] else Value{});
+    const idx_f = if (std.math.isNan(n)) 0 else @trunc(n);
+    if (idx_f < 0 or idx_f >= @as(f64, @floatFromInt(str_proto.cuLen(slots.s)))) return val_mod.makeUndefined(arena);
+    const idx: usize = @intFromFloat(idx_f);
+    const word = std.mem.eql(u8, slots.gran, "word");
+    for (try segmentString(arena, slots.s, slots.gran)) |seg| {
+        if (idx >= seg.cu_start and idx < seg.cu_end) return segDataObject(arena, slots.s, seg, word);
+    }
+    return val_mod.makeUndefined(arena);
+}
+
+/// %Segments.prototype%[@@iterator]: a fresh %SegmentIterator% over the same
+/// string, with its own cursor (spec §18.5.2 / §18.6).
+pub fn nativeSegmentsIterator(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const slots = try segSegmentsSlots(arena, this_val);
+    const it = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, active_segment_iterator_proto orelse realm_mod.active_object_proto)
+    else
+        try JsObject.create(arena, active_segment_iterator_proto orelse realm_mod.active_object_proto);
+    try it.set("__segiter_string", try val_mod.makeString(arena, slots.s));
+    try it.set("__segiter_granularity", try val_mod.makeString(arena, slots.gran));
+    try it.set("__segiter_pos", try val_mod.makeNumber(arena, 0));
+    return val_mod.makeObject(arena, it);
+}
+
+pub fn nativeSegmentIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const msg = "%SegmentIterator.prototype%.next called on an incompatible receiver";
+    if (this_val.bits == 0 or this_val.unbox() != .object) return throwTypeErrorIntl(arena, msg);
+    const o = this_val.toPtr().object;
+    const sv = o.getOwn("__segiter_string") orelse return throwTypeErrorIntl(arena, msg);
+    const gv = o.getOwn("__segiter_granularity") orelse return throwTypeErrorIntl(arena, msg);
+    const pv = o.getOwn("__segiter_pos") orelse return throwTypeErrorIntl(arena, msg);
+    const s = sv.unbox().string;
+    const gran = gv.unbox().string;
+    const pos: usize = @intFromFloat(pv.unbox().number);
+    const res = try dnEmptyObj(arena);
+    const segs = try segmentString(arena, s, gran);
+    // The cursor is a UTF-16 index into the string, so a re-entrant `next()`
+    // (nested-next.js) sees the advance the outer call already made.
+    for (segs) |seg| {
+        if (seg.cu_start < pos) continue;
+        try o.set("__segiter_pos", try val_mod.makeNumber(arena, @floatFromInt(seg.cu_end)));
+        try res.set("value", try segDataObject(arena, s, seg, std.mem.eql(u8, gran, "word")));
+        try res.set("done", try val_mod.makeBool(arena, false));
+        return val_mod.makeObject(arena, res);
+    }
+    try res.set("value", try val_mod.makeUndefined(arena));
+    try res.set("done", try val_mod.makeBool(arena, true));
+    return val_mod.makeObject(arena, res);
+}
+
+/// Build %Segments.prototype% and %SegmentIterator.prototype% (§18.5 / §18.6).
+/// Neither is reachable from `Intl`, so they are only stored in the module.
+pub fn registerSegmenterPrototypes(arena: std.mem.Allocator, object_proto: ?*JsObject, iterator_proto: ?*JsObject) !void {
+    const segs = try JsObject.create(arena, object_proto);
+    _ = try segs.defineOwnData("containing", try val_mod.makeNativeFunctionNamed(arena, nativeSegmentsContaining, "containing", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+    if (realm_mod.active_sym_iterator) |sym|
+        _ = try segs.defineOwnDataSym(sym, try val_mod.makeNativeFunctionNamed(arena, nativeSegmentsIterator, "[Symbol.iterator]", 0), .{ .writable = true, .enumerable = false, .configurable = true });
+    active_segments_proto = segs;
+
+    const it = try JsObject.create(arena, iterator_proto orelse object_proto);
+    _ = try it.defineOwnData("next", try val_mod.makeNativeFunctionNamed(arena, nativeSegmentIteratorNext, "next", 0), .{ .writable = true, .enumerable = false, .configurable = true });
+    if (realm_mod.active_sym_to_string_tag) |tag|
+        _ = try it.defineOwnDataSym(tag, try val_mod.makeString(arena, "Segmenter String Iterator"), .{ .writable = false, .enumerable = false, .configurable = true });
+    active_segment_iterator_proto = it;
+}
+
 // ----------------------------------------------------------------------- tests ---
+
+test "intl: segmentString tiles the input" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    for ([_][]const u8{ "grapheme", "word", "sentence" }) |g| {
+        const text = "Hi there! Foo bar? xy";
+        var joined = std.ArrayListUnmanaged(u8){};
+        for (try segmentString(a, text, g)) |seg| try joined.appendSlice(a, text[seg.byte_start..seg.byte_end]);
+        try std.testing.expectEqualStrings(text, joined.items);
+    }
+}
 
 test "intl: formatNumber decimal grouping" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
