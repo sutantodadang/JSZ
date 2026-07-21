@@ -1,0 +1,1 @@
+var v, r; ({ [1]: v, ...r } = { 1: "a", 2: "b" }); [v, JSON.stringify(r)].join("|")

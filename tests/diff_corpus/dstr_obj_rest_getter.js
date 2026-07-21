@@ -1,0 +1,1 @@
+var count = 0, x; ({ ...x } = { get v() { count++; return 2 } }); [count, JSON.stringify(x)].join("|")

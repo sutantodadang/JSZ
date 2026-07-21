@@ -1266,8 +1266,32 @@ pub const FnCompiler = struct {
                 // `({a} = null)` / `for ({a} of [null])`: destructuring null or
                 // undefined throws before any property read.
                 try self.emitRequireCoercible(rsrc, line);
-                for (target.data.object_literal.properties) |prop| {
+                const props = target.data.object_literal.properties;
+                // A trailing `...rest` (a property whose value is a spread_expr)
+                // gets every *preceding* key, so it can copy the remaining own
+                // enumerable properties. The keys are runtime values — a computed
+                // key must be excluded by what it evaluated to, not by its source
+                // text — so they are collected into an array as the pattern runs.
+                var rexcl: ?u8 = null;
+                for (props) |prop| {
+                    if (prop.value.kind == .spread_expr) {
+                        const r = self.allocReg();
+                        try self.emitOp(.NEW_ARRAY, line);
+                        try self.emitU8(r);
+                        try self.emitU8(0);
+                        rexcl = r;
+                        break;
+                    }
+                }
+                for (props) |prop| {
                     if (prop.kind != .init) continue; // patterns carry only data props
+                    if (prop.value.kind == .spread_expr) {
+                        const rrest = self.allocReg();
+                        try self.emitDestrCall("__destrObjRest__", rsrc, rexcl, rrest, line);
+                        try self.compileDestructure(prop.value.data.spread_expr, rrest, line);
+                        self.sp = rrest;
+                        continue;
+                    }
                     const rval = self.allocReg();
                     if (prop.computed_key) |key_node| {
                         const rkey = try self.compileExpr(key_node);
@@ -1275,6 +1299,11 @@ pub const FnCompiler = struct {
                         try self.emitU8(rval);
                         try self.emitU8(rsrc);
                         try self.emitU8(rkey);
+                        if (rexcl) |re| {
+                            try self.emitOp(.ARRAY_APPEND, line);
+                            try self.emitU8(re);
+                            try self.emitU8(rkey);
+                        }
                         self.sp = rval + 1; // free rkey
                     } else {
                         const sv = try val_mod.makeString(self.arena, prop.key);
@@ -1283,10 +1312,21 @@ pub const FnCompiler = struct {
                         try self.emitU8(rval);
                         try self.emitU8(rsrc);
                         try self.emitU16(kidx);
+                        if (rexcl) |re| {
+                            const rkey = self.allocReg();
+                            try self.emitOp(.LOAD_K, line);
+                            try self.emitU8(rkey);
+                            try self.emitI16(@intCast(kidx));
+                            try self.emitOp(.ARRAY_APPEND, line);
+                            try self.emitU8(re);
+                            try self.emitU8(rkey);
+                            self.sp = rval + 1; // free rkey
+                        }
                     }
                     try self.compileDestructure(prop.value, rval, line);
                     self.sp = rval; // free rval
                 }
+                if (rexcl) |re| self.sp = re;
             },
             .array_literal => {
                 // ES ArrayAssignmentPattern: destructure through the iterator
