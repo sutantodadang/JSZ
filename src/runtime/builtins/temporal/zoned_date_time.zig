@@ -128,7 +128,6 @@ fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128) !timezone.Zon
     }
 }
 
-/// Constructor calendar (CanonicalizeCalendar): a bare identifier only.
 /// The constructor's calendar argument: a bare identifier String only
 /// (CanonicalizeCalendar), unlike the property-bag form which also accepts an
 /// ISO temporal string.
@@ -718,7 +717,8 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     const to = if (since) z.* else other;
 
     var result: shared.DurationFields = undefined;
-    if (unitRank(largest.?) >= unitRank(.day)) {
+    // Rank 0 is `year`, so "day or larger" is a *lower* rank.
+    if (unitRank(largest.?) <= unitRank(.day)) {
         result = differenceZoned(from, to, largest.?);
     } else {
         result = balanceTime(to.ns - from.ns, largest.?);
@@ -747,9 +747,11 @@ fn differenceZoned(a: ZonedDT, b: ZonedDT, largest: shared.Unit) shared.Duration
     const date_sign = plain_date.compareISODate(d1, d2);
     if (ns_diff < 0 and date_sign < 0) {
         d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) + 1);
+        d1.calendar = d2.calendar;
         ns_diff += shared.NS_PER_DAY;
     } else if (ns_diff > 0 and date_sign > 0) {
         d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) - 1);
+        d1.calendar = d2.calendar;
         ns_diff -= shared.NS_PER_DAY;
     }
     var date_dur = plain_date.differenceISODate(d1, d2, largest);

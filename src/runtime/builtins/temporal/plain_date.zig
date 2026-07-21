@@ -298,7 +298,12 @@ pub fn differenceISODate(d1: ISODate, d2: ISODate, largest: shared.Unit) shared.
             const sign: i8 = cmp; // -1 if d1<d2, +1 if d1>d2
             const a = if (sign < 0) d1 else d2;
             const b = if (sign < 0) d2 else d1;
-            var total_months: i64 = (@as(i64, b.year) - a.year) * 12 + (@as(i64, b.month) - a.month);
+            // Whole months between a and b, measured in the receiver's calendar.
+            const cal = d1.calendar;
+            const fa = calendar.fields(cal, a);
+            const fb = calendar.fields(cal, b);
+            var total_months: i64 = calendar.absoluteMonth(cal, fb.year, fb.month) -
+                calendar.absoluteMonth(cal, fa.year, fa.month);
             var cand = addMonthsConstrain(a, total_months);
             if (compareISODate(cand, b) > 0) {
                 total_months -= 1;
@@ -308,8 +313,13 @@ pub fn differenceISODate(d1: ISODate, d2: ISODate, largest: shared.Unit) shared.
             var years: i64 = 0;
             var months: i64 = total_months;
             if (largest == .year) {
-                years = @divTrunc(total_months, 12);
-                months = total_months - years * 12;
+                // Split into whole years by walking back whole years from b,
+                // since a calendar year is not always a fixed number of months.
+                years = @divTrunc(total_months, calendar.monthsInYear(cal, fa.year));
+                while (years != 0 and @abs(calendar.absoluteMonth(cal, fa.year + @as(i32, @intCast(years)), fa.month) -
+                    calendar.absoluteMonth(cal, fa.year, fa.month)) > @abs(total_months)) years -= 1;
+                months = total_months - (calendar.absoluteMonth(cal, fa.year + @as(i32, @intCast(years)), fa.month) -
+                    calendar.absoluteMonth(cal, fa.year, fa.month));
             }
             const dir: f64 = if (sign < 0) 1 else -1;
             out.years = @as(f64, @floatFromInt(years)) * dir;
@@ -320,13 +330,14 @@ pub fn differenceISODate(d1: ISODate, d2: ISODate, largest: shared.Unit) shared.
     }
 }
 
+/// Shift `a` by `n` calendar months, clamping the day into the target month.
 fn addMonthsConstrain(a: ISODate, n: i64) ISODate {
-    const mtotal: i64 = @as(i64, a.month) + n;
-    const y: i64 = @as(i64, a.year) + @divFloor(mtotal - 1, 12);
-    const m: i64 = @mod(mtotal - 1, 12) + 1;
-    const dim = shared.isoDaysInMonth(@intCast(y), @intCast(m));
-    const day: i64 = @min(a.day, dim);
-    return .{ .year = @intCast(y), .month = @intCast(m), .day = @intCast(day) };
+    const cal = a.calendar;
+    const f = calendar.fields(cal, a);
+    const ym = calendar.addMonths(cal, f.year, f.month, n) catch return a;
+    const dim = calendar.daysInMonth(cal, ym.year, ym.month);
+    const day: i32 = @min(f.day, dim);
+    return calendar.toIso(cal, ym.year, ym.month, day, .constrain) catch a;
 }
 
 fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Value, since: bool) !Value {

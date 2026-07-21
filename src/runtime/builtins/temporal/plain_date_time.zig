@@ -259,7 +259,8 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     const to = if (since) dt.* else other;
 
     var result: shared.DurationFields = undefined;
-    if (unitRank(largest.?) >= unitRank(.day)) {
+    // Rank 0 is `year`, so "day or larger" is a *lower* rank.
+    if (unitRank(largest.?) <= unitRank(.day)) {
         // Calendar+time difference with day/week/month/year largest unit.
         result = differenceDateTime(from, to, largest.?);
     } else {
@@ -283,9 +284,11 @@ fn differenceDateTime(dt1: ISODateTime, dt2: ISODateTime, largest: shared.Unit) 
     // Borrow a day so time-diff sign agrees with date-diff sign.
     if (ns_diff < 0 and date_sign < 0) {
         d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) + 1);
+        d1.calendar = d2.calendar;
         ns_diff += shared.NS_PER_DAY;
     } else if (ns_diff > 0 and date_sign > 0) {
         d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) - 1);
+        d1.calendar = d2.calendar;
         ns_diff -= shared.NS_PER_DAY;
     }
     var date_dur = plain_date.differenceISODate(d1, d2, largest);

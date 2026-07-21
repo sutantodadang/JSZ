@@ -577,6 +577,22 @@ pub fn addMonths(cal: CalendarId, cal_year: i32, month: u8, delta: i128) Error!s
     return .{ .year = @intCast(y), .month = @intCast(m) };
 }
 
+/// A month's absolute index, counting from `cal`'s year 1 month 1. Differences
+/// of this are the whole-month distance between two dates, which is what
+/// until/since need and what a plain `(Δyear * 12 + Δmonth)` gets wrong on a
+/// calendar whose years hold different numbers of months.
+pub fn absoluteMonth(cal: CalendarId, cal_year: i32, month: u8) i64 {
+    const y: i64 = cal_year;
+    const before: i64 = switch (cal) {
+        // Months elapsed before year `y`, from the Metonic cycle: 235 months
+        // per 19 years.
+        .hebrew => @divFloor(235 * y - 234, 19),
+        .coptic, .ethiopic, .ethioaa => (y - 1) * 13,
+        else => (y - 1) * 12,
+    };
+    return before + month;
+}
+
 /// Reconstitute an ISO date from calendar-space fields, applying `overflow`.
 /// Under `.constrain` the month is clamped into the year and the day into the
 /// month; under `.reject` an out-of-range field is an error.
