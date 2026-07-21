@@ -367,6 +367,43 @@ pub inline fn opSetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+/// DEFINE_PRIVATE: PrivateFieldAdd / PrivateMethodOrAccessorAdd. Same operand
+/// encoding as SET_PROP, but *creates* the private element on the receiver
+/// instead of routing through PrivateSet — so it neither requires an existing
+/// element nor invokes a same-named private setter inherited from elsewhere.
+/// Only the class desugaring emits it, always with a receiver it just created
+/// (the instance under construction, or the class object itself for a static
+/// element), so no user code can run here.
+pub inline fn opDefinePrivate(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const robj = code[frame.pc];
+    frame.pc += 1;
+    const lo = code[frame.pc];
+    frame.pc += 1;
+    const hi = code[frame.pc];
+    frame.pc += 1;
+    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+    const rval = code[frame.pc];
+    frame.pc += 1;
+    const key = frame.func.chunk.constants[kidx].toPtr().string;
+    const obj_val = frame.registers[robj];
+    const val = frame.registers[rval];
+    if (obj_val.bits == 0) return null;
+    const holder: ?*@import("../../object/object.zig").JsObject = switch (obj_val.unbox()) {
+        .object => |o| o,
+        .bc_function => blk: {
+            const realm_mod = @import("../../runtime/realm.zig");
+            const ctx = realm_mod.active_context orelse break :blk null;
+            break :blk try ctx.backingObject(self.arena, obj_val);
+        },
+        else => null,
+    };
+    const obj = holder orelse return null;
+    _ = try obj.defineOwnData(key, val, .{ .writable = true, .enumerable = false, .configurable = false, .is_private = true });
+    obj.markPrivate(key);
+    return null;
+}
+
 pub inline fn opSetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const site_pc = frame.pc - 1;

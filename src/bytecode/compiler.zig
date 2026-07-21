@@ -1434,7 +1434,9 @@ pub const FnCompiler = struct {
             const prop_name = me.property.data.identifier;
             const sv = try val_mod.makeString(self.arena, prop_name);
             const kidx = try self.addConstant(sv);
-            try self.emitOp(.SET_PROP, line);
+            // Class-desugar private-element installation: create the element
+            // rather than requiring an existing one (PrivateFieldAdd).
+            try self.emitOp(if (me.private_define) .DEFINE_PRIVATE else .SET_PROP, line);
             try self.emitU8(robj);
             try self.emitU16(kidx);
             try self.emitU8(rval);

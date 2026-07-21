@@ -257,6 +257,12 @@ pub const MemberExpr = struct {
     computed: bool,
     /// ES2020 optional member `obj?.prop` / `obj?.[expr]`.
     optional: bool = false,
+    /// Set only by the class desugaring on the assignment targets that *install*
+    /// a private element (field initializer, private method/accessor). Such a
+    /// write is PrivateFieldAdd / PrivateMethodOrAccessorAdd and creates the
+    /// element; every ordinary `obj.#x = v` is PrivateSet and requires one to
+    /// already exist. Compiles to DEFINE_PRIVATE instead of SET_PROP.
+    private_define: bool = false,
 };
 
 pub const FuncExpr = struct {

@@ -328,7 +328,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d} len={d}", .{ rdst, len });
         },
-        .SET_PROP => {
+        .SET_PROP, .DEFINE_PRIVATE => {
             const robj = code[new_pc];
             new_pc += 1;
             const lo = code[new_pc];

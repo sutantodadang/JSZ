@@ -1352,6 +1352,7 @@ pub const BcVm = struct {
                 .GET_PROP => if (try property_ops.opGetProp(self, frame)) |o| return o,
                 .GET_PROP_DYN => if (try property_ops.opGetPropDyn(self, frame)) |o| return o,
                 .SET_PROP => if (try property_ops.opSetProp(self, frame)) |o| return o,
+                .DEFINE_PRIVATE => if (try property_ops.opDefinePrivate(self, frame)) |o| return o,
                 .SET_PROP_DYN => if (try property_ops.opSetPropDyn(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR => if (try property_ops.opDefineAccessor(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR_DYN => if (try property_ops.opDefineAccessorDyn(self, frame)) |o| return o,
@@ -1771,7 +1772,8 @@ pub const BcVm = struct {
     /// Throw the "no private brand" TypeError and surface it as error.JsException.
     fn throwPrivateBrand(self: *BcVm, key: []const u8) anyerror!Value {
         const realm_m = @import("../runtime/realm.zig");
-        const msg = try std.fmt.allocPrint(self.arena, "Cannot access private member {s} on an object whose class did not declare it", .{key});
+        const class_mod = @import("../parser/class.zig");
+        const msg = try std.fmt.allocPrint(self.arena, "Cannot access private member {s} on an object whose class did not declare it", .{class_mod.privateDisplayName(key)});
         realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", msg);
         return error.JsException;
     }
@@ -1797,27 +1799,31 @@ pub const BcVm = struct {
         return self.throwPrivateBrand(key);
     }
 
-    /// PrivateElement [[Set]] for a static-key `obj.#x = v` write, handling only
-    /// the cases the ordinary set path gets wrong: a private accessor (invoke its
-    /// setter, or TypeError when it has none). Returns true when handled here;
-    /// false to fall through to the ordinary set path (PrivateFieldAdd for a new
-    /// field, or a plain update of an existing writable data field).
+    /// PrivateElement [[Set]] for a static-key `obj.#x = v` write. The element
+    /// must already exist: PrivateSet never *adds* one (that is DEFINE_PRIVATE,
+    /// emitted only by the class desugaring), so an unbranded receiver is a
+    /// TypeError rather than a silently-created field. Returns true when handled
+    /// here (private accessor → invoke its setter, or TypeError when it has
+    /// none); false to fall through to the ordinary set path, which updates the
+    /// existing writable data field.
     pub fn privateSet(self: *BcVm, obj_val: Value, key: []const u8, val: Value) anyerror!bool {
-        const root = (try self.privateHolder(obj_val)) orelse return false;
-        if (root.findProperty(key)) |loc| {
-            const a = loc.holder.attrAt(loc.slot);
-            if (a.is_accessor) {
-                const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
-                const setter = accessorMember(raw, "set");
-                if (!isCallable(setter)) {
-                    _ = try self.throwPrivateBrand(key);
-                    return true;
-                }
-                _ = try self.callAccessor(setter, obj_val, &[_]Value{val});
-                return true;
-            }
+        const root = (try self.privateHolder(obj_val)) orelse return self.throwPrivateBrandBool(key);
+        const loc = root.findProperty(key) orelse return self.throwPrivateBrandBool(key);
+        const a = loc.holder.attrAt(loc.slot);
+        if (a.is_accessor) {
+            const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+            const setter = accessorMember(raw, "set");
+            if (!isCallable(setter)) return self.throwPrivateBrandBool(key);
+            _ = try self.callAccessor(setter, obj_val, &[_]Value{val});
+            return true;
         }
         return false;
+    }
+
+    /// `throwPrivateBrand` at the `!bool` call sites (it always returns the error).
+    fn throwPrivateBrandBool(self: *BcVm, key: []const u8) anyerror!bool {
+        _ = try self.throwPrivateBrand(key);
+        return true;
     }
 
     /// Read a symbol-keyed property, walking the prototype chain (own first).
