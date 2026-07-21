@@ -12,6 +12,7 @@
 //!   integration/es_features.zig – es2016–2022, tco, debugger, source map   (44 tests)
 //!   integration/phase13.zig    – phase13                                   (39 tests)
 //!   integration/typed_array.zig – TypedArray constructors + prototype methods (28 tests)
+//!   integration/temporal_calendar.zig – Temporal non-ISO calendars            (9 tests)
 
 // Pull in each sub-file so Zig discovers their test blocks.
 const _core = @import("./integration/core.zig");
@@ -21,6 +22,7 @@ const _esm = @import("./integration/esm.zig");
 const _es_features = @import("./integration/es_features.zig");
 const _phase13 = @import("./integration/phase13.zig");
 const _typed_array = @import("./integration/typed_array.zig");
+const _temporal_calendar = @import("./integration/temporal_calendar.zig");
 
 // Suppress unused-import warnings.
 comptime {
@@ -31,4 +33,5 @@ comptime {
     _ = _es_features;
     _ = _phase13;
     _ = _typed_array;
+    _ = _temporal_calendar;
 }

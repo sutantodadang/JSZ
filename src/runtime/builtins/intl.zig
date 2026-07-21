@@ -107,8 +107,19 @@ fn groupInteger(arena: std.mem.Allocator, int_part: u64, group: bool) ![]const u
     return out.items;
 }
 
-/// Core en-US number formatting.
-fn formatNumber(
+/// One element of a `formatToParts` result.
+pub const NumberPart = struct {
+    type: []const u8,
+    value: []const u8,
+    /// Which end of a range this part came from. Only `formatRangeToParts`
+    /// reports it; plain `formatToParts` parts leave it null.
+    source: ?[]const u8 = null,
+};
+
+/// Core en-US number formatting, as the `formatToParts` part list. `format` is
+/// the concatenation of these values, so both share one implementation and
+/// cannot drift apart.
+fn formatNumberParts(
     arena: std.mem.Allocator,
     value: f64,
     style: []const u8,
@@ -117,8 +128,12 @@ fn formatNumber(
     max_frac_in: u32,
     group: bool,
     sign_display: []const u8,
-) ![]const u8 {
-    if (std.math.isNan(value)) return "NaN";
+) ![]NumberPart {
+    var parts: std.ArrayList(NumberPart) = .empty;
+    if (std.math.isNan(value)) {
+        try parts.append(arena, .{ .type = "nan", .value = "NaN" });
+        return parts.items;
+    }
 
     var n = value;
     const negative = std.math.signbit(n) and n != 0;
@@ -151,8 +166,18 @@ fn formatNumber(
     }
     if (is_percent) suffix = "%";
 
+    if (sign_prefix.len > 0) {
+        try parts.append(arena, .{
+            .type = if (sign_prefix[0] == '-') "minusSign" else "plusSign",
+            .value = sign_prefix,
+        });
+    }
+    if (cur_prefix.len > 0) try parts.append(arena, .{ .type = "currency", .value = cur_prefix });
+
     if (std.math.isInf(value)) {
-        return std.fmt.allocPrint(arena, "{s}{s}\u{221e}{s}", .{ sign_prefix, cur_prefix, suffix });
+        try parts.append(arena, .{ .type = "infinity", .value = "\u{221e}" });
+        if (suffix.len > 0) try parts.append(arena, .{ .type = "percentSign", .value = suffix });
+        return parts.items;
     }
 
     const scale = pow10(max_frac);
@@ -167,21 +192,48 @@ fn formatNumber(
     const int_part = scaled_u / scale;
     const frac_part = scaled_u % scale;
 
+    // The integer digits are emitted as alternating integer/group runs, which is
+    // what distinguishes formatToParts from a plain grouped string.
     const int_str = try groupInteger(arena, int_part, group);
+    var run_start: usize = 0;
+    for (int_str, 0..) |c, i| {
+        if (c != ',') continue;
+        try parts.append(arena, .{ .type = "integer", .value = int_str[run_start..i] });
+        try parts.append(arena, .{ .type = "group", .value = "," });
+        run_start = i + 1;
+    }
+    try parts.append(arena, .{ .type = "integer", .value = int_str[run_start..] });
 
     // Fraction: zero-pad to max_frac, then trim trailing zeros down to min_frac.
-    var frac_str: []const u8 = "";
     if (max_frac > 0) {
         const buf = try std.fmt.allocPrint(arena, "{d:0>[1]}", .{ frac_part, max_frac });
         var keep = buf.len;
         while (keep > min_frac and buf[keep - 1] == '0') keep -= 1;
-        frac_str = buf[0..keep];
+        if (keep > 0) {
+            try parts.append(arena, .{ .type = "decimal", .value = "." });
+            try parts.append(arena, .{ .type = "fraction", .value = buf[0..keep] });
+        }
     }
 
-    if (frac_str.len > 0) {
-        return std.fmt.allocPrint(arena, "{s}{s}{s}.{s}{s}", .{ sign_prefix, cur_prefix, int_str, frac_str, suffix });
-    }
-    return std.fmt.allocPrint(arena, "{s}{s}{s}{s}", .{ sign_prefix, cur_prefix, int_str, suffix });
+    if (suffix.len > 0) try parts.append(arena, .{ .type = "percentSign", .value = suffix });
+    return parts.items;
+}
+
+/// `format`: the part values concatenated.
+fn formatNumber(
+    arena: std.mem.Allocator,
+    value: f64,
+    style: []const u8,
+    currency: []const u8,
+    min_frac_in: u32,
+    max_frac_in: u32,
+    group: bool,
+    sign_display: []const u8,
+) ![]const u8 {
+    const parts = try formatNumberParts(arena, value, style, currency, min_frac_in, max_frac_in, group, sign_display);
+    var out: std.ArrayList(u8) = .empty;
+    for (parts) |p| try out.appendSlice(arena, p.value);
+    return out.items;
 }
 
 fn currencySymbol(code: []const u8) []const u8 {
@@ -268,6 +320,117 @@ pub fn nativeNumberFormatFormat(arena: std.mem.Allocator, this_val: Value, args:
     const n = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
     const s = try formatNumber(arena, n, style, currency, min_frac, max_frac, group, sign_display);
     return val_mod.makeString(arena, s);
+}
+
+/// Read the resolved options a NumberFormat stored on itself at construction.
+const NfOptions = struct {
+    style: []const u8 = "decimal",
+    currency: []const u8 = "USD",
+    min_frac: u32 = 0,
+    max_frac: u32 = 3,
+    group: bool = true,
+    sign_display: []const u8 = "auto",
+};
+
+/// Brand check: our NumberFormat instances carry the internal `__intl_style`
+/// marker, so anything without it is not an initialized NumberFormat.
+fn requireNumberFormat(arena: std.mem.Allocator, this_val: Value) !void {
+    if (this_val.bits == 0 or this_val.unbox() != .object or
+        this_val.toPtr().object.getOwn("__intl_style") == null)
+        return realm_mod.throwTypeError(arena, "called on incompatible receiver");
+}
+
+fn readNfOptions(this_val: Value) NfOptions {
+    var r = NfOptions{};
+    if (this_val.bits == 0 or this_val.unbox() != .object) return r;
+    const o = this_val.toPtr().object;
+    if (o.get("__intl_style")) |v| if (v.bits != 0 and v.unbox() == .string) {
+        r.style = v.unbox().string;
+    };
+    if (o.get("__intl_currency")) |v| if (v.bits != 0 and v.unbox() == .string) {
+        r.currency = v.unbox().string;
+    };
+    if (o.get("__intl_minFrac")) |v| if (v.bits != 0 and v.unbox() == .number) {
+        r.min_frac = @intFromFloat(v.unbox().number);
+    };
+    if (o.get("__intl_maxFrac")) |v| if (v.bits != 0 and v.unbox() == .number) {
+        r.max_frac = @intFromFloat(v.unbox().number);
+    };
+    if (o.get("__intl_group")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
+        r.group = v.unbox().boolean;
+    };
+    if (o.get("__intl_sign")) |v| if (v.bits != 0 and v.unbox() == .string) {
+        r.sign_display = v.unbox().string;
+    };
+    return r;
+}
+
+fn nfParts(arena: std.mem.Allocator, this_val: Value, value: f64) ![]NumberPart {
+    const r = readNfOptions(this_val);
+    return formatNumberParts(arena, value, r.style, r.currency, r.min_frac, r.max_frac, r.group, r.sign_display);
+}
+
+/// Build the JS array of `{type, value}` objects `formatToParts` returns.
+fn partsToArray(arena: std.mem.Allocator, parts: []const NumberPart) !Value {
+    const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    for (parts) |p| {
+        const o = if (realm_mod.active_heap) |h|
+            try JsObject.createOnHeap(h, realm_mod.active_object_proto)
+        else
+            try JsObject.create(arena, realm_mod.active_object_proto);
+        try o.set("type", try val_mod.makeString(arena, p.type));
+        try o.set("value", try val_mod.makeString(arena, p.value));
+        if (p.source) |src| try o.set("source", try val_mod.makeString(arena, src));
+        try arr.appendElement(try val_mod.makeObject(arena, o));
+    }
+    return val_mod.makeObject(arena, arr);
+}
+
+pub fn nativeNumberFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    try requireNumberFormat(arena, this_val);
+    const n = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
+    return partsToArray(arena, try nfParts(arena, this_val, n));
+}
+
+/// The en-US range separator is an en dash with no surrounding spaces.
+const range_separator = "\u{2013}";
+
+/// `formatRange` / `formatRangeToParts`. When both ends format identically the
+/// spec collapses the range to the single approximate value; we format the two
+/// ends and join them, which is what the en-US pattern does.
+fn rangeParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) ![]NumberPart {
+    try requireNumberFormat(arena, this_val);
+    // Both endpoints are required: undefined is a TypeError, NaN a RangeError.
+    const start = if (args.len > 0) args[0] else Value{};
+    const end = if (args.len > 1) args[1] else Value{};
+    if (start.bits == 0 or start.unbox() == .undefined_ or end.bits == 0 or end.unbox() == .undefined_)
+        return realm_mod.throwTypeError(arena, "formatRange requires two arguments");
+    // ToIntlMathematicalValue rejects Symbols rather than coercing them.
+    if (start.unbox() == .symbol or end.unbox() == .symbol)
+        return realm_mod.throwTypeError(arena, "cannot convert a Symbol to a number");
+    const a = getNum(start);
+    const b = getNum(end);
+    if (std.math.isNan(a) or std.math.isNan(b)) return throwRangeError(arena, "formatRange arguments must not be NaN");
+    var out: std.ArrayList(NumberPart) = .empty;
+    for (try nfParts(arena, this_val, a)) |p| {
+        try out.append(arena, .{ .type = p.type, .value = p.value, .source = "startRange" });
+    }
+    try out.append(arena, .{ .type = "literal", .value = range_separator, .source = "shared" });
+    for (try nfParts(arena, this_val, b)) |p| {
+        try out.append(arena, .{ .type = p.type, .value = p.value, .source = "endRange" });
+    }
+    return out.items;
+}
+
+pub fn nativeNumberFormatFormatRange(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const parts = try rangeParts(arena, this_val, args);
+    var out: std.ArrayList(u8) = .empty;
+    for (parts) |p| try out.appendSlice(arena, p.value);
+    return val_mod.makeString(arena, out.items);
+}
+
+pub fn nativeNumberFormatFormatRangeToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    return partsToArray(arena, try rangeParts(arena, this_val, args));
 }
 
 /// `nf.resolvedOptions()` — en-US, latn numbering system.

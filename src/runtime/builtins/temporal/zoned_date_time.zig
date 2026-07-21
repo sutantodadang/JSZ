@@ -15,6 +15,7 @@ const JsObject = @import("../../../object/object.zig").JsObject;
 const realm_mod = @import("../../realm.zig");
 const intrinsics = @import("../intrinsics.zig");
 const shared = @import("shared.zig");
+const calendar = @import("calendar.zig");
 const timezone = @import("timezone.zig");
 const tzdata = @import("tzdata.zig");
 const duration = @import("duration.zig");
@@ -35,6 +36,7 @@ pub const ZonedDT = struct {
     ns: i128,
     tz: []const u8,
     offset_ns: i128,
+    calendar: shared.calendar_mod.CalendarId = .iso8601,
 };
 
 pub fn getZoned(v: Value) ?*ZonedDT {
@@ -81,7 +83,10 @@ fn localDT(z: *const ZonedDT) ISODateTime {
     const days: i64 = @intCast(@divFloor(total, shared.NS_PER_DAY));
     const tod = total - @as(i128, days) * shared.NS_PER_DAY;
     const tr = shared.nanosToTime(tod);
-    const date = shared.epochDaysToISODate(days + tr.days);
+    var date = shared.epochDaysToISODate(days + tr.days);
+    // Carry the calendar onto the projected wall-clock date so everything
+    // derived from it (getters, toPlainDate/toPlainDateTime) keeps the lens.
+    date.calendar = z.calendar;
     return .{ .date = date, .time = tr.time };
 }
 
@@ -123,20 +128,14 @@ fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128) !timezone.Zon
     }
 }
 
-/// Constructor calendar (CanonicalizeCalendar): a bare identifier only.
-fn checkCalendar(arena: std.mem.Allocator, v: Value) !void {
-    if (v.bits == 0 or v.unbox() == .undefined_) return;
+/// The constructor's calendar argument: a bare identifier String only
+/// (CanonicalizeCalendar), unlike the property-bag form which also accepts an
+/// ISO temporal string.
+fn resolveCtorCalendar(arena: std.mem.Allocator, v: Value) !calendar.CalendarId {
+    if (v.bits == 0 or v.unbox() == .undefined_) return .iso8601;
     if (v.unbox() != .string) return realm_mod.throwTypeError(arena, "calendar must be a string");
-    if (!isIso(v.unbox().string)) return realm_mod.throwRangeError(arena, "only the iso8601 calendar is supported");
-}
-
-fn isIso(s: []const u8) bool {
-    if (s.len != 7) return false;
-    const lower = "iso8601";
-    for (s, 0..) |c, i| {
-        if (std.ascii.toLower(c) != lower[i]) return false;
-    }
-    return true;
+    return calendar.canonicalize(v.unbox().string) orelse
+        realm_mod.throwRangeError(arena, "unsupported calendar");
 }
 
 // -------------------------------------------------------------- constructor ---
@@ -148,8 +147,8 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const ns = shared.bigIntToI128(ns_arg) orelse return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
     if (!isValidEpochNs(ns)) return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
     const zone = try toTimeZone(arena, if (args.len > 1) args[1] else Value{}, ns);
-    if (args.len > 2) try checkCalendar(arena, args[2]);
-    const z = ZonedDT{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns };
+    const cal = if (args.len > 2) try resolveCtorCalendar(arena, args[2]) else .iso8601;
+    const z = ZonedDT{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = cal };
     if (this_val.bits != 0 and this_val.unbox() == .object) return installInto(arena, this_val, z);
     return makeZoned(arena, z);
 }
@@ -227,7 +226,7 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
     // ToTemporalZonedDateTime validates the calendar (ToTemporalCalendarIdentifier;
     // ISO strings ok) BEFORE requiring the timeZone field, so an invalid calendar
     // throws RangeError even when timeZone is absent.
-    if (o.get("calendar")) |cv| try shared.validateCalendarArg(arena, cv);
+    const cal = if (o.get("calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
     // timeZone is required.
     const tz_v = o.get("timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
     if (tz_v.bits != 0 and tz_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing timeZone");
@@ -236,7 +235,7 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
     const offset_opt = try getOffsetOption(arena, opts, .reject);
 
     // Read the wall-clock datetime from the property bag (reuse PlainDateTime).
-    const dt = try readDateTimeFields(arena, o, overflow);
+    const dt = try readDateTimeFields(arena, o, overflow, cal);
 
     // offset property.
     var provided: ?i128 = null;
@@ -247,37 +246,16 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
         }
     }
     const ns = try interpretOffset(arena, dt, zone.offset_ns, provided, offset_opt);
-    return .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns };
+    return .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = cal };
 }
 
 /// Read the required/optional date+time fields from a property bag into an
 /// ISODateTime (mirrors PlainDateTime's field reading, inlined so ZonedDateTime
 /// can require timeZone separately).
-fn readDateTimeFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISODateTime {
-    const year_v = o.get("year");
-    const day_v = o.get("day");
-    if (year_v == null or year_v.?.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing year");
-    if (day_v == null or day_v.?.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing day");
-    var month: f64 = undefined;
-    const month_v = o.get("month");
-    const mc_v = o.get("monthCode");
-    if (month_v != null and month_v.?.unbox() != .undefined_) {
-        month = try shared.toIntegerWithTruncation(arena, month_v.?);
-    } else if (mc_v != null and mc_v.?.unbox() != .undefined_) {
-        if (mc_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
-        const code = mc_v.?.unbox().string;
-        if (code.len < 3 or code[0] != 'M') return realm_mod.throwRangeError(arena, "invalid monthCode");
-        month = @floatFromInt(std.fmt.parseInt(u8, code[1..3], 10) catch return realm_mod.throwRangeError(arena, "invalid monthCode"));
-    } else return realm_mod.throwTypeError(arena, "missing month or monthCode");
-    const year = try shared.toIntegerWithTruncation(arena, year_v.?);
-    const day = try shared.toIntegerWithTruncation(arena, day_v.?);
-    var date: ISODate = undefined;
-    if (overflow == .reject) {
-        if (!shared.isValidISODate(f2i(year), f2i(month), f2i(day))) return realm_mod.throwRangeError(arena, "date out of range");
-        date = .{ .year = f2i(year), .month = @intCast(f2i(month)), .day = @intCast(f2i(day)) };
-    } else {
-        date = shared.regulateISODateConstrain(f2i(year), f2i(month), f2i(day));
-    }
+fn readDateTimeFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow, cal: calendar.CalendarId) !ISODateTime {
+    // The date half is exactly PlainDate's field set, read in `cal`'s space.
+    var date = try plain_date.dateFromFields(arena, o, overflow);
+    date.calendar = cal;
     const time = try readTimeFields(arena, o, overflow);
     return .{ .date = date, .time = time };
 }
@@ -348,7 +326,7 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
     const str_off = extractStringOffset(arena, s) catch |e| return e;
     const offset_opt = try getOffsetOption(arena, opts, .reject);
     const ns = try interpretOffset(arena, dt, zone.offset_ns, str_off, offset_opt);
-    return .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns };
+    return .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = dt.date.calendar };
 }
 
 /// Scan every `[...]` annotation on a ZonedDateTime string: require exactly one
@@ -371,7 +349,7 @@ fn extractAnnotations(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
             if (tz != null) return realm_mod.throwRangeError(arena, "more than one time zone annotation");
             tz = inner;
         } else if (std.mem.startsWith(u8, inner, "u-ca=")) {
-            if (!isIso(inner[5..])) return realm_mod.throwRangeError(arena, "only the iso8601 calendar is supported");
+            if (calendar.canonicalize(inner[5..]) == null) return realm_mod.throwRangeError(arena, "unsupported calendar");
         }
     }
     return tz orelse realm_mod.throwRangeError(arena, "ZonedDateTime string requires a time zone");
@@ -417,21 +395,23 @@ pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) an
 
 fn getYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    return val_mod.makeNumber(arena, @floatFromInt(localDT(z).date.year));
+    const d = localDT(z).date;
+    return val_mod.makeNumber(arena, @floatFromInt(calendar.fields(d.calendar, d).year));
 }
 fn getMonth(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    return val_mod.makeNumber(arena, @floatFromInt(localDT(z).date.month));
+    const d = localDT(z).date;
+    return val_mod.makeNumber(arena, @floatFromInt(calendar.fields(d.calendar, d).month));
 }
 fn getDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    return val_mod.makeNumber(arena, @floatFromInt(localDT(z).date.day));
+    const d = localDT(z).date;
+    return val_mod.makeNumber(arena, @floatFromInt(calendar.fields(d.calendar, d).day));
 }
 fn getMonthCode(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    var b: [4]u8 = undefined;
-    const s = std.fmt.bufPrint(&b, "M{d:0>2}", .{localDT(z).date.month}) catch unreachable;
-    return val_mod.makeString(arena, try arena.dupe(u8, s));
+    const d = localDT(z).date;
+    return val_mod.makeString(arena, try shared.formatMonthCode(arena, calendar.fields(d.calendar, d)));
 }
 fn getHour(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
@@ -478,8 +458,8 @@ fn getTimeZoneId(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     return val_mod.makeString(arena, z.tz);
 }
 fn getCalendarId(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    _ = try requireZoned(arena, this_val);
-    return val_mod.makeString(arena, "iso8601");
+    const z = try requireZoned(arena, this_val);
+    return val_mod.makeString(arena, z.calendar.str());
 }
 fn getDayOfWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
@@ -498,12 +478,16 @@ fn getYearOfWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     return val_mod.makeNumber(arena, @floatFromInt(yearOfWeek(localDT(z).date)));
 }
 fn getEra(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    _ = try requireZoned(arena, this_val);
-    return Value{};
+    const z = try requireZoned(arena, this_val);
+    const d = localDT(z).date;
+    const era = calendar.fields(d.calendar, d).era orelse return Value{};
+    return val_mod.makeString(arena, era);
 }
 fn getEraYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    _ = try requireZoned(arena, this_val);
-    return Value{};
+    const z = try requireZoned(arena, this_val);
+    const d = localDT(z).date;
+    const ey = calendar.fields(d.calendar, d).era_year orelse return Value{};
+    return val_mod.makeNumber(arena, @floatFromInt(ey));
 }
 fn getDaysInWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     _ = try requireZoned(arena, this_val);
@@ -512,19 +496,23 @@ fn getDaysInWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
 fn getDaysInMonth(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
     const d = localDT(z).date;
-    return val_mod.makeNumber(arena, @floatFromInt(shared.isoDaysInMonth(d.year, d.month)));
+    const f = calendar.fields(d.calendar, d);
+    return val_mod.makeNumber(arena, @floatFromInt(calendar.daysInMonth(d.calendar, f.year, f.month)));
 }
 fn getDaysInYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    return val_mod.makeNumber(arena, @floatFromInt(shared.daysInYear(localDT(z).date.year)));
+    const d = localDT(z).date;
+    return val_mod.makeNumber(arena, @floatFromInt(calendar.daysInYear(d.calendar, calendar.fields(d.calendar, d).year)));
 }
 fn getMonthsInYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    _ = try requireZoned(arena, this_val);
-    return val_mod.makeNumber(arena, 12);
+    const z = try requireZoned(arena, this_val);
+    const d = localDT(z).date;
+    return val_mod.makeNumber(arena, @floatFromInt(calendar.monthsInYear(d.calendar, calendar.fields(d.calendar, d).year)));
 }
 fn getInLeapYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    return val_mod.makeBool(arena, shared.isLeapYear(localDT(z).date.year));
+    const d = localDT(z).date;
+    return val_mod.makeBool(arena, calendar.inLeapYear(d.calendar, calendar.fields(d.calendar, d).year));
 }
 fn getHoursInDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
@@ -577,15 +565,18 @@ pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, _: []con
 pub fn nativeWithTimeZone(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
     const zone = try toTimeZone(arena, if (args.len > 0) args[0] else Value{}, z.ns);
-    return makeZoned(arena, .{ .ns = z.ns, .tz = zone.id, .offset_ns = zone.offset_ns });
+    return makeZoned(arena, .{ .ns = z.ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = z.calendar });
 }
 
 pub fn nativeWithCalendar(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
     const v = if (args.len > 0) args[0] else Value{};
     if (v.bits == 0 or v.unbox() != .string) return realm_mod.throwTypeError(arena, "calendar must be a string");
-    if (!isIso(v.unbox().string)) return realm_mod.throwRangeError(arena, "only the iso8601 calendar is supported");
-    return makeZoned(arena, z.*);
+    // The instant and zone are unchanged; only the lens through which the
+    // wall-clock date is read.
+    var out = z.*;
+    out.calendar = try shared.resolveCalendarArg(arena, v);
+    return makeZoned(arena, out);
 }
 
 pub fn nativeWithPlainTime(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -596,7 +587,7 @@ pub fn nativeWithPlainTime(arena: std.mem.Allocator, this_val: Value, args: []co
     }
     const cur = localDT(z);
     const ns = wallNs(.{ .date = cur.date, .time = time }) - z.offset_ns;
-    return makeZoned(arena, .{ .ns = ns, .tz = z.tz, .offset_ns = z.offset_ns });
+    return makeZoned(arena, .{ .ns = ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
 }
 
 pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -613,27 +604,14 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const offset_opt = try getOffsetOption(arena, opts, .prefer);
 
     const cur = localDT(z);
-    var year: f64 = @floatFromInt(cur.date.year);
-    var month: f64 = @floatFromInt(cur.date.month);
-    var day: f64 = @floatFromInt(cur.date.day);
+    const merged = try plain_date.withDateFields(arena, cur.date, o, overflow);
     var h: f64 = @floatFromInt(cur.time.hour);
     var min: f64 = @floatFromInt(cur.time.minute);
     var s: f64 = @floatFromInt(cur.time.second);
     var ms: f64 = @floatFromInt(cur.time.millisecond);
     var us: f64 = @floatFromInt(cur.time.microsecond);
     var ns: f64 = @floatFromInt(cur.time.nanosecond);
-    var any = false;
-    if (try readField(arena, o, "year")) |x| { year = x; any = true; }
-    if (o.get("monthCode")) |mc| {
-        if (mc.bits != 0 and mc.unbox() != .undefined_) {
-            const code = try shared.valueToString(arena, mc);
-            if (code.len < 3 or code[0] != 'M') return realm_mod.throwRangeError(arena, "invalid monthCode");
-            month = @floatFromInt(std.fmt.parseInt(u8, code[1..3], 10) catch return realm_mod.throwRangeError(arena, "invalid monthCode"));
-            any = true;
-        }
-    }
-    if (try readField(arena, o, "month")) |x| { month = x; any = true; }
-    if (try readField(arena, o, "day")) |x| { day = x; any = true; }
+    var any = merged.any;
     if (try readField(arena, o, "hour")) |x| { h = x; any = true; }
     if (try readField(arena, o, "minute")) |x| { min = x; any = true; }
     if (try readField(arena, o, "second")) |x| { s = x; any = true; }
@@ -650,14 +628,10 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     }
     if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
 
-    var date: ISODate = undefined;
+    const date = merged.date;
     if (overflow == .reject) {
-        if (!shared.isValidISODate(f2i(year), f2i(month), f2i(day))) return realm_mod.throwRangeError(arena, "date out of range");
-        date = .{ .year = f2i(year), .month = @intCast(f2i(month)), .day = @intCast(f2i(day)) };
         if (h > 23 or min > 59 or s > 59 or ms > 999 or us > 999 or ns > 999)
             return realm_mod.throwRangeError(arena, "time out of range");
-    } else {
-        date = shared.regulateISODateConstrain(f2i(year), f2i(month), f2i(day));
     }
     const time = ISOTime{
         .hour = @intFromFloat(std.math.clamp(h, 0, 23)),
@@ -668,7 +642,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
         .nanosecond = @intFromFloat(std.math.clamp(ns, 0, 999)),
     };
     const new_ns = try interpretOffset(arena, .{ .date = date, .time = time }, z.offset_ns, provided, offset_opt);
-    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns });
+    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
 }
 
 // ---------------------------------------------------------------- arithmetic ---
@@ -697,7 +671,7 @@ fn addSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, subtra
         new_ns = wallNs(.{ .date = new_date, .time = cur.time }) - z.offset_ns;
     }
     new_ns += durTimeNanos(dur);
-    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns });
+    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
 }
 
 fn negate(d: shared.DurationFields) shared.DurationFields {
@@ -743,7 +717,8 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     const to = if (since) z.* else other;
 
     var result: shared.DurationFields = undefined;
-    if (unitRank(largest.?) >= unitRank(.day)) {
+    // Rank 0 is `year`, so "day or larger" is a *lower* rank.
+    if (unitRank(largest.?) <= unitRank(.day)) {
         result = differenceZoned(from, to, largest.?);
     } else {
         result = balanceTime(to.ns - from.ns, largest.?);
@@ -772,9 +747,11 @@ fn differenceZoned(a: ZonedDT, b: ZonedDT, largest: shared.Unit) shared.Duration
     const date_sign = plain_date.compareISODate(d1, d2);
     if (ns_diff < 0 and date_sign < 0) {
         d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) + 1);
+        d1.calendar = d2.calendar;
         ns_diff += shared.NS_PER_DAY;
     } else if (ns_diff > 0 and date_sign > 0) {
         d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) - 1);
+        d1.calendar = d2.calendar;
         ns_diff -= shared.NS_PER_DAY;
     }
     var date_dur = plain_date.differenceISODate(d1, d2, largest);
@@ -850,7 +827,9 @@ pub fn nativeSince(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 pub fn nativeEquals(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
     const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
-    return val_mod.makeBool(arena, z.ns == other.ns and std.mem.eql(u8, z.tz, other.tz));
+    // Equality is on the instant, the zone *and* the calendar.
+    return val_mod.makeBool(arena, z.ns == other.ns and std.mem.eql(u8, z.tz, other.tz) and
+        z.calendar == other.calendar);
 }
 
 // ---------------------------------------------------------------- round ---
@@ -859,7 +838,7 @@ pub fn nativeStartOfDay(arena: std.mem.Allocator, this_val: Value, _: []const Va
     const z = try requireZoned(arena, this_val);
     const cur = localDT(z);
     const ns = wallNs(.{ .date = cur.date, .time = .{} }) - z.offset_ns;
-    return makeZoned(arena, .{ .ns = ns, .tz = z.tz, .offset_ns = z.offset_ns });
+    return makeZoned(arena, .{ .ns = ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
 }
 
 pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -919,7 +898,7 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
         const rounded = shared.roundI128ToIncrement(since_start, inc_ns, mode);
         new_ns = day_start_ns + rounded;
     }
-    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns });
+    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
 }
 
 // ---------------------------------------------------------------- toString ---
@@ -951,13 +930,13 @@ pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const V
         };
         if (sm == .minute) smallest = .minute;
     }
-    const s = try zonedToString(arena, z_ns, z.offset_ns, z.tz, frac_digits, show_cal, show_off, show_tz, smallest);
+    const s = try zonedToString(arena, z_ns, z.offset_ns, z.tz, z.calendar, frac_digits, show_cal, show_off, show_tz, smallest);
     return val_mod.makeString(arena, s);
 }
 
 pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const s = try zonedToString(arena, z.ns, z.offset_ns, z.tz, null, .auto, .auto, .auto, null);
+    const s = try zonedToString(arena, z.ns, z.offset_ns, z.tz, z.calendar, null, .auto, .auto, .auto, null);
     return val_mod.makeString(arena, s);
 }
 
@@ -987,7 +966,7 @@ fn getShowTimeZoneName(arena: std.mem.Allocator, opts: ?*JsObject) !ShowTZ {
     return realm_mod.throwRangeError(arena, "invalid timeZoneName option");
 }
 
-fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []const u8, digits: ?u8, show_cal: shared.ShowCalendar, show_off: ShowOffset, show_tz: ShowTZ, smallest: ?shared.Unit) ![]const u8 {
+fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []const u8, cal: shared.calendar_mod.CalendarId, digits: ?u8, show_cal: shared.ShowCalendar, show_off: ShowOffset, show_tz: ShowTZ, smallest: ?shared.Unit) ![]const u8 {
     const total = ns + offset_ns;
     const days: i64 = @intCast(@divFloor(total, shared.NS_PER_DAY));
     const tod = total - @as(i128, days) * shared.NS_PER_DAY;
@@ -1017,7 +996,7 @@ fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []cons
         try buf.appendSlice(arena, tz);
         try buf.append(arena, ']');
     }
-    try plain_date.appendCalendar(arena, &buf, show_cal);
+    try plain_date.appendCalendar(arena, &buf, show_cal, cal);
     return buf.items;
 }
 
@@ -1039,7 +1018,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.setMethod(arena, proto, "equals", nativeEquals);
     try intrinsics.setMethod(arena, proto, "round", nativeRound);
     try intrinsics.setMethod(arena, proto, "startOfDay", nativeStartOfDay);
-    try intrinsics.setMethodLen(arena, proto, "getTimeZoneTransition", nativeGetTimeZoneTransition, 0);
+    try intrinsics.setMethodLen(arena, proto, "getTimeZoneTransition", nativeGetTimeZoneTransition, 1);
     try intrinsics.setMethod(arena, proto, "toInstant", nativeToInstant);
     try intrinsics.setMethod(arena, proto, "toPlainDate", nativeToPlainDate);
     try intrinsics.setMethod(arena, proto, "toPlainTime", nativeToPlainTime);
