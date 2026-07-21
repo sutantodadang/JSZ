@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Wave 30: Temporal.PlainYearMonth — an ISO calendar year+month with no day.
 //! Storage: internal_kind = .temporal_plain_year_month, internal_slot -> ISODate
-//! whose [[Day]] is the ISO reference day (always 1 for the iso8601 calendar).
-//! The only calendar is "iso8601".
+//! whose [[Day]] is the ISO reference day: 1 for iso8601, and for other
+//! calendars the ISO date of the first day of the calendar month.
 const std = @import("std");
 const val_mod = @import("../../../value/value.zig");
 const Value = val_mod.Value;

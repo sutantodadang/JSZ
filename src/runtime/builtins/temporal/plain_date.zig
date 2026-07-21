@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Wave 25: Temporal.PlainDate — an ISO calendar date (year/month/day, no time
 //! or zone). Storage: internal_kind = .temporal_plain_date, internal_slot ->
-//! ISODate. The only calendar is "iso8601".
+//! ISODate, whose `calendar` field is the [[Calendar]] slot (see calendar.zig).
 const std = @import("std");
 const val_mod = @import("../../../value/value.zig");
 const Value = val_mod.Value;

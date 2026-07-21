@@ -4,9 +4,10 @@
 //! BigInt<->i128 helpers. All Temporal value types (Instant, Duration, PlainDate,
 //! PlainTime, PlainDateTime) build on these.
 //!
-//! The ISO calendar is the only calendar implemented here; `calendarId` is always
-//! "iso8601". Proleptic Gregorian date<->epoch-day conversion uses Howard
-//! Hinnant's algorithms (days_from_civil / civil_from_days).
+//! Dates are stored in the proleptic Gregorian (ISO) system whatever their
+//! calendar; calendar.zig owns the projection onto other calendars.
+//! Proleptic Gregorian date<->epoch-day conversion uses Howard Hinnant's
+//! algorithms (days_from_civil / civil_from_days).
 const std = @import("std");
 const val_mod = @import("../../../value/value.zig");
 const Value = val_mod.Value;
@@ -1070,7 +1071,7 @@ pub fn getOptionsObject(arena: std.mem.Allocator, v: ?Value) !?*JsObject {
     }
 }
 
-/// Case-insensitive check for the sole supported calendar, "iso8601".
+/// Case-insensitive check for the "iso8601" identifier specifically.
 pub fn isIso8601(s: []const u8) bool {
     if (s.len != 7) return false;
     const lower = "iso8601";

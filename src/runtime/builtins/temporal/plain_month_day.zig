@@ -2,7 +2,8 @@
 //! Wave 30: Temporal.PlainMonthDay — an ISO calendar month+day with no year.
 //! Storage: internal_kind = .temporal_plain_month_day, internal_slot ->
 //! ISOMonthDay { month, day, ref_year }. The ISO reference year is 1972 (a leap
-//! year) by default. The only calendar is "iso8601".
+//! year) by default; for other calendars it is the latest date on or before
+//! 1972-12-31 whose calendar month code and day match.
 const std = @import("std");
 const val_mod = @import("../../../value/value.zig");
 const Value = val_mod.Value;
