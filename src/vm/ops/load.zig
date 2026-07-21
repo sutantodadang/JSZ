@@ -37,23 +37,15 @@ fn globalObjectOwn(frame: *BcCallFrame, name: []const u8) ?Value {
 /// `globalThis` object here. Only runs at true global scope (`parent == null`),
 /// which naturally excludes block/catch/function-local bindings (those execute
 /// in a child environment). Internal `__`-prefixed names are never exposed.
-/// The environment a `var`/function declaration (and a sloppy implicit global)
-/// binds into for this frame. Ordinary code binds into its own environment; an
-/// `eval` frame runs in a fresh declarative scope, so its vars hoist out to the
-/// enclosing function or global scope (EvalDeclarationInstantiation) — unless
-/// the eval is strict, in which case that fresh scope is itself the var scope.
-inline fn varEnv(frame: *BcCallFrame) *Environment {
-    return if (frame.func.is_eval) frame.env.varScope() else frame.env;
-}
-
 fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value, configurable: bool) void {
-    mirrorGlobalBindingIn(frame, varEnv(frame), name, value, configurable);
+    mirrorGlobalBindingOpts(frame, name, value, configurable, false);
 }
 
-/// As `mirrorGlobalBinding`, for a caller that already resolved which
-/// environment record the binding was made in.
-fn mirrorGlobalBindingIn(frame: *BcCallFrame, target: *Environment, name: []const u8, value: Value, configurable: bool) void {
-    if (target.parent != null) return;
+/// `declare_only` mirrors CreateGlobalVarBinding's "if the property already
+/// exists, leave it (and its value) alone" clause — used by HOIST_VAR, which
+/// only has to *reserve* the name at scope entry.
+fn mirrorGlobalBindingOpts(frame: *BcCallFrame, name: []const u8, value: Value, configurable: bool, declare_only: bool) void {
+    if (frame.env.parent != null) return;
     // ES module top-level declarations live in the Module Environment Record
     // and must NOT become own-properties of the global object (spec §16.2.1.6).
     if (frame.func.is_module) return;
@@ -65,16 +57,16 @@ fn mirrorGlobalBindingIn(frame: *BcCallFrame, target: *Environment, name: []cons
     // (a top-level `var`'s property is non-configurable; overwriting its
     // descriptor would either reject or wrongly flip configurable).
     if (obj.hasOwn(name)) {
+        if (declare_only) return;
         obj.set(name, value) catch {};
         return;
     }
-    // First definition. A declared `var`/function global is non-configurable
-    // (DontDelete); a sloppy implicit global is configurable/deletable.
-    // Non-enumerable to match the built-in globals already installed on the
-    // object (and to avoid polluting `for-in`/`Object.keys(globalThis)`); read
-    // and `in` visibility — what the global-object semantics require — are
-    // unaffected by enumerability.
-    _ = obj.defineOwnData(name, value, .{ .writable = true, .enumerable = false, .configurable = configurable }) catch {};
+    // First definition. A declared `var`/function global in Script code is
+    // non-configurable (DontDelete); one created by eval code, and a sloppy
+    // implicit global, are configurable/deletable. All of them are enumerable
+    // (CreateGlobalVarBinding/CreateGlobalFunctionBinding/CreateDataProperty),
+    // unlike the non-enumerable built-in globals installed at realm setup.
+    _ = obj.defineOwnData(name, value, .{ .writable = true, .enumerable = true, .configurable = configurable }) catch {};
 }
 
 pub inline fn opLoadK(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
@@ -245,7 +237,13 @@ pub inline fn opHoistVar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name = frame.func.chunk.constants[kidx].toPtr().string;
     const undef = try val_mod.makeUndefined(self.arena);
-    varEnv(frame).hoistVar(name, undef) catch return error.OutOfMemory;
+    frame.env.hoistVar(name, undef) catch return error.OutOfMemory;
+    // ES §9.1.1.4.17 CreateGlobalVarBinding: a top-level `var`/function name in
+    // Script or eval code reserves an own property of the global object at
+    // declaration-instantiation time, even when it is never assigned (`var x;`
+    // still yields `globalThis.x === undefined`). Bindings introduced by eval
+    // are deletable; Script-level ones are not.
+    mirrorGlobalBindingOpts(frame, name, undef, frame.func.is_eval, true);
     return null;
 }
 
@@ -418,30 +416,10 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 return null;
             }
             if (frame.inherited_env_floor != null) {
-                // Retry without the floor: the binding may live outside the
-                // inherited with-scopes, past which the first walk stopped.
                 if (frame.env.assign(name, value)) |_| {
                     mirrorGlobalBinding(frame, name, value, true);
                     return null;
-                } else |e2| switch (e2) {
-                    // Found, but not assignable. These are the same errors the
-                    // unfloored walk reports and must not decay into an
-                    // implicit global — `with (o) { (() => { constX = 1 })() }`
-                    // is still a TypeError.
-                    error.ConstAssignment, error.TemporalDeadZone => {
-                        const msg = if (e2 == error.ConstAssignment)
-                            try std.fmt.allocPrint(self.arena, "Assignment to constant variable.", .{})
-                        else
-                            try std.fmt.allocPrint(self.arena, "Cannot access '{s}' before initialization", .{name});
-                        const kind = if (e2 == error.ConstAssignment) "TypeError" else "ReferenceError";
-                        const exc_val = try self.makeErrorObjectBc(kind, msg);
-                        self.last_exception_value = exc_val;
-                        const found = try self.throwException(exc_val);
-                        if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
-                        return null;
-                    },
-                    else => {},
-                }
+                } else |_| {}
             }
             if (cur_is_strict) {
                 // Phase 4d: strict mode — undeclared variable assignment is a ReferenceError.
@@ -450,10 +428,9 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 self.last_exception_value = exc_val;
                 const found = try self.throwException(exc_val);
                 if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
-            } else if (varEnv(frame).parent == null) {
-                // The frame's variable environment IS the global env — sloppy
-                // implicit global (deletable).
-                varEnv(frame).define(name, value) catch return error.OutOfMemory;
+            } else if (frame.env.parent == null) {
+                // Already at global env — sloppy implicit global (deletable).
+                frame.env.define(name, value) catch return error.OutOfMemory;
             } else {
                 // Sloppy-mode implicit global: write reaches the global object, not a
                 // local binding (spec §8.1.1.4.11 PutValue). Handles cross-realm functions
@@ -496,19 +473,38 @@ pub inline fn opDefineGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const value = frame.registers[rsrc];
     // Try assign first (update existing binding), else define.
     frame.env.assign(name, value) catch {
-        varEnv(frame).define(name, value) catch return error.OutOfMemory;
+        if (frame.env.parent == null) {
+            frame.env.define(name, value) catch return error.OutOfMemory;
+        } else {
+            frame.env.define(name, value) catch return error.OutOfMemory;
+        }
     };
     // Top-level `var`/function declarations are also own properties of the
-    // global object (observable as `globalThis.name`), and are non-configurable
-    // (DontDelete): `delete globalThis.x` / `delete this.x` returns false.
-    mirrorGlobalBinding(frame, name, value, false);
+    // global object (observable as `globalThis.name`). Script-level ones are
+    // non-configurable (DontDelete) — `delete globalThis.x` returns false —
+    // while eval-introduced ones are deletable (EvalDeclarationInstantiation
+    // passes varEnv.CreateGlobal{Var,Function}Binding a `true` deletable flag).
+    mirrorGlobalBinding(frame, name, value, frame.func.is_eval);
     return null;
 }
 
-/// BlockDeclarationInstantiation for a block-nested function declaration: bind
-/// the name in THIS environment record. Unlike DEFINE_GLOBAL this never walks
-/// the parent chain, so an outer `let f` / parameter `f` keeps its own value
-/// while the block sees the function.
+/// As `mirrorGlobalBinding`, for a caller that already resolved which
+/// environment record the binding was made in.
+fn mirrorGlobalBindingIn(frame: *BcCallFrame, target: *Environment, name: []const u8, value: Value, configurable: bool) void {
+    if (target.parent != null) return;
+    if (frame.func.is_module) return;
+    if (name.len >= 2 and name[0] == '_' and name[1] == '_') return;
+    const gt = frame.env.lookup("globalThis") catch return;
+    if (gt.bits == 0 or gt.unbox() != .object) return;
+    const obj = gt.toPtr().object;
+    if (obj.hasOwn(name)) {
+        obj.set(name, value) catch {};
+        return;
+    }
+    _ = obj.defineOwnData(name, value, .{ .writable = true, .enumerable = false, .configurable = configurable }) catch {};
+}
+
+/// DEFINE_LOCAL: declare a block/function-scoped `let`/`const`.
 pub inline fn opDefineLocal(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const lo = code[frame.pc];
@@ -524,10 +520,7 @@ pub inline fn opDefineLocal(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 }
 
 /// Annex B.3.3: propagate a block-scoped function declaration's current value
-/// out to the same-named `var` binding in the frame's variable environment.
-/// Emitted only for names the extension applies to, so the target binding was
-/// created by this scope's hoisting pre-pass; a missing target is a silent
-/// no-op rather than an implicit global.
+/// to the enclosing variable environment.
 pub inline fn opSyncAnnexBFn(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const lo = code[frame.pc];
@@ -537,9 +530,6 @@ pub inline fn opSyncAnnexBFn(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name = frame.func.chunk.constants[kidx].toPtr().string;
     const value = frame.env.lookup(name) catch return null;
-    // Always the enclosing *variable* environment: the block record the
-    // declaration was just instantiated in sits between, and assigning there
-    // would be the no-op of writing the binding back to itself.
     const target = frame.env.varScope();
     target.assign(name, value) catch return null;
     mirrorGlobalBindingIn(frame, target, name, value, false);
