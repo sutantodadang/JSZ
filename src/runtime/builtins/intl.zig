@@ -107,6 +107,86 @@ fn groupInteger(arena: std.mem.Allocator, int_part: u64, group: bool) ![]const u
     return out.items;
 }
 
+/// The resolved NumberFormat options that affect digit output.
+const NfOptions = struct {
+    style: []const u8 = "decimal",
+    currency: []const u8 = "USD",
+    min_frac: u32 = 0,
+    max_frac: u32 = 3,
+    group: bool = true,
+    sign_display: []const u8 = "auto",
+    /// Significant digits take precedence over fraction digits when set.
+    min_sig: u32 = 0,
+    max_sig: u32 = 0,
+    use_sig: bool = false,
+    rounding_mode: RoundMode = .half_expand,
+    /// Round to a multiple of this many units of the last fraction digit.
+    rounding_increment: u32 = 1,
+    /// trailingZeroDisplay "stripIfInteger".
+    strip_if_integer: bool = false,
+};
+
+/// ECMA-402 roundingMode.
+const RoundMode = enum {
+    ceil,
+    floor,
+    expand,
+    trunc,
+    half_ceil,
+    half_floor,
+    half_expand,
+    half_trunc,
+    half_even,
+};
+
+fn roundModeFromString(s_: []const u8) ?RoundMode {
+    const table = .{
+        .{ "ceil", RoundMode.ceil },
+        .{ "floor", RoundMode.floor },
+        .{ "expand", RoundMode.expand },
+        .{ "trunc", RoundMode.trunc },
+        .{ "halfCeil", RoundMode.half_ceil },
+        .{ "halfFloor", RoundMode.half_floor },
+        .{ "halfExpand", RoundMode.half_expand },
+        .{ "halfTrunc", RoundMode.half_trunc },
+        .{ "halfEven", RoundMode.half_even },
+    };
+    inline for (table) |e| if (std.mem.eql(u8, s_, e[0])) return e[1];
+    return null;
+}
+
+/// GetUnsignedRoundingMode: how to round a *magnitude*, given the sign of the
+/// value it came from. "ceil" on a negative number rounds its magnitude down.
+const UnsignedMode = enum { zero, infinity, half_zero, half_infinity, half_even };
+
+fn unsignedRoundingMode(mode: RoundMode, negative: bool) UnsignedMode {
+    return switch (mode) {
+        .ceil => if (negative) .zero else .infinity,
+        .floor => if (negative) .infinity else .zero,
+        .expand => .infinity,
+        .trunc => .zero,
+        .half_ceil => if (negative) .half_zero else .half_infinity,
+        .half_floor => if (negative) .half_infinity else .half_zero,
+        .half_expand => .half_infinity,
+        .half_trunc => .half_zero,
+        .half_even => .half_even,
+    };
+}
+
+/// Round a non-negative magnitude to an integer under an unsigned mode.
+fn roundMagnitude(x: f64, mode: UnsignedMode) f64 {
+    const fl = @floor(x);
+    const frac = x - fl;
+    if (frac == 0) return fl;
+    return switch (mode) {
+        .zero => fl,
+        .infinity => fl + 1,
+        .half_zero => if (frac > 0.5) fl + 1 else fl,
+        .half_infinity => if (frac >= 0.5) fl + 1 else fl,
+        .half_even => if (frac > 0.5) fl + 1 else if (frac < 0.5) fl else (if (@mod(fl, 2) == 0) fl else fl + 1),
+    };
+}
+
 /// One element of a `formatToParts` result.
 pub const NumberPart = struct {
     type: []const u8,
@@ -119,16 +199,11 @@ pub const NumberPart = struct {
 /// Core en-US number formatting, as the `formatToParts` part list. `format` is
 /// the concatenation of these values, so both share one implementation and
 /// cannot drift apart.
-fn formatNumberParts(
-    arena: std.mem.Allocator,
-    value: f64,
-    style: []const u8,
-    currency: []const u8,
-    min_frac_in: u32,
-    max_frac_in: u32,
-    group: bool,
-    sign_display: []const u8,
-) ![]NumberPart {
+fn formatNumberParts(arena: std.mem.Allocator, value: f64, opt: NfOptions) ![]NumberPart {
+    const style = opt.style;
+    const currency = opt.currency;
+    const group = opt.group;
+    const sign_display = opt.sign_display;
     var parts: std.ArrayList(NumberPart) = .empty;
     if (std.math.isNan(value)) {
         try parts.append(arena, .{ .type = "nan", .value = "NaN" });
@@ -136,27 +211,62 @@ fn formatNumberParts(
     }
 
     var n = value;
-    const negative = std.math.signbit(n) and n != 0;
+    // ECMA-402 counts -0 as negative, so `format(-0)` is "-0".
+    const negative = std.math.signbit(n);
     n = @abs(n);
 
     const is_percent = std.mem.eql(u8, style, "percent");
     const is_currency = std.mem.eql(u8, style, "currency");
     if (is_percent) n *= 100;
 
-    const min_frac = min_frac_in;
-    var max_frac = max_frac_in;
+    var min_frac = opt.min_frac;
+    var max_frac = opt.max_frac;
+    // Significant digits, when requested, fix the digit positions instead:
+    // express them as an equivalent fraction-digit window plus, when the value
+    // is wider than maxSig, a power-of-ten increment that zeroes the low
+    // integer digits (123456 at 3 significant digits is 123,000).
+    var sig_increment: u64 = 1;
+    if (opt.use_sig and n != 0 and !std.math.isInf(n)) {
+        const e: i32 = @intFromFloat(@floor(@log10(n)));
+        const max_sig: i32 = @intCast(opt.max_sig);
+        const min_sig: i32 = @intCast(opt.min_sig);
+        if (e + 1 >= max_sig) {
+            max_frac = 0;
+            min_frac = 0;
+            const shift = e + 1 - max_sig;
+            sig_increment = pow10(@intCast(@min(shift, 18)));
+        } else {
+            max_frac = @intCast(@min(max_sig - 1 - e, 18));
+            min_frac = if (min_sig - 1 - e > 0) @intCast(@min(min_sig - 1 - e, 18)) else 0;
+        }
+    } else if (opt.use_sig) {
+        max_frac = if (opt.min_sig > 1) opt.min_sig - 1 else 0;
+        min_frac = max_frac;
+    }
     if (max_frac < min_frac) max_frac = min_frac;
     // `pow10(max_frac)` must fit u64 (10^18 < 2^63) and f64 carries only ~17
     // significant digits, so a larger fraction-digit count cannot be represented;
     // clamp the scale exponent to avoid integer overflow in pow10.
     if (max_frac > 18) max_frac = 18;
+    // roundingIncrement counts units of the last fraction digit, and per spec
+    // applies only in fraction-digit mode.
+    const increment: u64 = if (opt.use_sig) sig_increment else @max(opt.rounding_increment, 1);
 
-    // signDisplay: auto (default) / always / exceptZero / never.
+    // signDisplay: auto (default) / always / exceptZero / negative / never.
     const sign_prefix: []const u8 = blk: {
         if (std.mem.eql(u8, sign_display, "never")) break :blk "";
+        // exceptZero and negative suppress the sign on zero (including -0),
+        // so they must be tested before the sign bit.
+        if (std.mem.eql(u8, sign_display, "exceptZero")) {
+            if (value == 0 or std.math.isNan(value)) break :blk "";
+            break :blk if (negative) "-" else "+";
+        }
+        if (std.mem.eql(u8, sign_display, "negative")) {
+            if (value == 0 or std.math.isNan(value)) break :blk "";
+            break :blk if (negative) "-" else "";
+        }
         if (negative) break :blk "-";
         if (std.mem.eql(u8, sign_display, "always")) break :blk "+";
-        if (std.mem.eql(u8, sign_display, "exceptZero")) break :blk (if (value == 0) "" else "+");
         break :blk "";
     };
     var cur_prefix: []const u8 = "";
@@ -182,7 +292,10 @@ fn formatNumberParts(
 
     const scale = pow10(max_frac);
     const scale_f: f64 = @floatFromInt(scale);
-    const scaled: f64 = @round(n * scale_f);
+    const inc_f: f64 = @floatFromInt(increment);
+    const umode = unsignedRoundingMode(opt.rounding_mode, negative);
+    // Round in units of `increment`, then scale back up.
+    const scaled: f64 = roundMagnitude(n * scale_f / inc_f, umode) * inc_f;
     // Guard the float→int conversion: a value large enough to overflow u64 (or NaN)
     // would panic @intFromFloat. Saturate instead of crashing.
     const scaled_u: u64 = if (std.math.isNan(scaled) or scaled < 0 or scaled >= 1.8446744073709552e19)
@@ -205,7 +318,7 @@ fn formatNumberParts(
     try parts.append(arena, .{ .type = "integer", .value = int_str[run_start..] });
 
     // Fraction: zero-pad to max_frac, then trim trailing zeros down to min_frac.
-    if (max_frac > 0) {
+    if (max_frac > 0 and !(opt.strip_if_integer and frac_part == 0)) {
         const buf = try std.fmt.allocPrint(arena, "{d:0>[1]}", .{ frac_part, max_frac });
         var keep = buf.len;
         while (keep > min_frac and buf[keep - 1] == '0') keep -= 1;
@@ -220,17 +333,8 @@ fn formatNumberParts(
 }
 
 /// `format`: the part values concatenated.
-fn formatNumber(
-    arena: std.mem.Allocator,
-    value: f64,
-    style: []const u8,
-    currency: []const u8,
-    min_frac_in: u32,
-    max_frac_in: u32,
-    group: bool,
-    sign_display: []const u8,
-) ![]const u8 {
-    const parts = try formatNumberParts(arena, value, style, currency, min_frac_in, max_frac_in, group, sign_display);
+fn formatNumber(arena: std.mem.Allocator, value: f64, opt: NfOptions) ![]const u8 {
+    const parts = try formatNumberParts(arena, value, opt);
     var out: std.ArrayList(u8) = .empty;
     for (parts) |p| try out.appendSlice(arena, p.value);
     return out.items;
@@ -274,6 +378,21 @@ fn toFracDigits(arena: std.mem.Allocator, m: f64) anyerror!u32 {
     return @intFromFloat(@floor(m));
 }
 
+/// Significant-digit options are restricted to 1..21.
+fn toSigDigits(arena: std.mem.Allocator, m: f64) anyerror!u32 {
+    if (std.math.isNan(m) or m < 1 or m > 21) return throwRangeError(arena, "significant digits value is out of range");
+    return @intFromFloat(@floor(m));
+}
+
+/// roundingIncrement is restricted to this exact set by ECMA-402.
+fn isValidRoundingIncrement(x: f64) bool {
+    if (x != @floor(x)) return false;
+    for ([_]f64{ 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000 }) |v| {
+        if (x == v) return true;
+    }
+    return false;
+}
+
 // ----------------------------------------------------------------- NumberFormat ---
 
 /// `new Intl.NumberFormat(locales, options)` — store resolved options on `this`.
@@ -305,32 +424,49 @@ pub fn nativeNumberFormatCtor(arena: std.mem.Allocator, this_val: Value, args: [
     try obj.set("__intl_maxFrac", try val_mod.makeNumber(arena, @floatFromInt(max_frac)));
     try obj.set("__intl_group", try val_mod.makeBool(arena, group));
     try obj.set("__intl_sign", try val_mod.makeString(arena, optStr(opts, "signDisplay") orelse "auto"));
+
+    // roundingMode / roundingIncrement / significant digits / trailingZeroDisplay.
+    const mode_str = optStr(opts, "roundingMode") orelse "halfExpand";
+    const mode = roundModeFromString(mode_str) orelse
+        return throwRangeError(arena, "invalid roundingMode");
+    try obj.set("__intl_roundMode", try val_mod.makeString(arena, mode_str));
+    _ = mode;
+
+    var inc: u32 = 1;
+    if (optNum(opts, "roundingIncrement")) |ri| {
+        if (!isValidRoundingIncrement(ri)) return throwRangeError(arena, "invalid roundingIncrement");
+        inc = @intFromFloat(ri);
+    }
+    try obj.set("__intl_roundInc", try val_mod.makeNumber(arena, @floatFromInt(inc)));
+
+    const min_sig_v = optNum(opts, "minimumSignificantDigits");
+    const max_sig_v = optNum(opts, "maximumSignificantDigits");
+    if (min_sig_v != null or max_sig_v != null) {
+        const min_sig = if (min_sig_v) |m| try toSigDigits(arena, m) else 1;
+        const max_sig = if (max_sig_v) |m| try toSigDigits(arena, m) else 21;
+        if (min_sig > max_sig) return throwRangeError(arena, "minimumSignificantDigits exceeds maximumSignificantDigits");
+        try obj.set("__intl_minSig", try val_mod.makeNumber(arena, @floatFromInt(min_sig)));
+        try obj.set("__intl_maxSig", try val_mod.makeNumber(arena, @floatFromInt(max_sig)));
+    }
+
+    if (optStr(opts, "trailingZeroDisplay")) |tz| {
+        if (std.mem.eql(u8, tz, "stripIfInteger")) {
+            try obj.set("__intl_stripZero", try val_mod.makeBool(arena, true));
+        } else if (!std.mem.eql(u8, tz, "auto")) {
+            return throwRangeError(arena, "invalid trailingZeroDisplay");
+        }
+    }
     return val_mod.makeObject(arena, obj);
 }
 
 pub fn nativeNumberFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object) return val_mod.makeString(arena, "");
     const o = this_val.toPtr().object;
-    const style = if (o.get("__intl_style")) |v| (if (v.bits != 0 and v.unbox() == .string) v.unbox().string else "decimal") else "decimal";
-    const currency = if (o.get("__intl_currency")) |v| (if (v.bits != 0 and v.unbox() == .string) v.unbox().string else "USD") else "USD";
-    const min_frac: u32 = if (o.get("__intl_minFrac")) |v| (if (v.bits != 0 and v.unbox() == .number) @intFromFloat(v.unbox().number) else 0) else 0;
-    const max_frac: u32 = if (o.get("__intl_maxFrac")) |v| (if (v.bits != 0 and v.unbox() == .number) @intFromFloat(v.unbox().number) else 3) else 3;
-    const group: bool = if (o.get("__intl_group")) |v| (if (v.bits != 0 and v.unbox() == .boolean) v.unbox().boolean else true) else true;
-    const sign_display = if (o.get("__intl_sign")) |v| (if (v.bits != 0 and v.unbox() == .string) v.unbox().string else "auto") else "auto";
+    _ = o;
     const n = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
-    const s = try formatNumber(arena, n, style, currency, min_frac, max_frac, group, sign_display);
+    const s = try formatNumber(arena, n, readNfOptions(this_val));
     return val_mod.makeString(arena, s);
 }
-
-/// Read the resolved options a NumberFormat stored on itself at construction.
-const NfOptions = struct {
-    style: []const u8 = "decimal",
-    currency: []const u8 = "USD",
-    min_frac: u32 = 0,
-    max_frac: u32 = 3,
-    group: bool = true,
-    sign_display: []const u8 = "auto",
-};
 
 /// Brand check: our NumberFormat instances carry the internal `__intl_style`
 /// marker, so anything without it is not an initialized NumberFormat.
@@ -362,12 +498,28 @@ fn readNfOptions(this_val: Value) NfOptions {
     if (o.get("__intl_sign")) |v| if (v.bits != 0 and v.unbox() == .string) {
         r.sign_display = v.unbox().string;
     };
+    if (o.get("__intl_roundMode")) |v| if (v.bits != 0 and v.unbox() == .string) {
+        r.rounding_mode = roundModeFromString(v.unbox().string) orelse .half_expand;
+    };
+    if (o.get("__intl_roundInc")) |v| if (v.bits != 0 and v.unbox() == .number) {
+        r.rounding_increment = @intFromFloat(v.unbox().number);
+    };
+    if (o.get("__intl_minSig")) |v| if (v.bits != 0 and v.unbox() == .number) {
+        r.min_sig = @intFromFloat(v.unbox().number);
+        r.use_sig = true;
+    };
+    if (o.get("__intl_maxSig")) |v| if (v.bits != 0 and v.unbox() == .number) {
+        r.max_sig = @intFromFloat(v.unbox().number);
+    };
+    if (o.get("__intl_stripZero")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
+        r.strip_if_integer = v.unbox().boolean;
+    };
     return r;
 }
 
 fn nfParts(arena: std.mem.Allocator, this_val: Value, value: f64) ![]NumberPart {
     const r = readNfOptions(this_val);
-    return formatNumberParts(arena, value, r.style, r.currency, r.min_frac, r.max_frac, r.group, r.sign_display);
+    return formatNumberParts(arena, value, r);
 }
 
 /// Build the JS array of `{type, value}` objects `formatToParts` returns.
@@ -2442,28 +2594,28 @@ test "intl: formatNumber decimal grouping" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("1,234,567.891", try formatNumber(a, 1234567.891, "decimal", "USD", 0, 3, true, "auto"));
-    try std.testing.expectEqualStrings("1000", try formatNumber(a, 1000, "decimal", "USD", 0, 3, false, "auto"));
-    try std.testing.expectEqualStrings("5.00", try formatNumber(a, 5, "decimal", "USD", 2, 3, true, "auto"));
+    try std.testing.expectEqualStrings("1,234,567.891", try formatNumber(a, 1234567.891, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 3, .group = true, .sign_display = "auto" }));
+    try std.testing.expectEqualStrings("1000", try formatNumber(a, 1000, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 3, .group = false, .sign_display = "auto" }));
+    try std.testing.expectEqualStrings("5.00", try formatNumber(a, 5, .{ .style = "decimal", .currency = "USD", .min_frac = 2, .max_frac = 3, .group = true, .sign_display = "auto" }));
 }
 
 test "intl: formatNumber currency and percent" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("-$1,234.50", try formatNumber(a, -1234.5, "currency", "USD", 2, 2, true, "auto"));
-    try std.testing.expectEqualStrings("26%", try formatNumber(a, 0.255, "percent", "USD", 0, 0, true, "auto"));
+    try std.testing.expectEqualStrings("-$1,234.50", try formatNumber(a, -1234.5, .{ .style = "currency", .currency = "USD", .min_frac = 2, .max_frac = 2, .group = true, .sign_display = "auto" }));
+    try std.testing.expectEqualStrings("26%", try formatNumber(a, 0.255, .{ .style = "percent", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "auto" }));
 }
 
 test "intl: formatNumber signDisplay" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("+5", try formatNumber(a, 5, "decimal", "USD", 0, 0, true, "always"));
-    try std.testing.expectEqualStrings("+0", try formatNumber(a, 0, "decimal", "USD", 0, 0, true, "always"));
-    try std.testing.expectEqualStrings("+5", try formatNumber(a, 5, "decimal", "USD", 0, 0, true, "exceptZero"));
-    try std.testing.expectEqualStrings("0", try formatNumber(a, 0, "decimal", "USD", 0, 0, true, "exceptZero"));
-    try std.testing.expectEqualStrings("5", try formatNumber(a, -5, "decimal", "USD", 0, 0, true, "never"));
+    try std.testing.expectEqualStrings("+5", try formatNumber(a, 5, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "always" }));
+    try std.testing.expectEqualStrings("+0", try formatNumber(a, 0, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "always" }));
+    try std.testing.expectEqualStrings("+5", try formatNumber(a, 5, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "exceptZero" }));
+    try std.testing.expectEqualStrings("0", try formatNumber(a, 0, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "exceptZero" }));
+    try std.testing.expectEqualStrings("5", try formatNumber(a, -5, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "never" }));
 }
 
 test "intl: parseLocaleTag subtags" {
