@@ -822,6 +822,7 @@ pub fn parseFunctionDecl(p: *Parser, is_async: bool) ?*Node {
     const is_generator = p.match(.star);
     const name_tok = p.expect(.identifier) orelse return null;
     const name = name_tok.value_str;
+    if (!parser_file.checkStrictBindingName(p, name, name_tok.line, name_tok.column)) return null;
     const parsed_params = p.parseFunctionParams() orelse return null;
     const prev_gen = p.in_generator_function;
     p.in_generator_function = is_generator;
@@ -876,6 +877,8 @@ pub fn parseWhileStmt(p: *Parser) ?*Node {
 
 pub fn parseWithStmt(p: *Parser) ?*Node {
     const start = p.current.start;
+    // A `with` statement in strict-mode code is an early SyntaxError (ES §14.11.1).
+    if (p.strict) return p.fail("strict mode code may not include a with statement");
     _ = p.advance(); // consume 'with'
     _ = p.expect(.left_paren) orelse return null;
     const object = p.parseExpression() orelse return null;

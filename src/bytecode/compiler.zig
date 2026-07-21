@@ -48,11 +48,6 @@ pub const LoopCtx = struct {
     /// Label attached to this loop (from a directly-enclosing labeled statement),
     /// so `break L`/`continue L` can target it. null when unlabeled.
     label: ?[]const u8 = null,
-    /// Phase 13 completion values: register holding the completion value at the
-    /// start of the current iteration. `continue` reverts the completion register
-    /// to this (its iteration produced an empty completion). null outside the
-    /// program's implicit-return (completion-value) compilation.
-    prev_reg: ?u8 = null,
     /// Block-scope nesting depth just outside this loop's per-iteration scope.
     /// `break`/`continue` emit EXIT_SCOPE for each block scope between the
     /// statement and this depth so the frame env is balanced on the jump.
@@ -209,18 +204,6 @@ pub const FnCompiler = struct {
         if (self.completion_reg) |cr| {
             try self.emitOp(.LOAD_UNDEF, line);
             try self.emitU8(cr);
-        }
-    }
-
-    /// Completion values: at the start of each loop iteration, snapshot the
-    /// completion register into the loop's `prev_reg` so `continue` can revert.
-    pub fn saveLoopPrev(self: *Self, prev_reg: ?u8, line: u32) error{OutOfMemory}!void {
-        if (prev_reg) |pr| {
-            if (self.completion_reg) |cr| {
-                try self.emitOp(.MOVE, line);
-                try self.emitU8(pr);
-                try self.emitU8(cr);
-            }
         }
     }
 
@@ -1434,10 +1417,13 @@ pub const FnCompiler = struct {
             const prop_name = me.property.data.identifier;
             const sv = try val_mod.makeString(self.arena, prop_name);
             const kidx = try self.addConstant(sv);
-            try self.emitOp(.SET_PROP, line);
+            // Class-desugar private-element installation: create the element
+            // rather than requiring an existing one (PrivateFieldAdd).
+            try self.emitOp(if (me.private_define) .DEFINE_PRIVATE else .SET_PROP, line);
             try self.emitU8(robj);
             try self.emitU16(kidx);
             try self.emitU8(rval);
+            if (me.private_define) try self.emitU8(@intFromBool(me.private_method));
         } else {
             if (me.property.kind == .string_literal) {
                 const prop_name = me.property.data.string_literal;

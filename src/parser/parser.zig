@@ -65,6 +65,23 @@ pub fn isStrictReservedWord(name: []const u8) bool {
     return false;
 }
 
+/// Reject a BindingIdentifier that strict-mode code may not bind (a future
+/// reserved word, `eval` or `arguments` — ES 13.1.1 / 12.7.2). Returns true when
+/// the name is legal; on rejection it records the early SyntaxError and the
+/// caller must bail out. No-op in sloppy-mode code.
+pub fn checkStrictBindingName(p: *Parser, name: []const u8, line: u32, column: u32) bool {
+    if (!p.strict or !isStrictReservedWord(name)) return true;
+    if (!p.had_error) {
+        p.had_error = true;
+        p.error_info = ParseError{
+            .message = "unexpected strict-mode reserved word as binding name",
+            .line = line,
+            .column = column,
+        };
+    }
+    return false;
+}
+
 pub const ParseResult = union(enum) {
     ok: []*Node,
     err: ParseError,
@@ -156,6 +173,12 @@ pub const Parser = struct {
     arrow_rest_param: ?[]const u8 = null,
     /// Monotonic counter for synthetic destructuring-param names (`__param_N`).
     param_destruct_counter: u32,
+    /// Monotonic counter giving every class body that declares private elements a
+    /// distinct PrivateEnvironment identity. `#x` is stored as the property key
+    /// "#x", so two nested classes both declaring `#x` would otherwise share one
+    /// key and defeat the brand check; `manglePrivateNames` rewrites each class's
+    /// own private names to "#x\x01N" using this id. See `mangled_priv_sep`.
+    private_class_counter: u32 = 0,
     /// Var-decl / for-of-head pattern destructuring: when set, `desugarParamPattern`
     /// / `bindPatternElement` emit their decls here instead of into `arrow_prelude`,
     /// and user-visible bindings use `destruct_kind` instead of a hardcoded `.let`

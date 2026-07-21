@@ -223,7 +223,6 @@ pub fn lowerWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     self.pending_label = null;
     // Completion value: a loop's value starts fresh at `undefined`.
     try self.resetCompletion(line);
-    const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
     const loop_start = self.currentOffset();
 
     const rcond = try self.compileExpr(ws.test_);
@@ -234,10 +233,7 @@ pub fn lowerWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     const patch_exit = self.currentOffset();
     try self.emitI16(0);
 
-    // Save the completion value at the start of this iteration so a
-    // `continue` (an empty completion) can revert to it.
-    try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
     try self.compileStmt(ws.body, last_expr_reg);
 
     // Jump back to loop start (continue lands here too: re-eval cond).
@@ -257,11 +253,9 @@ pub fn lowerDoWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) err
     const loop_lbl = self.pending_label;
     self.pending_label = null;
     try self.resetCompletion(line);
-    const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
     const loop_start = self.currentOffset();
 
-    try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
     try self.compileStmt(dw.body, last_expr_reg);
 
     // continue in a do-while jumps to the condition test.
@@ -307,7 +301,6 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     }
 
     try self.resetCompletion(line);
-    const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
     const loop_start = self.currentOffset();
     var patch_exit: ?usize = null;
 
@@ -320,8 +313,7 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         try self.emitI16(0);
     }
 
-    try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
     try self.compileStmt(fs.body, last_expr_reg);
 
     // continue in a for-loop runs the update expression, then re-tests.
@@ -391,6 +383,10 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     const line: u32 = node.start;
     const ts = node.data.try_stmt;
     const saved_sp = self.sp;
+    // Completion value: every TryStatement production ends in
+    // UpdateEmpty(<result>, undefined), so an empty try/catch/finally completes
+    // with `undefined` rather than the enclosing script's running value.
+    try self.resetCompletion(line);
     // Phase 8: returns anywhere inside try/catch/finally are not in
     // tail position (a pending finally must run after the callee).
     self.try_depth += 1;
@@ -455,6 +451,9 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     const fin = ts.finalizer.?;
     const rct = self.allocReg(); // completion type
     const rcv = self.allocReg(); // completion value (exception)
+    // Completion value: a normally-completing Finally is discarded and the
+    // try/catch block's value wins, so snapshot V across the finalizer.
+    const rcompl_save: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
     const body_sp = self.sp;
     const k_normal = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 0));
     const k_throw = try self.builder.addConstant(try val_mod.makeNumber(self.arena, 2));
@@ -531,7 +530,17 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     if (jmp_catch_norm) |jc| self.patchJump(jc, finally_offset);
     _ = self.finally_stack.pop(); // out of the protected region
     self.sp = body_sp;
+    if (rcompl_save) |sv| {
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(sv);
+        try self.emitU8(self.completion_reg.?);
+    }
     try self.compileStmt(fin, last_expr_reg);
+    if (rcompl_save) |sv| {
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(self.completion_reg.?);
+        try self.emitU8(sv);
+    }
     self.sp = body_sp;
     try self.emitOp(.END_FINALLY, line);
     try self.emitU8(rct);
@@ -645,17 +654,11 @@ pub fn lowerContinueStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
     } else if (self.loop_stack.items.len > 0) {
         target_idx = self.loop_stack.items.len - 1;
     }
-    // Completion value: `continue` yields an empty completion, so the
-    // loop's value reverts to its value at this iteration's start.
-    if (target_idx) |ti| {
-        if (self.loop_stack.items[ti].prev_reg) |pr| {
-            if (self.completion_reg) |cr| {
-                try self.emitOp(.MOVE, line);
-                try self.emitU8(cr);
-                try self.emitU8(pr);
-            }
-        }
-    }
+    // Completion value: `continue` propagates the running value rather than
+    // resetting it — LoopEvaluation step "if stmtResult.[[Value]] is not EMPTY,
+    // set V to stmtResult.[[Value]]" applies to a continue completion too, and
+    // the enclosing UpdateEmpty chain has already filled in the value. (`if`
+    // and loop entry are what reset V; see resetCompletion.)
     // Run (and POP_TRY) any try-blocks opened inside the loop, then unwind block
     // scopes, before jumping to the loop's continue target.
     if (target_idx) |ti| {
@@ -703,12 +706,10 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             self.sp = riter + 1;
         }
         const rstep = self.allocReg();
-        // Completion value: a loop's value starts fresh at `undefined`; prev_reg
-        // holds the value at the start of each iteration so a `continue` (an empty
-        // completion) reverts to it. No-op outside implicit-return compilation.
+        // Completion value: a loop's value starts fresh at `undefined`. No-op
+        // outside implicit-return (completion-value) compilation.
         try self.resetCompletion(line);
-        const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
-        // Permanent registers (riter, rstep, prev_reg) sit below iter_sp; the
+        // Permanent registers (riter, rstep) sit below iter_sp; the
         // per-iteration temporaries above it are reclaimed each pass.
         const iter_sp = self.sp;
         const loop_start = self.currentOffset();
@@ -796,8 +797,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         // it; `continue` jumps to loop_start, which advances the iterator (re-calls
         // __iterStep__) before the next done-check. scope_depth is the depth
         // *outside* the per-iteration scope so break/continue unwind it.
-        try self.saveLoopPrev(prev_reg, line);
-        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = outer_depth, .finally_depth = self.finally_stack.items.len });
+        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = outer_depth, .finally_depth = self.finally_stack.items.len });
         try self.compileStmt(fo.body, last_expr_reg);
         if (is_lexical_loopvar) {
             try self.emitOp(.EXIT_SCOPE, line);
@@ -857,6 +857,10 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     try self.emitU8(rkeys);
     try self.emitU8(@intCast(len_idx & 0xFF));
     try self.emitU8(@intCast((len_idx >> 8) & 0xFF));
+
+    // Completion value: like every other iteration statement, a for-in's value
+    // starts fresh at `undefined` (ForIn/OfBodyEvaluation step 2).
+    try self.resetCompletion(line);
 
     const loop_start = self.currentOffset();
 
@@ -937,6 +941,10 @@ pub fn lowerSwitchStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
     // Compile as chain of strict-equality checks + JMPs.
     const sw = node.data.switch_stmt;
     const rdisc = try self.compileExpr(sw.discriminant);
+    // Completion value: CaseBlockEvaluation starts with V = undefined, so a
+    // switch whose selected clauses produce nothing completes with `undefined`
+    // rather than leaving the enclosing script's running value in place.
+    try self.resetCompletion(line);
 
     // We'll collect patch offsets for end-of-switch breaks.
     // Each case that matches jumps to its body.
@@ -1072,6 +1080,8 @@ pub fn lowerWithStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{
     try self.emitOp(.PUSH_WITH, line);
     try self.emitU8(robj);
     self.sp = robj;
+    // Completion value: `with` returns UpdateEmpty(bodyCompletion, undefined).
+    try self.resetCompletion(line);
     self.with_depth += 1;
     try self.compileStmt(ws.body, last_expr_reg);
     self.with_depth -= 1;
