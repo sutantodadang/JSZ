@@ -374,7 +374,9 @@ const DOLLAR262_PRELUDE =
     \\    return r;
 
     \\  },
-    \\  evalScript: function(s) { return eval(s); },
+    \\  // Script semantics, not eval semantics: top-level let/const/class must
+    \\  // become global lexical bindings that survive the call.
+    \\  evalScript: function(s) { return __jszEvalScript__(s); },
     \\  AbstractModuleSource: function AbstractModuleSource() {},
     \\  IsHTMLDDA: function IsHTMLDDA() {}
     \\};

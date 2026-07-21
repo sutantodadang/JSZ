@@ -47,6 +47,12 @@ pub const TryEntry = struct {
     /// the object environment records the abandoned `with`s had pushed —
     /// otherwise they keep shadowing name resolution after the catch.
     with_depth: usize = 0,
+    /// The frame's environment record when the try was entered. A throw out of a
+    /// block skips its EXIT_SCOPE, so without this the abandoned block's env
+    /// would stay current and its `let`/`const` would keep shadowing the outer
+    /// scope for the rest of the frame. Block envs are always descendants of
+    /// this one, so restoring the pointer is exactly the missing EXIT_SCOPEs.
+    env: *Environment,
 };
 
 /// Phase 12: key for the per-loop OSR plan cache — a loop is identified by its
@@ -219,6 +225,15 @@ pub const BcVm = struct {
     exception: ?[]const u8 = null,
     /// Phase 4a: the last thrown JS value (for catch binding).
     last_exception_value: Value = Value{},
+    /// One-shot flag raised by MARK_DIRECT_EVAL immediately before a CALL whose
+    /// callee was the bare identifier `eval`. `doCall` consumes it into
+    /// `direct_eval_call` for the duration of that one dispatch.
+    direct_eval_mark: bool = false,
+    /// True while dispatching a call that was syntactically a direct eval, so
+    /// `bcEval` knows to run the source in the caller's scope rather than the
+    /// global one. Saved/restored around every dispatch, so a call made from
+    /// within the eval'd code does not inherit it.
+    direct_eval_call: bool = false,
     /// Phase 4d: context for re-entry from native callbacks.
     context: @import("../runtime/realm.zig").Context = undefined,
     /// Phase 9: optional JIT profiler. Null = no profiling (zero hot-path cost).
@@ -340,7 +355,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, eff_this, args, closure);
                 // Eval code shares the calling/global VariableEnvironment directly
                 // so its top-level declarations hoist there (not a discarded child).
-                const call_env = if (fn_ptr.is_eval) def_env else try Environment.init(self.arena, def_env);
+                const call_env = if (fn_ptr.is_eval) def_env else try Environment.initVarScope(self.arena, def_env);
                 try call_env.define("__new_target__", if (captured_nt.bits != 0) captured_nt else try val_mod.makeUndefined(self.arena));
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
@@ -776,10 +791,14 @@ pub const BcVm = struct {
         // declarations are early SyntaxErrors here, unlike CJS-desugar bundle
         // source (run through the separate isolate-level parseScript path).
         p.eval_code = true;
+        // A *direct* eval runs in the caller's scope; an indirect one (`(0,eval)(s)`,
+        // an aliased binding, a host call) always runs in global scope as
+        // non-strict code. MARK_DIRECT_EVAL told the call dispatch which this is.
+        const direct = self.direct_eval_call and self.frames.items.len > 0;
         // Direct eval inherits the calling context's strict mode (the eval'd code
         // is strict if the caller is strict, even without its own directive). Use
         // the currently-executing frame's function as the calling context.
-        if (self.frames.items.len > 0 and self.frames.items[self.frames.items.len - 1].func.is_strict)
+        if (direct and self.frames.items[self.frames.items.len - 1].func.is_strict)
             p.strict = true;
         const parse_result = p.parseScript();
         const stmts = switch (parse_result) {
@@ -789,26 +808,38 @@ pub const BcVm = struct {
                 return error.JsException;
             },
         };
-        // Direct eval: a top-level `var` whose name collides with a lexical
-        // (`let`/`const`) binding in the immediately-enclosing scope is a
-        // SyntaxError (EvalDeclarationInstantiation). Checked against the calling
-        // frame's own env to avoid crossing function boundaries.
-        if (self.frames.items.len > 0) {
-            const caller_env: *Environment = self.frames.items[self.frames.items.len - 1].env;
+        // The scope the eval'd code is nested in, and the `this` it observes:
+        // the caller's for a direct eval, the global scope / undefined otherwise.
+        const outer_env: *Environment = if (direct)
+            self.frames.items[self.frames.items.len - 1].env
+        else
+            self.realm.global_env;
+        const outer_this: Value = if (direct)
+            self.frames.items[self.frames.items.len - 1].this_val
+        else
+            Value{};
+        // A top-level `var` whose name collides with a lexical (`let`/`const`)
+        // binding in the immediately-enclosing scope is a SyntaxError
+        // (EvalDeclarationInstantiation) — eval must not create a var binding
+        // that a lexical declaration would shadow. `outer_env` is the caller's
+        // own scope for a direct eval and the global scope for an indirect one,
+        // so the same check covers both without crossing function boundaries.
+        {
             var var_names = std.ArrayList([]const u8){};
             collectEvalVarNames(stmts, &var_names, self.arena);
             for (var_names.items) |vn| {
-                if (caller_env.hasOwnLexical(vn)) {
+                if (outer_env.hasOwnLexical(vn)) {
                     realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", "Identifier has already been declared");
                     return error.JsException;
                 }
             }
         }
-        const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(stmts) };
+        const eval_is_strict = parser_mod.hasUseStrict(stmts) or p.strict;
+        const prog = ast_mod.Program{ .body = stmts, .is_strict = eval_is_strict };
         const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<eval>");
         // Eval's top-level `var`/function declarations belong to the calling
-        // VariableEnvironment (the global environment here), so run the body with
-        // that env directly rather than a fresh child — see BcFunction.is_eval.
+        // VariableEnvironment, so run the body with the environment built below
+        // directly rather than a fresh child — see BcFunction.is_eval.
         main_func.is_eval = true;
         // An undefined `break`/`continue` label is an early SyntaxError; the
         // compiler records it (it can't unwind), and eval surfaces it as a throw.
@@ -817,11 +848,22 @@ pub const BcVm = struct {
             realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", msg);
             return error.JsException;
         }
+        // Eval always gets its own declarative environment, so its `let`/`const`/
+        // `class` bindings die with it instead of leaking into the caller's scope.
+        // Its *variable* environment is the enclosing one — except for strict
+        // eval, whose `var`s are confined to the same fresh scope.
+        const eval_env = try Environment.init(self.arena, outer_env);
+        eval_env.is_var_scope = eval_is_strict;
         const closure = try self.arena.create(BcClosure);
-        closure.* = .{ .func = main_func, .env = @ptrCast(self.realm.global_env), .realm = self.realmAsOpaque() };
+        closure.* = .{ .func = main_func, .env = @ptrCast(eval_env), .realm = self.realmAsOpaque() };
+        // A direct eval nested in `with (o)` still resolves free names through o.
+        if (direct) {
+            const caller = &self.frames.items[self.frames.items.len - 1];
+            if (caller.with_stack.items.len > 0)
+                closure.with_scopes = try self.arena.dupe(Value, caller.with_stack.items);
+        }
         const closure_val = try val_mod.makeBcFunction(self.arena, closure);
-        const undef = try val_mod.makeUndefined(self.arena);
-        return bcInvokeJs(self, self.arena, undef, closure_val, &[_]Value{});
+        return bcInvokeJs(self, self.arena, outer_this, closure_val, &[_]Value{});
     }
 
     /// ShadowRealm host hook: compile + run `source` as Script code in the given
@@ -1308,6 +1350,9 @@ pub const BcVm = struct {
                 .POP_WITH => if (try load_ops.opPopWith(self, frame)) |o| return o,
                 .SET_GLOBAL => if (try load_ops.opSetGlobal(self, frame)) |o| return o,
                 .DEFINE_GLOBAL => if (try load_ops.opDefineGlobal(self, frame)) |o| return o,
+                .MARK_DIRECT_EVAL => self.direct_eval_mark = true,
+                .DEFINE_LOCAL => if (try load_ops.opDefineLocal(self, frame)) |o| return o,
+                .SYNC_ANNEXB_FN => if (try load_ops.opSyncAnnexBFn(self, frame)) |o| return o,
                 .GET_LOCAL => if (try load_ops.opGetLocal(self, frame)) |o| return o,
                 .SET_LOCAL => if (try load_ops.opSetLocal(self, frame)) |o| return o,
                 .ADD => if (try arith_ops.opAdd(self, frame)) |o| return o,
@@ -1443,6 +1488,7 @@ pub const BcVm = struct {
                 f.pc = entry.handler_pc;
                 if (f.with_stack.items.len > entry.with_depth)
                     f.with_stack.shrinkRetainingCapacity(entry.with_depth);
+                f.env = entry.env;
                 if (entry.rexc != 0xFF) {
                     f.registers[entry.rexc] = thrown_val;
                 }
@@ -1670,7 +1716,7 @@ pub const BcVm = struct {
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = g;
                     return null;
                 }
-                const call_env = try Environment.init(self.arena, def_env);
+                const call_env = try Environment.initVarScope(self.arena, def_env);
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < nargs)
                         frame.registers[base + 1 + @as(u8, @intCast(i))]
@@ -3065,7 +3111,7 @@ pub const BcVm = struct {
         locals_bits: []const i64,
         resume_pc: u32,
     ) anyerror!Value {
-        const call_env = try Environment.init(self.arena, def_env);
+        const call_env = try Environment.initVarScope(self.arena, def_env);
         const n_loc = @min(local_names.len, locals_bits.len);
         for (0..n_loc) |i| {
             try call_env.define(local_names[i], Value{ .bits = @bitCast(locals_bits[i]) });
@@ -3216,6 +3262,18 @@ pub const BcVm = struct {
 
     pub fn doCall(self: *BcVm, callee_val: Value, this_val: Value, base: u8, nargs: u8, ret_dst: u8) !?[]const u8 {
         @import("../runtime/realm.zig").active_constructing = false;
+        // Consume the one-shot direct-eval marker: it describes exactly this
+        // dispatch. Saving the previous value keeps a nested call made by the
+        // callee (or by an argument's getter) from inheriting it.
+        const prev_direct_eval = self.direct_eval_call;
+        // The syntactic mark is necessary but not sufficient: the callee must
+        // also *be* %eval% (§13.3.6.1 step 6), so `var eval = f; eval(s)` is an
+        // ordinary call to f — and the flag must not survive into it, or f's own
+        // call to the real eval would inherit the caller's scope.
+        self.direct_eval_call = self.direct_eval_mark and
+            @import("../runtime/realm.zig").isEvalIntrinsic(callee_val);
+        self.direct_eval_mark = false;
+        defer self.direct_eval_call = prev_direct_eval;
         const frame = &self.frames.items[self.frames.items.len - 1];
         if (callee_val.bits == 0) {
             return try std.fmt.allocPrint(self.arena, "TypeError: undefined is not a function", .{});
@@ -3270,7 +3328,7 @@ pub const BcVm = struct {
                 }
 
                 // Create call environment.
-                const call_env = try Environment.init(self.arena, def_env);
+                const call_env = try Environment.initVarScope(self.arena, def_env);
 
                 // Bind parameters.
                 for (fn_ptr.param_names, 0..) |pname, i| {
@@ -3293,7 +3351,7 @@ pub const BcVm = struct {
                         }
                     }
                     if (!is_param) {
-                        call_env.define(fname, callee_val) catch {};
+                        call_env.defineImmutable(fname, callee_val, fn_ptr.is_strict) catch {};
                     }
                 }
 
@@ -3531,7 +3589,7 @@ pub const BcVm = struct {
                     return null;
                 }
 
-                const call_env = try Environment.init(self.arena, def_env);
+                const call_env = try Environment.initVarScope(self.arena, def_env);
 
                 // Bind parameters. Args are at R[base+2..base+1+nargs].
                 for (fn_ptr.param_names, 0..) |pname, i| {
@@ -3554,7 +3612,7 @@ pub const BcVm = struct {
                         }
                     }
                     if (!is_param) {
-                        call_env.define(fname, callee_val) catch {};
+                        call_env.defineImmutable(fname, callee_val, fn_ptr.is_strict) catch {};
                     }
                 }
 
@@ -3718,6 +3776,10 @@ pub const BcVm = struct {
     /// `arguments` (that binding wins per spec). No-op for the common case.
     pub fn defineArguments(self: *BcVm, env: *Environment, fn_ptr: *const BcFunction, args: []const Value) !void {
         if (!fn_ptr.uses_arguments) return;
+        // Only *function* code gets an arguments object. In eval code the name
+        // resolves through the enclosing scope chain — to the calling function's
+        // arguments for a direct eval, or to a global binding for an indirect one.
+        if (fn_ptr.is_eval) return;
         for (fn_ptr.param_names) |p| {
             if (std.mem.eql(u8, p, "arguments")) return;
         }
@@ -3792,7 +3854,7 @@ pub const BcVm = struct {
     /// a fresh call env with params bound, register file with params seeded, and
     /// a BcGeneratorState registered for GC scanning. The frame starts at pc 0.
     fn buildGenState(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value) !*BcGeneratorState {
-        const call_env = try Environment.init(self.arena, def_env);
+        const call_env = try Environment.initVarScope(self.arena, def_env);
         for (fn_ptr.param_names, 0..) |pname, i| {
             const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
             try call_env.define(pname, av);

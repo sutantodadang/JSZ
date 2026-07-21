@@ -303,6 +303,29 @@ pub const Op = enum(u8) {
     /// non-writable, so assigning over a private method is a TypeError. Declared
     /// last (ordinal stability for the pinned JIT contract).
     DEFINE_PRIVATE,
+    /// MARK_DIRECT_EVAL | 1 | op. Emitted immediately before the CALL of a
+    /// call whose callee is the *identifier* `eval` — the syntactic shape that
+    /// makes a call a direct eval (§13.3.6.1). Sets a one-shot VM flag that the
+    /// call dispatch consumes, so `eval(src)` runs `src` in the caller's scope
+    /// while `(0, eval)(src)` / `var e = eval; e(src)` stay indirect (global
+    /// scope). Declared last (ordinal stability for the pinned JIT contract).
+    MARK_DIRECT_EVAL,
+    /// DEFINE_LOCAL | 4 | op, Kname u16-LE, Rsrc u8. Creates/overwrites an
+    /// binding for Kname in the frame's *own* environment, never walking the
+    /// parent chain (unlike DEFINE_GLOBAL, which assigns an outer binding when
+    /// one exists). Emitted by BlockDeclarationInstantiation for a function
+    /// declaration nested in a block, whose binding is block-scoped.
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    DEFINE_LOCAL,
+    /// SYNC_ANNEXB_FN | 3 | op, Kname u16-LE. The Annex B.3.3 web-compat
+    /// half of a block-nested function declaration: copies the block-scoped
+    /// binding's current value into the same-named binding in the frame's
+    /// *variable* environment. Emitted at the declaration's source position
+    /// (the spec replaces FunctionDeclaration Evaluation with this step), and
+    /// only for names the extension applies to — a name shadowed by a lexical
+    /// declaration or a parameter between the block and the var scope gets no
+    /// var binding and no sync. Declared last (JIT ordinal stability).
+    SYNC_ANNEXB_FN,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -402,6 +425,9 @@ pub fn instrSize(op: Op) usize {
         .ARRAY_SPREAD => 3,
         .ARRAY_APPEND_HOLE => 3,
         .DEFINE_PRIVATE => 6,
+        .MARK_DIRECT_EVAL => 1,
+        .DEFINE_LOCAL => 4,
+        .SYNC_ANNEXB_FN => 3,
         .IN => 4,
         .DELETE_PROP => 4,
         .CALL_SPREAD => 5,

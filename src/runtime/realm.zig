@@ -478,18 +478,36 @@ pub fn nativeImportDefer(arena: std.mem.Allocator, _: Value, args: []const Value
     return getOrMakeDeferredNamespace(arena, canonical);
 }
 
+/// ImportCall step 4: `Let specifierString be ? ToString(specifier)`. The
+/// argument is an arbitrary value, so an object's `toString`/`valueOf` runs
+/// here and may throw — the caller turns that into a rejection (the spec's
+/// IfAbruptRejectPromise), which is why this returns error.JsException with
+/// `pending_exception` set rather than a canned TypeError.
+fn importSpecifierString(arena: std.mem.Allocator, args: []const Value) anyerror![]const u8 {
+    const v = if (args.len > 0) args[0] else Value{};
+    if (v.bits != 0 and v.unbox() == .string) return v.toPtr().string;
+    return array_proto_mod.valueToJsString(arena, v);
+}
+
+/// Reject a fresh promise with the exception a coercion just raised. The value
+/// is whatever was thrown — `throw 'custom error'` rejects with that string, not
+/// with an Error wrapping it.
+fn rejectWithPending(arena: std.mem.Allocator) anyerror!Value {
+    const exc = if (pending_exception.bits != 0) pending_exception else try val_mod.makeUndefined(arena);
+    pending_exception = Value{};
+    return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{exc});
+}
+
 /// Dynamic deferred import: `import.defer(spec)` returns a promise that fulfils
 /// with the module's deferred namespace exotic object WITHOUT evaluating it (the
 /// module body runs lazily on first triggering access). Loading is synchronous in
 /// the bundler model, so the promise resolves immediately with the (cached)
 /// deferred namespace — identical to the static `import defer` object.
 pub fn nativeImportDeferDynamic(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
-        return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{
-            try val_mod.makeString(arena, "TypeError: import.defer() requires a string specifier"),
-        });
-    }
-    const spec = args[0].toPtr().string;
+    const spec = importSpecifierString(arena, args) catch |e| {
+        if (e != error.JsException) return e;
+        return rejectWithPending(arena);
+    };
     const env = active_global_env;
     const canonical = if (env) |e| (resolveModuleName(arena, e, spec) catch spec) else spec;
     const ns = try getOrMakeDeferredNamespace(arena, canonical);
@@ -874,15 +892,17 @@ fn deferredImportResolve(arena: std.mem.Allocator, _: Value, _: []const Value) a
 /// import's side-effects, matching the spec's InnerModuleEvaluation order.
 pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (std.process.hasEnvVarConstant("JSZ_DBG") and args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) std.debug.print("IMPORT {s}\n", .{args[0].toPtr().string});
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .string) {
-        return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{
-            try val_mod.makeString(arena, "TypeError: import() requires a string specifier"),
-        });
-    }
+    const spec_str = importSpecifierString(arena, args) catch |e| {
+        if (e != error.JsException) return e;
+        return rejectWithPending(arena);
+    };
     // A second argument `{ with: { type: '...' } }` selects a typed (JSON/text)
     // module: fold the type into the specifier so it keys the same synthetic
     // module record the static-import desugar registers (`spec\x00type`).
-    const args2 = importApplyTypeAttr(arena, args) catch args;
+    var coerced = try arena.dupe(Value, args);
+    if (coerced.len == 0) coerced = try arena.alloc(Value, 1);
+    coerced[0] = try val_mod.makeString(arena, spec_str);
+    const args2 = importApplyTypeAttr(arena, coerced) catch coerced;
     const raw_name = args2[0].toPtr().string;
     // Resolve the specifier to the canonical id used in __modules__.
     const env = active_global_env orelse {
@@ -2147,7 +2167,9 @@ pub fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8
         .null_ => "null",
         .undefined_ => "undefined",
         .bigint => |b| try val_mod.bigIntToString(arena, b),
-        .object => blk: {
+        // Functions are objects too: `String(function f(){})` is the source
+        // text produced by Function.prototype.toString, not "[object Object]".
+        .object, .function, .bc_function, .native_function => blk: {
             // ToString(ToPrimitive(arg, "string")) when a user hook applies.
             if (try coercion_mod.toPrimitive(arena, arg, .string)) |prim|
                 break :blk try stringPrimitive(arena, prim);
@@ -2485,15 +2507,14 @@ fn uriToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
         .undefined_ => return "undefined",
         .bigint => |bi| return try val_mod.bigIntToString(arena, bi),
         .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a string"),
-        .object => {
+        .object, .function, .bc_function, .native_function => {
             // ToString(object): ToPrimitive(string). A missing/uncallable
             // toString & valueOf (null result) is a TypeError, not a fallback.
             const prim = (try coercion_mod.toPrimitive(arena, v, .string)) orelse
                 return throwTypeError(arena, "Cannot convert object to primitive value");
-            if (prim.bits != 0 and prim.unbox() == .object) return "[object Object]";
+            if (!coercion_mod.isPrimitive(prim)) return "[object Object]";
             return uriToString(arena, prim);
         },
-        else => return "[object Object]",
     }
 }
 
@@ -2876,6 +2897,16 @@ fn nativeEval(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!
     const src = args[0].toPtr().string;
     const ctx = active_context orelse return val_mod.makeUndefined(arena);
     return ctx.evalSource(arena, src);
+}
+
+/// Is `v` the %eval% intrinsic itself? A direct eval requires more than the
+/// syntactic shape `eval(...)`: §13.3.6.1 falls back to an ordinary call unless
+/// the callee actually evaluates to %eval%. So `var eval = f; eval(s)` and
+/// `var eval = realEval.bind(null, s); eval()` are plain calls, even though the
+/// callee is spelled `eval`.
+pub fn isEvalIntrinsic(v: Value) bool {
+    if (v.bits == 0 or v.unbox() != .native_function) return false;
+    return v.toPtr().native_function.call == nativeEval;
 }
 
 fn toBooleanCoerce(v: Value) bool {
@@ -3603,6 +3634,20 @@ pub const EvalData = struct {
     env: *anyopaque,
     realm: *Realm,
 };
+
+/// Host hook backing `$262.evalScript`: evaluates `args[0]` as *Script* code in
+/// the running realm's global scope. Unlike `eval`, a Script's top-level
+/// `let`/`const`/`class` become global lexical bindings that outlive the call,
+/// so this cannot be expressed as either a direct or an indirect eval.
+pub fn nativeEvalScript(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = active_context orelse return val_mod.makeUndefined(arena);
+    const env = active_global_env orelse return val_mod.makeUndefined(arena);
+    const s: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string)
+        args[0].toPtr().string
+    else
+        "";
+    return ctx.shadowEval(arena, s, @ptrCast(env));
+}
 
 /// `evalScript` of a secondary realm record: evaluates `args[0]` as Script code
 /// in that realm's global environment (carried as native userdata, an opaque

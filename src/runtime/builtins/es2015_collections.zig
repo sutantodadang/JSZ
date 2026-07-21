@@ -2371,33 +2371,62 @@ pub fn nativeDestrIterClose(arena: std.mem.Allocator, _: Value, args: []const Va
 }
 
 /// __destrObjRest__(src, excludeKeys): CopyDataProperties into a fresh plain
-/// object from `src`'s own enumerable string-keyed properties, skipping any key
-/// present in `excludeKeys` (an Array of strings — the compile-time list of
-/// already-destructured keys for this pattern: static keys as literals, and
-/// computed keys pre-evaluated once into a temp so they're read exactly once).
-/// Used by the object-rest binding pattern (`{a, ...rest} = x`). `src` is
-/// non-object (e.g. a primitive) only via unusual call sites — the pattern
-/// desugar always runs `__requireObjectCoercible__` first, but that only
-/// rejects null/undefined, not other primitives — so a non-object `src` yields
-/// an empty result (no own enumerable string keys to copy) rather than a crash.
+/// object from `src`'s own enumerable properties, skipping any key present in
+/// `excludeKeys` (an Array of the already-destructured keys for this pattern:
+/// static keys as string literals, and computed keys pre-evaluated once into a
+/// temp so they're read exactly once — a computed key may therefore be a
+/// Symbol, and is matched by identity). Used by the object-rest pattern
+/// (`{a, ...rest} = x`) in both the binding and assignment forms.
+///
+/// Like its sibling `nativeObjSpreadInto`, properties are read via [[Get]]: a
+/// getter runs and its RETURN VALUE is copied, since CopyDataProperties never
+/// copies the accessor itself. Symbol keys are copied too.
+///
+/// `src` is non-object (e.g. a primitive) only via unusual call sites — the
+/// pattern desugar always runs `__requireObjectCoercible__` first, but that
+/// only rejects null/undefined, not other primitives — so a non-object `src`
+/// yields an empty result rather than a crash.
 pub fn nativeDestrObjRest(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const out = try JsObject.create(arena, realm_mod.active_object_proto);
     const src = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     if (src.bits == 0 or src.unbox() != .object) return val_mod.makeObject(arena, out);
     const src_obj = src.toPtr().object;
     const excl_list: ?*JsObject = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    const ctx = realm_mod.active_context;
+    // The exclusion list is an ordinary array built by the desugar; snapshot it
+    // once instead of re-reading a decimal key per (key, exclusion) pair.
+    var excluded: []const Value = &[_]Value{};
+    if (excl_list) |ex| {
+        const n: usize = ex.array_length;
+        const buf = try arena.alloc(Value, n);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
+            buf[i] = ex.getOwn(ek) orelse try val_mod.makeUndefined(arena);
+        }
+        excluded = buf;
+    }
     outer: for (src_obj.ownKeys()) |k| {
         if (!src_obj.isEnumerable(k)) continue;
-        if (excl_list) |ex| {
-            var i: usize = 0;
-            while (i < ex.array_length) : (i += 1) {
-                const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
-                const ev = ex.getOwn(ek) orelse continue;
-                if (ev.bits != 0 and ev.unbox() == .string and std.mem.eql(u8, ev.unbox().string, k)) continue :outer;
-            }
+        for (excluded) |ev| {
+            // A computed key's value is compared as a *property key*, so
+            // `{[1]: a, ...rest}` excludes the key "1".
+            if (ev.bits == 0 or ev.unbox() == .symbol) continue;
+            const ek = toPropertyKeyString(arena, ev) catch continue;
+            if (std.mem.eql(u8, ek, k)) continue :outer;
         }
-        const v = src_obj.getOwn(k) orelse continue;
+        const v = if (ctx) |c| try c.getProp(arena, src, k) else (src_obj.getOwn(k) orelse continue);
         try out.set(k, v);
+    }
+    outer_sym: for (src_obj.symKeys()) |sp| {
+        if (!sp.attr.enumerable) continue;
+        for (excluded) |ev| {
+            if (ev.bits == 0 or ev.unbox() != .symbol) continue;
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and
+                ev.toPtr().symbol == sp.key.toPtr().symbol) continue :outer_sym;
+        }
+        const v = if (ctx) |c| try c.getPropSym(arena, src, sp.key) else sp.value;
+        try out.setSym(sp.key, v);
     }
     return val_mod.makeObject(arena, out);
 }

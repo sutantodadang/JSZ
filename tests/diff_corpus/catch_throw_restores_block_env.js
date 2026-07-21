@@ -1,0 +1,1 @@
+var y = 1; try { { let y = 2; throw 0 } } catch (e) {} y

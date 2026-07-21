@@ -1,0 +1,1 @@
+var r = function B() { "use strict"; try { B = 1 } catch (e) { return e.constructor.name } return "no-throw" }; r()

@@ -1,0 +1,1 @@
+var o = {}; ({ a: o.x, ...o.r } = { a: 1, b: 2 }); JSON.stringify(o)

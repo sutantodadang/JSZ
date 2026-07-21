@@ -1,0 +1,1 @@
+var out = []; try { throw 7 } catch (e) { out.push(e) } out.push(typeof e); out.join(",")

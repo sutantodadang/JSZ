@@ -314,7 +314,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d}", .{rsrc});
         },
-        .RETURN_UNDEF, .HALT, .DEBUGGER, .PARAMS_DONE => {},
+        .RETURN_UNDEF, .HALT, .DEBUGGER, .PARAMS_DONE, .MARK_DIRECT_EVAL => {},
         // Phase 3a
         .NEW_OBJECT => {
             const rdst = code[new_pc];
@@ -649,7 +649,21 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
                 try writer.print(" K{d} R{d}{s}", .{ kidx, rsrc, kind_str });
             }
         },
-        .DEFINE_GLOBAL => {
+        .SYNC_ANNEXB_FN => {
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
+            const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+            if (kidx < chunk.constants.len and chunk.constants[kidx].bits != 0 and
+                chunk.constants[kidx].unbox() == .string)
+            {
+                try writer.print(" \"{s}\"", .{chunk.constants[kidx].unbox().string});
+            } else {
+                try writer.print(" K{d}", .{kidx});
+            }
+        },
+        .DEFINE_GLOBAL, .DEFINE_LOCAL => {
             const lo = code[new_pc];
             new_pc += 1;
             const hi = code[new_pc];

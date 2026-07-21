@@ -1,0 +1,1 @@
+var r = function B() { eval("B = 1"); return B }; r() === r
