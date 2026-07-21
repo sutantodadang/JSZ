@@ -2144,6 +2144,7 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
     const is_generator = p.match(.star);
     var name: ?[]const u8 = null;
     if (p.check(.identifier)) {
+        if (!parser_file.checkStrictBindingName(p, p.current.value_str, p.current.line, p.current.column)) return null;
         name = p.current.value_str;
         _ = p.advance();
     }

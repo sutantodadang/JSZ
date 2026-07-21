@@ -822,6 +822,7 @@ pub fn parseFunctionDecl(p: *Parser, is_async: bool) ?*Node {
     const is_generator = p.match(.star);
     const name_tok = p.expect(.identifier) orelse return null;
     const name = name_tok.value_str;
+    if (!parser_file.checkStrictBindingName(p, name, name_tok.line, name_tok.column)) return null;
     const parsed_params = p.parseFunctionParams() orelse return null;
     const prev_gen = p.in_generator_function;
     p.in_generator_function = is_generator;

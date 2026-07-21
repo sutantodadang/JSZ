@@ -65,6 +65,23 @@ pub fn isStrictReservedWord(name: []const u8) bool {
     return false;
 }
 
+/// Reject a BindingIdentifier that strict-mode code may not bind (a future
+/// reserved word, `eval` or `arguments` — ES 13.1.1 / 12.7.2). Returns true when
+/// the name is legal; on rejection it records the early SyntaxError and the
+/// caller must bail out. No-op in sloppy-mode code.
+pub fn checkStrictBindingName(p: *Parser, name: []const u8, line: u32, column: u32) bool {
+    if (!p.strict or !isStrictReservedWord(name)) return true;
+    if (!p.had_error) {
+        p.had_error = true;
+        p.error_info = ParseError{
+            .message = "unexpected strict-mode reserved word as binding name",
+            .line = line,
+            .column = column,
+        };
+    }
+    return false;
+}
+
 pub const ParseResult = union(enum) {
     ok: []*Node,
     err: ParseError,

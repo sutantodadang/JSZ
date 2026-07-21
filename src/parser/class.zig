@@ -1414,6 +1414,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
             continue;
         }
         const param_tok = p.expect(.identifier) orelse return null;
+        if (!parser_file.checkStrictBindingName(p, param_tok.value_str, param_tok.line, param_tok.column)) return null;
         if (is_rest) {
             saw_rest = true;
             rest_param = param_tok.value_str;
