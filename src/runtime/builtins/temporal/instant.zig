@@ -304,21 +304,24 @@ pub fn nativeSince(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
 pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const ins = try requireInstant(arena, this_val);
-    var opts: ?*JsObject = null;
-    var smallest: ?shared.Unit = null;
-    const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits != 0 and arg0.unbox() == .string) {
-        smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
-    } else {
-        opts = try shared.getOptionsObject(arena, arg0);
-        smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    }
-    if (smallest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
-    if (unitRank(smallest.?) < unitRank(.hour)) return realm_mod.throwRangeError(arena, "smallestUnit must be hour..nanosecond");
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
-    const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
-    const rounded = shared.roundI128ToIncrement(ins.*, inc_ns, mode);
+    const ro = try shared.getRoundToOptions(arena, if (args.len > 0) args[0] else Value{});
+    const smallest = ro.smallest orelse return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
+    if (unitRank(smallest) < unitRank(.hour)) return realm_mod.throwRangeError(arena, "smallestUnit must be hour..nanosecond");
+    // An Instant has no wall clock to overflow, so the increment is measured
+    // against a whole day's worth of the unit — inclusively, which is how
+    // `{ smallestUnit: "second", roundingIncrement: 86400 }` rounds to days.
+    const per_day: f64 = switch (smallest) {
+        .hour => 24,
+        .minute => 1440,
+        .second => 86400,
+        .millisecond => 86_400_000,
+        .microsecond => 86_400_000_000,
+        else => 86_400_000_000_000,
+    };
+    if (ro.inc > per_day or @mod(per_day, ro.inc) != 0)
+        return realm_mod.throwRangeError(arena, "invalid roundingIncrement for smallestUnit");
+    const inc_ns = shared.unitLengthNanos(smallest).? * @as(i128, @intFromFloat(ro.inc));
+    const rounded = shared.roundI128ToIncrement(ins.*, inc_ns, ro.mode);
     return makeInstant(arena, rounded);
 }
 

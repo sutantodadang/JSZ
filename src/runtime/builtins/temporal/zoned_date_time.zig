@@ -979,20 +979,12 @@ pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, ar
 
 pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    var opts: ?*JsObject = null;
-    var smallest: ?shared.Unit = null;
-    const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits == 0 or arg0.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "round() requires an argument");
-    if (arg0.unbox() == .string) {
-        smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
-    } else {
-        opts = try shared.getOptionsObject(arena, arg0);
-        smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    }
-    if (smallest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
-    if (unitRank(smallest.?) < unitRank(.day)) return realm_mod.throwRangeError(arena, "smallestUnit must be day..nanosecond");
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
+    const ro = try shared.getRoundToOptions(arena, if (args.len > 0) args[0] else Value{});
+    const smallest = ro.smallest orelse return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
+    if (unitRank(smallest) < unitRank(.day)) return realm_mod.throwRangeError(arena, "smallestUnit must be day..nanosecond");
+    const mode = ro.mode;
+    const inc = ro.inc;
+    if (smallest == .day) try shared.validateDayIncrement(arena, inc) else try shared.validateIncrement(arena, smallest, inc);
 
     const cur = localDT(z);
     const day_start_ns = try disambiguate(arena, z.tz, wallNs(.{ .date = cur.date, .time = .{} }), .compatible);
@@ -1001,11 +993,11 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const day_len = (try disambiguate(arena, z.tz, wallNs(.{ .date = next, .time = .{} }), .compatible)) - day_start_ns;
     const since_start = z.ns - day_start_ns;
     var new_ns: i128 = undefined;
-    if (smallest.? == .day) {
+    if (smallest == .day) {
         const rounded = shared.roundI128ToIncrement(since_start, day_len, mode);
         new_ns = day_start_ns + rounded;
     } else {
-        const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
+        const inc_ns = shared.unitLengthNanos(smallest).? * @as(i128, @intFromFloat(inc));
         const rounded = shared.roundI128ToIncrement(since_start, inc_ns, mode);
         new_ns = day_start_ns + rounded;
     }

@@ -1335,6 +1335,37 @@ pub fn getDiffOptions(arena: std.mem.Allocator, opts: ?*JsObject, since: bool) !
     return .{ .smallest = smallest, .largest = largest, .inc = inc, .mode = mode };
 }
 
+/// The options every `round()` takes. A bare string argument is shorthand for
+/// `{ smallestUnit }`; `smallest` is null only when the property was absent.
+pub const RoundToOptions = struct {
+    smallest: ?Unit,
+    inc: f64,
+    mode: RoundingMode,
+};
+
+/// Steps 1-6 of every Temporal `round()`: reject a missing argument with a
+/// TypeError, expand the string shorthand, then read roundingIncrement,
+/// roundingMode and smallestUnit in that order.
+pub fn getRoundToOptions(arena: std.mem.Allocator, arg: Value) !RoundToOptions {
+    if (arg.bits == 0 or arg.unbox() == .undefined_)
+        return realm_mod.throwTypeError(arena, "round() requires an argument");
+    if (arg.unbox() == .string) {
+        const u = unitFromString(arg.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
+        return .{ .smallest = u, .inc = 1, .mode = .half_expand };
+    }
+    const opts = try getOptionsObject(arena, arg);
+    const inc = try getRoundingIncrement(arena, opts);
+    const mode = try getRoundingMode(arena, opts, .half_expand);
+    const smallest = try getTemporalUnit(arena, opts, "smallestUnit");
+    return .{ .smallest = smallest, .inc = inc, .mode = mode };
+}
+
+/// ValidateTemporalRoundingIncrement in its *inclusive* form, used when
+/// rounding to whole days: the only increment a day accepts is 1.
+pub fn validateDayIncrement(arena: std.mem.Allocator, inc: f64) !void {
+    if (inc != 1) return realm_mod.throwRangeError(arena, "roundingIncrement must be 1 for smallestUnit 'day'");
+}
+
 /// MaximumTemporalDurationRoundingIncrement: the dividend a rounding increment
 /// is validated against. Calendar units have no maximum.
 pub fn maxIncrementDividend(u: Unit) ?f64 {

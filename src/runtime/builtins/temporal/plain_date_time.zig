@@ -416,21 +416,14 @@ pub fn nativeWithPlainTime(arena: std.mem.Allocator, this_val: Value, args: []co
 
 pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
-    var opts: ?*JsObject = null;
-    var smallest: ?shared.Unit = null;
-    const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits != 0 and arg0.unbox() == .string) {
-        smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
-    } else {
-        opts = try shared.getOptionsObject(arena, arg0);
-        smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    }
-    if (smallest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
-    if (unitRank(smallest.?) < unitRank(.day)) return realm_mod.throwRangeError(arena, "smallestUnit must be day..nanosecond");
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
+    const ro = try shared.getRoundToOptions(arena, if (args.len > 0) args[0] else Value{});
+    const smallest = ro.smallest orelse return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
+    if (unitRank(smallest) < unitRank(.day)) return realm_mod.throwRangeError(arena, "smallestUnit must be day..nanosecond");
+    const mode = ro.mode;
+    const inc = ro.inc;
+    if (smallest == .day) try shared.validateDayIncrement(arena, inc) else try shared.validateIncrement(arena, smallest, inc);
 
-    if (smallest.? == .day) {
+    if (smallest == .day) {
         // Round to nearest day.
         const day_ns = shared.timeToNanos(dt.time);
         const rounded = shared.roundI128ToIncrement(day_ns, shared.NS_PER_DAY, mode);
@@ -439,7 +432,7 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
         new_date.calendar = dt.date.calendar;
         return makeDateTime(arena, .{ .date = new_date, .time = .{} });
     }
-    const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
+    const inc_ns = shared.unitLengthNanos(smallest).? * @as(i128, @intFromFloat(inc));
     const total = shared.timeToNanos(dt.time);
     const rounded = shared.roundI128ToIncrement(total, inc_ns, mode);
     const tr = shared.nanosToTime(rounded);

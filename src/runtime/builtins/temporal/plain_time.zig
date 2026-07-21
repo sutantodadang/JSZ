@@ -333,23 +333,13 @@ fn unitRank(u: shared.Unit) u8 {
 
 pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const t = try requireTime(arena, this_val);
-    var opts: ?*JsObject = null;
-    var smallest: ?shared.Unit = null;
-    const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits != 0 and arg0.unbox() == .string) {
-        smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
-    } else {
-        opts = try shared.getOptionsObject(arena, arg0);
-        smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    }
-    if (smallest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
-    if (!isTimeUnit(smallest.?) and smallest.? != .day) return realm_mod.throwRangeError(arena, "invalid smallestUnit for PlainTime");
-    if (smallest.? == .day) return realm_mod.throwRangeError(arena, "smallestUnit 'day' invalid for PlainTime");
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
-    const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
+    const ro = try shared.getRoundToOptions(arena, if (args.len > 0) args[0] else Value{});
+    const smallest = ro.smallest orelse return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
+    if (!isTimeUnit(smallest)) return realm_mod.throwRangeError(arena, "invalid smallestUnit for PlainTime");
+    try shared.validateIncrement(arena, smallest, ro.inc);
+    const inc_ns = shared.unitLengthNanos(smallest).? * @as(i128, @intFromFloat(ro.inc));
     var total = shared.timeToNanos(t.*);
-    total = shared.roundI128ToIncrement(total, inc_ns, mode);
+    total = shared.roundI128ToIncrement(total, inc_ns, ro.mode);
     total = @mod(total, shared.NS_PER_DAY);
     const r = shared.nanosToTime(total);
     return makeTime(arena, r.time);
