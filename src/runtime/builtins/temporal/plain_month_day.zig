@@ -122,17 +122,24 @@ fn monthDayFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.O
     const year_v = o.get("year");
     const has_year = (year_v != null and year_v.?.bits != 0 and year_v.?.unbox() != .undefined_) or
         (calendar.hasEras(cal) and o.get("era") != null and o.get("era").?.bits != 0 and o.get("era").?.unbox() != .undefined_);
+    var resolved_day = day;
     if (has_year) {
         const cal_year = try plain_date.readCalendarYear(arena, o, cal);
-        const iso = calendar.toIso(cal, cal_year, code.num, day, overflow) catch
-            return realm_mod.throwRangeError(arena, "month-day out of range");
+        const iso = if (has_code)
+            calendar.toIsoFromCode(cal, cal_year, code.num, code.leap, day, overflow) catch
+                return realm_mod.throwRangeError(arena, "month-day out of range")
+        else
+            calendar.toIso(cal, cal_year, code.num, day, overflow) catch
+                return realm_mod.throwRangeError(arena, "month-day out of range");
         const f = calendar.fields(cal, iso);
-        code = .{ .num = f.code_num, .leap = f.code_leap };
         if (has_month and has_code) {
             const m = floatToI32(try shared.toIntegerWithTruncation(arena, month_v.?));
             if (m != f.month) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
         }
-        return .{ .month = iso.month, .day = iso.day, .ref_year = iso.year, .calendar = cal };
+        // The year only picks the month code and constrains the day; the stored
+        // reference date is still the canonical one near 1972.
+        code = .{ .num = f.code_num, .leap = f.code_leap };
+        resolved_day = f.day;
     }
 
     // month and monthCode, when both present, must name the same month.
@@ -140,7 +147,10 @@ fn monthDayFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.O
         const m = floatToI32(try shared.toIntegerWithTruncation(arena, month_v.?));
         if (m != code.num or code.leap) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
     }
-    const iso = calendar.monthDayReference(cal, code.num, code.leap, day, overflow) catch
+    // A day already constrained against a supplied year must not be constrained
+    // a second time here, so the reference lookup is exact in that case.
+    const ref_overflow: shared.Overflow = if (has_year) .reject else overflow;
+    const iso = calendar.monthDayReference(cal, code.num, code.leap, resolved_day, ref_overflow) catch
         return realm_mod.throwRangeError(arena, "month-day out of range");
     return .{ .month = iso.month, .day = iso.day, .ref_year = iso.year, .calendar = cal };
 }

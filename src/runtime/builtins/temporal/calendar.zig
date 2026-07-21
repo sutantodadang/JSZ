@@ -14,7 +14,7 @@
 //! from the start of the year — so adding a calendar means adding those two
 //! rules and its era labels, not another pair of conversion formulas.
 //!
-//! Not implemented: the lunisolar calendars (hebrew, chinese, dangi) and
+//! Not implemented: the astronomical lunisolar calendars (chinese, dangi) and
 //! islamic-umalqura, which need observational or tabulated month data rather
 //! than a closed-form year start.
 const std = @import("std");
@@ -38,6 +38,8 @@ pub const CalendarId = enum(u8) {
     // Solar, non-Gregorian month lengths.
     persian,
     indian,
+    // Lunisolar: 12 or 13 months, with a leap month interpolated after M05.
+    hebrew,
 
     /// The canonical BCP-47 `-u-ca-` identifier, as reported by `calendarId`.
     pub fn str(self: CalendarId) []const u8 {
@@ -54,6 +56,7 @@ pub const CalendarId = enum(u8) {
             .islamic_tbla => "islamic-tbla",
             .persian => "persian",
             .indian => "indian",
+            .hebrew => "hebrew",
         };
     }
 };
@@ -107,6 +110,7 @@ const ethiopic_epoch: i64 = 2796 - 719163; // Julian 8-08-29
 const islamic_civil_epoch: i64 = 227015 - 719163; // Julian 622-07-16
 const islamic_tbla_epoch: i64 = 227014 - 719163; // Julian 622-07-15 (astronomical)
 const persian_epoch: i64 = 226896 - 719163; // Julian 622-03-19
+const hebrew_epoch: i64 = -1373427 - 719163; // Gregorian -3760-09-07
 
 /// Ethiopic's Amete Alem numbering runs 5500 years ahead of Amete Mihret.
 const ethioaa_offset: i32 = 5500;
@@ -144,6 +148,7 @@ fn yearStartDays(cal: CalendarId, year: i32) i64 {
         .islamic_civil => islamic_civil_epoch + 354 * (y - 1) + @divFloor(3 + 11 * y, 30),
         .islamic_tbla => islamic_tbla_epoch + 354 * (y - 1) + @divFloor(3 + 11 * y, 30),
         .persian => persianYearStart(year),
+        .hebrew => hebrewNewYear(year),
         // Saka year Y begins on 22 March of Gregorian year Y+78, or 21 March
         // when that Gregorian year is a leap year.
         .indian => shared.isoDateToEpochDays(year + 78, 3, if (shared.isLeapYear(year + 78)) 21 else 22),
@@ -174,10 +179,85 @@ fn persianYearStart(year: i32) i64 {
     return persian_epoch - 1 + 365 * (y - 1) + persianLeapsUpTo(y - 1);
 }
 
+// ------------------------------------------------------------------- Hebrew ---
+
+/// A Hebrew leap year interpolates a 13th month; 7 of every 19 years are leap.
+fn hebrewIsLeap(year: i32) bool {
+    return @mod(7 * @as(i64, year) + 1, 19) < 7;
+}
+
+/// Days elapsed from the epoch to the mean new moon (molad) of `year`, with the
+/// first of the four postponement rules (dehiyyot) already applied.
+fn hebrewElapsedDays(year: i64) i64 {
+    const months_elapsed = @divFloor(235 * year - 234, 19);
+    const parts_elapsed = 12084 + 13753 * months_elapsed;
+    var day = 29 * months_elapsed + @divFloor(parts_elapsed, 25920);
+    // Rosh Hashanah may not fall on a Sunday, Wednesday or Friday.
+    if (@mod(3 * (day + 1), 7) < 3) day += 1;
+    return day;
+}
+
+/// Epoch day of 1 Tishri of `year`, applying the remaining postponement rules,
+/// which exist only to keep the year length one of 353/354/355/383/384/385.
+fn hebrewNewYear(year: i32) i64 {
+    const y: i64 = year;
+    const prev = hebrewElapsedDays(y - 1);
+    const cur = hebrewElapsedDays(y);
+    const next = hebrewElapsedDays(y + 1);
+    const correction: i64 = if (next - cur == 356) 2 else if (cur - prev == 382) 1 else 0;
+    return hebrew_epoch + cur + correction;
+}
+
+/// Month lengths counted from Tishri. Heshvan and Kislev are the two variable
+/// months: the year's total length (…3 deficient, …4 regular, …5 complete)
+/// decides them, which is how the calendar absorbs the postponement rules.
+fn hebrewDaysInMonth(year: i32, month: u8) u8 {
+    const leap = hebrewIsLeap(year);
+    const year_len = @mod(daysInYear(.hebrew, year), 10);
+    return switch (month) {
+        1 => 30, // Tishri
+        2 => if (year_len == 5) 30 else 29, // Heshvan, long in a complete year
+        3 => if (year_len == 3) 29 else 30, // Kislev, short in a deficient year
+        4 => 29, // Tevet
+        5 => 30, // Shevat
+        // In a leap year month 6 is Adar I (30 days) and month 7 Adar II (29);
+        // in a common year month 6 is the sole Adar.
+        6 => if (leap) 30 else 29,
+        // From here the leap year runs one ordinal behind the common year, so
+        // the alternating 30/29 pattern flips parity.
+        else => if (leap)
+            (if (month % 2 == 1) 29 else 30)
+        else
+            (if (month % 2 == 1) 30 else 29),
+    };
+}
+
+/// Hebrew month codes are year-dependent: the leap month Adar I sits at ordinal
+/// 6 and carries the code "M05L", pushing Adar..Elul one ordinal later.
+fn hebrewCodeFromMonth(year: i32, month: u8) shared.MonthCode {
+    if (!hebrewIsLeap(year)) return .{ .num = month };
+    if (month <= 5) return .{ .num = month };
+    if (month == 6) return .{ .num = 5, .leap = true };
+    return .{ .num = month - 1 };
+}
+
+fn hebrewMonthFromCode(year: i32, code_num: u8, code_leap: bool) ?u8 {
+    const leap = hebrewIsLeap(year);
+    if (code_leap) {
+        // Adar I exists only in a leap year.
+        if (!leap or code_num != 5) return null;
+        return 6;
+    }
+    if (code_num < 1 or code_num > 12) return null;
+    if (!leap) return code_num;
+    return if (code_num <= 5) code_num else code_num + 1;
+}
+
 pub fn monthsInYear(cal: CalendarId, cal_year: i32) u8 {
-    _ = cal_year;
     return switch (cal) {
         .coptic, .ethiopic, .ethioaa => 13,
+        // A Hebrew leap year interpolates Adar I, giving 13 months.
+        .hebrew => if (hebrewIsLeap(cal_year)) 13 else 12,
         else => 12,
     };
 }
@@ -191,6 +271,7 @@ pub fn inLeapYear(cal: CalendarId, cal_year: i32) bool {
         .islamic_civil, .islamic_tbla => @mod(14 + 11 * @as(i64, cal_year), 30) < 11,
         // Both are simply "the year is 366 days long".
         .persian, .indian => daysInYear(cal, cal_year) == 366,
+        .hebrew => hebrewIsLeap(cal_year),
         else => unreachable,
     };
 }
@@ -212,6 +293,7 @@ pub fn daysInMonth(cal: CalendarId, cal_year: i32, month: u8) u8 {
         .indian => if (month == 1)
             (if (shared.isLeapYear(cal_year + 78)) 31 else 30)
         else if (month <= 6) 31 else 30,
+        .hebrew => hebrewDaysInMonth(cal_year, month),
         else => unreachable,
     };
 }
@@ -255,6 +337,8 @@ fn estimateYear(cal: CalendarId, days: i64) i32 {
         .islamic_tbla => @intCast(@divFloor((days - islamic_tbla_epoch) * 30, 10631) + 1),
         .persian => @intCast(@divFloor((days - persian_epoch) * 1000, 365242) + 1),
         .indian => shared.epochDaysToISODate(days).year - 78,
+        // Mean Hebrew year is ~365.2468 days.
+        .hebrew => @intCast(@divFloor((days - hebrew_epoch) * 10000, 3652468) + 1),
         else => unreachable,
     };
 }
@@ -317,7 +401,14 @@ pub fn fields(cal: CalendarId, d: ISODate) CalFields {
             out.era = "shaka";
             out.era_year = y;
         },
+        .hebrew => {
+            out.era = "am";
+            out.era_year = y;
+        },
     }
+    const code = codeFromMonth(cal, ymd.year, ymd.month);
+    out.code_num = code.num;
+    out.code_leap = code.leap;
     return out;
 }
 
@@ -367,6 +458,7 @@ pub fn yearFromEra(cal: CalendarId, era: []const u8, era_year: i32) ?i32 {
         else if (eq(u8, era, "bh")) 1 - era_year else null,
         .persian => if (eq(u8, era, "ap")) era_year else null,
         .indian => if (eq(u8, era, "shaka")) era_year else null,
+        .hebrew => if (eq(u8, era, "am")) era_year else null,
     };
 }
 
@@ -379,16 +471,39 @@ pub fn hasEras(cal: CalendarId) bool {
 
 /// Whether `cal` can have leap months (i.e. month codes with an "L" suffix).
 pub fn hasLeapMonths(cal: CalendarId) bool {
-    _ = cal;
-    return false;
+    return cal == .hebrew;
 }
 
 /// Map a month code onto its ordinal position in `cal_year`, or null when the
 /// year has no such month.
 pub fn monthFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bool) ?u8 {
+    if (cal == .hebrew) return hebrewMonthFromCode(cal_year, code_num, code_leap);
     if (code_leap) return null;
     if (code_num < 1 or code_num > monthsInYear(cal, cal_year)) return null;
     return code_num;
+}
+
+/// Whether `cal` ever has this month code, in any year. A code that is merely
+/// absent from one year (Hebrew's M05L in a common year) is still valid and gets
+/// constrained; a code the calendar never uses at all is a RangeError whatever
+/// the overflow option says.
+pub fn isValidCode(cal: CalendarId, code_num: u8, code_leap: bool) bool {
+    if (code_leap) {
+        // Hebrew's sole leap month is Adar I, which follows M05.
+        return cal == .hebrew and code_num == 5;
+    }
+    return switch (cal) {
+        // The epagomenal 13th month is an ordinary M13.
+        .coptic, .ethiopic, .ethioaa => code_num >= 1 and code_num <= 13,
+        else => code_num >= 1 and code_num <= 12,
+    };
+}
+
+/// The month code of an ordinal month position — the inverse of
+/// `monthFromCode`. Only lunisolar calendars make this year-dependent.
+fn codeFromMonth(cal: CalendarId, cal_year: i32, month: u8) shared.MonthCode {
+    if (cal == .hebrew) return hebrewCodeFromMonth(cal_year, month);
+    return .{ .num = month };
 }
 
 /// The ISO year holding `cal_year`'s first month. Only meaningful for the
@@ -437,12 +552,26 @@ pub const Error = error{OutOfRange};
 pub fn addMonths(cal: CalendarId, cal_year: i32, month: u8, delta: i128) Error!struct { year: i32, month: u8 } {
     var y: i128 = cal_year;
     var m: i128 = @as(i128, month) + delta;
-    // Every implemented calendar has a fixed month count, so the carry is exact
-    // division rather than a walk.
-    const per_year = monthsInYear(cal, cal_year);
-    if (m < 1 or m > per_year) {
-        y += @divFloor(m - 1, per_year);
-        m = @mod(m - 1, per_year) + 1;
+    if (hasLeapMonths(cal)) {
+        // A lunisolar year's month count varies, so the carry has to walk a
+        // year at a time. Bounded by the range gate below.
+        while (m < 1) {
+            y -= 1;
+            if (y < -300_000) return error.OutOfRange;
+            m += monthsInYear(cal, @intCast(y));
+        }
+        while (m > monthsInYear(cal, @intCast(y))) {
+            m -= monthsInYear(cal, @intCast(y));
+            y += 1;
+            if (y > 300_000) return error.OutOfRange;
+        }
+    } else {
+        // A fixed month count makes the carry exact division.
+        const per_year = monthsInYear(cal, cal_year);
+        if (m < 1 or m > per_year) {
+            y += @divFloor(m - 1, per_year);
+            m = @mod(m - 1, per_year) + 1;
+        }
     }
     if (y > 300_000 or y < -300_000) return error.OutOfRange;
     return .{ .year = @intCast(y), .month = @intCast(m) };
@@ -485,6 +614,9 @@ pub fn toIso(cal: CalendarId, cal_year: i32, month: i32, day: i32, overflow: sha
 /// year does not have (e.g. a leap month in a common year) is constrained to the
 /// nearest ordinary month, or rejected.
 pub fn toIsoFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bool, day: i32, overflow: shared.Overflow) Error!ISODate {
+    // A code the calendar never uses is always an error; overflow only governs
+    // codes that exist but are absent from this particular year.
+    if (!isValidCode(cal, code_num, code_leap)) return error.OutOfRange;
     const m = monthFromCode(cal, cal_year, code_num, code_leap) orelse {
         if (overflow == .reject) return error.OutOfRange;
         // Constrain: drop the leap flag and clamp into the year.
@@ -588,6 +720,7 @@ test "year 0 of each calendar starts in the documented ISO year" {
         .{ .cal = .islamic_civil, .iso = 621 },
         .{ .cal = .islamic_tbla, .iso = 621 },
         .{ .cal = .japanese, .iso = 0 },
+        .{ .cal = .hebrew, .iso = -3761 },
         .{ .cal = .persian, .iso = 621 },
         .{ .cal = .roc, .iso = 1911 },
     };
@@ -601,7 +734,7 @@ test "epoch-day conversion round-trips across every calendar" {
     const cals = [_]CalendarId{
         .iso8601,       .gregory,        .buddhist, .roc,     .japanese,
         .coptic,        .ethiopic,       .ethioaa,  .persian, .indian,
-        .islamic_civil, .islamic_tbla,
+        .islamic_civil, .islamic_tbla,   .hebrew,
     };
     // A spread of dates either side of the Unix epoch.
     const days = [_]i64{ -700_000, -100_000, -36_524, -1, 0, 1, 18_993, 100_000, 400_000 };
@@ -609,7 +742,7 @@ test "epoch-day conversion round-trips across every calendar" {
         for (days) |dd| {
             const iso = shared.epochDaysToISODate(dd);
             const f = fields(cal, iso);
-            const back = try toIso(cal, f.year, f.month, f.day, .reject);
+            const back = try toIsoFromCode(cal, f.year, f.code_num, f.code_leap, f.day, .reject);
             try std.testing.expectEqual(iso.year, back.year);
             try std.testing.expectEqual(iso.month, back.month);
             try std.testing.expectEqual(iso.day, back.day);
@@ -619,7 +752,7 @@ test "epoch-day conversion round-trips across every calendar" {
 
 test "year length equals the sum of its month lengths" {
     const cals = [_]CalendarId{
-        .coptic, .ethiopic, .ethioaa, .persian, .indian, .islamic_civil, .islamic_tbla,
+        .coptic, .ethiopic, .ethioaa, .persian, .indian, .islamic_civil, .islamic_tbla, .hebrew,
     };
     for (cals) |cal| {
         var year: i32 = 1300;

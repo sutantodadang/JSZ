@@ -232,11 +232,14 @@ pub fn addISODate(date: ISODate, years: f64, months: f64, weeks: f64, days: f64,
     } else {
         if (day > dim) day = dim;
     }
+    // `anchor` is the ISO date of day 1 of the target *calendar* month, which is
+    // not generally the 1st of an ISO month — so the offset must be taken from
+    // the anchor's own ISO day, not a literal 1.
     const anchor = calendar.toIso(cal, ym.year, ym.month, 1, .constrain) catch
         return realm_mod.throwRangeError(arena, "date out of range");
 
     const extra: i128 = @as(i128, @intFromFloat(days)) + @as(i128, @intFromFloat(weeks)) * 7;
-    const target: i128 = @as(i128, shared.isoDateToEpochDays(anchor.year, anchor.month, 1)) + (day - 1) + extra;
+    const target: i128 = @as(i128, shared.isoDateToEpochDays(anchor.year, anchor.month, anchor.day)) + (day - 1) + extra;
     // Valid epoch-day window for the Temporal year range (~±1e8 days).
     if (target > 400_000_000 or target < -400_000_000) return realm_mod.throwRangeError(arena, "date out of range");
     var out = shared.epochDaysToISODate(@intCast(target));
