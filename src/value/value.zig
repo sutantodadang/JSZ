@@ -730,6 +730,16 @@ pub fn makeNativeFunctionLen(arena: std.mem.Allocator, fn_ptr: NativeFnPtr, leng
     return Value.fromPtr(v);
 }
 
+/// Wrap a native function with an explicit name AND explicit length, with NO
+/// name→length inference fallback (unlike `makeNativeFunctionNamed`, which
+/// infers when `length` is 0). Use when the correct arity is 0 but the name
+/// would otherwise infer a non-zero length (e.g. Temporal `toJSON`).
+pub fn makeNativeFunctionNamedLen(arena: std.mem.Allocator, fn_ptr: NativeFnPtr, name: []const u8, length: u8) !Value {
+    const v = try arena.create(JsValue);
+    v.* = .{ .native_function = .{ .call = fn_ptr, .name = name, .length = length } };
+    return Value.fromPtr(v);
+}
+
 /// Wrap a native fn pointer plus host userdata as a Value.
 pub fn makeNativeFunctionData(arena: std.mem.Allocator, fn_ptr: NativeFnPtr, data: ?*anyopaque) !Value {
     const v = try arena.create(JsValue);

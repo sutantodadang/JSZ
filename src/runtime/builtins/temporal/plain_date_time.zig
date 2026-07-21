@@ -122,6 +122,9 @@ pub fn toTemporalDateTime(arena: std.mem.Allocator, v: Value, overflow: shared.O
     if (getDateTime(v)) |dt| return dt.*;
     if (v.bits != 0 and v.unbox() == .object) {
         if (plain_date.getDate(v)) |d| return .{ .date = d.*, .time = .{} };
+        // A ZonedDateTime yields its wall-clock date+time.
+        const zdt = @import("zoned_date_time.zig");
+        if (zdt.getZoned(v)) |z| return zdt.localISODateTime(z);
         return try dtFromFields(arena, v.toPtr().object, overflow);
     }
     if (v.bits != 0 and v.unbox() == .string) {
@@ -493,6 +496,15 @@ pub fn nativeToPlainDate(arena: std.mem.Allocator, this_val: Value, _: []const V
     return plain_date.makeDate(arena, dt.date);
 }
 
+pub fn nativeWithCalendar(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const dt = try requireDT(arena, this_val);
+    // ToTemporalCalendarIdentifier: only the ISO 8601 calendar is supported.
+    const cal = if (args.len > 0) args[0] else Value{};
+    if (cal.bits == 0 or cal.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "withCalendar requires a calendar");
+    try shared.validateCalendarArg(arena, cal);
+    return makeDateTime(arena, dt.*);
+}
+
 pub fn nativeToZonedDateTime(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
     const timezone = @import("timezone.zig");
@@ -617,6 +629,18 @@ fn getWeekOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     const dt = try requireDT(arena, this_val);
     return val_mod.makeNumber(arena, @floatFromInt(shared.weekOfYear(dt.date)));
 }
+fn getYearOfWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const dt = try requireDT(arena, this_val);
+    return val_mod.makeNumber(arena, @floatFromInt(shared.yearOfWeek(dt.date)));
+}
+fn getEra(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    _ = try requireDT(arena, this_val);
+    return Value{};
+}
+fn getEraYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    _ = try requireDT(arena, this_val);
+    return Value{};
+}
 fn getDaysInWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     _ = try requireDT(arena, this_val);
     return val_mod.makeNumber(arena, 7);
@@ -649,9 +673,9 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const proto = try JsObject.create(arena, ctx.object_proto);
     proto_obj = proto;
 
-    try intrinsics.setMethod(arena, proto, "with", nativeWith);
+    try intrinsics.setMethodLen(arena, proto, "with", nativeWith, 1);
     try intrinsics.setMethod(arena, proto, "withPlainTime", nativeWithPlainTime);
-    try intrinsics.setMethod(arena, proto, "add", nativeAdd);
+    try intrinsics.setMethodLen(arena, proto, "add", nativeAdd, 1);
     try intrinsics.setMethod(arena, proto, "subtract", nativeSubtract);
     try intrinsics.setMethod(arena, proto, "until", nativeUntil);
     try intrinsics.setMethod(arena, proto, "since", nativeSince);
@@ -659,9 +683,10 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.setMethod(arena, proto, "equals", nativeEquals);
     try intrinsics.setMethod(arena, proto, "toPlainDate", nativeToPlainDate);
     try intrinsics.setMethod(arena, proto, "toPlainTime", nativeToPlainTime);
+    try intrinsics.setMethod(arena, proto, "withCalendar", nativeWithCalendar);
     try intrinsics.setMethod(arena, proto, "toZonedDateTime", nativeToZonedDateTime);
     try intrinsics.setMethod(arena, proto, "toString", nativeToString);
-    try intrinsics.setMethod(arena, proto, "toJSON", nativeToJSON);
+    try intrinsics.setMethodLen(arena, proto, "toJSON", nativeToJSON, 0);
     try intrinsics.setMethod(arena, proto, "toLocaleString", nativeToLocaleString);
     try intrinsics.setMethod(arena, proto, "valueOf", nativeValueOf);
 
@@ -678,6 +703,9 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.defineGetter(arena, proto, "dayOfWeek", getDayOfWeek);
     try intrinsics.defineGetter(arena, proto, "dayOfYear", getDayOfYear);
     try intrinsics.defineGetter(arena, proto, "weekOfYear", getWeekOfYear);
+    try intrinsics.defineGetter(arena, proto, "yearOfWeek", getYearOfWeek);
+    try intrinsics.defineGetter(arena, proto, "era", getEra);
+    try intrinsics.defineGetter(arena, proto, "eraYear", getEraYear);
     try intrinsics.defineGetter(arena, proto, "daysInWeek", getDaysInWeek);
     try intrinsics.defineGetter(arena, proto, "daysInMonth", getDaysInMonth);
     try intrinsics.defineGetter(arena, proto, "daysInYear", getDaysInYear);
