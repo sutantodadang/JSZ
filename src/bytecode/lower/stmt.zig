@@ -642,8 +642,17 @@ pub fn lowerContinueStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
                 }
             }
         }
-    } else if (self.loop_stack.items.len > 0) {
-        target_idx = self.loop_stack.items.len - 1;
+    } else {
+        // Innermost enclosing *loop*: a switch pushes a break-only context, so
+        // `continue` inside a switch must jump past it to the real loop.
+        var li = self.loop_stack.items.len;
+        while (li > 0) {
+            li -= 1;
+            if (!self.loop_stack.items[li].is_switch) {
+                target_idx = li;
+                break;
+            }
+        }
     }
     // Completion value: `continue` yields an empty completion, so the
     // loop's value reverts to its value at this iteration's start.
@@ -984,8 +993,19 @@ pub fn lowerSwitchStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
         try self.emitI16(0);
     }
 
+    // A switch is a `break` target, so push a context that lowerBreakStmt can
+    // find. This must cover the WHOLE case body, not just a `break` written as
+    // a direct statement of the case: a `break` nested in an if/block/try is
+    // lowered by lowerBreakStmt, which without this entry would target the
+    // innermost enclosing loop (or emit a dangling jump when there is none).
+    try self.loop_stack.append(self.arena, LoopCtx{
+        .label = null,
+        .scope_depth = self.block_scope_depth,
+        .finally_depth = self.finally_stack.items.len,
+        .is_switch = true,
+    });
+
     // Emit case bodies. Patch the jump-to-body addresses.
-    var break_patches = std.ArrayListUnmanaged(usize).empty;
     for (sw.cases, 0..) |case, ci| {
         const body_start = self.currentOffset();
         if (case.test_ != null) {
@@ -998,13 +1018,7 @@ pub fn lowerSwitchStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
             }
         }
         for (case.body) |stmt| {
-            if (stmt.kind == .break_stmt) {
-                try self.emitOp(.JMP, line);
-                try break_patches.append(self.arena, self.currentOffset());
-                try self.emitI16(0);
-            } else {
-                try self.compileStmt(stmt, last_expr_reg);
-            }
+            try self.compileStmt(stmt, last_expr_reg);
         }
     }
 
@@ -1015,10 +1029,11 @@ pub fn lowerSwitchStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
         self.patchJump(pd, end_offset);
     }
 
-    // Patch all break jumps.
-    for (break_patches.items) |bp| {
-        self.patchJump(bp, end_offset);
-    }
+    // Patch every break that targeted this switch.
+    var ctx = self.loop_stack.pop().?;
+    for (ctx.break_patches.items) |bp| self.patchJump(bp, end_offset);
+    ctx.break_patches.deinit(self.arena);
+    ctx.continue_patches.deinit(self.arena);
 }
 
 pub fn lowerLabeledStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
