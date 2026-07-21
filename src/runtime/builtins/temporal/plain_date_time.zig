@@ -569,7 +569,7 @@ fn dtToString(arena: std.mem.Allocator, dt: ISODateTime, digits: ?u8, show: shar
     try buf.append(arena, ':');
     try shared.appendPadded(arena, &buf, dt.time.second, 2);
     try shared.appendFraction(arena, &buf, dt.time, digits);
-    try plain_date.appendCalendar(arena, &buf, show);
+    try plain_date.appendCalendar(arena, &buf, show, dt.date.calendar);
     return buf.items;
 }
 

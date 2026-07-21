@@ -35,6 +35,7 @@ pub const ZonedDT = struct {
     ns: i128,
     tz: []const u8,
     offset_ns: i128,
+    calendar: shared.calendar_mod.CalendarId = .iso8601,
 };
 
 pub fn getZoned(v: Value) ?*ZonedDT {
@@ -951,13 +952,13 @@ pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const V
         };
         if (sm == .minute) smallest = .minute;
     }
-    const s = try zonedToString(arena, z_ns, z.offset_ns, z.tz, frac_digits, show_cal, show_off, show_tz, smallest);
+    const s = try zonedToString(arena, z_ns, z.offset_ns, z.tz, z.calendar, frac_digits, show_cal, show_off, show_tz, smallest);
     return val_mod.makeString(arena, s);
 }
 
 pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const s = try zonedToString(arena, z.ns, z.offset_ns, z.tz, null, .auto, .auto, .auto, null);
+    const s = try zonedToString(arena, z.ns, z.offset_ns, z.tz, z.calendar, null, .auto, .auto, .auto, null);
     return val_mod.makeString(arena, s);
 }
 
@@ -987,7 +988,7 @@ fn getShowTimeZoneName(arena: std.mem.Allocator, opts: ?*JsObject) !ShowTZ {
     return realm_mod.throwRangeError(arena, "invalid timeZoneName option");
 }
 
-fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []const u8, digits: ?u8, show_cal: shared.ShowCalendar, show_off: ShowOffset, show_tz: ShowTZ, smallest: ?shared.Unit) ![]const u8 {
+fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []const u8, cal: shared.calendar_mod.CalendarId, digits: ?u8, show_cal: shared.ShowCalendar, show_off: ShowOffset, show_tz: ShowTZ, smallest: ?shared.Unit) ![]const u8 {
     const total = ns + offset_ns;
     const days: i64 = @intCast(@divFloor(total, shared.NS_PER_DAY));
     const tod = total - @as(i128, days) * shared.NS_PER_DAY;
@@ -1017,7 +1018,7 @@ fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []cons
         try buf.appendSlice(arena, tz);
         try buf.append(arena, ']');
     }
-    try plain_date.appendCalendar(arena, &buf, show_cal);
+    try plain_date.appendCalendar(arena, &buf, show_cal, cal);
     return buf.items;
 }
 
