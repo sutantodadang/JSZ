@@ -18,7 +18,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !*JsObject {
     try promise_proto.set("catch", try val_mod.makeNativeFunctionNamed(arena, nativePromiseCatch, "catch", 0));
 
     const promise_ctor_obj = try JsObject.create(arena, null);
-    try promise_ctor_obj.set("prototype", try val_mod.makeObject(arena, promise_proto));
+    try promise_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, promise_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try promise_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativePromiseCtor));
     try promise_ctor_obj.set("resolve", try val_mod.makeNativeFunctionNamed(arena, nativePromiseResolve, "resolve", 0));
     try promise_ctor_obj.set("reject", try val_mod.makeNativeFunctionNamed(arena, nativePromiseReject, "reject", 0));

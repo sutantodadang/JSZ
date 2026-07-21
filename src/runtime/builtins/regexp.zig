@@ -44,7 +44,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
     const regexp_ctor_obj = try JsObject.create(arena, null);
     const regexp_proto_val = try val_mod.makeObject(arena, regexp_proto);
-    try regexp_ctor_obj.set("prototype", regexp_proto_val);
+    try regexp_ctor_obj.defineOwnDataForced("prototype", regexp_proto_val, .{ .writable = false, .enumerable = false, .configurable = false });
     const regexp_call_fn = try val_mod.makeNativeFunction(arena, nativeRegExpCtor);
     try regexp_ctor_obj.set("__call__", regexp_call_fn);
     _ = try regexp_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "RegExp"), .{ .writable = false, .enumerable = false, .configurable = true });
@@ -81,6 +81,11 @@ fn isSyntaxChar(c: u21) bool {
         '^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|' => true,
         else => false,
     };
+}
+
+/// ControlLetter (§22.2.1): the ASCII letters accepted after `\c`.
+fn isAsciiAlpha(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
 }
 
 /// otherPunctuators (§EncodeForRegExpEscape): , - = < > # & ! % : ; @ ~ ' ` "
@@ -541,6 +546,8 @@ pub const CompiledRegex = struct {
         /// ES2024 `v` (unicodeSets): extended character classes plus set
         /// operations. Implies full code-point matching semantics like `u`.
         unicode_sets: bool = false,
+        /// ES2022 `d` (hasIndices): exec results carry an `indices` array.
+        has_indices: bool = false,
 
         /// Whether the matcher should advance by whole code points (true under
         /// either `u` or `v`) rather than by single bytes.
@@ -648,6 +655,7 @@ const PatternParser = struct {
     unicode: bool, // codepoint mode (`/u` or `/v`)
     unicode_sets: bool = false, // `/v` flag: enables ClassSetExpression grammar
     group_names: []const NameIdx = &.{}, // pre-scanned names, for `\k<name>` resolution
+    total_caps: u32 = 0, // pre-scanned capture-group count, for `\N` validation
 
     fn init(src: []const u8, alloc: std.mem.Allocator, unicode: bool) PatternParser {
         return .{ .src = src, .pos = 0, .alloc = alloc, .next_cap = 1, .unicode = unicode };
@@ -715,6 +723,19 @@ const PatternParser = struct {
             // Check for quantifier
             const quant = try self.parseQuantifier();
             if (quant) |q| {
+                // Only an Atom is quantifiable. Assertions are not, with the one
+                // Annex B exception of `(?=...)`/`(?!...)` outside unicode mode
+                // (QuantifiableAssertion); lookbehind is never quantifiable.
+                switch (atom) {
+                    .look_ahead => if (self.unicode) return ParseError.InvalidPattern,
+                    .look_behind,
+                    .anchor_start,
+                    .anchor_end,
+                    .word_boundary,
+                    .non_word_boundary,
+                    => return ParseError.InvalidPattern,
+                    else => {},
+                }
                 const inner = try self.alloc.create(RegexNode);
                 inner.* = atom;
                 try items.append(self.alloc, RegexNode{ .quant = .{
@@ -969,6 +990,26 @@ const PatternParser = struct {
                 self.advance();
                 return try self.parseEscape();
             },
+            // A quantifier here has no Atom to repeat (`*a`, `a**`, `(+)`).
+            '*', '+', '?' => return ParseError.InvalidPattern,
+            '{' => {
+                // `{` is a SyntaxCharacter: under /u it must be escaped. Annex B
+                // lets it stand for itself, but only when it cannot begin a
+                // quantifier -- `{1}` here would be a quantifier with no Atom.
+                if (self.unicode) return ParseError.InvalidPattern;
+                const saved = self.pos;
+                const q = self.parseQuantifier() catch return ParseError.InvalidPattern;
+                if (q != null) return ParseError.InvalidPattern;
+                self.pos = saved;
+                self.advance();
+                return RegexNode{ .literal = '{' };
+            },
+            '}', ']' => {
+                // Likewise reserved under /u; a bare literal under Annex B.
+                if (self.unicode) return ParseError.InvalidPattern;
+                self.advance();
+                return RegexNode{ .literal = @as(u21, c) };
+            },
             else => {
                 // Under /u, multi-byte UTF-8 sequences are decoded to a single codepoint literal.
                 const cp = self.readCp();
@@ -998,6 +1039,21 @@ const PatternParser = struct {
                 if (self.eof()) return ParseError.InvalidPattern;
                 const esc = self.cur();
                 self.advance();
+                // A CharacterClassEscape stands for a whole set, so it can never
+                // be an endpoint of a range: `[\d-a]` / `[a-\d]` are early errors
+                // under /u (Annex B tolerates them as three separate atoms).
+                const is_set_escape = switch (esc) {
+                    'd', 'D', 'w', 'W', 's', 'S', 'p', 'P' => true,
+                    else => false,
+                };
+                if (self.unicode and is_set_escape and !self.eof() and self.cur() == '-' and
+                    self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']')
+                {
+                    // `\p{..}`/`\P{..}` have not consumed their braces yet, so only
+                    // the single-letter escapes can be checked here; the property
+                    // forms are re-checked after their name is read.
+                    if (esc != 'p' and esc != 'P') return ParseError.InvalidPattern;
+                }
                 switch (esc) {
                     'd' => cc.addPredefined('d', false),
                     'D' => {
@@ -1037,13 +1093,40 @@ const PatternParser = struct {
                     'r' => cc.addChar('\r'),
                     'v' => cc.addChar(0x0B),
                     'f' => cc.addChar(0x0C),
-                    '0' => cc.addChar(0),
+                    // Inside a class `\b` is BACKSPACE, not a word boundary.
+                    'b' => cc.addChar(0x08),
+                    '0' => {
+                        if (self.unicode and !self.eof() and self.cur() >= '0' and self.cur() <= '9') {
+                            return ParseError.InvalidPattern; // legacy octal
+                        }
+                        cc.addChar(0);
+                    },
+                    'c' => {
+                        if (!self.eof() and isAsciiAlpha(self.cur())) {
+                            cc.addChar(self.cur() & 0x1F);
+                            self.advance();
+                        } else if (self.unicode) {
+                            return ParseError.InvalidPattern;
+                        } else {
+                            // Annex B ClassAtom :: `\` -- the backslash itself,
+                            // with the `c` left to be read as an ordinary member.
+                            cc.addChar('\\');
+                            self.pos -= 1;
+                        }
+                    },
                     'x' => {
-                        if (self.pos + 1 >= self.src.len) return ParseError.InvalidPattern;
-                        const h1 = hexVal(self.src[self.pos]) orelse return ParseError.InvalidPattern;
-                        const h2 = hexVal(self.src[self.pos + 1]) orelse return ParseError.InvalidPattern;
-                        self.pos += 2;
-                        cc.addChar(@intCast(h1 * 16 + h2));
+                        if (self.pos + 1 >= self.src.len or
+                            hexVal(self.src[self.pos]) == null or
+                            hexVal(self.src[self.pos + 1]) == null)
+                        {
+                            if (self.unicode) return ParseError.InvalidPattern;
+                            cc.addChar('x');
+                        } else {
+                            const h1 = hexVal(self.src[self.pos]).?;
+                            const h2 = hexVal(self.src[self.pos + 1]).?;
+                            self.pos += 2;
+                            cc.addChar(@intCast(@as(u16, h1) * 16 + h2));
+                        }
                     },
                     'u' => {
                         const cp = try self.parseUEscape();
@@ -1065,9 +1148,23 @@ const PatternParser = struct {
                             // per-property negation flag handles this correctly when
                             // OR-combined with the rest of the class.
                             cc.addPropTable(self.alloc, table, esc == 'P') catch return ParseError.OutOfMemory;
+                            // Now that `{Name}` is consumed, apply the same
+                            // "set escape cannot be a range endpoint" rule.
+                            if (!self.eof() and self.cur() == '-' and
+                                self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']')
+                            {
+                                return ParseError.InvalidPattern;
+                            }
                         }
                     },
-                    else => cc.addChar(esc),
+                    else => {
+                        // ClassEscape :: IdentityEscape. Under /u only
+                        // SyntaxCharacter, `/` and `-` may be escaped this way.
+                        if (self.unicode and !isSyntaxChar(esc) and esc != '/' and esc != '-') {
+                            return ParseError.InvalidPattern;
+                        }
+                        cc.addChar(esc);
+                    },
                 }
             } else if (self.unicode and ch >= 0x80) {
                 // Non-ASCII codepoint start in unicode mode -- decode the full codepoint.
@@ -1106,6 +1203,11 @@ const PatternParser = struct {
                         if (self.eof()) return ParseError.InvalidPattern;
                         const e = self.cur();
                         self.advance();
+                        // `[a-\d]`: a CharacterClassEscape cannot end a range.
+                        if (self.unicode) switch (e) {
+                            'd', 'D', 'w', 'W', 's', 'S', 'p', 'P' => return ParseError.InvalidPattern,
+                            else => {},
+                        };
                         break :blk switch (e) {
                             'n' => '\n',
                             't' => '\t',
@@ -1180,6 +1282,11 @@ const PatternParser = struct {
         // Backreferences \1..\9
         if (c >= '1' and c <= '9') {
             const idx: u8 = c - '0';
+            // Under /u a DecimalEscape is always a backreference, so naming a
+            // group that does not exist is an early error. Without /u the same
+            // spelling falls back to a legacy octal escape (Annex B), which the
+            // matcher approximates as a never-matching backreference.
+            if (self.unicode and idx > self.total_caps) return ParseError.InvalidPattern;
             return RegexNode{ .back_ref = idx };
         }
         // Named backreference \k<name> (only meaningful when the pattern has
@@ -1248,19 +1355,51 @@ const PatternParser = struct {
             'r' => RegexNode{ .literal = '\r' },
             'v' => RegexNode{ .literal = 0x0B },
             'f' => RegexNode{ .literal = 0x0C },
-            '0' => RegexNode{ .literal = 0 },
+            '0' => {
+                // `\0` is NUL; `\0` followed by a digit is a legacy octal escape,
+                // which /u forbids outright.
+                if (self.unicode and !self.eof() and self.cur() >= '0' and self.cur() <= '9') {
+                    return ParseError.InvalidPattern;
+                }
+                return RegexNode{ .literal = 0 };
+            },
+            'c' => {
+                // \cX -- the control character for ControlLetter X. Under /u a
+                // missing/invalid ControlLetter is an early error; Annex B instead
+                // rereads the whole thing as a literal `\` followed by `c`.
+                if (!self.eof() and isAsciiAlpha(self.cur())) {
+                    const letter = self.cur();
+                    self.advance();
+                    return RegexNode{ .literal = @as(u21, letter & 0x1F) };
+                }
+                if (self.unicode) return ParseError.InvalidPattern;
+                self.pos -= 1; // re-emit the 'c' as an ordinary literal next round
+                return RegexNode{ .literal = '\\' };
+            },
             'x' => {
-                if (self.pos + 2 > self.src.len) return RegexNode{ .literal = 'x' };
-                const h1 = hexVal(self.src[self.pos]) orelse return RegexNode{ .literal = 'x' };
-                const h2 = hexVal(self.src[self.pos + 1]) orelse return RegexNode{ .literal = 'x' };
+                if (self.pos + 2 > self.src.len or
+                    hexVal(self.src[self.pos]) == null or
+                    hexVal(self.src[self.pos + 1]) == null)
+                {
+                    // Incomplete \xHH: an identity escape under Annex B only.
+                    if (self.unicode) return ParseError.InvalidPattern;
+                    return RegexNode{ .literal = 'x' };
+                }
+                const h1 = hexVal(self.src[self.pos]).?;
+                const h2 = hexVal(self.src[self.pos + 1]).?;
                 self.pos += 2;
-                return RegexNode{ .literal = @intCast(h1 * 16 + h2) };
+                return RegexNode{ .literal = @intCast(@as(u16, h1) * 16 + h2) };
             },
             'u' => {
                 const cp = try self.parseUEscape();
                 return RegexNode{ .literal = cp };
             },
-            else => RegexNode{ .literal = @as(u21, c) },
+            else => {
+                // IdentityEscape: /u admits only SyntaxCharacter and `/`; Annex B
+                // admits (almost) anything.
+                if (self.unicode and !isSyntaxChar(c) and c != '/') return ParseError.InvalidPattern;
+                return RegexNode{ .literal = @as(u21, c) };
+            },
         };
     }
 
@@ -1733,6 +1872,7 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
             'y' => flags.sticky = true,
             'u' => flags.unicode = true,
             'v' => flags.unicode_sets = true,
+            'd' => flags.has_indices = true,
             else => return error.InvalidPattern,
         }
     }
@@ -1741,17 +1881,24 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
 
     // Pre-scan named groups so `\k<name>` (which may forward-reference a group
     // defined later) resolves to a capture index during parsing.
-    const names = try scanGroupNames(alloc, pattern);
+    var total_caps: u32 = 0;
+    const names = try scanGroupNames(alloc, pattern, &total_caps);
     // `v` mode implies full code-point semantics like `u`, so the parser runs in
     // codepoint mode; `unicode_sets` separately gates the ClassSetExpression grammar.
     var pp = PatternParser.init(pattern, alloc, flags.unicode or flags.unicode_sets);
     pp.unicode_sets = flags.unicode_sets;
     pp.group_names = names;
+    pp.total_caps = total_caps;
     const root = try pp.parseAlt();
     if (!pp.eof()) return error.InvalidPattern; // unconsumed chars
 
     const br = hasBackref(&root);
-    const prog = if (!br and !hasModifier(&root)) buildProgram(alloc, &root, pp.next_cap - 1) else null;
+    // The Pike VM's `look` instruction keeps a pointer to its assertion node, so
+    // the root must outlive this frame: a pattern that IS an assertion (`/(?=a)/`)
+    // would otherwise bake in a pointer to this function's stack slot.
+    const root_ptr = try alloc.create(RegexNode);
+    root_ptr.* = root;
+    const prog = if (!br and !hasModifier(&root)) buildProgram(alloc, root_ptr, pp.next_cap - 1) else null;
 
     return CompiledRegex{
         .root = root,
@@ -1773,7 +1920,7 @@ fn isGroupNameChar(c: u8) bool {
 /// Pre-scan a pattern for `(?<name>...)` groups, assigning each the 1-based
 /// capture index it will receive during parsing. Skips char classes, escapes,
 /// and non-capturing / assertion groups so indices match the parser exactly.
-fn scanGroupNames(alloc: std.mem.Allocator, src: []const u8) ![]const NameIdx {
+fn scanGroupNames(alloc: std.mem.Allocator, src: []const u8, total_caps: *u32) ![]const NameIdx {
     var names = std.ArrayList(NameIdx){};
     var cap: u32 = 0;
     var i: usize = 0;
@@ -1815,6 +1962,7 @@ fn scanGroupNames(alloc: std.mem.Allocator, src: []const u8) ![]const NameIdx {
         }
         i += 1;
     }
+    total_caps.* = cap;
     return names.items;
 }
 
@@ -2091,12 +2239,12 @@ fn matchNode(
         .look_ahead => |la| {
             const saved_caps = caps.*;
             const matched = matchNode(la.inner, input, pos, caps, flags) != null;
-            caps.* = saved_caps;
-            if (la.negative) {
-                return if (!matched) pos else null;
-            } else {
-                return if (matched) pos else null;
-            }
+            // §22.2.2.5: a *positive* assertion's captures survive into the rest
+            // of the pattern (`/(?=(a+))/.exec("baa")` reports "aa"); a negative
+            // one's are discarded, as are those of a failed positive one.
+            if (la.negative or !matched) caps.* = saved_caps;
+            if (la.negative) return if (!matched) pos else null;
+            return if (matched) pos else null;
         },
         .look_behind => |lb| {
             var matched_lb = false;
@@ -2107,6 +2255,8 @@ fn matchNode(
                 if (matchNode(lb.inner, input, j, &tmp_caps, flags)) |end| {
                     if (end == pos) {
                         matched_lb = true;
+                        // A positive lookbehind contributes its captures.
+                        if (!lb.negative) caps.* = tmp_caps;
                         break;
                     }
                 }
@@ -2537,8 +2687,22 @@ const PikeVM = struct {
                 self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
             .look => |lnode| {
                 var tmp = [_]CaptureSpan{INVALID_CAP} ** MAX_CAPTURES;
-                if (matchNode(lnode, input, sp, &tmp, flags) != null)
-                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                if (matchNode(lnode, input, sp, &tmp, flags) == null) return;
+                // matchNode already discarded a negative assertion's captures, so
+                // whatever `tmp` holds belongs in the thread's capture set. Merge
+                // into a local copy: `caps` is the caller's shared work buffer.
+                var merged: [2 * MAX_CAPTURES]isize = undefined;
+                @memcpy(merged[0..self.ns], caps[0..self.ns]);
+                var gi: usize = 1;
+                var touched = false;
+                while (gi < MAX_CAPTURES and 2 * gi + 1 < self.ns) : (gi += 1) {
+                    if (tmp[gi].start == 0 and tmp[gi].end == 0) continue;
+                    merged[2 * gi] = @intCast(tmp[gi].start);
+                    merged[2 * gi + 1] = @intCast(tmp[gi].end);
+                    touched = true;
+                }
+                const next_caps = if (touched) merged[0..self.ns] else caps;
+                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, next_caps, input, flags);
             },
             // Leaf: a consuming op or `match`. Snapshot caps into the list slot.
             .char, .class, .any_char, .match => {
@@ -2708,29 +2872,72 @@ fn setLastIndexThrow(arena: std.mem.Allocator, v: Value, idx: usize) !void {
     }
 }
 
-pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const pattern_str: []const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .string => |s| s,
-            .object => |obj| blk: {
-                if (obj.internal_kind == .regexp) {
-                    if (obj.get("[[OriginalSource]]")) |sv| {
-                        if (sv.bits != 0 and sv.unbox() == .string) break :blk sv.toPtr().string;
-                    }
-                }
-                break :blk "";
-            },
-            else => "",
+/// IsRegExp (§7.2.8): an own/inherited `Symbol.match` wins over the
+/// [[RegExpMatcher]] slot, so `re[Symbol.match] = false` makes `re` stop
+/// counting as a RegExp for the constructor's short-circuit.
+fn isRegExpValue(arena: std.mem.Allocator, v: Value) anyerror!bool {
+    if (v.bits == 0 or v.unbox() != .object) return false;
+    if (realm_mod.active_sym_match) |match_sym| {
+        if (realm_mod.active_context) |ctx| {
+            const mv = try ctx.getPropSym(arena, v, match_sym);
+            if (!(mv.bits == 0 or mv.unbox() == .undefined_)) return truthyValue(mv);
         }
-    else
-        "";
+    }
+    return getCompiledRegex(v) != null;
+}
 
-    const flags_str: []const u8 = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].unbox()) {
-            .string => |s| s,
-            .undefined_ => "",
-            else => "",
+fn truthyValue(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .undefined_, .null_ => false,
+        .boolean => |b| b,
+        .number => |n| n != 0 and !std.math.isNan(n),
+        .string => |s| s.len > 0,
+        else => true,
+    };
+}
+
+pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // A plain call and a `new` both arrive with a synthesized object `this`, so
+    // only this flag distinguishes them (see realm.active_constructing).
+    const is_construct = realm_mod.active_constructing;
+    realm_mod.active_constructing = false;
+    const pattern_arg = if (args.len > 0) args[0] else Value{};
+    const flags_arg = if (args.len > 1) args[1] else Value{};
+    const flags_undefined = flags_arg.bits == 0 or flags_arg.unbox() == .undefined_;
+
+    // Step 1-2: `RegExp(re)` (no `new`, no flags) with a RegExp whose
+    // .constructor is %RegExp% returns that very object (§22.2.4.1).
+    const pattern_cr: ?*CompiledRegex = if (pattern_arg.bits != 0 and pattern_arg.unbox() == .object)
+        getCompiledRegex(pattern_arg)
+    else
+        null;
+    if (!is_construct and flags_undefined and pattern_cr != null and try isRegExpValue(arena, pattern_arg)) {
+        const ctor_v = pattern_arg.toPtr().object.get("constructor");
+        if (ctor_v) |cv| {
+            if (cv.bits != 0 and cv.unbox() == .object and
+                active_regexp_ctor == cv.toPtr().object) return pattern_arg;
         }
+    }
+
+    // Step 3/5 + RegExpInitialize: P is the source of a RegExp argument, else
+    // ToString(pattern) (undefined → ""); F is ToString(flags) (undefined → the
+    // RegExp argument's own flags, else "").
+    const pattern_str: []const u8 = if (pattern_cr) |pcr| blk: {
+        if (pattern_arg.toPtr().object.get("[[OriginalSource]]")) |sv| {
+            if (sv.bits != 0 and sv.unbox() == .string) break :blk sv.toPtr().string;
+        }
+        _ = pcr;
+        break :blk "";
+    } else if (pattern_arg.bits == 0 or pattern_arg.unbox() == .undefined_)
+        ""
+    else
+        try realm_mod.stringPrimitive(arena, pattern_arg);
+
+    const flags_str: []const u8 = if (!flags_undefined)
+        try realm_mod.stringPrimitive(arena, flags_arg)
+    else if (pattern_cr) |pcr|
+        try flagsToString(arena, pcr.flags)
     else
         "";
 
@@ -2786,8 +2993,12 @@ fn throwRegExpSyntaxError(arena: std.mem.Allocator, pattern: []const u8, flags: 
 /// Reconstruct the canonical flag string (g,i,m,s,u,y order) from a compiled
 /// RegExp's flag set — used when `compile` copies flags from a RegExp pattern.
 fn flagsToString(arena: std.mem.Allocator, f: CompiledRegex.Flags) ![]const u8 {
-    var buf: [7]u8 = undefined;
+    var buf: [8]u8 = undefined;
     var n: usize = 0;
+    if (f.has_indices) {
+        buf[n] = 'd';
+        n += 1;
+    }
     if (f.global) {
         buf[n] = 'g';
         n += 1;
@@ -2955,6 +3166,52 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
         break :grp try val_mod.makeObject(arena, gobj);
     };
     try arr.set("groups", groups_val);
+
+    // ES2022 `d`: MakeMatchIndicesIndexPairArray — one [start, end] pair per
+    // capture (undefined when the group did not participate), plus a `groups`
+    // object mirroring the named captures.
+    if (cr.flags.has_indices) {
+        const ind = try JsObject.createArray(arena, arr_proto);
+        var k: u32 = 0;
+        while (k <= cr.num_captures and k < MAX_CAPTURES) : (k += 1) {
+            const span: CaptureSpan = if (k == 0)
+                .{ .start = result.start, .end = result.state.pos }
+            else
+                result.state.captures[k];
+            const key = try std.fmt.allocPrint(arena, "{d}", .{k});
+            if (k > 0 and span.start == 0 and span.end == 0) {
+                try ind.set(key, try val_mod.makeUndefined(arena));
+                continue;
+            }
+            const pair = try JsObject.createArray(arena, arr_proto);
+            try pair.set("0", try val_mod.makeNumber(arena, @floatFromInt(span.start)));
+            try pair.set("1", try val_mod.makeNumber(arena, @floatFromInt(span.end)));
+            pair.array_length = 2;
+            try ind.set(key, try val_mod.makeObject(arena, pair));
+        }
+        ind.array_length = cr.num_captures + 1;
+
+        const ind_groups: Value = if (cr.group_names.len == 0)
+            try val_mod.makeUndefined(arena)
+        else grp: {
+            const gobj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+            for (cr.group_names) |ni| {
+                if (gobj.getOwn(ni.name) == null) try gobj.set(ni.name, try val_mod.makeUndefined(arena));
+            }
+            for (cr.group_names) |ni| {
+                const cap = if (ni.idx < MAX_CAPTURES) result.state.captures[ni.idx] else INVALID_CAP;
+                if (cap.start == 0 and cap.end == 0) continue;
+                const pair = try JsObject.createArray(arena, arr_proto);
+                try pair.set("0", try val_mod.makeNumber(arena, @floatFromInt(cap.start)));
+                try pair.set("1", try val_mod.makeNumber(arena, @floatFromInt(cap.end)));
+                pair.array_length = 2;
+                try gobj.set(ni.name, try val_mod.makeObject(arena, pair));
+            }
+            break :grp try val_mod.makeObject(arena, gobj);
+        };
+        try ind.set("groups", ind_groups);
+        try arr.set("indices", try val_mod.makeObject(arena, ind));
+    }
 
     // Annex B: record the match context for the legacy RegExp static accessors.
     updateLegacyState(s, result.start, result.state.pos, &result.state.captures, cr.num_captures);
@@ -3699,8 +3956,8 @@ pub fn nativeRegExpGetUnicode(arena: std.mem.Allocator, this_val: Value, _: []co
 }
 
 pub fn nativeRegExpGetHasIndices(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    _ = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeUndefined(arena);
-    return val_mod.makeBool(arena, false); // `d` flag not tracked; always false
+    const cr = try regexpFlagBrand(arena, this_val) orelse return val_mod.makeUndefined(arena);
+    return val_mod.makeBool(arena, cr.flags.has_indices);
 }
 
 pub fn nativeRegExpGetUnicodeSets(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -3770,6 +4027,65 @@ test "regexp: invalid pattern throws" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.InvalidPattern, compileRegex(arena.allocator(), "[", ""));
+}
+
+test "regexp: pattern early errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // A quantifier needs an Atom, and an assertion is not one (except the
+    // Annex B `(?=)`/`(?!)` exception, checked below).
+    const rejected = [_][2][]const u8{
+        .{ "a**", "" },      .{ "+a", "" },       .{ "(*)", "" },
+        .{ "a{1}{1,}", "" }, .{ "{1}", "" },      .{ "^*", "" },
+        .{ "$*", "" },       .{ "(?<=a)*", "" },
+        // /u tightens the grammar: no Annex B literals or legacy escapes.
+        .{ "(?=.)*", "u" },  .{ "a{1", "u" },     .{ "}", "u" },
+        .{ "]", "u" },       .{ "\\1", "u" },     .{ "\\01", "u" },
+        .{ "\\x", "u" },     .{ "\\c", "u" },     .{ "\\A", "u" },
+        .{ "[\\d-a]", "u" }, .{ "[a-\\d]", "u" }, .{ "[\\c]", "u" },
+    };
+    for (rejected) |c| {
+        std.testing.expectError(error.InvalidPattern, compileRegex(alloc, c[0], c[1])) catch |e| {
+            std.debug.print("expected /{s}/{s} to be rejected\n", .{ c[0], c[1] });
+            return e;
+        };
+    }
+    const accepted = [_][2][]const u8{
+        .{ "a??", "" },      .{ "(?=a)*", "" },  .{ "{", "" },
+        .{ "]", "" },        .{ "a{", "" },      .{ "\\c", "" },
+        .{ "\\1", "" },      .{ "[\\d-a]", "" }, .{ "\\x", "" },
+        .{ "\\1(a)", "u" },  .{ "\\$", "u" },    .{ "[\\-]", "u" },
+        .{ "\\cA", "u" },    .{ "[\\b]", "u" },
+    };
+    for (accepted) |c| {
+        _ = compileRegex(alloc, c[0], c[1]) catch |e| {
+            std.debug.print("expected /{s}/{s} to compile\n", .{ c[0], c[1] });
+            return e;
+        };
+    }
+}
+
+test "regexp: a bare assertion is a valid whole pattern" {
+    // Regression: the Pike VM's `look` instruction used to hold a pointer to
+    // compileRegex's stack-local root, so a pattern that IS an assertion read
+    // freed memory.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cr = try compileRegex(arena.allocator(), "(?=a)", "");
+    const m = findMatch(&cr, "ba", 0) orelse return error.TestExpectedMatch;
+    try std.testing.expectEqual(@as(usize, 1), m.start);
+    try std.testing.expectEqual(@as(usize, 1), m.state.pos);
+}
+
+test "regexp: a positive assertion keeps its captures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cr = try compileRegex(arena.allocator(), "(?=(a+))", "");
+    const m = findMatch(&cr, "baaabac", 0) orelse return error.TestExpectedMatch;
+    try std.testing.expectEqual(@as(usize, 1), m.start);
+    try std.testing.expectEqual(@as(usize, 1), m.state.captures[1].start);
+    try std.testing.expectEqual(@as(usize, 4), m.state.captures[1].end);
 }
 
 // ------- Unicode tests -------

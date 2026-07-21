@@ -574,6 +574,9 @@ pub const JsObject = struct {
     /// (getOwnPropertyNames, hasOwnProperty, getOwnPropertyDescriptor, Reflect.*,
     /// Object.keys, for-in). They are also created non-enumerable (see `set`).
     pub fn isInternalSlotKey(key: []const u8) bool {
+        // Built-in constructor objects keep their native callable in a `__call__`
+        // slot; like the `[[...]]` slots it is machinery, not an own property.
+        if (std.mem.eql(u8, key, "__call__")) return true;
         return key.len >= 4 and key[0] == '[' and key[1] == '[';
     }
 
@@ -780,6 +783,20 @@ pub const JsObject = struct {
         const bo = b.toPtr().object;
         return holderFnBits(ao, "get") == holderFnBits(bo, "get") and
             holderFnBits(ao, "set") == holderFnBits(bo, "set");
+    }
+
+    /// Overwrite an existing own data property's value and attributes, skipping
+    /// the ValidateAndApplyPropertyDescriptor checks. Realm bootstrap only: a
+    /// locked builtin slot (`Object.prototype`) has to be re-pointed after the
+    /// arena→heap migration, which an ordinary define would reject.
+    pub fn defineOwnDataForced(self: *JsObject, key: []const u8, value: Value, attr: PropAttr) !void {
+        if (self.shape.key_to_slot.get(key)) |slot| {
+            if (slot < self.slots.items.len) self.slots.items[slot] = value;
+            if (slot < self.attrs.items.len) self.attrs.items[slot] = attr;
+            self.gcWrite(value);
+            return;
+        }
+        _ = try self.defineOwnData(key, value, attr);
     }
 
     pub fn defineOwnAccessor(self: *JsObject, key: []const u8, holder: Value, attr_in: PropAttr) !bool {

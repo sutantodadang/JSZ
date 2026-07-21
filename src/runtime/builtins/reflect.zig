@@ -722,6 +722,10 @@ pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
     // OrdinarySetPrototypeOf (spec 10.1.2.1): a no-op when unchanged; fails on a
     // non-extensible target or when the new prototype chain cycles back to O.
     if (new_proto == obj.proto) return val_mod.makeBool(arena, true);
+    // %Object.prototype% is an immutable prototype exotic object (§10.4.7.1).
+    if (@import("../realm.zig").active_object_proto) |op| {
+        if (obj == op) return val_mod.makeBool(arena, false);
+    }
     if (!obj.extensible) return val_mod.makeBool(arena, false);
     var p = new_proto;
     var depth: usize = 0;

@@ -8,6 +8,8 @@ const JsObject = obj_mod.JsObject;
 const PropAttr = obj_mod.PropAttr;
 const proxy_mod = @import("proxy.zig");
 const namespace_mod = @import("namespace.zig");
+/// For the arguments-exotic [[ParameterMap]] helpers.
+const bc_vm_mod = @import("../../vm/bc_vm.zig");
 
 /// Object.is(x, y): the SameValue algorithm — like === except NaN equals NaN
 /// and +0 is distinct from -0.
@@ -18,8 +20,13 @@ pub fn nativeObjectIs(arena: std.mem.Allocator, _: Value, args: []const Value) a
 }
 
 fn sameValue(x: Value, y: Value) bool {
-    if (x.bits == 0 and y.bits == 0) return true;
-    if (x.bits == 0 or y.bits == 0) return false;
+    // An omitted argument (`bits == 0`) and an explicitly passed `undefined`
+    // (a boxed undefined) are the same value.
+    if (x.bits == 0 or y.bits == 0) {
+        const x_undef = x.bits == 0 or x.unbox() == .undefined_;
+        const y_undef = y.bits == 0 or y.unbox() == .undefined_;
+        return x_undef and y_undef;
+    }
     const xi = x.unbox();
     const yi = y.unbox();
     const Tag = std.meta.Tag(val_mod.JsValue);
@@ -466,17 +473,93 @@ pub fn nativeObjectGetOwnPropertyDescriptors(arena: std.mem.Allocator, _: Value,
     const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
     const out = try JsObject.create(arena, obj_proto);
 
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() != .object) return val_mod.makeObject(arena, out);
-    const obj = args[0].toPtr().object;
-
-    for (obj.ownKeys()) |k| {
-        if (obj.isPrivate(k)) continue; // private class elements are hidden
-        if (JsObject.isInternalSlotKey(k)) continue; // internal slots ([[PrimitiveValue]], …)
-        const v = obj.getOwn(k) orelse continue;
-        const desc_val = try makeDataDescriptor(arena, v);
-        try out.set(k, desc_val);
+    const target = if (args.len > 0) args[0] else Value{};
+    if (target.isNullish()) return throwTypeError(arena, "Cannot convert undefined or null to object");
+    // Step 2: obj.[[OwnPropertyKeys]](); step 3: [[GetOwnProperty]] per key. Both
+    // are observable on a Proxy, so route them through the shared helpers rather
+    // than reading the property table directly.
+    const keys = (try ownPropertyKeyValues(arena, target)) orelse return val_mod.makeObject(arena, out);
+    for (keys) |k| {
+        const desc = try nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ target, k });
+        if (desc.bits == 0 or desc.unbox() == .undefined_) continue;
+        if (k.bits != 0 and k.unbox() == .symbol) {
+            _ = try out.defineOwnDataSym(k, desc, .{ .writable = true, .enumerable = true, .configurable = true });
+        } else {
+            try out.set(try realm_mod.stringPrimitive(arena, k), desc);
+        }
     }
     return val_mod.makeObject(arena, out);
+}
+
+/// [[OwnPropertyKeys]] as a list of property-key Values (Strings then Symbols),
+/// shared by every reflection entry point that must observe the same order (and
+/// the same Proxy trap calls) as the spec. Returns null when the argument has no
+/// own keys at all (a non-string primitive).
+fn ownPropertyKeyValues(arena: std.mem.Allocator, target: Value) anyerror!?[]Value {
+    const realm_mod = @import("../realm.zig");
+    if (target.bits == 0) return null;
+    var list = std.ArrayListUnmanaged(Value){};
+
+    // Primitive string: "0".."n-1" then "length".
+    if (target.unbox() == .string) {
+        const s = target.unbox().string;
+        const n = @import("string_proto.zig").cuLen(s);
+        var si: u32 = 0;
+        while (si < n) : (si += 1) {
+            try list.append(arena, try val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}", .{si})));
+        }
+        try list.append(arena, try val_mod.makeString(arena, "length"));
+        return list.items;
+    }
+    // A native function's own keys are just "length" and "name" (unless deleted).
+    if (target.unbox() == .native_function) {
+        const entry = target.unbox().native_function;
+        if (!entry.length_deleted) try list.append(arena, try val_mod.makeString(arena, "length"));
+        if (!entry.name_deleted) try list.append(arena, try val_mod.makeString(arena, "name"));
+        return list.items;
+    }
+    const obj = (try resolveObject(arena, target)) orelse return null;
+
+    if (obj.internal_kind == .proxy) {
+        return (try proxy_mod.proxyOwnKeys(arena, obj)) orelse list.items;
+    }
+    if (obj.internal_kind == .module_namespace) {
+        try namespace_mod.triggerAll(arena, obj);
+        for (try namespace_mod.sortedNames(arena, obj)) |k| {
+            try list.append(arena, try val_mod.makeString(arena, k));
+        }
+        for (obj.symKeys()) |sp| try list.append(arena, sp.key);
+        return list.items;
+    }
+    // TypedArray integer indices are exotic — not in the property table.
+    if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
+        const ta_mod = @import("typed_array.zig");
+        const td: *ta_mod.TypedArrayData = @ptrCast(@alignCast(obj.internal_slot.?));
+        if (!ta_mod.taIsOob(td)) {
+            var ti: u32 = 0;
+            const cur_len = ta_mod.taCurrentLen(td);
+            while (ti < cur_len) : (ti += 1) {
+                try list.append(arena, try val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d}", .{ti})));
+            }
+        }
+    }
+    // Ordinary string keys: `ownKeys()` already yields integer indices first.
+    // An array's "length" is synthetic and slots in after the index keys.
+    var length_emitted = !obj.is_array;
+    for (obj.ownKeys()) |k| {
+        if (obj.isPrivate(k)) continue;
+        if (JsObject.isInternalSlotKey(k)) continue;
+        if (!length_emitted and !isArrayIndexKey(k)) {
+            try list.append(arena, try val_mod.makeString(arena, "length"));
+            length_emitted = true;
+        }
+        try list.append(arena, try val_mod.makeString(arena, k));
+    }
+    if (!length_emitted) try list.append(arena, try val_mod.makeString(arena, "length"));
+
+    for (obj.symKeys()) |sp| try list.append(arena, sp.key);
+    _ = realm_mod;
+    return list.items;
 }
 
 /// Object.hasOwn(O, P) (ES2022 §20.1.2.13): ToObject(O), then HasOwnProperty.
@@ -1186,6 +1269,12 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
             // No trap: forward to the target.
             if (proxy_mod.proxyTarget(obj)) |t| return nativeObjectSetPrototypeOf(arena, Value{}, &.{ t, proto_val });
         }
+        // %Object.prototype% is an immutable prototype exotic object
+        // (SetImmutablePrototype §10.4.7.1): every change but a no-op fails.
+        if (@import("../realm.zig").active_object_proto) |op| {
+            if (obj == op and obj.proto != new_proto)
+                return throwTypeError(arena, "Immutable prototype object '#<Object>' cannot have their prototype set");
+        }
         // OrdinarySetPrototypeOf (ES §10.1.2): a no-op to the same proto always
         // succeeds; otherwise a non-extensible object, or a change that would
         // create a prototype cycle, fails and Object.setPrototypeOf throws.
@@ -1386,6 +1475,31 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     // getOwnPropertyDescriptor(obj, [1]) looks up "1" (may throw / yield a Symbol).
     const key_v = try toPropertyKeyValue(arena, if (args.len >= 2) args[1] else Value{});
     const arg0_unboxed = args[0].unbox();
+    // Primitive string: ToObject boxes it, and a String exotic object exposes
+    // "length" plus one non-writable, non-configurable index per code unit.
+    if (arg0_unboxed == .string) {
+        if (args.len < 2) return val_mod.makeUndefined(arena);
+        const key = (try coerceKey(arena, key_v)) orelse return val_mod.makeUndefined(arena);
+        const sp = @import("string_proto.zig");
+        const s = arg0_unboxed.string;
+        const obj_proto_s: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+        const desc_s = try JsObject.create(arena, obj_proto_s);
+        if (std.mem.eql(u8, key, "length")) {
+            try desc_s.set("value", try val_mod.makeNumber(arena, @floatFromInt(sp.cuLen(s))));
+            try desc_s.set("writable", try val_mod.makeBool(arena, false));
+            try desc_s.set("enumerable", try val_mod.makeBool(arena, false));
+            try desc_s.set("configurable", try val_mod.makeBool(arena, false));
+            return val_mod.makeObject(arena, desc_s);
+        }
+        if (!isArrayIndexKey(key)) return val_mod.makeUndefined(arena);
+        const idx = std.fmt.parseInt(usize, key, 10) catch return val_mod.makeUndefined(arena);
+        if (idx >= sp.cuLen(s)) return val_mod.makeUndefined(arena);
+        try desc_s.set("value", try val_mod.makeString(arena, try sp.cuSliceAlloc(arena, s, idx, idx + 1)));
+        try desc_s.set("writable", try val_mod.makeBool(arena, false));
+        try desc_s.set("enumerable", try val_mod.makeBool(arena, true));
+        try desc_s.set("configurable", try val_mod.makeBool(arena, false));
+        return val_mod.makeObject(arena, desc_s);
+    }
     // Handle native_function: synthesize descriptors for .name/.length (respecting deletion).
     if (arg0_unboxed == .native_function) {
         if (args.len < 2) return val_mod.makeUndefined(arena);
@@ -1786,6 +1900,9 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         };
         const ok = try obj.defineOwnAccessor(key, holder, attr);
         if (!ok) return throwTypeError(arena, "cannot redefine property");
+        // Arguments exotic [[DefineOwnProperty]] (§10.4.4.2 step 5.a): turning a
+        // mapped index into an accessor drops it from the [[ParameterMap]].
+        bc_vm_mod.unmapArg(obj, key);
         return args[0];
     }
 
@@ -1803,7 +1920,10 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         cur_c = a.configurable;
         if (!a.is_accessor) {
             cur_w = a.writable;
-            cur_val = obj.getOwn(key);
+            // A mapped arguments index aliases the parameter binding, which is
+            // the authoritative value (§10.4.4.2 step 3): the object's own slot
+            // goes stale when the parameter itself is reassigned.
+            cur_val = bc_vm_mod.readMappedArg(obj, key) orelse obj.getOwn(key);
             has_own_data = true;
         }
     }
@@ -1820,6 +1940,11 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     };
     const ok = try obj.defineOwnData(key, value, attr);
     if (!ok) return throwTypeError(arena, "cannot redefine property");
+    // Arguments exotic [[DefineOwnProperty]] (§10.4.4.2 step 5.b): a new value
+    // writes through to the aliased parameter, and losing [[Writable]] drops the
+    // index from the [[ParameterMap]].
+    if (descHas(desc, "value")) bc_vm_mod.assignMappedArg(obj, key, value);
+    if (descHas(desc, "writable") and !attr.writable) bc_vm_mod.unmapArg(obj, key);
     return args[0];
 }
 
@@ -1873,10 +1998,41 @@ fn defineFromProps(arena: std.mem.Allocator, target: Value, props_val: Value, pr
 }
 
 /// Object.freeze(o): freeze the object (non-extensible, all props non-writable/non-configurable).
+/// SetIntegrityLevel (§7.3.15) for a Proxy target: every step -- the
+/// [[PreventExtensions]], the [[OwnPropertyKeys]] and one [[DefineOwnProperty]]
+/// per key -- is trap-observable, so it cannot use the plain-object shortcut.
+fn setIntegrityLevelProxy(arena: std.mem.Allocator, target: Value, freeze: bool) anyerror!void {
+    const realm_mod = @import("../realm.zig");
+    const obj = target.toPtr().object;
+    if (try proxy_mod.proxyPreventExtensions(arena, obj)) |ok| {
+        if (!ok) return throwTypeError(arena, "proxy preventExtensions returned false");
+    }
+    const keys = (try ownPropertyKeyValues(arena, target)) orelse return;
+    const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
+    for (keys) |k| {
+        const desc = try JsObject.create(arena, obj_proto);
+        if (freeze) {
+            // Only a data property also loses [[Writable]]; deciding that needs
+            // the current descriptor, which is itself a trap call.
+            const cur = try nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ target, k });
+            if (cur.bits == 0 or cur.unbox() == .undefined_) continue;
+            const cur_obj = cur.toPtr().object;
+            const is_accessor = cur_obj.getOwn("get") != null or cur_obj.getOwn("set") != null;
+            if (!is_accessor) try desc.set("writable", try val_mod.makeBool(arena, false));
+        }
+        try desc.set("configurable", try val_mod.makeBool(arena, false));
+        _ = try nativeObjectDefineProperty(arena, Value{}, &[_]Value{ target, k, try val_mod.makeObject(arena, desc) });
+    }
+}
+
 pub fn nativeObjectFreeze(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
     if (args[0].unbox() != .object) return args[0];
     const obj = args[0].toPtr().object;
+    if (obj.internal_kind == .proxy) {
+        try setIntegrityLevelProxy(arena, args[0], true);
+        return args[0];
+    }
     // Module Namespace: [[DefineOwnProperty]] rejects {writable:false} for exports
     // (§10.4.6.7), so SetIntegrityLevel("frozen") always throws TypeError.
     if (obj.internal_kind == .module_namespace) {
@@ -1913,6 +2069,10 @@ pub fn nativeObjectSeal(arena: std.mem.Allocator, _: Value, args: []const Value)
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
     if (args[0].unbox() != .object) return args[0];
     const obj = args[0].toPtr().object;
+    if (obj.internal_kind == .proxy) {
+        try setIntegrityLevelProxy(arena, args[0], false);
+        return args[0];
+    }
     // TypedArray SetIntegrityLevel(sealed) throws TypeError when either the
     // backing buffer is resizable (PreventExtensions fails) or the TA is
     // non-empty (its integer indices cannot be made non-configurable). An empty
@@ -1952,10 +2112,42 @@ pub fn nativeObjectPreventExtensions(arena: std.mem.Allocator, _: Value, args: [
 }
 
 /// Object.isFrozen(o): primitives → true; objects → isFrozenSelf().
+/// TestIntegrityLevel (§7.3.16) for a Proxy target — see setIntegrityLevelProxy.
+fn testIntegrityLevelProxy(arena: std.mem.Allocator, target: Value, freeze: bool) anyerror!bool {
+    const obj = target.toPtr().object;
+    if (try proxy_mod.proxyIsExtensible(arena, obj)) |ext| {
+        if (ext) return false;
+    }
+    const keys = (try ownPropertyKeyValues(arena, target)) orelse return true;
+    for (keys) |k| {
+        const cur = try nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ target, k });
+        if (cur.bits == 0 or cur.unbox() == .undefined_) continue;
+        const cur_obj = cur.toPtr().object;
+        if (truthy(cur_obj.getOwn("configurable"))) return false;
+        if (freeze) {
+            const is_accessor = cur_obj.getOwn("get") != null or cur_obj.getOwn("set") != null;
+            if (!is_accessor and truthy(cur_obj.getOwn("writable"))) return false;
+        }
+    }
+    return true;
+}
+
+fn truthy(v: ?Value) bool {
+    const val = v orelse return false;
+    if (val.bits == 0) return false;
+    return switch (val.unbox()) {
+        .boolean => |b| b,
+        .undefined_, .null_ => false,
+        else => true,
+    };
+}
+
 pub fn nativeObjectIsFrozen(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeBool(arena, true);
     if (args[0].unbox() != .object) return val_mod.makeBool(arena, true);
     const obj = args[0].toPtr().object;
+    if (obj.internal_kind == .proxy)
+        return val_mod.makeBool(arena, try testIntegrityLevelProxy(arena, args[0], true));
     // Module Namespace exports always have writable:true → namespace is never frozen.
     if (obj.internal_kind == .module_namespace) {
         const names = try namespace_mod.sortedNames(arena, obj);
@@ -1977,6 +2169,8 @@ pub fn nativeObjectIsSealed(arena: std.mem.Allocator, _: Value, args: []const Va
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeBool(arena, true);
     if (args[0].unbox() != .object) return val_mod.makeBool(arena, true);
     const obj = args[0].toPtr().object;
+    if (obj.internal_kind == .proxy)
+        return val_mod.makeBool(arena, try testIntegrityLevelProxy(arena, args[0], false));
     // A non-empty TypedArray is never sealed: its integer indices stay
     // configurable (they are exotic, not in the property table).
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
@@ -2011,7 +2205,7 @@ pub fn nativeObjectGetOwnPropertySymbols(arena: std.mem.Allocator, _: Value, arg
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
     const arr = try JsObject.createArray(arena, arr_proto);
     // ToObject(O): undefined/null throw TypeError; other primitives box → no symbols → [].
-    if (args.len == 0 or args[0].bits == 0 or args[0].unbox() == .null_)
+    if (args.len == 0 or args[0].isNullish())
         return throwTypeError(arena, "Cannot convert undefined or null to object");
     if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
     const obj = args[0].toPtr().object;
