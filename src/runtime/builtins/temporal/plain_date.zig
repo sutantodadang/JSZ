@@ -126,8 +126,8 @@ pub fn toTemporalDate(arena: std.mem.Allocator, v: Value, overflow: shared.Overf
 /// day} off a property bag. Shared with PlainDateTime and ZonedDateTime, whose
 /// date portion uses exactly these fields.
 pub fn dateFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISODate {
-    const cal = if (o.get("calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
-    const day_v = o.get("day");
+    const cal = if (try shared.getField(arena, o, "calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
+    const day_v = try shared.getField(arena, o, "day");
     if (day_v == null or (day_v.?.bits != 0 and day_v.?.unbox() == .undefined_)) return realm_mod.throwTypeError(arena, "missing day");
     const day = try shared.toIntegerWithTruncation(arena, day_v.?);
     const cal_year = try readCalendarYear(arena, o, cal);
@@ -137,12 +137,12 @@ pub fn dateFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.O
 /// Resolve the calendar-space year from either a "year" field or an
 /// {era, eraYear} pair. Exactly one of the two forms must be present.
 pub fn readCalendarYear(arena: std.mem.Allocator, o: *JsObject, cal: calendar.CalendarId) !i32 {
-    const year_v = o.get("year");
+    const year_v = try shared.getField(arena, o, "year");
     const has_year = year_v != null and year_v.?.bits != 0 and year_v.?.unbox() != .undefined_;
     // A calendar without eras has no era/eraYear fields, so any such properties
     // on the bag are ignored; an era-bearing calendar needs both or neither.
-    const era_v = if (calendar.hasEras(cal)) o.get("era") else null;
-    const era_year_v = if (calendar.hasEras(cal)) o.get("eraYear") else null;
+    const era_v = if (calendar.hasEras(cal)) try shared.getField(arena, o, "era") else null;
+    const era_year_v = if (calendar.hasEras(cal)) try shared.getField(arena, o, "eraYear") else null;
     const has_era = era_v != null and era_v.?.bits != 0 and era_v.?.unbox() != .undefined_;
     const has_era_year = era_year_v != null and era_year_v.?.bits != 0 and era_year_v.?.unbox() != .undefined_;
     if (has_era != has_era_year) return realm_mod.throwTypeError(arena, "era and eraYear must be provided together");
@@ -164,8 +164,8 @@ pub fn readCalendarYear(arena: std.mem.Allocator, o: *JsObject, cal: calendar.Ca
 
 /// Apply whichever of "month" / "monthCode" is present to produce an ISO date.
 fn monthFieldsToIso(arena: std.mem.Allocator, o: *JsObject, cal: calendar.CalendarId, cal_year: i32, day: i32, overflow: shared.Overflow) !ISODate {
-    const month_v = o.get("month");
-    const monthcode_v = o.get("monthCode");
+    const month_v = try shared.getField(arena, o, "month");
+    const monthcode_v = try shared.getField(arena, o, "monthCode");
     const has_month = month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_;
     const has_code = monthcode_v != null and monthcode_v.?.bits != 0 and monthcode_v.?.unbox() != .undefined_;
     if (has_code) {
@@ -570,8 +570,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "with() requires an object");
     if (getDate(arg) != null) return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
     const o = arg.toPtr().object;
-    if (o.get("calendar") != null and o.get("calendar").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set calendar");
-    if (o.get("timeZone") != null and o.get("timeZone").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    if (try shared.getField(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
+    if (try shared.getField(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
     const merged = try withDateFields(arena, cur.*, o, overflow);
@@ -592,8 +592,8 @@ pub fn withDateFields(arena: std.mem.Allocator, cur: ISODate, o: *JsObject, over
     var any = false;
 
     // Era fields only exist on calendars that number years by era.
-    const era_v = if (calendar.hasEras(cal)) o.get("era") else null;
-    const era_year_v = if (calendar.hasEras(cal)) o.get("eraYear") else null;
+    const era_v = if (calendar.hasEras(cal)) try shared.getField(arena, o, "era") else null;
+    const era_year_v = if (calendar.hasEras(cal)) try shared.getField(arena, o, "eraYear") else null;
     const has_era = era_v != null and era_v.?.bits != 0 and era_v.?.unbox() != .undefined_;
     const has_era_year = era_year_v != null and era_year_v.?.bits != 0 and era_year_v.?.unbox() != .undefined_;
     if (has_era != has_era_year) return realm_mod.throwTypeError(arena, "era and eraYear must be provided together");
@@ -612,8 +612,8 @@ pub fn withDateFields(arena: std.mem.Allocator, cur: ISODate, o: *JsObject, over
         any = true;
     }
 
-    const month_v = o.get("month");
-    const monthcode_v = o.get("monthCode");
+    const month_v = try shared.getField(arena, o, "month");
+    const monthcode_v = try shared.getField(arena, o, "monthCode");
     const has_month = month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_;
     const has_code = monthcode_v != null and monthcode_v.?.bits != 0 and monthcode_v.?.unbox() != .undefined_;
     if (has_month or has_code) any = true;
@@ -665,10 +665,10 @@ pub fn nativeToZonedDateTime(arena: std.mem.Allocator, this_val: Value, args: []
         zone = try timezone.toZone(arena, item.unbox().string);
     } else if (item.bits != 0 and item.unbox() == .object) {
         const o = item.toPtr().object;
-        const tz_v = o.get("timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
+        const tz_v = try shared.getField(arena, o, "timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
         if (tz_v.bits == 0 or tz_v.unbox() != .string) return realm_mod.throwTypeError(arena, "time zone must be a string");
         zone = try timezone.toZone(arena, tz_v.unbox().string);
-        if (o.get("plainTime")) |ptv| {
+        if (try shared.getField(arena, o, "plainTime")) |ptv| {
             if (ptv.bits != 0 and ptv.unbox() != .undefined_) {
                 time = try pt.toTemporalTime(arena, ptv, .constrain);
             }

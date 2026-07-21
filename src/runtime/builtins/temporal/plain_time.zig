@@ -370,14 +370,16 @@ pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, args: []
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const t = try requireTime(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
-    const digits = try shared.getFractionalDigits(arena, opts);
-    const s = try timeToString(arena, t.*, digits);
+    const prec = try shared.getSecondsPrecision(arena, opts, true);
+    // A PlainTime has no date to carry into, so a rounding step that reaches
+    // the next day simply wraps back to 00:00.
+    const s = try timeToString(arena, shared.roundTimeToPrecision(t.*, prec).time, prec);
     return val_mod.makeString(arena, s);
 }
 
 pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const t = try requireTime(arena, this_val);
-    return val_mod.makeString(arena, try timeToString(arena, t.*, null));
+    return val_mod.makeString(arena, try timeToString(arena, t.*, .{}));
 }
 
 pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -389,14 +391,9 @@ pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyer
     return realm_mod.throwTypeError(arena, "Called valueOf on a Temporal.PlainTime");
 }
 
-pub fn timeToString(arena: std.mem.Allocator, t: ISOTime, digits: ?u8) ![]const u8 {
+pub fn timeToString(arena: std.mem.Allocator, t: ISOTime, prec: shared.SecondsPrecision) ![]const u8 {
     var buf = shared.Buf{};
-    try shared.appendPadded(arena, &buf, t.hour, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, t.minute, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, t.second, 2);
-    try shared.appendFraction(arena, &buf, t, digits);
+    try shared.appendWallTime(arena, &buf, t, prec);
     return buf.items;
 }
 

@@ -226,9 +226,9 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
     // ToTemporalZonedDateTime validates the calendar (ToTemporalCalendarIdentifier;
     // ISO strings ok) BEFORE requiring the timeZone field, so an invalid calendar
     // throws RangeError even when timeZone is absent.
-    const cal = if (o.get("calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
+    const cal = if (try shared.getField(arena, o, "calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
     // timeZone is required.
-    const tz_v = o.get("timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
+    const tz_v = try shared.getField(arena, o, "timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
     if (tz_v.bits != 0 and tz_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing timeZone");
     const zone = try toTimeZone(arena, tz_v, null);
     const overflow = try shared.getOverflow(arena, opts);
@@ -239,7 +239,7 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
 
     // offset property.
     var provided: ?i128 = null;
-    if (o.get("offset")) |ov| {
+    if (try shared.getField(arena, o, "offset")) |ov| {
         if (ov.bits != 0 and ov.unbox() != .undefined_) {
             if (ov.unbox() != .string) return realm_mod.throwTypeError(arena, "offset must be a string");
             provided = try parseOffsetValue(arena, ov.unbox().string);
@@ -597,8 +597,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (getZoned(arg) != null or plain_date.getDate(arg) != null or plain_time.getTime(arg) != null or plain_date_time.getDateTime(arg) != null)
         return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
     const o = arg.toPtr().object;
-    if (o.get("calendar")) |c| if (c.bits != 0 and c.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set calendar");
-    if (o.get("timeZone")) |c| if (c.bits != 0 and c.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    if (try shared.getField(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
+    if (try shared.getField(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
     const offset_opt = try getOffsetOption(arena, opts, .prefer);
@@ -619,7 +619,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (try readField(arena, o, "microsecond")) |x| { us = x; any = true; }
     if (try readField(arena, o, "nanosecond")) |x| { ns = x; any = true; }
     var provided: ?i128 = null;
-    if (o.get("offset")) |ov| {
+    if (try shared.getField(arena, o, "offset")) |ov| {
         if (ov.bits != 0 and ov.unbox() != .undefined_) {
             if (ov.unbox() != .string) return realm_mod.throwTypeError(arena, "offset must be a string");
             provided = try parseOffsetValue(arena, ov.unbox().string);
@@ -849,7 +849,7 @@ pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, ar
         dir = arg.unbox().string;
     } else if (arg.bits != 0 and arg.unbox() == .object) {
         const o = arg.toPtr().object;
-        const dv = o.get("direction") orelse return realm_mod.throwTypeError(arena, "missing direction");
+        const dv = try shared.getField(arena, o, "direction") orelse return realm_mod.throwTypeError(arena, "missing direction");
         if (dv.bits == 0 or dv.unbox() != .string) return realm_mod.throwTypeError(arena, "direction must be a string");
         dir = dv.unbox().string;
     } else if (arg.bits == 0 or arg.unbox() == .undefined_) {
@@ -906,37 +906,21 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
-    const digits = try shared.getFractionalDigits(arena, opts);
+    // Options are observed in alphabetical order: calendarName, then the
+    // seconds trio, then offset and timeZoneName.
     const show_cal = try shared.getShowCalendar(arena, opts);
     const show_off = try getShowOffset(arena, opts);
+    const prec = try shared.getSecondsPrecision(arena, opts, true);
     const show_tz = try getShowTimeZoneName(arena, opts);
-    // rounding options
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
-    var z_ns = z.ns;
-    var frac_digits = digits;
-    if (smallest) |sm| {
-        if (unitRank(sm) < unitRank(.minute)) return realm_mod.throwRangeError(arena, "smallestUnit must be minute..nanosecond");
-        const inc_ns = shared.unitLengthNanos(sm).? * @as(i128, @intFromFloat(inc));
-        z_ns = shared.roundI128ToIncrement(z.ns, inc_ns, mode);
-        frac_digits = switch (sm) {
-            .minute => 0,
-            .second => 0,
-            .millisecond => 3,
-            .microsecond => 6,
-            .nanosecond => 9,
-            else => digits,
-        };
-        if (sm == .minute) smallest = .minute;
-    }
-    const s = try zonedToString(arena, z_ns, z.offset_ns, z.tz, z.calendar, frac_digits, show_cal, show_off, show_tz, smallest);
+    const inc_ns = shared.precisionIncrementNanos(prec);
+    const z_ns = if (inc_ns > 1) shared.roundI128ToIncrement(z.ns, inc_ns, prec.mode) else z.ns;
+    const s = try zonedToString(arena, z_ns, z.offset_ns, z.tz, z.calendar, prec, show_cal, show_off, show_tz);
     return val_mod.makeString(arena, s);
 }
 
 pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const s = try zonedToString(arena, z.ns, z.offset_ns, z.tz, z.calendar, null, .auto, .auto, .auto, null);
+    const s = try zonedToString(arena, z.ns, z.offset_ns, z.tz, z.calendar, .{}, .auto, .auto, .auto);
     return val_mod.makeString(arena, s);
 }
 
@@ -966,7 +950,7 @@ fn getShowTimeZoneName(arena: std.mem.Allocator, opts: ?*JsObject) !ShowTZ {
     return realm_mod.throwRangeError(arena, "invalid timeZoneName option");
 }
 
-fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []const u8, cal: shared.calendar_mod.CalendarId, digits: ?u8, show_cal: shared.ShowCalendar, show_off: ShowOffset, show_tz: ShowTZ, smallest: ?shared.Unit) ![]const u8 {
+fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []const u8, cal: shared.calendar_mod.CalendarId, prec: shared.SecondsPrecision, show_cal: shared.ShowCalendar, show_off: ShowOffset, show_tz: ShowTZ) ![]const u8 {
     const total = ns + offset_ns;
     const days: i64 = @intCast(@divFloor(total, shared.NS_PER_DAY));
     const tod = total - @as(i128, days) * shared.NS_PER_DAY;
@@ -979,14 +963,7 @@ fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []cons
     try buf.append(arena, '-');
     try shared.appendPadded(arena, &buf, date.day, 2);
     try buf.append(arena, 'T');
-    try shared.appendPadded(arena, &buf, tr.time.hour, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, tr.time.minute, 2);
-    if (!(smallest != null and smallest.? == .minute)) {
-        try buf.append(arena, ':');
-        try shared.appendPadded(arena, &buf, tr.time.second, 2);
-        try shared.appendFraction(arena, &buf, tr.time, digits);
-    }
+    try shared.appendWallTime(arena, &buf, tr.time, prec);
     if (show_off == .auto) {
         try buf.appendSlice(arena, try timezone.formatOffset(arena, offset_ns));
     }

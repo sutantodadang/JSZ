@@ -353,15 +353,15 @@ fn getEpochNanoseconds(arena: std.mem.Allocator, this_val: Value, _: []const Val
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const ins = try requireInstant(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
-    const digits = try shared.getFractionalDigits(arena, opts);
+    const prec = try shared.getSecondsPrecision(arena, opts, true);
     // timeZone option ignored (UTC).
-    const s = try instantToString(arena, ins.*, digits);
+    const s = try instantToString(arena, ins.*, prec);
     return val_mod.makeString(arena, s);
 }
 
 pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const ins = try requireInstant(arena, this_val);
-    return val_mod.makeString(arena, try instantToString(arena, ins.*, null));
+    return val_mod.makeString(arena, try instantToString(arena, ins.*, .{}));
 }
 
 pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -383,7 +383,9 @@ pub fn nativeToZonedDateTimeISO(arena: std.mem.Allocator, this_val: Value, args:
     return zoned.makeZoned(arena, .{ .ns = ins.*, .tz = zone.id, .offset_ns = zone.offset_ns });
 }
 
-fn instantToString(arena: std.mem.Allocator, ns: i128, digits: ?u8) ![]const u8 {
+fn instantToString(arena: std.mem.Allocator, raw_ns: i128, prec: shared.SecondsPrecision) ![]const u8 {
+    const inc = shared.precisionIncrementNanos(prec);
+    const ns = if (inc > 1) shared.roundI128ToIncrement(raw_ns, inc, prec.mode) else raw_ns;
     const days: i64 = @intCast(@divFloor(ns, shared.NS_PER_DAY));
     const time_of_day: i128 = ns - @as(i128, days) * shared.NS_PER_DAY;
     const date = shared.epochDaysToISODate(days);
@@ -395,12 +397,7 @@ fn instantToString(arena: std.mem.Allocator, ns: i128, digits: ?u8) ![]const u8 
     try buf.append(arena, '-');
     try shared.appendPadded(arena, &buf, date.day, 2);
     try buf.append(arena, 'T');
-    try shared.appendPadded(arena, &buf, tr.time.hour, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, tr.time.minute, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, tr.time.second, 2);
-    try shared.appendFraction(arena, &buf, tr.time, digits);
+    try shared.appendWallTime(arena, &buf, tr.time, prec);
     try buf.append(arena, 'Z');
     return buf.items;
 }

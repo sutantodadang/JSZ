@@ -1214,10 +1214,24 @@ pub fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
 
 /// Read a string-valued option; returns null if the property is absent/undefined.
 /// Throws if present but coerces to a value not in `allowed` (when allowed given).
+/// [[Get]] on an options bag or property bag, going through the full property
+/// lookup so accessors and Proxy traps fire. Which properties Temporal reads,
+/// and in what order, is observable and tested, so none of this may take the
+/// own-shape shortcut. Returns null for both absent and undefined, which every
+/// Temporal field read treats alike.
+pub fn getField(arena: std.mem.Allocator, o: *JsObject, key: []const u8) !?Value {
+    const ctx = realm_mod.active_context orelse {
+        const v = o.get(key) orelse return null;
+        return if (v.bits == 0 or v.unbox() == .undefined_) null else v;
+    };
+    const v = try ctx.getProp(arena, try val_mod.makeObject(arena, o), key);
+    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    return v;
+}
+
 pub fn readStringOption(arena: std.mem.Allocator, opts: ?*JsObject, key: []const u8) !?[]const u8 {
     const o = opts orelse return null;
-    const v = o.get(key) orelse return null;
-    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    const v = (try getField(arena, o, key)) orelse return null;
     return try valueToString(arena, v);
 }
 
@@ -1251,7 +1265,7 @@ pub fn toNumberOption(arena: std.mem.Allocator, v: Value) !f64 {
 
 pub fn getRoundingIncrement(arena: std.mem.Allocator, opts: ?*JsObject) !f64 {
     const o = opts orelse return 1;
-    const v = o.get("roundingIncrement") orelse return 1;
+    const v = try getField(arena, o, "roundingIncrement") orelse return 1;
     if (v.bits == 0 or v.unbox() == .undefined_) return 1;
     const n = try toNumberOption(arena, v);
     if (!std.math.isFinite(n)) return realm_mod.throwRangeError(arena, "roundingIncrement must be finite");
@@ -1348,15 +1362,96 @@ pub fn getShowCalendar(arena: std.mem.Allocator, opts: ?*JsObject) !ShowCalendar
 /// Parse fractionalSecondDigits option: null = auto, else 0..9.
 pub fn getFractionalDigits(arena: std.mem.Allocator, opts: ?*JsObject) !?u8 {
     const o = opts orelse return null;
-    const v = o.get("fractionalSecondDigits") orelse return null;
+    const v = try getField(arena, o, "fractionalSecondDigits") orelse return null;
     if (v.bits == 0 or v.unbox() == .undefined_) return null;
-    if (v.unbox() == .string) {
-        if (std.mem.eql(u8, v.unbox().string, "auto")) return null;
+    // Anything that is not a Number has to spell "auto" — this option takes no
+    // other strings, and a non-string is stringified rather than coerced to a
+    // digit count.
+    if (v.unbox() != .number) {
+        const s = try valueToString(arena, v);
+        if (std.mem.eql(u8, s, "auto")) return null;
         return realm_mod.throwRangeError(arena, "invalid fractionalSecondDigits");
     }
-    const n = try realm_mod.toNumberValue(arena, v);
-    if (std.math.isNan(n)) return realm_mod.throwRangeError(arena, "invalid fractionalSecondDigits");
+    const n = v.unbox().number;
+    if (std.math.isNan(n) or std.math.isInf(n)) return realm_mod.throwRangeError(arena, "invalid fractionalSecondDigits");
     const t = @floor(n);
     if (t < 0 or t > 9) return realm_mod.throwRangeError(arena, "fractionalSecondDigits out of range");
     return @intFromFloat(t);
+}
+
+/// ToSecondsStringPrecisionRecord: how a Temporal serialization renders its
+/// seconds — how many fractional digits to print, and what the time has to be
+/// rounded to first.
+pub const SecondsPrecision = struct {
+    /// Fractional digits to print, or null for "as many as are significant".
+    digits: ?u8 = null,
+    /// Unit the time is rounded to before formatting.
+    unit: Unit = .nanosecond,
+    increment: u32 = 1,
+    /// smallestUnit was "minute": seconds are dropped from the output entirely.
+    minute_only: bool = false,
+    mode: RoundingMode = .trunc,
+};
+
+/// Read the three options every Temporal `toString` shares, in the order the
+/// spec observes them (which is alphabetical, and is itself tested), and fold
+/// them into a precision record. `allow_minute` is false for Duration, whose
+/// serialization has no minute-granularity form.
+pub fn getSecondsPrecision(arena: std.mem.Allocator, opts: ?*JsObject, allow_minute: bool) !SecondsPrecision {
+    const digits = try getFractionalDigits(arena, opts);
+    const mode = try getRoundingMode(arena, opts, .trunc);
+    const smallest = try getTemporalUnit(arena, opts, "smallestUnit");
+    var out = SecondsPrecision{ .digits = digits, .mode = mode };
+    if (smallest) |u| {
+        switch (u) {
+            .minute => {
+                if (!allow_minute) return realm_mod.throwRangeError(arena, "invalid smallestUnit");
+                out.minute_only = true;
+                out.unit = .minute;
+            },
+            .second => out.digits = 0,
+            .millisecond => out.digits = 3,
+            .microsecond => out.digits = 6,
+            .nanosecond => out.digits = 9,
+            else => return realm_mod.throwRangeError(arena, "invalid smallestUnit"),
+        }
+        if (u != .minute) out.unit = u;
+        return out;
+    }
+    // Without a smallestUnit the digit count picks the rounding increment: 3
+    // digits means rounding to the nearest millisecond, and so on.
+    if (digits) |d| {
+        out.unit = .nanosecond;
+        out.increment = std.math.pow(u32, 10, 9 - @as(u32, d));
+    }
+    return out;
+}
+
+/// Nanoseconds-per-unit for the rounding a `SecondsPrecision` calls for.
+pub fn precisionIncrementNanos(p: SecondsPrecision) i128 {
+    const per = unitLengthNanos(p.unit) orelse NS_PER_MINUTE;
+    return per * p.increment;
+}
+
+/// Round a wall-clock time to `p`'s granularity. The day carry is returned
+/// rather than folded in: a PlainTime wraps, but a PlainDateTime rolls its date
+/// forward.
+pub fn roundTimeToPrecision(t: ISOTime, p: SecondsPrecision) TimeWithCarry {
+    const inc = precisionIncrementNanos(p);
+    if (inc <= 1) return .{ .days = 0, .time = t };
+    const r = nanosToTime(roundI128ToIncrement(timeToNanos(t), inc, p.mode));
+    return .{ .days = r.days, .time = r.time };
+}
+
+pub const TimeWithCarry = struct { days: i64, time: ISOTime };
+
+/// "HH:MM", "HH:MM:SS" or "HH:MM:SS.fff…" per `p`.
+pub fn appendWallTime(a: std.mem.Allocator, buf: *Buf, t: ISOTime, p: SecondsPrecision) !void {
+    try appendPadded(a, buf, t.hour, 2);
+    try buf.append(a, ':');
+    try appendPadded(a, buf, t.minute, 2);
+    if (p.minute_only) return;
+    try buf.append(a, ':');
+    try appendPadded(a, buf, t.second, 2);
+    try appendFraction(a, buf, t, p.digits);
 }

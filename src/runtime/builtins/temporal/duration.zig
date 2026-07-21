@@ -447,7 +447,7 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
     const rv = if (realm_mod.active_context) |c|
         try c.getProp(arena, try val_mod.makeObject(arena, o), "relativeTo")
     else
-        (o.get("relativeTo") orelse Value{});
+        (try shared.getField(arena, o, "relativeTo") orelse Value{});
     if (rv.bits == 0 or rv.isUndefined() or rv.isNull()) return null;
     // A ZonedDateTime relativeTo is reduced to its local calendar date (we do not
     // model per-day time-zone offset changes; correct for fixed-offset zones).
@@ -792,8 +792,35 @@ pub fn nativeTotal(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const d = try requireDuration(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
-    const digits = try shared.getFractionalDigits(arena, opts);
-    const s = try durationToString(arena, d.*, digits);
+    // A Duration has no "minute" serialization form, so smallestUnit stops at
+    // seconds here.
+    const prec = try shared.getSecondsPrecision(arena, opts, false);
+    // Rounding the time part can carry across unit boundaries, but only up to
+    // whatever the duration's own largest unit already is: 60 seconds stays
+    // "PT60S", while 1:59:59.9 becomes "PT2H0S".
+    var out = d.*;
+    const inc_ns = shared.precisionIncrementNanos(prec);
+    if (inc_ns > 1) {
+        const largest = largerUnit(defaultLargestUnit(d.*), .second);
+        const rounded = shared.roundI128ToIncrement(timeDurationNanos(d.*), inc_ns, prec.mode);
+        if (!balancedComponentsFitF64(rounded, largest))
+            return realm_mod.throwRangeError(arena, "rounded Duration component is out of range");
+        const time = balanceTimeDuration(rounded, largest);
+        out = .{
+            .years = d.years,
+            .months = d.months,
+            .weeks = d.weeks,
+            // `timeDurationNanos` already folded the days in.
+            .days = time.days,
+            .hours = time.hours,
+            .minutes = time.minutes,
+            .seconds = time.seconds,
+            .milliseconds = time.milliseconds,
+            .microseconds = time.microseconds,
+            .nanoseconds = time.nanoseconds,
+        };
+    }
+    const s = try durationToString(arena, out, prec.digits);
     return val_mod.makeString(arena, s);
 }
 
@@ -837,7 +864,9 @@ fn durationToString(arena: std.mem.Allocator, d: DurationFields, digits: ?u8) ![
         @as(i128, @intFromFloat(@abs(d.nanoseconds)));
     const sec_whole: i64 = @intCast(@divTrunc(total_sec_ns, 1_000_000_000));
     const frac_ns: u32 = @intCast(@mod(total_sec_ns, 1_000_000_000));
-    const has_s = total_sec_ns != 0 or (digits != null and digits.? > 0);
+    // Seconds are printed whenever a digit count was asked for, even when it is
+    // zero and the seconds are: "P3Y" with fractionalSecondDigits 0 is "P3YT0S".
+    const has_s = total_sec_ns != 0 or digits != null;
 
     if (has_h or has_m or has_s) {
         try buf.append(arena, 'T');

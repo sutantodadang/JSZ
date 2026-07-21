@@ -360,8 +360,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (getDateTime(arg) != null or plain_date.getDate(arg) != null or plain_time.getTime(arg) != null)
         return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
     const o = arg.toPtr().object;
-    if (o.get("calendar") != null and o.get("calendar").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set calendar");
-    if (o.get("timeZone") != null and o.get("timeZone").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    if (try shared.getField(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
+    if (try shared.getField(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
 
@@ -495,15 +495,25 @@ pub fn nativeToPlainTime(arena: std.mem.Allocator, this_val: Value, _: []const V
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
-    const digits = try shared.getFractionalDigits(arena, opts);
+    // Alphabetical: calendarName is observed before the seconds options.
     const show = try shared.getShowCalendar(arena, opts);
-    const s = try dtToString(arena, dt.*, digits, show);
+    const prec = try shared.getSecondsPrecision(arena, opts, true);
+    // Rounding up out of 23:59 rolls the date forward.
+    const r = shared.roundTimeToPrecision(dt.time, prec);
+    var rounded = dt.*;
+    rounded.time = r.time;
+    if (r.days != 0) {
+        const shifted = shared.isoDateToEpochDays(dt.date.year, dt.date.month, dt.date.day) + r.days;
+        rounded.date = shared.epochDaysToISODate(shifted);
+        rounded.date.calendar = dt.date.calendar;
+    }
+    const s = try dtToString(arena, rounded, prec, show);
     return val_mod.makeString(arena, s);
 }
 
 pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
-    return val_mod.makeString(arena, try dtToString(arena, dt.*, null, .auto));
+    return val_mod.makeString(arena, try dtToString(arena, dt.*, .{}, .auto));
 }
 
 pub fn nativeToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -515,7 +525,7 @@ pub fn nativeValueOf(arena: std.mem.Allocator, _: Value, _: []const Value) anyer
     return realm_mod.throwTypeError(arena, "Called valueOf on a Temporal.PlainDateTime");
 }
 
-fn dtToString(arena: std.mem.Allocator, dt: ISODateTime, digits: ?u8, show: shared.ShowCalendar) ![]const u8 {
+fn dtToString(arena: std.mem.Allocator, dt: ISODateTime, prec: shared.SecondsPrecision, show: shared.ShowCalendar) ![]const u8 {
     var buf = shared.Buf{};
     try shared.appendISOYear(arena, &buf, dt.date.year);
     try buf.append(arena, '-');
@@ -523,12 +533,7 @@ fn dtToString(arena: std.mem.Allocator, dt: ISODateTime, digits: ?u8, show: shar
     try buf.append(arena, '-');
     try shared.appendPadded(arena, &buf, dt.date.day, 2);
     try buf.append(arena, 'T');
-    try shared.appendPadded(arena, &buf, dt.time.hour, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, dt.time.minute, 2);
-    try buf.append(arena, ':');
-    try shared.appendPadded(arena, &buf, dt.time.second, 2);
-    try shared.appendFraction(arena, &buf, dt.time, digits);
+    try shared.appendWallTime(arena, &buf, dt.time, prec);
     try plain_date.appendCalendar(arena, &buf, show, dt.date.calendar);
     return buf.items;
 }
