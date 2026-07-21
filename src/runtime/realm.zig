@@ -4773,7 +4773,12 @@ pub const Realm = struct {
             try intl_obj.set("DateTimeFormat", try val_mod.makeObject(arena, dtf_ctor));
             // Intl.Collator
             const col_proto = try JsObject.create(arena, object_proto);
-            try IntlReg.method(arena, col_proto, "compare", intl_mod.nativeCollatorCompare, 0);
+            {
+                // §10.3.3: `compare` is an accessor returning a bound function.
+                const holder = try JsObject.create(arena, object_proto);
+                try holder.set("get", try val_mod.makeNativeFunctionNamedLen(arena, intl_mod.nativeCollatorCompareGetter, "get compare", 0));
+                _ = try col_proto.defineOwnAccessor("compare", try val_mod.makeObject(arena, holder), .{ .enumerable = false, .configurable = true, .writable = false });
+            }
             try IntlReg.method(arena, col_proto, "resolvedOptions", intl_mod.nativeCollatorResolved, 0);
             const col_ctor = try JsObject.create(arena, function_proto);
             try col_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeCollatorCtor));

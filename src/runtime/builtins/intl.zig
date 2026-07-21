@@ -529,7 +529,7 @@ pub fn nativeNumberFormatCtor(arena: std.mem.Allocator, this_val: Value, args: [
         try legacyServiceObj(arena, active_number_format_proto);
     for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
         _ = try canonicalizeTag(arena, t);
-    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
 
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
     if (try dnGetOption(arena, options, "numberingSystem", &.{}, null)) |ns| {
@@ -1542,7 +1542,7 @@ pub fn nativeCollatorCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
         _ = try canonicalizeTag(arena, t);
     // InitializeCollator (§10.1.2) reads the options in this exact order.
-    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
     const usage = (try dnGetOption(arena, options, "usage", &.{ "sort", "search" }, "sort")).?;
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
     if (try dnGetOption(arena, options, "collation", &.{}, null)) |c| {
@@ -1557,11 +1557,20 @@ pub fn nativeCollatorCtor(arena: std.mem.Allocator, this_val: Value, args: []con
     try obj.set("__col_sensitivity", try val_mod.makeString(arena, sensitivity));
     try obj.set("__col_numeric", try val_mod.makeBool(arena, numeric));
     try obj.set("__col_caseFirst", try val_mod.makeString(arena, caseFirst));
-    // `Intl.Collator.prototype.compare` is spec'd to return a function bound to the
-    // instance, so a detached `arr.sort(col.compare)` still sees the options. Install
-    // a per-instance bound `compare` that recovers the collator via native userdata.
-    try obj.set("compare", try val_mod.makeNativeFunctionData(arena, nativeCollatorCompare, @ptrCast(obj)));
     return val_mod.makeObject(arena, obj);
+}
+
+/// §10.3.3 `get Intl.Collator.prototype.compare`: an accessor returning a
+/// function bound to this collator, so a detached `arr.sort(col.compare)` still
+/// sees the options. Cached in [[BoundCompare]] so repeated reads are identical.
+pub fn nativeCollatorCompareGetter(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__col_usage") == null)
+        return throwTypeErrorIntl(arena, "get Intl.Collator.prototype.compare called on an incompatible receiver");
+    const o = this_val.toPtr().object;
+    if (o.getOwn("[[BoundCompare]]")) |bound| return bound;
+    const bound = try val_mod.makeNativeFunctionDataLen(arena, nativeCollatorCompare, @ptrCast(o), 2);
+    _ = try o.defineOwnData("[[BoundCompare]]", bound, .{ .writable = false, .enumerable = false, .configurable = false });
+    return bound;
 }
 
 fn asciiLower(c: u8) u8 {
@@ -1654,6 +1663,8 @@ pub fn nativeCollatorCompare(arena: std.mem.Allocator, this_val: Value, args: []
 
 /// `col.resolvedOptions()` — en-US defaults, echoing the stored options.
 pub fn nativeCollatorResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__col_usage") == null)
+        return throwTypeErrorIntl(arena, "Intl.Collator.prototype.resolvedOptions called on an incompatible receiver");
     const r = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
@@ -2347,7 +2358,7 @@ pub fn nativePluralRulesCtor(arena: std.mem.Allocator, this_val: Value, args: []
     const obj = try intlNewTarget(arena, this_val, "Intl.PluralRules");
     for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
         _ = try canonicalizeTag(arena, t);
-    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
     const typ = (try dnGetOption(arena, options, "type", &.{ "cardinal", "ordinal" }, "cardinal")).?;
     try obj.set("__pr_type", try val_mod.makeString(arena, typ));
@@ -2355,6 +2366,8 @@ pub fn nativePluralRulesCtor(arena: std.mem.Allocator, this_val: Value, args: []
 }
 
 pub fn nativePluralRulesSelect(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__pr_type") == null)
+        return throwTypeErrorIntl(arena, "Intl.PluralRules.prototype.select called on an incompatible receiver");
     var ordinal = false;
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         if (this_val.toPtr().object.get("__pr_type")) |v| if (v.bits != 0 and v.unbox() == .string) {
@@ -2384,6 +2397,8 @@ pub fn nativePluralRulesSelectRange(arena: std.mem.Allocator, this_val: Value, a
 }
 
 pub fn nativePluralRulesResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__pr_type") == null)
+        return throwTypeErrorIntl(arena, "Intl.PluralRules.prototype.resolvedOptions called on an incompatible receiver");
     const r = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
@@ -2423,7 +2438,7 @@ pub fn nativeRelativeTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, a
     const obj = try intlNewTarget(arena, this_val, "Intl.RelativeTimeFormat");
     for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
         _ = try canonicalizeTag(arena, t);
-    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
+    const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
     if (try dnGetOption(arena, options, "numberingSystem", &.{}, null)) |ns| {
         if (!isWellFormedNumberingSystem(ns)) return throwRangeError(arena, "invalid numberingSystem");
@@ -2472,14 +2487,18 @@ fn rtfValidUnit(u: []const u8) bool {
 /// values, so the two can't drift. Parts carry `unit` on everything but the
 /// surrounding literals (`NumberPart.source` doubles as the `unit` field here).
 fn rtfBuildParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) ![]NumberPart {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__rtf_numeric") == null)
+        return throwTypeErrorIntl(arena, "Intl.RelativeTimeFormat.prototype method called on an incompatible receiver");
     var numeric: []const u8 = "always";
-    if (this_val.bits != 0 and this_val.unbox() == .object) {
-        if (this_val.toPtr().object.get("__rtf_numeric")) |v| if (v.bits != 0 and v.unbox() == .string) {
-            numeric = v.unbox().string;
-        };
-    } else return throwTypeErrorIntl(arena, "Intl.RelativeTimeFormat.prototype method called on an incompatible receiver");
-    // ToNumber the value; a non-finite result is a RangeError (spec step 3).
-    const value = if (args.len > 0) try realm_mod.toNumberValue(arena, args[0]) else std.math.nan(f64);
+    if (this_val.toPtr().object.getOwn("__rtf_numeric")) |v| if (v.bits != 0 and v.unbox() == .string) {
+        numeric = v.unbox().string;
+    };
+    // ToNumber the value; a Symbol is a TypeError and a non-finite result a
+    // RangeError (spec steps 2-3, in that order).
+    const arg0 = if (args.len > 0) args[0] else Value{};
+    if (arg0.bits != 0 and arg0.unbox() == .symbol)
+        return throwTypeErrorIntl(arena, "Cannot convert a Symbol value to a number");
+    const value = try realm_mod.toNumberValue(arena, arg0);
     if (!std.math.isFinite(value)) return throwRangeError(arena, "Intl.RelativeTimeFormat.prototype.format: value must be finite");
     const unit_raw = try t_shared.valueToString(arena, if (args.len > 1) args[1] else Value{});
     const u = singularUnit(unit_raw);
@@ -2531,6 +2550,8 @@ pub fn nativeRelativeTimeFormatFormatToParts(arena: std.mem.Allocator, this_val:
 }
 
 pub fn nativeRelativeTimeFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.getOwn("__rtf_numeric") == null)
+        return throwTypeErrorIntl(arena, "Intl.RelativeTimeFormat.prototype.resolvedOptions called on an incompatible receiver");
     const r = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
@@ -2562,13 +2583,35 @@ fn dnEmptyObj(arena: std.mem.Allocator) !*JsObject {
         try JsObject.create(arena, realm_mod.active_object_proto);
 }
 
-/// GetOptionsObject (ES §9.2.13): undefined → a fresh empty object; an object →
-/// itself; any other value → TypeError. Shared by every Intl service constructor.
+/// An absent `options` argument becomes OrdinaryObjectCreate(**null**), so a
+/// getter planted on Object.prototype is never consulted for a defaulted option.
+fn emptyOptions(arena: std.mem.Allocator) !Value {
+    return val_mod.makeObject(arena, if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null));
+}
+
+/// GetOptionsObject (ES §9.2.13): undefined → a fresh null-prototype object; an
+/// object → itself; any other value → TypeError. Used by the services introduced
+/// after the option-coercion rules were tightened (ListFormat, DisplayNames,
+/// Segmenter, DurationFormat).
 pub fn dnGetOptionsObject(arena: std.mem.Allocator, options: ?Value) anyerror!Value {
-    const o = options orelse return val_mod.makeObject(arena, try dnEmptyObj(arena));
-    if (o.bits == 0 or o.unbox() == .undefined_) return val_mod.makeObject(arena, try dnEmptyObj(arena));
+    const o = options orelse return emptyOptions(arena);
+    if (o.bits == 0 or o.unbox() == .undefined_) return emptyOptions(arena);
     if (o.unbox() == .object) return o;
     return throwTypeErrorIntl(arena, "options must be an object");
+}
+
+/// CoerceOptionsToObject (ES §9.2.14): the legacy services (Collator,
+/// NumberFormat, DateTimeFormat, PluralRules, RelativeTimeFormat) ToObject their
+/// `options` instead of rejecting a primitive.
+fn coerceOptionsToObject(arena: std.mem.Allocator, options: ?Value) anyerror!Value {
+    const o = options orelse return emptyOptions(arena);
+    if (o.bits == 0 or o.unbox() == .undefined_) return emptyOptions(arena);
+    if (o.unbox() == .object) return o;
+    if (o.unbox() == .null_) return throwTypeErrorIntl(arena, "Cannot convert null to object");
+    return realm_mod.toObjectForThis(arena, o);
 }
 
 /// GetOption(options, key, string, allowed, default): reads through the active
