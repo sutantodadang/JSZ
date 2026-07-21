@@ -282,14 +282,7 @@ fn balanceTime(total_ns: i128, largest: shared.Unit) shared.DurationFields {
         rem = @mod(rem, shared.NS_PER_MICRO);
     }
     d.nanoseconds = @floatFromInt(@as(i128, (rem)));
-    if (neg) {
-        d.hours = -d.hours;
-        d.minutes = -d.minutes;
-        d.seconds = -d.seconds;
-        d.milliseconds = -d.milliseconds;
-        d.microseconds = -d.microseconds;
-        d.nanoseconds = -d.nanoseconds;
-    }
+    if (neg) d = shared.negateDuration(d);
     return d;
 }
 
@@ -316,7 +309,7 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const mode = try shared.getRoundingMode(arena, opts, .half_expand);
     const inc = try shared.getRoundingIncrement(arena, opts);
     const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
-    const rounded = shared.roundI128ToIncrement(ins.*, inc_ns, mode);
+    const rounded = shared.roundI128AsIfPositive(ins.*, inc_ns, mode);
     return makeInstant(arena, rounded);
 }
 
@@ -385,7 +378,7 @@ pub fn nativeToZonedDateTimeISO(arena: std.mem.Allocator, this_val: Value, args:
 
 fn instantToString(arena: std.mem.Allocator, raw_ns: i128, prec: shared.SecondsPrecision) ![]const u8 {
     const inc = shared.precisionIncrementNanos(prec);
-    const ns = if (inc > 1) shared.roundI128ToIncrement(raw_ns, inc, prec.mode) else raw_ns;
+    const ns = if (inc > 1) shared.roundI128AsIfPositive(raw_ns, inc, prec.mode) else raw_ns;
     const days: i64 = @intCast(@divFloor(ns, shared.NS_PER_DAY));
     const time_of_day: i128 = ns - @as(i128, days) * shared.NS_PER_DAY;
     const date = shared.epochDaysToISODate(days);

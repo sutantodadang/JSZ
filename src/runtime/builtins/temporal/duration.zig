@@ -130,7 +130,7 @@ fn toDurationFromFields(arena: std.mem.Allocator, o: *JsObject, require_any: boo
     var any = false;
     const names = [_][]const u8{ "days", "hours", "microseconds", "milliseconds", "minutes", "months", "nanoseconds", "seconds", "weeks", "years" };
     for (names) |name| {
-        if (o.get(name)) |fv| {
+        if (try shared.getField(arena, o, name)) |fv| {
             if (fv.bits != 0 and fv.unbox() != .undefined_) {
                 const n = try shared.toIntegerIfIntegral(arena, fv);
                 any = true;
@@ -263,7 +263,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const names = [_][]const u8{ "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds", "nanoseconds" };
     var any = false;
     for (names) |name| {
-        if (o.get(name)) |fv| {
+        if (try shared.getField(arena, o, name)) |fv| {
             if (fv.bits != 0 and fv.unbox() != .undefined_) {
                 const n = try shared.toIntegerIfIntegral(arena, fv);
                 assignField(&d, name, n);
@@ -296,21 +296,7 @@ pub fn nativeAbs(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     return makeDuration(arena, r);
 }
 
-pub fn negate(d: DurationFields) DurationFields {
-    // Preserve -0 as 0: multiply then add 0.0 to normalize.
-    return .{
-        .years = -d.years + 0.0,
-        .months = -d.months + 0.0,
-        .weeks = -d.weeks + 0.0,
-        .days = -d.days + 0.0,
-        .hours = -d.hours + 0.0,
-        .minutes = -d.minutes + 0.0,
-        .seconds = -d.seconds + 0.0,
-        .milliseconds = -d.milliseconds + 0.0,
-        .microseconds = -d.microseconds + 0.0,
-        .nanoseconds = -d.nanoseconds + 0.0,
-    };
-}
+pub const negate = shared.negateDuration;
 
 pub fn nativeAdd(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     return addSubtract(arena, this_val, args, false);

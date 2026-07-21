@@ -164,8 +164,7 @@ fn readTimeFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overf
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
-    const v = o.get(name) orelse return null;
-    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    const v = (try shared.getField(arena, o, name)) orelse return null;
     return try shared.toIntegerWithTruncation(arena, v);
 }
 
@@ -211,13 +210,7 @@ fn addSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, subtra
     return makeDateTime(arena, .{ .date = new_date, .time = tr.time });
 }
 
-fn negate(d: shared.DurationFields) shared.DurationFields {
-    return .{
-        .years = -d.years, .months = -d.months, .weeks = -d.weeks, .days = -d.days,
-        .hours = -d.hours, .minutes = -d.minutes, .seconds = -d.seconds,
-        .milliseconds = -d.milliseconds, .microseconds = -d.microseconds, .nanoseconds = -d.nanoseconds,
-    };
-}
+const negate = shared.negateDuration;
 
 fn durTimeNanos(d: shared.DurationFields) i128 {
     return @as(i128, @intFromFloat(d.hours)) * shared.NS_PER_HOUR +

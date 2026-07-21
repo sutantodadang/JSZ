@@ -640,8 +640,7 @@ pub fn withDateFields(arena: std.mem.Allocator, cur: ISODate, o: *JsObject, over
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
-    const v = o.get(name) orelse return null;
-    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    const v = (try shared.getField(arena, o, name)) orelse return null;
     return try shared.toIntegerWithTruncation(arena, v);
 }
 

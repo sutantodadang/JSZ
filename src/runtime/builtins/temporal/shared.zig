@@ -839,20 +839,28 @@ pub fn parseISODuration(s0: []const u8) ParseError!DurationFields {
     if (!any) return error.Invalid;
     if (!p.eof()) return error.Invalid;
 
-    if (factor < 0) {
-        out.years = -out.years;
-        out.months = -out.months;
-        out.weeks = -out.weeks;
-        out.days = -out.days;
-        out.hours = -out.hours;
-        out.minutes = -out.minutes;
-        out.seconds = -out.seconds;
-        out.milliseconds = -out.milliseconds;
-        out.microseconds = -out.microseconds;
-        out.nanoseconds = -out.nanoseconds;
-    }
+    if (factor < 0) out = negateDuration(out);
     return out;
 }
+
+/// Negate every component, leaving empty ones at +0. Duration fields are
+/// observable through `Object.is`, so a backwards result whose minutes happen
+/// to be zero must report 0 rather than -0.
+pub fn negateDuration(d: DurationFields) DurationFields {
+    return .{
+        .years = -d.years + 0.0,
+        .months = -d.months + 0.0,
+        .weeks = -d.weeks + 0.0,
+        .days = -d.days + 0.0,
+        .hours = -d.hours + 0.0,
+        .minutes = -d.minutes + 0.0,
+        .seconds = -d.seconds + 0.0,
+        .milliseconds = -d.milliseconds + 0.0,
+        .microseconds = -d.microseconds + 0.0,
+        .nanoseconds = -d.nanoseconds + 0.0,
+    };
+}
+
 
 fn sliceInt(s: []const u8, start: usize) []const u8 {
     var i = start;
@@ -959,6 +967,26 @@ pub fn roundI128ToIncrement(x: i128, increment: i128, mode: RoundingMode) i128 {
         result_q += if (neg) -1 else 1;
     }
     return result_q * increment;
+}
+
+/// RoundNumberToIncrementAsIfPositive: round on the number line rather than
+/// around zero. An Instant's epoch nanoseconds are negative before 1970, but
+/// "floor" on a pre-1970 instant still has to mean *earlier* — towards the Big
+/// Bang, not towards the epoch — so the sign plays no part in the direction.
+pub fn roundI128AsIfPositive(x: i128, increment: i128, mode: RoundingMode) i128 {
+    if (increment == 0) return x;
+    const q = @divFloor(x, increment);
+    const r = x - q * increment; // 0 <= r < increment
+    if (r == 0) return x;
+    const twice = r * 2;
+    const round_up = switch (mode) {
+        .ceil, .expand => true,
+        .floor, .trunc => false,
+        .half_ceil, .half_expand => twice >= increment,
+        .half_floor, .half_trunc => twice > increment,
+        .half_even => if (twice != increment) twice > increment else @mod(q, 2) != 0,
+    };
+    return (q + @as(i128, if (round_up) 1 else 0)) * increment;
 }
 
 fn applyRounding(q: f64, mode: RoundingMode) f64 {

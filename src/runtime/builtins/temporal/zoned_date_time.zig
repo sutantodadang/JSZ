@@ -289,8 +289,7 @@ fn readTimeFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overf
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
-    const v = o.get(name) orelse return null;
-    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    const v = (try shared.getField(arena, o, name)) orelse return null;
     return try shared.toIntegerWithTruncation(arena, v);
 }
 
@@ -674,13 +673,7 @@ fn addSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, subtra
     return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
 }
 
-fn negate(d: shared.DurationFields) shared.DurationFields {
-    return .{
-        .years = -d.years, .months = -d.months, .weeks = -d.weeks, .days = -d.days,
-        .hours = -d.hours, .minutes = -d.minutes, .seconds = -d.seconds,
-        .milliseconds = -d.milliseconds, .microseconds = -d.microseconds, .nanoseconds = -d.nanoseconds,
-    };
-}
+const negate = shared.negateDuration;
 
 pub fn nativeAdd(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     return addSub(arena, this_val, args, false);
@@ -913,7 +906,7 @@ pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const V
     const prec = try shared.getSecondsPrecision(arena, opts, true);
     const show_tz = try getShowTimeZoneName(arena, opts);
     const inc_ns = shared.precisionIncrementNanos(prec);
-    const z_ns = if (inc_ns > 1) shared.roundI128ToIncrement(z.ns, inc_ns, prec.mode) else z.ns;
+    const z_ns = if (inc_ns > 1) shared.roundI128AsIfPositive(z.ns, inc_ns, prec.mode) else z.ns;
     const s = try zonedToString(arena, z_ns, z.offset_ns, z.tz, z.calendar, prec, show_cal, show_off, show_tz);
     return val_mod.makeString(arena, s);
 }

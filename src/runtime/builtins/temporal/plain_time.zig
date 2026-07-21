@@ -137,8 +137,7 @@ fn timeFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overf
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
-    const v = o.get(name) orelse return null;
-    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    const v = (try shared.getField(arena, o, name)) orelse return null;
     return try shared.toIntegerWithTruncation(arena, v);
 }
 
@@ -265,16 +264,7 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     return duration.makeDuration(arena, balanceTime(rounded, largest.?));
 }
 
-fn negateDur(d: shared.DurationFields) shared.DurationFields {
-    var r = d;
-    r.hours = -r.hours;
-    r.minutes = -r.minutes;
-    r.seconds = -r.seconds;
-    r.milliseconds = -r.milliseconds;
-    r.microseconds = -r.microseconds;
-    r.nanoseconds = -r.nanoseconds;
-    return r;
-}
+const negateDur = shared.negateDuration;
 
 fn isTimeUnit(u: shared.Unit) bool {
     return switch (u) {
