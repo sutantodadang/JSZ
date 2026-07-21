@@ -260,7 +260,7 @@ fn od(s: []const u8, i: usize) ?i128 {
 }
 
 /// Convert a value to a ZonedDateTime (used by from/compare/equals/since/until).
-fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts: ?*JsObject) !ZonedDT {
+pub fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts: ?*JsObject) !ZonedDT {
     if (getZoned(v)) |z| return z.*;
     if (v.bits != 0 and v.unbox() == .object) {
         return try zonedFromFields(arena, v.toPtr().object, opts);
