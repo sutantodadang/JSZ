@@ -4692,6 +4692,8 @@ pub const Realm = struct {
         // now that @@iterator / @@toStringTag exist. Array + TypedArray iterators
         // all inherit from it.
         try es2015_collections_mod.initArrayIteratorProto(arena, object_proto);
+        // %RegExpStringIteratorPrototype% hangs off %IteratorPrototype%.
+        try regexp_mod.initStringIteratorProto(arena);
 
         // ---- ES2024 Iterator global (map/filter/take/drop/… helpers) ----
         try es2015_collections_mod.registerIteratorGlobal(&reg_ctx);

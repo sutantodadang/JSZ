@@ -1123,6 +1123,12 @@ pub const FnCompiler = struct {
             if (a.target.kind == .identifier and a.value.kind == .function_expr) {
                 self.name_hint = a.target.data.identifier;
             }
+            // `obj[k] = v`: the LeftHandSideExpression is evaluated (base, then
+            // key expression) BEFORE the RHS — only ToPropertyKey is deferred to
+            // PutValue. Route through the shared member-assign path so neither
+            // sub-expression is evaluated twice or out of order.
+            if (a.target.kind == .member_expr and !a.target.data.member_expr.private_define)
+                return self.compileMemberAssign(a, line);
             const rhs = try self.compileExpr(a.value);
             self.name_hint = null; // defensive clear (no-op if consumed inside)
             if (a.target.kind == .identifier) {
@@ -1143,7 +1149,10 @@ pub const FnCompiler = struct {
             .logical_and, .logical_or, .logical_nullish => return self.compileLogicalAssign(a, line),
             else => {},
         }
-        // Compound assignment.
+        // Compound assignment. A member target needs the base/key evaluated once
+        // and reused for both the read and the write-back.
+        if (a.target.kind == .member_expr and !a.target.data.member_expr.private_define)
+            return self.compileMemberAssign(a, line);
         const rcur = try self.compileExpr(a.target);
         const rrhs = try self.compileExpr(a.value);
         self.sp = rcur;
@@ -1598,6 +1607,96 @@ pub const FnCompiler = struct {
     /// evaluated a single time, then reused for both the read (GetValue) and, on
     /// the assign branch, the write (PutValue). This also makes a nullish base
     /// throw a TypeError before the RHS runs, per RequireObjectCoercible.
+    /// `obj.k <op>= v` / `obj[k] <op>= v` (including the plain `=` form).
+    ///
+    /// Spec order (§13.15.2 + §6.2.5.6 PutValue): evaluate the base, then the key
+    /// *expression* — ToPropertyKey is deferred — then, for a compound operator,
+    /// GetValue, then the RHS, and only then the store. Keeping the base/key in
+    /// their own registers across the whole sequence also guarantees each is
+    /// evaluated exactly once, which the naive "compile target, compile value,
+    /// compile target again" shape did not.
+    fn compileMemberAssign(self: *Self, a: ast.AssignExpr, line: u32) error{OutOfMemory}!u8 {
+        const me = a.target.data.member_expr;
+        const robj = try self.compileExpr(me.object);
+        // A static/literal key is a constant; a computed expression key lives in
+        // its own register so it is evaluated once, before the RHS.
+        var static_kidx: ?u16 = null;
+        var rkey: u8 = 0;
+        if (!me.computed) {
+            static_kidx = try self.addConstant(try val_mod.makeString(self.arena, me.property.data.identifier));
+        } else if (me.property.kind == .string_literal) {
+            static_kidx = try self.addConstant(try val_mod.makeString(self.arena, me.property.data.string_literal));
+        } else if (me.property.kind == .number_literal) {
+            const key_str = std.fmt.allocPrint(self.arena, "{d}", .{me.property.data.number_literal}) catch return error.OutOfMemory;
+            static_kidx = try self.addConstant(try val_mod.makeString(self.arena, key_str));
+        } else {
+            rkey = try self.compileExpr(me.property);
+        }
+
+        const rres = blk: {
+            if (a.op == .assign) {
+                const rrhs = try self.compileExpr(a.value);
+                break :blk rrhs;
+            }
+            // Compound: read the current value through the saved base/key.
+            const rcur = self.allocReg();
+            if (static_kidx) |kidx| {
+                try self.emitOp(.GET_PROP, line);
+                try self.emitU8(rcur);
+                try self.emitU8(robj);
+                try self.emitU16(kidx);
+            } else {
+                try self.emitOp(.GET_PROP_DYN, line);
+                try self.emitU8(rcur);
+                try self.emitU8(robj);
+                try self.emitU8(rkey);
+            }
+            const rrhs = try self.compileExpr(a.value);
+            try self.emitOp(compoundOp(a.op), line);
+            try self.emitU8(rcur);
+            try self.emitU8(rcur);
+            try self.emitU8(rrhs);
+            break :blk rcur;
+        };
+
+        if (static_kidx) |kidx| {
+            try self.emitOp(.SET_PROP, line);
+            try self.emitU8(robj);
+            try self.emitU16(kidx);
+            try self.emitU8(rres);
+        } else {
+            try self.emitOp(.SET_PROP_DYN, line);
+            try self.emitU8(robj);
+            try self.emitU8(rkey);
+            try self.emitU8(rres);
+        }
+        // Collapse the result down to where compilation started.
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(robj);
+        try self.emitU8(rres);
+        self.sp = robj + 1;
+        return robj;
+    }
+
+    /// Map a compound-assignment operator to its binary opcode.
+    fn compoundOp(op: ast.AssignOp) Op {
+        return switch (op) {
+            .add => .ADD,
+            .sub => .SUB,
+            .mul => .MUL,
+            .div => .DIV,
+            .mod => .MOD,
+            .exp => .EXP,
+            .bit_and => .BIT_AND,
+            .bit_or => .BIT_OR,
+            .bit_xor => .BIT_XOR,
+            .lshift => .SHL,
+            .rshift => .SHR,
+            .urshift => .USHR,
+            .assign, .logical_and, .logical_or, .logical_nullish => unreachable,
+        };
+    }
+
     fn compileLogicalAssignMember(self: *Self, a: ast.AssignExpr, skip_op: Op, line: u32) error{OutOfMemory}!u8 {
         const me = a.target.data.member_expr;
         const robj = try self.compileExpr(me.object);

@@ -483,7 +483,7 @@ pub const RegexNode = union(enum) {
         negative: bool,
     },
     /// Phase 4d: backreference \1..\9
-    back_ref: u8, // group index 1-9
+    back_ref: u8, // group index 1..MAX_CAPTURES-1
     /// ES2025 RegExp modifiers `(?ims-ims: ... )`: rebinds the i/m/s flags for
     /// the enclosed disjunction only. `add` and `remove` can never overlap --
     /// the parser rejects a modifier listed on both sides.
@@ -1255,7 +1255,28 @@ const PatternParser = struct {
         const h3 = hexVal(self.src[self.pos + 2]) orelse return ParseError.InvalidPattern;
         const h4 = hexVal(self.src[self.pos + 3]) orelse return ParseError.InvalidPattern;
         self.pos += 4;
-        return @intCast(@as(u32, h1) * 4096 + @as(u32, h2) * 256 + @as(u32, h3) * 16 + h4);
+        const unit: u32 = @as(u32, h1) * 4096 + @as(u32, h2) * 256 + @as(u32, h3) * 16 + h4;
+        // Under /u a lead surrogate escape immediately followed by a trail
+        // surrogate escape is one RegExpUnicodeEscapeSequence denoting the
+        // combined astral code point (`/𝌆/u` === `/\u{1d306}/u`).
+        if (self.unicode and unit >= 0xD800 and unit <= 0xDBFF and self.pos + 5 < self.src.len and
+            self.src[self.pos] == '\\' and self.src[self.pos + 1] == 'u')
+        {
+            if (hexVal(self.src[self.pos + 2])) |t1| {
+                if (hexVal(self.src[self.pos + 3])) |t2| {
+                    if (hexVal(self.src[self.pos + 4])) |t3| {
+                        if (hexVal(self.src[self.pos + 5])) |t4| {
+                            const trail: u32 = @as(u32, t1) * 4096 + @as(u32, t2) * 256 + @as(u32, t3) * 16 + t4;
+                            if (trail >= 0xDC00 and trail <= 0xDFFF) {
+                                self.pos += 6;
+                                return @intCast(0x10000 + ((unit - 0xD800) << 10) + (trail - 0xDC00));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return @intCast(unit);
     }
 
     /// Parse the end of a char-class range that starts with \. Returns codepoint.
@@ -1279,15 +1300,25 @@ const PatternParser = struct {
         if (self.eof()) return ParseError.InvalidPattern;
         const c = self.cur();
         self.advance();
-        // Backreferences \1..\9
+        // Backreferences \1..\N. A DecimalEscape swallows *all* following digits,
+        // so `\10` is group 10 in a pattern with ten groups (not `\1` then '0').
         if (c >= '1' and c <= '9') {
-            const idx: u8 = c - '0';
+            const digits_start = self.pos - 1;
+            var num: u32 = c - '0';
+            while (!self.eof() and self.cur() >= '0' and self.cur() <= '9') {
+                num = num * 10 + (self.cur() - '0');
+                if (num > 0xFFFF) break;
+                self.advance();
+            }
+            if (num <= self.total_caps) return RegexNode{ .back_ref = @intCast(num) };
             // Under /u a DecimalEscape is always a backreference, so naming a
             // group that does not exist is an early error. Without /u the same
             // spelling falls back to a legacy octal escape (Annex B), which the
-            // matcher approximates as a never-matching backreference.
-            if (self.unicode and idx > self.total_caps) return ParseError.InvalidPattern;
-            return RegexNode{ .back_ref = idx };
+            // matcher approximates as a never-matching backreference — re-read
+            // just the leading digit so the rest stays literal.
+            if (self.unicode) return ParseError.InvalidPattern;
+            self.pos = digits_start + 1;
+            return RegexNode{ .back_ref = @intCast(c - '0') };
         }
         // Named backreference \k<name> (only meaningful when the pattern has
         // named groups; otherwise `\k` is a literal 'k' in non-unicode mode).
@@ -2912,24 +2943,25 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         getCompiledRegex(pattern_arg)
     else
         null;
-    if (!is_construct and flags_undefined and pattern_cr != null and try isRegExpValue(arena, pattern_arg)) {
-        const ctor_v = pattern_arg.toPtr().object.get("constructor");
-        if (ctor_v) |cv| {
-            if (cv.bits != 0 and cv.unbox() == .object and
-                active_regexp_ctor == cv.toPtr().object) return pattern_arg;
-        }
+    // Step 1: patternIsRegExp = IsRegExp(pattern) — observable via @@match.
+    const pattern_is_regexp = try isRegExpValue(arena, pattern_arg);
+    if (!is_construct and flags_undefined and pattern_is_regexp) {
+        const ctor_v = try ctxGetProp(arena, pattern_arg, "constructor");
+        if (ctor_v.bits != 0 and ctor_v.unbox() == .object and
+            active_regexp_ctor == ctor_v.toPtr().object) return pattern_arg;
     }
 
-    // Step 3/5 + RegExpInitialize: P is the source of a RegExp argument, else
-    // ToString(pattern) (undefined → ""); F is ToString(flags) (undefined → the
-    // RegExp argument's own flags, else "").
-    const pattern_str: []const u8 = if (pattern_cr) |pcr| blk: {
+    // Steps 4-6 + RegExpInitialize: P/F come from the [[OriginalSource]] slot for
+    // a real RegExp, from Get(pattern, "source"/"flags") for a merely
+    // RegExp-*like* object, and from ToString(pattern)/ToString(flags) otherwise.
+    const pattern_str: []const u8 = if (pattern_cr != null) blk: {
         if (pattern_arg.toPtr().object.get("[[OriginalSource]]")) |sv| {
             if (sv.bits != 0 and sv.unbox() == .string) break :blk sv.toPtr().string;
         }
-        _ = pcr;
         break :blk "";
-    } else if (pattern_arg.bits == 0 or pattern_arg.unbox() == .undefined_)
+    } else if (pattern_is_regexp)
+        try realm_mod.stringPrimitive(arena, try ctxGetProp(arena, pattern_arg, "source"))
+    else if (pattern_arg.bits == 0 or pattern_arg.unbox() == .undefined_)
         ""
     else
         try realm_mod.stringPrimitive(arena, pattern_arg);
@@ -2938,6 +2970,8 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         try realm_mod.stringPrimitive(arena, flags_arg)
     else if (pattern_cr) |pcr|
         try flagsToString(arena, pcr.flags)
+    else if (pattern_is_regexp)
+        try realm_mod.stringPrimitive(arena, try ctxGetProp(arena, pattern_arg, "flags"))
     else
         "";
 
@@ -3761,16 +3795,90 @@ pub fn nativeRegExpSymbolSplit(arena: std.mem.Allocator, this_val: Value, args: 
     return val_mod.makeObject(arena, arr);
 }
 
-/// RegExp.prototype[@@matchAll] (ES §22.2.6.9): eagerly collect all matches and
-/// return an array iterator over them (the observable order/values match a lazy
-/// RegExpStringIterator for the common cases the tests exercise).
+// ==================================================== %RegExpStringIterator% ==
+
+/// Per-instance state for a RegExp String Iterator (ES §22.2.9.1). Lives on the
+/// iterator object's `internal_slot`; the GC traces `regexp`/`string` through
+/// the `.regexp_string_iterator` brand.
+pub const RegExpStringIterData = struct {
+    regexp: Value,
+    string: Value,
+    global: bool,
+    unicode: bool,
+    done: bool = false,
+};
+
+/// %RegExpStringIteratorPrototype% for the active realm.
+pub var active_regexp_string_iter_proto: ?*JsObject = null;
+
+/// Build %RegExpStringIteratorPrototype%. Must run after %IteratorPrototype%
+/// exists (i.e. after es2015_collections.initArrayIteratorProto).
+pub fn initStringIteratorProto(arena: std.mem.Allocator) !void {
+    const parent = @import("es2015_collections.zig").active_iterator_proto orelse return;
+    const p = try JsObject.create(arena, parent);
+    _ = try p.defineOwnData(
+        "next",
+        try val_mod.makeNativeFunctionNamed(arena, nativeRegExpStringIterNext, "next", 0),
+        .{ .writable = true, .enumerable = false, .configurable = true },
+    );
+    if (realm_mod.active_sym_to_string_tag) |tag|
+        try p.setSymAttr(tag, try val_mod.makeString(arena, "RegExp String Iterator"), .{ .writable = false, .enumerable = false, .configurable = true });
+    active_regexp_string_iter_proto = p;
+}
+
+/// GC trace hook for `.regexp_string_iterator` objects — keeps the iterated
+/// RegExp and string alive for the iterator's lifetime.
+pub fn gcTraceStringIterator(heap: anytype, obj: *JsObject) void {
+    const d: *RegExpStringIterData = @ptrCast(@alignCast(obj.internal_slot orelse return));
+    heap.markValueLive(d.regexp);
+    heap.markValueLive(d.string);
+}
+
+fn iterResult(arena: std.mem.Allocator, value: Value, done: bool) !Value {
+    const o = try JsObject.create(arena, realm_mod.active_object_proto);
+    try o.set("value", value);
+    try o.set("done", try val_mod.makeBool(arena, done));
+    return val_mod.makeObject(arena, o);
+}
+
+/// %RegExpStringIteratorPrototype%.next (ES §22.2.9.2.1).
+fn nativeRegExpStringIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object or
+        this_val.toPtr().object.internal_kind != .regexp_string_iterator)
+        return realm_mod.throwTypeError(arena, "next called on a non-RegExpStringIterator");
+    const obj = this_val.toPtr().object;
+    const d: *RegExpStringIterData = @ptrCast(@alignCast(obj.internal_slot.?));
+    const undef = try val_mod.makeUndefined(arena);
+    if (d.done) return iterResult(arena, undef, true);
+
+    const match = try regExpExec(arena, d.regexp, d.string);
+    if (match.bits == 0 or match.unbox() == .null_ or match.unbox() == .undefined_) {
+        d.done = true;
+        return iterResult(arena, undef, true);
+    }
+    if (!d.global) {
+        d.done = true;
+        return iterResult(arena, match, false);
+    }
+    // A zero-length match must advance lastIndex, else the loop never ends.
+    const match_str = try getStrProp(arena, match, "0");
+    if (match_str.len == 0) {
+        const s_str = if (d.string.unbox() == .string) d.string.unbox().string else "";
+        const li = try realm_mod.toLengthValue(arena, try ctxGetProp(arena, d.regexp, "lastIndex"));
+        try ctxSetProp(arena, d.regexp, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(advanceStringIndex(s_str, li, d.unicode))));
+    }
+    return iterResult(arena, match, false);
+}
+
+/// RegExp.prototype[@@matchAll] (ES §22.2.6.9): build a lazy RegExpStringIterator
+/// over a species-constructed clone of `this`.
 pub fn nativeRegExpSymbolMatchAll(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireObject(arena, this_val, "RegExp.prototype[Symbol.matchAll]");
     const s_str = if (args.len > 0) try realm_mod.stringPrimitive(arena, args[0]) else "undefined";
     const s_val = try val_mod.makeString(arena, s_str);
 
     // §22.2.6.9: matcher = Construct(SpeciesConstructor(R, %RegExp%), [R, flags]).
-    // global / fullUnicode are read from R's OWN flags, not the matcher's.
+    // global / fullUnicode are read from the MATCHER's flags string.
     const default_ctor: Value = if (active_regexp_ctor) |c| try val_mod.makeObject(arena, c) else try ctxGetProp(arena, this_val, "constructor");
     const c = try speciesConstructor(arena, this_val, default_ctor);
     const flags = try getStrProp(arena, this_val, "flags");
@@ -3781,29 +3889,18 @@ pub fn nativeRegExpSymbolMatchAll(arena: std.mem.Allocator, this_val: Value, arg
     const start_li = try realm_mod.toLengthValue(arena, try ctxGetProp(arena, this_val, "lastIndex"));
     try ctxSetProp(arena, matcher, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(start_li)));
 
-    const matches = try JsObject.createArray(arena, realm_mod.active_array_proto);
-    var count: u32 = 0;
-    while (true) {
-        const result = try regExpExec(arena, matcher, s_val);
-        if (result.bits == 0 or result.unbox() == .null_) break;
-        const key = try std.fmt.allocPrint(arena, "{d}", .{count});
-        try matches.set(key, result);
-        count += 1;
-        if (!global) break;
-        const match_str = try getStrProp(arena, result, "0");
-        if (match_str.len == 0) {
-            const li = try realm_mod.toLengthValue(arena, try ctxGetProp(arena, matcher, "lastIndex"));
-            try ctxSetProp(arena, matcher, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(advanceStringIndex(s_str, li, unicode))));
-        }
-    }
-    matches.array_length = count;
-    // Return an array iterator over the collected match arrays.
-    const arr_val = try val_mod.makeObject(arena, matches);
-    if (realm_mod.active_context) |ctx| {
-        const values_fn = try ctx.getProp(arena, arr_val, "values");
-        return fp.invokeCallback(arena, arr_val, values_fn, &[_]Value{});
-    }
-    return arr_val;
+    const d = try arena.create(RegExpStringIterData);
+    d.* = .{ .regexp = matcher, .string = s_val, .global = global, .unicode = unicode };
+    const it = if (realm_mod.active_heap) |h|
+        try JsObject.createOnHeap(h, active_regexp_string_iter_proto)
+    else
+        try JsObject.create(arena, active_regexp_string_iter_proto);
+    it.internal_slot = d;
+    it.internal_kind = .regexp_string_iterator;
+    // Bootstrap fallback: no shared prototype yet, so carry `next` directly.
+    if (active_regexp_string_iter_proto == null)
+        try it.set("next", try val_mod.makeNativeFunctionNamed(arena, nativeRegExpStringIterNext, "next", 0));
+    return val_mod.makeObject(arena, it);
 }
 
 /// Install RegExp.prototype[@@match/@@replace/@@search/@@split/@@matchAll].
@@ -3820,6 +3917,19 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
         _ = try proto.defineOwnDataSym(sym, try val_mod.makeNativeFunctionNamed(arena, nativeRegExpSymbolSplit, "[Symbol.split]", 2), attr);
     if (realm_mod.active_sym_match_all) |sym|
         _ = try proto.defineOwnDataSym(sym, try val_mod.makeNativeFunctionNamed(arena, nativeRegExpSymbolMatchAll, "[Symbol.matchAll]", 1), attr);
+    // get RegExp[@@species] — an accessor with no setter, returning `this`.
+    if (realm_mod.active_sym_species) |sym| {
+        if (active_regexp_ctor) |c| {
+            const holder = try JsObject.create(arena, null);
+            try holder.set("get", try val_mod.makeNativeFunctionNamed(arena, nativeRegExpGetSpecies, "get [Symbol.species]", 0));
+            try c.setSymAttr(sym, try val_mod.makeObject(arena, holder), .{ .writable = false, .enumerable = false, .configurable = true, .is_accessor = true });
+        }
+    }
+}
+
+/// get RegExp[@@species] (ES §22.2.5.2) — returns the receiver unchanged.
+fn nativeRegExpGetSpecies(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return this_val;
 }
 
 // ============================================================= Prototype Getters

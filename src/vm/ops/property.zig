@@ -20,6 +20,22 @@ const namespace_mod = @import("../../runtime/builtins/namespace.zig");
 const typed_array = @import("../../runtime/builtins/typed_array.zig");
 const string_proto = @import("../../runtime/builtins/string_proto.zig");
 
+/// ToPropertyKey's string half (ES §7.1.19): an object key first goes through
+/// ToPrimitive(string) — running a user `@@toPrimitive`/`toString`/`valueOf`,
+/// which may throw — before being stringified. Symbols are handled by the
+/// callers' dedicated branches and never reach here.
+fn toPropertyKeyString(self: *BcVm, key_val: Value) ![]const u8 {
+    if (key_val.bits != 0 and bcv.isObjectOperand(key_val)) {
+        if (try @import("../../runtime/builtins/coercion.zig").toPrimitive(self.arena, key_val, .string)) |p| {
+            // ToPrimitive may yield a Symbol (via @@toPrimitive); such a key is a
+            // symbol property, which the callers' symbol branch owns — but the
+            // string form is the only channel here, so fall through to it.
+            return bcv.valueToStringArena(self.arena, p);
+        }
+    }
+    return bcv.valueToStringArena(self.arena, key_val);
+}
+
 /// A number Value → canonical array index (integer in [0, 2^32-2]), or null.
 /// Lets `a[i]` reads/writes hit the dense integer path without stringifying `i`.
 inline fn canonicalIndexFromValue(v: Value) ?u32 {
@@ -54,6 +70,18 @@ fn strictAssignThrow(self: *BcVm) !?RunOutcome {
 fn nullishReadThrow(self: *BcVm, obj_val: Value, key_desc: []const u8) !?RunOutcome {
     const kind: []const u8 = if (obj_val.isNull()) "null" else "undefined";
     const msg = try std.fmt.allocPrint(self.arena, "Cannot read properties of {s} (reading '{s}')", .{ kind, key_desc });
+    const exc = try self.makeErrorObjectBc("TypeError", msg);
+    self.last_exception_value = exc;
+    const found = try self.throwException(exc);
+    if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc } };
+    return null;
+}
+
+/// PutValue step 5.a — ToObject(V.[[Base]]) throws a TypeError for a nullish
+/// base, *after* the RHS has been evaluated (`null.x = f()` still calls `f`).
+fn nullishWriteThrow(self: *BcVm, obj_val: Value, key_desc: []const u8) !?RunOutcome {
+    const kind: []const u8 = if (obj_val.isNull()) "null" else "undefined";
+    const msg = try std.fmt.allocPrint(self.arena, "Cannot set properties of {s} (setting '{s}')", .{ kind, key_desc });
     const exc = try self.makeErrorObjectBc("TypeError", msg);
     self.last_exception_value = exc;
     const found = try self.throwException(exc);
@@ -285,7 +313,11 @@ pub inline fn opGetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             }
         }
         const frame_idx_dyn2 = self.frames.items.len - 1;
-        const key = try bcv.valueToStringArena(self.arena, key_val);
+        const key = toPropertyKeyString(self, key_val) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in ToPropertyKey")) |oc| return oc;
+            return null;
+        };
         const result_dyn2 = self.getProp(obj_val, key) catch |e| {
             if (e != error.JsException) return e;
             if (try self.raisePendingException("error in getter")) |oc| return oc;
@@ -312,6 +344,7 @@ pub inline fn opSetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const key = key_val.toPtr().string;
     const obj_val = frame.registers[robj];
     const val = frame.registers[rval];
+    if (obj_val.isNullish()) return nullishWriteThrow(self, obj_val, key);
     // A static-key `#x = v` write is a PrivateElement [[Set]]. Handle the private
     // accessor case here (invoke its setter, or TypeError when it has none);
     // everything else (a new field → PrivateFieldAdd, or updating an existing
@@ -421,6 +454,13 @@ pub inline fn opSetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const obj_val = frame.registers[robj];
     const key_val = frame.registers[rkey];
     const val = frame.registers[rval];
+    if (obj_val.isNullish()) {
+        const key_desc: []const u8 = if (key_val.bits != 0 and key_val.unbox() == .string)
+            key_val.toPtr().string
+        else
+            "";
+        return nullishWriteThrow(self, obj_val, key_desc);
+    }
     if (key_val.bits != 0 and key_val.unbox() == .string) {
         const key = key_val.toPtr().string;
         const set_dyn_func = frame.func;
@@ -467,7 +507,11 @@ pub inline fn opSetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 }
             }
         }
-        const key = try bcv.valueToStringArena(self.arena, key_val);
+        const key = toPropertyKeyString(self, key_val) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in ToPropertyKey")) |oc| return oc;
+            return null;
+        };
         self.setProp(obj_val, key, val) catch |e| {
             if (e != error.JsException) return e;
             if (try self.raisePendingException("error in setter")) |oc| return oc;
