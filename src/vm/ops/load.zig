@@ -253,7 +253,13 @@ pub inline fn opHoistVar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         (globalObjectOwn(frame, name) orelse undef)
     else
         undef;
-    target.hoistVar(name, seed) catch return error.OutOfMemory;
+    // A binding eval introduces into a *function* var scope is deletable; a
+    // global one is deleted through the global object's [[Delete]] instead
+    // (mirrorGlobalBindingOpts makes that property configurable for eval).
+    if (frame.func.is_eval and target.parent != null)
+        target.hoistVarDeletable(name, seed) catch return error.OutOfMemory
+    else
+        target.hoistVar(name, seed) catch return error.OutOfMemory;
     // ES §9.1.1.4.17 CreateGlobalVarBinding: a top-level `var`/function name in
     // Script or eval code reserves an own property of the global object at
     // declaration-instantiation time, even when it is never assigned (`var x;`
@@ -587,8 +593,8 @@ pub inline fn opDeleteName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     //    non-deletable (false). A global object-record binding (var/function/
     //    implicit/builtin) defers to the global object's [[Delete]] below.
     const classify = frame.env.deleteName(name);
-    if (classify == .not_deletable) {
-        frame.registers[rdst] = try val_mod.makeBool(self.arena, false);
+    if (classify == .not_deletable or classify == .deleted) {
+        frame.registers[rdst] = try val_mod.makeBool(self.arena, classify == .deleted);
         return null;
     }
     // No declarative binding: an object environment record inherited from this

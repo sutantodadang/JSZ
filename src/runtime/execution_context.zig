@@ -27,6 +27,11 @@ pub const Binding = struct {
     /// `(function f(){ f = 1; return f })()` returns the function. The strict
     /// form (throwOnError = true) is modelled as `kind == .const_` instead.
     immutable: bool = false,
+    /// EvalDeclarationInstantiation creates its `var`/function bindings with the
+    /// deletable flag set (§19.2.1.3 passes `true` to CreateMutableBinding), so
+    /// `eval("var x"); delete x` actually removes them — unlike every binding a
+    /// declaration in the surrounding code makes.
+    deletable: bool = false,
 };
 
 /// Result of `Environment.deleteName` (the `delete identifier` operation over the
@@ -35,7 +40,7 @@ pub const Binding = struct {
 /// to the global object's [[Delete]] (configurability); a lexical global binding
 /// (top-level let/const/class) is non-deletable; `not_found` means the caller
 /// consults the global object directly (else the reference is unresolvable → true).
-pub const DeleteNameResult = enum { not_found, not_deletable, global_object_ref };
+pub const DeleteNameResult = enum { not_found, not_deletable, global_object_ref, deleted };
 
 /// A single lexical environment frame. Linked to parent.
 pub const Environment = struct {
@@ -84,6 +89,17 @@ pub const Environment = struct {
     pub fn hoistVar(self: *Environment, name: []const u8, value: Value) !void {
         if (self.bindings.contains(name)) return;
         try self.define(name, value);
+    }
+
+    /// `hoistVar` for eval code: the new binding is deletable (see `Binding.deletable`).
+    pub fn hoistVarDeletable(self: *Environment, name: []const u8, value: Value) !void {
+        if (self.bindings.contains(name)) return;
+        try self.bindings.put(self.arena, name, .{
+            .value = value,
+            .kind = .var_,
+            .initialized = true,
+            .deletable = true,
+        });
     }
 
     /// Define a var-style binding in THIS frame.
@@ -216,6 +232,10 @@ pub const Environment = struct {
     ///   - no binding → `.not_found`.
     pub fn deleteName(self: *Environment, name: []const u8) DeleteNameResult {
         if (self.bindings.getPtr(name)) |b| {
+            if (b.deletable) {
+                _ = self.bindings.remove(name);
+                return .deleted;
+            }
             if (self.parent != null) return .not_deletable; // local declarative binding
             if (b.kind == .let or b.kind == .const_) return .not_deletable; // global lexical
             return .global_object_ref; // global object-record binding
