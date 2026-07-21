@@ -1468,7 +1468,14 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         };
         var default_expr: ?*Node = null;
         if (p.match(.eq)) {
+            // NamedEvaluation: `function f(cls = class {})` names the anonymous
+            // class "cls" (§8.6.3 — the default is an Initializer whose target
+            // is a single BindingIdentifier). A class is named at parse time,
+            // so the hint has to be set here rather than in the compiler.
+            const set_class_hint = p.check(.kw_class) and p.export_default_name_hint == null;
+            if (set_class_hint) p.export_default_name_hint = param_tok.value_str;
             default_expr = p.parseAssignmentExpr() orelse return null;
+            if (set_class_hint) p.export_default_name_hint = null;
         }
         defaults.append(p.arena, default_expr) catch return null;
         if (saw_rest) break;

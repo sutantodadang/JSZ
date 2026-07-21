@@ -1,0 +1,1 @@
+function f({ c = class {} }, d = class {}) { return [c.name, d.name] } var { e = class {} } = {}; var g; ({ g = class {} } = {}); JSON.stringify(f({}).concat([e.name, g.name]))
