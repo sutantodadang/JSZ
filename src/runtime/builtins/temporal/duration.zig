@@ -479,21 +479,11 @@ fn hasTimeZoneAnnotation(str: []const u8) bool {
 
 /// MaximumTemporalDurationRoundingIncrement: the dividend used to validate a
 /// rounding increment for a time unit; calendar units have no maximum.
-fn maxIncrementDividend(u: shared.Unit) ?f64 {
-    return switch (u) {
-        .hour => 24,
-        .minute, .second => 60,
-        .millisecond, .microsecond, .nanosecond => 1000,
-        else => null,
-    };
-}
-
-/// ValidateTemporalRoundingIncrement (non-inclusive): the increment must be less
-/// than the unit's maximum and divide it evenly.
+/// Duration rounding places no cap on a calendar-unit increment — the relativeTo
+/// reference decides what a "day" is — so only the time units are checked.
 fn validateIncrement(arena: std.mem.Allocator, u: shared.Unit, inc: f64) !void {
-    const dividend = maxIncrementDividend(u) orelse return;
-    if (inc >= dividend or @mod(dividend, inc) != 0)
-        return realm_mod.throwRangeError(arena, "invalid roundingIncrement for smallestUnit");
+    if (isCalendarUnit(u) or u == .day) return;
+    return shared.validateRoundingIncrement(arena, u, inc);
 }
 
 const RelResult = struct { d: DurationFields, total: f64 };
@@ -632,7 +622,9 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     var smallest: ?shared.Unit = null;
     var largest: ?shared.Unit = null;
     const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits != 0 and arg0.unbox() == .string) {
+    // `round(undefined)` is a missing argument, not an empty options bag.
+    if (arg0.bits == 0 or arg0.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "round() requires an argument");
+    if (arg0.unbox() == .string) {
         smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
     } else {
         opts = try shared.getOptionsObject(arena, arg0);

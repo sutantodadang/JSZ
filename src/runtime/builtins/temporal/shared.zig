@@ -1302,6 +1302,42 @@ pub fn getRoundingIncrement(arena: std.mem.Allocator, opts: ?*JsObject) !f64 {
     return t;
 }
 
+/// ValidateTemporalRoundingIncrement: the increment must divide the next unit
+/// up evenly, and (except for a whole day, which has no larger unit to overflow
+/// into) must be strictly smaller than it — rounding minutes to an increment of
+/// 60 would be rounding to hours.
+pub fn validateRoundingIncrement(arena: std.mem.Allocator, u: Unit, inc: f64) !void {
+    const dividend: f64 = switch (u) {
+        .day => 1,
+        .hour => 24,
+        .minute, .second => 60,
+        .millisecond, .microsecond, .nanosecond => 1000,
+        // Calendar units are only reachable with a relativeTo, where the
+        // increment is unconstrained.
+        else => return,
+    };
+    const inclusive = u == .day;
+    if (@mod(dividend, inc) != 0 or (if (inclusive) inc > dividend else inc >= dividend))
+        return realm_mod.throwRangeError(arena, "invalid roundingIncrement for smallestUnit");
+}
+
+/// As `validateRoundingIncrement`, but for an Instant, which has no wall-clock
+/// structure to overflow into: its units are capped at a whole day rather than
+/// at the next unit up, and reaching that cap exactly is allowed.
+pub fn validateInstantRoundingIncrement(arena: std.mem.Allocator, u: Unit, inc: f64) !void {
+    const dividend: f64 = switch (u) {
+        .hour => 24,
+        .minute => 1440,
+        .second => 86400,
+        .millisecond => 86400000,
+        .microsecond => 86400000000,
+        .nanosecond => 86400000000000,
+        else => return,
+    };
+    if (inc > dividend or @mod(dividend, inc) != 0)
+        return realm_mod.throwRangeError(arena, "invalid roundingIncrement for smallestUnit");
+}
+
 /// Read a required or optional temporal unit option (e.g. "smallestUnit").
 pub fn getTemporalUnit(arena: std.mem.Allocator, opts: ?*JsObject, key: []const u8) !?Unit {
     const s = (try readStringOption(arena, opts, key)) orelse return null;

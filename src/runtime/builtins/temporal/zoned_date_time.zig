@@ -705,6 +705,7 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
     const mode = try shared.getRoundingMode(arena, opts, .trunc);
     const inc = try shared.getRoundingIncrement(arena, opts);
+    try shared.validateRoundingIncrement(arena, smallest.?, inc);
 
     const from = if (since) other else z.*;
     const to = if (since) z.* else other;
@@ -877,6 +878,7 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     if (unitRank(smallest.?) < unitRank(.day)) return realm_mod.throwRangeError(arena, "smallestUnit must be day..nanosecond");
     const mode = try shared.getRoundingMode(arena, opts, .half_expand);
     const inc = try shared.getRoundingIncrement(arena, opts);
+    try shared.validateRoundingIncrement(arena, smallest.?, inc);
 
     const cur = localDT(z);
     const day_start_ns = wallNs(.{ .date = cur.date, .time = .{} }) - z.offset_ns;
