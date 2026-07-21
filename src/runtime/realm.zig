@@ -45,6 +45,7 @@ const shadow_realm_mod = @import("./builtins/shadow_realm.zig");
 const disposable_stack_mod = @import("./builtins/disposable_stack.zig");
 // Phase 13 Intl
 const intl_mod = @import("./builtins/intl.zig");
+const segmenter_mod = @import("./builtins/segmenter.zig");
 const builtinLength = @import("./builtins/builtin_lengths.zig").builtinLength;
 
 // ---------------------------------------------------------------- Context interface ---
@@ -4767,6 +4768,9 @@ pub const Realm = struct {
             _ = try df_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
             _ = try df_ctor.defineOwnData("supportedLocalesOf", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatSupportedLocalesOf, "supportedLocalesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             try intl_obj.set("DurationFormat", try val_mod.makeObject(arena, df_ctor));
+            // Intl.Segmenter (own module: the segmentation rules and the two
+            // hidden %Segments%/%SegmentIterator% prototypes live there).
+            try segmenter_mod.register(arena, intl_obj, object_proto, function_proto, @import("./builtins/es2015_collections.zig").active_iterator_proto);
             // Intl.getCanonicalLocales (static)
             _ = try intl_obj.defineOwnData("getCanonicalLocales", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeGetCanonicalLocales, "getCanonicalLocales", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             // Intl.supportedValuesOf (static)

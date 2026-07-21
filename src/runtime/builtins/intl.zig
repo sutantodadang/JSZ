@@ -244,7 +244,7 @@ fn currencySymbol(code: []const u8) []const u8 {
     return "$";
 }
 
-fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+pub fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.error_proto_RangeError)
     else
@@ -255,7 +255,7 @@ fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     return error.JsException;
 }
 
-fn throwTypeErrorIntl(arena: std.mem.Allocator, msg: []const u8) anyerror {
+pub fn throwTypeErrorIntl(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)
     else
@@ -1328,36 +1328,193 @@ pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     return val_mod.makeObject(arena, obj);
 }
 
-/// Canonicalize one BCP-47 tag to `language[-Script][-REGION]` form.
-fn canonicalizeTag(arena: std.mem.Allocator, tag: []const u8) ![]const u8 {
-    const parts = parseLocaleTag(tag);
-    const language = try canonSubtag(arena, parts.language, .lang);
-    const script = try canonSubtag(arena, parts.script, .script);
-    const region = try canonSubtag(arena, parts.region, .region);
-    var bn = std.ArrayListUnmanaged(u8){};
-    try bn.appendSlice(arena, language);
-    if (script.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, script);
+fn isAlnum(s: []const u8) bool {
+    for (s) |c| if (!std.ascii.isAlphanumeric(c)) return false;
+    return true;
+}
+
+/// UTS #35 `unicode_locale_id` structural validation (ECMA-402
+/// IsStructurallyValidLanguageTag). Deliberately grammar-only: it says nothing
+/// about whether the language exists, only whether the tag is well formed.
+///
+///   unicode_locale_id = unicode_language_id extension* pu_extension?
+///   unicode_language_id = language ("-" script)? ("-" region)? ("-" variant)*
+///
+/// Note there is no `extlang` production, so BCP-47 tags like "hans-cmn-cn" are
+/// rejected, and duplicate variants / duplicate extension singletons are errors.
+pub fn isStructurallyValidLanguageTag(tag: []const u8) bool {
+    if (tag.len == 0) return false;
+    // ASCII alphanumerics and '-' only; no empty subtag (leading/trailing/double '-').
+    for (tag) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+
+    var parts: [64][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, tag, '-');
+    while (it.next()) |p| {
+        if (p.len == 0 or n == parts.len) return false;
+        parts[n] = p;
+        n += 1;
     }
-    if (region.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, region);
+
+    // --- unicode_language_id ---
+    var i: usize = 0;
+    const lang = parts[i];
+    if (!isAllAlpha(lang)) return false;
+    if (!((lang.len >= 2 and lang.len <= 3) or (lang.len >= 5 and lang.len <= 8))) return false;
+    i += 1;
+    if (i < n and parts[i].len == 4 and isAllAlpha(parts[i])) i += 1; // script
+    if (i < n and ((parts[i].len == 2 and isAllAlpha(parts[i])) or
+        (parts[i].len == 3 and isAllDigit(parts[i])))) i += 1; // region
+
+    var variants: [16][]const u8 = undefined;
+    var nv: usize = 0;
+    while (i < n and parts[i].len != 1) {
+        const v = parts[i];
+        const ok = (v.len >= 5 and v.len <= 8 and isAlnum(v)) or
+            (v.len == 4 and std.ascii.isDigit(v[0]) and isAlnum(v));
+        if (!ok) return false;
+        for (variants[0..nv]) |seen| if (std.ascii.eqlIgnoreCase(seen, v)) return false;
+        if (nv == variants.len) return false;
+        variants[nv] = v;
+        nv += 1;
+        i += 1;
     }
-    return bn.items;
+
+    // --- extensions (each introduced by a one-character singleton) ---
+    var singletons: [36]u8 = undefined;
+    var ns: usize = 0;
+    while (i < n) {
+        const sg = parts[i];
+        if (sg.len != 1 or !std.ascii.isAlphanumeric(sg[0])) return false;
+        const key = std.ascii.toLower(sg[0]);
+        for (singletons[0..ns]) |seen| if (seen == key) return false;
+        if (ns == singletons.len) return false;
+        singletons[ns] = key;
+        ns += 1;
+        i += 1;
+        // Private use allows 1-character subtags; every other extension needs
+        // at least two. Either way an empty extension body is an error.
+        const min_len: usize = if (key == 'x') 1 else 2;
+        var count: usize = 0;
+        while (i < n and parts[i].len != 1) : (i += 1) {
+            const sub = parts[i];
+            if (sub.len < min_len or sub.len > 8 or !isAlnum(sub)) return false;
+            count += 1;
+        }
+        if (key == 'x') {
+            // pu_extension consumes the rest of the tag, including single chars.
+            while (i < n) : (i += 1) {
+                if (parts[i].len > 8 or !isAlnum(parts[i])) return false;
+                count += 1;
+            }
+        }
+        if (count == 0) return false;
+    }
+    return true;
+}
+
+/// Whether this implementation claims data for a tag's primary language.
+/// Two-letter ISO 639-1 codes are all treated as available; three-letter codes
+/// only when CLDR actually has a locale for them, so a well-formed but
+/// unassigned tag like "xyz" resolves to the next requested locale instead.
+pub fn languageAvailable(tag: []const u8) bool {
+    const lang = primaryLanguage(tag);
+    if (std.mem.eql(u8, lang, "zxx") or std.mem.eql(u8, lang, "und") or std.mem.eql(u8, lang, "root")) return false;
+    if (lang.len == 2) return true;
+    const known3 = [_][]const u8{
+        "asa", "bem", "bez", "brx", "ccp", "ceb", "cgg", "chr", "dav", "dje", "doi",
+        "dsb", "dua", "dyo", "ebu", "ewo", "fil", "fur", "gsw", "guz", "haw", "hsb",
+        "jgo", "jmc", "kab", "kam", "kde", "kea", "khq", "kkj", "kln", "kok", "ksb",
+        "ksf", "ksh", "lag", "lkt", "lrc", "luo", "luy", "mai", "mas", "mer", "mfe",
+        "mgh", "mgo", "mni", "mua", "mzn", "naq", "nds", "nmg", "nnh", "nqo", "nus",
+        "nyn", "rof", "rwk", "sah", "saq", "sat", "sbp", "seh", "ses", "shi", "smn",
+        "teo", "twq", "tzm", "vun", "wae", "xog", "yav", "yrl", "yue", "zgh",
+    };
+    for (known3) |k| if (std.mem.eql(u8, k, lang)) return true;
+    return false;
+}
+
+/// CanonicalizeUnicodeLocaleId: fix each subtag's case (language lower, script
+/// Title, region UPPER, everything else lower), sort the variants, and order the
+/// extension sequences by singleton with the private-use one last. Variants and
+/// extensions are preserved — `en-u-ca-gregory` must not collapse to `en`. A
+/// structurally invalid tag is a RangeError.
+pub fn canonicalizeTag(arena: std.mem.Allocator, tag: []const u8) ![]const u8 {
+    if (!isStructurallyValidLanguageTag(tag))
+        return throwRangeError(arena, "invalid language tag");
+
+    var parts = std.ArrayListUnmanaged([]const u8){};
+    var it = std.mem.splitScalar(u8, tag, '-');
+    while (it.next()) |p| try parts.append(arena, p);
+
+    var out = std.ArrayListUnmanaged(u8){};
+    var i: usize = 0;
+    try out.appendSlice(arena, try canonSubtag(arena, parts.items[i], .lang));
+    i += 1;
+    if (i < parts.items.len and parts.items[i].len == 4 and isAllAlpha(parts.items[i])) {
+        try out.append(arena, '-');
+        try out.appendSlice(arena, try canonSubtag(arena, parts.items[i], .script));
+        i += 1;
+    }
+    if (i < parts.items.len and ((parts.items[i].len == 2 and isAllAlpha(parts.items[i])) or
+        (parts.items[i].len == 3 and isAllDigit(parts.items[i]))))
+    {
+        try out.append(arena, '-');
+        try out.appendSlice(arena, try canonSubtag(arena, parts.items[i], .region));
+        i += 1;
+    }
+    var variants = std.ArrayListUnmanaged([]const u8){};
+    while (i < parts.items.len and parts.items[i].len != 1) : (i += 1)
+        try variants.append(arena, try canonSubtag(arena, parts.items[i], .lang));
+    std.mem.sort([]const u8, variants.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    for (variants.items) |v| {
+        try out.append(arena, '-');
+        try out.appendSlice(arena, v);
+    }
+
+    // Each extension sequence is `singleton (-subtag)+`; collect them whole so
+    // they can be reordered without losing their bodies.
+    var exts = std.ArrayListUnmanaged([]const u8){};
+    var private: ?[]const u8 = null;
+    while (i < parts.items.len) {
+        var seq = std.ArrayListUnmanaged(u8){};
+        const singleton = std.ascii.toLower(parts.items[i][0]);
+        try seq.append(arena, singleton);
+        i += 1;
+        while (i < parts.items.len and (singleton == 'x' or parts.items[i].len != 1)) : (i += 1) {
+            try seq.append(arena, '-');
+            try seq.appendSlice(arena, try canonSubtag(arena, parts.items[i], .lang));
+        }
+        if (singleton == 'x') private = seq.items else try exts.append(arena, seq.items);
+    }
+    std.mem.sort([]const u8, exts.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return a[0] < b[0];
+        }
+    }.lt);
+    for (exts.items) |e| {
+        try out.append(arena, '-');
+        try out.appendSlice(arena, e);
+    }
+    if (private) |p| {
+        try out.append(arena, '-');
+        try out.appendSlice(arena, p);
+    }
+    return out.items;
 }
 
 /// `Intl.getCanonicalLocales(locales)` — accepts a string or array-like of tags,
 /// returns a de-duplicated array of canonical tags.
 pub fn nativeGetCanonicalLocales(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    // CanonicalizeLocaleList proper: ToObject/HasProperty/[[Get]] over the
+    // argument (so a poisoned length or element getter propagates) and a
+    // TypeError for an element that is neither String nor Object.
     var tags = std.ArrayListUnmanaged([]const u8){};
-    if (args.len > 0 and args[0].bits != 0) {
-        if (args[0].unbox() == .string) {
-            try tags.append(arena, args[0].unbox().string);
-        } else if (args[0].unbox() == .object) {
-            tags.items = try listElements(arena, args[0]);
-        }
-    }
+    tags.items = try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{});
     const arr = if (realm_mod.active_heap) |h|
         try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
     else
@@ -1365,7 +1522,6 @@ pub fn nativeGetCanonicalLocales(arena: std.mem.Allocator, _: Value, args: []con
     var seen = std.ArrayListUnmanaged([]const u8){};
     var n: usize = 0;
     for (tags.items) |t| {
-        if (t.len == 0) continue;
         const canon = try canonicalizeTag(arena, t);
         var dup = false;
         for (seen.items) |s| if (std.mem.eql(u8, s, canon)) {
@@ -2016,13 +2172,16 @@ fn dfIsNumericStyle(style: []const u8) bool {
 }
 
 /// Read + validate an option string; RangeError if present but not in `allowed`.
-/// Returns null when absent/undefined. (Getter dispatch is not performed — plain
-/// data option objects, which the corpus overwhelmingly uses.)
+/// Returns null when absent/undefined. The read is a real [[Get]], so accessors
+/// and inherited properties behave as the spec's GetOption requires (a boxed
+/// primitive inherits from Object.prototype and sees its accessors).
 fn dfGetOption(arena: std.mem.Allocator, opts: ?Value, key: []const u8, allowed: []const []const u8) !?[]const u8 {
     const o = opts orelse return null;
-    if (o.bits == 0 or o.unbox() != .object) return null;
-    const v = o.toPtr().object.get(key) orelse return null;
+    if (o.bits == 0 or o.unbox() == .undefined_ or o.unbox() == .null_) return null;
+    const ctx = realm_mod.active_context orelse return null;
+    const v = try ctx.getProp(arena, o, key);
     if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    if (v.unbox() == .symbol) return throwTypeErrorIntl(arena, "Cannot convert a Symbol value to a string");
     const s = try t_shared.valueToString(arena, v);
     for (allowed) |a| if (std.mem.eql(u8, a, s)) return s;
     return throwRangeError(arena, "invalid value for Intl.DurationFormat option");
@@ -2160,7 +2319,7 @@ fn primaryLanguage(tag: []const u8) []const u8 {
 /// array-like is walked via HasProperty + [[Get]] so a poisoned length/getter
 /// propagates, and a present element that is neither a String nor an Object is a
 /// TypeError.
-fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror![][]const u8 {
+pub fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror![][]const u8 {
     var out = std.ArrayListUnmanaged([]const u8){};
     if (locales.bits == 0 or locales.unbox() == .undefined_) return out.items;
     // ToObject(null) is a TypeError; other primitives box to a wrapper with no
@@ -2196,9 +2355,15 @@ fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror![][
 
 pub fn nativeDurationFormatSupportedLocalesOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const requested = try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{});
-    // Validate the options' localeMatcher (RangeError if malformed).
-    const opts: ?Value = if (args.len > 1) args[1] else null;
-    _ = try dfGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" });
+    // SupportedLocales step 1: a non-undefined `options` goes through ToObject,
+    // so `null` is a TypeError and a primitive is boxed — a `localeMatcher`
+    // accessor inherited from Object.prototype still runs exactly once.
+    const opts_v: Value = if (args.len > 1) args[1] else Value{};
+    if (opts_v.bits != 0 and opts_v.unbox() != .undefined_) {
+        if (opts_v.unbox() == .null_)
+            return throwTypeErrorIntl(arena, "Cannot convert null options to object");
+        _ = try dfGetOption(arena, opts_v, "localeMatcher", &.{ "lookup", "best fit" });
+    }
 
     const arr = if (realm_mod.active_heap) |h|
         try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
@@ -2207,7 +2372,6 @@ pub fn nativeDurationFormatSupportedLocalesOf(arena: std.mem.Allocator, _: Value
     var seen = std.ArrayListUnmanaged([]const u8){};
     var n: usize = 0;
     for (requested) |t| {
-        if (t.len == 0) continue;
         const canon = try canonicalizeTag(arena, t); // throws on invalid
         var dup = false;
         for (seen.items) |s| if (std.mem.eql(u8, s, canon)) {
@@ -2216,8 +2380,7 @@ pub fn nativeDurationFormatSupportedLocalesOf(arena: std.mem.Allocator, _: Value
         };
         if (dup) continue;
         try seen.append(arena, canon);
-        const lang = primaryLanguage(canon);
-        if (std.mem.eql(u8, lang, "zxx") or std.mem.eql(u8, lang, "und")) continue;
+        if (!languageAvailable(canon)) continue;
         try arr.set(try std.fmt.allocPrint(arena, "{d}", .{n}), try val_mod.makeString(arena, canon));
         n += 1;
     }
