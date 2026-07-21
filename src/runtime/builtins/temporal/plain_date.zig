@@ -172,6 +172,7 @@ fn monthFieldsToIso(arena: std.mem.Allocator, o: *JsObject, cal: calendar.Calend
     if (has_code) {
         if (monthcode_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
         const mc = try shared.parseMonthCode(arena, monthcode_v.?.unbox().string, calendar.hasLeapMonths(cal));
+        if (day < 1) return realm_mod.throwRangeError(arena, "day must be positive");
         const iso = calendar.toIsoFromCode(cal, cal_year, mc.num, mc.leap, day, overflow) catch
             return realm_mod.throwRangeError(arena, "date out of range");
         // A "month" given alongside "monthCode" must name the same month.
@@ -183,6 +184,9 @@ fn monthFieldsToIso(arena: std.mem.Allocator, o: *JsObject, cal: calendar.Calend
     }
     if (!has_month) return realm_mod.throwTypeError(arena, "missing month or monthCode");
     const month = floatToI32(try shared.toIntegerWithTruncation(arena, month_v.?));
+    // "constrain" clamps a month or day that runs past the end of its container;
+    // a non-positive one names nothing to clamp towards and is always an error.
+    if (month < 1 or day < 1) return realm_mod.throwRangeError(arena, "month and day must be positive");
     return calendar.toIso(cal, cal_year, month, day, overflow) catch
         realm_mod.throwRangeError(arena, "date out of range");
 }

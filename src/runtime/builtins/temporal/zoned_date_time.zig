@@ -243,7 +243,9 @@ fn parseOffsetValue(arena: std.mem.Allocator, s: []const u8) !i128 {
                     if (k < 9) frac[k] = s[i];
                     k += 1;
                 }
-                if (k == 0) return realm_mod.throwRangeError(arena, "invalid offset string");
+                // The grammar allows one to nine fractional digits; a tenth is
+                // not "more precision than we keep", it is malformed.
+                if (k == 0 or k > 9) return realm_mod.throwRangeError(arena, "invalid offset string");
                 sub = std.fmt.parseInt(i128, &frac, 10) catch 0;
             }
         }
