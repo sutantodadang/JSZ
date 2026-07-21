@@ -114,9 +114,65 @@ pub const ZoneDef = struct {
     dst_rule: ?DstRule,
 };
 
+/// IANA "Link" entries: a deprecated or regional spelling and the zone it now
+/// points at. Resolving through these is what makes `Asia/Calcutta` and
+/// `Asia/Kolkata` compare equal while both report the canonical id.
+const LINKS = [_]struct { alias: []const u8, target: []const u8 }{
+    .{ .alias = "Asia/Calcutta", .target = "Asia/Kolkata" },
+    .{ .alias = "Asia/Katmandu", .target = "Asia/Kathmandu" },
+    .{ .alias = "Asia/Saigon", .target = "Asia/Ho_Chi_Minh" },
+    .{ .alias = "Asia/Ulan_Bator", .target = "Asia/Ulaanbaatar" },
+    .{ .alias = "Atlantic/Jan_Mayen", .target = "Europe/Oslo" },
+    .{ .alias = "Australia/ACT", .target = "Australia/Sydney" },
+    .{ .alias = "Australia/Canberra", .target = "Australia/Sydney" },
+    .{ .alias = "Australia/NSW", .target = "Australia/Sydney" },
+    .{ .alias = "Australia/Melbourne", .target = "Australia/Melbourne" },
+    .{ .alias = "Australia/Victoria", .target = "Australia/Melbourne" },
+    .{ .alias = "Australia/Queensland", .target = "Australia/Brisbane" },
+    .{ .alias = "Australia/West", .target = "Australia/Perth" },
+    .{ .alias = "Australia/North", .target = "Australia/Darwin" },
+    .{ .alias = "Australia/South", .target = "Australia/Adelaide" },
+    .{ .alias = "Brazil/East", .target = "America/Sao_Paulo" },
+    .{ .alias = "Canada/Eastern", .target = "America/Toronto" },
+    .{ .alias = "Canada/Pacific", .target = "America/Vancouver" },
+    .{ .alias = "Europe/Bratislava", .target = "Europe/Prague" },
+    .{ .alias = "Europe/Kiev", .target = "Europe/Kyiv" },
+    .{ .alias = "Europe/Uzhgorod", .target = "Europe/Kyiv" },
+    .{ .alias = "Europe/Zaporozhye", .target = "Europe/Kyiv" },
+    .{ .alias = "Europe/Vatican", .target = "Europe/Rome" },
+    .{ .alias = "Europe/San_Marino", .target = "Europe/Rome" },
+    .{ .alias = "Europe/Ljubljana", .target = "Europe/Belgrade" },
+    .{ .alias = "Europe/Nicosia", .target = "Asia/Nicosia" },
+    .{ .alias = "GB", .target = "Europe/London" },
+    .{ .alias = "GB-Eire", .target = "Europe/London" },
+    .{ .alias = "Japan", .target = "Asia/Tokyo" },
+    .{ .alias = "Mexico/General", .target = "America/Mexico_City" },
+    .{ .alias = "NZ", .target = "Pacific/Auckland" },
+    .{ .alias = "Pacific/Truk", .target = "Pacific/Chuuk" },
+    .{ .alias = "Pacific/Yap", .target = "Pacific/Chuuk" },
+    .{ .alias = "Pacific/Samoa", .target = "Pacific/Pago_Pago" },
+    .{ .alias = "Poland", .target = "Europe/Warsaw" },
+    .{ .alias = "Portugal", .target = "Europe/Lisbon" },
+    .{ .alias = "Singapore", .target = "Asia/Singapore" },
+    .{ .alias = "Turkey", .target = "Europe/Istanbul" },
+    .{ .alias = "US/Alaska", .target = "America/Anchorage" },
+    .{ .alias = "US/Arizona", .target = "America/Phoenix" },
+    .{ .alias = "US/Central", .target = "America/Chicago" },
+    .{ .alias = "US/Eastern", .target = "America/New_York" },
+    .{ .alias = "US/Hawaii", .target = "Pacific/Honolulu" },
+    .{ .alias = "US/Mountain", .target = "America/Denver" },
+    .{ .alias = "US/Pacific", .target = "America/Los_Angeles" },
+};
+
 fn lookupZoneDef(name: []const u8) ?*const ZoneDef {
     for (&ZONES) |*z| {
         if (eqIgnoreCase(name, z.name)) return z;
+    }
+    for (&LINKS) |l| {
+        if (!eqIgnoreCase(name, l.alias)) continue;
+        for (&ZONES) |*z| {
+            if (eqIgnoreCase(l.target, z.name)) return z;
+        }
     }
     return null;
 }
@@ -231,6 +287,12 @@ const ZONES = [_]ZoneDef{
     .{ .name = "Africa/Cairo", .std_offset_sec = 2 * 3600, .dst_save_sec = 0, .dst_rule = null },
     .{ .name = "Africa/Lagos", .std_offset_sec = 3600, .dst_save_sec = 0, .dst_rule = null },
     .{ .name = "America/Argentina/Buenos_Aires", .std_offset_sec = -3 * 3600, .dst_save_sec = 0, .dst_rule = null },
+    .{ .name = "Africa/Monrovia", .std_offset_sec = 0, .dst_save_sec = 0, .dst_rule = null },
+    .{ .name = "Asia/Ulaanbaatar", .std_offset_sec = 8 * 3600, .dst_save_sec = 0, .dst_rule = null },
+    .{ .name = "Pacific/Chuuk", .std_offset_sec = 10 * 3600, .dst_save_sec = 0, .dst_rule = null },
+    .{ .name = "Pacific/Niue", .std_offset_sec = -11 * 3600, .dst_save_sec = 0, .dst_rule = null },
+    .{ .name = "Pacific/Apia", .std_offset_sec = 13 * 3600, .dst_save_sec = 0, .dst_rule = null },
+    .{ .name = "Asia/Colombo", .std_offset_sec = 5 * 3600 + 1800, .dst_save_sec = 0, .dst_rule = null },
 
     // ── US zones (2007+ rules) ──────────────────────────
     .{
@@ -307,6 +369,33 @@ const ZONES = [_]ZoneDef{
     .{
         .name = "Europe/Berlin",
         .std_offset_sec = 3600,
+        .dst_save_sec = 3600,
+        .dst_rule = .{
+            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
+            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
+        },
+    },
+    .{
+        .name = "Europe/Vienna",
+        .std_offset_sec = 3600,
+        .dst_save_sec = 3600,
+        .dst_rule = .{
+            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
+            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
+        },
+    },
+    .{
+        .name = "Europe/Oslo",
+        .std_offset_sec = 3600,
+        .dst_save_sec = 3600,
+        .dst_rule = .{
+            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
+            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
+        },
+    },
+    .{
+        .name = "Europe/Kyiv",
+        .std_offset_sec = 2 * 3600,
         .dst_save_sec = 3600,
         .dst_rule = .{
             .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,

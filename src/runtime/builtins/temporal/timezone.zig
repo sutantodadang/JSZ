@@ -24,6 +24,50 @@ pub const Zone = struct {
     offset_ns: i128,
 };
 
+/// The `Etc/GMT±N` family. These are fixed-offset zones whose sign is *inverted*
+/// from the offset they name (POSIX convention): `Etc/GMT-5` is UTC+05:00. Only
+/// -14..0 and 0..+12 exist, and the digits carry no leading zero, so `Etc/GMT-05`
+/// is not a zone at all. The identifier is kept verbatim rather than folded to
+/// its offset, since `timeZoneId` must round-trip.
+fn etcGmtOffset(s: []const u8) ?i128 {
+    if (s.len < 7 or !eqIgnoreCase(s[0..7], "Etc/GMT")) return null;
+    const rest = s[7..];
+    if (rest.len == 0) return 0; // "Etc/GMT"
+    const neg = rest[0] == '-';
+    if (!neg and rest[0] != '+') {
+        // "Etc/GMT0" is the sole unsigned member.
+        return if (std.mem.eql(u8, rest, "0")) 0 else null;
+    }
+    const digits = rest[1..];
+    if (digits.len == 0 or digits.len > 2) return null;
+    if (digits.len == 2 and digits[0] == '0') return null;
+    var n: i32 = 0;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + @as(i32, c - '0');
+    }
+    if (neg) {
+        if (n > 14) return null;
+    } else if (n > 12) return null;
+    return @as(i128, if (neg) n else -n) * shared.NS_PER_HOUR;
+}
+
+fn parseEtcGmt(arena: std.mem.Allocator, s: []const u8) !?Zone {
+    const off = etcGmtOffset(s) orelse return null;
+    // The identifier keeps its own spelling — "Etc/GMT", "Etc/GMT0" and
+    // "Etc/GMT+0" are three distinct ids for the same offset — but its case is
+    // normalized.
+    var buf: [16]u8 = undefined;
+    const canon = std.ascii.lowerString(buf[0..s.len], s);
+    canon[0] = 'E';
+    if (canon.len >= 5) {
+        canon[4] = 'G';
+        canon[5] = 'M';
+        canon[6] = 'T';
+    }
+    return Zone{ .id = try arena.dupe(u8, canon), .offset_ns = off };
+}
+
 /// Case-insensitive ASCII equality.
 fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
@@ -111,6 +155,7 @@ pub fn toZone(arena: std.mem.Allocator, s0: []const u8) !Zone {
         const def = tzdata.lookupDef(s) orelse unreachable;
         return .{ .id = def.name, .offset_ns = @as(i128, def.std_offset_sec) * shared.NS_PER_SECOND };
     }
+    if (try parseEtcGmt(arena, s)) |z| return z;
 
     // 3. Direct offset identifier.
     var buf: [7]u8 = undefined;
@@ -129,6 +174,7 @@ pub fn toZone(arena: std.mem.Allocator, s0: []const u8) !Zone {
             const def = tzdata.lookupDef(inner) orelse unreachable;
             return .{ .id = def.name, .offset_ns = @as(i128, def.std_offset_sec) * shared.NS_PER_SECOND };
         }
+        if (try parseEtcGmt(arena, inner)) |z| return z;
         if (parseOffsetIdentifier(inner, &buf)) |ns| {
             return .{ .id = try arena.dupe(u8, buf[0..6]), .offset_ns = ns };
         }
@@ -154,6 +200,7 @@ pub fn toZoneAtInstant(arena: std.mem.Allocator, s0: []const u8, epoch_ns: i128)
         const offset_sec = tzdata.offsetAt(def, unix_sec) orelse def.std_offset_sec;
         return .{ .id = def.name, .offset_ns = @as(i128, offset_sec) * shared.NS_PER_SECOND };
     }
+    if (try parseEtcGmt(arena, s)) |z| return z;
 
     // 3. Direct offset identifier.
     var buf: [7]u8 = undefined;
@@ -192,6 +239,7 @@ pub fn offsetAtInstant(id: []const u8, epoch_ns: i128) i128 {
 /// The offset of a fixed-offset identifier ("UTC" or "±HH:MM"); 0 for anything
 /// unrecognized, which cannot occur for a stored (already validated) id.
 fn fixedOffsetOf(id: []const u8) i128 {
+    if (etcGmtOffset(id)) |ns| return ns;
     var buf: [7]u8 = undefined;
     return parseOffsetIdentifier(id, &buf) orelse 0;
 }
