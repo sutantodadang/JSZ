@@ -38,6 +38,13 @@ fn globalObjectOwn(frame: *BcCallFrame, name: []const u8) ?Value {
 /// which naturally excludes block/catch/function-local bindings (those execute
 /// in a child environment). Internal `__`-prefixed names are never exposed.
 fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value, configurable: bool) void {
+    mirrorGlobalBindingOpts(frame, name, value, configurable, false);
+}
+
+/// `declare_only` mirrors CreateGlobalVarBinding's "if the property already
+/// exists, leave it (and its value) alone" clause — used by HOIST_VAR, which
+/// only has to *reserve* the name at scope entry.
+fn mirrorGlobalBindingOpts(frame: *BcCallFrame, name: []const u8, value: Value, configurable: bool, declare_only: bool) void {
     if (frame.env.parent != null) return;
     // ES module top-level declarations live in the Module Environment Record
     // and must NOT become own-properties of the global object (spec §16.2.1.6).
@@ -50,16 +57,16 @@ fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value, conf
     // (a top-level `var`'s property is non-configurable; overwriting its
     // descriptor would either reject or wrongly flip configurable).
     if (obj.hasOwn(name)) {
+        if (declare_only) return;
         obj.set(name, value) catch {};
         return;
     }
-    // First definition. A declared `var`/function global is non-configurable
-    // (DontDelete); a sloppy implicit global is configurable/deletable.
-    // Non-enumerable to match the built-in globals already installed on the
-    // object (and to avoid polluting `for-in`/`Object.keys(globalThis)`); read
-    // and `in` visibility — what the global-object semantics require — are
-    // unaffected by enumerability.
-    _ = obj.defineOwnData(name, value, .{ .writable = true, .enumerable = false, .configurable = configurable }) catch {};
+    // First definition. A declared `var`/function global in Script code is
+    // non-configurable (DontDelete); one created by eval code, and a sloppy
+    // implicit global, are configurable/deletable. All of them are enumerable
+    // (CreateGlobalVarBinding/CreateGlobalFunctionBinding/CreateDataProperty),
+    // unlike the non-enumerable built-in globals installed at realm setup.
+    _ = obj.defineOwnData(name, value, .{ .writable = true, .enumerable = true, .configurable = configurable }) catch {};
 }
 
 pub inline fn opLoadK(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
@@ -231,6 +238,12 @@ pub inline fn opHoistVar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const name = frame.func.chunk.constants[kidx].toPtr().string;
     const undef = try val_mod.makeUndefined(self.arena);
     frame.env.hoistVar(name, undef) catch return error.OutOfMemory;
+    // ES §9.1.1.4.17 CreateGlobalVarBinding: a top-level `var`/function name in
+    // Script or eval code reserves an own property of the global object at
+    // declaration-instantiation time, even when it is never assigned (`var x;`
+    // still yields `globalThis.x === undefined`). Bindings introduced by eval
+    // are deletable; Script-level ones are not.
+    mirrorGlobalBindingOpts(frame, name, undef, frame.func.is_eval, true);
     return null;
 }
 
@@ -467,9 +480,11 @@ pub inline fn opDefineGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         }
     };
     // Top-level `var`/function declarations are also own properties of the
-    // global object (observable as `globalThis.name`), and are non-configurable
-    // (DontDelete): `delete globalThis.x` / `delete this.x` returns false.
-    mirrorGlobalBinding(frame, name, value, false);
+    // global object (observable as `globalThis.name`). Script-level ones are
+    // non-configurable (DontDelete) — `delete globalThis.x` returns false —
+    // while eval-introduced ones are deletable (EvalDeclarationInstantiation
+    // passes varEnv.CreateGlobal{Var,Function}Binding a `true` deletable flag).
+    mirrorGlobalBinding(frame, name, value, frame.func.is_eval);
     return null;
 }
 
