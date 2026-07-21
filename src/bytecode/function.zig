@@ -18,6 +18,11 @@ pub const BcFunction = struct {
     /// binding rather than shadowing it.
     nfe_name: ?[]const u8 = null,
     arity: u16,
+    /// ES ExpectedArgumentCount — what `fn.length` reports: the number of
+    /// parameters before the first one with an initializer (rest excluded).
+    /// Distinct from `arity`, which stays = param_names.len because the JIT maps
+    /// parameters onto local slots 0..arity-1.
+    expected_argc: u16 = 0,
     chunk: Chunk,
     num_regs: u16,
     /// Nested function literals referenced by NEW_CLOSURE funcIdx.

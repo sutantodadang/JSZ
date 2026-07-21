@@ -145,6 +145,8 @@ const ClassMember = struct {
     computed_key: ?*Node = null,
     params: [][]const u8 = &[_][]const u8{},
     param_defaults: []?*Node = &[_]?*Node{},
+    /// See ParamParse.expected_argc — null means "params.len".
+    expected_argc: ?u16 = null,
     rest_param: ?[]const u8 = null,
     body: []*Node = &[_]*Node{},
     /// Source span of this member (name through end of body), captured in
@@ -185,6 +187,18 @@ fn nextTokenEndsName(p: *Parser) bool {
 }
 
 /// Parse the body of a class (`{` already consumed). Consumes the closing `}`.
+/// ToString of a NumericLiteral property name (mirrors the object-literal path).
+fn numericKeyString(p: *Parser, n: f64) ?[]const u8 {
+    const s = if (n == @trunc(n) and n >= 0 and n < 1e15)
+        std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))})
+    else
+        std.fmt.allocPrint(p.arena, "{d}", .{n});
+    return s catch {
+        p.had_error = true;
+        return null;
+    };
+}
+
 /// Handles `static`, `get`/`set` accessors, and computed `[expr]` keys.
 fn parseClassMembers(p: *Parser) ?ClassBodyParse {
     var res = ClassBodyParse{};
@@ -234,7 +248,13 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             const key_expr = p.parseAssignmentExpr() orelse return null;
             _ = p.expect(.right_bracket) orelse return null;
             computed_key = key_expr;
-        } else if (p.check(.identifier) or p.check(.string) or p.check(.number)) {
+        } else if (p.check(.number)) {
+            // A NumericLiteral member name is ToString(numeric value), not its
+            // source spelling: `get 0x10()` defines "16" (§13.2.5.5 PropName).
+            const n = p.current.value_num;
+            _ = p.advance();
+            name = numericKeyString(p, n) orelse return null;
+        } else if (p.check(.identifier) or p.check(.string)) {
             name = p.current.value_str;
             _ = p.advance();
         } else if (p.currentIsIdentifierName()) {
@@ -293,6 +313,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
                 .computed_key = computed_key,
                 .params = mparams.params,
                 .param_defaults = mparams.param_defaults,
+                .expected_argc = mparams.expected_argc,
                 .rest_param = mparams.rest_param,
                 .body = mbody,
                 .src_start = member_start,
@@ -762,6 +783,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         .name = method_name,
         .params = m.params,
         .param_defaults = m.param_defaults,
+        .expected_argc = m.expected_argc,
         .rest_param = m.rest_param,
         .body = body,
         .is_arrow = false,
@@ -1490,13 +1512,16 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
     // as a body-scoped `let` initialized from it — the existing let TDZ + hoisting
     // does the rest. Scoped to simple-named param lists (no destructuring / rest),
     // which is where these tests live; mixed lists keep the prior behavior.
-    var any_default = false;
-    for (defaults.items) |d| {
+    // ExpectedArgumentCount, captured before the TDZ desugar below nulls out
+    // every entry of `defaults`.
+    var expected_argc: u16 = @intCast(params.items.len);
+    for (defaults.items, 0..) |d, i| {
         if (d != null) {
-            any_default = true;
+            expected_argc = @intCast(i);
             break;
         }
     }
+    const any_default = expected_argc < params.items.len;
     if (any_default and rest_param == null and param_prelude.items.len == 0) {
         var lets = std.ArrayList(*Node){};
         for (params.items, 0..) |orig, i| {
@@ -1529,6 +1554,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         .params = params.items,
         .param_defaults = defaults.items,
         .rest_param = rest_param,
+        .expected_argc = expected_argc,
     };
 }
 

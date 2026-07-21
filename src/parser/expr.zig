@@ -179,6 +179,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
     if (p.match(.arrow)) {
         const params = p.extractArrowParams(left) orelse return null;
         const rest_param = p.arrow_rest_param;
+        const expected_argc = p.arrow_expected_argc;
         // Snapshot + detach the destructuring-param prelude before parsing the
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
@@ -206,6 +207,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
                 .name = null,
                 .params = params,
                 .param_defaults = &[_]?*Node{},
+                .expected_argc = expected_argc,
                 .rest_param = rest_param,
                 .body = body_nodes,
                 .is_arrow = true,
@@ -331,6 +333,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
     if (p.match(.arrow)) {
         const params = p.extractArrowParams(left) orelse return null;
         const rest_param = p.arrow_rest_param;
+        const expected_argc = p.arrow_expected_argc;
         // Snapshot + detach the destructuring-param prelude before parsing the
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
@@ -358,6 +361,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
                 .name = null,
                 .params = params,
                 .param_defaults = &[_]?*Node{},
+                .expected_argc = expected_argc,
                 .rest_param = rest_param,
                 .body = body_nodes,
                 .is_arrow = true,
@@ -407,6 +411,7 @@ pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
     // Fresh prelude per extraction (snapshotted by the caller right after).
     p.arrow_prelude = .{};
     p.arrow_rest_param = null;
+    p.arrow_expected_argc = null;
     var params = std.ArrayList([]const u8){};
     switch (lhs.kind) {
         .identifier => {
@@ -432,6 +437,7 @@ pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
             return null;
         },
     }
+    if (p.arrow_expected_argc == null) p.arrow_expected_argc = @intCast(params.items.len);
     return params.items;
 }
 
@@ -495,6 +501,9 @@ fn extractOneArrowParam(p: *Parser, e: *Node, params: *std.ArrayList([]const u8)
                 arrowParamError(p);
                 return false;
             }
+            // First defaulted parameter — everything from here on is excluded
+            // from `length` (ExpectedArgumentCount).
+            if (p.arrow_expected_argc == null) p.arrow_expected_argc = @intCast(params.items.len);
             const tmp_name = std.fmt.allocPrint(p.arena, "__param_{d}", .{p.param_destruct_counter}) catch {
                 p.had_error = true;
                 return false;
@@ -1756,6 +1765,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .name = if (ckey == null) mkey else null,
                     .params = am_params.params,
                     .param_defaults = am_params.param_defaults,
+                    .expected_argc = am_params.expected_argc,
                     .rest_param = am_params.rest_param,
                     .body = am_body,
                     .is_arrow = false,
@@ -1793,6 +1803,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                         .name = null,
                         .params = cm_params.params,
                         .param_defaults = cm_params.param_defaults,
+                    .expected_argc = cm_params.expected_argc,
                         .rest_param = cm_params.rest_param,
                         .body = cm_body,
                         .is_arrow = false,
@@ -1910,6 +1921,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .name = null,
                     .params = acc_params.params,
                     .param_defaults = acc_params.param_defaults,
+                    .expected_argc = acc_params.expected_argc,
                     .rest_param = acc_params.rest_param,
                     .body = acc_body,
                     .is_arrow = false,
@@ -1941,6 +1953,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .name = key,
                     .params = m_params.params,
                     .param_defaults = m_params.param_defaults,
+                    .expected_argc = m_params.expected_argc,
                     .rest_param = m_params.rest_param,
                     .body = m_body,
                     .is_arrow = false,
@@ -2182,6 +2195,7 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
             .name = name,
             .params = parsed_params.params,
             .param_defaults = parsed_params.param_defaults,
+                    .expected_argc = parsed_params.expected_argc,
             .rest_param = parsed_params.rest_param,
             .body = body,
             .is_arrow = false,

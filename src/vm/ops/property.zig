@@ -36,6 +36,36 @@ fn toPropertyKeyString(self: *BcVm, key_val: Value) ![]const u8 {
     return bcv.valueToStringArena(self.arena, key_val);
 }
 
+/// TO_PROPERTY_KEY — materialize a member Reference's [[ReferencedName]] once.
+/// Objects are coerced (running user code); primitives pass through so the dyn
+/// get/set fast paths keep seeing numbers as numbers.
+pub inline fn opToPropertyKey(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rdst = code[frame.pc];
+    frame.pc += 1;
+    const rsrc = code[frame.pc];
+    frame.pc += 1;
+    const sv = frame.registers[rsrc];
+    if (!(sv.bits != 0 and bcv.isObjectOperand(sv))) {
+        frame.registers[rdst] = sv;
+        return null;
+    }
+    const prim = @import("../../runtime/builtins/coercion.zig").toPrimitive(self.arena, sv, .string) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error in ToPropertyKey")) |oc| return oc;
+        return null;
+    };
+    const key_val = if (prim) |p| blk: {
+        // A @@toPrimitive that yields a Symbol produces a symbol key verbatim;
+        // anything else stringifies.
+        if (p.bits != 0 and p.unbox() == .symbol) break :blk p;
+        break :blk try val_mod.makeString(self.arena, try bcv.valueToStringArena(self.arena, p));
+    } else sv;
+    // Re-fetch: the coercion may have appended frames and reallocated the slice.
+    self.frames.items[self.frames.items.len - 1].registers[rdst] = key_val;
+    return null;
+}
+
 /// A number Value → canonical array index (integer in [0, 2^32-2]), or null.
 /// Lets `a[i]` reads/writes hit the dense integer path without stringifying `i`.
 inline fn canonicalIndexFromValue(v: Value) ?u32 {

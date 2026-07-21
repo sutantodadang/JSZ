@@ -1617,40 +1617,15 @@ pub const FnCompiler = struct {
     /// compile target again" shape did not.
     fn compileMemberAssign(self: *Self, a: ast.AssignExpr, line: u32) error{OutOfMemory}!u8 {
         const me = a.target.data.member_expr;
-        const robj = try self.compileExpr(me.object);
-        // A static/literal key is a constant; a computed expression key lives in
-        // its own register so it is evaluated once, before the RHS.
-        var static_kidx: ?u16 = null;
-        var rkey: u8 = 0;
-        if (!me.computed) {
-            static_kidx = try self.addConstant(try val_mod.makeString(self.arena, me.property.data.identifier));
-        } else if (me.property.kind == .string_literal) {
-            static_kidx = try self.addConstant(try val_mod.makeString(self.arena, me.property.data.string_literal));
-        } else if (me.property.kind == .number_literal) {
-            const key_str = std.fmt.allocPrint(self.arena, "{d}", .{me.property.data.number_literal}) catch return error.OutOfMemory;
-            static_kidx = try self.addConstant(try val_mod.makeString(self.arena, key_str));
-        } else {
-            rkey = try self.compileExpr(me.property);
-        }
+        // A compound operator reads *and* writes through one Reference, so
+        // ToPropertyKey must run exactly once — resolve it up front.
+        const ref = try self.compileMemberRef(me, a.op != .assign, line);
 
         const rres = blk: {
-            if (a.op == .assign) {
-                const rrhs = try self.compileExpr(a.value);
-                break :blk rrhs;
-            }
+            if (a.op == .assign) break :blk try self.compileExpr(a.value);
             // Compound: read the current value through the saved base/key.
             const rcur = self.allocReg();
-            if (static_kidx) |kidx| {
-                try self.emitOp(.GET_PROP, line);
-                try self.emitU8(rcur);
-                try self.emitU8(robj);
-                try self.emitU16(kidx);
-            } else {
-                try self.emitOp(.GET_PROP_DYN, line);
-                try self.emitU8(rcur);
-                try self.emitU8(robj);
-                try self.emitU8(rkey);
-            }
+            try self.emitMemberRefGet(ref, rcur, line);
             const rrhs = try self.compileExpr(a.value);
             try self.emitOp(compoundOp(a.op), line);
             try self.emitU8(rcur);
@@ -1659,23 +1634,69 @@ pub const FnCompiler = struct {
             break :blk rcur;
         };
 
-        if (static_kidx) |kidx| {
-            try self.emitOp(.SET_PROP, line);
-            try self.emitU8(robj);
-            try self.emitU16(kidx);
-            try self.emitU8(rres);
-        } else {
-            try self.emitOp(.SET_PROP_DYN, line);
-            try self.emitU8(robj);
-            try self.emitU8(rkey);
-            try self.emitU8(rres);
-        }
+        try self.emitMemberRefSet(ref, rres, line);
         // Collapse the result down to where compilation started.
         try self.emitOp(.MOVE, line);
-        try self.emitU8(robj);
+        try self.emitU8(ref.robj);
         try self.emitU8(rres);
-        self.sp = robj + 1;
-        return robj;
+        self.sp = ref.robj + 1;
+        return ref.robj;
+    }
+
+    /// A member Reference held open across a read and a write: the base register
+    /// plus either a constant key index or a register holding the resolved key.
+    const MemberRef = struct { robj: u8, static_kidx: ?u16 = null, rkey: u8 = 0 };
+
+    /// Evaluate a member target's base and key expression into live registers.
+    /// `resolve_key` additionally runs ToPropertyKey on a computed key so a
+    /// later read+write pair coerces the key only once.
+    fn compileMemberRef(self: *Self, me: ast.MemberExpr, resolve_key: bool, line: u32) error{OutOfMemory}!MemberRef {
+        const robj = try self.compileExpr(me.object);
+        // A static/literal key is a constant; a computed expression key lives in
+        // its own register so it is evaluated once, before the RHS.
+        if (!me.computed)
+            return .{ .robj = robj, .static_kidx = try self.addConstant(try val_mod.makeString(self.arena, me.property.data.identifier)) };
+        if (me.property.kind == .string_literal)
+            return .{ .robj = robj, .static_kidx = try self.addConstant(try val_mod.makeString(self.arena, me.property.data.string_literal)) };
+        if (me.property.kind == .number_literal) {
+            const key_str = std.fmt.allocPrint(self.arena, "{d}", .{me.property.data.number_literal}) catch return error.OutOfMemory;
+            return .{ .robj = robj, .static_kidx = try self.addConstant(try val_mod.makeString(self.arena, key_str)) };
+        }
+        const rkey = try self.compileExpr(me.property);
+        if (resolve_key) {
+            try self.emitOp(.TO_PROPERTY_KEY, line);
+            try self.emitU8(rkey);
+            try self.emitU8(rkey);
+        }
+        return .{ .robj = robj, .rkey = rkey };
+    }
+
+    fn emitMemberRefGet(self: *Self, ref: MemberRef, rdst: u8, line: u32) error{OutOfMemory}!void {
+        if (ref.static_kidx) |kidx| {
+            try self.emitOp(.GET_PROP, line);
+            try self.emitU8(rdst);
+            try self.emitU8(ref.robj);
+            try self.emitU16(kidx);
+        } else {
+            try self.emitOp(.GET_PROP_DYN, line);
+            try self.emitU8(rdst);
+            try self.emitU8(ref.robj);
+            try self.emitU8(ref.rkey);
+        }
+    }
+
+    fn emitMemberRefSet(self: *Self, ref: MemberRef, rval: u8, line: u32) error{OutOfMemory}!void {
+        if (ref.static_kidx) |kidx| {
+            try self.emitOp(.SET_PROP, line);
+            try self.emitU8(ref.robj);
+            try self.emitU16(kidx);
+            try self.emitU8(rval);
+        } else {
+            try self.emitOp(.SET_PROP_DYN, line);
+            try self.emitU8(ref.robj);
+            try self.emitU8(ref.rkey);
+            try self.emitU8(rval);
+        }
     }
 
     /// Map a compound-assignment operator to its binary opcode.
@@ -2054,6 +2075,11 @@ pub const FnCompiler = struct {
     }
 
     pub fn compileUpdate(self: *Self, u: ast.UpdateExpr, line: u32) error{OutOfMemory}!u8 {
+        // `obj[k]++` reads and writes through ONE Reference: the base and key are
+        // evaluated once and ToPropertyKey runs once, so a key object's `toString`
+        // is not observed twice.
+        if (u.operand.kind == .member_expr and !u.operand.data.member_expr.private_define)
+            return self.compileMemberUpdate(u, line);
         const r_old = try self.compileExpr(u.operand);
 
         if (u.prefix) {
@@ -2095,6 +2121,30 @@ pub const FnCompiler = struct {
             self.freeReg(); // free r_scratch
             return r_old; // return old (numeric) value
         }
+    }
+
+    /// `obj.k++` / `--obj[k]` — see compileUpdate. The result lands back in the
+    /// base register so the caller's single-result-register convention holds.
+    fn compileMemberUpdate(self: *Self, u: ast.UpdateExpr, line: u32) error{OutOfMemory}!u8 {
+        const ref = try self.compileMemberRef(u.operand.data.member_expr, true, line);
+        const r_old = self.allocReg();
+        try self.emitMemberRefGet(ref, r_old, line);
+        // ES UpdateExpression: `oldValue := ? ToNumeric(GetValue(lhs))`, so the
+        // postfix result is the *numeric* coercion of the old value, and the
+        // coercion runs exactly once.
+        try self.emitOp(.TO_NUMERIC, line);
+        try self.emitU8(r_old);
+        try self.emitU8(r_old);
+        const r_new = self.allocReg();
+        try self.emitOp(if (u.op == .inc) .INC else .DEC, line);
+        try self.emitU8(r_new);
+        try self.emitU8(r_old);
+        try self.emitMemberRefSet(ref, r_new, line);
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(ref.robj);
+        try self.emitU8(if (u.prefix) r_new else r_old);
+        self.sp = ref.robj + 1;
+        return ref.robj;
     }
 
     /// Sync `yield* rhs` with full next/throw/return forwarding (ES
@@ -2573,6 +2623,7 @@ pub const FnCompiler = struct {
             fe.rest_param,
             fe.param_defaults,
             fe.source_text,
+            fe.expected_argc,
         );
 
         // Concise methods (object/class method shorthand, getters, setters) are
@@ -2741,7 +2792,7 @@ fn compileFunction(
     body: []*Node,
     nfe_name: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null, &[_]?*Node{}, null);
+    return compileFunctionStrict(arena, name, params, body, nfe_name, false, false, false, false, false, null, &[_]?*Node{}, null, null);
 }
 
 /// Allocate an AST node from `data` (synthetic — no source span).
@@ -2801,6 +2852,10 @@ pub fn compileFunctionStrict(
     rest_param: ?[]const u8,
     param_defaults: []const ?*Node,
     source_text: ?[]const u8,
+    /// ES ExpectedArgumentCount, or null to derive it from `param_defaults`.
+    /// The parser's default-parameter TDZ desugar clears `param_defaults`, so
+    /// only the parser can compute this for such lists.
+    expected_argc: ?u16,
 ) error{OutOfMemory}!*BcFunction {
     var fc = FnCompiler.init(arena, name, params);
     fc.nfe_name = nfe_name;
@@ -2839,6 +2894,16 @@ pub fn compileFunctionStrict(
         .source_text = source_text,
         .nfe_name = nfe_name,
         .arity = @intCast(params.len),
+        // ES ExpectedArgumentCount (what `fn.length` reports): the parameters
+        // *before* the first one with an initializer. A rest parameter is
+        // already excluded from `params`. Kept separate from `arity`, which the
+        // JIT uses for the local-slot layout and so must stay = params.len.
+        .expected_argc = expected_argc orelse blk: {
+            for (params, 0..) |_, i| {
+                if (i < param_defaults.len and param_defaults[i] != null) break :blk @intCast(i);
+            }
+            break :blk @intCast(params.len);
+        },
         .chunk = chunk,
         .num_regs = num_regs,
         .child_functions = child_fns,
@@ -2889,6 +2954,7 @@ pub fn compileProgram(
         null, // program has no rest parameter
         &[_]?*ast.Node{}, // no parameters → no defaults
         null,
+        null,
     );
     return f;
 }
@@ -2921,6 +2987,7 @@ pub fn compileModule(
         false, // program is not an arrow
         null, // program has no rest parameter
         &[_]?*ast.Node{}, // no parameters → no defaults
+        null,
         null,
     );
     f.is_module = true;

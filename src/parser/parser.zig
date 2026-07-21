@@ -25,6 +25,11 @@ pub const ParamParse = struct {
     params: [][]const u8,
     param_defaults: []?*Node,
     rest_param: ?[]const u8,
+    /// ES ExpectedArgumentCount (what `fn.length` reports): the count of
+    /// parameters before the first Initializer. Recorded here because the
+    /// default-parameter TDZ desugar rewrites `param_defaults` to all-null
+    /// before the compiler ever sees it.
+    expected_argc: u16 = 0,
 };
 
 /// Check if first statement of body is "use strict" directive.
@@ -171,6 +176,10 @@ pub const Parser = struct {
     /// element, so the arrow builders can carry the rest binding onto the
     /// `function_expr`. Reset at the start of each extraction.
     arrow_rest_param: ?[]const u8 = null,
+    /// ES ExpectedArgumentCount for the arrow parameter list most recently
+    /// recovered from the cover grammar (extractArrowParams): the count of
+    /// parameters before the first defaulted one. `null` = all params counted.
+    arrow_expected_argc: ?u16 = null,
     /// Monotonic counter for synthetic destructuring-param names (`__param_N`).
     param_destruct_counter: u32,
     /// Monotonic counter giving every class body that declares private elements a

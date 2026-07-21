@@ -1382,6 +1382,7 @@ pub const BcVm = struct {
                 .MARK_DIRECT_EVAL => self.direct_eval_mark = true,
                 .DEFINE_LOCAL => if (try load_ops.opDefineLocal(self, frame)) |o| return o,
                 .SYNC_ANNEXB_FN => if (try load_ops.opSyncAnnexBFn(self, frame)) |o| return o,
+                .TO_PROPERTY_KEY => if (try property_ops.opToPropertyKey(self, frame)) |o| return o,
                 .GET_LOCAL => if (try load_ops.opGetLocal(self, frame)) |o| return o,
                 .SET_LOCAL => if (try load_ops.opSetLocal(self, frame)) |o| return o,
                 .ADD => if (try arith_ops.opAdd(self, frame)) |o| return o,
@@ -2585,7 +2586,7 @@ pub const BcVm = struct {
                     return val_mod.makeString(self.arena, display);
                 }
                 if (std.mem.eql(u8, key, "length")) {
-                    return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity));
+                    return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.expected_argc));
                 }
                 // Walk the backing object's prototype chain. For a subclass
                 // constructor (`class C extends Base`), `bcSetProto` set the
@@ -2716,7 +2717,7 @@ pub const BcVm = struct {
             const nm = if (std.mem.eql(u8, nm_raw, "__esm_dflt_fn__") or
                 std.mem.eql(u8, nm_raw, "__esm_dflt_gen__")) "default" else nm_raw;
             const nec: @import("../object/object.zig").PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-            _ = try o.defineOwnData("length", try val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity)), nec);
+            _ = try o.defineOwnData("length", try val_mod.makeNumber(self.arena, @floatFromInt(closure.func.expected_argc)), nec);
             _ = try o.defineOwnData("name", try val_mod.makeString(self.arena, nm), nec);
         }
         if (closure.func.is_generator) {

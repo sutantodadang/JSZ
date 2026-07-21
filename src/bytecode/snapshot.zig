@@ -27,7 +27,7 @@ const Value = val_mod.Value;
 const ic_mod = @import("../vm/ic.zig");
 
 pub const MAGIC = [4]u8{ 'J', 'S', 'Z', 'B' };
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 pub const SnapshotError = error{
     BadMagic,
@@ -181,6 +181,7 @@ fn writeFunction(w: *Writer, f: *const BcFunction) !void {
     try w.optStr(f.name);
     try w.str(f.chunk.source_name);
     try w.u16v(f.arity);
+    try w.u16v(f.expected_argc);
     try w.u16v(f.num_regs);
     try w.u16v(f.chunk.num_locals);
     try w.u8v(if (f.is_strict) 1 else 0);
@@ -217,6 +218,7 @@ fn readFunction(r: *Reader, arena: std.mem.Allocator) (SnapshotError)!*BcFunctio
     const name = try r.optStr(arena);
     const source_name = try r.str(arena);
     const arity = try r.u16v();
+    const expected_argc = try r.u16v();
     const num_regs = try r.u16v();
     const num_locals = try r.u16v();
     const is_strict = (try r.u8v()) != 0;
@@ -254,6 +256,7 @@ fn readFunction(r: *Reader, arena: std.mem.Allocator) (SnapshotError)!*BcFunctio
     f.* = BcFunction{
         .name = name,
         .arity = arity,
+        .expected_argc = expected_argc,
         .chunk = Chunk{
             .code = code,
             .constants = constants,

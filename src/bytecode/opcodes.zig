@@ -326,6 +326,13 @@ pub const Op = enum(u8) {
     /// declaration or a parameter between the block and the var scope gets no
     /// var binding and no sync. Declared last (JIT ordinal stability).
     SYNC_ANNEXB_FN,
+    /// TO_PROPERTY_KEY | 3 | op, Rdst u8, Rsrc u8. Rdst = ToPropertyKey(R[Rsrc])
+    /// — an object key runs its @@toPrimitive/toString (observable, may throw);
+    /// primitives pass through unchanged so the dyn get/set fast paths still
+    /// see numbers as numbers. Emitted once per member Reference whose key is
+    /// read *and* written (`o[k] += v`, `o[k]++`), so the user coercion runs
+    /// exactly once. Declared last (JIT ordinal stability).
+    TO_PROPERTY_KEY,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -428,6 +435,7 @@ pub fn instrSize(op: Op) usize {
         .MARK_DIRECT_EVAL => 1,
         .DEFINE_LOCAL => 4,
         .SYNC_ANNEXB_FN => 3,
+        .TO_PROPERTY_KEY => 3,
         .IN => 4,
         .DELETE_PROP => 4,
         .CALL_SPREAD => 5,
