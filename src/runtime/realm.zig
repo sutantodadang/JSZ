@@ -4049,7 +4049,9 @@ pub const Realm = struct {
 
         // Also expose Object.prototype on the constructor.
         const proto_val = try val_mod.makeObject(arena, object_proto);
-        try object_ctor.set("prototype", proto_val);
+        // §20.1.2.x: `Object.prototype` is { [[Writable]]: false,
+        // [[Enumerable]]: false, [[Configurable]]: false }.
+        try object_ctor.defineOwnDataForced("prototype", proto_val, .{ .writable = false, .enumerable = false, .configurable = false });
 
         // Define "Object" in global env as the constructor object.
         _ = try object_ctor.defineOwnData("name", try val_mod.makeString(arena, "Object"), .{ .writable = false, .enumerable = false, .configurable = true });
