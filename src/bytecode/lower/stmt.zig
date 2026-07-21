@@ -126,7 +126,7 @@ pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         // is where Annex B.3.3 copies its value out to the var scope (the spec
         // replaces FunctionDeclaration Evaluation with exactly that step).
         if (has_scope and child.kind == .function_decl) {
-            try self.emitAnnexBSync(child.data.function_decl.name, child.start);
+            try self.emitAnnexBSync(child, child.start);
             continue;
         }
         var child_reg: ?u8 = null;
@@ -151,7 +151,7 @@ pub fn lowerNestedFunctionDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?
     self.block_scope_depth += 1;
     var fd_reg: ?u8 = null;
     try lowerBlockFunctionDecl(self, node, &fd_reg);
-    try self.emitAnnexBSync(node.data.function_decl.name, line);
+    try self.emitAnnexBSync(node, line);
     try self.emitOp(.EXIT_SCOPE, line);
     self.block_scope_depth -= 1;
     last_expr_reg.* = null;

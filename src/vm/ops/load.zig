@@ -418,10 +418,30 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 return null;
             }
             if (frame.inherited_env_floor != null) {
+                // Retry without the floor: the binding may live outside the
+                // inherited with-scopes, past which the first walk stopped.
                 if (frame.env.assign(name, value)) |_| {
                     mirrorGlobalBinding(frame, name, value, true);
                     return null;
-                } else |_| {}
+                } else |e2| switch (e2) {
+                    // Found, but not assignable. These are the same errors the
+                    // unfloored walk reports and must not decay into an
+                    // implicit global — `with (o) { (() => { constX = 1 })() }`
+                    // is still a TypeError.
+                    error.ConstAssignment, error.TemporalDeadZone => {
+                        const msg = if (e2 == error.ConstAssignment)
+                            try std.fmt.allocPrint(self.arena, "Assignment to constant variable.", .{})
+                        else
+                            try std.fmt.allocPrint(self.arena, "Cannot access '{s}' before initialization", .{name});
+                        const kind = if (e2 == error.ConstAssignment) "TypeError" else "ReferenceError";
+                        const exc_val = try self.makeErrorObjectBc(kind, msg);
+                        self.last_exception_value = exc_val;
+                        const found = try self.throwException(exc_val);
+                        if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+                        return null;
+                    },
+                    else => {},
+                }
             }
             if (cur_is_strict) {
                 // Phase 4d: strict mode — undeclared variable assignment is a ReferenceError.

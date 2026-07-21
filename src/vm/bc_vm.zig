@@ -3266,7 +3266,12 @@ pub const BcVm = struct {
         // dispatch. Saving the previous value keeps a nested call made by the
         // callee (or by an argument's getter) from inheriting it.
         const prev_direct_eval = self.direct_eval_call;
-        self.direct_eval_call = self.direct_eval_mark;
+        // The syntactic mark is necessary but not sufficient: the callee must
+        // also *be* %eval% (§13.3.6.1 step 6), so `var eval = f; eval(s)` is an
+        // ordinary call to f — and the flag must not survive into it, or f's own
+        // call to the real eval would inherit the caller's scope.
+        self.direct_eval_call = self.direct_eval_mark and
+            @import("../runtime/realm.zig").isEvalIntrinsic(callee_val);
         self.direct_eval_mark = false;
         defer self.direct_eval_call = prev_direct_eval;
         const frame = &self.frames.items[self.frames.items.len - 1];

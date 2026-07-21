@@ -2879,6 +2879,16 @@ fn nativeEval(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!
     return ctx.evalSource(arena, src);
 }
 
+/// Is `v` the %eval% intrinsic itself? A direct eval requires more than the
+/// syntactic shape `eval(...)`: §13.3.6.1 falls back to an ordinary call unless
+/// the callee actually evaluates to %eval%. So `var eval = f; eval(s)` and
+/// `var eval = realEval.bind(null, s); eval()` are plain calls, even though the
+/// callee is spelled `eval`.
+pub fn isEvalIntrinsic(v: Value) bool {
+    if (v.bits == 0 or v.unbox() != .native_function) return false;
+    return v.toPtr().native_function.call == nativeEval;
+}
+
 fn toBooleanCoerce(v: Value) bool {
     return val_mod.toBoolean(v);
 }

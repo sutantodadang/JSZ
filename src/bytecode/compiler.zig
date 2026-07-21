@@ -128,8 +128,13 @@ pub const FnCompiler = struct {
     block_scope_depth: u32 = 0,
     /// Annex B.3.3: block-level function declaration names that also get a
     /// `var`-scoped binding in this scope (see collectAnnexBNames). Computed
-    /// once per body in compileBody; consulted when lowering each declaration.
+    /// once per body in compileBody; drives the var-hoisting pre-pass.
     annexb_fn_names: std.ArrayList([]const u8) = .empty,
+    /// The individual declarations the extension applies to. Keyed by node
+    /// rather than by name because applicability is per-declaration: in
+    /// `{ function x(){} } { let x; { function x(){} } }` the first gets the
+    /// var binding and the second must not overwrite it.
+    annexb_fn_sites: std.ArrayList(*ast.Node) = .empty,
     /// Number of enclosing `with` statements whose body is currently being
     /// compiled. When >0, a `var x = init` initializer must route its store
     /// through the with-object environment (SET_GLOBAL) rather than a direct
@@ -334,13 +339,14 @@ pub const FnCompiler = struct {
     /// Annex B.3.3 (Web-compat semantics for block-level function declarations):
     /// collect the names of function declarations nested inside a block / `if`
     /// clause / loop body that additionally get a `var`-scoped binding in this
-    /// scope. A name is excluded when replacing the declaration with `var F`
-    /// would be an early error — that is, when some enclosing construct between
-    /// the declaration and this scope already binds F lexically (`let`/`const`/
-    /// `class`, a catch parameter, a `for` head binding) or F is a parameter of
-    /// the enclosing function. `blocked` is the running set of such names along
-    /// the current path; `nested` distinguishes a genuine block-level
-    /// declaration from an ordinary top-level one.
+    /// scope. A declaration is excluded when replacing it with `var F` would be
+    /// an early error — that is, when some enclosing construct between it and
+    /// this scope already binds F lexically (`let`/`const`/`class`, a `for` head
+    /// binding) or F is a parameter of the enclosing function. `blocked` is the
+    /// running set of such names along the current path; `nested` distinguishes
+    /// a genuine block-level declaration from an ordinary top-level one.
+    /// Applicability is decided per declaration, so `out` (the names to hoist)
+    /// is accompanied by `annexb_fn_sites` (the declarations that sync).
     pub fn collectAnnexBNames(
         self: *Self,
         node: *ast.Node,
@@ -354,6 +360,7 @@ pub const FnCompiler = struct {
                 const name = node.data.function_decl.name;
                 for (blocked.items) |b| if (std.mem.eql(u8, b, name)) return;
                 try self.addHoistName(out, name);
+                try self.annexb_fn_sites.append(self.arena, node);
             },
             .block_stmt => {
                 const bs = node.data.block_stmt;
@@ -421,11 +428,11 @@ pub const FnCompiler = struct {
         }
     }
 
-    /// True when `name` is a block-level function declaration that Annex B.3.3
+    /// True when `decl` is a block-level function declaration that Annex B.3.3
     /// also gives a `var`-scoped binding in the enclosing function/script scope.
-    pub fn isAnnexBFunction(self: *Self, name: []const u8) bool {
-        for (self.annexb_fn_names.items) |n| {
-            if (std.mem.eql(u8, n, name)) return true;
+    pub fn isAnnexBFunction(self: *Self, decl: *ast.Node) bool {
+        for (self.annexb_fn_sites.items) |n| {
+            if (n == decl) return true;
         }
         return false;
     }
@@ -519,10 +526,10 @@ pub const FnCompiler = struct {
     }
 
     /// Emit the Annex B.3.3 var-scope sync for a block-level function
-    /// declaration; a no-op for names the extension does not apply to.
-    pub fn emitAnnexBSync(self: *Self, name: []const u8, line: u32) !void {
-        if (!self.isAnnexBFunction(name)) return;
-        const sv = try val_mod.makeString(self.arena, name);
+    /// declaration; a no-op for declarations the extension does not apply to.
+    pub fn emitAnnexBSync(self: *Self, decl: *ast.Node, line: u32) !void {
+        if (!self.isAnnexBFunction(decl)) return;
+        const sv = try val_mod.makeString(self.arena, decl.data.function_decl.name);
         const kidx = try self.addConstant(sv);
         try self.emitOp(.SYNC_ANNEXB_FN, line);
         try self.emitU16(kidx);
@@ -2154,7 +2161,14 @@ pub const FnCompiler = struct {
         // NOT a direct eval however it is written.
         if (!c.optional and c.callee.kind == .identifier and
             std.mem.eql(u8, c.callee.data.identifier, "eval"))
+        {
             try self.emitOp(.MARK_DIRECT_EVAL, line);
+            // The eval'd source may name `arguments`, which the enclosing
+            // function cannot see by scanning its own body — so a direct eval
+            // forces the arguments object to be materialized (§10.2.11 step 15
+            // treats a function containing a direct eval as using it).
+            self.saw_arguments = true;
+        }
 
         // Emit CALL (or TAIL_CALL when this call is in tail position).
         const ret_dst = base; // result goes back into base register.
