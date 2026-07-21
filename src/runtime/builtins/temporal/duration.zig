@@ -31,7 +31,10 @@ fn requireDuration(arena: std.mem.Allocator, v: Value) !*DurationFields {
     return getDuration(v) orelse realm_mod.throwTypeError(arena, "not a Temporal.Duration");
 }
 
-pub fn makeDuration(arena: std.mem.Allocator, d: DurationFields) !Value {
+pub fn makeDuration(arena: std.mem.Allocator, fields: DurationFields) !Value {
+    // Negating or balancing a zero field yields -0, which is observable through
+    // every getter; a Duration field is always a positive zero.
+    const d = unnegateZeros(fields);
     if (!isValidDuration(d)) return realm_mod.throwRangeError(arena, "invalid Duration");
     const slot = try arena.create(DurationFields);
     slot.* = d;
@@ -44,8 +47,18 @@ pub fn makeDuration(arena: std.mem.Allocator, d: DurationFields) !Value {
     return val_mod.makeObject(arena, obj);
 }
 
+/// Replace every -0 field with +0.
+fn unnegateZeros(d: DurationFields) DurationFields {
+    var out = d;
+    inline for (@typeInfo(DurationFields).@"struct".fields) |f| {
+        if (f.type == f64 and @field(out, f.name) == 0) @field(out, f.name) = 0;
+    }
+    return out;
+}
+
 /// Populate a freshly-constructed `this` object (called via `new`).
-fn installInto(arena: std.mem.Allocator, this_val: Value, d: DurationFields) !Value {
+fn installInto(arena: std.mem.Allocator, this_val: Value, fields: DurationFields) !Value {
+    const d = unnegateZeros(fields);
     if (!isValidDuration(d)) return realm_mod.throwRangeError(arena, "invalid Duration");
     const slot = try arena.create(DurationFields);
     slot.* = d;
@@ -402,10 +415,17 @@ fn balanceTimeDuration(total_ns: i128, largest: shared.Unit) DurationFields {
         },
         else => {},
     }
-    d.milliseconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_MILLI))));
-    rem = @mod(rem, shared.NS_PER_MILLI);
-    d.microseconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_MICRO))));
-    rem = @mod(rem, shared.NS_PER_MICRO);
+    // Sub-second units only carry when largestUnit reaches down that far: with
+    // largestUnit "microseconds" the whole span belongs in microseconds, not
+    // milliseconds.
+    if (durUnitRank(largest) <= durUnitRank(.millisecond)) {
+        d.milliseconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_MILLI))));
+        rem = @mod(rem, shared.NS_PER_MILLI);
+    }
+    if (durUnitRank(largest) <= durUnitRank(.microsecond)) {
+        d.microseconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_MICRO))));
+        rem = @mod(rem, shared.NS_PER_MICRO);
+    }
     d.nanoseconds = @floatFromInt(@as(i128, (rem)));
     if (neg) return negate(d);
     return d;
@@ -491,26 +511,9 @@ fn hasTimeZoneAnnotation(str: []const u8) bool {
     return false;
 }
 
-/// MaximumTemporalDurationRoundingIncrement: the dividend used to validate a
-/// rounding increment for a time unit; calendar units have no maximum.
-fn maxIncrementDividend(u: shared.Unit) ?f64 {
-    return switch (u) {
-        .hour => 24,
-        .minute, .second => 60,
-        .millisecond, .microsecond, .nanosecond => 1000,
-        else => null,
-    };
-}
+const validateIncrement = shared.validateIncrement;
 
-/// ValidateTemporalRoundingIncrement (non-inclusive): the increment must be less
-/// than the unit's maximum and divide it evenly.
-fn validateIncrement(arena: std.mem.Allocator, u: shared.Unit, inc: f64) !void {
-    const dividend = maxIncrementDividend(u) orelse return;
-    if (inc >= dividend or @mod(dividend, inc) != 0)
-        return realm_mod.throwRangeError(arena, "invalid roundingIncrement for smallestUnit");
-}
-
-const RelResult = struct { d: DurationFields, total: f64 };
+pub const RelResult = struct { d: DurationFields, total: f64 };
 
 /// Round (or, for `total`, measure) a Duration against a PlainDate reference `R`.
 /// The whole span is balanced to `largest` via the ISO calendar, then the
@@ -525,46 +528,139 @@ fn roundRelative(
     inc: f64,
     mode: shared.RoundingMode,
 ) !RelResult {
-    // Weeks can only be produced under a "year" or "week" largestUnit; requesting
-    // week rounding while the (default) largestUnit is "month" is a RangeError.
-    if (smallest == .week and largest == .month)
-        return realm_mod.throwRangeError(arena, "cannot round to weeks with a months largestUnit");
-
     const DAY = shared.NS_PER_DAY;
     const time_ns = timePartNanos(d0);
     // Fold the sub-day/over-day time into whole days plus a sub-day remainder.
     const extra_days = @divTrunc(time_ns, DAY);
     const time_rem = time_ns - extra_days * DAY;
     const dest_date = try pd.addISODate(R, d0.years, d0.months, d0.weeks, d0.days + @as(f64, @floatFromInt(extra_days)), .constrain, arena);
+    const dest_ns: i128 = @as(i128, epochDaysOf(dest_date) - epochDaysOf(R)) * DAY + time_rem;
+
+    // Balance the whole span to largestUnit before nudging.
+    var bal: DurationFields = undefined;
+    if (durUnitRank(largest) > durUnitRank(.day)) {
+        bal = balanceTimeDuration(dest_ns, largest);
+    } else {
+        bal = pd.differenceISODate(R, dest_date, largest);
+        const t = balanceTimeDuration(time_rem, .hour);
+        bal.hours = t.hours;
+        bal.minutes = t.minutes;
+        bal.seconds = t.seconds;
+        bal.milliseconds = t.milliseconds;
+        bal.microseconds = t.microseconds;
+        bal.nanoseconds = t.nanoseconds;
+    }
+    // Weeks can only be produced under a "year" or "week" largestUnit; requesting
+    // week rounding while the (default) largestUnit is "month" is a RangeError.
+    if (smallest == .week and largest == .month)
+        return realm_mod.throwRangeError(arena, "cannot round to weeks with a months largestUnit");
 
     const s = d0.sign();
-    const sgn: f64 = if (s < 0) -1 else 1;
+    return roundRelativeBalanced(arena, bal, R, dest_ns, smallest, largest, inc, mode, if (s < 0) -1 else 1);
+}
+
+/// BubbleRelativeDuration: after the smallest unit expanded away from zero, the
+/// result may now reach a whole larger unit (11 months rounding up to 12 is a
+/// year). Walk outward from `start_unit` toward `largest`, promoting whenever the
+/// larger unit's own endpoint no longer overshoots the nudged endpoint.
+fn bubbleRelative(
+    arena: std.mem.Allocator,
+    d: DurationFields,
+    R: ISODate,
+    nudged_ns: i128,
+    largest: shared.Unit,
+    start_unit: shared.Unit,
+    sgn: f64,
+) !DurationFields {
+    const DAY = shared.NS_PER_DAY;
+    var out = d;
+    if (start_unit == largest) return out;
+    var idx: i8 = @as(i8, @intCast(durUnitRank(start_unit))) - 1;
+    const stop: i8 = @intCast(durUnitRank(largest));
+    while (idx >= stop) : (idx -= 1) {
+        const unit: shared.Unit = switch (idx) {
+            0 => .year,
+            1 => .month,
+            2 => .week,
+            else => break,
+        };
+        // Weeks are only a carrier under a "week" largestUnit; otherwise months
+        // absorb them directly and the week step must be skipped.
+        if (unit == .week and largest != .week) continue;
+        var cand = DurationFields{};
+        switch (unit) {
+            .year => cand.years = out.years + sgn,
+            .month => {
+                cand.years = out.years;
+                cand.months = out.months + sgn;
+            },
+            .week => {
+                cand.years = out.years;
+                cand.months = out.months;
+                cand.weeks = out.weeks + sgn;
+            },
+            else => unreachable,
+        }
+        const end_date = try pd.addISODate(R, cand.years, cand.months, cand.weeks, 0, .constrain, arena);
+        const end_ns: i128 = @as(i128, epochDaysOf(end_date) - epochDaysOf(R)) * DAY;
+        const beyond = if (sgn > 0) end_ns <= nudged_ns else nudged_ns <= end_ns;
+        if (!beyond) break;
+        out = cand;
+    }
+    return out;
+}
+
+/// RoundRelativeDuration proper: `bal` is the span already balanced to `largest`
+/// against the anchor date `R`, and `dest_ns` locates the exact endpoint in
+/// nanoseconds measured from midnight of `R` (the anchor's own time-of-day
+/// cancels out of every difference taken here, so it need not be supplied).
+pub fn roundRelativeBalanced(
+    arena: std.mem.Allocator,
+    bal: DurationFields,
+    R: ISODate,
+    dest_ns: i128,
+    smallest: shared.Unit,
+    largest: shared.Unit,
+    inc: f64,
+    mode: shared.RoundingMode,
+    sgn: f64,
+) !RelResult {
+    const DAY = shared.NS_PER_DAY;
 
     // ---- Time-unit smallestUnit: round the time portion, keep the calendar. ----
-    if (durUnitRank(smallest) > durUnitRank(.day)) {
+    // "day" belongs here too (spec NudgeToDayOrTime): only a time zone can make a
+    // day irregular, and none of these callers has one, so a day is a flat 24h.
+    if (durUnitRank(smallest) >= durUnitRank(.day)) {
         const unit_ns = shared.unitLengthNanos(smallest).?;
         const inc_ns = unit_ns * @as(i128, @intFromFloat(inc));
         if (largest == .year or largest == .month or largest == .week) {
-            const bal = pd.differenceISODate(R, dest_date, largest);
-            const low_ns = @as(i128, @intFromFloat(bal.days)) * DAY + time_rem;
+            const low_ns = @as(i128, @intFromFloat(bal.days)) * DAY + timePartNanos(bal);
             const rounded = shared.roundI128ToIncrement(low_ns, inc_ns, mode);
             var out = balanceTimeDuration(rounded, .day);
             out.years = bal.years;
             out.months = bal.months;
             out.weeks = bal.weeks;
+            // Rounding the time up can spill into a whole extra day, which may in
+            // turn complete a month or a year.
+            const expanded = if (sgn > 0) rounded > low_ns else rounded < low_ns;
+            if (expanded) {
+                const nudged_ns = dest_ns + (rounded - low_ns);
+                const bubbled = try bubbleRelative(arena, out, R, nudged_ns, largest, .day, sgn);
+                out.years = bubbled.years;
+                out.months = bubbled.months;
+                out.weeks = bubbled.weeks;
+                if (bubbled.years != bal.years or bubbled.months != bal.months or bubbled.weeks != bal.weeks) out.days = 0;
+            }
             return .{ .d = out, .total = @as(f64, @floatFromInt(low_ns)) / @as(f64, @floatFromInt(unit_ns)) };
         }
-        const full_ns: i128 = @as(i128, epochDaysOf(dest_date) - epochDaysOf(R)) * DAY + time_rem;
-        const rounded = shared.roundI128ToIncrement(full_ns, inc_ns, mode);
+        const rounded = shared.roundI128ToIncrement(dest_ns, inc_ns, mode);
         const out = balanceTimeDuration(rounded, largest);
-        return .{ .d = out, .total = @as(f64, @floatFromInt(full_ns)) / @as(f64, @floatFromInt(unit_ns)) };
+        return .{ .d = out, .total = @as(f64, @floatFromInt(dest_ns)) / @as(f64, @floatFromInt(unit_ns)) };
     }
 
     // ---- Calendar/day smallestUnit: nudge between two candidate dates. ----
-    // Balance the whole span to largestUnit, then round the smallest unit by
-    // measuring where the true endpoint falls between the r1 (toward zero) and
-    // r2 (one increment away) candidate dates.
-    const bal = pd.differenceISODate(R, dest_date, largest);
+    // Round the smallest unit by measuring where the true endpoint falls between
+    // the r1 (toward zero) and r2 (one increment away) candidate dates.
     var ry = bal.years;
     var rmo = bal.months;
     var rw = bal.weeks;
@@ -607,9 +703,9 @@ fn roundRelative(
 
     const start_date = try pd.addISODate(R, ry, rmo, rw, rd, .constrain, arena);
     const end_date = try pd.addISODate(R, ry + step_y, rmo + step_mo, rw + step_w, rd + step_d, .constrain, arena);
-    const start_ns: i128 = @as(i128, epochDaysOf(start_date)) * DAY;
-    const end_ns: i128 = @as(i128, epochDaysOf(end_date)) * DAY;
-    const dest_ns: i128 = @as(i128, epochDaysOf(dest_date)) * DAY + time_rem;
+    // Measured from midnight of `R`, matching `dest_ns`.
+    const start_ns: i128 = @as(i128, epochDaysOf(start_date) - epochDaysOf(R)) * DAY;
+    const end_ns: i128 = @as(i128, epochDaysOf(end_date) - epochDaysOf(R)) * DAY;
     const num = dest_ns - start_ns;
     const denom = end_ns - start_ns;
     const p: f64 = if (denom == 0) 0 else @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(denom));
@@ -635,6 +731,12 @@ fn roundRelative(
             out.days = rounded_count;
         },
         else => unreachable,
+    }
+    // Expanding the smallest unit can complete a larger one (11 months → 12 → a
+    // year). Weeks never carry, so they are excluded from the promotion walk.
+    if (rounded_count != r1_count and smallest != .week) {
+        const nudged_ns = end_ns;
+        out = try bubbleRelative(arena, out, R, nudged_ns, largest, smallest, sgn);
     }
     return .{ .d = out, .total = value };
 }

@@ -1303,6 +1303,48 @@ pub fn getRoundingIncrement(arena: std.mem.Allocator, opts: ?*JsObject) !f64 {
     return t;
 }
 
+/// The four options every `until`/`since` reads. `null` for a unit means the
+/// option was absent or "auto"; the caller applies its own defaults.
+pub const DiffOptions = struct {
+    smallest: ?Unit,
+    largest: ?Unit,
+    inc: f64,
+    mode: RoundingMode,
+};
+
+/// GetDifferenceSettings' observable half: every property is read and coerced —
+/// in the spec's order of largestUnit, roundingIncrement, roundingMode,
+/// smallestUnit — before any caller-side validation of the unit combination.
+/// `since` mirrors the rounding direction, since it is computed as the negation
+/// of `until` rather than by swapping the operands.
+pub fn getDiffOptions(arena: std.mem.Allocator, opts: ?*JsObject, since: bool) !DiffOptions {
+    const largest = try getTemporalUnit(arena, opts, "largestUnit");
+    const inc = try getRoundingIncrement(arena, opts);
+    var mode = try getRoundingMode(arena, opts, .trunc);
+    if (since) mode = negateRoundingMode(mode);
+    const smallest = try getTemporalUnit(arena, opts, "smallestUnit");
+    return .{ .smallest = smallest, .largest = largest, .inc = inc, .mode = mode };
+}
+
+/// MaximumTemporalDurationRoundingIncrement: the dividend a rounding increment
+/// is validated against. Calendar units have no maximum.
+pub fn maxIncrementDividend(u: Unit) ?f64 {
+    return switch (u) {
+        .hour => 24,
+        .minute, .second => 60,
+        .millisecond, .microsecond, .nanosecond => 1000,
+        else => null,
+    };
+}
+
+/// ValidateTemporalRoundingIncrement (non-inclusive): the increment must be less
+/// than the unit's maximum and divide it evenly.
+pub fn validateIncrement(arena: std.mem.Allocator, u: Unit, inc: f64) !void {
+    const dividend = maxIncrementDividend(u) orelse return;
+    if (inc >= dividend or @mod(dividend, inc) != 0)
+        return realm_mod.throwRangeError(arena, "invalid roundingIncrement for smallestUnit");
+}
+
 /// Read a required or optional temporal unit option (e.g. "smallestUnit").
 pub fn getTemporalUnit(arena: std.mem.Allocator, opts: ?*JsObject, key: []const u8) !?Unit {
     const s = (try readStringOption(arena, opts, key)) orelse return null;

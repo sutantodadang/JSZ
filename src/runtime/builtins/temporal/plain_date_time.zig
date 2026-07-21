@@ -250,35 +250,46 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     const dt = try requireDT(arena, this_val);
     const other = try toTemporalDateTime(arena, if (args.len > 0) args[0] else Value{}, .constrain);
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
-    if (smallest == null) smallest = .nanosecond;
-    if (largest == null) largest = if (unitRank(smallest.?) < unitRank(.day)) smallest.? else .day;
-    if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    var mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
-
     // `since` negates `until` rather than swapping the operands: both anchor
     // their calendar walk on the receiver, and calendar arithmetic is not
     // symmetric. Rounding runs mirrored, so the mode is negated too.
-    if (since) mode = shared.negateRoundingMode(mode);
+    const o = try shared.getDiffOptions(arena, opts, since);
+    const smallest = o.smallest orelse .nanosecond;
+    const largest = o.largest orelse if (unitRank(smallest) < unitRank(.day)) smallest else .day;
+    if (unitRank(largest) > unitRank(smallest)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
+    try shared.validateIncrement(arena, smallest, o.inc);
+
     const from = dt.*;
     const to = other;
+    // Exact span, in nanoseconds from midnight of the anchor date. The anchor's
+    // own time-of-day cancels out of every difference the rounder takes.
+    const dest_ns: i128 = @as(i128, shared.isoDateToEpochDays(to.date.year, to.date.month, to.date.day) -
+        shared.isoDateToEpochDays(from.date.year, from.date.month, from.date.day)) * shared.NS_PER_DAY +
+        (shared.timeToNanos(to.time) - shared.timeToNanos(from.time));
 
     var result: shared.DurationFields = undefined;
     // Rank 0 is `year`, so "day or larger" is a *lower* rank.
-    if (unitRank(largest.?) <= unitRank(.day)) {
+    if (unitRank(largest) <= unitRank(.day)) {
         // Calendar+time difference with day/week/month/year largest unit.
-        result = differenceDateTime(from, to, largest.?);
+        result = differenceDateTime(from, to, largest);
     } else {
         // Pure time balancing (largest is hour or smaller): convert everything.
-        const total_ns = (shared.isoDateToEpochDays(to.date.year, to.date.month, to.date.day) -
-            shared.isoDateToEpochDays(from.date.year, from.date.month, from.date.day)) * shared.NS_PER_DAY +
-            (shared.timeToNanos(to.time) - shared.timeToNanos(from.time));
-        result = balanceTime(total_ns, largest.?);
+        result = balanceTime(dest_ns, largest);
     }
-    // Rounding: only for time-unit / day smallestUnit (approximate).
-    result = roundResult(result, smallest.?, inc, mode, largest.?);
+    if (smallest != .nanosecond or o.inc != 1) {
+        const rr = try duration.roundRelativeBalanced(
+            arena,
+            result,
+            from.date,
+            dest_ns,
+            smallest,
+            largest,
+            o.inc,
+            o.mode,
+            if (dest_ns < 0) -1 else 1,
+        );
+        result = rr.d;
+    }
     if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
 }
@@ -339,19 +350,6 @@ fn balanceTime(total_ns: i128, largest: shared.Unit) shared.DurationFields {
     d.nanoseconds = @floatFromInt(@as(i128, (rem)));
     if (neg) return negate(d);
     return d;
-}
-
-/// Approximate rounding of a difference to `smallest`+increment for time units.
-fn roundResult(result: shared.DurationFields, smallest: shared.Unit, inc: f64, mode: shared.RoundingMode, largest: shared.Unit) shared.DurationFields {
-    if (unitRank(smallest) < unitRank(.hour)) return result; // date-unit rounding unsupported
-    // Only round when the whole duration is pure time (no calendar fields) so a
-    // nanosecond total is meaningful.
-    if (result.years != 0 or result.months != 0 or result.weeks != 0 or result.days != 0) return result;
-    const total = durTimeNanos(result);
-    const per = shared.unitLengthNanos(smallest) orelse return result;
-    const inc_ns = per * @as(i128, @intFromFloat(inc));
-    const rounded = shared.roundI128ToIncrement(total, inc_ns, mode);
-    return balanceTime(rounded, largest);
 }
 
 pub fn nativeUntil(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
