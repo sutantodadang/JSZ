@@ -4617,76 +4617,90 @@ pub const Realm = struct {
         // ---- Intl (en-US, dependency-free) ----
         {
             const intl_obj = try JsObject.create(arena, object_proto);
+            // Intl service constructors share a standard shape: a real function
+            // object ([[Prototype]] = Function.prototype), a non-writable/-enumerable/
+            // -configurable `prototype`, whose object carries non-enumerable methods,
+            // an own `constructor`, a `Symbol.toStringTag`, and (for the locale-aware
+            // services) a `supportedLocalesOf` static that reuses the shared impl.
+            const IntlReg = struct {
+                fn method(a: std.mem.Allocator, proto: *JsObject, name: []const u8, f: anytype, len: u8) !void {
+                    _ = try proto.defineOwnData(name, try val_mod.makeNativeFunctionNamed(a, f, name, len), .{ .writable = true, .enumerable = false, .configurable = true });
+                }
+                fn finish(a: std.mem.Allocator, ctor: *JsObject, proto: *JsObject, cname: []const u8, tag: []const u8, len: u8, has_slo: bool) !void {
+                    _ = try ctor.defineOwnData("prototype", try val_mod.makeObject(a, proto), .{ .writable = false, .enumerable = false, .configurable = false });
+                    _ = try proto.defineOwnData("constructor", try val_mod.makeObject(a, ctor), .{ .writable = true, .enumerable = false, .configurable = true });
+                    if (active_sym_to_string_tag) |tag_sym|
+                        _ = try proto.defineOwnDataSym(tag_sym, try val_mod.makeString(a, tag), .{ .writable = false, .enumerable = false, .configurable = true });
+                    _ = try ctor.defineOwnData("name", try val_mod.makeString(a, cname), .{ .writable = false, .enumerable = false, .configurable = true });
+                    _ = try ctor.defineOwnData("length", try val_mod.makeNumber(a, @floatFromInt(len)), .{ .writable = false, .enumerable = false, .configurable = true });
+                    if (has_slo)
+                        _ = try ctor.defineOwnData("supportedLocalesOf", try val_mod.makeNativeFunctionNamed(a, intl_mod.nativeDurationFormatSupportedLocalesOf, "supportedLocalesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+                }
+            };
             // Intl.NumberFormat
             const nf_proto = try JsObject.create(arena, object_proto);
-            try nf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeNumberFormatFormat, "format", 0));
-            try nf_proto.set("resolvedOptions", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeNumberFormatResolved, "resolvedOptions", 0));
-            const nf_ctor = try JsObject.create(arena, null);
+            try IntlReg.method(arena, nf_proto, "format", intl_mod.nativeNumberFormatFormat, 0);
+            try IntlReg.method(arena, nf_proto, "resolvedOptions", intl_mod.nativeNumberFormatResolved, 0);
+            const nf_ctor = try JsObject.create(arena, function_proto);
             try nf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeNumberFormatCtor));
-            try nf_ctor.set("prototype", try val_mod.makeObject(arena, nf_proto));
-            _ = try nf_ctor.defineOwnData("name", try val_mod.makeString(arena, "NumberFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
-            _ = try nf_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+            try IntlReg.finish(arena, nf_ctor, nf_proto, "NumberFormat", "Intl.NumberFormat", 0, true);
             try intl_obj.set("NumberFormat", try val_mod.makeObject(arena, nf_ctor));
             // Intl.DateTimeFormat
             const dtf_proto = try JsObject.create(arena, object_proto);
-            try dtf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatFormat, "format", 0));
-            try dtf_proto.set("formatToParts", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatFormatToParts, "formatToParts", 1));
-            try dtf_proto.set("resolvedOptions", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDateTimeFormatResolved, "resolvedOptions", 0));
-            const dtf_ctor = try JsObject.create(arena, null);
+            try IntlReg.method(arena, dtf_proto, "format", intl_mod.nativeDateTimeFormatFormat, 0);
+            try IntlReg.method(arena, dtf_proto, "formatToParts", intl_mod.nativeDateTimeFormatFormatToParts, 1);
+            try IntlReg.method(arena, dtf_proto, "resolvedOptions", intl_mod.nativeDateTimeFormatResolved, 0);
+            const dtf_ctor = try JsObject.create(arena, function_proto);
             try dtf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDateTimeFormatCtor));
-            try dtf_ctor.set("prototype", try val_mod.makeObject(arena, dtf_proto));
-            _ = try dtf_ctor.defineOwnData("name", try val_mod.makeString(arena, "DateTimeFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
-            _ = try dtf_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+            try IntlReg.finish(arena, dtf_ctor, dtf_proto, "DateTimeFormat", "Intl.DateTimeFormat", 0, true);
             try intl_obj.set("DateTimeFormat", try val_mod.makeObject(arena, dtf_ctor));
             // Intl.Collator
             const col_proto = try JsObject.create(arena, object_proto);
-            try col_proto.set("compare", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeCollatorCompare, "compare", 0));
-            try col_proto.set("resolvedOptions", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeCollatorResolved, "resolvedOptions", 0));
-            const col_ctor = try JsObject.create(arena, null);
+            try IntlReg.method(arena, col_proto, "compare", intl_mod.nativeCollatorCompare, 0);
+            try IntlReg.method(arena, col_proto, "resolvedOptions", intl_mod.nativeCollatorResolved, 0);
+            const col_ctor = try JsObject.create(arena, function_proto);
             try col_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeCollatorCtor));
-            try col_ctor.set("prototype", try val_mod.makeObject(arena, col_proto));
-            _ = try col_ctor.defineOwnData("name", try val_mod.makeString(arena, "Collator"), .{ .writable = false, .enumerable = false, .configurable = true });
-            _ = try col_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+            try IntlReg.finish(arena, col_ctor, col_proto, "Collator", "Intl.Collator", 0, true);
             try intl_obj.set("Collator", try val_mod.makeObject(arena, col_ctor));
-            // Intl.Locale
+            // Intl.Locale (no supportedLocalesOf; ctor length 1)
             const loc_proto = try JsObject.create(arena, object_proto);
-            try loc_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeLocaleToString, "toString", 0));
-            const loc_ctor = try JsObject.create(arena, null);
+            try IntlReg.method(arena, loc_proto, "toString", intl_mod.nativeLocaleToString, 0);
+            const loc_ctor = try JsObject.create(arena, function_proto);
             try loc_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeLocaleCtor));
-            try loc_ctor.set("prototype", try val_mod.makeObject(arena, loc_proto));
-            _ = try loc_ctor.defineOwnData("name", try val_mod.makeString(arena, "Locale"), .{ .writable = false, .enumerable = false, .configurable = true });
-            _ = try loc_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+            try IntlReg.finish(arena, loc_ctor, loc_proto, "Locale", "Intl.Locale", 1, false);
             try intl_obj.set("Locale", try val_mod.makeObject(arena, loc_ctor));
             // Intl.ListFormat
             const lf_proto = try JsObject.create(arena, object_proto);
-            try lf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeListFormatFormat, "format", 1));
-            try lf_proto.set("resolvedOptions", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeListFormatResolved, "resolvedOptions", 0));
-            const lf_ctor = try JsObject.create(arena, null);
+            try IntlReg.method(arena, lf_proto, "format", intl_mod.nativeListFormatFormat, 1);
+            try IntlReg.method(arena, lf_proto, "resolvedOptions", intl_mod.nativeListFormatResolved, 0);
+            const lf_ctor = try JsObject.create(arena, function_proto);
             try lf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeListFormatCtor));
-            try lf_ctor.set("prototype", try val_mod.makeObject(arena, lf_proto));
-            _ = try lf_ctor.defineOwnData("name", try val_mod.makeString(arena, "ListFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
-            _ = try lf_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+            try IntlReg.finish(arena, lf_ctor, lf_proto, "ListFormat", "Intl.ListFormat", 0, true);
             try intl_obj.set("ListFormat", try val_mod.makeObject(arena, lf_ctor));
             // Intl.PluralRules
             const pr_proto = try JsObject.create(arena, object_proto);
-            try pr_proto.set("select", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativePluralRulesSelect, "select", 1));
-            try pr_proto.set("resolvedOptions", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativePluralRulesResolved, "resolvedOptions", 0));
-            const pr_ctor = try JsObject.create(arena, null);
+            try IntlReg.method(arena, pr_proto, "select", intl_mod.nativePluralRulesSelect, 1);
+            try IntlReg.method(arena, pr_proto, "resolvedOptions", intl_mod.nativePluralRulesResolved, 0);
+            const pr_ctor = try JsObject.create(arena, function_proto);
             try pr_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativePluralRulesCtor));
-            try pr_ctor.set("prototype", try val_mod.makeObject(arena, pr_proto));
-            _ = try pr_ctor.defineOwnData("name", try val_mod.makeString(arena, "PluralRules"), .{ .writable = false, .enumerable = false, .configurable = true });
-            _ = try pr_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+            try IntlReg.finish(arena, pr_ctor, pr_proto, "PluralRules", "Intl.PluralRules", 0, true);
             try intl_obj.set("PluralRules", try val_mod.makeObject(arena, pr_ctor));
             // Intl.RelativeTimeFormat
             const rtf_proto = try JsObject.create(arena, object_proto);
-            try rtf_proto.set("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeRelativeTimeFormatFormat, "format", 2));
-            try rtf_proto.set("resolvedOptions", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeRelativeTimeFormatResolved, "resolvedOptions", 0));
-            const rtf_ctor = try JsObject.create(arena, null);
+            try IntlReg.method(arena, rtf_proto, "format", intl_mod.nativeRelativeTimeFormatFormat, 2);
+            try IntlReg.method(arena, rtf_proto, "resolvedOptions", intl_mod.nativeRelativeTimeFormatResolved, 0);
+            const rtf_ctor = try JsObject.create(arena, function_proto);
             try rtf_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeRelativeTimeFormatCtor));
-            try rtf_ctor.set("prototype", try val_mod.makeObject(arena, rtf_proto));
-            _ = try rtf_ctor.defineOwnData("name", try val_mod.makeString(arena, "RelativeTimeFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
-            _ = try rtf_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+            try IntlReg.finish(arena, rtf_ctor, rtf_proto, "RelativeTimeFormat", "Intl.RelativeTimeFormat", 0, true);
             try intl_obj.set("RelativeTimeFormat", try val_mod.makeObject(arena, rtf_ctor));
+            // Intl.DisplayNames
+            const dn_proto = try JsObject.create(arena, object_proto);
+            try IntlReg.method(arena, dn_proto, "of", intl_mod.nativeDisplayNamesOf, 1);
+            try IntlReg.method(arena, dn_proto, "resolvedOptions", intl_mod.nativeDisplayNamesResolved, 0);
+            const dn_ctor = try JsObject.create(arena, function_proto);
+            try dn_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDisplayNamesCtor));
+            try IntlReg.finish(arena, dn_ctor, dn_proto, "DisplayNames", "Intl.DisplayNames", 2, true);
+            try intl_obj.set("DisplayNames", try val_mod.makeObject(arena, dn_ctor));
             // Intl.DurationFormat
             const df_proto = try JsObject.create(arena, object_proto);
             _ = try df_proto.defineOwnData("format", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatFormat, "format", 1), .{ .writable = true, .enumerable = false, .configurable = true });
