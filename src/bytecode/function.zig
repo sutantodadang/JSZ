@@ -94,6 +94,13 @@ pub const BcClosure = struct {
     /// circular import with runtime/realm.zig). Null = primary realm / untagged.
     /// Read by GetFunctionRealm for GetPrototypeFromConstructor's realm fallback.
     realm: ?*anyopaque = null,
+    /// Object Environment Records (`with` scopes, outermost first) that enclosed
+    /// this function's definition site. A function declared inside `with (o)`
+    /// keeps resolving free names through `o` when it is called later, from
+    /// anywhere — the with-object is part of its scope chain, not of the frame
+    /// that happened to run the `with`. Seeded into the callee frame's
+    /// `with_stack` below its own entries; empty for the common case.
+    with_scopes: []const @import("../value/value.zig").Value = &.{},
 };
 
 test "BcFunction fields exist" {

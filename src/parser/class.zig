@@ -306,6 +306,224 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
     return res;
 }
 
+/// Separator between a private name and its PrivateEnvironment id in a mangled
+/// key ("#x\x01" ++ id). U+0001 cannot appear in source, so a mangled key can
+/// never collide with a user-written property key; `privateDisplayName` strips
+/// the suffix again for diagnostics.
+pub const mangled_priv_sep: u8 = 0x01;
+
+/// The user-facing spelling of a (possibly mangled) private key: "#x\x014" → "#x".
+pub fn privateDisplayName(key: []const u8) []const u8 {
+    const i = std.mem.indexOfScalar(u8, key, mangled_priv_sep) orelse return key;
+    return key[0..i];
+}
+
+fn isPrivateName(name: []const u8) bool {
+    return name.len > 0 and name[0] == '#';
+}
+
+/// Flag a desugared `<obj>.#x` assignment target as a private-element
+/// *installation* site (PrivateFieldAdd / PrivateMethodOrAccessorAdd) so it
+/// compiles to DEFINE_PRIVATE. Every other private write is a PrivateSet, which
+/// requires the element to already exist. Passes non-private targets through.
+fn markPrivateDefine(n: *Node, is_method: bool) *Node {
+    if (n.kind == .member_expr and !n.data.member_expr.computed and
+        n.data.member_expr.property.kind == .identifier and
+        isPrivateName(n.data.member_expr.property.data.identifier))
+    {
+        n.data.member_expr.private_define = true;
+        n.data.member_expr.private_method = is_method;
+    }
+    return n;
+}
+
+/// Rewrites the private names declared by one class body to that class's
+/// mangled keys. Every `#x` still spelled raw at this point either belongs to
+/// this class or to an enclosing one: a nested class is fully parsed (and
+/// therefore already mangled) before the enclosing body's pass runs, so its own
+/// `#x` reads no longer match and shadowing resolves innermost-first.
+const PrivateRewriter = struct {
+    raw: [][]const u8,
+    mangled: [][]const u8,
+
+    fn map(self: PrivateRewriter, name: []const u8) []const u8 {
+        for (self.raw, self.mangled) |r, m| {
+            if (std.mem.eql(u8, r, name)) return m;
+        }
+        return name;
+    }
+
+    fn walkOpt(self: PrivateRewriter, node: ?*Node) void {
+        if (node) |n| self.walk(n);
+    }
+
+    /// Descends through every construct, including ordinary function bodies and
+    /// nested class desugarings — a private name is in scope for the whole class
+    /// body regardless of intervening function boundaries.
+    fn walk(self: PrivateRewriter, node: *Node) void {
+        switch (node.data) {
+            .identifier => |name| node.data = .{ .identifier = self.map(name) },
+            .unary_expr => |u| self.walk(u.operand),
+            .binary_expr => |b| {
+                // `#x in obj` reaches here with the LHS already lowered to the
+                // string key "#x" (see parseBinaryRhs), so mangle it in place.
+                if (b.op == .in and b.left.kind == .string_literal and
+                    isPrivateName(b.left.data.string_literal))
+                {
+                    b.left.data = .{ .string_literal = self.map(b.left.data.string_literal) };
+                } else self.walk(b.left);
+                self.walk(b.right);
+            },
+            .logical_expr => |b| {
+                self.walk(b.left);
+                self.walk(b.right);
+            },
+            .assignment_expr => |a| {
+                self.walk(a.target);
+                self.walk(a.value);
+            },
+            .update_expr => |u| self.walk(u.operand),
+            .conditional_expr => |c| {
+                self.walk(c.test_);
+                self.walk(c.consequent);
+                self.walk(c.alternate);
+            },
+            .sequence_expr => |s| for (s.exprs) |e| self.walk(e),
+            .spread_expr => |e| self.walk(e),
+            .yield_expr => |e| self.walkOpt(e),
+            .call_expr => |c| {
+                self.walk(c.callee);
+                for (c.args) |a| self.walk(a);
+            },
+            .new_expr => |n| {
+                self.walk(n.callee);
+                for (n.args) |a| self.walk(a);
+            },
+            // Both parts: a non-computed `obj.#x` keeps the private name in the
+            // property identifier node.
+            .member_expr => |m| {
+                self.walk(m.object);
+                self.walk(m.property);
+            },
+            .optional_chain => |e| self.walk(e),
+            .function_expr => |f| {
+                for (f.param_defaults) |d| self.walkOpt(d);
+                for (f.body) |s| self.walk(s);
+            },
+            .function_decl => |f| {
+                for (f.param_defaults) |d| self.walkOpt(d);
+                for (f.body) |s| self.walk(s);
+            },
+            .object_literal => |o| for (o.properties) |pr| {
+                self.walk(pr.value);
+                self.walkOpt(pr.computed_key);
+            },
+            .array_literal => |a| for (a.elements) |e| self.walk(e),
+            .program => |pr| for (pr.body) |s| self.walk(s),
+            .expr_stmt => |e| self.walk(e),
+            .block_stmt => |b| for (b.body) |s| self.walk(s),
+            .var_decl => |v| self.walkOpt(v.init),
+            .if_stmt => |i| {
+                self.walk(i.test_);
+                self.walk(i.consequent);
+                self.walkOpt(i.alternate);
+            },
+            .while_stmt => |w| {
+                self.walk(w.test_);
+                self.walk(w.body);
+            },
+            .do_while_stmt => |w| {
+                self.walk(w.body);
+                self.walk(w.test_);
+            },
+            .with_stmt => |w| {
+                self.walk(w.object);
+                self.walk(w.body);
+            },
+            .for_stmt => |f| {
+                self.walkOpt(f.init);
+                self.walkOpt(f.test_);
+                self.walkOpt(f.update);
+                self.walk(f.body);
+            },
+            .return_stmt => |e| self.walkOpt(e),
+            .throw_stmt => |e| self.walk(e),
+            .try_stmt => |t| {
+                self.walk(t.block);
+                if (t.handler) |h| self.walk(h.body);
+                self.walkOpt(t.finalizer);
+            },
+            .for_in_stmt => |f| {
+                self.walk(f.left);
+                self.walk(f.right);
+                self.walk(f.body);
+            },
+            .switch_stmt => |s| {
+                self.walk(s.discriminant);
+                for (s.cases) |c| {
+                    self.walkOpt(c.test_);
+                    for (c.body) |st| self.walk(st);
+                }
+            },
+            .labeled_stmt => |l| self.walk(l.body),
+            else => {},
+        }
+    }
+};
+
+/// Give this class body's private elements a PrivateEnvironment-unique key, so
+/// `o.#x` only resolves on instances branded by *this* class (spec
+/// PrivateEnvironment / PrivateNameResolution). Without it two classes that both
+/// declare `#x` share the key "#x" and each accepts the other's instances.
+/// Returns false only on allocation failure.
+fn manglePrivateNames(p: *Parser, parsed: *ClassBodyParse) bool {
+    var raw = std.ArrayList([]const u8){};
+    // Dedupe: an instance and a static element, or a `get #x`/`set #x` pair,
+    // spell the same private name and must map to the same mangled key.
+    for (parsed.fields) |f| {
+        if (f.computed_key == null and isPrivateName(f.name)) {
+            var seen = false;
+            for (raw.items) |r| {
+                if (std.mem.eql(u8, r, f.name)) seen = true;
+            }
+            if (!seen) raw.append(p.arena, f.name) catch return false;
+        }
+    }
+    for (parsed.members) |m| {
+        if (m.computed_key == null and isPrivateName(m.name)) {
+            var seen = false;
+            for (raw.items) |r| {
+                if (std.mem.eql(u8, r, m.name)) seen = true;
+            }
+            if (!seen) raw.append(p.arena, m.name) catch return false;
+        }
+    }
+    if (raw.items.len == 0) return true;
+
+    const id = p.private_class_counter;
+    p.private_class_counter += 1;
+    var mangled = std.ArrayList([]const u8){};
+    for (raw.items) |r| {
+        const m = std.fmt.allocPrint(p.arena, "{s}{c}{d}", .{ r, mangled_priv_sep, id }) catch return false;
+        mangled.append(p.arena, m) catch return false;
+    }
+    const rw = PrivateRewriter{ .raw = raw.items, .mangled = mangled.items };
+
+    for (parsed.fields) |*f| {
+        if (f.computed_key == null) f.name = rw.map(f.name);
+        rw.walkOpt(f.computed_key);
+        rw.walkOpt(f.init);
+    }
+    for (parsed.members) |*m| {
+        if (m.computed_key == null) m.name = rw.map(m.name);
+        rw.walkOpt(m.computed_key);
+        for (m.param_defaults) |d| rw.walkOpt(d);
+        for (m.body) |s| rw.walk(s);
+    }
+    for (parsed.ctor_body) |s| rw.walk(s);
+    return true;
+}
+
 /// Build an instance-field initializer statement: `this.<name> = <init>` (or
 /// `this[<computed>] = <init>`), with `undefined` when there is no initializer.
 /// A private name (`#x`) is emitted as a non-computed member, so it resolves to
@@ -316,7 +534,7 @@ fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
     const lhs = if (f.computed_key) |k|
         (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = this_node, .property = k, .computed = true } }) orelse return null)
     else
-        (nodeMember(p, this_node, f.name) orelse return null);
+        markPrivateDefine(nodeMember(p, this_node, f.name) orelse return null, false);
     const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
     const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
@@ -343,7 +561,7 @@ fn makeDerivedInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
 
     // Private fields: `__superthis.#name = init` (member assignment → PrivateFieldAdd).
     if (f.computed_key == null and f.name.len > 0 and f.name[0] == '#') {
-        const lhs = nodeMember(p, superthis, f.name) orelse return null;
+        const lhs = markPrivateDefine(nodeMember(p, superthis, f.name) orelse return null, false);
         const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
         return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
     }
@@ -396,7 +614,7 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
     const lhs = if (f.computed_key) |k|
         (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = cls, .property = k, .computed = true } }) orelse return null)
     else
-        (nodeMember(p, cls, f.name) orelse return null);
+        markPrivateDefine(nodeMember(p, cls, f.name) orelse return null, false);
     const raw_init = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
 
     // Wrap: (function () { return <init>; }).call(ClassName)
@@ -487,10 +705,13 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
     // and so the descriptor object-literal's NamedEvaluation ({ value: fn }) does
     // not misname it "value". Computed keys are named at runtime (left null here).
     // Accessors get a "get "/"set " prefix, applied in the accessor branch below.
+    // A private method's `.name` is its source spelling ("#m"), not the mangled
+    // PrivateEnvironment key it is stored under.
+    const key_name = privateDisplayName(m.name);
     const method_name: ?[]const u8 = if (m.computed_key != null) null else switch (m.accessor) {
-        .none => m.name,
-        .get => std.fmt.allocPrint(p.arena, "get {s}", .{m.name}) catch return null,
-        .set => std.fmt.allocPrint(p.arena, "set {s}", .{m.name}) catch return null,
+        .none => key_name,
+        .get => std.fmt.allocPrint(p.arena, "get {s}", .{key_name}) catch return null,
+        .set => std.fmt.allocPrint(p.arena, "set {s}", .{key_name}) catch return null,
     };
     const fn_expr = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
         .name = method_name,
@@ -518,7 +739,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         // check. Private names (`#x`) keep the member-assignment form
         // (PrivateMethodAdd — not a real enumerable-checkable property).
         if (m.computed_key == null and m.name.len > 0 and m.name[0] == '#') {
-            const lhs = nodeMember(p, target, m.name) orelse return null;
+            const lhs = markPrivateDefine(nodeMember(p, target, m.name) orelse return null, true);
             const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = fn_expr } }) orelse return null;
             return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
         }
@@ -582,7 +803,8 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     }
 
     _ = p.expect(.left_brace) orelse return null;
-    const parsed = parseClassMembers(p) orelse return null;
+    var parsed = parseClassMembers(p) orelse return null;
+    if (!manglePrivateNames(p, &parsed)) return null;
     const ctor_params: [][]const u8 = parsed.ctor_params;
     const ctor_rest: ?[]const u8 = parsed.ctor_rest;
     var ctor_body: []*Node = parsed.ctor_body;
@@ -916,7 +1138,8 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
     }
 
     _ = p.expect(.left_brace) orelse return null;
-        const parsed = parseClassMembers(p) orelse return null;
+        var parsed = parseClassMembers(p) orelse return null;
+        if (!manglePrivateNames(p, &parsed)) return null;
         const ctor_params: [][]const u8 = parsed.ctor_params;
         var ctor_body: []*Node = parsed.ctor_body;
         const members = parsed.members;
@@ -1195,6 +1418,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
             continue;
         }
         const param_tok = p.expect(.identifier) orelse return null;
+        if (!parser_file.checkStrictBindingName(p, param_tok.value_str, param_tok.line, param_tok.column)) return null;
         if (is_rest) {
             saw_rest = true;
             rest_param = param_tok.value_str;

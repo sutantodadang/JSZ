@@ -133,9 +133,10 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // `with` scopes (if any) shadow the lexical/global scope: an object whose
     // [[HasProperty]] is true provides the binding via [[Get]].
     if (frame.with_stack.items.len > 0) {
-        if (try withLookup(self, frame, name)) |v| {
-            // withLookup may run a getter (re-entrant) → self.frames can realloc,
+        if (try ownWith(self, frame, name)) |wobj| {
+            // The [[Get]] runs a getter (re-entrant) → self.frames can realloc,
             // leaving `frame` dangling. Write through the re-fetched top frame.
+            const v = try self.getProp(wobj, name);
             self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
             return null;
         }
@@ -144,7 +145,7 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // An identifier that resolves nowhere is a ReferenceError
     // (env lookups run no user code, so no frame realloc here).
     // TemporalDeadZone is also a ReferenceError but with a specific message.
-    if (frame.env.lookup(name)) |v| {
+    if (frame.env.lookupUntil(name, frame.inherited_env_floor)) |v| {
         frame.registers[rdst] = v;
     } else |err| switch (err) {
         error.TemporalDeadZone => {
@@ -156,6 +157,17 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         },
         error.ConstAssignment => unreachable, // Can't happen on lookup
         error.NotDefined => {
+            if (try inheritedWith(self, frame, name)) |wobj| {
+                const v = try self.getProp(wobj, name);
+                self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
+                return null;
+            }
+            if (frame.inherited_env_floor != null) {
+                if (frame.env.lookup(name)) |v| {
+                    frame.registers[rdst] = v;
+                    return null;
+                } else |_| {}
+            }
             if (self.realm.global_env.lookup(name)) |v| {
                 frame.registers[rdst] = v;
             } else |_| if (globalObjectOwn(frame, name)) |v| {
@@ -283,7 +295,15 @@ pub inline fn opPushWith(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const robj = code[frame.pc];
     frame.pc += 1;
-    frame.with_stack.append(self.arena, frame.registers[robj]) catch return error.OutOfMemory;
+    const obj = frame.registers[robj];
+    // `with (expr)` runs ToObject(expr) before entering the scope, so a nullish
+    // head is a TypeError rather than a with-scope that matches nothing.
+    if (obj.bits == 0 or obj.unbox() == .null_ or obj.unbox() == .undefined_) {
+        realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot convert undefined or null to object");
+        if (try self.raisePendingException("with")) |oc| return oc;
+        return null;
+    }
+    frame.with_stack.append(self.arena, obj) catch return error.OutOfMemory;
     return null;
 }
 
@@ -306,24 +326,34 @@ pub fn withHasBinding(self: *BcVm, wobj: Value, key: Value, name: []const u8) !b
     return !val_mod.toBoolean(blocked);
 }
 
-/// `with`-scope resolution: search the frame's with-object stack (innermost
-/// last) for the first object that provides a binding for `name` (HasBinding);
-/// return its value via [[Get]]. Returns null when no with-object provides the
-/// binding (the caller then falls back to the lexical/global scope). Only the
-/// HasProperty/@@unscopables/Get of a matching object runs user code.
-inline fn withLookup(self: *BcVm, frame: *BcCallFrame, name: []const u8) !?Value {
-    if (frame.with_stack.items.len == 0) return null;
+/// The first with-object in `frame.with_stack[lo..hi]` (searched innermost-first)
+/// that provides a binding for `name`, or null. Splitting the stack lets callers
+/// consult the frame's OWN with-scopes before its environment and the ones
+/// inherited from the closure's definition site after it — an inherited scope
+/// encloses the callee, so it must not shadow the callee's own parameters and
+/// locals. Only the HasProperty/@@unscopables of a scanned object runs user code.
+fn withScan(self: *BcVm, frame: *BcCallFrame, name: []const u8, lo: usize, hi: usize) !?Value {
+    if (lo >= hi) return null;
     const key = try val_mod.makeString(self.arena, name);
-    var i = frame.with_stack.items.len;
-    while (i > 0) {
+    var i = hi;
+    while (i > lo) {
         i -= 1;
         const wobj = frame.with_stack.items[i];
         if (wobj.bits == 0 or wobj.unbox() != .object) continue;
-        if (try withHasBinding(self, wobj, key, name)) {
-            return try self.getProp(wobj, name);
-        }
+        if (try withHasBinding(self, wobj, key, name)) return wobj;
     }
     return null;
+}
+
+/// The with-scopes entered by this frame itself (they shadow everything).
+inline fn ownWith(self: *BcVm, frame: *BcCallFrame, name: []const u8) !?Value {
+    return withScan(self, frame, name, frame.inherited_with, frame.with_stack.items.len);
+}
+
+/// The with-scopes inherited from the callee's definition site (they sit outside
+/// the frame's own environment).
+inline fn inheritedWith(self: *BcVm, frame: *BcCallFrame, name: []const u8) !?Value {
+    return withScan(self, frame, name, 0, frame.inherited_with);
 }
 
 pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
@@ -341,21 +371,14 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const cur_is_strict = frame.func.is_strict;
     // `with` scopes: assign through an object whose [[HasProperty]] is true.
     if (frame.with_stack.items.len > 0) {
-        const key = try val_mod.makeString(self.arena, name);
-        var i = frame.with_stack.items.len;
-        while (i > 0) {
-            i -= 1;
-            const wobj = frame.with_stack.items[i];
-            if (wobj.bits == 0 or wobj.unbox() != .object) continue;
-            if (try withHasBinding(self, wobj, key, name)) {
-                try self.setProp(wobj, name, value);
-                return null;
-            }
+        if (try ownWith(self, frame, name)) |wobj| {
+            try self.setProp(wobj, name, value);
+            return null;
         }
     }
     // Try to assign in env chain (covers locals and upvalues).
     // TemporalDeadZone and ConstAssignment are real errors that must propagate.
-    frame.env.assign(name, value) catch |err| {
+    frame.env.assignUntil(name, value, frame.inherited_env_floor) catch |err| {
         switch (err) {
         error.TemporalDeadZone => {
             const msg = try std.fmt.allocPrint(self.arena, "Cannot access '{s}' before initialization", .{name});
@@ -372,7 +395,19 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
         },
         error.NotDefined => {
-            // Not found in chain.
+            // Not found in the environment chain: an object environment record
+            // inherited from the function's definition site still encloses it,
+            // and PutValue writes through it before reaching the global object.
+            if (try inheritedWith(self, frame, name)) |wobj| {
+                try self.setProp(wobj, name, value);
+                return null;
+            }
+            if (frame.inherited_env_floor != null) {
+                if (frame.env.assign(name, value)) |_| {
+                    mirrorGlobalBinding(frame, name, value, true);
+                    return null;
+                } else |_| {}
+            }
             if (cur_is_strict) {
                 // Phase 4d: strict mode — undeclared variable assignment is a ReferenceError.
                 const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{name});
@@ -457,21 +492,15 @@ pub inline fn opDeleteName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     //    with-object whose [[HasProperty]] is true (a Proxy trap here can re-enter
     //    the VM and reallocate self.frames — index back in afterwards).
     if (frame.with_stack.items.len > 0) {
-        const key = try val_mod.makeString(self.arena, name);
-        var i = frame.with_stack.items.len;
-        while (i > 0) {
-            i -= 1;
-            const wobj = self.frames.items[frame_idx].with_stack.items[i];
-            if (wobj.bits == 0 or wobj.unbox() != .object) continue;
-            if (try withHasBinding(self, wobj, key, name)) {
-                const res = self.deleteProperty(wobj, key) catch |e| {
-                    if (e != error.JsException) return e;
-                    if (try self.raisePendingException("error in deleteProperty trap")) |oc| return oc;
-                    return null;
-                };
-                self.frames.items[frame_idx].registers[rdst] = try val_mod.makeBool(self.arena, res);
+        if (try ownWith(self, frame, name)) |wobj| {
+            const key = try val_mod.makeString(self.arena, name);
+            const res = self.deleteProperty(wobj, key) catch |e| {
+                if (e != error.JsException) return e;
+                if (try self.raisePendingException("error in deleteProperty trap")) |oc| return oc;
                 return null;
-            }
+            };
+            self.frames.items[frame_idx].registers[rdst] = try val_mod.makeBool(self.arena, res);
+            return null;
         }
     }
 
@@ -482,6 +511,20 @@ pub inline fn opDeleteName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     if (classify == .not_deletable) {
         frame.registers[rdst] = try val_mod.makeBool(self.arena, false);
         return null;
+    }
+    // No declarative binding: an object environment record inherited from this
+    // function's definition site is still in scope, outside the frame's own.
+    if (classify == .not_found) {
+        if (try inheritedWith(self, frame, name)) |wobj| {
+            const key = try val_mod.makeString(self.arena, name);
+            const res = self.deleteProperty(wobj, key) catch |e| {
+                if (e != error.JsException) return e;
+                if (try self.raisePendingException("error in deleteProperty trap")) |oc| return oc;
+                return null;
+            };
+            self.frames.items[frame_idx].registers[rdst] = try val_mod.makeBool(self.arena, res);
+            return null;
+        }
     }
 
     // 3) Global object [[Delete]] — reached for `.global_object_ref` bindings and

@@ -111,6 +111,34 @@ pub const Environment = struct {
         return EnvError.NotDefined;
     }
 
+    /// `lookup`, but stopping before `stop` (exclusive). Used to search only the
+    /// bindings a call frame introduced — its parameters, vars and block scopes —
+    /// without reaching its definition environment, so that an object environment
+    /// record (`with` scope) inherited from the definition site can be consulted
+    /// in between. A null `stop` degenerates to `lookup`.
+    pub fn lookupUntil(self: *Environment, name: []const u8, stop: ?*Environment) EnvError!Value {
+        if (stop) |s| if (self == s) return EnvError.NotDefined;
+        if (self.bindings.get(name)) |b| {
+            if (!b.initialized) return EnvError.TemporalDeadZone;
+            return b.value;
+        }
+        if (self.parent) |p| return p.lookupUntil(name, stop);
+        return EnvError.NotDefined;
+    }
+
+    /// `assign`, but stopping before `stop` (exclusive). See `lookupUntil`.
+    pub fn assignUntil(self: *Environment, name: []const u8, value: Value, stop: ?*Environment) EnvError!void {
+        if (stop) |s| if (self == s) return EnvError.NotDefined;
+        if (self.bindings.getPtr(name)) |b| {
+            if (!b.initialized) return EnvError.TemporalDeadZone;
+            if (b.kind == .const_) return EnvError.ConstAssignment;
+            b.value = value;
+            return;
+        }
+        if (self.parent) |p| return p.assignUntil(name, value, stop);
+        return EnvError.NotDefined;
+    }
+
     /// Assign an existing binding (walk up the chain).
     pub fn assign(self: *Environment, name: []const u8, value: Value) EnvError!void {
         if (self.bindings.getPtr(name)) |b| {

@@ -1607,10 +1607,13 @@ fn nativeArrayFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anye
         } else {
             // Generic array-like: read .length then [0..length-1].
             const len_v = obj.get("length") orelse Value{};
-            const len: usize = if (len_v.bits != 0 and len_v.unbox() == .number)
-                @intFromFloat(@max(0, len_v.unbox().number))
-            else
-                0;
+            // ToLength: NaN → 0, clamp to 2^53-1 (`{length: Infinity}` must not
+            // reach @intFromFloat). Array.from then builds the result with
+            // ArrayCreate(len), which is a RangeError past the array-length limit.
+            const raw = if (len_v.bits != 0 and len_v.unbox() == .number) len_v.unbox().number else 0;
+            const clamped = if (std.math.isNan(raw)) 0 else @max(0, @min(raw, 9007199254740991.0));
+            if (clamped > 4294967295.0) return throwRangeError(arena, "Invalid array length");
+            const len: usize = @intFromFloat(clamped);
             var i: usize = 0;
             var buf: [32]u8 = undefined;
             while (i < len) : (i += 1) {
