@@ -564,6 +564,34 @@ fn roundRelative(
     return roundRelativeBalanced(arena, bal, R, dest_ns, smallest, largest, inc, mode, if (s < 0) -1 else 1);
 }
 
+/// Has `count` whole `smallest` units from `R` already passed the endpoint? An
+/// unrepresentable candidate date counts as past it, which stops the walk.
+fn overshoots(
+    arena: std.mem.Allocator,
+    R: ISODate,
+    smallest: shared.Unit,
+    base: DurationFields,
+    count: f64,
+    dest_ns: i128,
+    sgn: f64,
+) !bool {
+    var y = base.years;
+    var mo = base.months;
+    var w: f64 = 0;
+    switch (smallest) {
+        .year => {
+            y = count;
+            mo = 0;
+        },
+        .month => mo = count,
+        .week => w = count,
+        else => unreachable,
+    }
+    const d = pd.addISODate(R, y, mo, w, 0, .constrain, arena) catch return true;
+    const ns: i128 = @as(i128, epochDaysOf(d) - epochDaysOf(R)) * shared.NS_PER_DAY;
+    return if (sgn > 0) ns > dest_ns else ns < dest_ns;
+}
+
 /// BubbleRelativeDuration: after the smallest unit expanded away from zero, the
 /// result may now reach a whole larger unit (11 months rounding up to 12 is a
 /// year). Walk outward from `start_unit` toward `largest`, promoting whenever the
@@ -765,9 +793,38 @@ fn totalRelative(arena: std.mem.Allocator, d0: DurationFields, R: ISODate, u: sh
         const per = shared.unitLengthNanos(u).?;
         return @as(f64, @floatFromInt(dest_ns)) / @as(f64, @floatFromInt(per));
     }
-    const bal = DurationFields{ .years = d0.years, .months = d0.months, .weeks = d0.weeks, .days = days };
+    var bal = DurationFields{ .years = d0.years, .months = d0.months, .weeks = d0.weeks, .days = days };
     const s = d0.sign();
-    const rr = try roundRelativeBalanced(arena, bal, R, dest_ns, u, u, 1, .trunc, if (s < 0) -1 else 1);
+    const sgn: f64 = if (s < 0) -1 else 1;
+
+    // A total is a position inside the unit that actually *contains* the
+    // endpoint, so the whole-unit count is located by walking outward from the
+    // duration's own field rather than taken from it: P40D relative to Feb 1 has
+    // no months field, yet it lands one whole month plus 11 days out.
+    var count: f64 = switch (u) {
+        .year => bal.years,
+        .month => bal.months,
+        else => bal.weeks + @divTrunc(bal.days, 7),
+    };
+    var guard: u32 = 0;
+    while (count != 0 and try overshoots(arena, R, u, bal, count, dest_ns, sgn)) : (guard += 1) {
+        if (guard > 4096) break;
+        count -= sgn;
+    }
+    while (!try overshoots(arena, R, u, bal, count + sgn, dest_ns, sgn)) : (guard += 1) {
+        if (guard > 4096) break;
+        count += sgn;
+    }
+    switch (u) {
+        .year => bal.years = count,
+        .month => bal.months = count,
+        else => {
+            bal.weeks = count;
+            bal.days = 0;
+        },
+    }
+
+    const rr = try roundRelativeBalanced(arena, bal, R, dest_ns, u, u, 1, .trunc, sgn);
     return rr.total;
 }
 
