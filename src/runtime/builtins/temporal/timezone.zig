@@ -179,6 +179,58 @@ pub fn toZoneAtInstant(arena: std.mem.Allocator, s0: []const u8, epoch_ns: i128)
     return zoneFromDateTimeOffset(arena, s);
 }
 
+/// GetOffsetNanosecondsFor for an already-normalized identifier: the UTC offset
+/// this zone is at during the given instant. Fixed-offset ids and "UTC" are
+/// instant-independent; named IANA zones consult the transition table.
+pub fn offsetAtInstant(id: []const u8, epoch_ns: i128) i128 {
+    const def = tzdata.lookupDef(id) orelse return fixedOffsetOf(id);
+    const unix_sec: i64 = @intCast(@divFloor(epoch_ns, shared.NS_PER_SECOND));
+    const offset_sec = tzdata.offsetAt(def, unix_sec) orelse def.std_offset_sec;
+    return @as(i128, offset_sec) * shared.NS_PER_SECOND;
+}
+
+/// The offset of a fixed-offset identifier ("UTC" or "±HH:MM"); 0 for anything
+/// unrecognized, which cannot occur for a stored (already validated) id.
+fn fixedOffsetOf(id: []const u8) i128 {
+    var buf: [7]u8 = undefined;
+    return parseOffsetIdentifier(id, &buf) orelse 0;
+}
+
+/// The instants a wall-clock time maps to in this zone (spec
+/// GetPossibleEpochNanoseconds). Two for a fall-back overlap, none for a
+/// spring-forward gap, one everywhere else.
+pub const PossibleInstants = struct {
+    n: u8 = 0,
+    first: i128 = 0,
+    second: i128 = 0,
+};
+
+pub fn possibleInstants(id: []const u8, wall_ns: i128) PossibleInstants {
+    const def = tzdata.lookupDef(id) orelse {
+        return .{ .n = 1, .first = wall_ns - fixedOffsetOf(id) };
+    };
+    // A transition never moves the clock by more than a day, so the offsets in
+    // force a day either side of the wall time are the only candidates.
+    const wall_sec: i64 = @intCast(@divFloor(wall_ns, shared.NS_PER_SECOND));
+    const DAY_SEC: i64 = 86400;
+    const before = tzdata.offsetAt(def, wall_sec -| DAY_SEC) orelse def.std_offset_sec;
+    const after = tzdata.offsetAt(def, wall_sec +| DAY_SEC) orelse def.std_offset_sec;
+
+    var out = PossibleInstants{};
+    // Ascending instant order, which for a fall-back overlap means the larger
+    // (pre-transition) offset first.
+    const cands = if (before >= after) [2]i64{ before, after } else [2]i64{ after, before };
+    for (cands, 0..) |cand, i| {
+        if (i == 1 and cands[0] == cands[1]) break;
+        const ns = wall_ns - @as(i128, cand) * shared.NS_PER_SECOND;
+        // The candidate only counts if the zone really is at that offset then.
+        if (offsetAtInstant(id, ns) != @as(i128, cand) * shared.NS_PER_SECOND) continue;
+        if (out.n == 0) out.first = ns else out.second = ns;
+        out.n += 1;
+    }
+    return out;
+}
+
 /// For a bracket-less datetime string, derive the zone from its trailing offset.
 fn zoneFromDateTimeOffset(arena: std.mem.Allocator, s: []const u8) !Zone {
     // The string must parse as an ISO datetime (validates the date/time part).
