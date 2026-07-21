@@ -684,6 +684,17 @@ pub fn makeObject(arena: std.mem.Allocator, obj: *JsObject) !Value {
     return Value.fromPtr(v);
 }
 
+/// Wrap a stored `*JsObject` as the Value that object *is*. For a bytecode
+/// function's backing object that is the callable itself (see
+/// `JsObject.fn_closure`), not a plain object — so `Object.getPrototypeOf(D)`
+/// compares equal to the constructor it was linked to, and `typeof` reports
+/// "function". Use this wherever an object pointer read out of an internal slot
+/// is handed back to the program.
+pub fn makeObjectOrFunction(arena: std.mem.Allocator, obj: *JsObject) !Value {
+    if (obj.fn_closure) |c| return makeBcFunction(arena, @ptrCast(@alignCast(c)));
+    return makeObject(arena, obj);
+}
+
 pub fn makeSymbol(arena: std.mem.Allocator, description: ?[]const u8) !Value {
     const sd = try arena.create(SymbolData);
     g_symbol_counter += 1;

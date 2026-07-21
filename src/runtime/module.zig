@@ -1494,6 +1494,23 @@ fn scanDeclaratorNames(
 ///
 /// Allocations use `gpa`; the returned slice is owned by the caller.
 pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]const u8, entry_src: []const u8) ![]const u8 {
+    return buildBundleImpl(gpa, base_dir, entry_id, entry_src, false);
+}
+
+/// Same dependency-graph link phase as `buildBundle`, but for an entry that is
+/// *script* code rather than a Module Record. A script has no imports, exports or
+/// module scope, so only the `__modules__` registry is emitted ahead of it; the
+/// entry source itself is inlined verbatim at global scope (no IIFE, no
+/// `"use strict"`, no export wiring) so it keeps ordinary sloppy-mode Script
+/// semantics. What the registry buys the script is a *referrer*: `__module_id__`
+/// names the script's own path, so a relative `import('./dep.js')` inside it
+/// resolves against that path — the referencing-script half of
+/// HostLoadImportedModule — instead of failing to resolve.
+pub fn buildScriptBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]const u8, entry_src: []const u8) ![]const u8 {
+    return buildBundleImpl(gpa, base_dir, entry_id, entry_src, true);
+}
+
+fn buildBundleImpl(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]const u8, entry_src: []const u8, entry_is_script: bool) ![]const u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1822,6 +1839,18 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         }
         try sb.appendSlice(gpa, "\n};\n");
     }
+    if (entry_is_script) {
+        // Script entry: everything above (the registry, the star/live-export
+        // helpers, the module graph) is what a relative `import()` needs to
+        // resolve; none of the *module* wiring applies. Name the referrer and
+        // inline the script untouched at global scope.
+        try sb.appendSlice(gpa, "var __module_id__ = ");
+        try appendJsString(gpa, &sb, self_id);
+        try sb.appendSlice(gpa, ";\n");
+        try sb.appendSlice(gpa, entry_src);
+        try sb.appendSlice(gpa, "\n");
+        return finishBundle(gpa, &sb);
+    }
     try sb.appendSlice(gpa, "var module = { exports: {} }; var exports = module.exports;\nvar __module_id__ = \"");
     try sb.appendSlice(gpa, self_id);
     try sb.appendSlice(gpa, "\";\n");
@@ -1954,6 +1983,12 @@ pub fn buildBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         try sb.appendSlice(gpa, "\n})(require,module,exports);\n");
     // The entry body has returned: it is now ~evaluated~ (see loaded=false above).
     if (entry_id != null) try sb.appendSlice(gpa, "module.loaded = true;\n");
+    return finishBundle(gpa, &sb);
+}
+
+/// Take ownership of a finished bundle buffer, mirroring it to
+/// `/tmp/bundle_dump.js` when JSZ_DUMP_BUNDLE is set (debugging aid).
+fn finishBundle(gpa: std.mem.Allocator, sb: *std.ArrayList(u8)) ![]const u8 {
     const result = try sb.toOwnedSlice(gpa);
     if (std.process.hasEnvVarConstant("JSZ_DUMP_BUNDLE")) {
         const f = std.fs.cwd().createFile("/tmp/bundle_dump.js", .{}) catch return result;

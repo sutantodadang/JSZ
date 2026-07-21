@@ -1202,7 +1202,7 @@ pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
     if (args[0].unbox() == .bc_function or args[0].unbox() == .function) {
         if (@import("../realm.zig").active_context) |ctx| {
             if (try ctx.backingObject(arena, args[0])) |bo| {
-                if (bo.proto) |p| return val_mod.makeObject(arena, p);
+                if (bo.proto) |p| return val_mod.makeObjectOrFunction(arena, p);
             }
         }
         if (@import("../realm.zig").active_function_proto) |fp| return val_mod.makeObject(arena, fp);
@@ -1221,7 +1221,7 @@ pub fn nativeObjectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
         // No trap: forward to target's [[GetPrototypeOf]].
         if (proxy_mod.proxyTarget(obj)) |t| return nativeObjectGetPrototypeOf(arena, Value{}, &[_]Value{t});
     }
-    if (obj.proto) |p| return val_mod.makeObject(arena, p);
+    if (obj.proto) |p| return val_mod.makeObjectOrFunction(arena, p);
     return val_mod.makeNull(arena);
 }
 

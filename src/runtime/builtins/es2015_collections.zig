@@ -2749,7 +2749,71 @@ pub fn nativeGetAsyncIterator(arena: std.mem.Allocator, _: Value, args: []const 
     // iterator, so `break`/`throw` out of a `for await` over a sync iterable
     // still runs its `return()`.
     try wrap.set("return", try val_mod.makeNativeFunctionNamed(arena, nativeAsyncFromSyncReturn, "return", 1));
+    // …and `throw`, so an exception injected into an async generator delegating
+    // to a *sync* iterator (`async function* (){ yield* syncGen() }` then
+    // `.throw(e)`) reaches that iterator's own `throw` instead of looking like an
+    // iterator that provides none.
+    try wrap.set("throw", try val_mod.makeNativeFunctionNamed(arena, nativeAsyncFromSyncThrow, "throw", 1));
     return val_mod.makeObject(arena, wrap);
+}
+
+/// throw() of an AsyncFromSyncIterator (§27.1.4.4): forward to the wrapped sync
+/// iterator's `throw`. A sync iterator without one is closed and the promise
+/// rejects with a TypeError; a non-object result is likewise a TypeError.
+fn nativeAsyncFromSyncThrow(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const promise_mod = @import("promise.zig");
+    const p = try promise_mod.newPendingPromise(arena);
+    const arg = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const sync_it = blk: {
+        if (this_val.bits != 0 and this_val.unbox() == .object) {
+            if (this_val.toPtr().object.get("__syncit__")) |s| break :blk s;
+        }
+        break :blk Value{};
+    };
+    if (sync_it.bits == 0 or sync_it.unbox() != .object) {
+        promise_mod.settleResult(arena, p, arg, false);
+        return p;
+    }
+    const ctx = realm_mod.active_context orelse {
+        promise_mod.settleResult(arena, p, arg, false);
+        return p;
+    };
+    const thr = ctx.getProp(arena, sync_it, "throw") catch {
+        promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+        return p;
+    };
+    if (thr.bits == 0 or thr.unbox() == .undefined_ or thr.unbox() == .null_ or !isCallable(thr)) {
+        // AsyncIteratorClose(syncIterator, throw completion), then a TypeError.
+        _ = closeSyncIterator(arena, ctx, sync_it);
+        promise_mod.settleResult(arena, p, try makeTypeErrorVal(arena, "The iterator does not provide a 'throw' method"), false);
+        return p;
+    }
+    const r = function_proto.invokeCallback(arena, sync_it, thr, &[_]Value{arg}) catch {
+        promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+        return p;
+    };
+    if (r.bits == 0 or r.unbox() != .object) {
+        promise_mod.settleResult(arena, p, try makeTypeErrorVal(arena, "iterator 'throw' did not return an object"), false);
+        return p;
+    }
+    // NB: AsyncFromSyncIteratorContinuation also awaits the yielded value, but
+    // `awaitValue` here is a *synchronous* microtask drain, and `throw` is
+    // normally invoked from inside a reaction job — re-entering the drain
+    // corrupts the queue. The delegating loop awaits this result anyway.
+    promise_mod.settleResult(arena, p, r, true);
+    return p;
+}
+
+/// Best-effort IteratorClose of a sync iterator: call `return()` if present and
+/// swallow anything it throws (the caller is already completing abruptly).
+fn closeSyncIterator(arena: std.mem.Allocator, ctx: anytype, sync_it: Value) bool {
+    const ret = ctx.getProp(arena, sync_it, "return") catch return false;
+    if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_ or !isCallable(ret)) return false;
+    _ = function_proto.invokeCallback(arena, sync_it, ret, &[_]Value{}) catch {
+        realm_mod.pending_exception = Value{};
+        return false;
+    };
+    return true;
 }
 
 /// return() of an AsyncFromSyncIterator: IteratorClose the wrapped sync
@@ -2927,6 +2991,145 @@ pub fn nativeYieldStarStep(arena: std.mem.Allocator, _: Value, args: []const Val
     // return path this becomes the outer generator's return value.
     const value = try ctx.getProp(arena, result, "value");
     return makeYieldStarStep(arena, value, true, rtype == 2, try val_mod.makeUndefined(arena));
+}
+
+/// Build the `{ await, mode }` record consumed by the async `yield*` lowering:
+/// `await` is the value the delegation loop suspends on, `mode` selects how the
+/// awaited result is interpreted by `__asyncDelegStep__`.
+fn makeDelegCall(arena: std.mem.Allocator, await_v: Value, mode: f64) !Value {
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    try obj.set("await", await_v);
+    try obj.set("mode", try val_mod.makeNumber(arena, mode));
+    return val_mod.makeObject(arena, obj);
+}
+
+/// __asyncDelegInit__(x): GetIterator(x, async) — resolve the async iterator and
+/// capture its `next` method once (§7.4.2 builds an Iterator Record, so a `next`
+/// accessor fires exactly one time no matter how many steps the delegation runs).
+pub fn nativeAsyncDelegInit(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const it = try nativeGetAsyncIterator(arena, Value{}, args);
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const nx = try ctx.getProp(arena, it, "next");
+    const rec = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    try rec.set("it", it);
+    try rec.set("next", nx);
+    return val_mod.makeObject(arena, rec);
+}
+
+/// __asyncDelegCall__(rec, resumeType, resumeValue): perform the method call for
+/// one step of an async `yield*` (§14.4.14 step 6). resumeType 0=next, 1=throw,
+/// 2=return. Returns the `{ await, mode }` record; the caller awaits `await` and
+/// then hands the result to `__asyncDelegStep__` with the same `mode`.
+///
+/// mode 0 = the awaited value is an iterator result object.
+/// mode 1 = a return completion whose value is the awaited value (the inner
+///          iterator has no `return` method, step 6.c.iv).
+/// mode 2 = AsyncIteratorClose ran because the inner iterator has no `throw`
+///          method; the awaited value is validated and then a TypeError is
+///          raised (step 6.b.iii).
+pub fn nativeAsyncDelegCall(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const rec = if (args.len > 0) args[0] else Value{};
+    if (rec.bits == 0 or rec.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "yield* requires an iterator");
+        return error.JsException;
+    }
+    const rec_obj = rec.toPtr().object;
+    const iterator = rec_obj.get("it") orelse Value{};
+    const rtype: u8 = blk: {
+        if (args.len > 1 and args[1].bits != 0) switch (args[1].unbox()) {
+            .number => |n| break :blk @intFromFloat(n),
+            else => {},
+        };
+        break :blk 0;
+    };
+    const rval = if (args.len > 2) args[2] else try val_mod.makeUndefined(arena);
+
+    if (rtype == 1) {
+        const m = try ctx.getProp(arena, iterator, "throw");
+        if (m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_) {
+            // AsyncIteratorClose(iterator, normal) then throw a TypeError. The
+            // `return` result is awaited before the TypeError surfaces, so hand
+            // the promise back to the loop under mode 2.
+            const ret_m = try ctx.getProp(arena, iterator, "return");
+            if (ret_m.bits == 0 or ret_m.unbox() == .undefined_ or ret_m.unbox() == .null_) {
+                realm_mod.pending_exception = try makeTypeErrorVal(arena, "The iterator does not provide a 'throw' method");
+                return error.JsException;
+            }
+            if (!isCallable(ret_m)) {
+                realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'return' property is not a function");
+                return error.JsException;
+            }
+            const r = try function_proto.invokeCallback(arena, iterator, ret_m, &[_]Value{});
+            return makeDelegCall(arena, r, 2);
+        }
+        if (!isCallable(m)) {
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'throw' property is not a function");
+            return error.JsException;
+        }
+        return makeDelegCall(arena, try function_proto.invokeCallback(arena, iterator, m, &[_]Value{rval}), 0);
+    }
+    if (rtype == 2) {
+        const m = try ctx.getProp(arena, iterator, "return");
+        if (m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_) {
+            // Step 6.c.iv: await the received value, then return it.
+            return makeDelegCall(arena, rval, 1);
+        }
+        if (!isCallable(m)) {
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'return' property is not a function");
+            return error.JsException;
+        }
+        return makeDelegCall(arena, try function_proto.invokeCallback(arena, iterator, m, &[_]Value{rval}), 0);
+    }
+    const nx = rec_obj.get("next") orelse Value{};
+    if (!isCallable(nx)) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator.next is not a function");
+        return error.JsException;
+    }
+    return makeDelegCall(arena, try function_proto.invokeCallback(arena, iterator, nx, &[_]Value{rval}), 0);
+}
+
+/// __asyncDelegStep__(awaited, mode, resumeType): interpret the awaited result of
+/// one async `yield*` step. Returns the same `{ value, done, ret }` shape the
+/// synchronous delegation loop uses (`raw` is unused — an async generator builds
+/// its own iterator result from `IteratorValue`, §14.4.14 step 6.a.vi).
+pub fn nativeAsyncDelegStep(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = realm_mod.active_context orelse return error.JsException;
+    const awaited = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const mode: u8 = blk: {
+        if (args.len > 1 and args[1].bits != 0) switch (args[1].unbox()) {
+            .number => |n| break :blk @intFromFloat(n),
+            else => {},
+        };
+        break :blk 0;
+    };
+    const rtype: u8 = blk: {
+        if (args.len > 2 and args[2].bits != 0) switch (args[2].unbox()) {
+            .number => |n| break :blk @intFromFloat(n),
+            else => {},
+        };
+        break :blk 0;
+    };
+    if (mode == 1) {
+        return makeYieldStarStep(arena, awaited, true, true, try val_mod.makeUndefined(arena));
+    }
+    if (mode == 2) {
+        if (awaited.bits == 0 or awaited.unbox() != .object) {
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'return' method returned a non-object value");
+            return error.JsException;
+        }
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "The iterator does not provide a 'throw' method");
+        return error.JsException;
+    }
+    if (awaited.bits == 0 or awaited.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
+        return error.JsException;
+    }
+    // `done` is read before `value`, and `value` is read on every step (an async
+    // generator yields IteratorValue, not the inner result object).
+    const done = isTruthy(try ctx.getProp(arena, awaited, "done"));
+    const value = try ctx.getProp(arena, awaited, "value");
+    return makeYieldStarStep(arena, value, done, done and rtype == 2, try val_mod.makeUndefined(arena));
 }
 
 /// __retComplVal__(x): the value carried by a return-completion sentinel (used by

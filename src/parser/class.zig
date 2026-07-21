@@ -117,6 +117,61 @@ fn rewriteThisToSuperThis(node: *Node) void {
     }
 }
 
+/// Route every explicit `return` in a derived constructor's own body through the
+/// spec's return-override rule (§10.2.2 [[Construct]] step 13): an Object result
+/// replaces the instance, `undefined` yields the super-constructed `this`, and
+/// any other value — including `null` — is a TypeError. Without this the desugared
+/// constructor is an ordinary function, so `new` would silently substitute `this`
+/// for a primitive return, as it does for a *base* class.
+///
+/// `return;` becomes `return __superthis;` rather than `return undefined`, since
+/// the enclosing function's own `this` is the raw allocated object, not the
+/// instance the parent constructor produced.
+///
+/// Stops at every nested function boundary — including arrows, whose `return`
+/// belongs to the arrow, not to the constructor.
+fn rewriteDerivedReturns(p: *Parser, node: *Node) void {
+    switch (node.data) {
+        .return_stmt => |e| {
+            const start = node.start;
+            const superthis = nodeIdent(p, "__superthis") orelse return;
+            const arg = e orelse {
+                node.data = .{ .return_stmt = superthis };
+                return;
+            };
+            const callee = nodeIdent(p, "__derivedReturn__") orelse return;
+            var args = std.ArrayList(*Node){};
+            args.append(p.arena, arg) catch return;
+            args.append(p.arena, superthis) catch return;
+            const call = p.makeNode(.call_expr, start, node.end, .{
+                .call_expr = .{ .callee = callee, .args = args.items },
+            }) orelse return;
+            node.data = .{ .return_stmt = call };
+        },
+        .block_stmt => |b| for (b.body) |s| rewriteDerivedReturns(p, s),
+        .if_stmt => |i| {
+            rewriteDerivedReturns(p, i.consequent);
+            if (i.alternate) |a| rewriteDerivedReturns(p, a);
+        },
+        .while_stmt => |w| rewriteDerivedReturns(p, w.body),
+        .do_while_stmt => |w| rewriteDerivedReturns(p, w.body),
+        .for_stmt => |f| rewriteDerivedReturns(p, f.body),
+        .for_in_stmt => |f| rewriteDerivedReturns(p, f.body),
+        .try_stmt => |t| {
+            rewriteDerivedReturns(p, t.block);
+            if (t.handler) |h| rewriteDerivedReturns(p, h.body);
+            if (t.finalizer) |f| rewriteDerivedReturns(p, f);
+        },
+        .switch_stmt => |s| for (s.cases) |c| {
+            for (c.body) |st| rewriteDerivedReturns(p, st);
+        },
+        .labeled_stmt => |l| rewriteDerivedReturns(p, l.body),
+        // Expressions carry no constructor-level `return`; nested functions
+        // (arrows included) own theirs.
+        else => {},
+    }
+}
+
 /// Build the NewTarget node for a derived constructor's `Reflect.construct(Super,
 /// arguments, <newTarget>)` desugaring: `__new_target__ || ClassName`. The hidden
 /// `__new_target__` binding (set by [[Construct]]) carries the ORIGINAL new.target
@@ -234,7 +289,12 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             const key_expr = p.parseAssignmentExpr() orelse return null;
             _ = p.expect(.right_bracket) orelse return null;
             computed_key = key_expr;
-        } else if (p.check(.identifier) or p.check(.string) or p.check(.number)) {
+        } else if (p.check(.number)) {
+            // A NumericLiteral class-element name keys on its *value*: `get 0x10()`
+            // and `get 16()` define the same accessor (and `1e2` is "100", not
+            // "1e2"). The raw spelling would key a distinct, unreachable property.
+            name = expr_mod.numericLiteralKey(p) orelse return null;
+        } else if (p.check(.identifier) or p.check(.string)) {
             name = p.current.value_str;
             _ = p.advance();
         } else if (p.currentIsIdentifierName()) {
@@ -992,6 +1052,9 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         ctor_stmts.append(p.arena, super_decl) catch return null;
         // Bind `this` to the super-constructed instance (`__superthis`).
         for (ctor_body) |st| rewriteThisToSuperThis(st);
+        // Only a *written* constructor can carry a return-override; the default
+        // derived body synthesized above already returns the parent's result.
+        if (parsed.has_ctor) for (ctor_body) |st| rewriteDerivedReturns(p, st);
         for (ctor_body) |st| ctor_stmts.append(p.arena, st) catch return null;
         // `this` TDZ: a derived constructor that returns without having called
         // super() leaves `__superthis` unassigned (undefined). Reading `this`
@@ -1245,6 +1308,8 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
 
             // Bind `this` to the super-constructed instance (`__superthis`).
             for (ctor_body) |stmt| rewriteThisToSuperThis(stmt);
+            // See above: skip the synthesized default derived constructor.
+            if (parsed.has_ctor) for (ctor_body) |stmt| rewriteDerivedReturns(p, stmt);
             for (ctor_body) |stmt| {
                 out.append(p.arena, stmt) catch return null;
             }

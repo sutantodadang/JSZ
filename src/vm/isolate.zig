@@ -359,6 +359,9 @@ pub const IsolateImpl = struct {
         // dynamic `import.defer(spec)` routes through `__importDeferDyn__`.
         try realm.global_env.define("__importDefer__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImportDefer));
         try realm.global_env.define("__importDeferDyn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImportDeferDynamic));
+        // source-phase imports: `import.source(spec)` → a promise that rejects
+        // with a SyntaxError (source text modules have no [[ModuleSource]]).
+        try realm.global_env.define("__importSourceDyn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImportSourceDynamic));
         try realm.global_env.define("__initExports__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeInitExports));
         try realm.global_env.define("__iterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeIterStep));
         // W2-asyncgen: for-await-of helpers (async-iterator protocol).
@@ -366,7 +369,14 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__asyncIterStep__", try val_mod.makeNativeFunction(arena, es2015.nativeAsyncIterStep));
         // yield* delegation step + return-completion value extractor.
         try realm.global_env.define("__yieldStarStep__", try val_mod.makeNativeFunction(arena, es2015.nativeYieldStarStep));
+        // Async `yield*` delegation: iterator-record init, per-step method call,
+        // and post-await result interpretation.
+        try realm.global_env.define("__asyncDelegInit__", try val_mod.makeNativeFunction(arena, es2015.nativeAsyncDelegInit));
+        try realm.global_env.define("__asyncDelegCall__", try val_mod.makeNativeFunction(arena, es2015.nativeAsyncDelegCall));
+        try realm.global_env.define("__asyncDelegStep__", try val_mod.makeNativeFunction(arena, es2015.nativeAsyncDelegStep));
         try realm.global_env.define("__retComplVal__", try val_mod.makeNativeFunction(arena, es2015.nativeRetComplVal));
+        // Class desugar: the return-override rule for a derived constructor.
+        try realm.global_env.define("__derivedReturn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeDerivedReturn));
         // M16 Phase 3: dynamic import() native + the import.meta object binding.
         try realm.global_env.define("__import__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImport));
         try realm.global_env.define("__import_meta__", try @import("../runtime/realm.zig").makeImportMeta(arena, ""));

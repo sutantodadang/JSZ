@@ -6,6 +6,7 @@ const parser_file = @import("./parser.zig");
 const Parser = parser_file.Parser;
 const ast = @import("./ast.zig");
 const Node = ast.Node;
+const val_mod = @import("../value/value.zig");
 const prec_mod = @import("./precedence.zig");
 const Prec = prec_mod.Prec;
 const infixPrec = prec_mod.infixPrec;
@@ -846,18 +847,7 @@ pub fn parseObjectPattern(p: *Parser) ?*Node {
             key = p.current.value_str;
             _ = p.advance();
         } else if (p.check(.number)) {
-            const n = p.current.value_num;
-            _ = p.advance();
-            key = if (n == @trunc(n) and n >= 0 and n < 1e15)
-                std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch {
-                    p.had_error = true;
-                    return null;
-                }
-            else
-                std.fmt.allocPrint(p.arena, "{d}", .{n}) catch {
-                    p.had_error = true;
-                    return null;
-                };
+            key = numericLiteralKey(p) orelse return null;
         } else if (p.check(.identifier)) {
             key = p.current.value_str;
             _ = p.advance();
@@ -1035,12 +1025,32 @@ pub fn parseBinaryExpr(p: *Parser, min_prec: u8) ?*Node {
 /// True when the token kind can start a unary expression operand for `await`.
 /// Used to distinguish `await expr` (await keyword) from `await` as an identifier
 /// in script mode (e.g. `x instanceof await` where `await` is a class name).
+/// The property key a NumericLiteral member name denotes. Per
+/// sec-object-initializer, the key is `ToString(NumericValue)` — the literal's
+/// *value*, not its spelling — so `0x10`, `0b10000`, `1e1` and `16.0` all name
+/// the same property "16". Consumes the current `.number` token; sets
+/// `p.had_error` and returns null on allocation failure.
+pub fn numericLiteralKey(p: *Parser) ?[]const u8 {
+    const n = p.current.value_num;
+    _ = p.advance();
+    // Number::toString, so the key matches what a computed key or a later
+    // `obj[n]` lookup would produce — including the exponential forms
+    // (`0.0000001` keys "1e-7", not "0.0000001").
+    return val_mod.formatNumber(p.arena, n) catch {
+        p.had_error = true;
+        return null;
+    };
+}
+
 pub fn isAwaitOperandStart(kind: anytype) bool {
     return switch (kind) {
         .identifier, .number, .string, .left_paren, .left_bracket, .left_brace,
         .bang, .tilde, .minus, .plus, .kw_typeof, .kw_void, .kw_delete,
         .kw_new, .kw_function, .kw_class, .kw_this, .kw_true, .kw_false,
         .kw_null, .plus_plus, .minus_minus,
+        // `await import(spec)` / `await import.meta.f()` and `await super.m()`
+        // in an async method: both start a legal unary operand.
+        .kw_import, .kw_super,
         => true,
         else => false,
     };
@@ -1470,7 +1480,14 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
                 if (std.mem.eql(u8, meta.value_str, "defer")) {
                     return p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__importDeferDyn__" });
                 }
-                return p.fail("expected 'meta' or 'defer' after 'import.'");
+                // `import.source(spec)` → `__importSourceDyn__(spec)`: the source
+                // phase of the source-phase-imports proposal. A Source Text Module
+                // Record's GetModuleSource always throws (§16.2.1.7.2), so the
+                // native coerces the specifier and then rejects with a SyntaxError.
+                if (std.mem.eql(u8, meta.value_str, "source")) {
+                    return p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__importSourceDyn__" });
+                }
+                return p.fail("expected 'meta', 'defer' or 'source' after 'import.'");
             }
             if (p.check(.left_paren)) {
                 // `import(spec)` → `__import__(spec)`: return the native callee and
@@ -1712,18 +1729,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 mkey = p.current.value_str;
                 _ = p.advance();
             } else if (p.check(.number)) {
-                const n = p.current.value_num;
-                _ = p.advance();
-                mkey = if (n == @trunc(n) and n >= 0 and n < 1e15)
-                    std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch {
-                        p.had_error = true;
-                        return null;
-                    }
-                else
-                    std.fmt.allocPrint(p.arena, "{d}", .{n}) catch {
-                        p.had_error = true;
-                        return null;
-                    };
+                mkey = numericLiteralKey(p) orelse return null;
             } else {
                 const kn = @tagName(p.current.kind);
                 if (kn.len > 3 and std.mem.eql(u8, kn[0..3], "kw_")) {
@@ -1831,23 +1837,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             key = p.current.value_str;
             _ = p.advance();
         } else if (p.check(.number)) {
-            // Number key: convert to string.
-            const n = p.current.value_num;
-            _ = p.advance();
-            // Simple integer check.
-            if (n == @trunc(n) and n >= 0 and n < 1e15) {
-                const s = std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch {
-                    p.had_error = true;
-                    return null;
-                };
-                key = s;
-            } else {
-                const s = std.fmt.allocPrint(p.arena, "{d}", .{n}) catch {
-                    p.had_error = true;
-                    return null;
-                };
-                key = s;
-            }
+            key = numericLiteralKey(p) orelse return null;
         } else {
             // Reserved words are valid IdentifierNames as property keys (ES5+).
             const kn = @tagName(p.current.kind);
@@ -1891,12 +1881,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 aname = akn[3..];
                 _ = p.advance();
             } else if (p.check(.number)) {
-                const n = p.current.value_num;
-                _ = p.advance();
-                aname = if (n == @trunc(n) and n >= 0 and n < 1e15)
-                    std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch { p.had_error = true; return null; }
-                else
-                    std.fmt.allocPrint(p.arena, "{d}", .{n}) catch { p.had_error = true; return null; };
+                aname = numericLiteralKey(p) orelse return null;
             } else {
                 p.had_error = true;
                 p.error_info = parser_file.ParseError{ .message = "expected accessor name", .line = p.current.line, .column = p.current.column };

@@ -691,7 +691,9 @@ pub fn nativeReflectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
         if (try proxy_mod.proxyGetPrototypeOf(arena, obj)) |p| return p;
         if (proxy_mod.proxyTarget(obj)) |t| return nativeReflectGetPrototypeOf(arena, Value{}, &[_]Value{t});
     }
-    if (obj.proto) |p| return val_mod.makeObject(arena, p);
+    // Same [[GetPrototypeOf]] as Object.getPrototypeOf: a function stored as a
+    // prototype must come back as that function, not as its backing object.
+    if (obj.proto) |p| return val_mod.makeObjectOrFunction(arena, p);
     return val_mod.makeNull(arena);
 }
 
