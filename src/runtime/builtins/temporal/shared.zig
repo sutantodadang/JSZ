@@ -1335,6 +1335,25 @@ pub fn getDiffOptions(arena: std.mem.Allocator, opts: ?*JsObject, since: bool) !
     return .{ .smallest = smallest, .largest = largest, .inc = inc, .mode = mode };
 }
 
+/// IsPartialTemporalObject rejects *every* Temporal type, not just the
+/// receiver's own — `plainMonthDay.with(aPlainDate)` is a TypeError because a
+/// PlainDate is a complete Temporal object, not a bag of partial fields.
+pub fn isTemporalObject(v: Value) bool {
+    if (v.bits == 0 or v.unbox() != .object) return false;
+    return switch (v.toPtr().object.internal_kind) {
+        .temporal_instant,
+        .temporal_duration,
+        .temporal_plain_date,
+        .temporal_plain_time,
+        .temporal_plain_date_time,
+        .temporal_zoned_date_time,
+        .temporal_plain_year_month,
+        .temporal_plain_month_day,
+        => true,
+        else => false,
+    };
+}
+
 /// The options every `round()` takes. A bare string argument is shorthand for
 /// `{ smallestUnit }`; `smallest` is null only when the property was absent.
 pub const RoundToOptions = struct {
