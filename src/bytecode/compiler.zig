@@ -1440,6 +1440,7 @@ pub const FnCompiler = struct {
             try self.emitU8(robj);
             try self.emitU16(kidx);
             try self.emitU8(rval);
+            if (me.private_define) try self.emitU8(@intFromBool(me.private_method));
         } else {
             if (me.property.kind == .string_literal) {
                 const prop_name = me.property.data.string_literal;

@@ -283,7 +283,15 @@ pub inline fn opPushWith(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const robj = code[frame.pc];
     frame.pc += 1;
-    frame.with_stack.append(self.arena, frame.registers[robj]) catch return error.OutOfMemory;
+    const obj = frame.registers[robj];
+    // `with (expr)` runs ToObject(expr) before entering the scope, so a nullish
+    // head is a TypeError rather than a with-scope that matches nothing.
+    if (obj.bits == 0 or obj.unbox() == .null_ or obj.unbox() == .undefined_) {
+        realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot convert undefined or null to object");
+        if (try self.raisePendingException("with")) |oc| return oc;
+        return null;
+    }
+    frame.with_stack.append(self.arena, obj) catch return error.OutOfMemory;
     return null;
 }
 

@@ -328,7 +328,28 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d} len={d}", .{ rdst, len });
         },
-        .SET_PROP, .DEFINE_PRIVATE => {
+        .DEFINE_PRIVATE => {
+            const robj = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
+            const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+            const rval = code[new_pc];
+            new_pc += 1;
+            const is_method = code[new_pc];
+            new_pc += 1;
+            const kind: []const u8 = if (is_method != 0) "method" else "field";
+            if (kidx < chunk.constants.len and chunk.constants[kidx].bits != 0 and
+                chunk.constants[kidx].unbox() == .string)
+            {
+                try writer.print(" define {s} R{d}[\"{s}\"] = R{d}", .{ kind, robj, chunk.constants[kidx].toPtr().string, rval });
+            } else {
+                try writer.print(" define {s} R{d}[K{d}] = R{d}", .{ kind, robj, kidx, rval });
+            }
+        },
+        .SET_PROP => {
             const robj = code[new_pc];
             new_pc += 1;
             const lo = code[new_pc];

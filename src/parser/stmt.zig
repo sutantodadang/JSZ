@@ -876,6 +876,8 @@ pub fn parseWhileStmt(p: *Parser) ?*Node {
 
 pub fn parseWithStmt(p: *Parser) ?*Node {
     const start = p.current.start;
+    // A `with` statement in strict-mode code is an early SyntaxError (ES §14.11.1).
+    if (p.strict) return p.fail("strict mode code may not include a with statement");
     _ = p.advance(); // consume 'with'
     _ = p.expect(.left_paren) orelse return null;
     const object = p.parseExpression() orelse return null;

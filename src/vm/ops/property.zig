@@ -385,6 +385,8 @@ pub inline fn opDefinePrivate(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const rval = code[frame.pc];
     frame.pc += 1;
+    const is_method = code[frame.pc] != 0;
+    frame.pc += 1;
     const key = frame.func.chunk.constants[kidx].toPtr().string;
     const obj_val = frame.registers[robj];
     const val = frame.registers[rval];
@@ -399,7 +401,9 @@ pub inline fn opDefinePrivate(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         else => null,
     };
     const obj = holder orelse return null;
-    _ = try obj.defineOwnData(key, val, .{ .writable = true, .enumerable = false, .configurable = false, .is_private = true });
+    // A private method is not writable: `obj.#m = v` must be a TypeError, which
+    // `privateSet` derives from the stored attribute.
+    _ = try obj.defineOwnData(key, val, .{ .writable = !is_method, .enumerable = false, .configurable = false, .is_private = true });
     obj.markPrivate(key);
     return null;
 }

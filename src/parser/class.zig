@@ -326,12 +326,13 @@ fn isPrivateName(name: []const u8) bool {
 /// *installation* site (PrivateFieldAdd / PrivateMethodOrAccessorAdd) so it
 /// compiles to DEFINE_PRIVATE. Every other private write is a PrivateSet, which
 /// requires the element to already exist. Passes non-private targets through.
-fn markPrivateDefine(n: *Node) *Node {
+fn markPrivateDefine(n: *Node, is_method: bool) *Node {
     if (n.kind == .member_expr and !n.data.member_expr.computed and
         n.data.member_expr.property.kind == .identifier and
         isPrivateName(n.data.member_expr.property.data.identifier))
     {
         n.data.member_expr.private_define = true;
+        n.data.member_expr.private_method = is_method;
     }
     return n;
 }
@@ -529,7 +530,7 @@ fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
     const lhs = if (f.computed_key) |k|
         (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = this_node, .property = k, .computed = true } }) orelse return null)
     else
-        markPrivateDefine(nodeMember(p, this_node, f.name) orelse return null);
+        markPrivateDefine(nodeMember(p, this_node, f.name) orelse return null, false);
     const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
     const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
@@ -556,7 +557,7 @@ fn makeDerivedInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
 
     // Private fields: `__superthis.#name = init` (member assignment → PrivateFieldAdd).
     if (f.computed_key == null and f.name.len > 0 and f.name[0] == '#') {
-        const lhs = markPrivateDefine(nodeMember(p, superthis, f.name) orelse return null);
+        const lhs = markPrivateDefine(nodeMember(p, superthis, f.name) orelse return null, false);
         const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
         return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
     }
@@ -609,7 +610,7 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
     const lhs = if (f.computed_key) |k|
         (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = cls, .property = k, .computed = true } }) orelse return null)
     else
-        markPrivateDefine(nodeMember(p, cls, f.name) orelse return null);
+        markPrivateDefine(nodeMember(p, cls, f.name) orelse return null, false);
     const raw_init = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
 
     // Wrap: (function () { return <init>; }).call(ClassName)
@@ -734,7 +735,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         // check. Private names (`#x`) keep the member-assignment form
         // (PrivateMethodAdd — not a real enumerable-checkable property).
         if (m.computed_key == null and m.name.len > 0 and m.name[0] == '#') {
-            const lhs = markPrivateDefine(nodeMember(p, target, m.name) orelse return null);
+            const lhs = markPrivateDefine(nodeMember(p, target, m.name) orelse return null, true);
             const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = fn_expr } }) orelse return null;
             return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
         }

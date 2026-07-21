@@ -293,13 +293,14 @@ pub const Op = enum(u8) {
     /// absent (`n in arr` false). A run of >255 holes emits several ops. Declared
     /// last (ordinal stability for the pinned JIT int-subset contract).
     ARRAY_APPEND_HOLE,
-    /// DEFINE_PRIVATE | 5 | op, Robj u8, Kname u16-LE, Rval u8. Same encoding as
-    /// SET_PROP, but performs PrivateFieldAdd / PrivateMethodOrAccessorAdd rather
-    /// than PrivateSet: it *creates* the private element on R[Robj] instead of
+    /// DEFINE_PRIVATE | 6 | op, Robj u8, Kname u16-LE, Rval u8, isMethod u8.
+    /// Performs PrivateFieldAdd / PrivateMethodOrAccessorAdd rather than
+    /// PrivateSet: it *creates* the private element on R[Robj] instead of
     /// requiring one to already exist. Emitted only for the class desugaring's
-    /// element-installation sites (field initializers, private methods and
-    /// accessors); every other `obj.#x = v` compiles to SET_PROP, which throws a
-    /// TypeError when the object carries no matching private element. Declared
+    /// element-installation sites (field initializers, private methods); every
+    /// other `obj.#x = v` compiles to SET_PROP, which throws a TypeError when the
+    /// object carries no matching private element. `isMethod` marks the element
+    /// non-writable, so assigning over a private method is a TypeError. Declared
     /// last (ordinal stability for the pinned JIT contract).
     DEFINE_PRIVATE,
 };
@@ -400,7 +401,7 @@ pub fn instrSize(op: Op) usize {
         .ARRAY_APPEND => 3,
         .ARRAY_SPREAD => 3,
         .ARRAY_APPEND_HOLE => 3,
-        .DEFINE_PRIVATE => 5,
+        .DEFINE_PRIVATE => 6,
         .IN => 4,
         .DELETE_PROP => 4,
         .CALL_SPREAD => 5,

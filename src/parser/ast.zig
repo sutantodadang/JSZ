@@ -263,6 +263,10 @@ pub const MemberExpr = struct {
     /// element; every ordinary `obj.#x = v` is PrivateSet and requires one to
     /// already exist. Compiles to DEFINE_PRIVATE instead of SET_PROP.
     private_define: bool = false,
+    /// Narrows `private_define` to PrivateMethodOrAccessorAdd: the installed
+    /// element is a private method, which is non-writable, so a later
+    /// `obj.#m = v` is a TypeError instead of a field update.
+    private_method: bool = false,
 };
 
 pub const FuncExpr = struct {

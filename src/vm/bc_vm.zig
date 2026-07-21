@@ -1817,6 +1817,15 @@ pub const BcVm = struct {
             _ = try self.callAccessor(setter, obj_val, &[_]Value{val});
             return true;
         }
+        // A private method is installed non-writable (PrivateMethodOrAccessorAdd),
+        // so assigning over it is a TypeError rather than a field update.
+        if (!a.writable) {
+            const realm_m = @import("../runtime/realm.zig");
+            const class_mod = @import("../parser/class.zig");
+            const msg = try std.fmt.allocPrint(self.arena, "Cannot assign to private method {s}", .{class_mod.privateDisplayName(key)});
+            realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", msg);
+            return error.JsException;
+        }
         return false;
     }
 
