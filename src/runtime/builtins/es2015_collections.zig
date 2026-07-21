@@ -2686,8 +2686,24 @@ pub fn nativeGetIterator(arena: std.mem.Allocator, _: Value, args: []const Value
 pub fn nativeIterStep(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const it = if (args.len > 0) args[0] else return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     if (it.bits == 0 or it.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
-    const nx = it.toPtr().object.get("next") orelse return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
-    return function_proto.invokeCallback(arena, it, nx, &[_]Value{});
+    // Observable [[Get]] so an accessor or a Proxy `get` trap supplies `next`
+    // (a raw own-slot read finds nothing on a Proxy). Falls back to the raw
+    // read when no Context is active, and an absent `next` still ends the
+    // iteration rather than throwing — internal call sites rely on that.
+    const nx = if (realm_mod.active_context) |ctx| blk: {
+        const m = try ctx.getProp(arena, it, "next");
+        if (m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)
+            return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+        break :blk m;
+    } else it.toPtr().object.get("next") orelse
+        return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    const r = try function_proto.invokeCallback(arena, it, nx, &[_]Value{});
+    // IteratorNext step 3: a non-Object iterator result is a TypeError.
+    if (r.bits == 0 or r.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
+        return error.JsException;
+    }
+    return r;
 }
 
 /// __getAsyncIterator__(x): obtain an async iterator for `for await`. Uses the
