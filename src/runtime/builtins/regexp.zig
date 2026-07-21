@@ -44,7 +44,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
     const regexp_ctor_obj = try JsObject.create(arena, null);
     const regexp_proto_val = try val_mod.makeObject(arena, regexp_proto);
-    try regexp_ctor_obj.set("prototype", regexp_proto_val);
+    try regexp_ctor_obj.defineOwnDataForced("prototype", regexp_proto_val, .{ .writable = false, .enumerable = false, .configurable = false });
     const regexp_call_fn = try val_mod.makeNativeFunction(arena, nativeRegExpCtor);
     try regexp_ctor_obj.set("__call__", regexp_call_fn);
     _ = try regexp_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "RegExp"), .{ .writable = false, .enumerable = false, .configurable = true });
@@ -1893,7 +1893,12 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
     if (!pp.eof()) return error.InvalidPattern; // unconsumed chars
 
     const br = hasBackref(&root);
-    const prog = if (!br and !hasModifier(&root)) buildProgram(alloc, &root, pp.next_cap - 1) else null;
+    // The Pike VM's `look` instruction keeps a pointer to its assertion node, so
+    // the root must outlive this frame: a pattern that IS an assertion (`/(?=a)/`)
+    // would otherwise bake in a pointer to this function's stack slot.
+    const root_ptr = try alloc.create(RegexNode);
+    root_ptr.* = root;
+    const prog = if (!br and !hasModifier(&root)) buildProgram(alloc, root_ptr, pp.next_cap - 1) else null;
 
     return CompiledRegex{
         .root = root,
@@ -2234,12 +2239,12 @@ fn matchNode(
         .look_ahead => |la| {
             const saved_caps = caps.*;
             const matched = matchNode(la.inner, input, pos, caps, flags) != null;
-            caps.* = saved_caps;
-            if (la.negative) {
-                return if (!matched) pos else null;
-            } else {
-                return if (matched) pos else null;
-            }
+            // §22.2.2.5: a *positive* assertion's captures survive into the rest
+            // of the pattern (`/(?=(a+))/.exec("baa")` reports "aa"); a negative
+            // one's are discarded, as are those of a failed positive one.
+            if (la.negative or !matched) caps.* = saved_caps;
+            if (la.negative) return if (!matched) pos else null;
+            return if (matched) pos else null;
         },
         .look_behind => |lb| {
             var matched_lb = false;
@@ -2250,6 +2255,8 @@ fn matchNode(
                 if (matchNode(lb.inner, input, j, &tmp_caps, flags)) |end| {
                     if (end == pos) {
                         matched_lb = true;
+                        // A positive lookbehind contributes its captures.
+                        if (!lb.negative) caps.* = tmp_caps;
                         break;
                     }
                 }
@@ -2680,8 +2687,22 @@ const PikeVM = struct {
                 self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
             .look => |lnode| {
                 var tmp = [_]CaptureSpan{INVALID_CAP} ** MAX_CAPTURES;
-                if (matchNode(lnode, input, sp, &tmp, flags) != null)
-                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                if (matchNode(lnode, input, sp, &tmp, flags) == null) return;
+                // matchNode already discarded a negative assertion's captures, so
+                // whatever `tmp` holds belongs in the thread's capture set. Merge
+                // into a local copy: `caps` is the caller's shared work buffer.
+                var merged: [2 * MAX_CAPTURES]isize = undefined;
+                @memcpy(merged[0..self.ns], caps[0..self.ns]);
+                var gi: usize = 1;
+                var touched = false;
+                while (gi < MAX_CAPTURES and 2 * gi + 1 < self.ns) : (gi += 1) {
+                    if (tmp[gi].start == 0 and tmp[gi].end == 0) continue;
+                    merged[2 * gi] = @intCast(tmp[gi].start);
+                    merged[2 * gi + 1] = @intCast(tmp[gi].end);
+                    touched = true;
+                }
+                const next_caps = if (touched) merged[0..self.ns] else caps;
+                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, next_caps, input, flags);
             },
             // Leaf: a consuming op or `match`. Snapshot caps into the list slot.
             .char, .class, .any_char, .match => {
@@ -2851,29 +2872,72 @@ fn setLastIndexThrow(arena: std.mem.Allocator, v: Value, idx: usize) !void {
     }
 }
 
-pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const pattern_str: []const u8 = if (args.len > 0 and args[0].bits != 0)
-        switch (args[0].unbox()) {
-            .string => |s| s,
-            .object => |obj| blk: {
-                if (obj.internal_kind == .regexp) {
-                    if (obj.get("[[OriginalSource]]")) |sv| {
-                        if (sv.bits != 0 and sv.unbox() == .string) break :blk sv.toPtr().string;
-                    }
-                }
-                break :blk "";
-            },
-            else => "",
+/// IsRegExp (§7.2.8): an own/inherited `Symbol.match` wins over the
+/// [[RegExpMatcher]] slot, so `re[Symbol.match] = false` makes `re` stop
+/// counting as a RegExp for the constructor's short-circuit.
+fn isRegExpValue(arena: std.mem.Allocator, v: Value) anyerror!bool {
+    if (v.bits == 0 or v.unbox() != .object) return false;
+    if (realm_mod.active_sym_match) |match_sym| {
+        if (realm_mod.active_context) |ctx| {
+            const mv = try ctx.getPropSym(arena, v, match_sym);
+            if (!(mv.bits == 0 or mv.unbox() == .undefined_)) return truthyValue(mv);
         }
-    else
-        "";
+    }
+    return getCompiledRegex(v) != null;
+}
 
-    const flags_str: []const u8 = if (args.len > 1 and args[1].bits != 0)
-        switch (args[1].unbox()) {
-            .string => |s| s,
-            .undefined_ => "",
-            else => "",
+fn truthyValue(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .undefined_, .null_ => false,
+        .boolean => |b| b,
+        .number => |n| n != 0 and !std.math.isNan(n),
+        .string => |s| s.len > 0,
+        else => true,
+    };
+}
+
+pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // A plain call and a `new` both arrive with a synthesized object `this`, so
+    // only this flag distinguishes them (see realm.active_constructing).
+    const is_construct = realm_mod.active_constructing;
+    realm_mod.active_constructing = false;
+    const pattern_arg = if (args.len > 0) args[0] else Value{};
+    const flags_arg = if (args.len > 1) args[1] else Value{};
+    const flags_undefined = flags_arg.bits == 0 or flags_arg.unbox() == .undefined_;
+
+    // Step 1-2: `RegExp(re)` (no `new`, no flags) with a RegExp whose
+    // .constructor is %RegExp% returns that very object (§22.2.4.1).
+    const pattern_cr: ?*CompiledRegex = if (pattern_arg.bits != 0 and pattern_arg.unbox() == .object)
+        getCompiledRegex(pattern_arg)
+    else
+        null;
+    if (!is_construct and flags_undefined and pattern_cr != null and try isRegExpValue(arena, pattern_arg)) {
+        const ctor_v = pattern_arg.toPtr().object.get("constructor");
+        if (ctor_v) |cv| {
+            if (cv.bits != 0 and cv.unbox() == .object and
+                active_regexp_ctor == cv.toPtr().object) return pattern_arg;
         }
+    }
+
+    // Step 3/5 + RegExpInitialize: P is the source of a RegExp argument, else
+    // ToString(pattern) (undefined → ""); F is ToString(flags) (undefined → the
+    // RegExp argument's own flags, else "").
+    const pattern_str: []const u8 = if (pattern_cr) |pcr| blk: {
+        if (pattern_arg.toPtr().object.get("[[OriginalSource]]")) |sv| {
+            if (sv.bits != 0 and sv.unbox() == .string) break :blk sv.toPtr().string;
+        }
+        _ = pcr;
+        break :blk "";
+    } else if (pattern_arg.bits == 0 or pattern_arg.unbox() == .undefined_)
+        ""
+    else
+        try realm_mod.stringPrimitive(arena, pattern_arg);
+
+    const flags_str: []const u8 = if (!flags_undefined)
+        try realm_mod.stringPrimitive(arena, flags_arg)
+    else if (pattern_cr) |pcr|
+        try flagsToString(arena, pcr.flags)
     else
         "";
 
@@ -3963,6 +4027,65 @@ test "regexp: invalid pattern throws" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.InvalidPattern, compileRegex(arena.allocator(), "[", ""));
+}
+
+test "regexp: pattern early errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // A quantifier needs an Atom, and an assertion is not one (except the
+    // Annex B `(?=)`/`(?!)` exception, checked below).
+    const rejected = [_][2][]const u8{
+        .{ "a**", "" },      .{ "+a", "" },       .{ "(*)", "" },
+        .{ "a{1}{1,}", "" }, .{ "{1}", "" },      .{ "^*", "" },
+        .{ "$*", "" },       .{ "(?<=a)*", "" },
+        // /u tightens the grammar: no Annex B literals or legacy escapes.
+        .{ "(?=.)*", "u" },  .{ "a{1", "u" },     .{ "}", "u" },
+        .{ "]", "u" },       .{ "\\1", "u" },     .{ "\\01", "u" },
+        .{ "\\x", "u" },     .{ "\\c", "u" },     .{ "\\A", "u" },
+        .{ "[\\d-a]", "u" }, .{ "[a-\\d]", "u" }, .{ "[\\c]", "u" },
+    };
+    for (rejected) |c| {
+        std.testing.expectError(error.InvalidPattern, compileRegex(alloc, c[0], c[1])) catch |e| {
+            std.debug.print("expected /{s}/{s} to be rejected\n", .{ c[0], c[1] });
+            return e;
+        };
+    }
+    const accepted = [_][2][]const u8{
+        .{ "a??", "" },      .{ "(?=a)*", "" },  .{ "{", "" },
+        .{ "]", "" },        .{ "a{", "" },      .{ "\\c", "" },
+        .{ "\\1", "" },      .{ "[\\d-a]", "" }, .{ "\\x", "" },
+        .{ "\\1(a)", "u" },  .{ "\\$", "u" },    .{ "[\\-]", "u" },
+        .{ "\\cA", "u" },    .{ "[\\b]", "u" },
+    };
+    for (accepted) |c| {
+        _ = compileRegex(alloc, c[0], c[1]) catch |e| {
+            std.debug.print("expected /{s}/{s} to compile\n", .{ c[0], c[1] });
+            return e;
+        };
+    }
+}
+
+test "regexp: a bare assertion is a valid whole pattern" {
+    // Regression: the Pike VM's `look` instruction used to hold a pointer to
+    // compileRegex's stack-local root, so a pattern that IS an assertion read
+    // freed memory.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cr = try compileRegex(arena.allocator(), "(?=a)", "");
+    const m = findMatch(&cr, "ba", 0) orelse return error.TestExpectedMatch;
+    try std.testing.expectEqual(@as(usize, 1), m.start);
+    try std.testing.expectEqual(@as(usize, 1), m.state.pos);
+}
+
+test "regexp: a positive assertion keeps its captures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cr = try compileRegex(arena.allocator(), "(?=(a+))", "");
+    const m = findMatch(&cr, "baaabac", 0) orelse return error.TestExpectedMatch;
+    try std.testing.expectEqual(@as(usize, 1), m.start);
+    try std.testing.expectEqual(@as(usize, 1), m.state.captures[1].start);
+    try std.testing.expectEqual(@as(usize, 4), m.state.captures[1].end);
 }
 
 // ------- Unicode tests -------

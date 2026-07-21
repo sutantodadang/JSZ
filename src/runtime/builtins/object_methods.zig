@@ -8,6 +8,8 @@ const JsObject = obj_mod.JsObject;
 const PropAttr = obj_mod.PropAttr;
 const proxy_mod = @import("proxy.zig");
 const namespace_mod = @import("namespace.zig");
+/// For the arguments-exotic [[ParameterMap]] helpers.
+const bc_vm_mod = @import("../../vm/bc_vm.zig");
 
 /// Object.is(x, y): the SameValue algorithm — like === except NaN equals NaN
 /// and +0 is distinct from -0.
@@ -1267,6 +1269,12 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
             // No trap: forward to the target.
             if (proxy_mod.proxyTarget(obj)) |t| return nativeObjectSetPrototypeOf(arena, Value{}, &.{ t, proto_val });
         }
+        // %Object.prototype% is an immutable prototype exotic object
+        // (SetImmutablePrototype §10.4.7.1): every change but a no-op fails.
+        if (@import("../realm.zig").active_object_proto) |op| {
+            if (obj == op and obj.proto != new_proto)
+                return throwTypeError(arena, "Immutable prototype object '#<Object>' cannot have their prototype set");
+        }
         // OrdinarySetPrototypeOf (ES §10.1.2): a no-op to the same proto always
         // succeeds; otherwise a non-extensible object, or a change that would
         // create a prototype cycle, fails and Object.setPrototypeOf throws.
@@ -1892,6 +1900,9 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         };
         const ok = try obj.defineOwnAccessor(key, holder, attr);
         if (!ok) return throwTypeError(arena, "cannot redefine property");
+        // Arguments exotic [[DefineOwnProperty]] (§10.4.4.2 step 5.a): turning a
+        // mapped index into an accessor drops it from the [[ParameterMap]].
+        bc_vm_mod.unmapArg(obj, key);
         return args[0];
     }
 
@@ -1909,7 +1920,10 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
         cur_c = a.configurable;
         if (!a.is_accessor) {
             cur_w = a.writable;
-            cur_val = obj.getOwn(key);
+            // A mapped arguments index aliases the parameter binding, which is
+            // the authoritative value (§10.4.4.2 step 3): the object's own slot
+            // goes stale when the parameter itself is reassigned.
+            cur_val = bc_vm_mod.readMappedArg(obj, key) orelse obj.getOwn(key);
             has_own_data = true;
         }
     }
@@ -1926,6 +1940,11 @@ pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []co
     };
     const ok = try obj.defineOwnData(key, value, attr);
     if (!ok) return throwTypeError(arena, "cannot redefine property");
+    // Arguments exotic [[DefineOwnProperty]] (§10.4.4.2 step 5.b): a new value
+    // writes through to the aliased parameter, and losing [[Writable]] drops the
+    // index from the [[ParameterMap]].
+    if (descHas(desc, "value")) bc_vm_mod.assignMappedArg(obj, key, value);
+    if (descHas(desc, "writable") and !attr.writable) bc_vm_mod.unmapArg(obj, key);
     return args[0];
 }
 

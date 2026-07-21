@@ -72,7 +72,9 @@ pub fn setMethodLen(arena: std.mem.Allocator, obj: *JsObject, name: []const u8, 
 /// `constructor` back-link — set it explicitly if needed.
 pub fn makeCtor(arena: std.mem.Allocator, proto: *JsObject, call_fn: val_mod.NativeFnPtr, ctor_proto: ?*JsObject) !*JsObject {
     const ctor = try JsObject.create(arena, ctor_proto);
-    try ctor.set("prototype", try val_mod.makeObject(arena, proto));
+    // §17: a built-in constructor's `prototype` is { [[Writable]]: false,
+    // [[Enumerable]]: false, [[Configurable]]: false }.
+    _ = try ctor.defineOwnData("prototype", try val_mod.makeObject(arena, proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try ctor.set("__call__", try val_mod.makeNativeFunction(arena, call_fn));
     return ctor;
 }

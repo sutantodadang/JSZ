@@ -4320,6 +4320,12 @@ pub const Realm = struct {
         // ("") are non-writable, non-enumerable, configurable data properties.
         _ = try function_proto.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try function_proto.defineOwnData("name", try val_mod.makeString(arena, ""), .{ .writable = false, .enumerable = false, .configurable = true });
+        // NOTE: §20.2.3 makes %Function.prototype% a callable built-in function
+        // object. jsz still models it as a plain object, because the only
+        // available [[Call]] hook (a `__call__` slot) is found by a prototype
+        // chain walk -- which would make %GeneratorFunction.prototype% and every
+        // other object inheriting from it report `typeof === "function"` too.
+        // Marking it callable needs a brand checked at each IsCallable site.
         active_function_proto = function_proto;
 
         // R1: shared registration context for self-registering builtins (each
@@ -4373,7 +4379,7 @@ pub const Realm = struct {
 
         // ---- Phase 4: Array, String, Number constructors ----
         const array_ctor_obj = try JsObject.create(arena, null);
-        try array_ctor_obj.set("prototype", try val_mod.makeObject(arena, array_proto));
+        try array_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, array_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try array_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeArrayCtor));
         try array_ctor_obj.set("isArray", try val_mod.makeNativeFunctionNamed(arena, nativeArrayIsArray, "isArray", 1));
         try array_ctor_obj.set("from", try val_mod.makeNativeFunctionNamed(arena, nativeArrayFrom, "from", 1));
@@ -4387,7 +4393,7 @@ pub const Realm = struct {
         try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
 
         const string_ctor_obj = try JsObject.create(arena, null);
-        try string_ctor_obj.set("prototype", try val_mod.makeObject(arena, string_proto));
+        try string_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, string_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try string_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeStringCtor));
         try string_ctor_obj.set("fromCharCode", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCharCode, "fromCharCode", 1));
         try string_ctor_obj.set("fromCodePoint", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCodePoint, "fromCodePoint", 1));
@@ -4408,7 +4414,7 @@ pub const Realm = struct {
         try number_proto.set("toPrecision", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToPrecision, "toPrecision", 1));
         active_number_proto = number_proto;
         const number_ctor_obj = try JsObject.create(arena, null);
-        try number_ctor_obj.set("prototype", try val_mod.makeObject(arena, number_proto));
+        try number_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, number_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try number_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeNumberCtor));
         // Number static constants are non-writable, non-enumerable, non-configurable
         // (ES 20.1.2): `Number.NaN = 1` must be a silent no-op in sloppy mode.
@@ -4454,7 +4460,7 @@ pub const Realm = struct {
             }
             _ = try bigint_proto.defineOwnData("constructor",
                 try val_mod.makeObject(arena, bigint_ctor_obj), bi_attr);
-            try bigint_ctor_obj.set("prototype", try val_mod.makeObject(arena, bigint_proto));
+            try bigint_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, bigint_proto), .{ .writable = false, .enumerable = false, .configurable = false });
             active_bigint_proto = bigint_proto;
         }
         _ = try bigint_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
@@ -4465,7 +4471,8 @@ pub const Realm = struct {
         // is "function" and `new Function()` / `Function()` yield a truthy callable.
         // Does NOT compile a body string from arguments.
         const function_ctor_obj = try JsObject.create(arena, null);
-        try function_ctor_obj.set("prototype", try val_mod.makeObject(arena, function_proto));
+        // §20.2.2.2: `Function.prototype` is non-writable/non-configurable.
+        try function_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, function_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try function_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeFunctionCtor));
         try function_proto.set("constructor", try val_mod.makeObject(arena, function_ctor_obj));
         _ = try function_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Function"), .{ .writable = false, .enumerable = false, .configurable = true });
@@ -4481,7 +4488,7 @@ pub const Realm = struct {
         try boolean_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeBooleanToString, "toString", 0));
         active_boolean_proto = boolean_proto;
         const boolean_ctor_obj = try JsObject.create(arena, null);
-        try boolean_ctor_obj.set("prototype", try val_mod.makeObject(arena, boolean_proto));
+        try boolean_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, boolean_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try boolean_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBooleanCtor));
         try boolean_proto.set("constructor", try val_mod.makeObject(arena, boolean_ctor_obj));
         _ = try boolean_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Boolean"), .{ .writable = false, .enumerable = false, .configurable = true });
@@ -4512,7 +4519,7 @@ pub const Realm = struct {
         active_symbol_proto = symbol_proto;
         const symbol_ctor = try JsObject.create(arena, null);
         try symbol_ctor.set("__call__", try val_mod.makeNativeFunction(arena, symbol_mod.nativeSymbolCall));
-        try symbol_ctor.set("prototype", try val_mod.makeObject(arena, symbol_proto));
+        try symbol_ctor.defineOwnDataForced("prototype", try val_mod.makeObject(arena, symbol_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         _ = try symbol_proto.defineOwnData("constructor", try val_mod.makeObject(arena, symbol_ctor), .{ .writable = true, .enumerable = false, .configurable = true });
         // Fresh realm ⇒ fresh per-agent symbol registry. The registry's buffers
         // live in this realm's arena; a stale registry from a prior (freed) realm
@@ -5045,7 +5052,9 @@ pub const Realm = struct {
                 switch (obj_val_ptr.unbox()) {
                     .object => |ctor_obj| {
                         const new_proto_val = try val_mod.makeObject(self.arena, hp_proto);
-                        try ctor_obj.set("prototype", new_proto_val);
+                        // The slot is locked (non-writable/non-configurable), so
+                        // re-point it directly rather than through [[Set]].
+                        try ctor_obj.defineOwnDataForced("prototype", new_proto_val, .{ .writable = false, .enumerable = false, .configurable = false });
                     },
                     else => {},
                 }
@@ -5063,7 +5072,7 @@ pub const Realm = struct {
                 switch (arr_val_ptr.unbox()) {
                     .object => |ctor_obj| {
                         const new_proto_val = try val_mod.makeObject(self.arena, hp_array_proto);
-                        try ctor_obj.set("prototype", new_proto_val);
+                        try ctor_obj.defineOwnDataForced("prototype", new_proto_val, .{ .writable = false, .enumerable = false, .configurable = false });
                     },
                     else => {},
                 }

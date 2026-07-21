@@ -127,16 +127,45 @@ pub const MappedArgsData = struct {
     env: *Environment,
     param_names: [][]const u8,
     count: usize,
+    /// Per-index [[ParameterMap]] membership. An index drops out of the map when
+    /// it is deleted, redefined as an accessor, or made non-writable (§10.4.4.2).
+    mapped: []bool = &.{},
 };
 
-/// If `key` names a mapped argument index (an integer in `[0, count)`), return
-/// the aliased parameter name; otherwise null.
-fn mappedArgParam(obj: *JsObject, key: []const u8) ?[]const u8 {
+/// If `key` names a mapped argument index (an integer in `[0, count)` that is
+/// still in the [[ParameterMap]]), return the aliased parameter name; else null.
+pub fn mappedArgParam(obj: *JsObject, key: []const u8) ?[]const u8 {
     if (obj.internal_kind != .mapped_arguments) return null;
     const md: *MappedArgsData = @ptrCast(@alignCast(obj.internal_slot orelse return null));
     const idx = std.fmt.parseInt(usize, key, 10) catch return null;
     if (idx >= md.count) return null;
+    if (idx < md.mapped.len and !md.mapped[idx]) return null;
     return md.param_names[idx];
+}
+
+/// Drop `key` from the [[ParameterMap]] so the arguments object and the
+/// parameter binding stop tracking each other.
+pub fn unmapArg(obj: *JsObject, key: []const u8) void {
+    if (obj.internal_kind != .mapped_arguments) return;
+    const md: *MappedArgsData = @ptrCast(@alignCast(obj.internal_slot orelse return));
+    const idx = std.fmt.parseInt(usize, key, 10) catch return;
+    if (idx < md.mapped.len) md.mapped[idx] = false;
+}
+
+/// Read the parameter aliased by `key`. The arguments object's own slot can be
+/// stale (assigning the parameter directly does not touch it), so the binding is
+/// the authoritative value for a mapped index.
+pub fn readMappedArg(obj: *JsObject, key: []const u8) ?Value {
+    const pname = mappedArgParam(obj, key) orelse return null;
+    const md: *MappedArgsData = @ptrCast(@alignCast(obj.internal_slot.?));
+    return md.env.lookup(pname) catch null;
+}
+
+/// Write `value` through to the parameter aliased by `key`, if still mapped.
+pub fn assignMappedArg(obj: *JsObject, key: []const u8, value: Value) void {
+    const pname = mappedArgParam(obj, key) orelse return;
+    const md: *MappedArgsData = @ptrCast(@alignCast(obj.internal_slot.?));
+    md.env.assign(pname, value) catch {};
 }
 
 /// W2-async: how to resume a suspended coroutine.
@@ -2203,7 +2232,13 @@ pub const BcVm = struct {
         }
         // Array "length" is non-configurable: cannot be deleted.
         if (obj.is_array and std.mem.eql(u8, key, "length")) return false;
-        return obj.deleteOwn(key);
+        // Arguments exotic [[Delete]] (§10.4.4.5): a successful delete also
+        // removes the index from the [[ParameterMap]], so the parameter binding
+        // and the (now absent) property stop tracking each other.
+        const was_mapped = mappedArgParam(obj, key) != null;
+        const deleted = try obj.deleteOwn(key);
+        if (deleted and was_mapped) unmapArg(obj, key);
+        return deleted;
     }
 
     /// Abstract equality (`==`) with object↔primitive ToPrimitive coercion.
@@ -3759,7 +3794,10 @@ pub const BcVm = struct {
         // internal slot so Object.prototype.toString tags it "[object Arguments]".
         // `count` = 0 for unmapped lists, which disables index aliasing.
         const md = try self.arena.create(MappedArgsData);
-        md.* = .{ .env = env, .param_names = fn_ptr.param_names, .count = if (simple) @min(args.len, fn_ptr.param_names.len) else 0 };
+        const map_count = if (simple) @min(args.len, fn_ptr.param_names.len) else 0;
+        const mapped = try self.arena.alloc(bool, map_count);
+        @memset(mapped, true);
+        md.* = .{ .env = env, .param_names = fn_ptr.param_names, .count = map_count, .mapped = mapped };
         obj.internal_kind = .mapped_arguments;
         obj.internal_slot = md;
         try env.define("arguments", try val_mod.makeObject(self.arena, obj));

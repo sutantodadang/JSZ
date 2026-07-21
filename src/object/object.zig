@@ -574,6 +574,9 @@ pub const JsObject = struct {
     /// (getOwnPropertyNames, hasOwnProperty, getOwnPropertyDescriptor, Reflect.*,
     /// Object.keys, for-in). They are also created non-enumerable (see `set`).
     pub fn isInternalSlotKey(key: []const u8) bool {
+        // Built-in constructor objects keep their native callable in a `__call__`
+        // slot; like the `[[...]]` slots it is machinery, not an own property.
+        if (std.mem.eql(u8, key, "__call__")) return true;
         return key.len >= 4 and key[0] == '[' and key[1] == '[';
     }
 
