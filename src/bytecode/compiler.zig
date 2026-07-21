@@ -1086,44 +1086,112 @@ pub const FnCompiler = struct {
         self.sp = save_sp;
     }
 
+    /// `pattern = default`: copy `rsrc` into a fresh register and substitute
+    /// `default` only when it holds `undefined` (a destructuring default does NOT
+    /// apply to null). Returns that register; the caller frees it by resetting
+    /// `sp` to it once the value has been consumed.
+    fn emitPatternDefault(self: *Self, ae: ast.AssignExpr, rsrc: u8, line: u32) error{OutOfMemory}!u8 {
+        const rt = self.allocReg();
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(rt);
+        try self.emitU8(rsrc);
+        // Compute `rt === undefined` and skip the default-load when false.
+        const rundef = self.allocReg();
+        try self.emitOp(.LOAD_UNDEF, line);
+        try self.emitU8(rundef);
+        const rcond = self.allocReg();
+        try self.emitOp(.SEQ, line);
+        try self.emitU8(rcond);
+        try self.emitU8(rt);
+        try self.emitU8(rundef);
+        try self.emitOp(.JMP_IF_FALSE, line);
+        try self.emitU8(rcond);
+        const patch = self.currentOffset();
+        try self.emitI16(0);
+        self.sp = rt + 1; // free rundef/rcond (already consumed) before default expr
+        // NamedEvaluation: `[a = function(){}] = rhs` names the anonymous
+        // default "a" (only when the target is a plain identifier).
+        if (ae.target.kind == .identifier and ae.value.kind == .function_expr)
+            self.name_hint = ae.target.data.identifier;
+        const rd = try self.compileExpr(ae.value);
+        self.name_hint = null;
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(rt);
+        try self.emitU8(rd);
+        self.sp = rt + 1; // free any regs the default expr used
+        self.patchJump(patch, self.currentOffset());
+        return rt;
+    }
+
+    /// A member-expression assignment target whose object and key have already
+    /// been evaluated into live registers, but whose write has not happened yet.
+    /// ArrayAssignmentPattern evaluates each element's DestructuringAssignmentTarget
+    /// reference BEFORE stepping the iterator (ECMA-262 8.6.2), so a throwing
+    /// object or key expression must be observable before `next()` runs.
+    const PreparedRef = struct {
+        robj: u8,
+        /// Dynamic key register (computed, non-literal property), or null when
+        /// the key is a compile-time constant in `kidx`.
+        rkey: ?u8 = null,
+        kidx: u16 = 0,
+    };
+
+    /// Evaluate a member target's object (and computed key) without writing.
+    /// Registers stay live until `emitPreparedWrite`; the caller frees them by
+    /// resetting `sp`. Returns null for forms that must not be pre-evaluated
+    /// (private names, which have no observable key expression).
+    fn prepareMemberRef(self: *Self, me: ast.MemberExpr) error{OutOfMemory}!?PreparedRef {
+        if (me.private_define) return null;
+        const robj = try self.compileExpr(me.object);
+        if (!me.computed) {
+            const sv = try val_mod.makeString(self.arena, me.property.data.identifier);
+            return .{ .robj = robj, .kidx = try self.addConstant(sv) };
+        }
+        if (me.property.kind == .string_literal) {
+            const sv = try val_mod.makeString(self.arena, me.property.data.string_literal);
+            return .{ .robj = robj, .kidx = try self.addConstant(sv) };
+        }
+        if (me.property.kind == .number_literal) {
+            const key_str = std.fmt.allocPrint(self.arena, "{d}", .{me.property.data.number_literal}) catch return error.OutOfMemory;
+            const sv = try val_mod.makeString(self.arena, key_str);
+            return .{ .robj = robj, .kidx = try self.addConstant(sv) };
+        }
+        return .{ .robj = robj, .rkey = try self.compileExpr(me.property) };
+    }
+
+    fn emitPreparedWrite(self: *Self, pr: PreparedRef, rval: u8, line: u32) error{OutOfMemory}!void {
+        if (pr.rkey) |rk| {
+            try self.emitOp(.SET_PROP_DYN, line);
+            try self.emitU8(pr.robj);
+            try self.emitU8(rk);
+            try self.emitU8(rval);
+        } else {
+            try self.emitOp(.SET_PROP, line);
+            try self.emitU8(pr.robj);
+            try self.emitU16(pr.kidx);
+            try self.emitU8(rval);
+        }
+    }
+
+    /// The member target of an array-pattern element, looked through an optional
+    /// `= default`. Anything else (identifier, nested pattern) has no separately
+    /// observable reference evaluation, so it needs no pre-evaluation.
+    fn patternMemberTarget(elem: *Node) ?ast.MemberExpr {
+        const t = if (elem.kind == .assignment_expr and elem.data.assignment_expr.op == .assign)
+            elem.data.assignment_expr.target
+        else
+            elem;
+        return if (t.kind == .member_expr) t.data.member_expr else null;
+    }
+
     pub fn compileDestructure(self: *Self, target: *Node, rsrc: u8, line: u32) error{OutOfMemory}!void {
         switch (target.kind) {
             .identifier => try self.emitStore(target.data.identifier, rsrc, line),
             .member_expr => try self.compileMemberWrite(target.data.member_expr, rsrc, line),
             .assignment_expr => {
-                // `pattern = default`: substitute `default` only when `rsrc` is
-                // `undefined` (a destructuring default does NOT apply to null).
                 const ae = target.data.assignment_expr;
                 if (ae.op != .assign) return; // only plain `=` is a valid default
-                const rt = self.allocReg();
-                try self.emitOp(.MOVE, line);
-                try self.emitU8(rt);
-                try self.emitU8(rsrc);
-                // Compute `rt === undefined` and skip the default-load when false.
-                const rundef = self.allocReg();
-                try self.emitOp(.LOAD_UNDEF, line);
-                try self.emitU8(rundef);
-                const rcond = self.allocReg();
-                try self.emitOp(.SEQ, line);
-                try self.emitU8(rcond);
-                try self.emitU8(rt);
-                try self.emitU8(rundef);
-                try self.emitOp(.JMP_IF_FALSE, line);
-                try self.emitU8(rcond);
-                const patch = self.currentOffset();
-                try self.emitI16(0);
-                self.sp = rt + 1; // free rundef/rcond (already consumed) before default expr
-                // NamedEvaluation: `[a = function(){}] = rhs` names the anonymous
-                // default "a" (only when the target is a plain identifier).
-                if (ae.target.kind == .identifier and ae.value.kind == .function_expr)
-                    self.name_hint = ae.target.data.identifier;
-                const rd = try self.compileExpr(ae.value);
-                self.name_hint = null;
-                try self.emitOp(.MOVE, line);
-                try self.emitU8(rt);
-                try self.emitU8(rd);
-                self.sp = rt + 1; // free any regs the default expr used
-                self.patchJump(patch, self.currentOffset());
+                const rt = try self.emitPatternDefault(ae, rsrc, line);
                 try self.compileDestructure(ae.target, rt, line);
                 self.sp = rt; // free rt
             },
@@ -1131,11 +1199,42 @@ pub const FnCompiler = struct {
                 // `({a} = null)` / `for ({a} of [null])`: destructuring null or
                 // undefined throws before any property read.
                 try self.emitRequireCoercible(rsrc, line);
-                for (target.data.object_literal.properties) |prop| {
+                const props = target.data.object_literal.properties;
+                // A trailing `...rest` (ObjectProp with a `spread_expr` value —
+                // the object-literal parser's representation) needs the runtime
+                // key of every preceding property so CopyDataProperties can skip
+                // them. Only build that exclusion array when a rest element is
+                // actually present, so the common pattern stays allocation-free.
+                var has_rest = false;
+                for (props) |p| {
+                    if (p.value.kind == .spread_expr) has_rest = true;
+                }
+                var rexcl: u8 = 0;
+                if (has_rest) {
+                    rexcl = self.allocReg();
+                    try self.emitOp(.NEW_ARRAY, line);
+                    try self.emitU8(rexcl);
+                    try self.emitU8(0);
+                }
+                for (props) |prop| {
+                    if (prop.value.kind == .spread_expr) {
+                        const rrest = self.allocReg();
+                        try self.emitDestrCall("__destrObjRest__", rsrc, rexcl, rrest, line);
+                        try self.compileDestructure(prop.value.data.spread_expr, rrest, line);
+                        self.sp = rrest; // free rrest
+                        continue;
+                    }
                     if (prop.kind != .init) continue; // patterns carry only data props
                     const rval = self.allocReg();
                     if (prop.computed_key) |key_node| {
+                        // Evaluate the key once: it feeds both the property read
+                        // and (when a rest follows) the exclusion list.
                         const rkey = try self.compileExpr(key_node);
+                        if (has_rest) {
+                            try self.emitOp(.ARRAY_APPEND, line);
+                            try self.emitU8(rexcl);
+                            try self.emitU8(rkey);
+                        }
                         try self.emitOp(.GET_PROP_DYN, line);
                         try self.emitU8(rval);
                         try self.emitU8(rsrc);
@@ -1144,6 +1243,16 @@ pub const FnCompiler = struct {
                     } else {
                         const sv = try val_mod.makeString(self.arena, prop.key);
                         const kidx = try self.addConstant(sv);
+                        if (has_rest) {
+                            const rk = self.allocReg();
+                            try self.emitOp(.LOAD_K, line);
+                            try self.emitU8(rk);
+                            try self.emitU16(kidx);
+                            try self.emitOp(.ARRAY_APPEND, line);
+                            try self.emitU8(rexcl);
+                            try self.emitU8(rk);
+                            self.sp = rval + 1; // free rk
+                        }
                         try self.emitOp(.GET_PROP, line);
                         try self.emitU8(rval);
                         try self.emitU8(rsrc);
@@ -1152,6 +1261,7 @@ pub const FnCompiler = struct {
                     try self.compileDestructure(prop.value, rval, line);
                     self.sp = rval; // free rval
                 }
+                if (has_rest) self.sp = rexcl; // free rexcl
             },
             .array_literal => {
                 // ES ArrayAssignmentPattern: destructure through the iterator
@@ -1170,6 +1280,21 @@ pub const FnCompiler = struct {
                 const rbox = self.allocReg();
                 try self.emitOp(.NEW_OBJECT, line);
                 try self.emitU8(rbox);
+                // Any abrupt completion while binding the elements — a throwing
+                // target reference, a throwing default, or a generator
+                // `.return()` landing on a `yield` inside the pattern — must
+                // still close a not-yet-exhausted iterator before propagating
+                // (ECMA-262 8.6.2 / IteratorClose). `rexc` receives the
+                // completion; the handler closes and re-raises it verbatim, so a
+                // return-completion stays a return-completion.
+                const rexc = self.allocReg();
+                self.freeReg(); // PUSH_TRY reserves it
+                try self.emitOp(.PUSH_TRY, line);
+                try self.emitU8(rexc);
+                const handler_patch = self.currentOffset();
+                try self.emitI16(0);
+                const body_sp = self.sp;
+
                 var saw_rest = false;
                 for (elems) |elem| {
                     // Elision hole (`[, x] = rhs`): advance one step, discard.
@@ -1182,26 +1307,89 @@ pub const FnCompiler = struct {
                     if (elem.kind == .spread_expr) {
                         // Rest `...t = rhs`: collect the remaining values into a
                         // fresh Array. Must be final; no IteratorClose follows.
+                        // The rest target's reference is evaluated BEFORE the
+                        // iterator is drained, so `[...obj[throws()]]` never
+                        // calls `next()`.
+                        const prepared = if (patternMemberTarget(elem.data.spread_expr)) |me|
+                            try self.prepareMemberRef(me)
+                        else
+                            null;
                         const rrest = self.allocReg();
                         try self.emitDestrCall("__destrIterRest__", rit, rbox, rrest, line);
-                        try self.compileDestructure(elem.data.spread_expr, rrest, line);
-                        self.sp = rrest; // free rrest
+                        if (prepared) |pr| {
+                            try self.emitPreparedWrite(pr, rrest, line);
+                        } else {
+                            try self.compileDestructure(elem.data.spread_expr, rrest, line);
+                        }
+                        self.sp = body_sp; // free prepared regs + rrest
                         saw_rest = true;
                         break;
                     }
-                    // Normal element: one IteratorStep into a temp, then assign
-                    // (handles identifier / member / default / nested sub-pattern).
+                    // Normal element: evaluate a member target's reference first,
+                    // then one IteratorStep into a temp, then assign (handles
+                    // identifier / member / default / nested sub-pattern).
+                    const elem_base = self.sp;
+                    const prepared = if (patternMemberTarget(elem)) |me|
+                        try self.prepareMemberRef(me)
+                    else
+                        null;
                     const rstep = self.allocReg();
                     try self.emitDestrCall("__destrIterStep__", rit, rbox, rstep, line);
-                    try self.compileDestructure(elem, rstep, line);
-                    self.sp = rstep; // free rstep
+                    if (prepared) |pr| {
+                        const rval = if (elem.kind == .assignment_expr)
+                            try self.emitPatternDefault(elem.data.assignment_expr, rstep, line)
+                        else
+                            rstep;
+                        try self.emitPreparedWrite(pr, rval, line);
+                    } else {
+                        try self.compileDestructure(elem, rstep, line);
+                    }
+                    self.sp = elem_base; // free prepared regs + rstep
                 }
-                if (!saw_rest) {
+                self.sp = body_sp;
+                try self.emitOp(.POP_TRY, line);
+                try self.emitOp(.JMP, line);
+                const jmp_end = self.currentOffset();
+                try self.emitI16(0);
+                // Handler: close, then re-raise the original completion. The VM
+                // has just written that completion into `rexc`, so every call
+                // here must allocate ABOVE it. A *throw* completion wins
+                // outright, so errors from `return()` are discarded; a *return*
+                // completion (generator `.return()` landing on a `yield` inside
+                // the pattern) is not a throw completion, so IteratorClose steps
+                // 6-7 still apply and a throwing / non-Object `return()` result
+                // replaces it.
+                self.patchJump(handler_patch, self.currentOffset());
+                self.sp = rexc + 1;
+                try self.emitOp(.JMP_IF_RET_COMPL, line);
+                try self.emitU8(rexc);
+                const ret_compl_patch = self.currentOffset();
+                try self.emitI16(0);
+                {
+                    const scratch = self.allocReg();
+                    try self.emitDestrCall("__destrIterCloseThrow__", rit, rbox, scratch, line);
+                    self.sp = rexc + 1;
+                }
+                try self.emitOp(.THROW, line);
+                try self.emitU8(rexc);
+                self.patchJump(ret_compl_patch, self.currentOffset());
+                {
                     const scratch = self.allocReg();
                     try self.emitDestrCall("__destrIterClose__", rit, rbox, scratch, line);
-                    self.sp = scratch; // free scratch
+                    self.sp = rexc + 1;
                 }
-                self.sp = rit; // free rit + rbox
+                try self.emitOp(.THROW, line);
+                try self.emitU8(rexc);
+                self.patchJump(jmp_end, self.currentOffset());
+                // Normal completion: IteratorClose runs OUTSIDE the handler, so a
+                // throwing `return()` propagates once instead of being caught and
+                // re-closed. `...rest` already exhausted the iterator.
+                if (!saw_rest) {
+                    self.sp = rit + 2;
+                    const scratch = self.allocReg();
+                    try self.emitDestrCall("__destrIterClose__", rit, rbox, scratch, line);
+                }
+                self.sp = rit; // free rit + rbox + rexc
             },
             else => {}, // unsupported pattern element: leave unassigned
         }

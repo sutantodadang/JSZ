@@ -886,7 +886,14 @@ pub fn parseObjectPattern(p: *Parser) ?*Node {
             target = p.makeNode(.identifier, start, start, .{ .identifier = key }) orelse return null;
         }
         if (p.match(.eq)) {
+            // NamedEvaluation: `var { cls = class {} } = x` names the anonymous
+            // class after the binding (threaded via the parser hint — the class
+            // desugars to an IIFE the compiler's name-hint cannot reach).
+            const set_def_class_hint = p.check(.kw_class) and target.kind == .identifier and
+                p.export_default_name_hint == null;
+            if (set_def_class_hint) p.export_default_name_hint = target.data.identifier;
             const def = p.parseAssignmentExpr() orelse return null;
+            if (set_def_class_hint) p.export_default_name_hint = null;
             target = p.makeNode(.assignment_expr, target.start, target.start, .{
                 .assignment_expr = .{ .op = .assign, .target = target, .value = def },
             }) orelse return null;
@@ -1972,7 +1979,14 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
         // using this form is a refinement error we currently accept.
         if (p.check(.eq)) {
             _ = p.advance();
+            // NamedEvaluation: `{ cls = class {} } = x` names the anonymous class
+            // after the target binding, same as `{ key: class {} }` below — the
+            // class desugars to an IIFE, so the name must travel via the parser
+            // hint rather than the compiler's function name-hint.
+            const set_def_class_hint = p.check(.kw_class) and p.export_default_name_hint == null;
+            if (set_def_class_hint) p.export_default_name_hint = key;
             const def = p.parseAssignmentExpr() orelse return null;
+            if (set_def_class_hint) p.export_default_name_hint = null;
             const id_node = p.makeNode(.identifier, prop_start, prop_start, .{ .identifier = key }) orelse return null;
             const ae = p.makeNode(.assignment_expr, prop_start, p.current.start, .{
                 .assignment_expr = .{ .target = id_node, .value = def, .op = .assign },

@@ -2307,17 +2307,37 @@ pub fn nativeDestrIterStep(arena: std.mem.Allocator, _: Value, args: []const Val
     if (box) |b| {
         if (b.get("done")) |dv| if (isTruthy(dv)) return val_mod.makeUndefined(arena);
     }
-    const r = try nativeIterStep(arena, Value{}, &[_]Value{it});
+    // Every abrupt exit below leaves the iterator [[Done]] — a throwing `next()`,
+    // a bad result object, or a throwing done/value getter all set [[Done]] to
+    // true before propagating (7.4.6/7.4.7), which is what suppresses the
+    // IteratorClose that would otherwise follow.
+    const r = nativeIterStep(arena, Value{}, &[_]Value{it}) catch |e| {
+        try markDone(arena, box);
+        return e;
+    };
     if (r.bits == 0 or r.unbox() != .object) {
+        try markDone(arena, box);
         realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
         return error.JsException;
     }
-    const done = try ctx.getProp(arena, r, "done");
+    const done = ctx.getProp(arena, r, "done") catch |e| {
+        try markDone(arena, box);
+        return e;
+    };
     if (isTruthy(done)) {
-        if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
+        try markDone(arena, box);
         return val_mod.makeUndefined(arena);
     }
-    return try ctx.getProp(arena, r, "value");
+    return ctx.getProp(arena, r, "value") catch |e| {
+        try markDone(arena, box);
+        return e;
+    };
+}
+
+/// Mark the destructuring done-box exhausted, so a later `__destrIterClose__`
+/// call is a no-op (the spec's `iteratorRecord.[[Done]] = true`).
+fn markDone(arena: std.mem.Allocator, box: ?*JsObject) !void {
+    if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
 }
 
 /// __destrIterRest__(iterator, box): collect the remaining iterator values into a
@@ -2334,17 +2354,29 @@ pub fn nativeDestrIterRest(arena: std.mem.Allocator, _: Value, args: []const Val
     var n: usize = 0;
     while (true) {
         if (box) |b| if (b.get("done")) |dv| if (isTruthy(dv)) break;
-        const r = try nativeIterStep(arena, Value{}, &[_]Value{it});
+        // As in __destrIterStep__, any abrupt exit leaves the iterator [[Done]],
+        // which suppresses the IteratorClose that would otherwise follow.
+        const r = nativeIterStep(arena, Value{}, &[_]Value{it}) catch |e| {
+            try markDone(arena, box);
+            return e;
+        };
         if (r.bits == 0 or r.unbox() != .object) {
+            try markDone(arena, box);
             realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator result is not an object");
             return error.JsException;
         }
-        const done = try ctx.getProp(arena, r, "done");
+        const done = ctx.getProp(arena, r, "done") catch |e| {
+            try markDone(arena, box);
+            return e;
+        };
         if (isTruthy(done)) {
-            if (box) |b| try b.set("done", try val_mod.makeBool(arena, true));
+            try markDone(arena, box);
             break;
         }
-        const v = try ctx.getProp(arena, r, "value");
+        const v = ctx.getProp(arena, r, "value") catch |e| {
+            try markDone(arena, box);
+            return e;
+        };
         const key = try std.fmt.allocPrint(arena, "{d}", .{n});
         try arr.set(key, v);
         n += 1;
@@ -2365,9 +2397,41 @@ pub fn nativeDestrIterClose(arena: std.mem.Allocator, _: Value, args: []const Va
     if (it.bits == 0 or it.unbox() != .object) return val_mod.makeUndefined(arena);
     const ret = try ctx.getProp(arena, it, "return");
     if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_) return val_mod.makeUndefined(arena);
-    if (!isCallable(ret)) return val_mod.makeUndefined(arena);
-    _ = try function_proto.invokeCallback(arena, it, ret, &[_]Value{});
+    // GetMethod: a present-but-uncallable `return` is a TypeError.
+    if (!isCallable(ret)) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'return' is not a function");
+        return error.JsException;
+    }
+    const inner = try function_proto.invokeCallback(arena, it, ret, &[_]Value{});
+    // IteratorClose step 6: after a NORMAL completion, `return()` must yield an
+    // Object. (On an abrupt completion the original error wins and this check is
+    // skipped — that path runs through `__destrIterCloseThrow__`.)
+    if (inner.bits == 0 or inner.unbox() != .object) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "iterator 'return' did not return an object");
+        return error.JsException;
+    }
     return val_mod.makeUndefined(arena);
+}
+
+/// __destrIterCloseThrow__(iterator, box): IteratorClose for an ABRUPT (throw)
+/// completion of an array destructuring pattern — the element's target reference
+/// or its assignment threw, so the iterator must still be closed, but any error
+/// from `return()` (including a non-Object result) is DISCARDED so the original
+/// exception is what propagates (ECMA-262 7.4.9 step 5). Never throws.
+pub fn nativeDestrIterCloseThrow(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const undef = try val_mod.makeUndefined(arena);
+    const ctx = realm_mod.active_context orelse return undef;
+    const it = if (args.len > 0) args[0] else return undef;
+    const box = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
+    if (box) |b| if (b.get("done")) |dv| if (isTruthy(dv)) return undef;
+    if (it.bits == 0 or it.unbox() != .object) return undef;
+    const saved = realm_mod.pending_exception;
+    defer realm_mod.pending_exception = saved;
+    const ret = ctx.getProp(arena, it, "return") catch return undef;
+    if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_) return undef;
+    if (!isCallable(ret)) return undef;
+    _ = function_proto.invokeCallback(arena, it, ret, &[_]Value{}) catch return undef;
+    return undef;
 }
 
 /// __destrObjRest__(src, excludeKeys): CopyDataProperties into a fresh plain
@@ -2383,21 +2447,64 @@ pub fn nativeDestrIterClose(arena: std.mem.Allocator, _: Value, args: []const Va
 pub fn nativeDestrObjRest(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const out = try JsObject.create(arena, realm_mod.active_object_proto);
     const src = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    if (src.bits == 0 or src.unbox() != .object) return val_mod.makeObject(arena, out);
-    const src_obj = src.toPtr().object;
-    const excl_list: ?*JsObject = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) args[1].toPtr().object else null;
-    outer: for (src_obj.ownKeys()) |k| {
-        if (!src_obj.isEnumerable(k)) continue;
-        if (excl_list) |ex| {
-            var i: usize = 0;
-            while (i < ex.array_length) : (i += 1) {
-                const ek = try std.fmt.allocPrint(arena, "{d}", .{i});
-                const ev = ex.getOwn(ek) orelse continue;
-                if (ev.bits != 0 and ev.unbox() == .string and std.mem.eql(u8, ev.unbox().string, k)) continue :outer;
+    if (src.bits == 0 or src.unbox() == .undefined_ or src.unbox() == .null_)
+        return val_mod.makeObject(arena, out);
+
+    // Normalize the exclusion list once: each entry goes through ToPropertyKey,
+    // so a computed key like `{[1.]: b, ...rest}` excludes "1" and a Symbol key
+    // excludes that symbol (compared by SymbolData identity, not description).
+    var excl_str = std.ArrayList([]const u8){};
+    var excl_sym = std.ArrayList(*val_mod.SymbolData){};
+    if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .object) {
+        const ex = args[1].toPtr().object;
+        var i: usize = 0;
+        while (i < ex.array_length) : (i += 1) {
+            const ev = ex.getIndexOwn(@intCast(i)) orelse continue;
+            if (ev.bits != 0 and ev.unbox() == .symbol) {
+                try excl_sym.append(arena, ev.toPtr().symbol);
+            } else {
+                try excl_str.append(arena, try toPropertyKeyString(arena, ev));
             }
         }
-        const v = src_obj.getOwn(k) orelse continue;
+    }
+
+    // ToObject(src) for primitives: only a String has own enumerable properties
+    // (its indexed code units); Number/Boolean/Symbol/BigInt wrappers have none,
+    // so they simply yield an empty object rather than throwing.
+    if (src.unbox() == .string) {
+        const s = src.unbox().string;
+        var i: usize = 0;
+        outer_str: while (i < s.len) : (i += 1) {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            for (excl_str.items) |e| if (std.mem.eql(u8, e, idx_key)) continue :outer_str;
+            const ch = try val_mod.makeString(arena, try arena.dupe(u8, s[i .. i + 1]));
+            try out.set(idx_key, ch);
+        }
+        return val_mod.makeObject(arena, out);
+    }
+    if (src.unbox() != .object) return val_mod.makeObject(arena, out);
+
+    // CopyDataProperties: read each own enumerable key through [[Get]] (so
+    // getters run and their VALUE is copied) and write it as a plain data
+    // property — the copy is always writable/enumerable/configurable regardless
+    // of the source descriptor. String keys precede symbol keys, matching
+    // OwnPropertyKeys order (integer indices, then insertion order, then symbols).
+    const src_obj = src.toPtr().object;
+    const ctx = realm_mod.active_context;
+    outer: for (src_obj.ownKeys()) |k| {
+        if (!src_obj.isEnumerable(k)) continue;
+        for (excl_str.items) |e| if (std.mem.eql(u8, e, k)) continue :outer;
+        const v = if (ctx) |c| try c.getProp(arena, src, k) else (src_obj.getOwn(k) orelse continue);
         try out.set(k, v);
+    }
+    outer_sym: for (src_obj.symKeys()) |sp| {
+        if (!sp.attr.enumerable) continue;
+        if (sp.key.bits != 0 and sp.key.unbox() == .symbol) {
+            const sd = sp.key.toPtr().symbol;
+            for (excl_sym.items) |e| if (e == sd) continue :outer_sym;
+        }
+        const v = if (ctx) |c| try c.getPropSym(arena, src, sp.key) else sp.value;
+        try out.setSym(sp.key, v);
     }
     return val_mod.makeObject(arena, out);
 }
