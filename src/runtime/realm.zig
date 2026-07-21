@@ -2147,7 +2147,9 @@ pub fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8
         .null_ => "null",
         .undefined_ => "undefined",
         .bigint => |b| try val_mod.bigIntToString(arena, b),
-        .object => blk: {
+        // Functions are objects too: `String(function f(){})` is the source
+        // text produced by Function.prototype.toString, not "[object Object]".
+        .object, .function, .bc_function, .native_function => blk: {
             // ToString(ToPrimitive(arg, "string")) when a user hook applies.
             if (try coercion_mod.toPrimitive(arena, arg, .string)) |prim|
                 break :blk try stringPrimitive(arena, prim);
@@ -2485,15 +2487,14 @@ fn uriToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
         .undefined_ => return "undefined",
         .bigint => |bi| return try val_mod.bigIntToString(arena, bi),
         .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a string"),
-        .object => {
+        .object, .function, .bc_function, .native_function => {
             // ToString(object): ToPrimitive(string). A missing/uncallable
             // toString & valueOf (null result) is a TypeError, not a fallback.
             const prim = (try coercion_mod.toPrimitive(arena, v, .string)) orelse
                 return throwTypeError(arena, "Cannot convert object to primitive value");
-            if (prim.bits != 0 and prim.unbox() == .object) return "[object Object]";
+            if (!coercion_mod.isPrimitive(prim)) return "[object Object]";
             return uriToString(arena, prim);
         },
-        else => return "[object Object]",
     }
 }
 

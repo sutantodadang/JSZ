@@ -24,12 +24,13 @@ pub fn isPrimitive(v: Value) bool {
     };
 }
 
-/// True if `v` is an object that may carry a user-defined coercion hook.
+/// True if `v` is an ordinary object (excluding callables, which are their own
+/// value kinds here but are still objects as far as ECMAScript is concerned).
 pub fn isObjectValue(v: Value) bool {
     return v.bits != 0 and v.unbox() == .object;
 }
 
-fn isCallable(v: Value) bool {
+pub fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
@@ -75,12 +76,24 @@ fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
 /// Throws (`error.JsException` + sets `pending_exception`) when a
 /// `Symbol.toPrimitive` hook returns a non-primitive.
 pub fn toPrimitive(arena: std.mem.Allocator, v: Value, hint: Hint) anyerror!?Value {
-    if (!isObjectValue(v)) return null;
-    const obj = v.toPtr().object;
+    if (isPrimitive(v)) return null;
+    // Functions are callable objects, but they are their own Value kinds here
+    // (their props and Function.prototype live on a backing object reachable
+    // only through the VM). Property lookups below therefore go through the
+    // active context, which resolves both representations; the plain-object
+    // fast paths are guarded on `is_obj`.
+    const is_obj = isObjectValue(v);
+    const obj: ?*JsObject = if (is_obj) v.toPtr().object else null;
 
     // 1. Exotic @@toPrimitive hook.
     if (realm_mod.active_sym_to_primitive) |sym| {
-        if (getSymMethod(obj, sym)) |method| {
+        const hook: ?Value = if (obj) |o|
+            getSymMethod(o, sym)
+        else if (realm_mod.active_context) |ctx|
+            try ctx.getPropSym(arena, v, sym)
+        else
+            null;
+        if (hook) |method| {
             // GetMethod: a present @@toPrimitive that is undefined/null is
             // skipped; one that is neither but not callable throws a TypeError.
             const is_nullish = method.bits == 0 or switch (method.unbox()) {
@@ -108,8 +121,10 @@ pub fn toPrimitive(arena: std.mem.Allocator, v: Value, hint: Hint) anyerror!?Val
 
     // 1b. Wrapper objects (Number/String/Boolean/BigInt/Symbol) unbox via their
     // stored [[PrimitiveValue]] — equivalent to the prototype valueOf result.
-    if (obj.get("[[PrimitiveValue]]")) |p| {
-        if (isPrimitive(p)) return p;
+    if (obj) |o| {
+        if (o.get("[[PrimitiveValue]]")) |p| {
+            if (isPrimitive(p)) return p;
+        }
     }
 
     // 2. OrdinaryToPrimitive: method order depends on hint.
@@ -123,7 +138,7 @@ pub fn toPrimitive(arena: std.mem.Allocator, v: Value, hint: Hint) anyerror!?Val
 /// Date.prototype[@@toPrimitive] can invoke it without re-entering ToPrimitive's
 /// @@toPrimitive dispatch (which would recurse infinitely).
 pub fn ordinaryToPrimitive(arena: std.mem.Allocator, v: Value, string_first: bool) anyerror!?Value {
-    const obj = v.toPtr().object;
+    const obj: ?*JsObject = if (isObjectValue(v)) v.toPtr().object else null;
     const names: [2][]const u8 = if (string_first)
         .{ "toString", "valueOf" }
     else
@@ -135,8 +150,12 @@ pub fn ordinaryToPrimitive(arena: std.mem.Allocator, v: Value, string_first: boo
         // never invoking a `get valueOf(){…}`). Getter throws propagate.
         const method = if (realm_mod.active_context) |ctx|
             try ctx.getProp(arena, v, name)
+        else if (obj) |o|
+            (o.get(name) orelse continue)
         else
-            (obj.get(name) orelse continue);
+            // A function value with no active context: its methods live on the
+            // VM-side backing object we cannot reach, so no hook applies.
+            continue;
         if (!isCallable(method)) continue;
         had_callable = true;
         const res = try function_proto.invokeCallback(arena, v, method, &[_]Value{});

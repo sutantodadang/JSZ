@@ -306,7 +306,10 @@ pub fn valueToJsString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
         else => blk: {
             const coercion = @import("coercion.zig");
             const prim = (try coercion.toPrimitive(arena, v, .string)) orelse v;
-            if (prim.bits != 0 and prim.unbox() == .object) break :blk "[object Object]";
+            // Guard on "still not primitive" rather than "is an ordinary
+            // object": a function whose coercion produced nothing would
+            // otherwise recurse into this same branch forever.
+            if (!coercion.isPrimitive(prim)) break :blk "[object Object]";
             break :blk try valueToJsString(arena, prim);
         },
     };

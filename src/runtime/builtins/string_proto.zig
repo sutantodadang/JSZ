@@ -91,12 +91,11 @@ fn argToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
             _ = try throwTypeErrorStr(arena, "Cannot convert a Symbol value to a string");
             unreachable;
         },
-        .object => {
+        .object, .function, .bc_function, .native_function => {
             const prim = (try coercion_mod.toPrimitive(arena, v, .string)) orelse return "[object Object]";
-            if (prim.bits != 0 and prim.unbox() == .object) return "[object Object]";
+            if (!coercion_mod.isPrimitive(prim)) return "[object Object]";
             return argToString(arena, prim);
         },
-        else => return "[object Object]",
     }
 }
 
