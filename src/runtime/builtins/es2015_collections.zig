@@ -2738,7 +2738,52 @@ pub fn nativeGetAsyncIterator(arena: std.mem.Allocator, _: Value, args: []const 
         try JsObject.create(arena, null);
     try wrap.set("__syncit__", sync_it);
     try wrap.set("next", try val_mod.makeNativeFunctionNamed(arena, nativeAsyncFromSyncNext, "next", 0));
+    // %AsyncFromSyncIteratorPrototype%.return forwards to the wrapped sync
+    // iterator, so `break`/`throw` out of a `for await` over a sync iterable
+    // still runs its `return()`.
+    try wrap.set("return", try val_mod.makeNativeFunctionNamed(arena, nativeAsyncFromSyncReturn, "return", 1));
     return val_mod.makeObject(arena, wrap);
+}
+
+/// return() of an AsyncFromSyncIterator: IteratorClose the wrapped sync
+/// iterator and hand back a settled promise of the result. A sync iterator with
+/// no `return` method completes with `{value, done: true}`.
+fn nativeAsyncFromSyncReturn(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const promise_mod = @import("promise.zig");
+    const p = try promise_mod.newPendingPromise(arena);
+    const arg = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const done_result = try makeIteratorResult(arena, arg, true);
+    if (this_val.bits == 0 or this_val.unbox() != .object) {
+        promise_mod.settleResult(arena, p, done_result, true);
+        return p;
+    }
+    const sync_it = this_val.toPtr().object.get("__syncit__") orelse Value{};
+    if (sync_it.bits == 0 or sync_it.unbox() != .object) {
+        promise_mod.settleResult(arena, p, done_result, true);
+        return p;
+    }
+    const ctx = realm_mod.active_context orelse {
+        promise_mod.settleResult(arena, p, done_result, true);
+        return p;
+    };
+    const ret = ctx.getProp(arena, sync_it, "return") catch {
+        promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+        return p;
+    };
+    if (ret.bits == 0 or ret.unbox() == .undefined_ or ret.unbox() == .null_ or !isCallable(ret)) {
+        promise_mod.settleResult(arena, p, done_result, true);
+        return p;
+    }
+    const r = function_proto.invokeCallback(arena, sync_it, ret, &[_]Value{arg}) catch {
+        promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+        return p;
+    };
+    if (r.bits == 0 or r.unbox() != .object) {
+        promise_mod.settleResult(arena, p, try makeTypeErrorVal(arena, "iterator 'return' did not return an object"), false);
+        return p;
+    }
+    promise_mod.settleResult(arena, p, r, true);
+    return p;
 }
 
 /// next() of an AsyncFromSyncIterator: step the underlying sync iterator and
