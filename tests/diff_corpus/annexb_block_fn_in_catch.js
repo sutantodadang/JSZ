@@ -1,0 +1,1 @@
+var out = []; out.push(typeof f); try { throw null } catch (f) { { function f() { return 123 } } out.push(typeof f) } out.push(typeof f, f()); out.join(",")

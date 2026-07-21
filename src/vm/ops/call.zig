@@ -104,7 +104,7 @@ pub inline fn opTailCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         const closure = callee_val.toPtr().bc_function;
         const fn_ptr = closure.func;
         const def_env: *Environment = @ptrCast(@alignCast(closure.env));
-        const call_env = try Environment.init(self.arena, def_env);
+        const call_env = try Environment.initVarScope(self.arena, def_env);
 
         for (fn_ptr.param_names, 0..) |pname, i| {
             const av: Value = if (i < nargs)
@@ -256,7 +256,7 @@ pub inline fn opTailMethodCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         const closure = callee_val.toPtr().bc_function;
         const fn_ptr = closure.func;
         const def_env: *Environment = @ptrCast(@alignCast(closure.env));
-        const call_env = try Environment.init(self.arena, def_env);
+        const call_env = try Environment.initVarScope(self.arena, def_env);
 
         for (fn_ptr.param_names, 0..) |pname, i| {
             const av: Value = if (i < nargs)

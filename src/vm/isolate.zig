@@ -373,6 +373,7 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__awaitDeps__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAwaitDeps));
         // M16 TLA: `[module, async]` completion signals wired to the harness $DONE.
         try realm.global_env.define("__jszCreateRealm__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeCreateRealm));
+        try realm.global_env.define("__jszEvalScript__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeEvalScript));
         try realm.global_env.define("__jszAsyncDone__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncDone));
         try realm.global_env.define("__jszAsyncFail__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncFail));
         try realm.global_env.define("__jszModuleReject__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeModuleReject));

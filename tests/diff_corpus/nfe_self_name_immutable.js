@@ -1,0 +1,1 @@
+var r = function B() { B = 1; return B }; r() === r

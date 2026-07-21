@@ -92,16 +92,24 @@ pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     // `let`/`const` names; if any exist, push a child env, hoist them (TDZ),
     // then pop the scope on exit.
     var lex_names = std.ArrayList([]const u8){};
+    // Direct-child function declarations are block-scoped too
+    // (BlockDeclarationInstantiation): they are instantiated at block entry, so
+    // a forward reference inside the block resolves, and their binding lives in
+    // the block's own record rather than shadowing an outer `let`/parameter.
+    var fn_decls = std.ArrayList(*Node){};
     if (node.data.block_stmt.lexical_scope) {
         for (node.data.block_stmt.body) |child| {
             try self.collectLexicalNames(child, &lex_names);
+            if (child.kind == .function_decl) try fn_decls.append(self.arena, child);
         }
     }
-    const has_scope = lex_names.items.len > 0;
+    const has_scope = lex_names.items.len > 0 or fn_decls.items.len > 0;
     if (has_scope) {
         try self.emitOp(.ENTER_SCOPE, line);
         self.block_scope_depth += 1;
         for (lex_names.items) |nm| try self.emitHoistLexical(nm, line);
+        var fd_reg: ?u8 = null;
+        for (fn_decls.items) |fd| try lowerBlockFunctionDecl(self, fd, &fd_reg);
     }
     // Reclaim registers between statements — same discipline as compileBody so
     // that deeply-nested or repeated blocks do not exhaust the u8 register space.
@@ -114,6 +122,13 @@ pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             if (pr >= entry_sp) self.sp = pr;
             prev_reg = null;
         }
+        // Already instantiated at block entry above. Reaching the declaration
+        // is where Annex B.3.3 copies its value out to the var scope (the spec
+        // replaces FunctionDeclaration Evaluation with exactly that step).
+        if (has_scope and child.kind == .function_decl) {
+            try self.emitAnnexBSync(child.data.function_decl.name, child.start);
+            continue;
+        }
         var child_reg: ?u8 = null;
         try self.compileStmt(child, &child_reg);
         prev_reg = child_reg;
@@ -125,7 +140,34 @@ pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     }
 }
 
-pub fn lowerFunctionDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
+/// A function declaration reaching the ordinary statement path is nested in a
+/// construct that is not a statement list of its own — an `if` clause, a loop
+/// body, a labelled statement. Annex B.3.4 treats such a declaration as if it
+/// were wrapped in a block, so give it a one-statement scope of its own and run
+/// the same B.3.3 var-scope sync a block-level declaration gets.
+pub fn lowerNestedFunctionDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
+    const line: u32 = node.start;
+    try self.emitOp(.ENTER_SCOPE, line);
+    self.block_scope_depth += 1;
+    var fd_reg: ?u8 = null;
+    try lowerBlockFunctionDecl(self, node, &fd_reg);
+    try self.emitAnnexBSync(node.data.function_decl.name, line);
+    try self.emitOp(.EXIT_SCOPE, line);
+    self.block_scope_depth -= 1;
+    last_expr_reg.* = null;
+}
+
+/// Instantiate a block-level function declaration: create the closure and bind
+/// it in the *current* environment record (never an enclosing one).
+pub fn lowerBlockFunctionDecl(self: *FnCompiler, node: *Node, fd_reg: *?u8) error{OutOfMemory}!void {
+    try lowerFunctionDeclInto(self, node, fd_reg, true);
+}
+
+pub fn lowerFunctionDecl(self: *FnCompiler, node: *Node, fd_reg: *?u8) error{OutOfMemory}!void {
+    try lowerFunctionDeclInto(self, node, fd_reg, false);
+}
+
+fn lowerFunctionDeclInto(self: *FnCompiler, node: *Node, last_expr_reg: *?u8, local: bool) error{OutOfMemory}!void {
     _ = last_expr_reg;
     const line: u32 = node.start;
     // Compile inner function, store into local slot.
@@ -153,7 +195,7 @@ pub fn lowerFunctionDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
     try self.emitU8(r);
     try self.emitU16(child_idx);
     // Phase 4d: function declarations are var-like bindings; use DEFINE_GLOBAL.
-    try self.emitDefine(fd.name, r, line);
+    if (local) try self.emitDefineLocal(fd.name, r, line) else try self.emitDefine(fd.name, r, line);
     self.freeReg();
 }
 
@@ -379,6 +421,27 @@ pub fn lowerThrowStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     self.freeReg();
 }
 
+/// CatchClauseEvaluation (§14.15.3): the catch parameter lives in its own
+/// declarative environment record, distinct from both the enclosing scope and
+/// the catch Block's own record. Without it `catch (e)` would leak `e` outward
+/// and, worse, overwrite a same-named `var` in the enclosing function. Returns
+/// whether a scope was pushed (an optional catch binding pushes none).
+fn enterCatchScope(self: *FnCompiler, param_name: []const u8, rexc: u8, line: u32) error{OutOfMemory}!bool {
+    if (param_name.len == 0) return false;
+    try self.emitOp(.ENTER_SCOPE, line);
+    self.block_scope_depth += 1;
+    // DEFINE_LOCAL, not DEFINE_GLOBAL: the binding belongs to the record just
+    // pushed, so it must not walk out and assign an outer binding of that name.
+    try self.emitDefineLocal(param_name, rexc, line);
+    return true;
+}
+
+fn exitCatchScope(self: *FnCompiler, scoped: bool, line: u32) error{OutOfMemory}!void {
+    if (!scoped) return;
+    try self.emitOp(.EXIT_SCOPE, line);
+    self.block_scope_depth -= 1;
+}
+
 pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
     const line: u32 = node.start;
     const ts = node.data.try_stmt;
@@ -425,11 +488,11 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
             try self.emitU8(rexc);
             const rethrow_patch = self.currentOffset();
             try self.emitI16(0);
-            if (handler.param_name.len > 0)
-                try self.emitDefine(handler.param_name, rexc, line);
+            const scoped = try enterCatchScope(self, handler.param_name, rexc, line);
             self.sp = saved_sp;
             try self.compileStmt(handler.body, last_expr_reg);
             self.sp = saved_sp;
+            try exitCatchScope(self, scoped, line);
             try self.emitOp(.JMP, line);
             const jmp_over_rethrow = self.currentOffset();
             try self.emitI16(0);
@@ -490,16 +553,18 @@ pub fn lowerTryStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         try self.emitU8(rcv);
         const skip_catch_patch = self.currentOffset();
         try self.emitI16(0);
-        if (handler.param_name.len > 0)
-            try self.emitDefine(handler.param_name, rcv, line);
-        // The catch body is itself protected by the finally.
+        // The catch body is itself protected by the finally. PUSH_TRY comes
+        // *before* the catch scope is entered so the recorded environment is the
+        // one outside it — a throw from the catch body then unwinds the scope.
         try self.emitOp(.PUSH_TRY, line);
         try self.emitU8(rcv);
         const catch_try_patch = self.currentOffset();
         try self.emitI16(0);
+        const scoped = try enterCatchScope(self, handler.param_name, rcv, line);
         self.sp = body_sp;
         try self.compileStmt(handler.body, last_expr_reg);
         self.sp = body_sp;
+        try exitCatchScope(self, scoped, line);
         try self.emitOp(.POP_TRY, line);
         try self.emitOp(.LOAD_K, line);
         try self.emitU8(rct);

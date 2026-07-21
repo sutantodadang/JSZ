@@ -3605,6 +3605,20 @@ pub const EvalData = struct {
     realm: *Realm,
 };
 
+/// Host hook backing `$262.evalScript`: evaluates `args[0]` as *Script* code in
+/// the running realm's global scope. Unlike `eval`, a Script's top-level
+/// `let`/`const`/`class` become global lexical bindings that outlive the call,
+/// so this cannot be expressed as either a direct or an indirect eval.
+pub fn nativeEvalScript(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const ctx = active_context orelse return val_mod.makeUndefined(arena);
+    const env = active_global_env orelse return val_mod.makeUndefined(arena);
+    const s: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string)
+        args[0].toPtr().string
+    else
+        "";
+    return ctx.shadowEval(arena, s, @ptrCast(env));
+}
+
 /// `evalScript` of a secondary realm record: evaluates `args[0]` as Script code
 /// in that realm's global environment (carried as native userdata, an opaque
 /// `*Environment`). Mirrors global-script semantics via the ShadowRealm eval hook.

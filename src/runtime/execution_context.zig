@@ -21,6 +21,12 @@ pub const Binding = struct {
     value: Value,
     kind: BindingKind,
     initialized: bool,
+    /// A CreateImmutableBinding(N, false) record: assignment is *silently
+    /// ignored* rather than an error. The only such binding in the language is
+    /// a sloppy-mode named function expression's self-name (§15.2.5), so
+    /// `(function f(){ f = 1; return f })()` returns the function. The strict
+    /// form (throwOnError = true) is modelled as `kind == .const_` instead.
+    immutable: bool = false,
 };
 
 /// Result of `Environment.deleteName` (the `delete identifier` operation over the
@@ -36,6 +42,13 @@ pub const Environment = struct {
     parent: ?*Environment,
     bindings: std.StringHashMapUnmanaged(Binding),
     arena: std.mem.Allocator,
+    /// True for a *variable* environment — the record a `var`/function
+    /// declaration binds into. Function call scopes (and the root/global scope,
+    /// which qualifies by having no parent) are variable environments; block
+    /// scopes pushed by ENTER_SCOPE are not. Direct `eval` runs in a fresh
+    /// declarative scope but hoists its vars to `varScope()`, i.e. the
+    /// enclosing function or global scope, per EvalDeclarationInstantiation.
+    is_var_scope: bool = false,
 
     pub fn init(arena: std.mem.Allocator, parent: ?*Environment) !*Environment {
         const env = try arena.create(Environment);
@@ -45,6 +58,22 @@ pub const Environment = struct {
             .arena = arena,
         };
         return env;
+    }
+
+    /// A function-call (variable) environment: `var` declarations made anywhere
+    /// inside it bind here rather than escaping to an enclosing scope.
+    pub fn initVarScope(arena: std.mem.Allocator, parent: ?*Environment) !*Environment {
+        const env = try Environment.init(arena, parent);
+        env.is_var_scope = true;
+        return env;
+    }
+
+    /// The nearest enclosing variable environment (this one, if it qualifies).
+    /// The root of a chain is always a variable environment.
+    pub fn varScope(self: *Environment) *Environment {
+        var cur = self;
+        while (!cur.is_var_scope) cur = cur.parent orelse return cur;
+        return cur;
     }
 
     /// Hoist a `var`/function-declaration binding into THIS frame: define it as
@@ -73,6 +102,18 @@ pub const Environment = struct {
             .value = value,
             .kind = kind,
             .initialized = initialized,
+        });
+    }
+
+    /// CreateImmutableBinding + InitializeBinding in THIS frame. `strict` picks
+    /// the throwOnError form: a strict named function expression's self-name
+    /// rejects assignment with a TypeError, the sloppy one ignores it.
+    pub fn defineImmutable(self: *Environment, name: []const u8, value: Value, strict: bool) !void {
+        try self.bindings.put(self.arena, name, .{
+            .value = value,
+            .kind = if (strict) .const_ else .var_,
+            .initialized = true,
+            .immutable = !strict,
         });
     }
 
@@ -131,6 +172,7 @@ pub const Environment = struct {
         if (stop) |s| if (self == s) return EnvError.NotDefined;
         if (self.bindings.getPtr(name)) |b| {
             if (!b.initialized) return EnvError.TemporalDeadZone;
+            if (b.immutable) return; // silently ignored, see Binding.immutable
             if (b.kind == .const_) return EnvError.ConstAssignment;
             b.value = value;
             return;
@@ -143,6 +185,7 @@ pub const Environment = struct {
     pub fn assign(self: *Environment, name: []const u8, value: Value) EnvError!void {
         if (self.bindings.getPtr(name)) |b| {
             if (!b.initialized) return EnvError.TemporalDeadZone;
+            if (b.immutable) return; // silently ignored, see Binding.immutable
             if (b.kind == .const_) return EnvError.ConstAssignment;
             b.value = value;
             return;

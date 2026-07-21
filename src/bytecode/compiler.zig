@@ -126,6 +126,10 @@ pub const FnCompiler = struct {
     /// Number of block scopes (ENTER_SCOPE) currently open in the bytecode being
     /// emitted. Used so `break`/`continue` emit matching EXIT_SCOPE ops.
     block_scope_depth: u32 = 0,
+    /// Annex B.3.3: block-level function declaration names that also get a
+    /// `var`-scoped binding in this scope (see collectAnnexBNames). Computed
+    /// once per body in compileBody; consulted when lowering each declaration.
+    annexb_fn_names: std.ArrayList([]const u8) = .empty,
     /// Number of enclosing `with` statements whose body is currently being
     /// compiled. When >0, a `var x = init` initializer must route its store
     /// through the with-object environment (SET_GLOBAL) rather than a direct
@@ -281,45 +285,149 @@ pub const FnCompiler = struct {
     /// function/script scope (recursing through nested statements but NOT into
     /// nested function bodies — those are separate scopes). `let`/`const` are
     /// block-scoped and intentionally excluded.
-    pub fn collectHoistedNames(self: *Self, node: *ast.Node, list: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+    /// `nested` is true once the walk has entered a block / clause / loop body:
+    /// a function declaration found there is NOT an ordinary var-scoped
+    /// declaration, and only gets a var binding via the Annex B.3.3 set
+    /// computed separately by `collectAnnexBNames`.
+    pub fn collectHoistedNames(self: *Self, node: *ast.Node, list: *std.ArrayList([]const u8), nested: bool) error{OutOfMemory}!void {
         switch (node.kind) {
             .var_decl => {
                 if (node.data.var_decl.kind == .var_) {
                     try self.addHoistName(list, node.data.var_decl.name);
                 }
             },
-            .function_decl => try self.addHoistName(list, node.data.function_decl.name),
+            .function_decl => if (!nested) try self.addHoistName(list, node.data.function_decl.name),
             .block_stmt => {
-                for (node.data.block_stmt.body) |c| try self.collectHoistedNames(c, list);
+                const inner = nested or node.data.block_stmt.lexical_scope;
+                for (node.data.block_stmt.body) |c| try self.collectHoistedNames(c, list, inner);
             },
             .if_stmt => {
-                try self.collectHoistedNames(node.data.if_stmt.consequent, list);
-                if (node.data.if_stmt.alternate) |a| try self.collectHoistedNames(a, list);
+                try self.collectHoistedNames(node.data.if_stmt.consequent, list, true);
+                if (node.data.if_stmt.alternate) |a| try self.collectHoistedNames(a, list, true);
             },
-            .while_stmt => try self.collectHoistedNames(node.data.while_stmt.body, list),
-            .do_while_stmt => try self.collectHoistedNames(node.data.do_while_stmt.body, list),
-            .with_stmt => try self.collectHoistedNames(node.data.with_stmt.body, list),
+            .while_stmt => try self.collectHoistedNames(node.data.while_stmt.body, list, true),
+            .do_while_stmt => try self.collectHoistedNames(node.data.do_while_stmt.body, list, true),
+            .with_stmt => try self.collectHoistedNames(node.data.with_stmt.body, list, true),
             .for_stmt => {
-                if (node.data.for_stmt.init) |i| try self.collectHoistedNames(i, list);
-                try self.collectHoistedNames(node.data.for_stmt.body, list);
+                if (node.data.for_stmt.init) |i| try self.collectHoistedNames(i, list, nested);
+                try self.collectHoistedNames(node.data.for_stmt.body, list, true);
             },
             .for_in_stmt => {
-                try self.collectHoistedNames(node.data.for_in_stmt.left, list);
-                try self.collectHoistedNames(node.data.for_in_stmt.body, list);
+                try self.collectHoistedNames(node.data.for_in_stmt.left, list, nested);
+                try self.collectHoistedNames(node.data.for_in_stmt.body, list, true);
             },
             .try_stmt => {
-                try self.collectHoistedNames(node.data.try_stmt.block, list);
-                if (node.data.try_stmt.handler) |h| try self.collectHoistedNames(h.body, list);
-                if (node.data.try_stmt.finalizer) |f| try self.collectHoistedNames(f, list);
+                try self.collectHoistedNames(node.data.try_stmt.block, list, nested);
+                if (node.data.try_stmt.handler) |h| try self.collectHoistedNames(h.body, list, nested);
+                if (node.data.try_stmt.finalizer) |f| try self.collectHoistedNames(f, list, nested);
             },
             .switch_stmt => {
                 for (node.data.switch_stmt.cases) |case| {
-                    for (case.body) |c| try self.collectHoistedNames(c, list);
+                    for (case.body) |c| try self.collectHoistedNames(c, list, true);
                 }
             },
-            .labeled_stmt => try self.collectHoistedNames(node.data.labeled_stmt.body, list),
+            .labeled_stmt => try self.collectHoistedNames(node.data.labeled_stmt.body, list, nested),
             else => {},
         }
+    }
+
+    /// Annex B.3.3 (Web-compat semantics for block-level function declarations):
+    /// collect the names of function declarations nested inside a block / `if`
+    /// clause / loop body that additionally get a `var`-scoped binding in this
+    /// scope. A name is excluded when replacing the declaration with `var F`
+    /// would be an early error — that is, when some enclosing construct between
+    /// the declaration and this scope already binds F lexically (`let`/`const`/
+    /// `class`, a catch parameter, a `for` head binding) or F is a parameter of
+    /// the enclosing function. `blocked` is the running set of such names along
+    /// the current path; `nested` distinguishes a genuine block-level
+    /// declaration from an ordinary top-level one.
+    pub fn collectAnnexBNames(
+        self: *Self,
+        node: *ast.Node,
+        blocked: *std.ArrayList([]const u8),
+        out: *std.ArrayList([]const u8),
+        nested: bool,
+    ) error{OutOfMemory}!void {
+        switch (node.kind) {
+            .function_decl => {
+                if (!nested) return; // an ordinary declaration of this scope
+                const name = node.data.function_decl.name;
+                for (blocked.items) |b| if (std.mem.eql(u8, b, name)) return;
+                try self.addHoistName(out, name);
+            },
+            .block_stmt => {
+                const bs = node.data.block_stmt;
+                // A transparent (desugaring) block is not a scope: its contents
+                // belong to the enclosing one, so neither its bindings nor its
+                // function declarations change classification.
+                if (!bs.lexical_scope) {
+                    for (bs.body) |c| try self.collectAnnexBNames(c, blocked, out, nested);
+                    return;
+                }
+                const mark = blocked.items.len;
+                for (bs.body) |c| try self.collectLexicalNames(c, blocked);
+                for (bs.body) |c| try self.collectAnnexBNames(c, blocked, out, true);
+                blocked.shrinkRetainingCapacity(mark);
+            },
+            .if_stmt => {
+                // Each clause behaves as a block containing the declaration
+                // (B.3.4, FunctionDeclarations in IfStatement Statement Clauses).
+                try self.collectAnnexBNames(node.data.if_stmt.consequent, blocked, out, true);
+                if (node.data.if_stmt.alternate) |a| try self.collectAnnexBNames(a, blocked, out, true);
+            },
+            .while_stmt => try self.collectAnnexBNames(node.data.while_stmt.body, blocked, out, true),
+            .do_while_stmt => try self.collectAnnexBNames(node.data.do_while_stmt.body, blocked, out, true),
+            .with_stmt => try self.collectAnnexBNames(node.data.with_stmt.body, blocked, out, true),
+            .for_stmt => {
+                const mark = blocked.items.len;
+                if (node.data.for_stmt.init) |i| try self.collectLexicalNames(i, blocked);
+                try self.collectAnnexBNames(node.data.for_stmt.body, blocked, out, true);
+                blocked.shrinkRetainingCapacity(mark);
+            },
+            .for_in_stmt => {
+                const mark = blocked.items.len;
+                try self.collectLexicalNames(node.data.for_in_stmt.left, blocked);
+                try self.collectAnnexBNames(node.data.for_in_stmt.body, blocked, out, true);
+                blocked.shrinkRetainingCapacity(mark);
+            },
+            .try_stmt => {
+                const ts = node.data.try_stmt;
+                try self.collectAnnexBNames(ts.block, blocked, out, nested);
+                if (ts.handler) |h| {
+                    // A catch parameter does NOT block the extension: B.3.5
+                    // exempts a `CatchParameter: BindingIdentifier` from the
+                    // "VarDeclaredNames of the Block must not collide" early
+                    // error, so `var F` there is legal and the var binding is
+                    // still created. (Only a destructuring catch parameter
+                    // would block — this engine parses none.)
+                    try self.collectAnnexBNames(h.body, blocked, out, nested);
+                }
+                if (ts.finalizer) |f| try self.collectAnnexBNames(f, blocked, out, nested);
+            },
+            .switch_stmt => {
+                // The whole switch body is one block scope shared by every case.
+                const mark = blocked.items.len;
+                for (node.data.switch_stmt.cases) |case| {
+                    for (case.body) |c| try self.collectLexicalNames(c, blocked);
+                }
+                for (node.data.switch_stmt.cases) |case| {
+                    for (case.body) |c| try self.collectAnnexBNames(c, blocked, out, true);
+                }
+                blocked.shrinkRetainingCapacity(mark);
+            },
+            // A label introduces no scope, so it does not change classification.
+            .labeled_stmt => try self.collectAnnexBNames(node.data.labeled_stmt.body, blocked, out, nested),
+            else => {},
+        }
+    }
+
+    /// True when `name` is a block-level function declaration that Annex B.3.3
+    /// also gives a `var`-scoped binding in the enclosing function/script scope.
+    pub fn isAnnexBFunction(self: *Self, name: []const u8) bool {
+        for (self.annexb_fn_names.items) |n| {
+            if (std.mem.eql(u8, n, name)) return true;
+        }
+        return false;
     }
 
     /// Collect `let`/`const` declaration names reachable at function/script scope
@@ -398,6 +506,26 @@ pub const FnCompiler = struct {
         try self.emitOp(.DEFINE_GLOBAL, line);
         try self.emitU16(kidx);
         try self.emitU8(rsrc);
+    }
+
+    /// Emit a DEFINE_LOCAL for `name` (binds it in the *current* environment
+    /// record only — BlockDeclarationInstantiation for a block-level function).
+    pub fn emitDefineLocal(self: *Self, name: []const u8, rsrc: u8, line: u32) !void {
+        const sv = try val_mod.makeString(self.arena, name);
+        const kidx = try self.addConstant(sv);
+        try self.emitOp(.DEFINE_LOCAL, line);
+        try self.emitU16(kidx);
+        try self.emitU8(rsrc);
+    }
+
+    /// Emit the Annex B.3.3 var-scope sync for a block-level function
+    /// declaration; a no-op for names the extension does not apply to.
+    pub fn emitAnnexBSync(self: *Self, name: []const u8, line: u32) !void {
+        if (!self.isAnnexBFunction(name)) return;
+        const sv = try val_mod.makeString(self.arena, name);
+        const kidx = try self.addConstant(sv);
+        try self.emitOp(.SYNC_ANNEXB_FN, line);
+        try self.emitU16(kidx);
     }
 
     /// Emit a HOIST_LEX for `name` (declares it as an uninitialized lexical
@@ -2016,6 +2144,18 @@ pub const FnCompiler = struct {
             _ = try self.compileExpr(arg);
         }
 
+        // A call written as the bare identifier `eval` is a *direct* eval
+        // (§13.3.6.1) — the eval'd code sees this scope. Flag it for the call
+        // dispatch here, where the syntactic shape is still known; any other
+        // callee expression (`(0,eval)(s)`, `o.eval(s)`, an aliased binding)
+        // reaches %eval% indirectly and runs in global scope. Emitted after the
+        // arguments so an intervening call cannot consume the flag first.
+        // `eval?.(s)` is an OptionalExpression, not a CallExpression, so it is
+        // NOT a direct eval however it is written.
+        if (!c.optional and c.callee.kind == .identifier and
+            std.mem.eql(u8, c.callee.data.identifier, "eval"))
+            try self.emitOp(.MARK_DIRECT_EVAL, line);
+
         // Emit CALL (or TAIL_CALL when this call is in tail position).
         const ret_dst = base; // result goes back into base register.
         try self.emitOp(if (tail) .TAIL_CALL else .CALL, line);
@@ -2147,7 +2287,7 @@ pub const FnCompiler = struct {
             .expr_stmt => try lower.lowerExprStmt(self, node, last_expr_reg),
             .var_decl => try lower.lowerVarDecl(self, node, last_expr_reg),
             .block_stmt => try lower.lowerBlockStmt(self, node, last_expr_reg),
-            .function_decl => try lower.lowerFunctionDecl(self, node, last_expr_reg),
+            .function_decl => try lower.lowerNestedFunctionDecl(self, node, last_expr_reg),
             .if_stmt => try lower.lowerIfStmt(self, node, last_expr_reg),
             .while_stmt => try lower.lowerWhileStmt(self, node, last_expr_reg),
             .do_while_stmt => try lower.lowerDoWhileStmt(self, node, last_expr_reg),
@@ -2183,8 +2323,18 @@ pub const FnCompiler = struct {
         // this scope to `undefined` at entry, so reads before initialization
         // yield undefined while genuinely-undeclared names throw ReferenceError.
         {
+            // Annex B.3.3 first: a block-level function declaration only gets a
+            // var-scoped binding when no lexical declaration or parameter
+            // between it and this scope would make `var F` an early error.
+            {
+                var blocked: std.ArrayList([]const u8) = .empty;
+                for (self.param_names) |p| try self.addHoistName(&blocked, p);
+                for (body) |stmt| try self.collectLexicalNames(stmt, &blocked);
+                for (body) |stmt| try self.collectAnnexBNames(stmt, &blocked, &self.annexb_fn_names, false);
+            }
             var hoisted: std.ArrayList([]const u8) = .empty;
-            for (body) |stmt| try self.collectHoistedNames(stmt, &hoisted);
+            for (body) |stmt| try self.collectHoistedNames(stmt, &hoisted, false);
+            for (self.annexb_fn_names.items) |name| try self.addHoistName(&hoisted, name);
             for (hoisted.items) |name| try self.emitHoist(name, 0);
         }
 

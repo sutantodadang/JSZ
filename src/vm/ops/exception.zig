@@ -37,6 +37,12 @@ pub inline fn opThrow(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             const entry = f.try_stack.pop().?;
             // Jump to handler in that frame.
             f.pc = entry.handler_pc;
+            // The throw skipped the POP_WITH/EXIT_SCOPE of every `with` and
+            // block it escaped, so restore the scope state the try was entered
+            // with (same unwinding as `BcVm.throwException`).
+            if (f.with_stack.items.len > entry.with_depth)
+                f.with_stack.shrinkRetainingCapacity(entry.with_depth);
+            f.env = entry.env;
             // Store exception in target register.
             if (entry.rexc != 0xFF) {
                 f.registers[entry.rexc] = thrown_val;
@@ -79,6 +85,7 @@ pub inline fn opPushTry(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         .rexc = rexc,
         .handler_pc = handler_pc,
         .with_depth = frame.with_stack.items.len,
+        .env = frame.env,
     });
     return null;
 }

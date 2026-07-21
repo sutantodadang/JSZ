@@ -1,0 +1,1 @@
+var f = 1; try { throw 7 } catch (f) { f = 9 } f
