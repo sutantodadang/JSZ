@@ -294,40 +294,63 @@ pub fn differenceISODate(d1: ISODate, d2: ISODate, largest: shared.Unit) shared.
             return out;
         },
         else => {
-            // year / month: order earlier→later, compute, then re-sign.
-            const sign: i8 = cmp; // -1 if d1<d2, +1 if d1>d2
-            const a = if (sign < 0) d1 else d2;
-            const b = if (sign < 0) d2 else d1;
-            // Whole months between a and b, measured in the receiver's calendar.
+            // Always measure *from* d1, stepping toward d2. Computing the
+            // earlier→later difference and negating it is wrong: calendar
+            // arithmetic is not symmetric. 1997-07-16 until 2021-07-15 is
+            // +23y 11m 29d, but 2021-07-15 until 1997-07-16 is -23y -11m -30d,
+            // because each anchors its month walk on a different day-of-month.
+            const step: i64 = if (cmp < 0) 1 else -1; // cmp<0 → d1 precedes d2
             const cal = d1.calendar;
-            const fa = calendar.fields(cal, a);
-            const fb = calendar.fields(cal, b);
-            var total_months: i64 = calendar.absoluteMonth(cal, fb.year, fb.month) -
-                calendar.absoluteMonth(cal, fa.year, fa.month);
-            var cand = addMonthsConstrain(a, total_months);
-            if (compareISODate(cand, b) > 0) {
-                total_months -= 1;
-                cand = addMonthsConstrain(a, total_months);
-            }
-            const days = shared.isoDateToEpochDays(b.year, b.month, b.day) - shared.isoDateToEpochDays(cand.year, cand.month, cand.day);
+            const fa = calendar.fields(cal, d1);
+            const fb = calendar.fields(cal, d2);
+
+            // Whole years first, stepping by *calendar year* rather than by a
+            // month count. A year is not a fixed number of months (Hebrew leap
+            // years have 13), and a year-over-year step must hold the month
+            // *code* fixed, not its ordinal: Hebrew M07 is ordinal 8 in a leap
+            // year and 7 in a common one, so counting ordinals loses a year.
             var years: i64 = 0;
-            var months: i64 = total_months;
+            var base = d1;
             if (largest == .year) {
-                // Split into whole years by walking back whole years from b,
-                // since a calendar year is not always a fixed number of months.
-                years = @divTrunc(total_months, calendar.monthsInYear(cal, fa.year));
-                while (years != 0 and @abs(calendar.absoluteMonth(cal, fa.year + @as(i32, @intCast(years)), fa.month) -
-                    calendar.absoluteMonth(cal, fa.year, fa.month)) > @abs(total_months)) years -= 1;
-                months = total_months - (calendar.absoluteMonth(cal, fa.year + @as(i32, @intCast(years)), fa.month) -
-                    calendar.absoluteMonth(cal, fa.year, fa.month));
+                years = @as(i64, fb.year) - @as(i64, fa.year);
+                while (years != 0 and surpasses(addYearsConstrain(d1, fa, years), d2, step)) years -= step;
+                while (!surpasses(addYearsConstrain(d1, fa, years + step), d2, step)) years += step;
+                base = addYearsConstrain(d1, fa, years);
             }
-            const dir: f64 = if (sign < 0) 1 else -1;
-            out.years = @as(f64, @floatFromInt(years)) * dir;
-            out.months = @as(f64, @floatFromInt(months)) * dir;
-            out.days = @as(f64, @floatFromInt(days)) * dir;
+
+            // Then the largest whole-month count from `base` that does not
+            // overshoot d2. The absolute-month delta is exact up to the
+            // day-of-month clamp, so these loops correct by a step or two.
+            const fbase = calendar.fields(cal, base);
+            var months: i64 = calendar.absoluteMonth(cal, fb.year, fb.month) -
+                calendar.absoluteMonth(cal, fbase.year, fbase.month);
+            while (months != 0 and surpasses(addMonthsConstrain(base, months), d2, step)) months -= step;
+            while (!surpasses(addMonthsConstrain(base, months + step), d2, step)) months += step;
+
+            const anchor = addMonthsConstrain(base, months);
+            const days = shared.isoDateToEpochDays(d2.year, d2.month, d2.day) -
+                shared.isoDateToEpochDays(anchor.year, anchor.month, anchor.day);
+
+            out.years = @floatFromInt(years);
+            out.months = @floatFromInt(months);
+            out.days = @floatFromInt(days);
             return out;
         },
     }
+}
+
+/// True once `cand` has moved past `target` in the direction `step`.
+fn surpasses(cand: ISODate, target: ISODate, step: i64) bool {
+    const c = compareISODate(cand, target);
+    return if (step > 0) c > 0 else c < 0;
+}
+
+/// Shift `a` by `n` calendar years, holding its month *code* and day and
+/// constraining both into the target year. `fa` is `a`'s decomposition.
+fn addYearsConstrain(a: ISODate, fa: calendar.CalFields, n: i64) ISODate {
+    const cal = a.calendar;
+    const y = std.math.cast(i32, @as(i64, fa.year) + n) orelse return a;
+    return calendar.toIsoFromCode(cal, y, fa.code_num, fa.code_leap, fa.day, .constrain) catch a;
 }
 
 /// Shift `a` by `n` calendar months, clamping the day into the target month.
@@ -353,11 +376,15 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (unitRank(smallest.?) > unitRank(.day) or unitRank(largest.?) > unitRank(.day))
         return realm_mod.throwRangeError(arena, "PlainDate difference units must be year..day");
     if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    var mode = try shared.getRoundingMode(arena, opts, .trunc);
     const inc = try shared.getRoundingIncrement(arena, opts);
 
-    const from = if (since) other else d.*;
-    const to = if (since) d.* else other;
+    // `since` is the negation of `until`, not the difference with the operands
+    // swapped: both anchor their calendar walk on the receiver. Rounding runs
+    // in the mirrored direction, so the mode is negated too.
+    if (since) mode = shared.negateRoundingMode(mode);
+    const from = d.*;
+    const to = other;
 
     var result: shared.DurationFields = undefined;
     if (largest.? == smallest.?) {
@@ -372,6 +399,7 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
             result.days = shared.roundNumberToIncrement(result.days, inc, mode);
         }
     }
+    if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
 }
 

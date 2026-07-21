@@ -993,6 +993,24 @@ fn roundHalfDown(q: f64) f64 {
     return fl;
 }
 
+/// Negate every Duration field. Adding 0.0 normalizes the -0.0 that negating a
+/// zero field would otherwise produce: a Duration field that is zero must read
+/// as +0 regardless of the duration's overall sign.
+pub fn negateFields(d: DurationFields) DurationFields {
+    return .{
+        .years = -d.years + 0.0,
+        .months = -d.months + 0.0,
+        .weeks = -d.weeks + 0.0,
+        .days = -d.days + 0.0,
+        .hours = -d.hours + 0.0,
+        .minutes = -d.minutes + 0.0,
+        .seconds = -d.seconds + 0.0,
+        .milliseconds = -d.milliseconds + 0.0,
+        .microseconds = -d.microseconds + 0.0,
+        .nanoseconds = -d.nanoseconds + 0.0,
+    };
+}
+
 pub fn negateRoundingMode(mode: RoundingMode) RoundingMode {
     return switch (mode) {
         .ceil => .floor,

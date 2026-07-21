@@ -231,30 +231,38 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (unitRank(smallest.?) > 1 or unitRank(largest.?) > 1)
         return realm_mod.throwRangeError(arena, "PlainYearMonth difference units must be year or month");
     if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    var mode = try shared.getRoundingMode(arena, opts, .trunc);
     const inc = try shared.getRoundingIncrement(arena, opts);
 
-    const a = ISODate{ .year = ym.year, .month = ym.month, .day = 1 };
-    const b = ISODate{ .year = other.year, .month = other.month, .day = 1 };
-    const from = if (since) b else a;
-    const to = if (since) a else b;
-    var result = plain_date.differenceISODate(from, to, largest.?);
+    // `since` negates `until` rather than swapping the operands, and both keep
+    // the receiver's calendar: rebuilding these as bare literals would silently
+    // measure a non-ISO year-month difference in the ISO calendar.
+    if (since) mode = shared.negateRoundingMode(mode);
+    var result = plain_date.differenceISODate(ym.*, other, largest.?);
     result.weeks = 0;
     result.days = 0;
 
-    // Round the (years, months) difference to the requested smallestUnit. Work in
-    // total signed months; the increment is measured in months (12 per year).
-    var total_months = result.years * 12.0 + result.months;
-    const round_increment: f64 = if (smallest.? == .year) inc * 12.0 else inc;
-    total_months = shared.roundNumberToIncrement(total_months, round_increment, mode);
-    result.years = 0;
-    result.months = 0;
-    if (largest.? == .year) {
-        result.years = @trunc(total_months / 12.0);
-        result.months = total_months - result.years * 12.0;
-    } else {
-        result.months = total_months;
+    // differenceISODate already split years/months using the calendar's own
+    // months-per-year, so only re-derive the split when rounding disturbs it.
+    // The total-months form assumes 12 months per year and is reached only for
+    // year-granularity or multi-month increments.
+    if (inc != 1 or smallest.? == .year) {
+        var total_months = result.years * 12.0 + result.months;
+        const round_increment: f64 = if (smallest.? == .year) inc * 12.0 else inc;
+        total_months = shared.roundNumberToIncrement(total_months, round_increment, mode);
+        result.years = 0;
+        result.months = 0;
+        if (largest.? == .year) {
+            result.years = @trunc(total_months / 12.0);
+            result.months = total_months - result.years * 12.0;
+        } else {
+            result.months = total_months;
+        }
+    } else if (largest.? == .month) {
+        result.months = result.years * 12.0 + result.months;
+        result.years = 0;
     }
+    if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
 }
 

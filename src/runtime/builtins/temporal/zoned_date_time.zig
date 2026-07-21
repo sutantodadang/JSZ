@@ -710,11 +710,15 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     if (smallest == null) smallest = .nanosecond;
     if (largest == null) largest = if (unitRank(smallest.?) < unitRank(.hour)) smallest.? else .hour;
     if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    var mode = try shared.getRoundingMode(arena, opts, .trunc);
     const inc = try shared.getRoundingIncrement(arena, opts);
 
-    const from = if (since) other else z.*;
-    const to = if (since) z.* else other;
+    // `since` negates `until` rather than swapping the operands: both anchor
+    // their calendar walk on the receiver, and calendar arithmetic is not
+    // symmetric. Rounding runs mirrored, so the mode is negated too.
+    if (since) mode = shared.negateRoundingMode(mode);
+    const from = z.*;
+    const to = other;
 
     var result: shared.DurationFields = undefined;
     // Rank 0 is `year`, so "day or larger" is a *lower* rank.
@@ -724,6 +728,7 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
         result = balanceTime(to.ns - from.ns, largest.?);
     }
     result = roundResult(result, smallest.?, inc, mode, largest.?);
+    if (since) result = shared.negateFields(result);
     result.years = nz(result.years);
     result.months = nz(result.months);
     result.weeks = nz(result.weeks);
