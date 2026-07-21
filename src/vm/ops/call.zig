@@ -39,6 +39,12 @@ pub inline fn opNewClosure(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             (if (frame.this_val.bits != 0) frame.this_val else try val_mod.makeUndefined(self.arena))
         else
             Value{},
+        // Snapshot the enclosing `with` scopes (the frame's stack already holds
+        // any it inherited itself, so one copy carries the whole chain).
+        .with_scopes = if (frame.with_stack.items.len > 0)
+            try self.arena.dupe(Value, frame.with_stack.items)
+        else
+            &.{},
     };
     const jsv = try self.arena.create(@import("../../value/value.zig").JsValue);
     jsv.* = @import("../../value/value.zig").JsValue{ .bc_function = closure };

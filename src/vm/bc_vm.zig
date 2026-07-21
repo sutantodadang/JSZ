@@ -42,6 +42,11 @@ pub const TryEntry = struct {
     rexc: u8,
     /// Absolute PC of the catch/finally handler.
     handler_pc: usize,
+    /// Depth of the frame's `with_stack` when the try was entered. A throw out of
+    /// a `with` body skips its POP_WITH, so unwinding to this handler must drop
+    /// the object environment records the abandoned `with`s had pushed —
+    /// otherwise they keep shadowing name resolution after the catch.
+    with_depth: usize = 0,
 };
 
 /// Phase 12: key for the per-loop OSR plan cache — a loop is identified by its
@@ -73,6 +78,17 @@ pub const BcCallFrame = struct {
     /// `with` statement: object scopes consulted (innermost last) by unqualified
     /// name lookups before the lexical/global scope. Pushed by PUSH_WITH.
     with_stack: std.ArrayListUnmanaged(Value) = .empty,
+    /// How many leading `with_stack` entries were inherited from the callee's
+    /// definition site (`BcClosure.with_scopes`) rather than pushed by a `with`
+    /// running in this frame. Inherited scopes sit OUTSIDE this function's own
+    /// bindings in the scope chain, so name resolution consults them only after
+    /// the frame's environment; the frame's own entries still shadow it.
+    inherited_with: usize = 0,
+    /// The callee's definition environment, when `inherited_with` is non-zero.
+    /// Marks where this frame's own bindings end: names resolve against the
+    /// frame's own environments first, then the inherited with-scopes, then the
+    /// rest of the chain — the order those records appear in the real scope chain.
+    inherited_env_floor: ?*Environment = null,
     /// W2: when this frame belongs to a generator, links back to its state so
     /// YIELD can save the suspended frame. Null for ordinary frames.
     gen: ?*BcGeneratorState = null,
@@ -356,6 +372,7 @@ pub const BcVm = struct {
                     .caller_idx = if (self.frames.items.len > 0) caller_idx else null,
                     .this_val = frame_this,
                 });
+                try self.seedInheritedWith(closure);
                 // Run until this frame returns.
                 const frames_before = self.frames.items.len - 1;
                 // Re-entrancy boundary: an uncaught throw inside this nested run
@@ -1424,6 +1441,8 @@ pub const BcVm = struct {
             if (f.try_stack.items.len > 0) {
                 const entry = f.try_stack.pop().?;
                 f.pc = entry.handler_pc;
+                if (f.with_stack.items.len > entry.with_depth)
+                    f.with_stack.shrinkRetainingCapacity(entry.with_depth);
                 if (entry.rexc != 0xFF) {
                     f.registers[entry.rexc] = thrown_val;
                 }
@@ -1674,6 +1693,7 @@ pub const BcVm = struct {
                     .caller_idx = caller_idx,
                     .this_val = try self.bindThisValue(fn_ptr, closure, this_val),
                 });
+                try self.seedInheritedWith(closure);
                 return null;
             },
             else => return "not a callable",
@@ -1754,6 +1774,20 @@ pub const BcVm = struct {
     fn callAccessor(self: *BcVm, fn_val: Value, this_val: Value, args: []const Value) !Value {
         const fp = @import("../runtime/builtins/function_proto.zig");
         return fp.invokeCallback(self.arena, this_val, fn_val, args);
+    }
+
+    /// Seed the just-pushed frame's `with_stack` with the object environment
+    /// records that enclosed the callee's definition site, so a function declared
+    /// inside `with (o)` still resolves free names through `o` however it is later
+    /// called. They go in below any `with` the frame itself enters, and
+    /// `inherited_with` records the boundary so the frame's own bindings still
+    /// take precedence over them.
+    fn seedInheritedWith(self: *BcVm, closure: *const @import("../bytecode/function.zig").BcClosure) !void {
+        if (closure.with_scopes.len == 0) return;
+        const frame = &self.frames.items[self.frames.items.len - 1];
+        try frame.with_stack.appendSlice(self.arena, closure.with_scopes);
+        frame.inherited_with = closure.with_scopes.len;
+        frame.inherited_env_floor = @ptrCast(@alignCast(closure.env));
     }
 
     /// Resolve the ordinary object that backs `v` for the purpose of private
@@ -3310,6 +3344,7 @@ pub const BcVm = struct {
                     .caller_idx = caller_idx,
                     .this_val = frame_this,
                 });
+                try self.seedInheritedWith(closure);
                 return null;
             },
             .native_function => |fn_ptr| {
@@ -3564,6 +3599,7 @@ pub const BcVm = struct {
                     .caller_idx = caller_idx,
                     .this_val = this_val_eff,
                 });
+                try self.seedInheritedWith(closure);
                 return null;
             },
             .native_function => |fn_ptr| {

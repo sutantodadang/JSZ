@@ -78,6 +78,7 @@ pub inline fn opPushTry(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     try frame.try_stack.append(self.arena, TryEntry{
         .rexc = rexc,
         .handler_pc = handler_pc,
+        .with_depth = frame.with_stack.items.len,
     });
     return null;
 }
