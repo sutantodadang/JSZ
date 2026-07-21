@@ -226,7 +226,16 @@ pub fn addISODate(date: ISODate, years: f64, months: f64, weeks: f64, days: f64,
     const f = calendar.fields(cal, date);
     const y0: i128 = @as(i128, f.year) + @as(i128, @intFromFloat(years));
     if (y0 > 300_000 or y0 < -300_000) return realm_mod.throwRangeError(arena, "date out of range");
-    const ym = calendar.addMonths(cal, @intCast(y0), f.month, @intFromFloat(months)) catch
+    // A year step holds the month *code*, not its ordinal: Hebrew M06 (Adar) is
+    // the 6th month of a common year but the 7th of a leap year, because Adar I
+    // is inserted ahead of it.
+    var base_month = f.month;
+    if (years != 0) {
+        const anchor_y = calendar.toIsoFromCode(cal, @intCast(y0), f.code_num, f.code_leap, 1, .constrain) catch
+            return realm_mod.throwRangeError(arena, "date out of range");
+        base_month = calendar.fields(cal, anchor_y).month;
+    }
+    const ym = calendar.addMonths(cal, @intCast(y0), base_month, @intFromFloat(months)) catch
         return realm_mod.throwRangeError(arena, "date out of range");
 
     const dim = calendar.daysInMonth(cal, ym.year, ym.month);
