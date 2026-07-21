@@ -228,11 +228,15 @@ fn parseOffsetValue(arena: std.mem.Allocator, s: []const u8) !i128 {
     var sec: i128 = 0;
     var sub: i128 = 0;
     if (i < s.len) {
-        if (s[i] == ':') i += 1;
+        // The extended ("+01:30") and basic ("+0130") forms may not be mixed, so
+        // whichever separator style the minutes use, the seconds must match.
+        const extended = s[i] == ':';
+        if (extended) i += 1;
         m = od(s, i) orelse return realm_mod.throwRangeError(arena, "invalid offset string");
         i += 2;
-        if (i < s.len) {
-            if (s[i] == ':') i += 1;
+        if (i < s.len and s[i] != '.' and s[i] != ',') {
+            if (extended != (s[i] == ':')) return realm_mod.throwRangeError(arena, "invalid offset string");
+            if (extended) i += 1;
             sec = od(s, i) orelse return realm_mod.throwRangeError(arena, "invalid offset string");
             i += 2;
             if (i < s.len and (s[i] == '.' or s[i] == ',')) {

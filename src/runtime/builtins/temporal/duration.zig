@@ -555,11 +555,6 @@ fn roundRelative(
         bal.microseconds = t.microseconds;
         bal.nanoseconds = t.nanoseconds;
     }
-    // Weeks can only be produced under a "year" or "week" largestUnit; requesting
-    // week rounding while the (default) largestUnit is "month" is a RangeError.
-    if (smallest == .week and largest == .month)
-        return realm_mod.throwRangeError(arena, "cannot round to weeks with a months largestUnit");
-
     const s = d0.sign();
     return roundRelativeBalanced(arena, bal, R, dest_ns, smallest, largest, inc, mode, if (s < 0) -1 else 1);
 }
@@ -861,6 +856,7 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     // largestUnit must be the same or larger magnitude than smallestUnit.
     if (durUnitRank(large) > durUnitRank(small))
         return realm_mod.throwRangeError(arena, "largestUnit must be larger than or equal to smallestUnit");
+    try shared.validateDateIncrementSpan(arena, small, large, inc);
 
     // Anything touching calendar units (in the receiver or as a rounding unit)
     // needs a reference date.

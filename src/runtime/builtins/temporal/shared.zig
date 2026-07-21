@@ -1404,6 +1404,20 @@ pub fn validateIncrement(arena: std.mem.Allocator, u: Unit, inc: f64) !void {
         return realm_mod.throwRangeError(arena, "invalid roundingIncrement for smallestUnit");
 }
 
+/// A multi-unit increment over a calendar unit has no meaning: "every 99 weeks"
+/// cannot be expressed alongside a months component, since the two carry
+/// independently. The spec allows it only when the result is a single unit.
+pub fn validateDateIncrementSpan(arena: std.mem.Allocator, smallest: Unit, largest: Unit, inc: f64) !void {
+    if (inc <= 1 or largest == smallest) return;
+    switch (smallest) {
+        .year, .month, .week, .day => return realm_mod.throwRangeError(
+            arena,
+            "roundingIncrement must be 1 when smallestUnit is a date unit smaller than largestUnit",
+        ),
+        else => {},
+    }
+}
+
 /// Read a required or optional temporal unit option (e.g. "smallestUnit").
 pub fn getTemporalUnit(arena: std.mem.Allocator, opts: ?*JsObject, key: []const u8) !?Unit {
     const s = (try readStringOption(arena, opts, key)) orelse return null;
