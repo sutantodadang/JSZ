@@ -801,22 +801,41 @@ pub fn monthDayReference(cal: CalendarId, code_num: u8, code_leap: bool, day: i3
     const start_year = fields(cal, shared.epochDaysToISODate(limit)).year;
     // Two passes: first demanding the exact day, then — only when constraining
     // — allowing it to be clamped into the month.
+    // A month/day recurs at least once per leap cycle; the Islamic 30-year cycle
+    // is the longest among the arithmetic calendars. A lunisolar leap month is
+    // far rarer — some (M12L in the Chinese calendar) skip centuries — so those
+    // get a much longer look-back.
+    const limit_years: u32 = if (hasLeapMonths(cal) and code_leap) 400 else 40;
+
+    // Two passes: first demanding the exact day, then — only when constraining —
+    // clamping it to the *longest* the month ever gets. Clamping per candidate
+    // year instead would answer "Cheshvan 31" with 29, the length of whichever
+    // year happened to come first, rather than the 30 the month can reach.
     var pass: u8 = 0;
     while (pass < 2) : (pass += 1) {
         if (pass == 1 and overflow == .reject) return error.OutOfRange;
+        var want = day;
+        if (pass == 1) {
+            var max_dim: i32 = 0;
+            var yy = start_year;
+            var n: u32 = 0;
+            while (n < limit_years) : (n += 1) {
+                if (monthFromCode(cal, yy, code_num, code_leap)) |m| {
+                    const dim = daysInMonth(cal, yy, m);
+                    if (dim > max_dim) max_dim = dim;
+                }
+                yy -= 1;
+            }
+            if (max_dim == 0) return error.OutOfRange;
+            if (want > max_dim) want = max_dim;
+        }
         var y = start_year;
-        // A month/day recurs at least once per leap cycle; the Islamic 30-year
-        // cycle is the longest among the arithmetic calendars. A lunisolar leap
-        // month is far rarer — some (M12L in the Chinese calendar) skip
-        // centuries — so those get a much longer look-back.
-        const limit_years: u32 = if (hasLeapMonths(cal) and code_leap) 400 else 40;
         var tries: u32 = 0;
         while (tries < limit_years) : (tries += 1) {
             if (monthFromCode(cal, y, code_num, code_leap)) |m| {
                 const dim = daysInMonth(cal, y, m);
-                const use_day = if (pass == 1 and day > dim) dim else day;
-                if (use_day >= 1 and use_day <= dim) {
-                    const iso = try toIso(cal, y, m, use_day, .reject);
+                if (want >= 1 and want <= dim) {
+                    const iso = try toIso(cal, y, m, want, .reject);
                     if (shared.isoDateToEpochDays(iso.year, iso.month, iso.day) <= limit) return iso;
                 }
             }
