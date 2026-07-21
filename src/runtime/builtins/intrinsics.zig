@@ -57,6 +57,15 @@ pub fn setMethod(arena: std.mem.Allocator, obj: *JsObject, name: []const u8, fn_
     _ = try obj.defineOwnData(name, fn_val, method_attr);
 }
 
+/// Like `setMethod` but pins an explicit `.length` (arity). Use when the shared
+/// name→length inference would give the wrong value (e.g. names such as `with`,
+/// `toJSON`, `toPlainDate` mean different arities on different built-ins). The
+/// `.name` is still set from `name`. Installed NON-enumerable per spec.
+pub fn setMethodLen(arena: std.mem.Allocator, obj: *JsObject, name: []const u8, fn_ptr: val_mod.NativeFnPtr, length: u8) !void {
+    const fn_val = try val_mod.makeNativeFunctionNamedLen(arena, fn_ptr, name, length);
+    _ = try obj.defineOwnData(name, fn_val, method_attr);
+}
+
 /// Build a constructor object with the `{ prototype, __call__ }` shape used
 /// throughout `realm.init`. `ctor_proto` is the constructor object's own
 /// prototype (usually `null` historically, or Function.prototype). Does not add a

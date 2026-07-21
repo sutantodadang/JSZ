@@ -15,3 +15,4 @@ jit-native/target/
 .omo/
 .hermes/
 .claude/.test262_shards/
+.test262_shards/

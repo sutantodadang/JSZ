@@ -96,7 +96,10 @@ pub fn isoDateToEpochDays(year: i32, month: i32, day: i32) i64 {
     const m: i64 = month;
     const d: i64 = day;
     const yy = if (m <= 2) y - 1 else y;
-    const era = @divFloor(if (yy >= 0) yy else yy - 399, 400);
+    // Hinnant's algorithm: the `- 399` bias makes *truncating* division behave
+    // like floor(yy/400). Using @divFloor here would double-correct and shift
+    // negative years, so this must be @divTrunc.
+    const era = @divTrunc(if (yy >= 0) yy else yy - 399, 400);
     const yoe = yy - era * 400; // [0, 399]
     const mp = if (m > 2) m - 3 else m + 9; // [0, 11]
     const doy = @divTrunc(153 * mp + 2, 5) + d - 1; // [0, 365]
@@ -107,7 +110,9 @@ pub fn isoDateToEpochDays(year: i32, month: i32, day: i32) i64 {
 /// Inverse of isoDateToEpochDays.
 pub fn epochDaysToISODate(z0: i64) ISODate {
     const z = z0 + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    // As in isoDateToEpochDays, the `- 146096` bias targets *truncating*
+    // division; @divTrunc (not @divFloor) yields the correct era for z < 0.
+    const era = @divTrunc(if (z >= 0) z else z - 146096, 146097);
     const doe = z - era * 146097; // [0, 146096]
     const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365); // [0, 399]
     const y = yoe + era * 400;
@@ -153,6 +158,18 @@ pub fn weekOfYear(date: ISODate) u16 {
         week = 1;
     }
     return @intCast(week);
+}
+
+/// ISO 8601 week-numbering year: the calendar year that owns this date's ISO
+/// week. Differs from `date.year` for the first/last few days of a year that
+/// belong to the adjacent year's week (matches `weekOfYear`'s year rollover).
+pub fn yearOfWeek(date: ISODate) i32 {
+    const dow = dayOfWeek(date); // 1..7
+    const doy: i32 = dayOfYear(date);
+    const week = @divFloor(doy - @as(i32, dow) + 10, 7);
+    if (week < 1) return date.year - 1;
+    if (week > weeksInISOYear(date.year)) return date.year + 1;
+    return date.year;
 }
 
 fn weeksInISOYear(year: i32) i32 {
@@ -312,6 +329,9 @@ pub fn parseISODateTime(s0: []const u8) ParseError!ISODateTime {
 pub const IsoParseOpts = struct {
     validate_calendar: bool = true,
     reject_utc: bool = true,
+    /// Require an explicit time component; a date-only string is rejected. Used
+    /// by PlainTime, which does not implicitly convert a date to midnight.
+    require_time: bool = false,
 };
 
 pub fn parseISODateTimeOpts(s0: []const u8, opts: IsoParseOpts) ParseError!ISODateTime {
@@ -338,17 +358,20 @@ pub fn parseISODateTimeOpts(s0: []const u8, opts: IsoParseOpts) ParseError!ISODa
     const day = p.digitsN(2) orelse return error.Invalid;
 
     var time = ISOTime{};
+    var had_time = false;
     // Optional time part: 'T'/'t'/' ' then time.
     if (p.peek()) |c| {
         if (c == 'T' or c == 't' or c == ' ') {
             p.i += 1;
+            had_time = true;
             time = try parseTimeInner(&p);
             // Optional offset / Z — the offset is ignored for plain types, but a
             // bare `Z` UTC designator is rejected by wall-clock types.
-            const had_utc = skipOffset(&p);
+            const had_utc = try skipOffset(&p);
             if (had_utc and opts.reject_utc) return error.Invalid;
         }
     }
+    if (opts.require_time and !had_time) return error.Invalid;
     try parseAnnotations(&p, opts.validate_calendar);
     if (!p.eof()) return error.Invalid;
 
@@ -428,19 +451,76 @@ pub fn parseISOMonthDay(s0: []const u8) ParseError!ISOMonthDay {
 pub fn parseISOTime(s0: []const u8) ParseError!ISOTime {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     var p = Parser{ .s = s };
+    // A bare (no time-designator) numeric string that is ALSO a valid
+    // DateSpecYearMonth ("2021-12"/"202112") or DateSpecMonthDay ("12-14"/"1214")
+    // is ambiguous and must be rejected — a "T" prefix is required to force the
+    // time interpretation. (Strings starting with a sign or "T" are unambiguous.)
+    if (s.len > 0 and s[0] >= '0' and s[0] <= '9') {
+        const core = s[0 .. std.mem.indexOfScalar(u8, s, '[') orelse s.len];
+        if (isAmbiguousBareTime(core)) return error.Invalid;
+    }
     // Try full datetime first if it looks like a date (has a '-' in first 6, or
     // 8 leading digits followed by 'T').
     if (looksLikeDate(s)) {
         // PlainTime has no calendar but still rejects a bare `Z` UTC designator.
-        const dt = try parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = true });
+        const dt = try parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = true, .require_time = true });
         return dt.time;
     }
+    // A time-only string may carry the ISO 8601 time designator prefix ("T"/"t"),
+    // e.g. "T00:30" or "t003000.5". Consume it before parsing the time components.
+    if (p.peek()) |c0| {
+        if (c0 == 'T' or c0 == 't') p.i += 1;
+    }
     const t = try parseTimeInner(&p);
-    if (skipOffset(&p)) return error.Invalid; // bare `Z` invalid for PlainTime
+    if (try skipOffset(&p)) return error.Invalid; // bare `Z` invalid for PlainTime
     try parseAnnotations(&p, false);
     if (!p.eof()) return error.Invalid;
     if (!isValidISOTime(t)) return error.Invalid;
     return t;
+}
+
+/// Returns true if `core` (a numeric datetime string with any bracket
+/// annotations already stripped) matches a valid year-month or month-day date
+/// production, making a bare time interpretation ambiguous per the Temporal
+/// grammar. All-digit MMDD/YYYYMM and dashed MM-DD/YYYY-MM forms are checked.
+fn isAmbiguousBareTime(core: []const u8) bool {
+    const allDigits = struct {
+        fn f(x: []const u8) bool {
+            for (x) |c| if (c < '0' or c > '9') return false;
+            return x.len > 0;
+        }
+    }.f;
+    const num = struct {
+        fn f(x: []const u8) i32 {
+            var v: i32 = 0;
+            for (x) |c| v = v * 10 + @as(i32, c - '0');
+            return v;
+        }
+    }.f;
+    const validMD = struct {
+        fn f(m: i32, d: i32) bool {
+            return m >= 1 and m <= 12 and d >= 1 and d <= isoDaysInMonth(1972, @intCast(m));
+        }
+    }.f;
+    // YYYY-MM (valid year-month) — e.g. "2021-12".
+    if (core.len == 7 and core[4] == '-' and allDigits(core[0..4]) and allDigits(core[5..7])) {
+        const m = num(core[5..7]);
+        return m >= 1 and m <= 12;
+    }
+    // MM-DD (valid month-day) — e.g. "12-14".
+    if (core.len == 5 and core[2] == '-' and allDigits(core[0..2]) and allDigits(core[3..5])) {
+        return validMD(num(core[0..2]), num(core[3..5]));
+    }
+    // YYYYMM (valid year-month) — e.g. "202112".
+    if (core.len == 6 and allDigits(core)) {
+        const m = num(core[4..6]);
+        return m >= 1 and m <= 12;
+    }
+    // MMDD (valid month-day) — e.g. "1214".
+    if (core.len == 4 and allDigits(core)) {
+        return validMD(num(core[0..2]), num(core[2..4]));
+    }
+    return false;
 }
 
 fn looksLikeDate(s: []const u8) bool {
@@ -500,6 +580,8 @@ fn parseFraction(p: *Parser, t: *ISOTime) ParseError!void {
             p.i += 1;
         }
         if (k == 0) return error.Invalid;
+        // ISO 8601 / Temporal grammar allows at most 9 fractional digits.
+        if (k > 9) return error.Invalid;
         const nanos = std.fmt.parseInt(u32, &frac, 10) catch return error.Invalid;
         t.millisecond = @intCast(nanos / 1_000_000);
         t.microsecond = @intCast((nanos / 1000) % 1000);
@@ -509,7 +591,7 @@ fn parseFraction(p: *Parser, t: *ISOTime) ParseError!void {
 
 /// Consume an optional UTC offset / `Z` designator. Returns true iff a bare `Z`
 /// (UTC designator) was consumed — plain (calendar/wall-clock) types reject it.
-fn skipOffset(p: *Parser) bool {
+fn skipOffset(p: *Parser) ParseError!bool {
     if (p.peek()) |c| {
         if (c == 'Z' or c == 'z') {
             p.i += 1;
@@ -533,7 +615,8 @@ fn skipOffset(p: *Parser) bool {
                 if (sep and isDigit(p.peek())) {
                     _ = p.digitsN(2);
                     var t = ISOTime{};
-                    parseFraction(p, &t) catch {};
+                    // The offset sub-second fraction obeys the same ≤9-digit rule.
+                    try parseFraction(p, &t);
                 }
             }
         }
@@ -1082,11 +1165,24 @@ pub fn getRoundingMode(arena: std.mem.Allocator, opts: ?*JsObject, default: Roun
     return roundingModeFromString(s) orelse realm_mod.throwRangeError(arena, "invalid roundingMode");
 }
 
+/// ToNumber for a Temporal option value, honouring the spec's TypeError on
+/// Symbol/BigInt operands (the shared `toNumberValue` silently yields NaN). Used
+/// by numeric option readers so a Symbol/BigInt throws TypeError before any
+/// range validation runs.
+pub fn toNumberOption(arena: std.mem.Allocator, v: Value) !f64 {
+    if (v.bits != 0) switch (v.unbox()) {
+        .symbol => return realm_mod.throwTypeError(arena, "Cannot convert a Symbol value to a number"),
+        .bigint => return realm_mod.throwTypeError(arena, "Cannot convert a BigInt value to a number"),
+        else => {},
+    };
+    return realm_mod.toNumberValue(arena, v);
+}
+
 pub fn getRoundingIncrement(arena: std.mem.Allocator, opts: ?*JsObject) !f64 {
     const o = opts orelse return 1;
     const v = o.get("roundingIncrement") orelse return 1;
     if (v.bits == 0 or v.unbox() == .undefined_) return 1;
-    const n = try realm_mod.toNumberValue(arena, v);
+    const n = try toNumberOption(arena, v);
     if (!std.math.isFinite(n)) return realm_mod.throwRangeError(arena, "roundingIncrement must be finite");
     const t = @trunc(n);
     if (t < 1 or t > 1_000_000_000) return realm_mod.throwRangeError(arena, "roundingIncrement out of range");

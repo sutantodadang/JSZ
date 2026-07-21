@@ -72,6 +72,9 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
 pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else Value{};
     if (getInstant(v)) |ins| return makeInstant(arena, ins.*);
+    // Fast path: a ZonedDateTime carries the epoch nanoseconds directly.
+    const zdt = @import("zoned_date_time.zig");
+    if (zdt.getZoned(v)) |z| return makeInstant(arena, z.ns);
     if (v.bits != 0 and v.unbox() == .string) {
         const ns = try parseInstantString(arena, v.unbox().string);
         return makeInstant(arena, ns);
@@ -134,7 +137,18 @@ fn parseOffset(s: []const u8) ?i128 {
         sec = twoDigits(s, idx) orelse 0;
         idx += 2;
     }
-    return sign * (h * shared.NS_PER_HOUR + m * shared.NS_PER_MINUTE + sec * shared.NS_PER_SECOND);
+    // Sub-second offset fraction (up to 9 digits → nanoseconds). Needed to
+    // represent boundary offsets like "-23:59:59.999999999".
+    var frac_ns: i128 = 0;
+    if (idx < s.len and (s[idx] == '.' or s[idx] == ',')) {
+        idx += 1;
+        var scale: i128 = 100_000_000; // first digit = 100ms in ns
+        while (idx < s.len and s[idx] >= '0' and s[idx] <= '9') : (idx += 1) {
+            frac_ns += @as(i128, s[idx] - '0') * scale;
+            scale = @divTrunc(scale, 10);
+        }
+    }
+    return sign * (h * shared.NS_PER_HOUR + m * shared.NS_PER_MINUTE + sec * shared.NS_PER_SECOND + frac_ns);
 }
 
 fn twoDigits(s: []const u8, idx: usize) ?i128 {
@@ -185,6 +199,8 @@ pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) an
 
 fn toInstantNs(arena: std.mem.Allocator, v: Value) !i128 {
     if (getInstant(v)) |ins| return ins.*;
+    const zdt = @import("zoned_date_time.zig");
+    if (zdt.getZoned(v)) |z| return z.ns;
     if (v.bits != 0 and v.unbox() == .string) return try parseInstantString(arena, v.unbox().string);
     return realm_mod.throwTypeError(arena, "cannot convert to Temporal.Instant");
 }
@@ -396,14 +412,14 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const proto = try JsObject.create(arena, ctx.object_proto);
     proto_obj = proto;
 
-    try intrinsics.setMethod(arena, proto, "add", nativeAdd);
+    try intrinsics.setMethodLen(arena, proto, "add", nativeAdd, 1);
     try intrinsics.setMethod(arena, proto, "subtract", nativeSubtract);
     try intrinsics.setMethod(arena, proto, "until", nativeUntil);
     try intrinsics.setMethod(arena, proto, "since", nativeSince);
     try intrinsics.setMethod(arena, proto, "round", nativeRound);
     try intrinsics.setMethod(arena, proto, "equals", nativeEquals);
     try intrinsics.setMethod(arena, proto, "toString", nativeToString);
-    try intrinsics.setMethod(arena, proto, "toJSON", nativeToJSON);
+    try intrinsics.setMethodLen(arena, proto, "toJSON", nativeToJSON, 0);
     try intrinsics.setMethod(arena, proto, "toLocaleString", nativeToLocaleString);
     try intrinsics.setMethod(arena, proto, "valueOf", nativeValueOf);
     try intrinsics.setMethod(arena, proto, "toZonedDateTimeISO", nativeToZonedDateTimeISO);

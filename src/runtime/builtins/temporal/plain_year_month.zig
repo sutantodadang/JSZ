@@ -423,15 +423,15 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const proto = try JsObject.create(arena, ctx.object_proto);
     proto_obj = proto;
 
-    try intrinsics.setMethod(arena, proto, "with", nativeWith);
-    try intrinsics.setMethod(arena, proto, "add", nativeAdd);
+    try intrinsics.setMethodLen(arena, proto, "with", nativeWith, 1);
+    try intrinsics.setMethodLen(arena, proto, "add", nativeAdd, 1);
     try intrinsics.setMethod(arena, proto, "subtract", nativeSubtract);
     try intrinsics.setMethod(arena, proto, "until", nativeUntil);
     try intrinsics.setMethod(arena, proto, "since", nativeSince);
     try intrinsics.setMethod(arena, proto, "equals", nativeEquals);
-    try intrinsics.setMethod(arena, proto, "toPlainDate", nativeToPlainDate);
+    try intrinsics.setMethodLen(arena, proto, "toPlainDate", nativeToPlainDate, 1);
     try intrinsics.setMethod(arena, proto, "toString", nativeToString);
-    try intrinsics.setMethod(arena, proto, "toJSON", nativeToJSON);
+    try intrinsics.setMethodLen(arena, proto, "toJSON", nativeToJSON, 0);
     try intrinsics.setMethod(arena, proto, "toLocaleString", nativeToLocaleString);
     try intrinsics.setMethod(arena, proto, "valueOf", nativeValueOf);
 

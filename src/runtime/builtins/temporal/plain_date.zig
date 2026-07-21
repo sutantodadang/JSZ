@@ -107,6 +107,9 @@ pub fn toTemporalDate(arena: std.mem.Allocator, v: Value, overflow: shared.Overf
     if (v.bits != 0 and v.unbox() == .object) {
         const pdt = @import("plain_date_time.zig");
         if (pdt.getDateTime(v)) |dt| return dt.date;
+        // A ZonedDateTime yields its wall-clock date.
+        const zdt = @import("zoned_date_time.zig");
+        if (zdt.getZoned(v)) |z| return zdt.localISODate(z);
         return try dateFromFields(arena, v.toPtr().object, overflow);
     }
     if (v.bits != 0 and v.unbox() == .string) {
@@ -497,6 +500,27 @@ pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, args: []
     return pdt.makeDateTime(arena, .{ .date = d.*, .time = time });
 }
 
+pub fn nativeToPlainYearMonth(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const d = try requireDate(arena, this_val);
+    const pym = @import("plain_year_month.zig");
+    return pym.makeYearMonth(arena, .{ .year = d.year, .month = d.month, .day = 1 });
+}
+
+pub fn nativeToPlainMonthDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const d = try requireDate(arena, this_val);
+    const pmd = @import("plain_month_day.zig");
+    return pmd.makeMonthDay(arena, .{ .month = d.month, .day = d.day, .ref_year = 1972 });
+}
+
+pub fn nativeWithCalendar(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const d = try requireDate(arena, this_val);
+    // ToTemporalCalendarIdentifier: only the ISO 8601 calendar is supported.
+    const cal = if (args.len > 0) args[0] else Value{};
+    if (cal.bits == 0 or cal.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "withCalendar requires a calendar");
+    try shared.validateCalendarArg(arena, cal);
+    return makeDate(arena, d.*);
+}
+
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const d = try requireDate(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
@@ -570,6 +594,20 @@ fn getWeekOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     const d = try requireDate(arena, this_val);
     return val_mod.makeNumber(arena, @floatFromInt(shared.weekOfYear(d.*)));
 }
+fn getYearOfWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const d = try requireDate(arena, this_val);
+    return val_mod.makeNumber(arena, @floatFromInt(shared.yearOfWeek(d.*)));
+}
+// era / eraYear are undefined for the ISO 8601 calendar, but the getters must
+// still exist (with correct branding) on the prototype.
+fn getEra(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    _ = try requireDate(arena, this_val);
+    return Value{};
+}
+fn getEraYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    _ = try requireDate(arena, this_val);
+    return Value{};
+}
 fn getDaysInWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     _ = try requireDate(arena, this_val);
     return val_mod.makeNumber(arena, 7);
@@ -602,16 +640,19 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const proto = try JsObject.create(arena, ctx.object_proto);
     proto_obj = proto;
 
-    try intrinsics.setMethod(arena, proto, "with", nativeWith);
-    try intrinsics.setMethod(arena, proto, "add", nativeAdd);
+    try intrinsics.setMethodLen(arena, proto, "with", nativeWith, 1);
+    try intrinsics.setMethodLen(arena, proto, "add", nativeAdd, 1);
     try intrinsics.setMethod(arena, proto, "subtract", nativeSubtract);
     try intrinsics.setMethod(arena, proto, "until", nativeUntil);
     try intrinsics.setMethod(arena, proto, "since", nativeSince);
     try intrinsics.setMethod(arena, proto, "equals", nativeEquals);
     try intrinsics.setMethod(arena, proto, "toPlainDateTime", nativeToPlainDateTime);
+    try intrinsics.setMethod(arena, proto, "toPlainYearMonth", nativeToPlainYearMonth);
+    try intrinsics.setMethod(arena, proto, "toPlainMonthDay", nativeToPlainMonthDay);
+    try intrinsics.setMethod(arena, proto, "withCalendar", nativeWithCalendar);
     try intrinsics.setMethod(arena, proto, "toZonedDateTime", nativeToZonedDateTime);
     try intrinsics.setMethod(arena, proto, "toString", nativeToString);
-    try intrinsics.setMethod(arena, proto, "toJSON", nativeToJSON);
+    try intrinsics.setMethodLen(arena, proto, "toJSON", nativeToJSON, 0);
     try intrinsics.setMethod(arena, proto, "toLocaleString", nativeToLocaleString);
     try intrinsics.setMethod(arena, proto, "valueOf", nativeValueOf);
 
@@ -622,6 +663,9 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.defineGetter(arena, proto, "dayOfWeek", getDayOfWeek);
     try intrinsics.defineGetter(arena, proto, "dayOfYear", getDayOfYear);
     try intrinsics.defineGetter(arena, proto, "weekOfYear", getWeekOfYear);
+    try intrinsics.defineGetter(arena, proto, "yearOfWeek", getYearOfWeek);
+    try intrinsics.defineGetter(arena, proto, "era", getEra);
+    try intrinsics.defineGetter(arena, proto, "eraYear", getEraYear);
     try intrinsics.defineGetter(arena, proto, "daysInWeek", getDaysInWeek);
     try intrinsics.defineGetter(arena, proto, "daysInMonth", getDaysInMonth);
     try intrinsics.defineGetter(arena, proto, "daysInYear", getDaysInYear);

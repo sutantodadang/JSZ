@@ -88,6 +88,9 @@ pub fn toTemporalTime(arena: std.mem.Allocator, v: Value, overflow: shared.Overf
         // A PlainDateTime carries a time; extract it.
         const pdt = @import("plain_date_time.zig");
         if (pdt.getDateTime(v)) |dt| return dt.time;
+        // A ZonedDateTime yields its wall-clock time.
+        const zdt = @import("zoned_date_time.zig");
+        if (zdt.getZoned(v)) |z| return zdt.localISODateTime(z).time;
         return try timeFromFields(arena, v.toPtr().object, overflow);
     }
     if (v.bits != 0 and v.unbox() == .string) {
@@ -415,8 +418,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const proto = try JsObject.create(arena, ctx.object_proto);
     proto_obj = proto;
 
-    try intrinsics.setMethod(arena, proto, "with", nativeWith);
-    try intrinsics.setMethod(arena, proto, "add", nativeAdd);
+    try intrinsics.setMethodLen(arena, proto, "with", nativeWith, 1);
+    try intrinsics.setMethodLen(arena, proto, "add", nativeAdd, 1);
     try intrinsics.setMethod(arena, proto, "subtract", nativeSubtract);
     try intrinsics.setMethod(arena, proto, "until", nativeUntil);
     try intrinsics.setMethod(arena, proto, "since", nativeSince);
@@ -424,7 +427,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.setMethod(arena, proto, "equals", nativeEquals);
     try intrinsics.setMethod(arena, proto, "toPlainDateTime", nativeToPlainDateTime);
     try intrinsics.setMethod(arena, proto, "toString", nativeToString);
-    try intrinsics.setMethod(arena, proto, "toJSON", nativeToJSON);
+    try intrinsics.setMethodLen(arena, proto, "toJSON", nativeToJSON, 0);
     try intrinsics.setMethod(arena, proto, "toLocaleString", nativeToLocaleString);
     try intrinsics.setMethod(arena, proto, "valueOf", nativeValueOf);
 
