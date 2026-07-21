@@ -223,16 +223,18 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const ym = try requireYM(arena, this_val);
     const other = try toTemporalYearMonth(arena, if (args.len > 0) args[0] else Value{}, .constrain);
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
+    // The option reads are observable, so they happen in the order the spec
+    // performs them — alphabetical — and all of them before any is validated.
     var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
+    const inc = try shared.getRoundingIncrement(arena, opts);
+    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     if (smallest == null) smallest = .month;
     if (largest == null) largest = .year;
     // Only year/month units allowed.
     if (unitRank(smallest.?) > 1 or unitRank(largest.?) > 1)
         return realm_mod.throwRangeError(arena, "PlainYearMonth difference units must be year or month");
     if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
 
     const a = ISODate{ .year = ym.year, .month = ym.month, .day = 1 };
     const b = ISODate{ .year = other.year, .month = other.month, .day = 1 };

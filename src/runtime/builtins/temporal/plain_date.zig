@@ -430,8 +430,12 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const d = try requireDate(arena, this_val);
     const other = try toTemporalDate(arena, if (args.len > 0) args[0] else Value{}, .constrain);
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
+    // The option reads are observable, so they happen in the order the spec
+    // performs them — alphabetical — and all of them before any is validated.
     var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
+    const inc = try shared.getRoundingIncrement(arena, opts);
+    var mode = try shared.getRoundingMode(arena, opts, .trunc);
+    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     if (smallest == null) smallest = .day;
     // largestUnit defaults to "auto" = the larger of "day" and smallestUnit.
     if (largest == null) largest = if (unitRank(smallest.?) < unitRank(.day)) smallest.? else .day;
@@ -439,8 +443,6 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (unitRank(smallest.?) > unitRank(.day) or unitRank(largest.?) > unitRank(.day))
         return realm_mod.throwRangeError(arena, "PlainDate difference units must be year..day");
     if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    var mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
 
     // `since` is `until` run backwards and negated — not the difference from
     // the argument to the receiver. The distinction matters because the whole

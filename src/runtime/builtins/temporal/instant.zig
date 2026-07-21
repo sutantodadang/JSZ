@@ -241,15 +241,19 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     const ins = try requireInstant(arena, this_val);
     const other = try toInstantNs(arena, if (args.len > 0) args[0] else Value{});
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
+    // The option reads are observable, so they happen in the order the spec
+    // performs them — alphabetical — and all of them before any is validated.
     var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
+    const inc = try shared.getRoundingIncrement(arena, opts);
+    const mode = try shared.getRoundingMode(arena, opts, .trunc);
+    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     if (smallest == null) smallest = .nanosecond;
-    if (largest == null) largest = .second;
+    // "auto" is the larger of "second" and smallestUnit, so asking for whole
+    // hours does not collide with the default.
+    if (largest == null) largest = if (unitRank(smallest.?) < unitRank(.second)) smallest.? else .second;
     if (unitRank(smallest.?) < unitRank(.hour) or unitRank(largest.?) < unitRank(.hour))
         return realm_mod.throwRangeError(arena, "Instant difference units must be hour..nanosecond");
     if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
     try shared.validateInstantRoundingIncrement(arena, smallest.?, inc);
 
     const diff = if (since) ins.* - other else other - ins.*;
@@ -305,12 +309,14 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
         smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
     } else {
         opts = try shared.getOptionsObject(arena, arg0);
-        smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     }
+    // Alphabetical, and all read before any is validated. The string shorthand
+    // supplies smallestUnit directly and reads nothing.
+    const inc = try shared.getRoundingIncrement(arena, opts);
+    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
+    if (opts != null) smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     if (smallest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
     if (unitRank(smallest.?) < unitRank(.hour)) return realm_mod.throwRangeError(arena, "smallestUnit must be hour..nanosecond");
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
     try shared.validateInstantRoundingIncrement(arena, smallest.?, inc);
     const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
     const rounded = shared.roundI128AsIfPositive(ins.*, inc_ns, mode);
