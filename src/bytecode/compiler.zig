@@ -55,6 +55,10 @@ pub const LoopCtx = struct {
     /// `finally_stack` length at loop entry. `break`/`continue` run (and POP_TRY)
     /// each try-block opened inside the loop before jumping out of it.
     finally_depth: usize = 0,
+    /// True for the context a `switch` pushes. A switch is a `break` target but
+    /// NOT a `continue` target, so unlabeled `continue` skips these entries and
+    /// keeps unwinding to the innermost real loop.
+    is_switch: bool = false,
 };
 
 pub const FnCompiler = struct {

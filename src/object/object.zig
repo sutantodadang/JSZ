@@ -1009,8 +1009,12 @@ pub const JsObject = struct {
     }
 };
 
-/// Loose SameValue for redefine compatibility checks: pointer-identity, or
-/// numeric equality (pointer-boxed numbers may differ in bits while equal).
+/// SameValue (ES §7.2.11) for redefine compatibility checks. Starts from
+/// pointer-identity, then compares by unboxed tag because a pointer-boxed
+/// number may differ in bits while denoting the same value.
+///
+/// Numbers use SameValue, NOT `==`: +0 and -0 are distinct (so redefining a
+/// non-writable -0 as +0 is rejected) while NaN equals itself.
 fn sameValueRough(a: Value, b: Value) bool {
     if (a.bits == b.bits) return true;
     // `unbox` maps a bare bits==0 to `.undefined_`; a heap-boxed `.undefined_`
@@ -1022,10 +1026,17 @@ fn sameValueRough(a: Value, b: Value) bool {
         .undefined_ => ub == .undefined_,
         .null_ => ub == .null_,
         .boolean => |x| ub == .boolean and x == ub.boolean,
-        .number => |x| ub == .number and x == ub.number,
+        .number => |x| ub == .number and sameValueNumber(x, ub.number),
         .string => |x| ub == .string and std.mem.eql(u8, x, ub.string),
         else => false,
     };
+}
+
+/// SameValue over two f64s: NaN equals NaN, and +0 differs from -0.
+fn sameValueNumber(x: f64, y: f64) bool {
+    if (std.math.isNan(x)) return std.math.isNan(y);
+    if (x == 0 and y == 0) return std.math.signbit(x) == std.math.signbit(y);
+    return x == y;
 }
 
 // ------------------------------------------------------------------- tests ---

@@ -162,18 +162,11 @@ pub fn nativeRegExpEscape(arena: std.mem.Allocator, this_val: Value, args: []con
     var out = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < s.len) {
-        const dec = decodeUtf8At(s, i);
-        var len = if (dec.len == 0) 1 else dec.len;
-        var c = dec.cp;
-        // Combine a high+low WTF-8 surrogate pair into one astral code point so it
-        // round-trips as an identity char (StringToCodePoints semantics).
-        if (c >= 0xD800 and c <= 0xDBFF and i + len < s.len) {
-            const nxt = decodeUtf8At(s, i + len);
-            if (nxt.len != 0 and nxt.cp >= 0xDC00 and nxt.cp <= 0xDFFF) {
-                c = 0x10000 + ((c - 0xD800) << 10) + (nxt.cp - 0xDC00);
-                len += nxt.len;
-            }
-        }
+        // decodeCpAt folds a high+low WTF-8 surrogate pair into one astral code
+        // point so it round-trips as an identity char (StringToCodePoints).
+        const dec = decodeCpAt(s, i);
+        const len = if (dec.len == 0) 1 else dec.len;
+        const c = dec.cp;
         if (i == 0 and ((c >= '0' and c <= '9') or (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z'))) {
             // Leading digit/ASCII-letter: force `\xHH` so it can't extend a prior escape.
             try appendHex2(arena, &out, c);
@@ -232,6 +225,31 @@ pub fn decodeUtf8At(buf: []const u8, pos: usize) struct { cp: u21, len: u8 } {
 /// Returns 1 on invalid sequences so scanning always advances.
 pub fn utf8ByteLenAt(buf: []const u8, pos: usize) u8 {
     return decodeUtf8At(buf, pos).len;
+}
+
+/// Decode one code point at `pos` the way `/u` and `/v` mode see the input.
+///
+/// JSZ stores an astral character either as a single 4-byte UTF-8 sequence
+/// (source literals) or as a WTF-8 surrogate pair of two 3-byte sequences
+/// (`\u{...}` escapes, `String.fromCodePoint`). Both denote the same
+/// ECMAScript string, so codepoint mode must fold the pair back into one
+/// code point -- otherwise `\p{...}`, astral literals and `.` silently fail
+/// to match anything built through the escape/`fromCodePoint` path.
+///
+/// Only for `cpMode()`: without `/u`, a surrogate pair really is two separate
+/// UTF-16 code units and must stay split.
+fn decodeCpAt(buf: []const u8, pos: usize) struct { cp: u21, len: u8 } {
+    const dec = decodeUtf8At(buf, pos);
+    if (dec.cp >= 0xD800 and dec.cp <= 0xDBFF and pos + dec.len < buf.len) {
+        const nxt = decodeUtf8At(buf, pos + dec.len);
+        if (nxt.len != 0 and nxt.cp >= 0xDC00 and nxt.cp <= 0xDFFF) {
+            return .{
+                .cp = 0x10000 + ((dec.cp - 0xD800) << 10) + (nxt.cp - 0xDC00),
+                .len = dec.len + nxt.len,
+            };
+        }
+    }
+    return .{ .cp = dec.cp, .len = dec.len };
 }
 
 /// Encode a codepoint into buf (must be at least 4 bytes). Returns byte count.
@@ -461,6 +479,31 @@ pub const RegexNode = union(enum) {
     },
     /// Phase 4d: backreference \1..\9
     back_ref: u8, // group index 1-9
+    /// ES2025 RegExp modifiers `(?ims-ims: ... )`: rebinds the i/m/s flags for
+    /// the enclosed disjunction only. `add` and `remove` can never overlap --
+    /// the parser rejects a modifier listed on both sides.
+    modifier: struct {
+        inner: *RegexNode,
+        add: ModifierSet,
+        remove: ModifierSet,
+    },
+};
+
+/// The three flags a `(?ims-ims:...)` group may rebind.
+pub const ModifierSet = struct {
+    ignore_case: bool = false,
+    multiline: bool = false,
+    dotall: bool = false,
+
+    fn empty(self: ModifierSet) bool {
+        return !self.ignore_case and !self.multiline and !self.dotall;
+    }
+
+    fn overlaps(self: ModifierSet, other: ModifierSet) bool {
+        return (self.ignore_case and other.ignore_case) or
+            (self.multiline and other.multiline) or
+            (self.dotall and other.dotall);
+    }
 };
 
 /// A named capture group's name → 1-based capture index mapping.
@@ -760,6 +803,55 @@ const PatternParser = struct {
         return q;
     }
 
+    /// Parse `(?ims:...)` / `(?ims-ims:...)` after `(` has been consumed and the
+    /// non-capturing / lookaround forms have been ruled out. Every other `(?`
+    /// spelling is a modifier group, so anything malformed here is a genuine
+    /// Syntax Error rather than a fallthrough to some other production.
+    fn parseModifierGroup(self: *PatternParser) ParseError!RegexNode {
+        self.advance(); // '?'
+        var add: ModifierSet = .{};
+        var remove: ModifierSet = .{};
+        try self.parseModifierList(&add);
+        if (!self.eof() and self.cur() == '-') {
+            self.advance();
+            try self.parseModifierList(&remove);
+        }
+        // `(?-:a)` names no flags at all; `(?i-i:a)` both adds and removes one.
+        if (add.empty() and remove.empty()) return ParseError.InvalidPattern;
+        if (add.overlaps(remove)) return ParseError.InvalidPattern;
+        if (self.eof() or self.cur() != ':') return ParseError.InvalidPattern;
+        self.advance(); // ':'
+        const inner = try self.parseAlt();
+        if (self.eof() or self.cur() != ')') return ParseError.InvalidPattern;
+        self.advance();
+        const inner_ptr = try self.alloc.create(RegexNode);
+        inner_ptr.* = inner;
+        return RegexNode{ .modifier = .{ .inner = inner_ptr, .add = add, .remove = remove } };
+    }
+
+    /// Consume a run of distinct `i`/`m`/`s` modifier letters. Stops at the
+    /// first character that is not one; a repeat (`(?ii:a)`) is a Syntax Error.
+    fn parseModifierList(self: *PatternParser, set: *ModifierSet) ParseError!void {
+        while (!self.eof()) {
+            switch (self.cur()) {
+                'i' => {
+                    if (set.ignore_case) return ParseError.InvalidPattern;
+                    set.ignore_case = true;
+                },
+                'm' => {
+                    if (set.multiline) return ParseError.InvalidPattern;
+                    set.multiline = true;
+                },
+                's' => {
+                    if (set.dotall) return ParseError.InvalidPattern;
+                    set.dotall = true;
+                },
+                else => return,
+            }
+            self.advance();
+        }
+    }
+
     fn parseUint(self: *PatternParser) ParseError!u32 {
         if (self.eof() or self.cur() < '0' or self.cur() > '9') return ParseError.InvalidPattern;
         var n: u64 = 0;
@@ -841,6 +933,11 @@ const PatternParser = struct {
                     const ninner_ptr = try self.alloc.create(RegexNode);
                     ninner_ptr.* = ninner;
                     return RegexNode{ .group = .{ .idx = nidx, .inner = ninner_ptr } };
+                }
+                // ES2025 modifier group `(?ims:...)` / `(?ims-ims:...)`. Every
+                // other `(?` form was handled above, so this is the last one.
+                if (!self.eof() and self.cur() == '?') {
+                    return try self.parseModifierGroup();
                 }
                 // Capturing group
                 const idx = self.next_cap;
@@ -1654,7 +1751,7 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
     if (!pp.eof()) return error.InvalidPattern; // unconsumed chars
 
     const br = hasBackref(&root);
-    const prog = if (!br) buildProgram(alloc, &root, pp.next_cap - 1) else null;
+    const prog = if (!br and !hasModifier(&root)) buildProgram(alloc, &root, pp.next_cap - 1) else null;
 
     return CompiledRegex{
         .root = root,
@@ -1842,7 +1939,7 @@ fn foldCaseCp(cp: u21) u21 {
 fn consumeLiteral(input: []const u8, pos: usize, ch: u21, flags: *const CompiledRegex.Flags) ?usize {
     if (pos >= input.len) return null;
     if (flags.cpMode()) {
-        const dc = decodeUtf8At(input, pos);
+        const dc = decodeCpAt(input, pos);
         const input_cp = dc.cp;
         if (flags.ignore_case) {
             if (foldCaseCp(input_cp) != foldCaseCp(ch)) return null;
@@ -1867,7 +1964,7 @@ fn consumeLiteral(input: []const u8, pos: usize, ch: u21, flags: *const Compiled
 fn consumeClass(input: []const u8, pos: usize, cc: *const CharClass, flags: *const CompiledRegex.Flags) ?usize {
     if (pos >= input.len) return null;
     if (flags.cpMode()) {
-        const dc = decodeUtf8At(input, pos);
+        const dc = decodeCpAt(input, pos);
         var cp = dc.cp;
         if (flags.ignore_case) cp = foldCaseCp(cp);
         var hit = cc.matchesCp(cp);
@@ -1900,7 +1997,7 @@ fn consumeClass(input: []const u8, pos: usize, cc: *const CharClass, flags: *con
 fn consumeDot(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) ?usize {
     if (pos >= input.len) return null;
     if (flags.cpMode()) {
-        const dc = decodeUtf8At(input, pos);
+        const dc = decodeCpAt(input, pos);
         if (!flags.dotall and isUnicodeLineTerminator(dc.cp)) return null;
         return pos + dc.len;
     } else {
@@ -1975,6 +2072,18 @@ fn matchNode(
         },
         .non_capturing => |inner| {
             return matchNode(inner, input, pos, caps, flags);
+        },
+        .modifier => |m| {
+            // Rebind i/m/s for the enclosed disjunction only. The copy lives on
+            // this frame, so the original flags are restored on return.
+            var scoped = flags.*;
+            if (m.add.ignore_case) scoped.ignore_case = true;
+            if (m.add.multiline) scoped.multiline = true;
+            if (m.add.dotall) scoped.dotall = true;
+            if (m.remove.ignore_case) scoped.ignore_case = false;
+            if (m.remove.multiline) scoped.multiline = false;
+            if (m.remove.dotall) scoped.dotall = false;
+            return matchNode(m.inner, input, pos, caps, &scoped);
         },
         .quant => |q| {
             return matchQuant(q.inner, q.min, q.max, q.lazy, input, pos, caps, flags);
@@ -2271,6 +2380,10 @@ const ProgBuilder = struct {
             .look_ahead, .look_behind => _ = self.emit(.{ .look = node }),
             // Backreference patterns never reach the Pike VM (has_backref gate).
             .back_ref => self.failed = true,
+            // Flag decisions are baked into the emitted instructions, so a
+            // mid-pattern rebind cannot be expressed; fall back to the
+            // backtracker (compileRegex also gates on hasModifier).
+            .modifier => self.failed = true,
         }
     }
 };
@@ -2293,6 +2406,30 @@ fn hasBackref(node: *const RegexNode) bool {
         .quant => |q| hasBackref(q.inner),
         .look_ahead => |la| hasBackref(la.inner),
         .look_behind => |lb| hasBackref(lb.inner),
+        .modifier => |m| hasBackref(m.inner),
+        else => false,
+    };
+}
+
+/// Whether the pattern contains a `(?ims-ims:...)` modifier group. The Pike VM
+/// compiles flag decisions into its instructions, so it cannot express a
+/// mid-pattern flag rebind; such patterns stay on the backtracking engine.
+fn hasModifier(node: *const RegexNode) bool {
+    return switch (node.*) {
+        .modifier => true,
+        .seq => |nodes| blk: {
+            for (nodes) |*c| if (hasModifier(c)) break :blk true;
+            break :blk false;
+        },
+        .alt => |arms| blk: {
+            for (arms) |*c| if (hasModifier(c)) break :blk true;
+            break :blk false;
+        },
+        .group => |g| hasModifier(g.inner),
+        .non_capturing => |inner| hasModifier(inner),
+        .quant => |q| hasModifier(q.inner),
+        .look_ahead => |la| hasModifier(la.inner),
+        .look_behind => |lb| hasModifier(lb.inner),
         else => false,
     };
 }
@@ -3022,9 +3159,10 @@ fn regExpExec(arena: std.mem.Allocator, R: Value, s_val: Value) !Value {
 /// AdvanceStringIndex(S, index, unicode) approximated over UTF-8 bytes.
 fn advanceStringIndex(s: []const u8, index: usize, unicode: bool) usize {
     if (!unicode or index >= s.len) return index + 1;
-    const b = s[index];
-    const clen: usize = if (b < 0x80) 1 else if (b < 0xE0) 2 else if (b < 0xF0) 3 else 4;
-    return index + clen;
+    // decodeCpAt folds a WTF-8 surrogate pair into one code point, so an astral
+    // char advances past both halves regardless of which storage form it uses.
+    const dc = decodeCpAt(s, index);
+    return index + if (dc.len == 0) 1 else dc.len;
 }
 
 fn requireObject(arena: std.mem.Allocator, v: Value, comptime what: []const u8) !void {
@@ -3651,6 +3789,33 @@ test "regexp/u: decodeUtf8At basic" {
     const c = decodeUtf8At(emoji, 0);
     try std.testing.expectEqual(@as(u21, 0x1F600), c.cp);
     try std.testing.expectEqual(@as(u8, 4), c.len);
+}
+
+test "regexp/u: decodeCpAt folds WTF-8 surrogate pairs" {
+    // U+1E900 stored as a single 4-byte UTF-8 sequence (source literal form).
+    const flat = "\xF0\x9E\xA4\x80";
+    const a = decodeCpAt(flat, 0);
+    try std.testing.expectEqual(@as(u21, 0x1E900), a.cp);
+    try std.testing.expectEqual(@as(u8, 4), a.len);
+
+    // The same character stored as a WTF-8 surrogate pair, which is what
+    // `\u{1E900}` and String.fromCodePoint produce: U+D83A then U+DD00.
+    const pair = "\xED\xA0\xBA\xED\xB4\x80";
+    const b = decodeCpAt(pair, 0);
+    try std.testing.expectEqual(@as(u21, 0x1E900), b.cp);
+    try std.testing.expectEqual(@as(u8, 6), b.len);
+
+    // A high surrogate NOT followed by a low one stays a lone surrogate.
+    const lone = "\xED\xA0\xBA";
+    const c = decodeCpAt(lone, 0);
+    try std.testing.expectEqual(@as(u21, 0xD83A), c.cp);
+    try std.testing.expectEqual(@as(u8, 3), c.len);
+
+    // decodeUtf8At itself must keep splitting the pair (non-`/u` mode relies
+    // on seeing the two UTF-16 code units separately).
+    const raw = decodeUtf8At(pair, 0);
+    try std.testing.expectEqual(@as(u21, 0xD83A), raw.cp);
+    try std.testing.expectEqual(@as(u8, 3), raw.len);
 }
 
 test "regexp/u: dot matches unicode codepoint" {

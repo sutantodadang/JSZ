@@ -247,6 +247,13 @@ fn nativeObjectCreate(arena: std.mem.Allocator, _: Value, args: []const Value) a
     switch (args[0].unbox()) {
         .object => |obj| proto = obj,
         .null_ => proto = null,
+        // A callable IS an Object; it just isn't a `.object` value here. Resolve
+        // it to its backing object so `Object.create(someFunction)` links the
+        // chain instead of throwing (mirrors Object.setPrototypeOf).
+        .bc_function, .function, .native_function => proto = if (active_context) |ctx|
+            (try ctx.backingObject(arena, args[0]))
+        else
+            null,
         else => return throwTypeError(arena, "Object prototype may only be an Object or null"),
     }
     // Allocate on the active heap if available, otherwise fallback to arena.
@@ -3073,6 +3080,17 @@ fn nativeNumberValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Val
     return val_mod.makeNumber(arena, n);
 }
 
+/// Number.prototype.toLocaleString([locales[, options]]) — ES §21.1.3.4, which
+/// with Intl present is `new Intl.NumberFormat(locales, options).format(this)`.
+/// Composes the two public NumberFormat entry points so grouping and
+/// fraction-digit defaults stay in one place.
+fn nativeNumberProtoToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toLocaleString requires a Number");
+    const nf = try intl_mod.nativeNumberFormatCtor(arena, Value{}, args);
+    return intl_mod.nativeNumberFormatFormat(arena, nf, &[_]Value{try val_mod.makeNumber(arena, n)});
+}
+
+
 const RADIX_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz";
 
 /// Stringify a finite f64 in an arbitrary radix 2..36 (ES Number::toString).
@@ -3327,7 +3345,9 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
             "Array"
         else if (obj.internal_kind == .mapped_arguments)
             "Arguments"
-        else if (obj.get("__call__") != null)
+        else if (obj.get("__call__") != null or obj.internal_kind == .bound_function)
+            // A bound function is callable but carries no `__call__` slot, so it
+            // needs its own check to get the reserved "Function" tag.
             "Function"
         else if (obj.is_error)
             "Error"
@@ -3353,7 +3373,18 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
     // result overrides the builtin tag.
     // ToObject(this) so a primitive receiver (e.g. a BigInt) reads @@toStringTag
     // off its wrapper's prototype (BigInt.prototype[@@toStringTag] === "BigInt").
-    const recv = try toObjectForThis(arena, this_val);
+    // Callables are objects too, but toObjectForThis passes them through as
+    // .function/.bc_function; resolve them to their backing object so an own
+    // @@toStringTag on a function is honoured (ES 20.1.3.6 step 15).
+    var recv = try toObjectForThis(arena, this_val);
+    switch (recv.unbox()) {
+        .function, .bc_function, .native_function => {
+            if (active_context) |ctx| {
+                if (try ctx.backingObject(arena, recv)) |bo| recv = try val_mod.makeObject(arena, bo);
+            }
+        },
+        else => {},
+    }
     if (recv.bits != 0 and recv.unbox() == .object) {
         if (active_sym_to_string_tag) |tag_sym| {
             if (active_context) |ctx| {
@@ -3406,9 +3437,13 @@ fn proxyIsCallableDeep(obj: *JsObject) bool {
     return false;
 }
 
-fn nativeObjectProtoValueOf(_: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    // ES 20.1.3.7: ToObject(this); for our purposes return `this` unchanged.
-    return this_val;
+fn nativeObjectProtoValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    // ES 20.1.3.7: return ToObject(this). A primitive receiver must come back as
+    // its wrapper object (so `typeof valueOf.call(true)` is "object"), and
+    // undefined/null throw rather than passing through.
+    if (this_val.bits == 0 or this_val.unbox() == .undefined_ or this_val.unbox() == .null_)
+        return throwTypeError(arena, "Object.prototype.valueOf called on null or undefined");
+    return toObjectForThis(arena, this_val);
 }
 
 // ---- Function constructor (minimal) ----
@@ -3423,16 +3458,18 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
         try src.append(arena, '(');
         try src.appendSlice(arena, keyword);
         try src.appendSlice(arena, " anonymous(");
+        // CreateDynamicFunction ToString's every argument, in order: a non-string
+        // parameter name or body used to be dropped silently, which shifted the
+        // remaining parameters onto a stray comma and made the source unparsable.
         if (args.len > 1) {
             for (args[0 .. args.len - 1], 0..) |a, i| {
                 if (i > 0) try src.append(arena, ',');
-                if (a.bits != 0 and a.unbox() == .string) try src.appendSlice(arena, a.toPtr().string);
+                try src.appendSlice(arena, try rawToStr(arena, a));
             }
         }
         try src.appendSlice(arena, "){");
         if (args.len > 0) {
-            const body = args[args.len - 1];
-            if (body.bits != 0 and body.unbox() == .string) try src.appendSlice(arena, body.toPtr().string);
+            try src.appendSlice(arena, try rawToStr(arena, args[args.len - 1]));
         }
         try src.appendSlice(arena, "})");
         // NewTarget [[Prototype]] override for dynamic generator/async-generator
@@ -4363,6 +4400,7 @@ pub const Realm = struct {
         try number_proto.set("[[PrimitiveValue]]", try val_mod.makeNumber(arena, 0));
         try number_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeNumberValueOf, "valueOf", 0));
         try number_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToString, "toString", 0));
+        try number_proto.set("toLocaleString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberProtoToLocaleString, "toLocaleString", 0));
         try number_proto.set("toFixed", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToFixed, "toFixed", 1));
         try number_proto.set("toExponential", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToExponential, "toExponential", 1));
         try number_proto.set("toPrecision", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToPrecision, "toPrecision", 1));
@@ -4589,6 +4627,12 @@ pub const Realm = struct {
         try disposable_stack_mod.registerSymbols(arena);
         try date_mod.registerSymbols(arena);
         try temporal_mod.registerSymbols(arena);
+        // Promise.prototype[@@toStringTag] = "Promise" (ES §27.2.5.5), so
+        // Object.prototype.toString tags a promise "[object Promise]".
+        if (active_sym_to_string_tag) |tag_sym| {
+            if (active_promise_proto) |p|
+                try p.setSymAttr(tag_sym, try val_mod.makeString(arena, "Promise"), .{ .writable = false, .enumerable = false, .configurable = true });
+        }
 
         // Build the shared %IteratorPrototype% → %ArrayIteratorPrototype% chain
         // now that @@iterator / @@toStringTag exist. Array + TypedArray iterators
