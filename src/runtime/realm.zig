@@ -3070,6 +3070,17 @@ fn nativeNumberValueOf(arena: std.mem.Allocator, this_val: Value, _: []const Val
     return val_mod.makeNumber(arena, n);
 }
 
+/// Number.prototype.toLocaleString([locales[, options]]) — ES §21.1.3.4, which
+/// with Intl present is `new Intl.NumberFormat(locales, options).format(this)`.
+/// Composes the two public NumberFormat entry points so grouping and
+/// fraction-digit defaults stay in one place.
+fn nativeNumberProtoToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toLocaleString requires a Number");
+    const nf = try intl_mod.nativeNumberFormatCtor(arena, Value{}, args);
+    return intl_mod.nativeNumberFormatFormat(arena, nf, &[_]Value{try val_mod.makeNumber(arena, n)});
+}
+
+
 const RADIX_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz";
 
 /// Stringify a finite f64 in an arbitrary radix 2..36 (ES Number::toString).
@@ -4375,6 +4386,7 @@ pub const Realm = struct {
         try number_proto.set("[[PrimitiveValue]]", try val_mod.makeNumber(arena, 0));
         try number_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeNumberValueOf, "valueOf", 0));
         try number_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToString, "toString", 0));
+        try number_proto.set("toLocaleString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberProtoToLocaleString, "toLocaleString", 0));
         try number_proto.set("toFixed", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToFixed, "toFixed", 1));
         try number_proto.set("toExponential", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToExponential, "toExponential", 1));
         try number_proto.set("toPrecision", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToPrecision, "toPrecision", 1));
