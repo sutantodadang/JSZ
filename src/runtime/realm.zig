@@ -45,6 +45,7 @@ const shadow_realm_mod = @import("./builtins/shadow_realm.zig");
 const disposable_stack_mod = @import("./builtins/disposable_stack.zig");
 // Phase 13 Intl
 const intl_mod = @import("./builtins/intl.zig");
+const segmenter_mod = @import("./builtins/segmenter.zig");
 const builtinLength = @import("./builtins/builtin_lengths.zig").builtinLength;
 
 // ---------------------------------------------------------------- Context interface ---
@@ -2364,12 +2365,12 @@ fn toNumberCoerce(v: Value) f64 {
 }
 
 fn nativeIsNaN(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const n = if (args.len > 0) toNumberCoerce(args[0]) else std.math.nan(f64);
+    const n = try coercion_mod.toNumberThrowing(arena, if (args.len > 0) args[0] else Value{});
     return val_mod.makeBool(arena, std.math.isNan(n));
 }
 
 fn nativeIsFinite(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const n = if (args.len > 0) toNumberCoerce(args[0]) else std.math.nan(f64);
+    const n = try coercion_mod.toNumberThrowing(arena, if (args.len > 0) args[0] else Value{});
     return val_mod.makeBool(arena, !std.math.isNan(n) and !std.math.isInf(n));
 }
 
@@ -3820,9 +3821,17 @@ fn installGlobalThis(arena: std.mem.Allocator, env: *Environment, object_proto: 
             .{ .writable = true, .enumerable = false, .configurable = true };
         _ = try global_obj.defineOwnData(name, entry.value_ptr.value, attrs);
     }
+    // §19.1.3: `undefined` is a value property of the global object (it is not
+    // an env binding, so the loop above never sees it).
+    _ = try global_obj.defineOwnData("undefined", Value{}, .{ .writable = false, .enumerable = false, .configurable = false });
     const global_val = try val_mod.makeObject(arena, global_obj);
     try env.define("globalThis", global_val);
     try env.define("global", global_val);
+    // globalThis/global are defined after the mirroring loop, so mirror them by
+    // hand (§19.1.1: writable, non-enumerable, configurable).
+    const global_attrs: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+    _ = try global_obj.defineOwnData("globalThis", global_val, global_attrs);
+    _ = try global_obj.defineOwnData("global", global_val, global_attrs);
     active_global_object = global_obj;
 }
 
@@ -4539,9 +4548,9 @@ pub const Realm = struct {
         _ = try boolean_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Boolean"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try boolean_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Boolean", try val_mod.makeObject(arena, boolean_ctor_obj));
-        try env.define("isNaN", try val_mod.makeNativeFunction(arena, nativeIsNaN));
-        try env.define("eval", try val_mod.makeNativeFunction(arena, nativeEval));
-        try env.define("isFinite", try val_mod.makeNativeFunction(arena, nativeIsFinite));
+        try env.define("isNaN", try val_mod.makeNativeFunctionNamed(arena, nativeIsNaN, "isNaN", 1));
+        try env.define("eval", try val_mod.makeNativeFunctionNamed(arena, nativeEval, "eval", 1));
+        try env.define("isFinite", try val_mod.makeNativeFunctionNamed(arena, nativeIsFinite, "isFinite", 1));
         try env.define("parseInt", try val_mod.makeNativeFunctionNamed(arena, nativeParseInt, "parseInt", 2));
         try env.define("parseFloat", try val_mod.makeNativeFunctionNamed(arena, nativeParseFloat, "parseFloat", 1));
         try env.define("encodeURI", try val_mod.makeNativeFunctionNamed(arena, nativeEncodeURI, "encodeURI", 1));
@@ -4790,6 +4799,15 @@ pub const Realm = struct {
             // Intl.Locale (no supportedLocalesOf; ctor length 1)
             const loc_proto = try JsObject.create(arena, object_proto);
             try IntlReg.method(arena, loc_proto, "toString", intl_mod.nativeLocaleToString, 0);
+            try IntlReg.method(arena, loc_proto, "maximize", intl_mod.nativeLocaleMaximize, 0);
+            try IntlReg.method(arena, loc_proto, "minimize", intl_mod.nativeLocaleMinimize, 0);
+            try IntlReg.method(arena, loc_proto, "getCalendars", intl_mod.nativeLocaleGetCalendars, 0);
+            try IntlReg.method(arena, loc_proto, "getCollations", intl_mod.nativeLocaleGetCollations, 0);
+            try IntlReg.method(arena, loc_proto, "getHourCycles", intl_mod.nativeLocaleGetHourCycles, 0);
+            try IntlReg.method(arena, loc_proto, "getNumberingSystems", intl_mod.nativeLocaleGetNumberingSystems, 0);
+            try IntlReg.method(arena, loc_proto, "getTimeZones", intl_mod.nativeLocaleGetTimeZones, 0);
+            try IntlReg.method(arena, loc_proto, "getTextInfo", intl_mod.nativeLocaleGetTextInfo, 0);
+            try IntlReg.method(arena, loc_proto, "getWeekInfo", intl_mod.nativeLocaleGetWeekInfo, 0);
             try intl_mod.registerLocaleAccessors(arena, loc_proto);
             const loc_ctor = try JsObject.create(arena, function_proto);
             try loc_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeLocaleCtor));
@@ -4845,15 +4863,31 @@ pub const Realm = struct {
             _ = try df_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
             _ = try df_ctor.defineOwnData("supportedLocalesOf", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatSupportedLocalesOf, "supportedLocalesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             try intl_obj.set("DurationFormat", try val_mod.makeObject(arena, df_ctor));
-            // Intl.Segmenter (+ the unreachable %Segments%/%SegmentIterator% protos)
-            try intl_mod.registerSegmenterPrototypes(arena, object_proto, es2015_collections_mod.active_iterator_proto);
+            // Intl.Segmenter, plus the two prototypes `segment()` produces. Both
+            // are reachable only through instances (they have no global binding),
+            // so the module keeps them in module-level slots.
             const seg_proto = try JsObject.create(arena, object_proto);
-            try IntlReg.method(arena, seg_proto, "segment", intl_mod.nativeSegmenterSegment, 1);
-            try IntlReg.method(arena, seg_proto, "resolvedOptions", intl_mod.nativeSegmenterResolved, 0);
+            try IntlReg.method(arena, seg_proto, "segment", segmenter_mod.nativeSegmenterSegment, 1);
+            try IntlReg.method(arena, seg_proto, "resolvedOptions", segmenter_mod.nativeSegmenterResolved, 0);
             const seg_ctor = try JsObject.create(arena, function_proto);
-            try seg_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeSegmenterCtor));
+            try seg_ctor.set("__call__", try val_mod.makeNativeFunction(arena, segmenter_mod.nativeSegmenterCtor));
             try IntlReg.finish(arena, seg_ctor, seg_proto, "Segmenter", "Intl.Segmenter", 0, true);
             try intl_obj.set("Segmenter", try val_mod.makeObject(arena, seg_ctor));
+
+            // %SegmentsPrototype% — `containing` plus @@iterator.
+            const segs_proto = try JsObject.create(arena, object_proto);
+            try IntlReg.method(arena, segs_proto, "containing", segmenter_mod.nativeSegmentsContaining, 1);
+            if (active_sym_iterator) |symv|
+                try segs_proto.setSymAttr(symv, try val_mod.makeNativeFunctionNamed(arena, segmenter_mod.nativeSegmentsIterator, "[Symbol.iterator]", 0), .{ .writable = true, .enumerable = false, .configurable = true });
+            segmenter_mod.segments_proto = segs_proto;
+
+            // %SegmentIteratorPrototype% — inherits %IteratorPrototype% so the
+            // segment iterator is itself iterable.
+            const segit_proto = try JsObject.create(arena, es2015_collections_mod.active_iterator_proto orelse object_proto);
+            try IntlReg.method(arena, segit_proto, "next", segmenter_mod.nativeSegmentIteratorNext, 0);
+            if (active_sym_to_string_tag) |tag_sym|
+                _ = try segit_proto.defineOwnDataSym(tag_sym, try val_mod.makeString(arena, "Segmenter String Iterator"), .{ .writable = false, .enumerable = false, .configurable = true });
+            segmenter_mod.segment_iterator_proto = segit_proto;
             // Intl.getCanonicalLocales (static)
             _ = try intl_obj.defineOwnData("getCanonicalLocales", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeGetCanonicalLocales, "getCanonicalLocales", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             // Intl.supportedValuesOf (static)

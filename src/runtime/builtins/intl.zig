@@ -66,6 +66,20 @@ fn optStr(opts: ?Value, key: []const u8) ?[]const u8 {
     return v.unbox().string;
 }
 
+/// Read `key` from an options object and ToString-coerce the result, so numeric
+/// option values (`{ firstDayOfWeek: 1 }`) are accepted alongside strings.
+/// Null when the option is absent or undefined.
+fn optStrCoerced(arena: std.mem.Allocator, opts: ?Value, key: []const u8) anyerror!?[]const u8 {
+    const o = opts orelse return null;
+    if (o.bits == 0 or o.unbox() != .object) return null;
+    const v = if (realm_mod.active_context) |c|
+        try c.getProp(arena, o, key)
+    else
+        (o.toPtr().object.get(key) orelse Value{});
+    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    return try t_shared.valueToString(arena, v);
+}
+
 fn optNum(opts: ?Value, key: []const u8) ?f64 {
     const o = opts orelse return null;
     if (o.bits == 0 or o.unbox() != .object) return null;
@@ -399,7 +413,7 @@ fn unitSymbol(unit: []const u8, long: bool) []const u8 {
     return unit;
 }
 
-fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+pub fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.error_proto_RangeError)
     else
@@ -410,7 +424,7 @@ fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     return error.JsException;
 }
 
-fn throwTypeErrorIntl(arena: std.mem.Allocator, msg: []const u8) anyerror {
+pub fn throwTypeErrorIntl(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)
     else
@@ -527,8 +541,7 @@ pub fn nativeNumberFormatCtor(arena: std.mem.Allocator, this_val: Value, args: [
         this_val.toPtr().object
     else
         try legacyServiceObj(arena, active_number_format_proto);
-    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
-        _ = try canonicalizeTag(arena, t);
+    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
     const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
 
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
@@ -817,7 +830,7 @@ pub fn nativeNumberFormatResolved(arena: std.mem.Allocator, this_val: Value, _: 
     }.f;
     // Property order follows table 12 of §15.4.5 (the resolvedOptions test walks
     // Object.keys in order).
-    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
     try r.set("numberingSystem", try val_mod.makeString(arena, "latn"));
     try r.set("style", try val_mod.makeString(arena, style));
     if (std.mem.eql(u8, style, "currency")) {
@@ -879,6 +892,7 @@ pub fn nativeDateTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
     else
         try legacyServiceObj(arena, active_date_time_format_proto);
 
+    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
     // Component options are stored verbatim (empty string == absent). `format`
     // reads them back off `this`. When no date/time component is requested, the
     // en-US default is a numeric year/month/day (the classic `M/D/YYYY`).
@@ -1500,7 +1514,7 @@ pub fn nativeDateTimeFormatResolved(arena: std.mem.Allocator, this_val: Value, _
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
-    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
     try r.set("calendar", try val_mod.makeString(arena, "gregory"));
     try r.set("numberingSystem", try val_mod.makeString(arena, "latn"));
     if (this_val.bits != 0 and this_val.unbox() == .object) {
@@ -1539,8 +1553,7 @@ pub fn nativeCollatorCtor(arena: std.mem.Allocator, this_val: Value, args: []con
         this_val.toPtr().object
     else
         try legacyServiceObj(arena, active_collator_proto);
-    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
-        _ = try canonicalizeTag(arena, t);
+    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
     // InitializeCollator (§10.1.2) reads the options in this exact order.
     const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
     const usage = (try dnGetOption(arena, options, "usage", &.{ "sort", "search" }, "sort")).?;
@@ -1692,7 +1705,7 @@ pub fn nativeCollatorResolved(arena: std.mem.Allocator, this_val: Value, _: []co
             ignore_punct = v.unbox().boolean;
         };
     }
-    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
     try r.set("usage", try val_mod.makeString(arena, usage));
     try r.set("sensitivity", try val_mod.makeString(arena, sensitivity));
     try r.set("ignorePunctuation", try val_mod.makeBool(arena, ignore_punct));
@@ -1706,19 +1719,92 @@ pub fn nativeCollatorResolved(arena: std.mem.Allocator, this_val: Value, _: []co
 
 /// Parse a BCP-47 language tag into language / script / region subtags.
 /// Extensions and variants are ignored (en-US scope).
-fn parseLocaleTag(tag: []const u8) struct { language: []const u8, script: []const u8, region: []const u8 } {
-    var it = std.mem.splitScalar(u8, tag, '-');
-    const language = it.first();
-    var script: []const u8 = "";
-    var region: []const u8 = "";
-    while (it.next()) |sub| {
-        if (sub.len == 4 and script.len == 0 and isAllAlpha(sub)) {
-            script = sub;
-        } else if ((sub.len == 2 and isAllAlpha(sub)) or (sub.len == 3 and isAllDigit(sub))) {
-            if (region.len == 0) region = sub;
-        }
+const LocaleTagParts = struct {
+    language: []const u8 = "",
+    script: []const u8 = "",
+    region: []const u8 = "",
+    /// The variant subtags of the `unicode_language_id`, as one `-`-joined slice
+    /// of the original tag ("" when the tag carries none).
+    variants: []const u8 = "",
+    /// The body of the `-u-` Unicode locale extension (everything after `-u-`,
+    /// up to the next singleton), "" when the tag carries none.
+    u_ext: []const u8 = "",
+};
+
+/// End offset of the extension sequence starting at `start` — the next
+/// singleton subtag (`-x-`) terminates it, otherwise the end of the tag.
+fn extSeqEnd(tag: []const u8, start: usize) usize {
+    var pos = start;
+    while (pos < tag.len) {
+        const dash = std.mem.indexOfScalarPos(u8, tag, pos, '-') orelse return tag.len;
+        const nxt = dash + 1;
+        const nxt_end = std.mem.indexOfScalarPos(u8, tag, nxt, '-') orelse tag.len;
+        if (nxt_end - nxt == 1) return dash; // a singleton starts the next sequence
+        pos = nxt;
     }
-    return .{ .language = language, .script = script, .region = region };
+    return tag.len;
+}
+
+/// Split a BCP-47 tag into its `unicode_language_id` pieces plus the `-u-`
+/// extension body. The language-id scan stops at the first singleton subtag, so
+/// extension keys like the `fw` of `en-u-fw-mon` are never mistaken for a region.
+fn parseLocaleTag(tag: []const u8) LocaleTagParts {
+    var res = LocaleTagParts{};
+    var pos: usize = 0;
+    var first = true;
+    var var_start: ?usize = null;
+    var var_end: usize = 0;
+    while (pos < tag.len) {
+        const dash = std.mem.indexOfScalarPos(u8, tag, pos, '-') orelse tag.len;
+        const sub = tag[pos..dash];
+        if (first) {
+            res.language = sub;
+            first = false;
+        } else if (sub.len == 1) {
+            if (sub[0] == 'u' or sub[0] == 'U') {
+                const ext_start = @min(dash + 1, tag.len);
+                res.u_ext = tag[ext_start..extSeqEnd(tag, ext_start)];
+            }
+            break;
+        } else if (sub.len == 4 and res.script.len == 0 and var_start == null and isAllAlpha(sub)) {
+            res.script = sub;
+        } else if (res.region.len == 0 and var_start == null and
+            ((sub.len == 2 and isAllAlpha(sub)) or (sub.len == 3 and isAllDigit(sub))))
+        {
+            res.region = sub;
+        } else {
+            if (var_start == null) var_start = pos;
+            var_end = dash;
+        }
+        pos = dash + 1;
+    }
+    if (var_start) |vs| res.variants = tag[vs..var_end];
+    return res;
+}
+
+/// Value of Unicode extension keyword `key` (a two-letter type key) within an
+/// extension body such as `"fw-mon-ca-buddhist"`. Keys are two characters; a
+/// keyword's value runs until the next two-character subtag.
+fn uExtKeyword(u_ext: []const u8, key: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    var val_of: ?[]const u8 = null;
+    var val_start: usize = 0;
+    var val_end: usize = 0;
+    while (pos < u_ext.len) {
+        const dash = std.mem.indexOfScalarPos(u8, u_ext, pos, '-') orelse u_ext.len;
+        const sub = u_ext[pos..dash];
+        if (sub.len == 2) {
+            if (val_of) |k| if (std.ascii.eqlIgnoreCase(k, key)) return u_ext[val_start..val_end];
+            val_of = sub;
+            val_start = @min(dash + 1, u_ext.len);
+            val_end = val_start;
+        } else if (val_of != null) {
+            val_end = dash;
+        }
+        pos = dash + 1;
+    }
+    if (val_of) |k| if (std.ascii.eqlIgnoreCase(k, key) and val_end > val_start) return u_ext[val_start..val_end];
+    return null;
 }
 
 fn isAllAlpha(s: []const u8) bool {
@@ -1831,6 +1917,22 @@ pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     if (try dnGetOption(arena, options_v, "caseFirst", &.{ "upper", "lower", "false" }, null)) |v|
         try obj.set("[[loc_caseFirst]]", try val_mod.makeString(arena, v));
     try obj.set("[[loc_numeric]]", try val_mod.makeBool(arena, (try dnGetBoolOption(arena, options_v, "numeric")) orelse false));
+
+    // Variant subtags (§14.3.7 `variants`): canonical lowercase, `undefined`
+    // when the tag has none.
+    if (parts.variants.len > 0)
+        try obj.set("[[loc_variants]]", try val_mod.makeString(arena, try lowerDup(arena, parts.variants)));
+
+    // `firstDayOfWeek` (§14.1.2): the option wins over the tag's `-u-fw-` keyword.
+    // Both accept a weekday id ("mon".."sun"); the option additionally accepts
+    // 0..7, where 0 and 7 both mean Sunday.
+    const fw_raw: ?[]const u8 = (try optStrCoerced(arena, options_v, "firstDayOfWeek")) orelse uExtKeyword(parts.u_ext, "fw");
+    if (fw_raw) |raw| {
+        const id = weekdayId(raw) orelse
+            return throwRangeError(arena, "invalid firstDayOfWeek value for Intl.Locale");
+        try obj.set("[[loc_firstDayOfWeek]]", try val_mod.makeString(arena, id));
+    }
+
     return val_mod.makeObject(arena, obj);
 }
 
@@ -1846,8 +1948,149 @@ fn stripUnicodeExtension(tag: []const u8) []const u8 {
     return tag;
 }
 
-/// Canonicalize one BCP-47 tag to `language[-Script][-REGION]` form.
-fn canonicalizeTag(arena: std.mem.Allocator, tag: []const u8) ![]const u8 {
+/// The seven weekday ids, indexed by ISO-8601 weekday number minus one
+/// (Monday = 1 … Sunday = 7).
+const weekday_ids = [_][]const u8{ "mon", "tue", "wed", "thu", "fri", "sat", "sun" };
+
+/// Canonical weekday id for a `firstDayOfWeek` value: an id passes through, and
+/// "0".."7" map to a day ("0" and "7" both being Sunday). Null when invalid.
+fn weekdayId(raw: []const u8) ?[]const u8 {
+    for (weekday_ids) |d| if (std.ascii.eqlIgnoreCase(d, raw)) return d;
+    if (raw.len == 1 and raw[0] >= '0' and raw[0] <= '7')
+        return weekday_ids[if (raw[0] == '0') 6 else raw[0] - '1'];
+    return null;
+}
+
+/// ISO-8601 weekday number (Monday = 1 … Sunday = 7) for a canonical id.
+fn weekdayNumber(id: []const u8) f64 {
+    for (weekday_ids, 0..) |d, i| if (std.mem.eql(u8, d, id)) return @floatFromInt(i + 1);
+    return 7;
+}
+
+// ------------------------------------------------- structural tag validation ---
+//
+// IsStructurallyValidLanguageTag (ES §6.2.2) against the UTS-35
+// `unicode_locale_id` grammar:
+//
+//   unicode_locale_id = unicode_language_id extensions* pu_extensions?
+//   unicode_language_id = lang (sep script)? (sep region)? (sep variant)*
+//   lang    = alpha{2,3} | alpha{5,8}      script = alpha{4}
+//   region  = alpha{2} | digit{3}          variant = alnum{5,8} | digit alnum{3}
+//
+// plus the two uniqueness rules: no repeated variant subtag and no repeated
+// extension singleton.
+
+fn allAlnum(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!std.ascii.isAlphanumeric(c)) return false;
+    return true;
+}
+
+fn isVariantSubtag(s: []const u8) bool {
+    if (s.len >= 5 and s.len <= 8) return allAlnum(s);
+    if (s.len == 4) return std.ascii.isDigit(s[0]) and allAlnum(s);
+    return false;
+}
+
+/// Split `tag` on `-`, rejecting a tag with an empty subtag (which also covers
+/// the empty tag, a leading/trailing `-`, and `--`).
+fn tagSubtags(arena: std.mem.Allocator, tag: []const u8) !?[][]const u8 {
+    if (tag.len == 0) return null;
+    // Only ASCII alphanumerics and `-` may appear; this rejects "中文", "en-ß",
+    // "*" and "de-*" before any structural analysis.
+    for (tag) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return null;
+    var out = std.ArrayListUnmanaged([]const u8){};
+    var it = std.mem.splitScalar(u8, tag, '-');
+    while (it.next()) |sub| {
+        if (sub.len == 0) return null;
+        try out.append(arena, sub);
+    }
+    return out.items;
+}
+
+/// True when `tag` matches `unicode_locale_id`.
+pub fn isStructurallyValidLanguageTag(arena: std.mem.Allocator, tag: []const u8) !bool {
+    const subs = (try tagSubtags(arena, tag)) orelse return false;
+    var i: usize = 0;
+
+    // unicode_language_subtag
+    const lang = subs[i];
+    const lang_ok = isAllAlpha(lang) and ((lang.len >= 2 and lang.len <= 3) or (lang.len >= 5 and lang.len <= 8));
+    if (!lang_ok) return false;
+    i += 1;
+
+    // (sep unicode_script_subtag)?
+    if (i < subs.len and subs[i].len == 4 and isAllAlpha(subs[i])) i += 1;
+
+    // (sep unicode_region_subtag)?
+    if (i < subs.len and ((subs[i].len == 2 and isAllAlpha(subs[i])) or (subs[i].len == 3 and isAllDigit(subs[i])))) i += 1;
+
+    // (sep unicode_variant_subtag)* — each may appear at most once.
+    var variants = std.ArrayListUnmanaged([]const u8){};
+    while (i < subs.len and isVariantSubtag(subs[i])) : (i += 1) {
+        for (variants.items) |v| if (std.ascii.eqlIgnoreCase(v, subs[i])) return false;
+        try variants.append(arena, subs[i]);
+    }
+
+    // extensions* pu_extensions? — each singleton may appear at most once, and
+    // each must be followed by at least one subtag of its own.
+    var singletons = std.ArrayListUnmanaged(u8){};
+    while (i < subs.len) {
+        if (subs[i].len != 1) return false; // a non-singleton here is unparsable
+        const singleton = std.ascii.toLower(subs[i][0]);
+        for (singletons.items) |s| if (s == singleton) return false;
+        try singletons.append(arena, singleton);
+        i += 1;
+        const body_start = i;
+        // `x-` private use takes 1..8-character subtags; every other singleton
+        // requires 2..8.
+        const min_len: usize = if (singleton == 'x') 1 else 2;
+        while (i < subs.len and subs[i].len >= min_len and subs[i].len <= 8 and allAlnum(subs[i])) i += 1;
+        if (i == body_start) return false; // singleton with an empty body
+    }
+    return true;
+}
+
+/// The locale this build actually formats in; also the fallback when none of the
+/// requested locales can be served.
+pub const default_locale = "en-US";
+
+/// Approximates `AvailableLocales`. There is no CLDR data here, so a tag counts
+/// as available when its primary language is a two-letter (ISO 639-1) code —
+/// enough to tell a real request like `"sr"` from a nonexistent `"xyz"`.
+fn isAvailableLocale(canon_tag: []const u8) bool {
+    const lang = primaryLanguage(canon_tag);
+    if (lang.len != 2 or !isAllAlpha(lang)) return false;
+    return true;
+}
+
+/// CanonicalizeLocaleList + ResolveLocale for a constructor's `locales`
+/// argument: every tag is validated (RangeError on a malformed one) and the
+/// first servable tag becomes the instance's `[[Locale]]`, stored in a hidden
+/// slot that `resolvedOptions()` reads back.
+pub fn resolveAndStoreLocale(arena: std.mem.Allocator, obj: *JsObject, locales: Value) anyerror!void {
+    const requested = try canonicalizeLocaleList(arena, locales);
+    var chosen: ?[]const u8 = null;
+    for (requested) |t| {
+        const canon = try canonicalizeTag(arena, t);
+        if (chosen == null and isAvailableLocale(canon)) chosen = canon;
+    }
+    try obj.set("[[intl_locale]]", try val_mod.makeString(arena, chosen orelse default_locale));
+}
+
+/// The `[[Locale]]` stored by `resolveAndStoreLocale`, or the default.
+pub fn resolvedLocaleOf(this_val: Value) []const u8 {
+    if (this_val.bits == 0 or this_val.unbox() != .object) return default_locale;
+    const v = this_val.toPtr().object.getOwn("[[intl_locale]]") orelse return default_locale;
+    if (v.bits == 0 or v.unbox() != .string) return default_locale;
+    return v.unbox().string;
+}
+
+/// Canonicalize one BCP-47 tag to `language[-Script][-REGION]` form. A tag that
+/// does not match `unicode_locale_id` is a RangeError (ES §9.2.1 step 7.c).
+pub fn canonicalizeTag(arena: std.mem.Allocator, tag: []const u8) ![]const u8 {
+    if (!try isStructurallyValidLanguageTag(arena, tag))
+        return throwRangeError(arena, "invalid language tag");
     const parts = parseLocaleTag(tag);
     const language = try canonSubtag(arena, parts.language, .lang);
     const script = try canonSubtag(arena, parts.script, .script);
@@ -2105,41 +2348,96 @@ pub fn nativeLocaleMinimize(arena: std.mem.Allocator, this_val: Value, _: []cons
     return makeLocaleFrom(arena, o, lang, if (keep_script) script else "", if (keep_region) region else "");
 }
 
-/// Build the `getX()` list methods (§14.3.5-§14.3.9): a brand check plus a fresh
-/// Array of the values this build supports for the receiver's locale.
-fn locListFn(comptime values: []const []const u8) val_mod.NativeFnPtr {
-    return struct {
-        fn f(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-            _ = try requireLocale(arena, this_val);
-            const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
-            for (values) |v| try arr.appendElement(try val_mod.makeString(arena, v));
-            return val_mod.makeObject(arena, arr);
-        }
-    }.f;
+// ------------------------------------------------------- Intl.Locale-info ---
+//
+// §14.3.8–14.3.14: the locale-information methods. This build carries no CLDR
+// tables, so each returns the structurally correct shape populated from the
+// locale's own subtags plus this implementation's actually-supported values
+// (the same narrow lists `Intl.supportedValuesOf` reports).
+
+/// A fresh Array whose elements are `items`, in the given order.
+fn makeStringArray(arena: std.mem.Allocator, items: []const []const u8) !Value {
+    const arr = if (realm_mod.active_heap) |h|
+        try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
+    else
+        try JsObject.createArray(arena, realm_mod.active_array_proto);
+    for (items, 0..) |item, i|
+        try arr.set(try std.fmt.allocPrint(arena, "{d}", .{i}), try val_mod.makeString(arena, item));
+    return val_mod.makeObject(arena, arr);
 }
 
-/// §14.3.10 getWeekInfo: `{firstDay, weekend, minimalDays}` on %Object.prototype%.
-pub fn nativeLocaleGetWeekInfo(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    _ = try requireLocale(arena, this_val);
+/// Read a `[[loc_*]]` slot as a string, or null when absent/empty.
+fn localeSlotStr(o: *JsObject, slot: []const u8) ?[]const u8 {
+    const v = o.getOwn(slot) orelse return null;
+    if (v.bits == 0 or v.unbox() != .string or v.unbox().string.len == 0) return null;
+    return v.unbox().string;
+}
+
+/// A one-element preference list: the locale's own value for `slot` when it
+/// carries one, else this implementation's single supported `fallback`.
+fn localePrefList(arena: std.mem.Allocator, this_val: Value, slot: []const u8, fallback: []const u8) anyerror!Value {
+    const o = try requireLocale(arena, this_val);
+    return makeStringArray(arena, &[_][]const u8{localeSlotStr(o, slot) orelse fallback});
+}
+
+pub fn nativeLocaleGetCalendars(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return localePrefList(arena, this_val, "[[loc_calendar]]", "gregory");
+}
+pub fn nativeLocaleGetCollations(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return localePrefList(arena, this_val, "[[loc_collation]]", "default");
+}
+pub fn nativeLocaleGetHourCycles(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return localePrefList(arena, this_val, "[[loc_hourCycle]]", "h12");
+}
+pub fn nativeLocaleGetNumberingSystems(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    return localePrefList(arena, this_val, "[[loc_numberingSystem]]", "latn");
+}
+
+/// §14.3.11 `getTimeZones` — undefined for a locale with no region, otherwise a
+/// sorted list of that region's time zones. Without CLDR region data every
+/// region reports UTC, which satisfies the "non-empty and sorted" contract.
+pub fn nativeLocaleGetTimeZones(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const o = try requireLocale(arena, this_val);
+    if (localeSlotStr(o, "[[loc_region]]") == null) return val_mod.makeUndefined(arena);
+    return makeStringArray(arena, &[_][]const u8{"UTC"});
+}
+
+/// §14.3.12 `getTextInfo` — { direction }, where direction is "rtl" for the
+/// right-to-left scripts/languages and "ltr" otherwise.
+pub fn nativeLocaleGetTextInfo(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const o = try requireLocale(arena, this_val);
+    const rtl_scripts = [_][]const u8{ "Adlm", "Arab", "Hebr", "Nkoo", "Rohg", "Syrc", "Thaa", "Yezi" };
+    const rtl_langs = [_][]const u8{ "ar", "he", "fa", "ur", "ps", "sd", "ug", "yi", "dv", "ku", "nqo" };
+    var rtl = false;
+    if (localeSlotStr(o, "[[loc_script]]")) |s| {
+        for (rtl_scripts) |r| if (std.ascii.eqlIgnoreCase(r, s)) {
+            rtl = true;
+        };
+    } else if (localeSlotStr(o, "[[loc_language]]")) |l| {
+        for (rtl_langs) |r| if (std.mem.eql(u8, r, l)) {
+            rtl = true;
+        };
+    }
     const r = try dnEmptyObj(arena);
-    try r.set("firstDay", try val_mod.makeNumber(arena, 7));
-    const weekend = try JsObject.createArray(arena, realm_mod.active_array_proto);
-    try weekend.appendElement(try val_mod.makeNumber(arena, 6));
-    try weekend.appendElement(try val_mod.makeNumber(arena, 7));
-    try r.set("weekend", try val_mod.makeObject(arena, weekend));
-    try r.set("minimalDays", try val_mod.makeNumber(arena, 1));
+    try r.set("direction", try val_mod.makeString(arena, if (rtl) "rtl" else "ltr"));
     return val_mod.makeObject(arena, r);
 }
 
-/// §14.3.11 getTextInfo: `{direction}` on %Object.prototype%.
-pub fn nativeLocaleGetTextInfo(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+/// §14.3.13 `getWeekInfo` — { firstDay, weekend }, both as ISO-8601 weekday
+/// numbers (Monday = 1 … Sunday = 7). `firstDay` honours the locale's
+/// `firstDayOfWeek`; the weekend is the Saturday/Sunday default.
+pub fn nativeLocaleGetWeekInfo(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const o = try requireLocale(arena, this_val);
-    const script = if (o.getOwn("[[loc_script]]")) |v| v.unbox().string else "";
-    const lang = if (o.getOwn("[[loc_language]]")) |v| v.unbox().string else "";
-    const rtl = std.mem.eql(u8, script, "Arab") or std.mem.eql(u8, script, "Hebr") or
-        std.mem.eql(u8, lang, "ar") or std.mem.eql(u8, lang, "he") or std.mem.eql(u8, lang, "fa");
+    const first: f64 = if (localeSlotStr(o, "[[loc_firstDayOfWeek]]")) |id| weekdayNumber(id) else 7;
     const r = try dnEmptyObj(arena);
-    try r.set("direction", try val_mod.makeString(arena, if (rtl) "rtl" else "ltr"));
+    try r.set("firstDay", try val_mod.makeNumber(arena, first));
+    const weekend = if (realm_mod.active_heap) |h|
+        try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
+    else
+        try JsObject.createArray(arena, realm_mod.active_array_proto);
+    try weekend.set("0", try val_mod.makeNumber(arena, 6));
+    try weekend.set("1", try val_mod.makeNumber(arena, 7));
+    try r.set("weekend", try val_mod.makeObject(arena, weekend));
     return val_mod.makeObject(arena, r);
 }
 
@@ -2153,11 +2451,11 @@ pub fn registerLocaleAccessors(arena: std.mem.Allocator, proto: *JsObject) !void
     };
     try M.add(arena, proto, "maximize", nativeLocaleMaximize);
     try M.add(arena, proto, "minimize", nativeLocaleMinimize);
-    try M.add(arena, proto, "getCalendars", locListFn(&.{"gregory"}));
-    try M.add(arena, proto, "getCollations", locListFn(&.{"emoji"}));
-    try M.add(arena, proto, "getHourCycles", locListFn(&.{"h12"}));
-    try M.add(arena, proto, "getNumberingSystems", locListFn(&.{"latn"}));
-    try M.add(arena, proto, "getTimeZones", locListFn(&.{"UTC"}));
+    try M.add(arena, proto, "getCalendars", nativeLocaleGetCalendars);
+    try M.add(arena, proto, "getCollations", nativeLocaleGetCollations);
+    try M.add(arena, proto, "getHourCycles", nativeLocaleGetHourCycles);
+    try M.add(arena, proto, "getNumberingSystems", nativeLocaleGetNumberingSystems);
+    try M.add(arena, proto, "getTimeZones", nativeLocaleGetTimeZones);
     try M.add(arena, proto, "getWeekInfo", nativeLocaleGetWeekInfo);
     try M.add(arena, proto, "getTextInfo", nativeLocaleGetTextInfo);
     try locAccessor(arena, proto, "baseName", "[[loc_baseName]]", false);
@@ -2232,8 +2530,7 @@ fn listElements(arena: std.mem.Allocator, v: Value) ![][]const u8 {
 
 pub fn nativeListFormatCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const obj = try intlNewTarget(arena, this_val, "Intl.ListFormat");
-    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
-        _ = try canonicalizeTag(arena, t);
+    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
     const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
     const typ = (try dnGetOption(arena, options, "type", &.{ "conjunction", "disjunction", "unit" }, "conjunction")).?;
@@ -2330,7 +2627,7 @@ pub fn nativeListFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []
             style = v.unbox().string;
         };
     }
-    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
     try r.set("type", try val_mod.makeString(arena, typ));
     try r.set("style", try val_mod.makeString(arena, style));
     return val_mod.makeObject(arena, r);
@@ -2356,8 +2653,7 @@ fn pluralCategory(n: f64, ordinal: bool) []const u8 {
 
 pub fn nativePluralRulesCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const obj = try intlNewTarget(arena, this_val, "Intl.PluralRules");
-    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
-        _ = try canonicalizeTag(arena, t);
+    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
     const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
     const typ = (try dnGetOption(arena, options, "type", &.{ "cardinal", "ordinal" }, "cardinal")).?;
@@ -2409,7 +2705,7 @@ pub fn nativePluralRulesResolved(arena: std.mem.Allocator, this_val: Value, _: [
             ordinal = std.mem.eql(u8, v.unbox().string, "ordinal");
         };
     }
-    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
     try r.set("type", try val_mod.makeString(arena, if (ordinal) "ordinal" else "cardinal"));
     try r.set("minimumIntegerDigits", try val_mod.makeNumber(arena, 1));
     try r.set("minimumFractionDigits", try val_mod.makeNumber(arena, 0));
@@ -2436,8 +2732,7 @@ fn singularUnit(unit: []const u8) []const u8 {
 
 pub fn nativeRelativeTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const obj = try intlNewTarget(arena, this_val, "Intl.RelativeTimeFormat");
-    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
-        _ = try canonicalizeTag(arena, t);
+    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
     const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
     if (try dnGetOption(arena, options, "numberingSystem", &.{}, null)) |ns| {
@@ -2567,7 +2862,7 @@ pub fn nativeRelativeTimeFormatResolved(arena: std.mem.Allocator, this_val: Valu
             style = v.unbox().string;
         };
     }
-    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
     try r.set("style", try val_mod.makeString(arena, style));
     try r.set("numeric", try val_mod.makeString(arena, numeric));
     try r.set("numberingSystem", try val_mod.makeString(arena, "latn"));
@@ -2733,9 +3028,9 @@ pub fn nativeDisplayNamesCtor(arena: std.mem.Allocator, this_val: Value, args: [
         try dnEmptyObj(arena);
 
     // CanonicalizeLocaleList(locales): walk via HasProperty/[[Get]] (poisoned
-    // length/getters and non-String/Object elements throw) and validate tags.
-    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
-        _ = try canonicalizeTag(arena, t);
+    // length/getters and non-String/Object elements throw), validate every tag
+    // and resolve the one this build will format in.
+    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
 
     // options is required: GetOptionsObject then a required `type`.
     const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
@@ -2773,7 +3068,7 @@ pub fn nativeDisplayNamesResolved(arena: std.mem.Allocator, this_val: Value, _: 
     const o = this_val.toPtr().object;
     const r = try dnEmptyObj(arena);
     const typ = o.getOwn("__dn_type").?.unbox().string;
-    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
     try r.set("style", o.getOwn("__dn_style") orelse try val_mod.makeString(arena, "long"));
     try r.set("type", try val_mod.makeString(arena, typ));
     try r.set("fallback", o.getOwn("__dn_fallback") orelse try val_mod.makeString(arena, "code"));
@@ -2871,6 +3166,7 @@ pub fn nativeDurationFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
 /// `obj`, and return `obj` boxed. Shared by the constructor and
 /// `Temporal.Duration.prototype.toLocaleString`.
 fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerror!Value {
+    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
     const opts: ?Value = if (args.len > 1) args[1] else null;
     if (opts) |ov| {
         if (ov.bits != 0 and ov.unbox() != .undefined_ and ov.unbox() != .object)
@@ -2982,7 +3278,7 @@ fn primaryLanguage(tag: []const u8) []const u8 {
 /// array-like is walked via HasProperty + [[Get]] so a poisoned length/getter
 /// propagates, and a present element that is neither a String nor an Object is a
 /// TypeError.
-fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror![][]const u8 {
+pub fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror![][]const u8 {
     var out = std.ArrayListUnmanaged([]const u8){};
     if (locales.bits == 0 or locales.unbox() == .undefined_) return out.items;
     // ToObject(null) is a TypeError; other primitives box to a wrapper with no
@@ -3018,9 +3314,15 @@ fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror![][
 
 pub fn nativeDurationFormatSupportedLocalesOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const requested = try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{});
-    // Validate the options' localeMatcher (RangeError if malformed).
-    const opts: ?Value = if (args.len > 1) args[1] else null;
-    _ = try dfGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" });
+    // CanonicalizeLocaleList validates every tag (RangeError) before options are
+    // even looked at, so canonicalize the whole list up front.
+    var canonical = try arena.alloc([]const u8, requested.len);
+    for (requested, 0..) |t, i| canonical[i] = try canonicalizeTag(arena, t);
+
+    // SupportedLocales then coerces options to an object and reads (and
+    // validates) localeMatcher through a real [[Get]].
+    const opts = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
+    _ = try dnGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
 
     const arr = if (realm_mod.active_heap) |h|
         try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
@@ -3028,9 +3330,7 @@ pub fn nativeDurationFormatSupportedLocalesOf(arena: std.mem.Allocator, _: Value
         try JsObject.createArray(arena, realm_mod.active_array_proto);
     var seen = std.ArrayListUnmanaged([]const u8){};
     var n: usize = 0;
-    for (requested) |t| {
-        if (t.len == 0) continue;
-        const canon = try canonicalizeTag(arena, t); // throws on invalid
+    for (canonical) |canon| {
         var dup = false;
         for (seen.items) |s| if (std.mem.eql(u8, s, canon)) {
             dup = true;
@@ -3243,7 +3543,7 @@ pub fn nativeDurationFormatResolved(arena: std.mem.Allocator, this_val: Value, _
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
-    try r.set("locale", try val_mod.makeString(arena, "en-US"));
+    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
     try r.set("numberingSystem", try val_mod.makeString(arena, dfReadStr(o, "__df_nu", "latn")));
     try r.set("style", try val_mod.makeString(arena, dfReadStr(o, "__df_style", "short")));
     for (DF_UNITS, 0..) |uname, i| {
@@ -3258,232 +3558,7 @@ pub fn nativeDurationFormatResolved(arena: std.mem.Allocator, this_val: Value, _
     return val_mod.makeObject(arena, r);
 }
 
-// -------------------------------------------------------------------- Segmenter ---
-
-const str_proto = @import("string_proto.zig");
-
-/// One segment of a segmented string: a half-open range in both UTF-16 code
-/// units (what the JS-visible `index` uses) and WTF-8 bytes (what slices use).
-const Segment = struct {
-    cu_start: usize,
-    cu_end: usize,
-    byte_start: usize,
-    byte_end: usize,
-    word_like: bool,
-};
-
-/// Code points that count as "word-like" for `granularity: "word"`: letters,
-/// digits and the connectors that keep a word together. Approximated with
-/// ranges rather than a full UAX-29 word-break table — enough that segments
-/// still reassemble to the input and `isWordLike` is stable per segment.
-fn segIsWordChar(cp: u21) bool {
-    if (cp < 128) return std.ascii.isAlphanumeric(@intCast(cp)) or cp == '_';
-    return switch (cp) {
-        0xA0, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => false, // spaces
-        0x2010...0x2027, 0x2030...0x205E, 0x3001...0x3003, 0x3008...0x3020 => false, // punctuation
-        0xFF01...0xFF0F, 0xFF1A...0xFF20, 0xFF3B...0xFF40, 0xFF5B...0xFF65 => false, // fullwidth punctuation
-        else => true,
-    };
-}
-
-/// Sentence terminators recognized by `granularity: "sentence"`.
-fn segIsSentenceEnd(cp: u21) bool {
-    return switch (cp) {
-        '.', '!', '?', 0x3002, 0xFF01, 0xFF1F, 0x061F, 0x06D4, 0x0964, 0x0965 => true,
-        else => false,
-    };
-}
-
-/// Split `s` into segments for `granularity`. "grapheme" yields one code point
-/// per segment (a base-plus-combining-mark cluster is not merged); "word" and
-/// "sentence" group runs as described above. Segments always tile the input, so
-/// concatenating them reproduces it exactly.
-fn segmentString(arena: std.mem.Allocator, s: []const u8, granularity: []const u8) ![]Segment {
-    var out: std.ArrayList(Segment) = .empty;
-    const is_word = std.mem.eql(u8, granularity, "word");
-    const is_sentence = std.mem.eql(u8, granularity, "sentence");
-    var byte: usize = 0;
-    var cu: usize = 0;
-    var cur: ?Segment = null;
-    var seen_end = false; // sentence: a terminator was passed, break after trailing spaces
-    while (byte < s.len) {
-        var dec = str_proto.decodeWtf8At(s, byte);
-        // A surrogate pair stored as two WTF-8 halves is one code point, not two
-        // segments (`cuLen` counts it as two units either way).
-        if (dec.cp >= 0xD800 and dec.cp <= 0xDBFF and byte + dec.len < s.len) {
-            const lo = str_proto.decodeWtf8At(s, byte + dec.len);
-            if (lo.cp >= 0xDC00 and lo.cp <= 0xDFFF)
-                dec = .{ .cp = 0x10000 + ((dec.cp - 0xD800) << 10) + (lo.cp - 0xDC00), .len = dec.len + lo.len };
-        }
-        const cu_w: usize = if (dec.cp > 0xFFFF) 2 else 1;
-        const wordish = segIsWordChar(dec.cp);
-        const start_new = blk: {
-            if (cur == null) break :blk true;
-            if (is_word) break :blk wordish != cur.?.word_like or !wordish;
-            if (is_sentence) break :blk seen_end and !segIsSentenceEnd(dec.cp) and dec.cp != ' ';
-            break :blk true; // grapheme: one code point per segment
-        };
-        if (start_new) {
-            if (cur) |c| try out.append(arena, c);
-            cur = .{ .cu_start = cu, .cu_end = cu, .byte_start = byte, .byte_end = byte, .word_like = wordish };
-            seen_end = false;
-        }
-        cur.?.cu_end = cu + cu_w;
-        cur.?.byte_end = byte + dec.len;
-        if (is_sentence and segIsSentenceEnd(dec.cp)) seen_end = true;
-        byte += dec.len;
-        cu += cu_w;
-    }
-    if (cur) |c| try out.append(arena, c);
-    return out.items;
-}
-
-/// %SegmentsPrototype% and %SegmentIteratorPrototype%, captured at realm setup.
-var active_segments_proto: ?*JsObject = null;
-var active_segment_iterator_proto: ?*JsObject = null;
-
-pub fn nativeSegmenterCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const obj = try intlNewTarget(arena, this_val, "Intl.Segmenter");
-    for (try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{})) |t|
-        _ = try canonicalizeTag(arena, t);
-    const options = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
-    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
-    const gran = (try dnGetOption(arena, options, "granularity", &.{ "grapheme", "word", "sentence" }, "grapheme")).?;
-    try obj.set("__seg_granularity", try val_mod.makeString(arena, gran));
-    return val_mod.makeObject(arena, obj);
-}
-
-fn segGranularityOf(arena: std.mem.Allocator, this_val: Value, comptime what: []const u8) anyerror![]const u8 {
-    if (this_val.bits == 0 or this_val.unbox() != .object) return throwTypeErrorIntl(arena, what);
-    const v = this_val.toPtr().object.getOwn("__seg_granularity") orelse return throwTypeErrorIntl(arena, what);
-    if (v.bits == 0 or v.unbox() != .string) return throwTypeErrorIntl(arena, what);
-    return v.unbox().string;
-}
-
-pub fn nativeSegmenterResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const gran = try segGranularityOf(arena, this_val, "Intl.Segmenter.prototype.resolvedOptions called on an incompatible receiver");
-    const r = try dnEmptyObj(arena);
-    try r.set("locale", try val_mod.makeString(arena, "en-US"));
-    try r.set("granularity", try val_mod.makeString(arena, gran));
-    return val_mod.makeObject(arena, r);
-}
-
-pub fn nativeSegmenterSegment(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const gran = try segGranularityOf(arena, this_val, "Intl.Segmenter.prototype.segment called on an incompatible receiver");
-    const s = try t_shared.valueToString(arena, if (args.len > 0) args[0] else Value{});
-    const segs = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, active_segments_proto orelse realm_mod.active_object_proto)
-    else
-        try JsObject.create(arena, active_segments_proto orelse realm_mod.active_object_proto);
-    try segs.set("__segments_string", try val_mod.makeString(arena, s));
-    try segs.set("__segments_granularity", try val_mod.makeString(arena, gran));
-    return val_mod.makeObject(arena, segs);
-}
-
-/// CreateSegmentDataObject: `{segment, index, input}` plus `isWordLike` for
-/// word granularity, in that property order.
-fn segDataObject(arena: std.mem.Allocator, s: []const u8, seg: Segment, word_granularity: bool) !Value {
-    const o = try dnEmptyObj(arena);
-    try o.set("segment", try val_mod.makeString(arena, s[seg.byte_start..seg.byte_end]));
-    try o.set("index", try val_mod.makeNumber(arena, @floatFromInt(seg.cu_start)));
-    try o.set("input", try val_mod.makeString(arena, s));
-    if (word_granularity) try o.set("isWordLike", try val_mod.makeBool(arena, seg.word_like));
-    return val_mod.makeObject(arena, o);
-}
-
-fn segSegmentsSlots(arena: std.mem.Allocator, this_val: Value) anyerror!struct { s: []const u8, gran: []const u8, obj: *JsObject } {
-    const msg = "%Segments.prototype% method called on an incompatible receiver";
-    if (this_val.bits == 0 or this_val.unbox() != .object) return throwTypeErrorIntl(arena, msg);
-    const o = this_val.toPtr().object;
-    const sv = o.getOwn("__segments_string") orelse return throwTypeErrorIntl(arena, msg);
-    const gv = o.getOwn("__segments_granularity") orelse return throwTypeErrorIntl(arena, msg);
-    return .{ .s = sv.unbox().string, .gran = gv.unbox().string, .obj = o };
-}
-
-/// %Segments.prototype%.containing(index): the segment covering `index`, or
-/// undefined when the (ToInteger-coerced) index falls outside the string.
-pub fn nativeSegmentsContaining(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const slots = try segSegmentsSlots(arena, this_val);
-    const n = try realm_mod.toNumberValue(arena, if (args.len > 0) args[0] else Value{});
-    const idx_f = if (std.math.isNan(n)) 0 else @trunc(n);
-    if (idx_f < 0 or idx_f >= @as(f64, @floatFromInt(str_proto.cuLen(slots.s)))) return val_mod.makeUndefined(arena);
-    const idx: usize = @intFromFloat(idx_f);
-    const word = std.mem.eql(u8, slots.gran, "word");
-    for (try segmentString(arena, slots.s, slots.gran)) |seg| {
-        if (idx >= seg.cu_start and idx < seg.cu_end) return segDataObject(arena, slots.s, seg, word);
-    }
-    return val_mod.makeUndefined(arena);
-}
-
-/// %Segments.prototype%[@@iterator]: a fresh %SegmentIterator% over the same
-/// string, with its own cursor (spec §18.5.2 / §18.6).
-pub fn nativeSegmentsIterator(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const slots = try segSegmentsSlots(arena, this_val);
-    const it = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, active_segment_iterator_proto orelse realm_mod.active_object_proto)
-    else
-        try JsObject.create(arena, active_segment_iterator_proto orelse realm_mod.active_object_proto);
-    try it.set("__segiter_string", try val_mod.makeString(arena, slots.s));
-    try it.set("__segiter_granularity", try val_mod.makeString(arena, slots.gran));
-    try it.set("__segiter_pos", try val_mod.makeNumber(arena, 0));
-    return val_mod.makeObject(arena, it);
-}
-
-pub fn nativeSegmentIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const msg = "%SegmentIterator.prototype%.next called on an incompatible receiver";
-    if (this_val.bits == 0 or this_val.unbox() != .object) return throwTypeErrorIntl(arena, msg);
-    const o = this_val.toPtr().object;
-    const sv = o.getOwn("__segiter_string") orelse return throwTypeErrorIntl(arena, msg);
-    const gv = o.getOwn("__segiter_granularity") orelse return throwTypeErrorIntl(arena, msg);
-    const pv = o.getOwn("__segiter_pos") orelse return throwTypeErrorIntl(arena, msg);
-    const s = sv.unbox().string;
-    const gran = gv.unbox().string;
-    const pos: usize = @intFromFloat(pv.unbox().number);
-    const res = try dnEmptyObj(arena);
-    const segs = try segmentString(arena, s, gran);
-    // The cursor is a UTF-16 index into the string, so a re-entrant `next()`
-    // (nested-next.js) sees the advance the outer call already made.
-    for (segs) |seg| {
-        if (seg.cu_start < pos) continue;
-        try o.set("__segiter_pos", try val_mod.makeNumber(arena, @floatFromInt(seg.cu_end)));
-        try res.set("value", try segDataObject(arena, s, seg, std.mem.eql(u8, gran, "word")));
-        try res.set("done", try val_mod.makeBool(arena, false));
-        return val_mod.makeObject(arena, res);
-    }
-    try res.set("value", try val_mod.makeUndefined(arena));
-    try res.set("done", try val_mod.makeBool(arena, true));
-    return val_mod.makeObject(arena, res);
-}
-
-/// Build %Segments.prototype% and %SegmentIterator.prototype% (§18.5 / §18.6).
-/// Neither is reachable from `Intl`, so they are only stored in the module.
-pub fn registerSegmenterPrototypes(arena: std.mem.Allocator, object_proto: ?*JsObject, iterator_proto: ?*JsObject) !void {
-    const segs = try JsObject.create(arena, object_proto);
-    _ = try segs.defineOwnData("containing", try val_mod.makeNativeFunctionNamed(arena, nativeSegmentsContaining, "containing", 1), .{ .writable = true, .enumerable = false, .configurable = true });
-    if (realm_mod.active_sym_iterator) |sym|
-        _ = try segs.defineOwnDataSym(sym, try val_mod.makeNativeFunctionNamed(arena, nativeSegmentsIterator, "[Symbol.iterator]", 0), .{ .writable = true, .enumerable = false, .configurable = true });
-    active_segments_proto = segs;
-
-    const it = try JsObject.create(arena, iterator_proto orelse object_proto);
-    _ = try it.defineOwnData("next", try val_mod.makeNativeFunctionNamed(arena, nativeSegmentIteratorNext, "next", 0), .{ .writable = true, .enumerable = false, .configurable = true });
-    if (realm_mod.active_sym_to_string_tag) |tag|
-        _ = try it.defineOwnDataSym(tag, try val_mod.makeString(arena, "Segmenter String Iterator"), .{ .writable = false, .enumerable = false, .configurable = true });
-    active_segment_iterator_proto = it;
-}
-
 // ----------------------------------------------------------------------- tests ---
-
-test "intl: segmentString tiles the input" {
-    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_inst.deinit();
-    const a = arena_inst.allocator();
-    for ([_][]const u8{ "grapheme", "word", "sentence" }) |g| {
-        const text = "Hi there! Foo bar? xy";
-        var joined = std.ArrayListUnmanaged(u8){};
-        for (try segmentString(a, text, g)) |seg| try joined.appendSlice(a, text[seg.byte_start..seg.byte_end]);
-        try std.testing.expectEqualStrings(text, joined.items);
-    }
-}
 
 test "intl: formatNumber decimal grouping" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -87,10 +87,13 @@ pub fn toPrimitive(arena: std.mem.Allocator, v: Value, hint: Hint) anyerror!?Val
 
     // 1. Exotic @@toPrimitive hook.
     if (realm_mod.active_sym_to_primitive) |sym| {
-        const hook: ?Value = if (obj) |o|
-            getSymMethod(o, sym)
-        else if (realm_mod.active_context) |ctx|
+        // GetMethod is a real [[Get]], so an accessor-defined @@toPrimitive must
+        // run its getter (and propagate a throw from it). Only without a context
+        // to route through does this fall back to reading the raw slot.
+        const hook: ?Value = if (realm_mod.active_context) |ctx|
             try ctx.getPropSym(arena, v, sym)
+        else if (obj) |o|
+            getSymMethod(o, sym)
         else
             null;
         if (hook) |method| {
@@ -171,4 +174,39 @@ pub fn ordinaryToPrimitive(arena: std.mem.Allocator, v: Value, string_first: boo
 
     // 3. No user-defined conversion applies; caller uses its default.
     return null;
+}
+
+/// ES 7.1.4 ToNumber, spec-faithful: runs `@@toPrimitive`/`valueOf`/`toString`
+/// on objects and PROPAGATES throws, and rejects Symbol/BigInt with a TypeError
+/// instead of silently yielding NaN (which `realm.toNumberValue` does).
+pub fn toNumberThrowing(arena: std.mem.Allocator, v: Value) anyerror!f64 {
+    if (v.bits == 0) return std.math.nan(f64); // undefined
+    switch (v.unbox()) {
+        .symbol => {
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "Cannot convert a Symbol value to a number");
+            return error.JsException;
+        },
+        .bigint => {
+            realm_mod.pending_exception = try makeTypeErrorVal(arena, "Cannot convert a BigInt value to a number");
+            return error.JsException;
+        },
+        .object, .function, .native_function, .bc_function => {
+            // `null` here means the object exposes no callable valueOf/toString
+            // at all, which ToPrimitive reports as a TypeError.
+            const prim = (try toPrimitive(arena, v, .number)) orelse {
+                realm_mod.pending_exception = try makeTypeErrorVal(arena, "Cannot convert object to primitive value");
+                return error.JsException;
+            };
+            if (!isPrimitive(prim)) {
+                realm_mod.pending_exception = try makeTypeErrorVal(arena, "Cannot convert object to primitive value");
+                return error.JsException;
+            }
+            return toNumberThrowing(arena, prim);
+        },
+        .boolean => |b| return if (b) 1 else 0,
+        .number => |n| return n,
+        .null_ => return 0,
+        .undefined_ => return std.math.nan(f64),
+        .string => |s| return val_mod.jsStringToNumber(s),
+    }
 }
