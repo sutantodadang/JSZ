@@ -478,15 +478,19 @@ const PrivateRewriter = struct {
 /// Returns false only on allocation failure.
 fn manglePrivateNames(p: *Parser, parsed: *ClassBodyParse) bool {
     var raw = std.ArrayList([]const u8){};
+    // Dedupe: an instance and a static element, or a `get #x`/`set #x` pair,
+    // spell the same private name and must map to the same mangled key.
     for (parsed.fields) |f| {
         if (f.computed_key == null and isPrivateName(f.name)) {
-            for (raw.items) |r| if (std.mem.eql(u8, r, f.name)) break;
-            raw.append(p.arena, f.name) catch return false;
+            var seen = false;
+            for (raw.items) |r| {
+                if (std.mem.eql(u8, r, f.name)) seen = true;
+            }
+            if (!seen) raw.append(p.arena, f.name) catch return false;
         }
     }
     for (parsed.members) |m| {
         if (m.computed_key == null and isPrivateName(m.name)) {
-            // A `get #x` / `set #x` pair is one private name; dedupe.
             var seen = false;
             for (raw.items) |r| {
                 if (std.mem.eql(u8, r, m.name)) seen = true;

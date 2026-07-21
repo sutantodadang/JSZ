@@ -223,7 +223,6 @@ pub fn lowerWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     self.pending_label = null;
     // Completion value: a loop's value starts fresh at `undefined`.
     try self.resetCompletion(line);
-    const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
     const loop_start = self.currentOffset();
 
     const rcond = try self.compileExpr(ws.test_);
@@ -234,10 +233,7 @@ pub fn lowerWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     const patch_exit = self.currentOffset();
     try self.emitI16(0);
 
-    // Save the completion value at the start of this iteration so a
-    // `continue` (an empty completion) can revert to it.
-    try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
     try self.compileStmt(ws.body, last_expr_reg);
 
     // Jump back to loop start (continue lands here too: re-eval cond).
@@ -257,11 +253,9 @@ pub fn lowerDoWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) err
     const loop_lbl = self.pending_label;
     self.pending_label = null;
     try self.resetCompletion(line);
-    const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
     const loop_start = self.currentOffset();
 
-    try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
     try self.compileStmt(dw.body, last_expr_reg);
 
     // continue in a do-while jumps to the condition test.
@@ -307,7 +301,6 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     }
 
     try self.resetCompletion(line);
-    const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
     const loop_start = self.currentOffset();
     var patch_exit: ?usize = null;
 
@@ -320,8 +313,7 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         try self.emitI16(0);
     }
 
-    try self.saveLoopPrev(prev_reg, line);
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len });
     try self.compileStmt(fs.body, last_expr_reg);
 
     // continue in a for-loop runs the update expression, then re-tests.
@@ -714,12 +706,10 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             self.sp = riter + 1;
         }
         const rstep = self.allocReg();
-        // Completion value: a loop's value starts fresh at `undefined`; prev_reg
-        // holds the value at the start of each iteration so a `continue` (an empty
-        // completion) reverts to it. No-op outside implicit-return compilation.
+        // Completion value: a loop's value starts fresh at `undefined`. No-op
+        // outside implicit-return (completion-value) compilation.
         try self.resetCompletion(line);
-        const prev_reg: ?u8 = if (self.completion_reg != null) self.allocReg() else null;
-        // Permanent registers (riter, rstep, prev_reg) sit below iter_sp; the
+        // Permanent registers (riter, rstep) sit below iter_sp; the
         // per-iteration temporaries above it are reclaimed each pass.
         const iter_sp = self.sp;
         const loop_start = self.currentOffset();
@@ -807,8 +797,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         // it; `continue` jumps to loop_start, which advances the iterator (re-calls
         // __iterStep__) before the next done-check. scope_depth is the depth
         // *outside* the per-iteration scope so break/continue unwind it.
-        try self.saveLoopPrev(prev_reg, line);
-        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .prev_reg = prev_reg, .scope_depth = outer_depth, .finally_depth = self.finally_stack.items.len });
+        try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = outer_depth, .finally_depth = self.finally_stack.items.len });
         try self.compileStmt(fo.body, last_expr_reg);
         if (is_lexical_loopvar) {
             try self.emitOp(.EXIT_SCOPE, line);

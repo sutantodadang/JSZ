@@ -326,11 +326,6 @@ pub fn withHasBinding(self: *BcVm, wobj: Value, key: Value, name: []const u8) !b
     return !val_mod.toBoolean(blocked);
 }
 
-/// `with`-scope resolution: search the frame's with-object stack (innermost
-/// last) for the first object that provides a binding for `name` (HasBinding);
-/// return its value via [[Get]]. Returns null when no with-object provides the
-/// binding (the caller then falls back to the lexical/global scope). Only the
-/// HasProperty/@@unscopables/Get of a matching object runs user code.
 /// The first with-object in `frame.with_stack[lo..hi]` (searched innermost-first)
 /// that provides a binding for `name`, or null. Splitting the stack lets callers
 /// consult the frame's OWN with-scopes before its environment and the ones
