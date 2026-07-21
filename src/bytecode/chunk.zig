@@ -481,6 +481,15 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
                 try writer.print(" R{d} = R{d}[K{d}]", .{ rdst, robj, kidx });
             }
         },
+        .SET_FN_NAME => {
+            const rfn = code[new_pc];
+            new_pc += 1;
+            const rkey = code[new_pc];
+            new_pc += 1;
+            const prefix = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d}.name = R{d} (prefix {d})", .{ rfn, rkey, prefix });
+        },
         .SET_PROP_DYN => {
             const robj = code[new_pc];
             new_pc += 1;

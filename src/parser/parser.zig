@@ -32,6 +32,16 @@ pub const ParamParse = struct {
     expected_argc: u16 = 0,
 };
 
+/// ToString of a NumericLiteral PropertyName (§13.2.5.5): the spec's
+/// Number::toString, so `0.0000001` keys "1e-7" and `1e21` keys "1e+21" — not
+/// Zig's `{d}` formatting.
+pub fn numericPropertyKey(p: *Parser, n: f64) ?[]const u8 {
+    return @import("../value/value.zig").formatNumber(p.arena, n) catch {
+        p.had_error = true;
+        return null;
+    };
+}
+
 /// Check if first statement of body is "use strict" directive.
 /// Hoisted to file scope so stmt/expr/class modules can call it without
 /// going through the Parser struct.

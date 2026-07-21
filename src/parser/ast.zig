@@ -306,6 +306,10 @@ pub const ObjectProp = struct {
     /// ES6 computed key `{ [expr]: value }`: the key is evaluated at runtime
     /// (may yield a symbol). `null` for ordinary static keys.
     computed_key: ?*Node = null,
+    /// IsAnonymousFunctionDefinition(value) — the value is a function/class/arrow
+    /// literal with no binding name, so NamedEvaluation applies. Only meaningful
+    /// together with `computed_key`, where the name is not known until runtime.
+    anon_value: bool = false,
 };
 
 /// Phase 3a: object literal { key: value, ... }

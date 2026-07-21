@@ -857,16 +857,7 @@ pub fn parseObjectPattern(p: *Parser) ?*Node {
         } else if (p.check(.number)) {
             const n = p.current.value_num;
             _ = p.advance();
-            key = if (n == @trunc(n) and n >= 0 and n < 1e15)
-                std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch {
-                    p.had_error = true;
-                    return null;
-                }
-            else
-                std.fmt.allocPrint(p.arena, "{d}", .{n}) catch {
-                    p.had_error = true;
-                    return null;
-                };
+            key = parser_file.numericPropertyKey(p, n) orelse return null;
         } else if (p.check(.identifier)) {
             key = p.current.value_str;
             _ = p.advance();
@@ -1723,16 +1714,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             } else if (p.check(.number)) {
                 const n = p.current.value_num;
                 _ = p.advance();
-                mkey = if (n == @trunc(n) and n >= 0 and n < 1e15)
-                    std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch {
-                        p.had_error = true;
-                        return null;
-                    }
-                else
-                    std.fmt.allocPrint(p.arena, "{d}", .{n}) catch {
-                        p.had_error = true;
-                        return null;
-                    };
+                mkey = parser_file.numericPropertyKey(p, n) orelse return null;
             } else {
                 const kn = @tagName(p.current.kind);
                 if (kn.len > 3 and std.mem.eql(u8, kn[0..3], "kw_")) {
@@ -1779,7 +1761,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 p.had_error = true;
                 return null;
             };
-            props.append(p.arena, ast.ObjectProp{ .key = mkey, .value = am_fn, .kind = .init, .computed_key = ckey }) catch {
+            props.append(p.arena, ast.ObjectProp{ .key = mkey, .value = am_fn, .kind = .init, .computed_key = ckey, .anon_value = true }) catch {
                 p.had_error = true;
                 return null;
             };
@@ -1817,7 +1799,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     p.had_error = true;
                     return null;
                 };
-                props.append(p.arena, ast.ObjectProp{ .key = "", .value = cm_fn, .kind = .init, .computed_key = key_expr }) catch {
+                props.append(p.arena, ast.ObjectProp{ .key = "", .value = cm_fn, .kind = .init, .computed_key = key_expr, .anon_value = true }) catch {
                     p.had_error = true;
                     return null;
                 };
@@ -1825,8 +1807,15 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 continue;
             }
             _ = p.expect(.colon) orelse return null;
+            // IsAnonymousFunctionDefinition — see the static-key path below.
+            const canon_class = p.check(.kw_class) and p.peekNext().kind != .identifier;
             const cval = p.parseAssignmentExpr() orelse return null;
-            props.append(p.arena, ast.ObjectProp{ .key = "", .value = cval, .kind = .init, .computed_key = key_expr }) catch {
+            const canon_value = switch (cval.kind) {
+                .function_expr => cval.data.function_expr.name == null,
+                .call_expr => canon_class,
+                else => false,
+            };
+            props.append(p.arena, ast.ObjectProp{ .key = "", .value = cval, .kind = .init, .computed_key = key_expr, .anon_value = canon_value }) catch {
                 p.had_error = true;
                 return null;
             };
@@ -1846,19 +1835,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             const n = p.current.value_num;
             _ = p.advance();
             // Simple integer check.
-            if (n == @trunc(n) and n >= 0 and n < 1e15) {
-                const s = std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch {
-                    p.had_error = true;
-                    return null;
-                };
-                key = s;
-            } else {
-                const s = std.fmt.allocPrint(p.arena, "{d}", .{n}) catch {
-                    p.had_error = true;
-                    return null;
-                };
-                key = s;
-            }
+            key = parser_file.numericPropertyKey(p, n) orelse return null;
         } else {
             // Reserved words are valid IdentifierNames as property keys (ES5+).
             const kn = @tagName(p.current.kind);
@@ -1904,10 +1881,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             } else if (p.check(.number)) {
                 const n = p.current.value_num;
                 _ = p.advance();
-                aname = if (n == @trunc(n) and n >= 0 and n < 1e15)
-                    std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch { p.had_error = true; return null; }
-                else
-                    std.fmt.allocPrint(p.arena, "{d}", .{n}) catch { p.had_error = true; return null; };
+                aname = parser_file.numericPropertyKey(p, n) orelse return null;
             } else {
                 p.had_error = true;
                 p.error_info = parser_file.ParseError{ .message = "expected accessor name", .line = p.current.line, .column = p.current.column };
@@ -1916,9 +1890,20 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             const acc_params = p.parseFunctionParams() orelse return null;
             p.super_used = false;
             const acc_body = p.parseFunctionBody() orelse return null;
+            // SetFunctionName(closure, propKey, "get"/"set") — a static accessor
+            // key is known here, so name the function at parse time. `is_method`
+            // keeps the compiler from overwriting it with a NamedEvaluation hint.
+            const acc_fn_name: ?[]const u8 = if (acc_computed_key != null)
+                null
+            else
+                std.fmt.allocPrint(p.arena, "{s} {s}", .{ if (acc_kind == .get) "get" else "set", aname }) catch {
+                    p.had_error = true;
+                    return null;
+                };
             const acc_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
-                    .name = null,
+                    .name = acc_fn_name,
+                    .is_method = true,
                     .params = acc_params.params,
                     .param_defaults = acc_params.param_defaults,
                     .expected_argc = acc_params.expected_argc,
@@ -2019,9 +2004,19 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
         // the parser's anonymous-name hint, which parseClassExpr consumes.
         const set_class_hint = p.check(.kw_class) and p.export_default_name_hint == null;
         if (set_class_hint) p.export_default_name_hint = key;
+        // IsAnonymousFunctionDefinition. A class expression has desugared into an
+        // IIFE by the time it lands here, so its anonymity is sampled from the
+        // token stream up front; a function/arrow literal is recognizable after
+        // the fact by its null name.
+        const anon_class = p.check(.kw_class) and p.peekNext().kind != .identifier;
         const val_node = p.parseAssignmentExpr() orelse return null;
         if (set_class_hint) p.export_default_name_hint = null;
-        props.append(p.arena, ast.ObjectProp{ .key = key, .value = val_node, .kind = .init }) catch {
+        const anon_value = switch (val_node.kind) {
+            .function_expr => val_node.data.function_expr.name == null,
+            .call_expr => anon_class,
+            else => false,
+        };
+        props.append(p.arena, ast.ObjectProp{ .key = key, .value = val_node, .kind = .init, .anon_value = anon_value }) catch {
             p.had_error = true;
             return null;
         };

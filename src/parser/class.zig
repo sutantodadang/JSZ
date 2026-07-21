@@ -189,14 +189,7 @@ fn nextTokenEndsName(p: *Parser) bool {
 /// Parse the body of a class (`{` already consumed). Consumes the closing `}`.
 /// ToString of a NumericLiteral property name (mirrors the object-literal path).
 fn numericKeyString(p: *Parser, n: f64) ?[]const u8 {
-    const s = if (n == @trunc(n) and n >= 0 and n < 1e15)
-        std.fmt.allocPrint(p.arena, "{d}", .{@as(i64, @intFromFloat(n))})
-    else
-        std.fmt.allocPrint(p.arena, "{d}", .{n});
-    return s catch {
-        p.had_error = true;
-        return null;
-    };
+    return parser_file.numericPropertyKey(p, n);
 }
 
 /// Handles `static`, `get`/`set` accessors, and computed `[expr]` keys.

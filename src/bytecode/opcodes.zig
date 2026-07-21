@@ -333,6 +333,13 @@ pub const Op = enum(u8) {
     /// read *and* written (`o[k] += v`, `o[k]++`), so the user coercion runs
     /// exactly once. Declared last (JIT ordinal stability).
     TO_PROPERTY_KEY,
+    /// SET_FN_NAME | 4 | op, Rfn u8, Rkey u8, prefix u8 (0 none / 1 get / 2 set).
+    /// SetFunctionName for a NamedEvaluation whose name is only known at runtime
+    /// — an object-literal (or class) member with a computed key. A string key
+    /// names the function directly; a symbol key names it "[description]" (or ""
+    /// when the symbol has none). No-op unless R[Rfn] is a closure that is still
+    /// anonymous. Declared last (JIT ordinal stability).
+    SET_FN_NAME,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -436,6 +443,7 @@ pub fn instrSize(op: Op) usize {
         .DEFINE_LOCAL => 4,
         .SYNC_ANNEXB_FN => 3,
         .TO_PROPERTY_KEY => 3,
+        .SET_FN_NAME => 4,
         .IN => 4,
         .DELETE_PROP => 4,
         .CALL_SPREAD => 5,

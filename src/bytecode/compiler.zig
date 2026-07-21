@@ -1959,7 +1959,25 @@ pub const FnCompiler = struct {
             // set dynamically (handles symbol keys).
             if (prop.computed_key) |key_node| {
                 const rkey = try self.compileExpr(key_node);
+                // ToPropertyKey runs before the value is evaluated (§13.2.5.5
+                // PropertyDefinitionEvaluation), and the resolved key is also
+                // what NamedEvaluation names an anonymous value after.
+                try self.emitOp(.TO_PROPERTY_KEY, line);
+                try self.emitU8(rkey);
+                try self.emitU8(rkey);
                 const rval = try self.compileExpr(prop.value);
+                // NamedEvaluation with a runtime key: `{ [k]: function(){} }`,
+                // `{ get [k]() {} }`.
+                if (prop.anon_value or prop.kind != .init) {
+                    try self.emitOp(.SET_FN_NAME, line);
+                    try self.emitU8(rval);
+                    try self.emitU8(rkey);
+                    try self.emitU8(switch (prop.kind) {
+                        .get => @as(u8, 1),
+                        .set => @as(u8, 2),
+                        else => @as(u8, 0),
+                    });
+                }
                 if (prop.kind == .init) {
                     try self.emitOp(.SET_PROP_DYN, line);
                     try self.emitU8(robj);

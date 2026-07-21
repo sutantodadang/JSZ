@@ -26,14 +26,22 @@ const string_proto = @import("../../runtime/builtins/string_proto.zig");
 /// callers' dedicated branches and never reach here.
 fn toPropertyKeyString(self: *BcVm, key_val: Value) ![]const u8 {
     if (key_val.bits != 0 and bcv.isObjectOperand(key_val)) {
-        if (try @import("../../runtime/builtins/coercion.zig").toPrimitive(self.arena, key_val, .string)) |p| {
-            // ToPrimitive may yield a Symbol (via @@toPrimitive); such a key is a
-            // symbol property, which the callers' symbol branch owns — but the
-            // string form is the only channel here, so fall through to it.
-            return bcv.valueToStringArena(self.arena, p);
-        }
+        // ToPrimitive may yield a Symbol (via @@toPrimitive); such a key is a
+        // symbol property, which the callers' symbol branch owns — but the
+        // string form is the only channel here, so fall through to it.
+        const p = try coercePropertyKey(self, key_val);
+        return bcv.valueToStringArena(self.arena, p);
     }
     return bcv.valueToStringArena(self.arena, key_val);
+}
+
+/// ToPrimitive(v, string) for an object, throwing the spec TypeError when no
+/// callable toString/valueOf produced a primitive (OrdinaryToPrimitive step 6).
+fn coercePropertyKey(self: *BcVm, v: Value) !Value {
+    if (try @import("../../runtime/builtins/coercion.zig").toPrimitive(self.arena, v, .string)) |p| return p;
+    const exc = try self.makeErrorObjectBc("TypeError", "Cannot convert object to primitive value");
+    @import("../../runtime/realm.zig").pending_exception = exc;
+    return error.JsException;
 }
 
 /// TO_PROPERTY_KEY — materialize a member Reference's [[ReferencedName]] once.
@@ -50,19 +58,53 @@ pub inline fn opToPropertyKey(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         frame.registers[rdst] = sv;
         return null;
     }
-    const prim = @import("../../runtime/builtins/coercion.zig").toPrimitive(self.arena, sv, .string) catch |e| {
+    const prim = coercePropertyKey(self, sv) catch |e| {
         if (e != error.JsException) return e;
         if (try self.raisePendingException("error in ToPropertyKey")) |oc| return oc;
         return null;
     };
-    const key_val = if (prim) |p| blk: {
-        // A @@toPrimitive that yields a Symbol produces a symbol key verbatim;
-        // anything else stringifies.
-        if (p.bits != 0 and p.unbox() == .symbol) break :blk p;
-        break :blk try val_mod.makeString(self.arena, try bcv.valueToStringArena(self.arena, p));
-    } else sv;
+    // A @@toPrimitive that yields a Symbol produces a symbol key verbatim;
+    // anything else stringifies.
+    const key_val = if (prim.bits != 0 and prim.unbox() == .symbol)
+        prim
+    else
+        try val_mod.makeString(self.arena, try bcv.valueToStringArena(self.arena, prim));
     // Re-fetch: the coercion may have appended frames and reallocated the slice.
     self.frames.items[self.frames.items.len - 1].registers[rdst] = key_val;
+    return null;
+}
+
+/// SET_FN_NAME — SetFunctionName for a runtime-computed NamedEvaluation key.
+pub inline fn opSetFnName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rfn = code[frame.pc];
+    frame.pc += 1;
+    const rkey = code[frame.pc];
+    frame.pc += 1;
+    const prefix = code[frame.pc];
+    frame.pc += 1;
+    const fn_val = frame.registers[rfn];
+    if (fn_val.bits == 0 or fn_val.unbox() != .bc_function) return null;
+    const closure = fn_val.unbox().bc_function;
+    // Only a still-anonymous function is named; a `function f(){}` value keeps
+    // its own name even when it is the value of a computed-key property.
+    if ((closure.func.name orelse "").len != 0) return null;
+    const key_val = frame.registers[rkey];
+    const base: []const u8 = if (key_val.bits == 0)
+        ""
+    else switch (key_val.unbox()) {
+        // A symbol key names the function "[description]", or "" when it has none.
+        .symbol => |sd| if (sd.description) |d| try std.fmt.allocPrint(self.arena, "[{s}]", .{d}) else "",
+        .string => |s| s,
+        else => try bcv.valueToStringArena(self.arena, key_val),
+    };
+    const full = switch (prefix) {
+        1 => try std.fmt.allocPrint(self.arena, "get {s}", .{base}),
+        2 => try std.fmt.allocPrint(self.arena, "set {s}", .{base}),
+        else => base,
+    };
+    const o = try self.closureBackingObj(closure);
+    _ = try o.defineOwnDataForced("name", try val_mod.makeString(self.arena, full), .{ .writable = false, .enumerable = false, .configurable = true });
     return null;
 }
 

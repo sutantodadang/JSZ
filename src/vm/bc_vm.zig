@@ -1383,6 +1383,7 @@ pub const BcVm = struct {
                 .DEFINE_LOCAL => if (try load_ops.opDefineLocal(self, frame)) |o| return o,
                 .SYNC_ANNEXB_FN => if (try load_ops.opSyncAnnexBFn(self, frame)) |o| return o,
                 .TO_PROPERTY_KEY => if (try property_ops.opToPropertyKey(self, frame)) |o| return o,
+                .SET_FN_NAME => if (try property_ops.opSetFnName(self, frame)) |o| return o,
                 .GET_LOCAL => if (try load_ops.opGetLocal(self, frame)) |o| return o,
                 .SET_LOCAL => if (try load_ops.opSetLocal(self, frame)) |o| return o,
                 .ADD => if (try arith_ops.opAdd(self, frame)) |o| return o,
