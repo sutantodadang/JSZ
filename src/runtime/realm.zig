@@ -247,6 +247,13 @@ fn nativeObjectCreate(arena: std.mem.Allocator, _: Value, args: []const Value) a
     switch (args[0].unbox()) {
         .object => |obj| proto = obj,
         .null_ => proto = null,
+        // A callable IS an Object; it just isn't a `.object` value here. Resolve
+        // it to its backing object so `Object.create(someFunction)` links the
+        // chain instead of throwing (mirrors Object.setPrototypeOf).
+        .bc_function, .function, .native_function => proto = if (active_context) |ctx|
+            (try ctx.backingObject(arena, args[0]))
+        else
+            null,
         else => return throwTypeError(arena, "Object prototype may only be an Object or null"),
     }
     // Allocate on the active heap if available, otherwise fallback to arena.
@@ -3335,7 +3342,9 @@ fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []con
             "Array"
         else if (obj.internal_kind == .mapped_arguments)
             "Arguments"
-        else if (obj.get("__call__") != null)
+        else if (obj.get("__call__") != null or obj.internal_kind == .bound_function)
+            // A bound function is callable but carries no `__call__` slot, so it
+            // needs its own check to get the reserved "Function" tag.
             "Function"
         else if (obj.is_error)
             "Error"
@@ -3446,16 +3455,18 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
         try src.append(arena, '(');
         try src.appendSlice(arena, keyword);
         try src.appendSlice(arena, " anonymous(");
+        // CreateDynamicFunction ToString's every argument, in order: a non-string
+        // parameter name or body used to be dropped silently, which shifted the
+        // remaining parameters onto a stray comma and made the source unparsable.
         if (args.len > 1) {
             for (args[0 .. args.len - 1], 0..) |a, i| {
                 if (i > 0) try src.append(arena, ',');
-                if (a.bits != 0 and a.unbox() == .string) try src.appendSlice(arena, a.toPtr().string);
+                try src.appendSlice(arena, try rawToStr(arena, a));
             }
         }
         try src.appendSlice(arena, "){");
         if (args.len > 0) {
-            const body = args[args.len - 1];
-            if (body.bits != 0 and body.unbox() == .string) try src.appendSlice(arena, body.toPtr().string);
+            try src.appendSlice(arena, try rawToStr(arena, args[args.len - 1]));
         }
         try src.appendSlice(arena, "})");
         // NewTarget [[Prototype]] override for dynamic generator/async-generator
