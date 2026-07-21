@@ -777,6 +777,25 @@ pub const BcVm = struct {
         for (stmts) |node| collectEvalVarNamesNode(node, out, arena);
     }
 
+    /// The global object seen from `env`'s scope chain (`globalThis`), or null
+    /// when the chain has no usable one (a bare/partial realm).
+    fn globalObjectForEnv(self: *BcVm, env: *Environment) !?*JsObject {
+        _ = self;
+        const gt = env.lookup("globalThis") catch return null;
+        if (gt.bits == 0 or gt.unbox() != .object) return null;
+        return gt.toPtr().object;
+    }
+
+    /// ES §9.1.1.4.16 CanDeclareGlobalFunction: a top-level function declaration
+    /// may claim `name` on the global object when the property is absent (and the
+    /// object is extensible), configurable, or an enumerable+writable data
+    /// property. `NaN`/`Infinity`/`undefined` fail all three.
+    fn canDeclareGlobalFunction(gobj: *JsObject, name: []const u8) bool {
+        const attr = gobj.ownAttr(name) orelse return gobj.extensible;
+        if (attr.configurable) return true;
+        return !attr.is_accessor and attr.writable and attr.enumerable;
+    }
+
     fn collectEvalVarNamesNode(node: *@import("../parser/ast.zig").Node, out: *std.ArrayList([]const u8), arena: std.mem.Allocator) void {
         switch (node.kind) {
             .var_decl => {
@@ -847,23 +866,58 @@ pub const BcVm = struct {
             self.frames.items[self.frames.items.len - 1].this_val
         else
             Value{};
-        // A top-level `var` whose name collides with a lexical (`let`/`const`)
-        // binding in the immediately-enclosing scope is a SyntaxError
-        // (EvalDeclarationInstantiation) — eval must not create a var binding
-        // that a lexical declaration would shadow. `outer_env` is the caller's
-        // own scope for a direct eval and the global scope for an indirect one,
-        // so the same check covers both without crossing function boundaries.
-        {
+        const eval_is_strict = parser_mod.hasUseStrict(stmts) or p.strict;
+        // EvalDeclarationInstantiation (§19.2.1.3) validates the whole declaration
+        // set BEFORE creating any binding, so a rejected declaration leaves no
+        // trace of the ones that would have preceded it.
+        if (!eval_is_strict) {
             var var_names = std.ArrayList([]const u8){};
             collectEvalVarNames(stmts, &var_names, self.arena);
-            for (var_names.items) |vn| {
-                if (outer_env.hasOwnLexical(vn)) {
-                    realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", "Identifier has already been declared");
-                    return error.JsException;
+            // Step 5.d: a top-level `var` whose name collides with a lexical
+            // (`let`/`const`) binding anywhere between the eval's LexicalEnvironment
+            // and its VariableEnvironment is a SyntaxError — eval must not create a
+            // var binding that a lexical declaration would shadow. Only sloppy eval
+            // shares the enclosing var scope; a strict eval confines its `var`s to
+            // its own scope and so can never conflict.
+            {
+                var scope: ?*Environment = outer_env;
+                while (scope) |s| {
+                    for (var_names.items) |vn| {
+                        if (s.hasOwnLexical(vn)) {
+                            realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", "Identifier has already been declared");
+                            return error.JsException;
+                        }
+                    }
+                    if (s.is_var_scope) break;
+                    scope = s.parent;
+                }
+            }
+            // Steps 5.a / 8 / 12: when the VariableEnvironment is the global
+            // environment record, every name must be declarable on the global
+            // object (CanDeclareGlobalFunction / CanDeclareGlobalVar) or the whole
+            // instantiation throws a TypeError before running any code.
+            if (outer_env.varScope().parent == null) {
+                if (try self.globalObjectForEnv(outer_env)) |gobj| {
+                    var fn_names = std.ArrayList([]const u8){};
+                    for (stmts) |node| {
+                        if (node.kind == .function_decl)
+                            fn_names.append(self.arena, node.data.function_decl.name) catch {};
+                    }
+                    for (fn_names.items) |fname| {
+                        if (!canDeclareGlobalFunction(gobj, fname)) {
+                            realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot declare global function");
+                            return error.JsException;
+                        }
+                    }
+                    for (var_names.items) |vn| {
+                        if (!gobj.hasOwn(vn) and !gobj.extensible) {
+                            realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot declare global variable");
+                            return error.JsException;
+                        }
+                    }
                 }
             }
         }
-        const eval_is_strict = parser_mod.hasUseStrict(stmts) or p.strict;
         const prog = ast_mod.Program{ .body = stmts, .is_strict = eval_is_strict };
         const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<eval>");
         // Eval's top-level `var`/function declarations belong to the calling
