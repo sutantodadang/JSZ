@@ -779,8 +779,7 @@ pub const BcVm = struct {
 
     /// The global object seen from `env`'s scope chain (`globalThis`), or null
     /// when the chain has no usable one (a bare/partial realm).
-    fn globalObjectForEnv(self: *BcVm, env: *Environment) !?*JsObject {
-        _ = self;
+    fn globalObjectForEnv(env: *Environment) ?*JsObject {
         const gt = env.lookup("globalThis") catch return null;
         if (gt.bits == 0 or gt.unbox() != .object) return null;
         return gt.toPtr().object;
@@ -897,14 +896,13 @@ pub const BcVm = struct {
             // object (CanDeclareGlobalFunction / CanDeclareGlobalVar) or the whole
             // instantiation throws a TypeError before running any code.
             if (outer_env.varScope().parent == null) {
-                if (try self.globalObjectForEnv(outer_env)) |gobj| {
-                    var fn_names = std.ArrayList([]const u8){};
+                if (globalObjectForEnv(outer_env)) |gobj| {
+                    // Only *top-level* function declarations use
+                    // CreateGlobalFunctionBinding; a block-nested one is an Annex
+                    // B.3.3 var binding and is covered by the var loop below.
                     for (stmts) |node| {
-                        if (node.kind == .function_decl)
-                            fn_names.append(self.arena, node.data.function_decl.name) catch {};
-                    }
-                    for (fn_names.items) |fname| {
-                        if (!canDeclareGlobalFunction(gobj, fname)) {
+                        if (node.kind != .function_decl) continue;
+                        if (!canDeclareGlobalFunction(gobj, node.data.function_decl.name)) {
                             realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot declare global function");
                             return error.JsException;
                         }

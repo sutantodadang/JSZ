@@ -1734,18 +1734,46 @@ fn canonSubtag(arena: std.mem.Allocator, s: []const u8, kind: enum { lang, scrip
 }
 
 pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const tag_raw: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) args[0].unbox().string else "";
-    if (tag_raw.len == 0) return throwRangeError(arena, "invalid language tag");
-    const opts: ?Value = if (args.len > 1) args[1] else null;
+    const constructing = realm_mod.active_constructing;
+    realm_mod.active_constructing = false;
+    if (!constructing) return throwTypeErrorIntl(arena, "Constructor Intl.Locale requires 'new'");
+    // §14.1.2 step 7: a String tag is used as-is, an Intl.Locale re-uses its
+    // [[Locale]], any other object is ToString'd, and a non-object primitive is
+    // a TypeError.
+    const arg0 = if (args.len > 0) args[0] else Value{};
+    const tag_raw: []const u8 = blk: {
+        if (arg0.bits != 0 and arg0.unbox() == .string) break :blk arg0.unbox().string;
+        if (arg0.bits != 0 and arg0.unbox() == .object) {
+            const o = arg0.toPtr().object;
+            if (o.getOwn("[[loc_baseName]]")) |_| {
+                if (o.getOwn("__locale_tag")) |t| break :blk t.unbox().string;
+            }
+            break :blk try t_shared.valueToString(arena, arg0);
+        }
+        return throwTypeErrorIntl(arena, "Intl.Locale: tag must be a string or an object");
+    };
+    if (!dnValidLanguageId(stripUnicodeExtension(tag_raw))) return throwRangeError(arena, "invalid language tag");
+    const options_v = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
 
     const parts = parseLocaleTag(tag_raw);
-    const language = try canonSubtag(arena, parts.language, .lang);
+    var language = try canonSubtag(arena, parts.language, .lang);
     var script = try canonSubtag(arena, parts.script, .script);
     var region = try canonSubtag(arena, parts.region, .region);
 
-    // Options override subtags (Intl.Locale second argument).
-    if (optStr(opts, "script")) |s| script = try canonSubtag(arena, s, .script);
-    if (optStr(opts, "region")) |s| region = try canonSubtag(arena, s, .region);
+    // ApplyOptionsToTag: each subtag option must be structurally valid on its
+    // own before it replaces the one parsed out of the tag.
+    if (try dnGetOption(arena, options_v, "language", &.{}, null)) |v| {
+        if (!dnIsLangSubtag(v)) return throwRangeError(arena, "invalid language option");
+        language = try canonSubtag(arena, v, .lang);
+    }
+    if (try dnGetOption(arena, options_v, "script", &.{}, null)) |v| {
+        if (!dnIsScript(v)) return throwRangeError(arena, "invalid script option");
+        script = try canonSubtag(arena, v, .script);
+    }
+    if (try dnGetOption(arena, options_v, "region", &.{}, null)) |v| {
+        if (!dnIsRegion(v)) return throwRangeError(arena, "invalid region option");
+        region = try canonSubtag(arena, v, .region);
+    }
 
     // baseName = language[-script][-region]
     var bn = std.ArrayListUnmanaged(u8){};
@@ -1777,13 +1805,34 @@ pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     // ApplyUnicodeExtensionToTag): reflect ca/co/nu/hourCycle/caseFirst when
     // supplied so `new Intl.Locale(tag, {calendar}).calendar` round-trips. The
     // value is lower-cased (canonical `type` form). Absent options stay absent.
-    if (optStr(opts, "calendar")) |s| try obj.set("[[loc_calendar]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "collation")) |s| try obj.set("[[loc_collation]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "numberingSystem")) |s| try obj.set("[[loc_numberingSystem]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "hourCycle")) |s| try obj.set("[[loc_hourCycle]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    if (optStr(opts, "caseFirst")) |s| try obj.set("[[loc_caseFirst]]", try val_mod.makeString(arena, try lowerDup(arena, s)));
-    try obj.set("[[loc_numeric]]", try val_mod.makeBool(arena, optBool(opts, "numeric") orelse false));
+    for ([_][2][]const u8{
+        .{ "calendar", "[[loc_calendar]]" },
+        .{ "collation", "[[loc_collation]]" },
+        .{ "numberingSystem", "[[loc_numberingSystem]]" },
+    }) |pair| {
+        if (try dnGetOption(arena, options_v, pair[0], &.{}, null)) |v| {
+            if (!isWellFormedNumberingSystem(v)) return throwRangeError(arena, "invalid Unicode extension value");
+            try obj.set(pair[1], try val_mod.makeString(arena, try lowerDup(arena, v)));
+        }
+    }
+    if (try dnGetOption(arena, options_v, "hourCycle", &.{ "h11", "h12", "h23", "h24" }, null)) |v|
+        try obj.set("[[loc_hourCycle]]", try val_mod.makeString(arena, v));
+    if (try dnGetOption(arena, options_v, "caseFirst", &.{ "upper", "lower", "false" }, null)) |v|
+        try obj.set("[[loc_caseFirst]]", try val_mod.makeString(arena, v));
+    try obj.set("[[loc_numeric]]", try val_mod.makeBool(arena, (try dnGetBoolOption(arena, options_v, "numeric")) orelse false));
     return val_mod.makeObject(arena, obj);
+}
+
+/// Drop a `-u-…`/`-x-…` extension sequence so the leading `unicode_language_id`
+/// can be validated on its own.
+fn stripUnicodeExtension(tag: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i + 2 < tag.len) : (i += 1) {
+        if (tag[i] != '-') continue;
+        if (tag[i + 2] != '-') continue;
+        return tag[0..i];
+    }
+    return tag;
 }
 
 /// Canonicalize one BCP-47 tag to `language[-Script][-REGION]` form.
@@ -2110,6 +2159,8 @@ pub fn registerLocaleAccessors(arena: std.mem.Allocator, proto: *JsObject) !void
     try locAccessor(arena, proto, "caseFirst", "[[loc_caseFirst]]", true);
     try locAccessor(arena, proto, "numberingSystem", "[[loc_numberingSystem]]", true);
     try locAccessor(arena, proto, "numeric", "[[loc_numeric]]", false);
+    try locAccessor(arena, proto, "variants", "[[loc_variants]]", true);
+    try locAccessor(arena, proto, "firstDayOfWeek", "[[loc_firstDayOfWeek]]", true);
 }
 
 // ------------------------------------------------------------------- ListFormat ---
