@@ -1174,21 +1174,31 @@ pub const BcVm = struct {
         {
             const sym_binding = nr.global_env.bindings.get("Symbol");
             const sym_val = if (sym_binding) |b| b.value else Value{};
-            if (sym_val.bits != 0 and sym_val.unbox() == .object) {
+            // The primary realm's Symbol object supplies every well-known symbol
+            // (ES §6.1.5.1: they are shared by ALL realms of an agent, not just
+            // the four the species/iterator machinery needs internally).
+            const primary_sym_val = blk: {
+                const b = self.realm.global_env.bindings.get("Symbol") orelse break :blk Value{};
+                break :blk b.value;
+            };
+            const primary_sym_obj: ?*JsObject = if (primary_sym_val.bits != 0 and primary_sym_val.unbox() == .object)
+                primary_sym_val.toPtr().object
+            else
+                null;
+            if (sym_val.bits != 0 and sym_val.unbox() == .object and primary_sym_obj != null) {
                 const sym_obj = sym_val.toPtr().object;
                 // Direct-slot overwrite bypasses non-writable/non-configurable guard.
-                inline for (.{
-                    .{ "species", realm_mod.active_sym_species },
-                    .{ "iterator", realm_mod.active_sym_iterator },
-                    .{ "toStringTag", realm_mod.active_sym_to_string_tag },
-                    .{ "toPrimitive", realm_mod.active_sym_to_primitive },
-                }) |entry| {
-                    if (entry[1]) |primary_sym| {
-                        if (sym_obj.shape.key_to_slot.get(entry[0])) |slot| {
-                            if (slot < sym_obj.slots.items.len) {
-                                sym_obj.slots.items[slot] = primary_sym;
-                                sym_obj.gcWrite(primary_sym);
-                            }
+                for ([_][]const u8{
+                    "iterator",     "asyncIterator", "hasInstance", "isConcatSpreadable",
+                    "match",        "matchAll",      "replace",     "search",
+                    "split",        "species",       "toPrimitive", "toStringTag",
+                    "unscopables",  "dispose",       "asyncDispose",
+                }) |wk_name| {
+                    const primary_sym = primary_sym_obj.?.getOwn(wk_name) orelse continue;
+                    if (sym_obj.shape.key_to_slot.get(wk_name)) |slot| {
+                        if (slot < sym_obj.slots.items.len) {
+                            sym_obj.slots.items[slot] = primary_sym;
+                            sym_obj.gcWrite(primary_sym);
                         }
                     }
                 }

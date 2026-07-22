@@ -2341,22 +2341,8 @@ fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Va
 /// ES ToNumber that coerces objects via ToPrimitive(number) and throws on
 /// Symbol / BigInt (used by fromCodePoint's RangeError validation).
 pub fn toNumberCheckedRealm(arena: std.mem.Allocator, v: Value) anyerror!f64 {
-    if (v.bits == 0) return std.math.nan(f64);
-    switch (v.unbox()) {
-        .number => |n| return n,
-        .boolean => |b| return if (b) 1 else 0,
-        .null_ => return 0,
-        .undefined_ => return std.math.nan(f64),
-        .string => |s| return val_mod.jsStringToNumber(s),
-        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
-        .bigint => return throwTypeError(arena, "Cannot convert a BigInt value to a number"),
-        .object => {
-            const prim = (try coercion_mod.toPrimitive(arena, v, .number)) orelse return std.math.nan(f64);
-            if (prim.bits != 0 and prim.unbox() == .object) return std.math.nan(f64);
-            return toNumberCheckedRealm(arena, prim);
-        },
-        else => return std.math.nan(f64),
-    }
+    // An object with no callable valueOf/toString is a TypeError, not NaN.
+    return coercion_mod.toNumberThrowing(arena, v);
 }
 
 /// String.fromCodePoint(...codePoints): each argument must be a non-negative
@@ -2992,6 +2978,9 @@ fn numberPrimitive(arena: std.mem.Allocator, arg: Value) anyerror!f64 {
         .string => |s| val_mod.jsStringToNumber(s),
         .null_ => 0,
         .undefined_ => std.math.nan(f64),
+        // ToNumeric(Symbol) is a TypeError even for `Number(sym)` (only BigInt
+        // gets the special Number() carve-out above).
+        .symbol => throwTypeError(arena, "Cannot convert a Symbol value to a number"),
         .object => blk: {
             // ToNumber(ToPrimitive(arg, "number")) when a user hook applies.
             if (try coercion_mod.toPrimitive(arena, arg, .number)) |prim|
@@ -3269,8 +3258,10 @@ fn numberToRadixString(arena: std.mem.Allocator, n: f64, radix: i32) ![]const u8
 fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toString requires a Number");
     var radix: i32 = 10;
-    if (args.len > 0 and args[0].bits != 0) {
-        const r_raw = args[0].toF64();
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_) {
+        // ToIntegerOrInfinity(radix) is a real ToNumber: an abrupt valueOf and a
+        // Symbol/BigInt radix must surface instead of silently becoming NaN → 0.
+        const r_raw = try toNumberCheckedRealm(arena, args[0]);
         const r_int: f64 = if (std.math.isNan(r_raw)) 0 else @trunc(r_raw);
         if (r_int < 2 or r_int > 36) return throwRangeError(arena, "toString() radix must be between 2 and 36");
         radix = @intFromFloat(r_int);
@@ -4588,7 +4579,7 @@ pub const Realm = struct {
         // Number.prototype is itself a Number object with [[NumberData]] = +0.
         try number_proto.set("[[PrimitiveValue]]", try val_mod.makeNumber(arena, 0));
         try number_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeNumberValueOf, "valueOf", 0));
-        try number_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToString, "toString", 0));
+        try number_proto.set("toString", try val_mod.makeNativeFunctionNamedLen(arena, nativeNumberToString, "toString", 1));
         try number_proto.set("toLocaleString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberProtoToLocaleString, "toLocaleString", 0));
         try number_proto.set("toFixed", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToFixed, "toFixed", 1));
         try number_proto.set("toExponential", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToExponential, "toExponential", 1));
@@ -4682,6 +4673,10 @@ pub const Realm = struct {
         try env.define("isFinite", try val_mod.makeNativeFunctionNamed(arena, nativeIsFinite, "isFinite", 1));
         try env.define("parseInt", try val_mod.makeNativeFunctionNamed(arena, nativeParseInt, "parseInt", 2));
         try env.define("parseFloat", try val_mod.makeNativeFunctionNamed(arena, nativeParseFloat, "parseFloat", 1));
+        // §21.1.2.12-13: Number.parseInt/parseFloat are the SAME function objects
+        // as the global parseInt/parseFloat, so `Number.parseInt === parseInt`.
+        _ = try number_ctor_obj.defineOwnData("parseInt", try env.lookup("parseInt"), num_method_attr);
+        _ = try number_ctor_obj.defineOwnData("parseFloat", try env.lookup("parseFloat"), num_method_attr);
         try env.define("encodeURI", try val_mod.makeNativeFunctionNamed(arena, nativeEncodeURI, "encodeURI", 1));
         try env.define("encodeURIComponent", try val_mod.makeNativeFunctionNamed(arena, nativeEncodeURIComponent, "encodeURIComponent", 1));
         try env.define("decodeURI", try val_mod.makeNativeFunctionNamed(arena, nativeDecodeURI, "decodeURI", 1));
