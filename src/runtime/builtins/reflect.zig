@@ -1053,7 +1053,7 @@ pub fn nativeReflectApply(arena: std.mem.Allocator, _: Value, args: []const Valu
 pub fn isConstructorVal(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
-        .bc_function => true,
+        .bc_function => |cl| cl.isConstructor(),
         .native_function => false,
         .object => |o| blk: {
             // A bound function is a constructor iff its target is (§10.4.1.2).

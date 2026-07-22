@@ -157,9 +157,13 @@ pub fn ordinaryToPrimitive(arena: std.mem.Allocator, v: Value, string_first: boo
         if (isPrimitive(res)) return res;
     }
 
-    // When the object had a callable `valueOf`/`toString` but neither produced a
-    // primitive, ToPrimitive throws a TypeError (ES OrdinaryToPrimitive step 5).
-    if (had_callable) {
+    // OrdinaryToPrimitive step 5 throws whenever no method yielded a primitive —
+    // including `{valueOf: null, toString: null}`, where neither was callable at
+    // all. Both lookups have to have been real [[Get]]s for that to be sound, so
+    // the no-context case (a function value whose methods live on a VM-side
+    // backing object we cannot reach from here) still falls back to the caller's
+    // default instead.
+    if (had_callable or (obj != null and realm_mod.active_context != null)) {
         realm_mod.pending_exception = try makeTypeErrorVal(arena, "Cannot convert object to primitive value");
         return error.JsException;
     }

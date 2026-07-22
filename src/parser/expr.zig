@@ -216,6 +216,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
                 .is_arrow = true,
                 .is_async = false,
                 .is_strict = is_strict,
+                .expected_argc = arrowExpectedArgc(left),
                 .source_text = p.sourceSlice(left.start, p.prev_end),
             },
         });
@@ -379,6 +380,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
                 .is_arrow = true,
                 .is_async = is_async_arrow,
                 .is_strict = is_strict,
+                .expected_argc = arrowExpectedArgc(left),
                 .source_text = p.sourceSlice(src_start, p.prev_end),
             },
         });
@@ -417,6 +419,27 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         });
     }
     return left;
+}
+
+/// ExpectedArgumentCount for an arrow's cover-grammar parameter list: the count
+/// of formals before the first one carrying an initializer, and before the rest
+/// parameter (§15.3.1 / §15.1.5). It has to be read off the cover grammar here —
+/// the defaults are desugared into the body prelude, so by the time the
+/// `function_expr` node exists `param_defaults` is empty.
+fn arrowExpectedArgc(lhs: *Node) u16 {
+    return switch (lhs.kind) {
+        .identifier, .array_literal, .object_literal => 1,
+        .assignment_expr, .spread_expr => 0,
+        .sequence_expr => blk: {
+            var n: u16 = 0;
+            for (lhs.data.sequence_expr.exprs) |e| switch (e.kind) {
+                .assignment_expr, .spread_expr => break :blk n,
+                else => n += 1,
+            };
+            break :blk n;
+        },
+        else => 0,
+    };
 }
 
 pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {

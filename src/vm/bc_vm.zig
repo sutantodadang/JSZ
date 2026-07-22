@@ -594,7 +594,11 @@ pub const BcVm = struct {
             return error.JsException;
         }
         switch (ctor.unbox()) {
-            .bc_function => {
+            .bc_function => |cl| {
+                if (!cl.isConstructor()) {
+                    realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                    return error.JsException;
+                }
                 const proto = try self.protoFromNewTarget(new_target, ctor, self.realm.object_prototype);
                 const new_obj = if (self.heap) |heap|
                     try JsObject.createOnHeap(heap, proto)
@@ -1645,7 +1649,7 @@ pub const BcVm = struct {
             .bc_function => {
                 // Generators and async functions are not constructors (spec 15.5.2 / 15.6.2).
                 const cl = callee_val.toPtr().bc_function;
-                if (cl.func.is_generator or cl.func.is_async) {
+                if (!cl.isConstructor()) {
                     self.last_exception_value = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
                     return "__js_exception__";
                 }
@@ -4708,6 +4712,51 @@ pub const BcVm = struct {
         if (prim.bits != 0 and prim.unbox() == .symbol)
             return self.throwTypeErr("Cannot convert a Symbol value to a number");
         return val_mod.makeNumber(self.arena, toNumber(prim));
+    }
+
+    /// The binary operators driven by ApplyStringOrNumericBinaryOperator, minus
+    /// `+` (which also has a string case — see `jsAdd`) and `**` (see `expOp`).
+    pub const NumericOp = enum { sub, mul, div, mod, band, bor, bxor, shl, shr, ushr };
+
+    /// ApplyStringOrNumericBinaryOperator for an operand pair that is not a pair
+    /// of plain numbers. Both sides are ToNumeric'd — i.e. ToPrimitive'd —
+    /// *before* the Number-vs-BigInt decision, so `Object(1n) & 2n` behaves as
+    /// `1n & 2n` rather than reporting a mixed-type TypeError.
+    pub fn numericBinaryOp(self: *BcVm, lv: Value, rv: Value, op: NumericOp) !Value {
+        const l = try self.toNumeric(lv);
+        const r = try self.toNumeric(rv);
+        const l_big = l.unbox() == .bigint;
+        const r_big = r.unbox() == .bigint;
+        if (l_big != r_big)
+            return self.throwTypeErr("Cannot mix BigInt and other types, use explicit conversions");
+        if (l_big) return switch (op) {
+            .sub => self.bigIntArithChecked(l, r, .sub),
+            .mul => self.bigIntArithChecked(l, r, .mul),
+            .div => self.bigIntArithChecked(l, r, .div),
+            .mod => self.bigIntArithChecked(l, r, .mod),
+            .band => self.bigIntBitChecked(l, r, .band),
+            .bor => self.bigIntBitChecked(l, r, .bor),
+            .bxor => self.bigIntBitChecked(l, r, .bxor),
+            .shl => self.bigIntBitChecked(l, r, .shl),
+            .shr => self.bigIntBitChecked(l, r, .shr),
+            .ushr => self.throwTypeErr("BigInts have no unsigned right shift, use >> instead"),
+        };
+        const ln = toNumber(l);
+        const rn = toNumber(r);
+        const shift: u5 = @intCast(toUint32(r) & 0x1F);
+        const num: f64 = switch (op) {
+            .sub => ln - rn,
+            .mul => ln * rn,
+            .div => ln / rn,
+            .mod => jsRemainder(ln, rn),
+            .band => @floatFromInt(toInt32(l) & toInt32(r)),
+            .bor => @floatFromInt(toInt32(l) | toInt32(r)),
+            .bxor => @floatFromInt(toInt32(l) ^ toInt32(r)),
+            .shl => @floatFromInt(toInt32(l) << shift),
+            .shr => @floatFromInt(toInt32(l) >> shift),
+            .ushr => @floatFromInt(@as(u32, @bitCast(toInt32(l))) >> shift),
+        };
+        return val_mod.makeNumber(self.arena, num);
     }
 
     /// Exponentiation runtime semantics (ES sec-exp-operator). ToNumeric both

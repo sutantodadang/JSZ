@@ -119,6 +119,14 @@ pub const BcClosure = struct {
     /// `with_stack` below its own entries; empty for the common case.
     with_scopes: []const @import("../value/value.zig").Value = &.{},
 
+    /// IsConstructor: only ordinary function literals have a [[Construct]].
+    /// Arrows, concise methods (incl. accessors), generators and async
+    /// functions are callable but `new f()` on them is a TypeError.
+    pub fn isConstructor(self: *const BcClosure) bool {
+        const f = self.func;
+        return !f.is_arrow and !f.is_method and !f.is_generator and !f.is_async;
+    }
+
     /// The `.name` this function reports, honouring a runtime SetFunctionName.
     pub fn effectiveName(self: *const BcClosure) []const u8 {
         return self.name_override orelse (self.func.name orelse "");

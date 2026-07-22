@@ -61,6 +61,19 @@ fn nullishReadThrow(self: *BcVm, obj_val: Value, key_desc: []const u8) !?RunOutc
     return null;
 }
 
+/// PutValue on a property Reference does `? ToObject(V.[[Base]])` before any
+/// [[Set]], so assigning through a `null`/`undefined` base is a TypeError — and
+/// it happens *after* the right-hand side has been evaluated.
+fn nullishWriteThrow(self: *BcVm, obj_val: Value, key_desc: []const u8) !?RunOutcome {
+    const kind: []const u8 = if (obj_val.isNull()) "null" else "undefined";
+    const msg = try std.fmt.allocPrint(self.arena, "Cannot set properties of {s} (setting '{s}')", .{ kind, key_desc });
+    const exc = try self.makeErrorObjectBc("TypeError", msg);
+    self.last_exception_value = exc;
+    const found = try self.throwException(exc);
+    if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc } };
+    return null;
+}
+
 pub inline fn opGetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const site_pc = frame.pc - 1;
@@ -312,6 +325,7 @@ pub inline fn opSetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const key = key_val.toPtr().string;
     const obj_val = frame.registers[robj];
     const val = frame.registers[rval];
+    if (obj_val.isNullish()) return nullishWriteThrow(self, obj_val, key);
     // A static-key `#x = v` write is a PrivateElement [[Set]]. Handle the private
     // accessor case here (invoke its setter, or TypeError when it has none);
     // everything else (a new field → PrivateFieldAdd, or updating an existing
@@ -516,6 +530,15 @@ pub inline fn opSetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const obj_val = frame.registers[robj];
     const key_val = frame.registers[rkey];
     const val = frame.registers[rval];
+    if (obj_val.isNullish()) {
+        // As on the read side, do not coerce the key for the message — that
+        // would run a user `toString` that PutValue never reaches.
+        const key_desc: []const u8 = if (key_val.bits != 0 and key_val.unbox() == .string)
+            key_val.toPtr().string
+        else
+            "";
+        return nullishWriteThrow(self, obj_val, key_desc);
+    }
     if (key_val.bits != 0 and key_val.unbox() == .string) {
         const key = key_val.toPtr().string;
         const set_dyn_func = frame.func;
