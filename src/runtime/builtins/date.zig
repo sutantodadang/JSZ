@@ -302,7 +302,7 @@ fn applyResult(arena: std.mem.Allocator, dd: *DateData, result: ?i64) !Value {
     return val_mod.makeNumber(arena, std.math.nan(f64));
 }
 
-fn getDateData(this_val: Value) ?*DateData {
+pub fn getDateData(this_val: Value) ?*DateData {
     if (this_val.bits == 0) return null;
     const inner = this_val.unbox();
     if (inner != .object) return null;
