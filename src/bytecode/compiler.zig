@@ -131,6 +131,12 @@ pub const FnCompiler = struct {
     has_param_init: bool = false,
     /// M14: this function literal is an arrow (no own `arguments`/`this`).
     is_arrow: bool = false,
+    /// How many statements at the front of the body are the desugared formal
+    /// parameter initializers (see applyParamDefaults). Code lowered from them
+    /// is still parameter-scope code for §19.2.1.3's purposes.
+    param_init_stmts: usize = 0,
+    /// True while lowering one of those leading `param_init_stmts` statements.
+    in_param_default: bool = false,
     /// M14: the body read an identifier named `arguments`. Combined with
     /// `!is_arrow` this drives BcFunction.uses_arguments.
     saw_arguments: bool = false,
@@ -2680,6 +2686,12 @@ pub const FnCompiler = struct {
             std.mem.eql(u8, c.callee.data.identifier, "eval"))
         {
             try self.emitOp(.MARK_DIRECT_EVAL, line);
+            // A direct eval in a formal-parameter initializer cannot declare
+            // `var arguments`: the parameter scope of a non-arrow function
+            // already binds that name (§19.2.1.3 step 5.d). An arrow has no
+            // `arguments` binding of its own, so the eval is fine there.
+            if (self.in_param_default and !self.is_arrow)
+                try self.emitOp(.MARK_PARAM_EVAL, line);
             // The eval'd source can introduce a binding that shadows one an
             // assignment in this body already resolved, so identifier writes
             // here must go through a Reference captured before the RHS ran.
@@ -2923,7 +2935,12 @@ pub const FnCompiler = struct {
         var last_other_reg: ?u8 = null;
         const reclaim_floor: u8 = if (self.completion_reg) |cr| cr + 1 else 0;
 
-        for (body) |stmt| {
+        for (body, 0..) |stmt, stmt_idx| {
+            // Parameter-initializer code reaches the body two ways: the parser's
+            // default-parameter TDZ desugar (flagged on the `let` it emits) and
+            // `applyParamDefaults` below (a leading run of synthetic statements).
+            self.in_param_default = stmt_idx < self.param_init_stmts or
+                (stmt.kind == .var_decl and stmt.data.var_decl.param_init);
             // Reclaim register from previous statement (never below the completion
             // register, which must persist across statements).
             if (last_expr_stmt_reg) |pr| {
@@ -2998,12 +3015,16 @@ fn expectedArgumentCount(params: [][]const u8, param_defaults: []const ?*Node) u
     return n;
 }
 
+/// The desugared body plus how many statements were prepended for it, so the
+/// compiler can tell parameter-initializer code from body code afterwards.
+const DesugaredBody = struct { body: []*Node, param_init_stmts: usize };
+
 fn applyParamDefaults(
     arena: std.mem.Allocator,
     params: [][]const u8,
     param_defaults: []const ?*Node,
     body: []*Node,
-) error{OutOfMemory}![]*Node {
+) error{OutOfMemory}!DesugaredBody {
     var any = false;
     for (param_defaults) |d| {
         if (d != null) {
@@ -3011,7 +3032,7 @@ fn applyParamDefaults(
             break;
         }
     }
-    if (!any) return body;
+    if (!any) return .{ .body = body, .param_init_stmts = 0 };
     var list: std.ArrayList(*Node) = .empty;
     for (params, 0..) |pname, i| {
         if (i >= param_defaults.len) break;
@@ -3025,8 +3046,9 @@ fn applyParamDefaults(
         const ifs = try mkSynthNode(arena, .{ .if_stmt = .{ .test_ = test_expr, .consequent = estmt, .alternate = null } });
         try list.append(arena, ifs);
     }
+    const n_init = list.items.len;
     try list.appendSlice(arena, body);
-    return list.toOwnedSlice(arena);
+    return .{ .body = try list.toOwnedSlice(arena), .param_init_stmts = n_init };
 }
 
 pub fn compileFunctionStrict(
@@ -3049,7 +3071,8 @@ pub fn compileFunctionStrict(
     // Register slots are used only for compiler temporaries.
     // sp starts at 0; max_regs tracks highest allocated temporary register.
 
-    const body = try applyParamDefaults(arena, params, param_defaults, body_in);
+    const desugared = try applyParamDefaults(arena, params, param_defaults, body_in);
+    const body = desugared.body;
 
     const Setup = struct {
         fn go(a: std.mem.Allocator, nm: ?[]const u8, ps: [][]const u8, dyn: bool) FnCompiler {
@@ -3066,6 +3089,7 @@ pub fn compileFunctionStrict(
     fc.is_async_generator = is_async and is_generator;
     fc.is_generator = is_generator;
     fc.is_arrow = is_arrow;
+    fc.param_init_stmts = desugared.param_init_stmts;
 
     const outer_dynamic = g_dynamic_scope_enclosing;
     g_dynamic_scope_enclosing = fc.dynamic_scope;
@@ -3085,6 +3109,7 @@ pub fn compileFunctionStrict(
         fc.is_async_generator = is_async and is_generator;
         fc.is_generator = is_generator;
         fc.is_arrow = is_arrow;
+        fc.param_init_stmts = desugared.param_init_stmts;
         g_dynamic_scope_enclosing = true;
         try fc.compileBody(body, implicit_return);
     }

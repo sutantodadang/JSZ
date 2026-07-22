@@ -1288,6 +1288,11 @@ pub fn parseReturnStmt(p: *Parser) ?*Node {
     // `return` has nothing to return from.
     if (p.in_static_block)
         return p.fail("'return' is not allowed in a class static initialization block");
+    // §19.2.1.1: eval code is Script code, so a `return` outside any function
+    // body in it is an early SyntaxError — even for a direct eval whose caller
+    // happens to be a function.
+    if (p.eval_code and p.fn_nesting_depth == 0)
+        return p.fail("'return' outside of function");
     _ = p.advance(); // consume 'return'
     // ASI rule: if next token has line terminator before it, return undefined.
     var value: ?*Node = null;

@@ -397,7 +397,14 @@ pub fn proxyDefineProperty(arena: std.mem.Allocator, proxy_obj: *JsObject, key: 
 pub fn proxyGetOwnPropertyDescriptor(arena: std.mem.Allocator, proxy_obj: *JsObject, key: Value) anyerror!?Value {
     const handler = proxyHandler(proxy_obj) orelse return throwRevoked(arena);
     const target = proxyTarget(proxy_obj) orelse return throwRevoked(arena);
-    const trap_fn = try getTrap(arena, handler, "getOwnPropertyDescriptor") orelse return null;
+    const trap_fn = try getTrap(arena, handler, "getOwnPropertyDescriptor") orelse {
+        // No trap: [[GetOwnProperty]] forwards to the target. `null` tells the
+        // caller to do that itself, but only an ordinary target has descriptors
+        // it can read directly — a proxy target needs its own trap to run.
+        if (target.bits != 0 and target.unbox() == .object and target.toPtr().object.internal_kind == .proxy)
+            return proxyGetOwnPropertyDescriptor(arena, target.toPtr().object, key);
+        return null;
+    };
     const res = try function_proto.invokeCallback(arena, handler, trap_fn, &[_]Value{ target, key });
 
     // Step 8: trap result must be an Object or undefined (null/primitive → throw).

@@ -1568,7 +1568,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
             } else {
                 init_node = p.makeNode(.identifier, 0, 0, .{ .identifier = synth }) orelse return null;
             }
-            const vd = p.makeNode(.var_decl, 0, 0, .{ .var_decl = .{ .kind = .let, .name = orig, .init = init_node } }) orelse return null;
+            const vd = p.makeNode(.var_decl, 0, 0, .{ .var_decl = .{ .kind = .let, .name = orig, .init = init_node, .param_init = true } }) orelse return null;
             lets.append(p.arena, vd) catch {
                 p.had_error = true;
                 return null;

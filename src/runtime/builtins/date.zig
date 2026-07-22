@@ -55,7 +55,6 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "setTime", nativeDateSetTime },
         .{ "setYear", nativeDateSetYear },
         .{ "toUTCString", nativeDateToUTCString },
-        .{ "toGMTString", nativeDateToGMTString },
         .{ "toDateString", nativeDateToDateString },
         .{ "toTimeString", nativeDateToTimeString },
         .{ "toJSON", nativeDateToJSON },
@@ -72,6 +71,12 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "toTemporalInstant", nativeDateToTemporalInstant },
     });
     active_date_proto = date_proto;
+
+    // Annex B B.2.3.3: `Date.prototype.toGMTString` is the *same function object*
+    // as `toUTCString` (so its `name` is "toUTCString" too), not a wrapper.
+    if (date_proto.get("toUTCString")) |utc| {
+        _ = try date_proto.defineOwnData("toGMTString", utc, .{ .writable = true, .enumerable = false, .configurable = true });
+    }
 
     const date_ctor = try intrinsics.makeCtor(arena, date_proto, nativeDateCtor, null);
     try intrinsics.setMethod(arena, date_ctor, "now", nativeDateNow);
@@ -278,7 +283,8 @@ fn coerceArgs(arena: std.mem.Allocator, args: []const Value, out: []f64) !usize 
     while (i < out.len) : (i += 1) {
         if (i != 0 and i >= args.len) break;
         const v: Value = if (i < args.len) args[i] else Value{};
-        out[i] = try realm_mod.toNumberValue(arena, v);
+        // Spec ToNumber: a Symbol/BigInt argument is a TypeError, not a silent NaN.
+        out[i] = try @import("coercion.zig").toNumberThrowing(arena, v);
     }
     return i;
 }
@@ -1082,10 +1088,6 @@ pub fn nativeDateToUTCString(arena: std.mem.Allocator, this_val: Value, _: []con
         @as(u8, @intCast(f.sec)),
     });
     return val_mod.makeString(arena, s);
-}
-
-pub fn nativeDateToGMTString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return nativeDateToUTCString(arena, this_val, args);
 }
 
 pub fn nativeDateToDateString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
