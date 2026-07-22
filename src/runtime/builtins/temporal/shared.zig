@@ -229,6 +229,19 @@ pub const NS_PER_SECOND: i128 = 1_000_000_000;
 pub const NS_PER_MILLI: i128 = 1_000_000;
 pub const NS_PER_MICRO: i128 = 1_000;
 
+/// `num / den` as a Number, keeping the precision the spec's exact rational
+/// arithmetic would. Converting a >2^53 nanosecond count to f64 first loses low
+/// bits, so split into an exact integer quotient plus the fractional remainder
+/// and let one f64 addition do the (single) rounding.
+pub fn divToF64(num: i128, den: i128) f64 {
+    if (den == 0) return 0;
+    // f128 holds 113 mantissa bits, so both operands (nanosecond counts, well
+    // under 2^90) convert exactly and the quotient rounds only once.
+    const n: f128 = @floatFromInt(num);
+    const d: f128 = @floatFromInt(den);
+    return @floatCast(n / d);
+}
+
 /// Nanoseconds since midnight for a wall-clock time.
 pub fn timeToNanos(t: ISOTime) i128 {
     return @as(i128, t.hour) * NS_PER_HOUR +
@@ -1485,15 +1498,17 @@ pub fn getTemporalUnit(arena: std.mem.Allocator, opts: ?*JsObject, key: []const 
 // -------------------------------------------------------- ToIntegerWithTrunc ---
 
 /// ToIntegerWithTruncation: ToNumber then truncate; NaN/Infinity throw RangeError.
+/// ToNumber of a Symbol/BigInt is a TypeError (via toNumberOption), not NaN.
 pub fn toIntegerWithTruncation(arena: std.mem.Allocator, v: Value) !f64 {
-    const n = try realm_mod.toNumberValue(arena, v);
+    const n = try toNumberOption(arena, v);
     if (std.math.isNan(n) or std.math.isInf(n)) return realm_mod.throwRangeError(arena, "value must be a finite integer");
     return @trunc(n);
 }
 
-/// ToIntegerIfIntegral: ToNumber; must be an integer (else RangeError).
+/// ToIntegerIfIntegral: ToNumber; must be an integer (else RangeError). ToNumber
+/// of a Symbol/BigInt is a TypeError (via toNumberOption), not NaN.
 pub fn toIntegerIfIntegral(arena: std.mem.Allocator, v: Value) !f64 {
-    const n = try realm_mod.toNumberValue(arena, v);
+    const n = try toNumberOption(arena, v);
     if (!std.math.isFinite(n) or n != @trunc(n)) return realm_mod.throwRangeError(arena, "value must be an integer");
     return n;
 }

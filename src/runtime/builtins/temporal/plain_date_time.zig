@@ -408,7 +408,7 @@ pub fn roundRelative(
 
     var total = q;
     if (p2 != p1) {
-        const progress = @as(f64, @floatFromInt(dest_wall - p1)) / @as(f64, @floatFromInt(p2 - p1));
+        const progress = shared.divToF64(dest_wall - p1, p2 - p1);
         total = q + progress * inc * sign;
     }
     var out = base;
