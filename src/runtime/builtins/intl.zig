@@ -29,6 +29,10 @@ const coercion_mod = @import("coercion.zig");
 // date/time objects, and `Temporal.X.prototype.toLocaleString` routes through
 // this module's en-US formatter (see temporalEpochMs / temporalToLocaleString).
 const t_shared = @import("temporal/shared.zig");
+const str_mod = @import("string_proto.zig");
+const unorm = @import("unicode_normalize.zig");
+const uprops = @import("unicode_prop_tables.zig");
+const ucase = @import("unicode_case_tables.zig");
 const t_instant = @import("temporal/instant.zig");
 const t_pdate = @import("temporal/plain_date.zig");
 const t_ptime = @import("temporal/plain_time.zig");
@@ -1474,24 +1478,130 @@ pub fn nativeCollatorCtor(arena: std.mem.Allocator, this_val: Value, args: []con
         this_val.toPtr().object
     else
         try legacyServiceObj(arena, active_collator_proto);
-    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
+    const locales = if (args.len > 0) args[0] else Value{};
     // InitializeCollator (§10.1.2) reads the options in this exact order.
     const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
     const usage = (try dnGetOption(arena, options, "usage", &.{ "sort", "search" }, "sort")).?;
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+    var co_opt: ?[]const u8 = null;
     if (try dnGetOption(arena, options, "collation", &.{}, null)) |c| {
         if (!isWellFormedNumberingSystem(c)) return throwRangeError(arena, "invalid collation");
+        co_opt = try lowerDup(arena, c);
     }
-    const numeric = (try dnGetBoolOption(arena, options, "numeric")) orelse false;
-    const caseFirst = (try dnGetOption(arena, options, "caseFirst", &.{ "upper", "lower", "false" }, "false")).?;
+    const numeric_opt = try dnGetBoolOption(arena, options, "numeric");
+    const case_first_opt = try dnGetOption(arena, options, "caseFirst", &.{ "upper", "lower", "false" }, null);
     const sensitivity = (try dnGetOption(arena, options, "sensitivity", &.{ "base", "accent", "case", "variant" }, "variant")).?;
-    const ignore_punct = (try dnGetBoolOption(arena, options, "ignorePunctuation")) orelse false;
+
+    // ResolveLocale over the three relevant extension keys. A value taken from
+    // the requested tag stays in `resolvedOptions().locale`; one supplied by an
+    // option does not (unless it happens to agree with the tag).
+    const req = try resolveLocaleRequest(arena, locales);
+    var kept: [3][2][]const u8 = undefined;
+    var n_kept: usize = 0;
+
+    var collation: []const u8 = "default";
+    var co_from_tag = false;
+    if (try req.keyword(arena, "co")) |ext| {
+        if (isSupportedCollation(req.base, ext)) {
+            collation = ext;
+            co_from_tag = true;
+        }
+    }
+    if (co_opt) |opt| {
+        if (isSupportedCollation(req.base, opt)) {
+            if (co_from_tag and !std.mem.eql(u8, opt, collation)) co_from_tag = false;
+            collation = opt;
+        }
+    }
+    if (co_from_tag) {
+        kept[n_kept] = .{ "co", collation };
+        n_kept += 1;
+    }
+
+    // `-u-kn` with no value means `true` (a missing type value is the boolean
+    // key's "true"), so an empty keyword must not read as absent.
+    var numeric = false;
+    var kn_from_tag = false;
+    if (try req.keyword(arena, "kn")) |ext| {
+        if (ext.len == 0 or std.mem.eql(u8, ext, "true")) {
+            numeric = true;
+            kn_from_tag = true;
+        } else if (std.mem.eql(u8, ext, "false")) {
+            numeric = false;
+            kn_from_tag = true;
+        }
+    }
+    if (numeric_opt) |opt| {
+        if (kn_from_tag and opt != numeric) kn_from_tag = false;
+        numeric = opt;
+    }
+    if (kn_from_tag) {
+        kept[n_kept] = .{ "kn", if (numeric) "true" else "false" };
+        n_kept += 1;
+    }
+
+    var case_first: []const u8 = "false";
+    var kf_from_tag = false;
+    if (try req.keyword(arena, "kf")) |ext| {
+        for ([_][]const u8{ "upper", "lower", "false" }) |v| {
+            if (std.mem.eql(u8, ext, v)) {
+                case_first = v;
+                kf_from_tag = true;
+            }
+        }
+    }
+    if (case_first_opt) |opt| {
+        if (kf_from_tag and !std.mem.eql(u8, opt, case_first)) kf_from_tag = false;
+        case_first = opt;
+    }
+    if (kf_from_tag) {
+        kept[n_kept] = .{ "kf", case_first };
+        n_kept += 1;
+    }
+    try storeResolvedLocale(arena, obj, req.base, kept[0..n_kept]);
+
+    // ignorePunctuation defaults to true only for the locales whose CLDR root
+    // collation sets `alternate=shifted` (the South-East Asian scripts).
+    const ignore_punct = (try dnGetBoolOption(arena, options, "ignorePunctuation")) orelse
+        defaultIgnorePunctuation(req.base);
     try obj.set("__col_ignorePunctuation", try val_mod.makeBool(arena, ignore_punct));
     try obj.set("__col_usage", try val_mod.makeString(arena, usage));
     try obj.set("__col_sensitivity", try val_mod.makeString(arena, sensitivity));
     try obj.set("__col_numeric", try val_mod.makeBool(arena, numeric));
-    try obj.set("__col_caseFirst", try val_mod.makeString(arena, caseFirst));
+    try obj.set("__col_caseFirst", try val_mod.makeString(arena, case_first));
+    try obj.set("__col_collation", try val_mod.makeString(arena, if (std.mem.eql(u8, usage, "search")) "default" else collation));
     return val_mod.makeObject(arena, obj);
+}
+
+/// The `-u-co-` collations this build accepts for a locale: the root ones plus
+/// the language's own CLDR tailorings.
+fn isSupportedCollation(locale: []const u8, co: []const u8) bool {
+    if (std.mem.eql(u8, co, "standard") or std.mem.eql(u8, co, "search")) return false;
+    for ([_][]const u8{ "emoji", "eor" }) |v| if (std.mem.eql(u8, co, v)) return true;
+    const lang = primaryLanguage(locale);
+    const table = [_]struct { l: []const u8, cos: []const []const u8 }{
+        .{ .l = "de", .cos = &.{"phonebk"} },
+        .{ .l = "es", .cos = &.{"trad"} },
+        .{ .l = "zh", .cos = &.{ "pinyin", "stroke", "zhuyin", "gb2312han", "big5han", "unihan" } },
+        .{ .l = "ja", .cos = &.{"unihan"} },
+        .{ .l = "ko", .cos = &.{ "unihan", "searchjl" } },
+        .{ .l = "sv", .cos = &.{"reformed"} },
+        .{ .l = "hi", .cos = &.{"trad"} },
+        .{ .l = "si", .cos = &.{"dict"} },
+    };
+    for (table) |row| {
+        if (!std.mem.eql(u8, row.l, lang)) continue;
+        for (row.cos) |v| if (std.mem.eql(u8, co, v)) return true;
+    }
+    return false;
+}
+
+/// CLDR gives these languages `alternate="shifted"` in their root collation, so
+/// `ignorePunctuation` defaults to true for them.
+fn defaultIgnorePunctuation(locale: []const u8) bool {
+    const lang = primaryLanguage(locale);
+    for ([_][]const u8{ "th", "lo", "km", "my" }) |v| if (std.mem.eql(u8, lang, v)) return true;
+    return false;
 }
 
 /// §10.3.3 `get Intl.Collator.prototype.compare`: an accessor returning a
@@ -1511,46 +1621,141 @@ fn asciiLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }
 
-/// Case/base-insensitive byte comparison used when `sensitivity` is `base`/`accent`.
-fn orderCaseInsensitive(a: []const u8, b: []const u8) std.math.Order {
-    var i: usize = 0;
-    while (i < a.len and i < b.len) : (i += 1) {
-        const ca = asciiLower(a[i]);
-        const cb = asciiLower(b[i]);
-        if (ca != cb) return if (ca < cb) .lt else .gt;
+// A three-level approximation of the UCA root collation. Full DUCET weights are
+// out of scope, but the level structure is what `sensitivity`, `caseFirst` and
+// `ignorePunctuation` are actually defined over, so modelling it directly gets
+// the observable behaviour right for the Latin/Greek/Cyrillic ranges the suite
+// exercises: strings are decomposed (NFD), then split into a primary key of
+// case-folded base characters, a secondary key of the combining marks, and a
+// tertiary key of the per-character case.
+
+/// Simple lowercase of one code point (collation only needs the 1:1 mappings).
+fn collFold(cp: u21) u21 {
+    if (cp < 128) return if (cp >= 'A' and cp <= 'Z') cp + 32 else cp;
+    if (ucase.lookup(ucase.to_lower, cp)) |m| {
+        if (m.len == 1) return m[0];
     }
-    if (a.len == b.len) return .eq;
-    return if (a.len < b.len) .lt else .gt;
+    return cp;
 }
 
-/// Numeric collation (`numeric: true`): digit runs compare by numeric value,
-/// everything else byte-wise (optionally case-insensitive).
-fn orderNumeric(a: []const u8, b: []const u8, case_insensitive: bool) std.math.Order {
+fn inProp(name: []const u8, cp: u21) bool {
+    const ranges = uprops.lookup(name) orelse return false;
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const r = ranges[mid];
+        if (cp < r[0]) {
+            hi = mid;
+        } else if (cp > r[1]) {
+            lo = mid + 1;
+        } else return true;
+    }
+    return false;
+}
+
+/// The "variable" characters `ignorePunctuation` drops: punctuation, symbols
+/// and whitespace (CLDR `alternate=shifted`).
+fn isVariableChar(cp: u21) bool {
+    return inProp("P", cp) or inProp("Z", cp) or inProp("S", cp);
+}
+
+const CollKey = struct {
+    /// Case-folded base characters.
+    primary: []const u21,
+    /// The combining marks, in canonical order.
+    secondary: []const u21,
+    /// 1 for an uppercase character, 0 otherwise — one entry per primary.
+    tertiary: []const u8,
+};
+
+/// The German *search* collation expands the umlauts, so `\u00c4` matches `AE`
+/// at the primary level (they still differ at the secondary level, which is
+/// what keeps a `sort` collator ordering them the other way round).
+fn searchExpansion(lang: []const u8, cp: u21) ?[]const u21 {
+    if (!std.mem.eql(u8, lang, "de")) return null;
+    return switch (cp) {
+        'a' => &[_]u21{ 'a', 'e' },
+        'o' => &[_]u21{ 'o', 'e' },
+        'u' => &[_]u21{ 'u', 'e' },
+        0xDF => &[_]u21{ 's', 's' }, // sharp s
+        else => null,
+    };
+}
+
+fn collationKey(
+    arena: std.mem.Allocator,
+    s: []const u8,
+    ignore_punct: bool,
+    search_lang: ?[]const u8,
+) !CollKey {
+    const cps = try str_mod.nfdCodePoints(arena, s);
+    var primary = std.ArrayListUnmanaged(u21){};
+    var secondary = std.ArrayListUnmanaged(u21){};
+    var tertiary = std.ArrayListUnmanaged(u8){};
+    for (cps, 0..) |cp, i| {
+        if (unorm.ccc(cp) != 0) {
+            try secondary.append(arena, cp);
+            continue;
+        }
+        if (ignore_punct and isVariableChar(cp)) continue;
+        const folded = collFold(cp);
+        // The case level only ranks cased characters: a digit or symbol
+        // contributes nothing, so "007" and "7" still tie once the primary
+        // level has compared them numerically.
+        const cased = inProp("Cased", cp);
+        const upper: u8 = @intFromBool(folded != cp);
+        // The expansion only applies to a base letter that actually carries a
+        // diaeresis (or to the sharp s, which stands alone).
+        const expand: ?[]const u21 = if (search_lang) |lang| blk: {
+            const diaeresis = cp == 0xDF or (i + 1 < cps.len and cps[i + 1] == 0x308);
+            break :blk if (diaeresis) searchExpansion(lang, folded) else null;
+        } else null;
+        if (expand) |seq| {
+            for (seq) |e| {
+                try primary.append(arena, e);
+                if (cased) try tertiary.append(arena, upper);
+            }
+            continue;
+        }
+        try primary.append(arena, folded);
+        if (cased) try tertiary.append(arena, upper);
+    }
+    return .{ .primary = primary.items, .secondary = secondary.items, .tertiary = tertiary.items };
+}
+
+fn orderCps(a: []const u21, b: []const u21) std.math.Order {
+    var i: usize = 0;
+    while (i < a.len and i < b.len) : (i += 1) {
+        if (a[i] != b[i]) return if (a[i] < b[i]) .lt else .gt;
+    }
+    return std.math.order(a.len, b.len);
+}
+
+/// Numeric collation over the primary key: a run of decimal digits compares by
+/// value rather than code point, so "item2" sorts before "item10".
+fn orderCpsNumeric(a: []const u21, b: []const u21) std.math.Order {
     var i: usize = 0;
     var j: usize = 0;
     while (i < a.len and j < b.len) {
         const da = a[i] >= '0' and a[i] <= '9';
         const db = b[j] >= '0' and b[j] <= '9';
         if (da and db) {
-            // Extract both digit runs.
             var ai = i;
             while (ai < a.len and a[ai] >= '0' and a[ai] <= '9') ai += 1;
             var bj = j;
             while (bj < b.len and b[bj] >= '0' and b[bj] <= '9') bj += 1;
-            // Strip leading zeros, then compare by significant length, then value.
             var sa = a[i..ai];
             var sb = b[j..bj];
             while (sa.len > 1 and sa[0] == '0') sa = sa[1..];
             while (sb.len > 1 and sb[0] == '0') sb = sb[1..];
             if (sa.len != sb.len) return if (sa.len < sb.len) .lt else .gt;
-            const c = std.mem.order(u8, sa, sb);
+            const c = orderCps(sa, sb);
             if (c != .eq) return c;
             i = ai;
             j = bj;
         } else {
-            const ca = if (case_insensitive) asciiLower(a[i]) else a[i];
-            const cb = if (case_insensitive) asciiLower(b[j]) else b[j];
-            if (ca != cb) return if (ca < cb) .lt else .gt;
+            if (a[i] != b[j]) return if (a[i] < b[j]) .lt else .gt;
             i += 1;
             j += 1;
         }
@@ -1559,34 +1764,103 @@ fn orderNumeric(a: []const u8, b: []const u8, case_insensitive: bool) std.math.O
     return if (i >= a.len) .lt else .gt;
 }
 
+fn orderCase(a: []const u8, b: []const u8, upper_first: bool) std.math.Order {
+    var i: usize = 0;
+    while (i < a.len and i < b.len) : (i += 1) {
+        if (a[i] == b[i]) continue;
+        const a_upper = a[i] == 1;
+        return if (a_upper == upper_first) .lt else .gt;
+    }
+    return std.math.order(a.len, b.len);
+}
+
+/// CompareStrings (§10.3.3): the level comparison `sensitivity` selects.
+fn collatorCompareStrings(
+    arena: std.mem.Allocator,
+    x: []const u8,
+    y: []const u8,
+    sensitivity: []const u8,
+    numeric: bool,
+    case_first: []const u8,
+    ignore_punct: bool,
+) !std.math.Order {
+    return collatorCompareStringsIn(arena, x, y, sensitivity, numeric, case_first, ignore_punct, null);
+}
+
+fn collatorCompareStringsIn(
+    arena: std.mem.Allocator,
+    x: []const u8,
+    y: []const u8,
+    sensitivity: []const u8,
+    numeric: bool,
+    case_first: []const u8,
+    ignore_punct: bool,
+    search_lang: ?[]const u8,
+) !std.math.Order {
+    const ka = try collationKey(arena, x, ignore_punct, search_lang);
+    const kb = try collationKey(arena, y, ignore_punct, search_lang);
+    const p = if (numeric) orderCpsNumeric(ka.primary, kb.primary) else orderCps(ka.primary, kb.primary);
+    if (p != .eq) return p;
+    const use_secondary = !std.mem.eql(u8, sensitivity, "base") and !std.mem.eql(u8, sensitivity, "case");
+    const use_tertiary = !std.mem.eql(u8, sensitivity, "base") and !std.mem.eql(u8, sensitivity, "accent");
+    if (use_secondary) {
+        const sec = orderCps(ka.secondary, kb.secondary);
+        if (sec != .eq) return sec;
+    }
+    if (use_tertiary) {
+        const ter = orderCase(ka.tertiary, kb.tertiary, std.mem.eql(u8, case_first, "upper"));
+        if (ter != .eq) return ter;
+    }
+    return .eq;
+}
+
 pub fn nativeCollatorCompare(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const a: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) args[0].unbox().string else "";
-    const b: []const u8 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .string) args[1].unbox().string else "";
-    var sensitivity: []const u8 = "variant";
-    var numeric = false;
-    // Bound compare passes the collator via native userdata; a plain prototype call
-    // arrives with the collator as `this`.
+    // Bound compare passes the collator via native userdata; a plain prototype
+    // call arrives with the collator as `this`.
     const col_obj: ?*JsObject = if (val_mod.g_active_native_data) |d|
         @ptrCast(@alignCast(d))
     else if (this_val.bits != 0 and this_val.unbox() == .object)
         this_val.toPtr().object
     else
         null;
+    var sensitivity: []const u8 = "variant";
+    var case_first: []const u8 = "false";
+    var numeric = false;
+    var ignore_punct = false;
+    var usage: []const u8 = "sort";
+    var collation: []const u8 = "default";
+    var locale: []const u8 = default_locale;
     if (col_obj) |o| {
+        if (o.get("__col_usage")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            usage = v.unbox().string;
+        };
+        if (o.get("__col_collation")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            collation = v.unbox().string;
+        };
+        if (o.getOwn("[[intl_locale]]")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            locale = v.unbox().string;
+        };
         if (o.get("__col_sensitivity")) |v| if (v.bits != 0 and v.unbox() == .string) {
             sensitivity = v.unbox().string;
+        };
+        if (o.get("__col_caseFirst")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            case_first = v.unbox().string;
         };
         if (o.get("__col_numeric")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
             numeric = v.unbox().boolean;
         };
+        if (o.get("__col_ignorePunctuation")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
+            ignore_punct = v.unbox().boolean;
+        };
     }
-    const case_insensitive = std.mem.eql(u8, sensitivity, "base") or std.mem.eql(u8, sensitivity, "accent");
-    const order = if (numeric)
-        orderNumeric(a, b, case_insensitive)
-    else if (case_insensitive)
-        orderCaseInsensitive(a, b)
-    else
-        std.mem.order(u8, a, b);
+    // Both arguments are ToString'd (a Symbol therefore throws).
+    const a = try t_shared.valueToString(arena, if (args.len > 0) args[0] else Value{});
+    const b = try t_shared.valueToString(arena, if (args.len > 1) args[1] else Value{});
+    // German expands the umlauts in both its `search` collation and its
+    // `phonebk` tailoring, so "\u00c4" sorts (and matches) as "AE".
+    const expand = std.mem.eql(u8, usage, "search") or std.mem.eql(u8, collation, "phonebk");
+    const search_lang: ?[]const u8 = if (expand) primaryLanguage(locale) else null;
+    const order = try collatorCompareStringsIn(arena, a, b, sensitivity, numeric, case_first, ignore_punct, search_lang);
     const r: f64 = switch (order) {
         .lt => -1,
         .eq => 0,
@@ -1607,9 +1881,13 @@ pub fn nativeCollatorResolved(arena: std.mem.Allocator, this_val: Value, _: []co
     var sensitivity: []const u8 = "variant";
     var numeric = false;
     var caseFirst: []const u8 = "false";
+    var collation: []const u8 = "default";
     var ignore_punct = false;
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const o = this_val.toPtr().object;
+        if (o.get("__col_collation")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            collation = v.unbox().string;
+        };
         if (o.get("__col_usage")) |v| if (v.bits != 0 and v.unbox() == .string) {
             usage = v.unbox().string;
         };
@@ -1630,7 +1908,7 @@ pub fn nativeCollatorResolved(arena: std.mem.Allocator, this_val: Value, _: []co
     try defineData(r, "usage", try val_mod.makeString(arena, usage));
     try defineData(r, "sensitivity", try val_mod.makeString(arena, sensitivity));
     try defineData(r, "ignorePunctuation", try val_mod.makeBool(arena, ignore_punct));
-    try defineData(r, "collation", try val_mod.makeString(arena, "default"));
+    try defineData(r, "collation", try val_mod.makeString(arena, collation));
     try defineData(r, "numeric", try val_mod.makeBool(arena, numeric));
     try defineData(r, "caseFirst", try val_mod.makeString(arena, caseFirst));
     return val_mod.makeObject(arena, r);
@@ -1724,7 +2002,9 @@ fn uExtKeyword(u_ext: []const u8, key: []const u8) ?[]const u8 {
         }
         pos = dash + 1;
     }
-    if (val_of) |k| if (std.ascii.eqlIgnoreCase(k, key) and val_end > val_start) return u_ext[val_start..val_end];
+    // A trailing key with no type value ("-u-kn") is present with the empty
+    // value, which for a boolean key means `true`.
+    if (val_of) |k| if (std.ascii.eqlIgnoreCase(k, key)) return u_ext[val_start..val_end];
     return null;
 }
 
@@ -2186,6 +2466,8 @@ pub fn storeResolvedLocale(arena: std.mem.Allocator, obj: *JsObject, base: []con
     for (sorted) |kv| {
         try out.append(arena, '-');
         try out.appendSlice(arena, kv[0]);
+        // The canonical spelling of a boolean key's `true` is the bare key.
+        if (std.mem.eql(u8, kv[1], "true")) continue;
         try out.append(arena, '-');
         try out.appendSlice(arena, kv[1]);
     }
@@ -3868,9 +4150,19 @@ test "intl: canonSubtag casing" {
 }
 
 test "intl: collator case-insensitive order" {
-    try std.testing.expectEqual(std.math.Order.eq, orderCaseInsensitive("Apple", "apple"));
-    try std.testing.expectEqual(std.math.Order.lt, orderCaseInsensitive("apple", "banana"));
-    try std.testing.expectEqual(std.math.Order.gt, orderCaseInsensitive("Banana", "apple"));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cmp = struct {
+        fn f(al: std.mem.Allocator, x: []const u8, y: []const u8) !std.math.Order {
+            return collatorCompareStrings(al, x, y, "accent", false, "false", false);
+        }
+    }.f;
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "Apple", "apple"));
+    try std.testing.expectEqual(std.math.Order.lt, try cmp(a, "apple", "banana"));
+    try std.testing.expectEqual(std.math.Order.gt, try cmp(a, "Banana", "apple"));
+    // Canonically equivalent spellings of "ö" collate as one string.
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "o\u{308}", "\u{f6}"));
 }
 
 test "intl: listformat en-US phrasing" {
@@ -3899,11 +4191,19 @@ test "intl: singularUnit strips plural s" {
 }
 
 test "intl: numeric collation order" {
-    try std.testing.expectEqual(std.math.Order.gt, orderNumeric("10", "2", false));
-    try std.testing.expectEqual(std.math.Order.lt, orderNumeric("a2", "a10", false));
-    try std.testing.expectEqual(std.math.Order.lt, orderNumeric("file9", "file10", false));
-    try std.testing.expectEqual(std.math.Order.eq, orderNumeric("2", "2", false));
-    try std.testing.expectEqual(std.math.Order.gt, orderNumeric("item20", "item3", false));
-    try std.testing.expectEqual(std.math.Order.eq, orderNumeric("007", "7", false));
-    try std.testing.expectEqual(std.math.Order.eq, orderNumeric("A1", "a1", true));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cmp = struct {
+        fn f(al: std.mem.Allocator, x: []const u8, y: []const u8, sens: []const u8) !std.math.Order {
+            return collatorCompareStrings(al, x, y, sens, true, "false", false);
+        }
+    }.f;
+    try std.testing.expectEqual(std.math.Order.gt, try cmp(a, "10", "2", "variant"));
+    try std.testing.expectEqual(std.math.Order.lt, try cmp(a, "a2", "a10", "variant"));
+    try std.testing.expectEqual(std.math.Order.lt, try cmp(a, "file9", "file10", "variant"));
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "2", "2", "variant"));
+    try std.testing.expectEqual(std.math.Order.gt, try cmp(a, "item20", "item3", "variant"));
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "007", "7", "variant"));
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "A1", "a1", "accent"));
 }
