@@ -283,7 +283,9 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
         result = balanceTime(total_ns, st.largest);
     }
     // Rounding: only for time-unit / day smallestUnit (approximate).
-    result = roundResult(result, st.smallest, st.increment, st.mode, st.largest);
+    const dest_wall = @as(i128, shared.isoDateToEpochDays(to.date.year, to.date.month, to.date.day)) *
+        shared.NS_PER_DAY + shared.timeToNanos(to.time);
+    result = try roundRelative(arena, from, dest_wall, result, st.smallest, st.increment, st.mode, st.largest);
     if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
 }
@@ -346,17 +348,108 @@ fn balanceTime(total_ns: i128, largest: shared.Unit) shared.DurationFields {
     return d;
 }
 
-/// Approximate rounding of a difference to `smallest`+increment for time units.
-fn roundResult(result: shared.DurationFields, smallest: shared.Unit, inc: f64, mode: shared.RoundingMode, largest: shared.Unit) shared.DurationFields {
-    if (unitRank(smallest) < unitRank(.hour)) return result; // date-unit rounding unsupported
-    // Only round when the whole duration is pure time (no calendar fields) so a
-    // nanosecond total is meaningful.
-    if (result.years != 0 or result.months != 0 or result.weeks != 0 or result.days != 0) return result;
-    const total = durTimeNanos(result);
-    const per = shared.unitLengthNanos(smallest) orelse return result;
+/// RoundRelativeDuration for a date+time difference measured from `from`.
+/// `dest_wall` is the target's wall-clock nanosecond position (epoch days ×
+/// NS_PER_DAY + time of day) — the same scale `wallNanos(from)` produces.
+///
+/// A calendar `smallest` cannot be rounded on a nanosecond total: a year is not
+/// a fixed length. So the spec brackets the answer between the two candidate
+/// multiples of the increment, converts each back into a real date, and rounds
+/// the *fraction* of the way `dest` lies between them.
+pub fn roundRelative(
+    arena: std.mem.Allocator,
+    from: ISODateTime,
+    dest_wall: i128,
+    dur: shared.DurationFields,
+    smallest: shared.Unit,
+    inc: f64,
+    mode: shared.RoundingMode,
+    largest: shared.Unit,
+) !shared.DurationFields {
+    if (unitRank(smallest) >= unitRank(.hour)) return roundTimeOnly(dur, smallest, inc, mode, largest);
+    if (dur.sign() == 0) return dur;
+    const sign: f64 = @floatFromInt(dur.sign());
+
+    // Everything coarser than `smallest` is carried through untouched; the unit
+    // itself is re-derived and everything finer is dropped.
+    var base = shared.DurationFields{};
+    switch (smallest) {
+        .month => base.years = dur.years,
+        .week => {
+            base.years = dur.years;
+            base.months = dur.months;
+        },
+        .day => {
+            base.years = dur.years;
+            base.months = dur.months;
+            base.weeks = dur.weeks;
+        },
+        else => {},
+    }
+    const unit_val: f64 = switch (smallest) {
+        .year => dur.years,
+        .month => dur.months,
+        .week => dur.weeks,
+        .day => dur.days,
+        else => unreachable,
+    };
+    const q = @trunc(@abs(unit_val) / inc) * inc * sign;
+    const q2 = q + inc * sign;
+
+    const time_ns = shared.timeToNanos(from.time);
+    const p1 = try candidateWall(arena, from.date, base, smallest, q, time_ns);
+    const p2 = try candidateWall(arena, from.date, base, smallest, q2, time_ns);
+
+    var total = q;
+    if (p2 != p1) {
+        const progress = @as(f64, @floatFromInt(dest_wall - p1)) / @as(f64, @floatFromInt(p2 - p1));
+        total = q + progress * inc * sign;
+    }
+    var out = base;
+    const rounded = shared.roundNumberToIncrement(total, inc, mode);
+    switch (smallest) {
+        .year => out.years = rounded,
+        .month => out.months = rounded,
+        .week => out.weeks = rounded,
+        .day => out.days = rounded,
+        else => {},
+    }
+    return out;
+}
+
+/// Wall position of `from` + (`base` plus `n` of `unit`), keeping the time of day.
+fn candidateWall(arena: std.mem.Allocator, from: ISODate, base: shared.DurationFields, unit: shared.Unit, n: f64, time_ns: i128) !i128 {
+    var d = base;
+    switch (unit) {
+        .year => d.years = n,
+        .month => d.months = n,
+        .week => d.weeks = n,
+        .day => d.days = n,
+        else => {},
+    }
+    const shifted = try plain_date.addISODate(from, d.years, d.months, d.weeks, d.days, .constrain, arena);
+    return @as(i128, shared.isoDateToEpochDays(shifted.year, shifted.month, shifted.day)) * shared.NS_PER_DAY + time_ns;
+}
+
+/// NudgeToDayOrTime: `smallest` is a time unit, so the time portion rounds on a
+/// plain nanosecond total. Calendar fields ride along unless `largest` is itself
+/// a time unit, in which case the days fold into the total too.
+fn roundTimeOnly(dur: shared.DurationFields, smallest: shared.Unit, inc: f64, mode: shared.RoundingMode, largest: shared.Unit) shared.DurationFields {
+    const per = shared.unitLengthNanos(smallest) orelse return dur;
     const inc_ns = per * @as(i128, @intFromFloat(inc));
-    const rounded = shared.roundI128ToIncrement(total, inc_ns, mode);
-    return balanceTime(rounded, largest);
+    if (unitRank(largest) >= unitRank(.hour)) {
+        const total = @as(i128, @intFromFloat(dur.days)) * shared.NS_PER_DAY + durTimeNanos(dur);
+        return balanceTime(shared.roundI128ToIncrement(total, inc_ns, mode), largest);
+    }
+    const rounded = shared.roundI128ToIncrement(durTimeNanos(dur), inc_ns, mode);
+    // Rounding the time can spill into a whole extra day.
+    const extra_days = @divTrunc(rounded, shared.NS_PER_DAY);
+    var out = balanceTime(rounded - extra_days * shared.NS_PER_DAY, .hour);
+    out.years = dur.years;
+    out.months = dur.months;
+    out.weeks = dur.weeks;
+    out.days = dur.days + @as(f64, @floatFromInt(extra_days));
+    return out;
 }
 
 pub fn nativeUntil(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {

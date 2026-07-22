@@ -710,7 +710,10 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     } else {
         result = balanceTime(to.ns - from.ns, st.largest);
     }
-    result = roundResult(result, st.smallest, st.increment, st.mode, st.largest);
+    const lto = localDT(&to);
+    const dest_wall = @as(i128, shared.isoDateToEpochDays(lto.date.year, lto.date.month, lto.date.day)) *
+        shared.NS_PER_DAY + shared.timeToNanos(lto.time);
+    result = try plain_date_time.roundRelative(arena, localDT(&from), dest_wall, result, st.smallest, st.increment, st.mode, st.largest);
     if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
 }

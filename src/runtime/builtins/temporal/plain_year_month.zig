@@ -208,8 +208,13 @@ fn nativeAddSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, 
     });
     const cal = ym.calendar;
     const f = calendar.fields(cal, ym.*);
-    const anchor_day: u8 = if (sign < 0) calendar.daysInMonth(cal, f.year, f.month) else 1;
-    const anchor = ISODate{ .year = ym.year, .month = ym.month, .day = anchor_day, .calendar = cal };
+    // The stored ISO date is already day 1 of the calendar month, which is the
+    // anchor a non-negative duration wants. A *calendar* month rarely starts on
+    // an ISO 1st, so the last-day anchor has to be built in calendar space too.
+    const anchor: ISODate = if (sign < 0)
+        calendar.toIso(cal, f.year, f.month, calendar.daysInMonth(cal, f.year, f.month), .constrain) catch ym.*
+    else
+        ym.*;
     const result = try plain_date.addISODate(anchor, dur.years, dur.months, dur.weeks, total_days, overflow, arena);
     // Renormalize onto the first day of the resulting *calendar* month.
     const rf = calendar.fields(cal, result);
@@ -332,8 +337,13 @@ pub fn nativeToPlainDate(arena: std.mem.Allocator, this_val: Value, args: []cons
     if (day_v.bits != 0 and day_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing day");
     const day = try shared.toIntegerWithTruncation(arena, day_v);
     const di = floatToI32(day);
-    if (!shared.isValidISODate(ym.year, ym.month, di)) return realm_mod.throwRangeError(arena, "invalid day for PlainDate");
-    return plain_date.makeDate(arena, .{ .year = ym.year, .month = ym.month, .day = @intCast(di) });
+    // `day` numbers a day of the *calendar* month, which for a non-ISO calendar
+    // is not the ISO day-of-month at all.
+    const cal = ym.calendar;
+    const f = calendar.fields(cal, ym.*);
+    const iso = calendar.toIso(cal, f.year, f.month, di, .constrain) catch
+        return realm_mod.throwRangeError(arena, "invalid day for PlainDate");
+    return plain_date.makeDate(arena, iso);
 }
 
 // ------------------------------------------------------------------ strings ---
