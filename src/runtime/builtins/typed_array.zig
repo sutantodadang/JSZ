@@ -222,8 +222,12 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     }
 
     // Uint8Array base64/hex (ES2025 "Uint8Array to/from base64" proposal): four
-    // instance methods live as own properties of %Uint8Array.prototype% only.
+    // instance methods live as own properties of %Uint8Array.prototype% only,
+    // plus two statics on %Uint8Array% itself.
     {
+        const u8_ctor = active_ta_ctors[@intFromEnum(TAKind.u8)].?;
+        _ = try u8_ctor.defineOwnData("fromBase64", try val_mod.makeNativeFunctionNamed(arena, nativeU8FromBase64, "fromBase64", 1), m_attr);
+        _ = try u8_ctor.defineOwnData("fromHex", try val_mod.makeNativeFunctionNamed(arena, nativeU8FromHex, "fromHex", 1), m_attr);
         const u8_proto = active_ta_protos[@intFromEnum(TAKind.u8)].?;
         _ = try u8_proto.defineOwnData("toBase64", try val_mod.makeNativeFunctionNamed(arena, nativeU8ToBase64, "toBase64", 0), m_attr);
         _ = try u8_proto.defineOwnData("toHex", try val_mod.makeNativeFunctionNamed(arena, nativeU8ToHex, "toHex", 0), m_attr);
@@ -734,15 +738,26 @@ fn validateTypedArrayThis(arena: std.mem.Allocator, this_val: Value) anyerror!*T
 
 // ------------------------------------ Uint8Array base64/hex (ES2025 proposal) ---
 
+/// ValidateUint8Array: brand check only (no detach/OOB check — the proposal
+/// splits the brand check, which happens before the options reads, from the
+/// buffer-liveness check, which happens after).
+fn validateU8Brand(arena: std.mem.Allocator, this_val: Value) anyerror!*TypedArrayData {
+    const td = getTd(this_val) orelse return throwTypeError(arena, "method called on non-Uint8Array");
+    if (td.kind != .u8) return throwTypeError(arena, "method requires a Uint8Array");
+    return td;
+}
+
+/// The live byte slice of an already brand-checked Uint8Array.
+fn u8Bytes(arena: std.mem.Allocator, td: *TypedArrayData) anyerror![]u8 {
+    if (td.ab.detached) return throwTypeError(arena, "Cannot operate on a detached ArrayBuffer");
+    if (taIsOob(td)) return throwTypeError(arena, "Cannot operate on an out-of-bounds TypedArray");
+    return td.ab.bytes[td.byte_offset..][0..taCurrentLen(td)];
+}
+
 /// Validate `this` is a non-OOB Uint8Array and return its live byte slice.
 /// The base64/hex methods are Uint8Array-specific ([[TypedArrayName]] check).
 fn validateU8This(arena: std.mem.Allocator, this_val: Value) anyerror![]u8 {
-    const td = getTd(this_val) orelse return throwTypeError(arena, "method called on non-Uint8Array");
-    if (td.kind != .u8) return throwTypeError(arena, "method requires a Uint8Array");
-    if (td.ab.detached) return throwTypeError(arena, "Cannot operate on a detached ArrayBuffer");
-    if (taIsOob(td)) return throwTypeError(arena, "Cannot operate on an out-of-bounds TypedArray");
-    const len = taCurrentLen(td);
-    return td.ab.bytes[td.byte_offset..][0..len];
+    return u8Bytes(arena, try validateU8Brand(arena, this_val));
 }
 
 /// Extract a required String argument (throws TypeError on non-string, matching
@@ -756,33 +771,58 @@ fn requireStringArg(arena: std.mem.Allocator, args: []const Value) anyerror![]co
 const b64_std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const b64_url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-/// Read option `name` off an options object as a string (returns `null` when the
-/// options arg is absent/undefined or the property is undefined).
-fn optString(arena: std.mem.Allocator, args: []const Value, idx: usize, name: []const u8) !?[]const u8 {
-    if (args.len <= idx or args[idx].bits == 0 or args[idx].unbox() != .object) return null;
-    const v = try vmGet(arena, args[idx], name);
-    if (v.bits == 0 or v.unbox() != .string) return null;
+/// GetOptionsObject: undefined → "no options" (null); an object → itself;
+/// anything else → TypeError. Returned as an optional so a caller reading an
+/// option off the absent case skips the [[Get]] entirely.
+fn getOptionsObject(arena: std.mem.Allocator, args: []const Value, idx: usize) anyerror!?Value {
+    if (args.len <= idx or args[idx].bits == 0 or args[idx].unbox() == .undefined_) return null;
+    if (args[idx].unbox() != .object) return throwTypeError(arena, "options must be an object");
+    return args[idx];
+}
+
+/// Read a String-valued option. `null` means absent/undefined; a non-String
+/// present value is a TypeError (the proposal never calls ToString here).
+fn optStringStrict(arena: std.mem.Allocator, opts: ?Value, name: []const u8) anyerror!?[]const u8 {
+    const o = opts orelse return null;
+    const v = try vmGet(arena, o, name);
+    if (v.bits == 0 or v.unbox() == .undefined_) return null;
+    if (v.unbox() != .string) return throwTypeError(arena, "option must be a string");
     return v.toPtr().string;
 }
 
-fn optBool(arena: std.mem.Allocator, args: []const Value, idx: usize, name: []const u8) !bool {
-    if (args.len <= idx or args[idx].bits == 0 or args[idx].unbox() != .object) return false;
-    const v = try vmGet(arena, args[idx], name);
+fn optBoolOpt(arena: std.mem.Allocator, opts: ?Value, name: []const u8) anyerror!bool {
+    const o = opts orelse return false;
+    const v = try vmGet(arena, o, name);
     if (v.bits == 0) return false;
     return toBool(v);
 }
 
-fn base64Alphabet(arena: std.mem.Allocator, args: []const Value, idx: usize) anyerror![]const u8 {
-    const a = (try optString(arena, args, idx, "alphabet")) orelse "base64";
-    if (std.mem.eql(u8, a, "base64")) return b64_std;
-    if (std.mem.eql(u8, a, "base64url")) return b64_url;
+/// `alphabet` option → true when "base64url". Absent ⇒ "base64".
+fn readAlphabet(arena: std.mem.Allocator, opts: ?Value) anyerror!bool {
+    const a = (try optStringStrict(arena, opts, "alphabet")) orelse return false;
+    if (std.mem.eql(u8, a, "base64")) return false;
+    if (std.mem.eql(u8, a, "base64url")) return true;
     return throwTypeError(arena, "alphabet must be \"base64\" or \"base64url\"");
 }
 
+const LastChunk = enum { loose, strict, stop_before_partial };
+
+fn readLastChunkHandling(arena: std.mem.Allocator, opts: ?Value) anyerror!LastChunk {
+    const s = (try optStringStrict(arena, opts, "lastChunkHandling")) orelse return .loose;
+    if (std.mem.eql(u8, s, "loose")) return .loose;
+    if (std.mem.eql(u8, s, "strict")) return .strict;
+    if (std.mem.eql(u8, s, "stop-before-partial")) return .stop_before_partial;
+    return throwTypeError(arena, "lastChunkHandling must be \"loose\", \"strict\" or \"stop-before-partial\"");
+}
+
 pub fn nativeU8ToBase64(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const alpha = try base64Alphabet(arena, args, 0);
-    const omit_padding = try optBool(arena, args, 0, "omitPadding");
-    const src = try validateU8This(arena, this_val);
+    // Brand check precedes every observable options read; the byte slice is
+    // taken AFTER, so an `alphabet` getter that mutates the receiver is visible.
+    const td = try validateU8Brand(arena, this_val);
+    const opts = try getOptionsObject(arena, args, 0);
+    const alpha = if (try readAlphabet(arena, opts)) b64_url else b64_std;
+    const omit_padding = try optBoolOpt(arena, opts, "omitPadding");
+    const src = try u8Bytes(arena, td);
     var out = std.ArrayList(u8){};
     var i: usize = 0;
     while (i + 3 <= src.len) : (i += 3) {
@@ -827,77 +867,194 @@ fn setResult(arena: std.mem.Allocator, read: usize, written: usize) !Value {
     return val_mod.makeObject(arena, obj);
 }
 
-fn b64Value(alpha: []const u8, c: u8) ?u6 {
-    for (alpha, 0..) |a, i| {
-        if (a == c) return @intCast(i);
+/// Sextet value of a base64 code unit under the chosen alphabet, or null when
+/// the character is not a member of it (`+`/`/` are rejected under base64url and
+/// vice versa — swapping alphabets must be an error, not a silent decode).
+fn b64Value(url: bool, c: u8) ?u6 {
+    return switch (c) {
+        'A'...'Z' => @intCast(c - 'A'),
+        'a'...'z' => @intCast(c - 'a' + 26),
+        '0'...'9' => @intCast(c - '0' + 52),
+        '+' => if (url) null else 62,
+        '/' => if (url) null else 63,
+        '-' => if (url) 62 else null,
+        '_' => if (url) 63 else null,
+        else => null,
+    };
+}
+
+fn isAsciiWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0c;
+}
+
+fn skipAsciiWs(s: []const u8, from: usize) usize {
+    var i = from;
+    while (i < s.len and isAsciiWs(s[i])) i += 1;
+    return i;
+}
+
+/// Result of the proposal's FromBase64 / FromHex abstract operations. The error
+/// is REPORTED, not thrown: `setFrom*` must write every byte decoded before the
+/// error into the target and only then throw.
+const DecodeRec = struct {
+    read: usize,
+    bytes: []const u8,
+    err: bool = false,
+    msg: []const u8 = "",
+};
+
+/// DecodeBase64Chunk: append the 1/2/3 bytes a 2/3/4-sextet chunk encodes.
+/// Returns false when `throw_extra_bits` is set and the chunk's unused low bits
+/// are non-zero (lastChunkHandling "strict").
+fn decodeB64Chunk(arena: std.mem.Allocator, out: *std.ArrayList(u8), chunk: []const u6, throw_extra_bits: bool) !bool {
+    var q = [_]u32{ 0, 0, 0, 0 };
+    for (chunk, 0..) |c, i| q[i] = c;
+    if (chunk.len == 2) {
+        if (throw_extra_bits and (q[1] & 0x0F) != 0) return false;
+    } else if (chunk.len == 3) {
+        if (throw_extra_bits and (q[2] & 0x03) != 0) return false;
     }
-    return null;
+    const n = (q[0] << 18) | (q[1] << 12) | (q[2] << 6) | q[3];
+    const all = [_]u8{ @intCast((n >> 16) & 0xFF), @intCast((n >> 8) & 0xFF), @intCast(n & 0xFF) };
+    try out.appendSlice(arena, all[0 .. chunk.len - 1]);
+    return true;
+}
+
+/// FromBase64(string, alphabet, lastChunkHandling, maxLength). Decoding stops as
+/// soon as `max_length` bytes are produced — that is what makes `setFromBase64`
+/// report a `read` that stops at the last chunk that fit in the target.
+fn fromBase64(arena: std.mem.Allocator, str: []const u8, url: bool, lch: LastChunk, max_length: usize) !DecodeRec {
+    var bytes = std.ArrayList(u8){};
+    if (max_length == 0) return .{ .read = 0, .bytes = &[_]u8{} };
+    var read: usize = 0;
+    var chunk: [4]u6 = undefined;
+    var chunk_len: usize = 0;
+    var index: usize = 0;
+    const bad_char = "Invalid base64 character";
+    while (true) {
+        index = skipAsciiWs(str, index);
+        if (index == str.len) {
+            if (chunk_len > 0) {
+                switch (lch) {
+                    .stop_before_partial => return .{ .read = read, .bytes = bytes.items },
+                    .loose => {
+                        if (chunk_len == 1)
+                            return .{ .read = read, .bytes = bytes.items, .err = true, .msg = "Base64 string has a trailing partial chunk" };
+                        _ = try decodeB64Chunk(arena, &bytes, chunk[0..chunk_len], false);
+                    },
+                    .strict => return .{ .read = read, .bytes = bytes.items, .err = true, .msg = "Base64 string is missing padding" },
+                }
+            }
+            return .{ .read = str.len, .bytes = bytes.items };
+        }
+        const c = str[index];
+        index += 1;
+        if (c == '=') {
+            if (chunk_len < 2)
+                return .{ .read = read, .bytes = bytes.items, .err = true, .msg = "Unexpected base64 padding" };
+            index = skipAsciiWs(str, index);
+            if (chunk_len == 2) {
+                if (index == str.len) {
+                    if (lch == .stop_before_partial) return .{ .read = read, .bytes = bytes.items };
+                    return .{ .read = read, .bytes = bytes.items, .err = true, .msg = "Base64 string is missing a second padding character" };
+                }
+                if (str[index] != '=')
+                    return .{ .read = read, .bytes = bytes.items, .err = true, .msg = "Base64 string is missing a second padding character" };
+                index = skipAsciiWs(str, index + 1);
+            }
+            if (index < str.len)
+                return .{ .read = read, .bytes = bytes.items, .err = true, .msg = "Unexpected data after base64 padding" };
+            if (!try decodeB64Chunk(arena, &bytes, chunk[0..chunk_len], lch == .strict))
+                return .{ .read = read, .bytes = bytes.items, .err = true, .msg = "Base64 chunk has non-zero padding bits" };
+            return .{ .read = str.len, .bytes = bytes.items };
+        }
+        const v = b64Value(url, c) orelse
+            return .{ .read = read, .bytes = bytes.items, .err = true, .msg = bad_char };
+        // A partial chunk that could not fit in the remaining space is not
+        // decoded at all — stop here and report the last whole-chunk `read`.
+        const remaining = max_length - bytes.items.len;
+        if ((remaining == 1 and chunk_len == 2) or (remaining == 2 and chunk_len == 3))
+            return .{ .read = read, .bytes = bytes.items };
+        chunk[chunk_len] = v;
+        chunk_len += 1;
+        if (chunk_len == 4) {
+            _ = try decodeB64Chunk(arena, &bytes, chunk[0..4], false);
+            chunk_len = 0;
+            read = index;
+            if (bytes.items.len == max_length) return .{ .read = read, .bytes = bytes.items };
+        }
+    }
+}
+
+/// FromHex(string, maxLength). An odd-length input reports the error without
+/// decoding anything.
+fn fromHex(arena: std.mem.Allocator, str: []const u8, max_length: usize) !DecodeRec {
+    var bytes = std.ArrayList(u8){};
+    if (str.len % 2 != 0)
+        return .{ .read = 0, .bytes = &[_]u8{}, .err = true, .msg = "Hex string must have an even number of characters" };
+    var read: usize = 0;
+    while (read < str.len and bytes.items.len < max_length) {
+        const hi = hexDigit(str[read]) orelse
+            return .{ .read = read, .bytes = bytes.items, .err = true, .msg = "Invalid hex character" };
+        const lo = hexDigit(str[read + 1]) orelse
+            return .{ .read = read, .bytes = bytes.items, .err = true, .msg = "Invalid hex character" };
+        read += 2;
+        try bytes.append(arena, (hi << 4) | lo);
+    }
+    return .{ .read = read, .bytes = bytes.items };
+}
+
+/// Uint8Array.fromBase64 / fromHex ignore their receiver entirely: the result is
+/// always a plain %Uint8Array% (a subclass constructor is never consulted).
+fn u8FromBytes(arena: std.mem.Allocator, bytes: []const u8) anyerror!Value {
+    const a = try allocTA(arena, .u8, bytes.len);
+    if (bytes.len > 0) @memcpy(a.td.ab.bytes[0..bytes.len], bytes);
+    return val_mod.makeObject(arena, a.obj);
+}
+
+pub fn nativeU8FromBase64(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const str = try requireStringArg(arena, args);
+    const opts = try getOptionsObject(arena, args, 1);
+    const url = try readAlphabet(arena, opts);
+    const lch = try readLastChunkHandling(arena, opts);
+    const rec = try fromBase64(arena, str, url, lch, std.math.maxInt(usize));
+    if (rec.err) return throwSyntaxError(arena, rec.msg);
+    return u8FromBytes(arena, rec.bytes);
+}
+
+pub fn nativeU8FromHex(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const str = try requireStringArg(arena, args);
+    const rec = try fromHex(arena, str, std.math.maxInt(usize));
+    if (rec.err) return throwSyntaxError(arena, rec.msg);
+    return u8FromBytes(arena, rec.bytes);
 }
 
 pub fn nativeU8SetFromBase64(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const alpha = try base64Alphabet(arena, args, 1);
+    const td = try validateU8Brand(arena, this_val);
+    // Mutability is checked before any argument is even looked at.
+    if (td.ab.immutable) return throwTypeError(arena, "Cannot write to an immutable ArrayBuffer");
     const str = try requireStringArg(arena, args);
-    const dst = try validateU8This(arena, this_val);
-    var written: usize = 0;
-    var read: usize = 0;
-    var quad: [4]u6 = undefined;
-    var qn: usize = 0;
-    var idx: usize = 0;
-    while (idx < str.len) : (idx += 1) {
-        const c = str[idx];
-        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\x0c') continue;
-        if (c == '=') break;
-        const v = b64Value(alpha, c) orelse return throwSyntaxError(arena, "Invalid base64 character");
-        quad[qn] = v;
-        qn += 1;
-        if (qn == 4) {
-            const out_bytes = [_]u8{
-                (@as(u8, quad[0]) << 2) | (@as(u8, quad[1]) >> 4),
-                (@as(u8, quad[1]) << 4) | (@as(u8, quad[2]) >> 2),
-                (@as(u8, quad[2]) << 6) | @as(u8, quad[3]),
-            };
-            for (out_bytes) |b| {
-                if (written >= dst.len) return setResult(arena, read, written);
-                dst[written] = b;
-                written += 1;
-            }
-            qn = 0;
-            read = idx + 1;
-        }
-    }
-    // Trailing partial group (2 or 3 base64 chars => 1 or 2 bytes).
-    if (qn >= 2) {
-        const partial = [_]u8{
-            (@as(u8, quad[0]) << 2) | (@as(u8, quad[1]) >> 4),
-            (@as(u8, quad[1]) << 4) | (@as(u8, quad[2]) >> 2),
-        };
-        const nbytes: usize = qn - 1;
-        var k: usize = 0;
-        while (k < nbytes and written < dst.len) : (k += 1) {
-            dst[written] = partial[k];
-            written += 1;
-        }
-        read = str.len;
-    }
-    return setResult(arena, read, written);
+    const opts = try getOptionsObject(arena, args, 1);
+    const url = try readAlphabet(arena, opts);
+    const lch = try readLastChunkHandling(arena, opts);
+    const dst = try u8Bytes(arena, td);
+    const rec = try fromBase64(arena, str, url, lch, dst.len);
+    // SetUint8ArrayBytes runs even on an abrupt result: everything decoded
+    // before the error is written, then the error is thrown.
+    @memcpy(dst[0..rec.bytes.len], rec.bytes);
+    if (rec.err) return throwSyntaxError(arena, rec.msg);
+    return setResult(arena, rec.read, rec.bytes.len);
 }
 
 pub fn nativeU8SetFromHex(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const td = try validateU8Brand(arena, this_val);
+    if (td.ab.immutable) return throwTypeError(arena, "Cannot write to an immutable ArrayBuffer");
     const str = try requireStringArg(arena, args);
-    const dst = try validateU8This(arena, this_val);
-    if (str.len % 2 != 0) return throwSyntaxError(arena, "Hex string must have an even number of characters");
-    var written: usize = 0;
-    var read: usize = 0;
-    var i: usize = 0;
-    while (i + 2 <= str.len) : (i += 2) {
-        if (written >= dst.len) break;
-        const hi = hexDigit(str[i]) orelse return throwSyntaxError(arena, "Invalid hex character");
-        const lo = hexDigit(str[i + 1]) orelse return throwSyntaxError(arena, "Invalid hex character");
-        dst[written] = (hi << 4) | lo;
-        written += 1;
-        read = i + 2;
-    }
-    return setResult(arena, read, written);
+    const dst = try u8Bytes(arena, td);
+    const rec = try fromHex(arena, str, dst.len);
+    @memcpy(dst[0..rec.bytes.len], rec.bytes);
+    if (rec.err) return throwSyntaxError(arena, rec.msg);
+    return setResult(arena, rec.read, rec.bytes.len);
 }
 
 fn hexDigit(c: u8) ?u8 {

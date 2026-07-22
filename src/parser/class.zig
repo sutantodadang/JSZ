@@ -895,23 +895,70 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     const name_tok = p.expect(.identifier) orelse return null;
     const class_name = name_tok.value_str;
 
-    var super_name: ?[]const u8 = null;
-    // When the heritage is a non-identifier expression (e.g. `extends fn(await x)`),
-    // store it here and emit `var __super__ = <expr>;` before the class body.
-    var heritage_expr: ?*Node = null;
-    if (p.match(.kw_extends)) {
-        const heritage = p.parseCallMemberExpr() orelse return null;
-        if (heritage.kind == .identifier) {
-            super_name = heritage.data.identifier;
-        } else {
-            super_name = "__super__";
-            heritage_expr = heritage;
-        }
-    }
-
+    const heritage = parseHeritage(p) orelse return null;
     _ = p.expect(.left_brace) orelse return null;
     var parsed = parseClassMembers(p) orelse return null;
     if (!manglePrivateNames(p, &parsed)) return null;
+
+    const out = emitClassStatements(p, .{
+        .class_name = class_name,
+        .ctor_fn_name = class_name,
+    }, heritage, parsed, start) orelse return null;
+
+    if (out.items.len == 1) return out.items[0];
+    // Transparent container: the `let <ClassName>` binding (and helpers) belong
+    // to the enclosing scope, not a fresh block scope, so a following
+    // `class B extends A` can resolve `A`.
+    return p.makeNode(.block_stmt, start, p.current.start, .{
+        .block_stmt = .{ .body = out.items, .lexical_scope = false },
+    });
+}
+
+/// The parsed `extends` clause. A non-identifier heritage expression (e.g.
+/// `extends fn(await x)`) is hoisted into a `var __super__ = <expr>;` emitted
+/// before the class body, so everything downstream can refer to it by name.
+const Heritage = struct {
+    super_name: ?[]const u8 = null,
+    expr: ?*Node = null,
+};
+
+fn parseHeritage(p: *Parser) ?Heritage {
+    if (!p.match(.kw_extends)) return Heritage{};
+    const h = p.parseCallMemberExpr() orelse return null;
+    if (h.kind == .identifier) return Heritage{ .super_name = h.data.identifier };
+    return Heritage{ .super_name = "__super__", .expr = h };
+}
+
+/// How a class's constructor is named and bound. The declaration form
+/// (`class C {}`) introduces a `let C` in the enclosing scope; the expression
+/// form (`x = class {}`) wraps the same statements in an IIFE, where the binding
+/// name is an internal detail and the constructor carries the NamedEvaluation
+/// name (`""` for a genuinely anonymous class).
+const ClassForm = struct {
+    /// Identifier the desugared statements refer to the constructor by.
+    class_name: []const u8,
+    /// `.name` of the constructor function object (SetFunctionName).
+    ctor_fn_name: ?[]const u8,
+};
+
+/// Emit the statements a class desugars to: the constructor binding, the
+/// static/prototype chain wiring, the `constructor` back-link, methods and
+/// static fields. Shared by `parseClassDeclStmt` and `parseClassExpr` — the two
+/// forms differ only in `form` and in what they wrap the result in. Keeping one
+/// implementation matters: the expression form previously carried a stale copy
+/// that scoped `__superthis` inside the `super()` helper (so every derived class
+/// *expression* with an explicit constructor threw a ReferenceError) and dropped
+/// constructor rest parameters, `__sproto__`, and derived instance fields.
+fn emitClassStatements(
+    p: *Parser,
+    form: ClassForm,
+    heritage: Heritage,
+    parsed: ClassBodyParse,
+    start: u32,
+) ?std.ArrayList(*Node) {
+    const class_name = form.class_name;
+    const super_name = heritage.super_name;
+    const heritage_expr = heritage.expr;
     const ctor_params: [][]const u8 = parsed.ctor_params;
     const ctor_rest: ?[]const u8 = parsed.ctor_rest;
     var ctor_body: []*Node = parsed.ctor_body;
@@ -1097,7 +1144,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     // var ClassName = function ClassName(...) { ... }
     const ctor_fn = p.makeNode(.function_expr, start, p.current.start, .{
         .function_expr = .{
-            .name = class_name,
+            .name = form.ctor_fn_name,
             .params = ctor_params,
             .param_defaults = &[_]?*Node{},
             .rest_param = ctor_rest,
@@ -1182,13 +1229,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         out.append(p.arena, stmt) catch return null;
     }
 
-    if (out.items.len == 1) return out.items[0];
-    // Transparent container: the `let <ClassName>` binding (and helpers) belong
-    // to the enclosing scope, not a fresh block scope, so a following
-    // `class B extends A` can resolve `A`.
-    return p.makeNode(.block_stmt, start, p.current.start, .{
-        .block_stmt = .{ .body = out.items, .lexical_scope = false },
-    });
+    return out;
 }
 
 /// Class expression (named or anonymous): `class [Name] [extends Super] { ... }`
@@ -1222,234 +1263,32 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
         break :blk h;
     };
 
-    var super_name: ?[]const u8 = null;
-    var heritage_expr: ?*Node = null;
-    if (p.match(.kw_extends)) {
-        const heritage = p.parseCallMemberExpr() orelse return null;
-        if (heritage.kind == .identifier) {
-            super_name = heritage.data.identifier;
-        } else {
-            super_name = "__super__";
-            heritage_expr = heritage;
-        }
-    }
-
+    const heritage = parseHeritage(p) orelse return null;
     _ = p.expect(.left_brace) orelse return null;
-        var parsed = parseClassMembers(p) orelse return null;
-        if (!manglePrivateNames(p, &parsed)) return null;
-        const ctor_params: [][]const u8 = parsed.ctor_params;
-        var ctor_body: []*Node = parsed.ctor_body;
-        const members = parsed.members;
-        const fields = parsed.fields;
+    var parsed = parseClassMembers(p) orelse return null;
+    if (!manglePrivateNames(p, &parsed)) return null;
 
-        // If no constructor and derives from something, generate default
-        if (!parsed.has_ctor and super_name != null) {
-            const sname = super_name.?;
-            const id_reflect = p.makeNode(.identifier, start, start, .{ .identifier = "Reflect" }) orelse return null;
-            const id_construct = p.makeNode(.identifier, start, start, .{ .identifier = "construct" }) orelse return null;
-            const callee = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = id_reflect, .property = id_construct, .computed = false },
-            }) orelse return null;
-            const id_super_p = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
-            const id_args = p.makeNode(.identifier, start, start, .{ .identifier = "arguments" }) orelse return null;
-            const id_nt = makeNewTargetNode(p, start, class_name) orelse return null;
-            var rc_args = std.ArrayList(*Node){};
-            rc_args.append(p.arena, id_super_p) catch return null;
-            rc_args.append(p.arena, id_args) catch return null;
-            rc_args.append(p.arena, id_nt) catch return null;
-            const rc_call = p.makeNode(.call_expr, start, start, .{
-                .call_expr = .{ .callee = callee, .args = rc_args.items },
-            }) orelse return null;
-            const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = rc_call }) orelse return null;
-            var body = std.ArrayList(*Node){};
-            body.append(p.arena, ret_stmt) catch return null;
-            ctor_body = body.items;
-        }
+    // Named class → ctor name = class_name; anonymous with a NamedEvaluation
+    // hint (`let x = class{}`, `export default`) → that name; else the empty
+    // string. The explicit "" matters: the ctor is bound as `<synthetic_name> =
+    // <ctor fn>` inside the IIFE, and without it the compiler's NamedEvaluation
+    // would leak that synthetic binding name onto a genuinely anonymous class.
+    var out = emitClassStatements(p, .{
+        .class_name = class_name,
+        .ctor_fn_name = if (has_name) class_name else (anon_name_hint orelse ""),
+    }, heritage, parsed, start) orelse return null;
 
-        // Build constructor body with super() handler for derived classes
-        var ctor_body_effective = ctor_body;
-        if (super_name) |sname| {
-            var out = std.ArrayList(*Node){};
-            var ctor_stmts = std.ArrayList(*Node){};
-            const st_decl = p.makeNode(.var_decl, start, start, .{
-                .var_decl = .{ .kind = .var_, .name = "__superthis", .init = null },
-            }) orelse return null;
-            ctor_stmts.append(p.arena, st_decl) catch return null;
-            const id_reflect = p.makeNode(.identifier, start, start, .{ .identifier = "Reflect" }) orelse return null;
-            const id_construct = p.makeNode(.identifier, start, start, .{ .identifier = "construct" }) orelse return null;
-            const rc_callee = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = id_reflect, .property = id_construct, .computed = false },
-            }) orelse return null;
-            const id_super_p = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
-            const id_args = p.makeNode(.identifier, start, start, .{ .identifier = "arguments" }) orelse return null;
-            const id_nt = makeNewTargetNode(p, start, class_name) orelse return null;
-            var rc_args = std.ArrayList(*Node){};
-            rc_args.append(p.arena, id_super_p) catch return null;
-            rc_args.append(p.arena, id_args) catch return null;
-            rc_args.append(p.arena, id_nt) catch return null;
-            const rc_call = p.makeNode(.call_expr, start, start, .{
-                .call_expr = .{ .callee = rc_callee, .args = rc_args.items },
-            }) orelse return null;
-            const target = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
-            const rc_assign = p.makeNode(.assignment_expr, start, start, .{
-                .assignment_expr = .{ .op = .assign, .target = target, .value = rc_call },
-            }) orelse return null;
-            const rc_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = rc_assign }) orelse return null;
-            ctor_stmts.append(p.arena, rc_stmt) catch return null;
+    // The IIFE evaluates to the constructor.
+    const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+    const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
+    out.append(p.arena, ret_stmt) catch return null;
 
-            const super_fn_params = p.arena.dupe([]const u8, ctor_params) catch return null;
-            const super_fn_body = ctor_stmts.items;
-            const super_fn = p.makeNode(.function_expr, start, start, .{
-                .function_expr = .{ .name = null, .params = super_fn_params, .body = super_fn_body, .is_arrow = false },
-            }) orelse return null;
-
-            const super_binding = p.makeNode(.var_decl, start, start, .{
-                .var_decl = .{ .kind = .var_, .name = "super", .init = super_fn },
-            }) orelse return null;
-            out.append(p.arena, super_binding) catch return null;
-
-            // Bind `this` to the super-constructed instance (`__superthis`).
-            for (ctor_body) |stmt| rewriteThisToSuperThis(stmt);
-            // See above: skip the synthesized default derived constructor.
-            if (parsed.has_ctor) for (ctor_body) |stmt| rewriteDerivedReturns(p, stmt);
-            for (ctor_body) |stmt| {
-                out.append(p.arena, stmt) catch return null;
-            }
-
-            // `this` TDZ: returning without calling super() leaves __superthis
-            // undefined; reading `this` must throw a ReferenceError.
-            {
-                const guard_lhs = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
-                const guard_rhs = p.makeNode(.identifier, start, start, .{ .identifier = "undefined" }) orelse return null;
-                const guard_test = p.makeNode(.binary_expr, start, start, .{
-                    .binary_expr = .{ .op = .strict_eq, .left = guard_lhs, .right = guard_rhs },
-                }) orelse return null;
-                const id_re = p.makeNode(.identifier, start, start, .{ .identifier = "ReferenceError" }) orelse return null;
-                const re_msg = p.makeNode(.string_literal, start, start, .{
-                    .string_literal = "must call super constructor before accessing 'this'",
-                }) orelse return null;
-                var re_args = std.ArrayList(*Node){};
-                re_args.append(p.arena, re_msg) catch return null;
-                const re_new = p.makeNode(.new_expr, start, start, .{
-                    .new_expr = .{ .callee = id_re, .args = re_args.items },
-                }) orelse return null;
-                const throw_st = p.makeNode(.throw_stmt, start, start, .{ .throw_stmt = re_new }) orelse return null;
-                const guard_if = p.makeNode(.if_stmt, start, start, .{
-                    .if_stmt = .{ .test_ = guard_test, .consequent = throw_st, .alternate = null },
-                }) orelse return null;
-                out.append(p.arena, guard_if) catch return null;
-            }
-
-            const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
-            const ret_stmt2 = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
-            out.append(p.arena, ret_stmt2) catch return null;
-            ctor_body_effective = out.items;
-        } else {
-            // Base class: instance fields initialize at the start of the ctor.
-            ctor_body_effective = prependInstanceFields(p, ctor_body_effective, fields) orelse return null;
-        }
-
-        // Emit IIFE wrapper
-        const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-        const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
-        var fn_body = std.ArrayList(*Node){};
-        if (heritage_expr) |he| {
-            const hv = p.makeNode(.var_decl, start, start, .{
-                .var_decl = .{ .kind = .var_, .name = "__super__", .init = he },
-            }) orelse return null;
-            fn_body.append(p.arena, hv) catch return null;
-        }
-
-        // Named class → ctor name = class_name; anonymous with a NamedEvaluation
-        // hint (`let x = class{}` binding, `export default`) → that name; else the
-        // empty string. The explicit "" is important: the ctor is desugared to
-        // `var __AnonClassExpr = <ctor fn>`, and without an explicit name the
-        // compiler's NamedEvaluation would otherwise leak that synthetic binding
-        // name onto a genuinely anonymous class (spec: its name is "").
-        const ctor_fn_name: ?[]const u8 = if (has_name) class_name else (anon_name_hint orelse "");
-        const ctor_fn = p.makeNode(.function_expr, start, start, .{
-            .function_expr = .{ .name = ctor_fn_name, .params = ctor_params, .body = ctor_body_effective, .is_arrow = false },
-        }) orelse return null;
-        const ctor_var = p.makeNode(.var_decl, start, start, .{
-            .var_decl = .{ .kind = .var_, .name = class_name, .init = ctor_fn },
-        }) orelse return null;
-        fn_body.append(p.arena, ctor_var) catch return null;
-
-        // Static inheritance: Object.setPrototypeOf(ClassName, Super)
-        if (super_name) |sname| {
-            const id_o = p.makeNode(.identifier, start, start, .{ .identifier = "Object" }) orelse return null;
-            const id_sp = p.makeNode(.identifier, start, start, .{ .identifier = "setPrototypeOf" }) orelse return null;
-            const callee_sp = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = id_o, .property = id_sp, .computed = false },
-            }) orelse return null;
-            const a_cls = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-            const a_sup = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
-            var sp_args = std.ArrayList(*Node){};
-            sp_args.append(p.arena, a_cls) catch return null;
-            sp_args.append(p.arena, a_sup) catch return null;
-            const sp_call = p.makeNode(.call_expr, start, start, .{
-                .call_expr = .{ .callee = callee_sp, .args = sp_args.items },
-            }) orelse return null;
-            const sp_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = sp_call }) orelse return null;
-            fn_body.append(p.arena, sp_stmt) catch return null;
-        }
-
-        // Prototype chain: ClassName.prototype = Object.create(Super.prototype)
-        if (super_name) |sname| {
-            const id_class = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-            const id_proto = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
-            const lhs_proto = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = id_class, .property = id_proto, .computed = false },
-            }) orelse return null;
-
-            const id_obj = p.makeNode(.identifier, start, start, .{ .identifier = "Object" }) orelse return null;
-            const id_create = p.makeNode(.identifier, start, start, .{ .identifier = "create" }) orelse return null;
-            const callee_create = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = id_obj, .property = id_create, .computed = false },
-            }) orelse return null;
-
-            const id_super = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
-            const id_super_proto = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
-            const super_proto = p.makeNode(.member_expr, start, start, .{
-                .member_expr = .{ .object = id_super, .property = id_super_proto, .computed = false },
-            }) orelse return null;
-
-            var args_create = std.ArrayList(*Node){};
-            args_create.append(p.arena, super_proto) catch return null;
-            const rhs_create = p.makeNode(.call_expr, start, start, .{
-                .call_expr = .{ .callee = callee_create, .args = args_create.items },
-            }) orelse return null;
-
-            const assign_proto = p.makeNode(.assignment_expr, start, start, .{
-                .assignment_expr = .{ .op = .assign, .target = lhs_proto, .value = rhs_create },
-            }) orelse return null;
-            const stmt_proto = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign_proto }) orelse return null;
-            fn_body.append(p.arena, stmt_proto) catch return null;
-        }
-
-        // Constructor back-link, defined non-enumerable (see makeCtorBackLink).
-        fn_body.append(p.arena, makeCtorBackLink(p, class_name) orelse return null) catch return null;
-
-        for (members) |m| {
-            const stmt = emitClassMember(p, class_name, super_name, m) orelse return null;
-            fn_body.append(p.arena, stmt) catch return null;
-        }
-
-        // static fields: `ClassName.<name> = <init>` after the class is defined.
-        for (fields) |f| {
-            if (!f.is_static) continue;
-            const stmt = makeStaticFieldInit(p, class_name, f) orelse return null;
-            fn_body.append(p.arena, stmt) catch return null;
-        }
-
-        fn_body.append(p.arena, ret_stmt) catch return null;
-
-        const fn_expr = p.makeNode(.function_expr, start, p.current.start, .{
-            .function_expr = .{ .name = null, .params = &[_][]const u8{}, .body = fn_body.items, .is_arrow = false },
-        }) orelse return null;
-        return p.makeNode(.call_expr, start, p.current.start, .{
-            .call_expr = .{ .callee = fn_expr, .args = &[_]*Node{} },
-        });
+    const fn_expr = p.makeNode(.function_expr, start, p.current.start, .{
+        .function_expr = .{ .name = null, .params = &[_][]const u8{}, .body = out.items, .is_arrow = false },
+    }) orelse return null;
+    return p.makeNode(.call_expr, start, p.current.start, .{
+        .call_expr = .{ .callee = fn_expr, .args = &[_]*Node{} },
+    });
 }
 
 pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
