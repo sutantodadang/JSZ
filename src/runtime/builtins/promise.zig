@@ -29,6 +29,7 @@ pub fn register(ctx: *const intrinsics.Ctx) !*JsObject {
     try promise_ctor_obj.set("withResolvers", try val_mod.makeNativeFunctionNamed(arena, nativePromiseWithResolvers, "withResolvers", 0));
     try promise_ctor_obj.set("try", try val_mod.makeNativeFunctionNamed(arena, nativePromiseTry, "try", 1));
     try promise_proto.set("finally", try val_mod.makeNativeFunctionNamed(arena, nativePromiseFinally, "finally", 0));
+    intrinsic_then_fn = promise_proto.get("then") orelse Value{};
     _ = try promise_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try promise_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Promise"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try promise_proto.defineOwnData("constructor", try val_mod.makeObject(arena, promise_ctor_obj), .{ .writable = true, .enumerable = false, .configurable = true });
@@ -59,14 +60,41 @@ const Job = struct {
     reaction: Reaction,
     input_state: PromiseState,
     input_value: Value,
+    /// When set, this is a PromiseResolveThenableJob (§27.2.2.2) rather than a
+    /// reaction job: `input_value` is the thenable and this is its `then`, to be
+    /// called with resolving functions for `reaction.next_data`.
+    then_method: Value = Value{},
 };
 
 const ResolverData = struct {
     promise: *PromiseData,
     resolve_mode: bool,
+    /// CreateResolvingFunctions' [[AlreadyResolved]] record, SHARED by the
+    /// resolve/reject pair. `promise.state != .pending` is not a substitute:
+    /// `resolve(thenable)` only *enqueues* a job, so the promise is still
+    /// pending when a later `reject` (or a throw from the executor) arrives —
+    /// and that later call must be ignored.
+    already: *bool,
 };
 
+fn newResolverPair(arena: std.mem.Allocator, data: *PromiseData) !struct { resolve: Value, reject: Value, already: *bool } {
+    const already = try arena.create(bool);
+    already.* = false;
+    const resolve_data = try arena.create(ResolverData);
+    const reject_data = try arena.create(ResolverData);
+    resolve_data.* = .{ .promise = data, .resolve_mode = true, .already = already };
+    reject_data.* = .{ .promise = data, .resolve_mode = false, .already = already };
+    return .{
+        .resolve = try makeResolverObject(arena, resolve_data),
+        .reject = try makeResolverObject(arena, reject_data),
+        .already = already,
+    };
+}
+
 var microtasks: std.ArrayListUnmanaged(Job) = .empty;
+
+/// %Promise.prototype.then% as built at realm init (see `promiseResolveData`).
+var intrinsic_then_fn: Value = Value{};
 
 fn getThenMethod(v: Value) ?Value {
     if (v.bits == 0 or v.unbox() != .object) return null;
@@ -94,15 +122,15 @@ fn makeResolverObject(arena: std.mem.Allocator, data: *ResolverData) !Value {
 /// PromiseResolveThenableJob (ES §27.2.2.2): call `then.call(thenable, resolve,
 /// reject)` with resolving functions for `data`; a throw rejects `data`.
 fn assimilateThenable(arena: std.mem.Allocator, data: *PromiseData, thenable: Value, then_method: Value) void {
-    const resolve_data = arena.create(ResolverData) catch return;
-    const reject_data = arena.create(ResolverData) catch return;
-    resolve_data.* = .{ .promise = data, .resolve_mode = true };
-    reject_data.* = .{ .promise = data, .resolve_mode = false };
-    const resolve_val = makeResolverObject(arena, resolve_data) catch return;
-    const reject_val = makeResolverObject(arena, reject_data) catch return;
-    _ = fn_proto.invokeCallback(arena, thenable, then_method, &[_]Value{ resolve_val, reject_val }) catch |e| {
+    const pair = newResolverPair(arena, data) catch return;
+    _ = fn_proto.invokeCallback(arena, thenable, then_method, &[_]Value{ pair.resolve, pair.reject }) catch |e| {
         if (e == error.JsException) {
-            promiseRejectData(arena, data, realm_mod.pending_exception);
+            // The abrupt completion calls reject(err), which the shared
+            // [[AlreadyResolved]] record makes a no-op once `then` resolved.
+            if (!pair.already.*) {
+                pair.already.* = true;
+                promiseRejectData(arena, data, realm_mod.pending_exception);
+            }
             realm_mod.pending_exception = Value{};
         }
     };
@@ -259,9 +287,12 @@ fn promiseResolveData(arena: std.mem.Allocator, data: *PromiseData, v: Value) vo
     }
     // Fast internal adoption when the resolution is a native promise still using
     // the intrinsic `then` (avoids a needless observable then invocation).
-    const intrinsic_then: ?Value = if (realm_mod.active_promise_proto) |p| p.get("then") else null;
+    // Compared against the `then` captured at realm init, NOT a fresh
+    // Promise.prototype lookup: user code that monkey-patches
+    // Promise.prototype.then would otherwise still take the fast path, and its
+    // replacement would never be called.
     if (getData(v)) |inner| {
-        if (intrinsic_then != null and then_method.bits == intrinsic_then.?.bits) {
+        if (intrinsic_then_fn.bits != 0 and then_method.bits == intrinsic_then_fn.bits) {
             if (inner.state == .pending) {
                 inner.reactions.append(arena, .{
                     .on_fulfilled = Value{},
@@ -276,7 +307,14 @@ fn promiseResolveData(arena: std.mem.Allocator, data: *PromiseData, v: Value) vo
         }
     }
     // Otherwise assimilate via the observable `then` (custom thenable / subclass).
-    assimilateThenable(arena, data, v, then_method);
+    // The spec ENQUEUES a PromiseResolveThenableJob here — `then` must not run
+    // synchronously inside the resolve function.
+    microtasks.append(arena, .{
+        .reaction = .{ .on_fulfilled = Value{}, .on_rejected = Value{}, .next_data = data },
+        .input_state = .fulfilled,
+        .input_value = v,
+        .then_method = then_method,
+    }) catch assimilateThenable(arena, data, v, then_method);
 }
 
 fn promiseRejectData(arena: std.mem.Allocator, data: *PromiseData, v: Value) void {
@@ -291,6 +329,8 @@ fn nativePromiseResolver(arena: std.mem.Allocator, this_val: Value, args: []cons
     else
         return val_mod.makeUndefined(arena);
     const arg = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    if (d.already.*) return val_mod.makeUndefined(arena);
+    d.already.* = true;
     if (d.resolve_mode) {
         promiseResolveData(arena, d.promise, arg);
     } else {
@@ -308,22 +348,29 @@ pub fn nativePromiseCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
         return throwTypeError(arena, "Promise resolver is not a function");
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const o = this_val.toPtr().object;
+        // OrdinaryCreateFromConstructor(NewTarget, "%Promise.prototype%") — step 3,
+        // BEFORE the executor runs. It has to happen here rather than in the VM's
+        // post-construct fixup because invoking the executor re-enters the VM and
+        // clears `pending_new_target`, so the fixup would never fire.
+        try applyNewTargetProto(arena, o);
         const d = try arena.create(PromiseData);
         d.* = .{};
         o.internal_kind = .promise;
         o.internal_slot = d;
         if (args.len > 0 and isCallable(args[0])) {
-            const resolve_data = try arena.create(ResolverData);
-            const reject_data = try arena.create(ResolverData);
-            resolve_data.* = .{ .promise = d, .resolve_mode = true };
-            reject_data.* = .{ .promise = d, .resolve_mode = false };
             // Anonymous unary non-constructor built-ins (name "", length 1) with
             // %Function.prototype% as prototype, per §27.2.1.3.
-            const resolve_val = try makeResolverObject(arena, resolve_data);
-            const reject_val = try makeResolverObject(arena, reject_data);
+            const pair = try newResolverPair(arena, d);
+            const resolve_val = pair.resolve;
+            const reject_val = pair.reject;
             _ = fn_proto.invokeCallback(arena, try val_mod.makeUndefined(arena), args[0], &[_]Value{ resolve_val, reject_val }) catch |e| {
                 if (e == error.JsException) {
-                    promiseRejectData(arena, d, realm_mod.pending_exception);
+                    // §27.2.3.1 step 8: the throw calls reject(err), which is a
+                    // no-op if the executor already resolved.
+                    if (!pair.already.*) {
+                        pair.already.* = true;
+                        promiseRejectData(arena, d, realm_mod.pending_exception);
+                    }
                     realm_mod.pending_exception = Value{};
                 }
             };
@@ -331,6 +378,28 @@ pub fn nativePromiseCtor(arena: std.mem.Allocator, this_val: Value, args: []cons
         return this_val;
     }
     return makePromise(arena, .pending, try val_mod.makeUndefined(arena));
+}
+
+/// GetPrototypeFromConstructor(NewTarget, "%Promise.prototype%"): reads
+/// `NewTarget.prototype` (observable — a throwing getter propagates) and adopts
+/// it, else falls back to %Promise.prototype% of NewTarget's OWN realm. Consumes
+/// `pending_new_target` so the VM's post-construct fixup does not re-apply it.
+fn applyNewTargetProto(arena: std.mem.Allocator, obj: *JsObject) anyerror!void {
+    const nt = realm_mod.pending_new_target;
+    if (nt.bits == 0) return;
+    realm_mod.pending_new_target = Value{}; // consume before the (throwing) Get
+    const ctx = realm_mod.active_context orelse return;
+    const pv = try ctx.getProp(arena, nt, "prototype");
+    if (pv.bits != 0 and pv.unbox() == .object) {
+        obj.proto = pv.toPtr().object;
+        obj.setProtoBarrier(pv.toPtr().object);
+        return;
+    }
+    const fr = realm_mod.getFunctionRealm(nt) orelse return;
+    if (fr.promise_prototype) |p| {
+        obj.proto = p;
+        obj.setProtoBarrier(p);
+    }
 }
 
 /// True when `v` is a constructor (mirrors Reflect's IsConstructor check): the
@@ -416,8 +485,15 @@ fn isIntrinsicPromiseC(this_val: Value) bool {
 pub fn nativePromiseResolve(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     if (isIntrinsicPromiseC(this_val)) {
-        // Default %Promise%: engine-internal fast path.
-        if (getData(v) != null) return v;
+        // Default %Promise%: engine-internal fast path. Passing a promise
+        // through unchanged still requires the observable SameValue(Get(x,
+        // "constructor"), C) test — `p.constructor = null` must produce a NEW
+        // promise (§27.2.4.7.1 step 2).
+        if (getData(v) != null) {
+            const ctx = realm_mod.active_context orelse return v;
+            const xctor = try ctx.getProp(arena, v, "constructor");
+            if (sameRef(xctor, this_val) or (this_val.bits == 0 and isIntrinsicPromiseC(xctor))) return v;
+        }
         const p = try makePendingPromise(arena);
         if (getData(p)) |d| promiseResolveData(arena, d, v);
         return p;
@@ -520,6 +596,12 @@ fn ctxFromThis(comptime T: type, this_val: Value) ?*T {
 /// Build a bound handler whose `this` is a carrier object holding ctx_ptr in its
 /// internal_slot. If with_index is true, prepends idx as the first call arg (prefix[0]).
 fn makeCtxHandler(arena: std.mem.Allocator, native_fn: Value, ctx_ptr: *anyopaque, idx: usize, with_index: bool) !Value {
+    return makeCtxHandlerLen(arena, native_fn, ctx_ptr, idx, with_index, 1);
+}
+
+/// As `makeCtxHandler`, but with an explicit `.length`. GetCapabilitiesExecutor
+/// is the one such closure whose length is 2 (§27.2.1.5.1), not 1.
+fn makeCtxHandlerLen(arena: std.mem.Allocator, native_fn: Value, ctx_ptr: *anyopaque, idx: usize, with_index: bool, length: u8) !Value {
     const carrier = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
     carrier.internal_slot = ctx_ptr;
     const carrier_val = try val_mod.makeObject(arena, carrier);
@@ -539,7 +621,7 @@ fn makeCtxHandler(arena: std.mem.Allocator, native_fn: Value, ctx_ptr: *anyopaqu
     // These are anonymous 1-ary built-in functions (Promise resolve/reject element
     // closures, the capability executor, finally handlers): length before name,
     // both non-writable/non-enumerable/configurable.
-    _ = try bound_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try bound_obj.defineOwnData("length", try val_mod.makeNumber(arena, @floatFromInt(length)), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try bound_obj.defineOwnData("name", try val_mod.makeString(arena, ""), .{ .writable = false, .enumerable = false, .configurable = true });
     return val_mod.makeObject(arena, bound_obj);
 }
@@ -601,7 +683,7 @@ fn newPromiseCapability(arena: std.mem.Allocator, ctor: Value) !*Capability {
     const cap = try arena.create(Capability);
     cap.* = .{};
     const exec_base = try val_mod.makeNativeFunction(arena, nativeCapabilityExecutor);
-    const executor = try makeCtxHandler(arena, exec_base, cap, 0, false);
+    const executor = try makeCtxHandlerLen(arena, exec_base, cap, 0, false, 2);
     const promise = try ctx.construct(arena, ctor, &[_]Value{executor});
     if (!isCallable(cap.resolve) or !isCallable(cap.reject))
         return realm_mod.throwTypeError(arena, "Promise resolve/reject is not callable");
@@ -1111,6 +1193,11 @@ fn runReactionJob(arena: std.mem.Allocator, job: Job) void {
     // reallocates `microtasks`; since `job` may be passed by reference to an
     // element of that buffer, touching `job.*` afterward would read freed memory.
     const next_data = job.reaction.next_data;
+    // PromiseResolveThenableJob: run the deferred `then` call now.
+    if (job.then_method.bits != 0) {
+        assimilateThenable(arena, next_data, job.input_value, job.then_method);
+        return;
+    }
     const cap_resolve = job.reaction.cap_resolve;
     const cap_reject = job.reaction.cap_reject;
     const cap_mode = cap_resolve.bits != 0;

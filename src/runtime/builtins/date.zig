@@ -69,25 +69,18 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         .{ "toLocaleString", nativeDateToLocaleString },
         .{ "toLocaleDateString", nativeDateToLocaleDateString },
         .{ "toLocaleTimeString", nativeDateToLocaleTimeString },
+        .{ "toTemporalInstant", nativeDateToTemporalInstant },
     });
     active_date_proto = date_proto;
 
     const date_ctor = try intrinsics.makeCtor(arena, date_proto, nativeDateCtor, null);
     try intrinsics.setMethod(arena, date_ctor, "now", nativeDateNow);
-    try intrinsics.setMethod(arena, date_ctor, "parse", nativeDateParse);
-    try intrinsics.setMethod(arena, date_ctor, "UTC", nativeDateUTC);
     // Date.UTC.length === 7 (year..ms); Date.parse.length === 1. Both bare names
-    // are ambiguous in the shared length table, so pin them explicitly here.
-    if (date_ctor.getOwn("UTC")) |u| {
-        if (u.bits != 0 and u.unbox() == .object) {
-            _ = try u.unbox().object.defineOwnData("length", try val_mod.makeNumber(arena, 7), .{ .writable = false, .enumerable = false, .configurable = true });
-        }
-    }
-    if (date_ctor.getOwn("parse")) |pf| {
-        if (pf.bits != 0 and pf.unbox() == .object) {
-            _ = try pf.unbox().object.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
-        }
-    }
+    // are ambiguous in the shared length table, so pin them at registration —
+    // patching the descriptor afterwards does not work, since a native function
+    // is not an `.object` Value.
+    try intrinsics.setMethodLen(arena, date_ctor, "parse", nativeDateParse, 1);
+    try intrinsics.setMethodLen(arena, date_ctor, "UTC", nativeDateUTC, 7);
     _ = try date_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 7), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try date_ctor.defineOwnData("name", try val_mod.makeString(arena, "Date"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try date_proto.defineOwnData("constructor", try val_mod.makeObject(arena, date_ctor), .{ .writable = true, .enumerable = false, .configurable = true });
@@ -302,6 +295,13 @@ fn applyResult(arena: std.mem.Allocator, dd: *DateData, result: ?i64) !Value {
     return val_mod.makeNumber(arena, std.math.nan(f64));
 }
 
+/// "If t is NaN, return NaN" — the spec RETURNS without touching [[DateValue]].
+/// That matters because the argument's ToNumber may itself have re-entered and
+/// called setTime on the same Date; writing NaN here would undo it.
+fn nanNoWrite(arena: std.mem.Allocator) !Value {
+    return val_mod.makeNumber(arena, std.math.nan(f64));
+}
+
 pub fn getDateData(this_val: Value) ?*DateData {
     if (this_val.bits == 0) return null;
     const inner = this_val.unbox();
@@ -326,6 +326,17 @@ fn getValidDateData(this_val: Value) ?*DateData {
 /// is Invalid — callers decide whether to surface NaN or a string for that.
 fn requireDate(arena: std.mem.Allocator, this_val: Value) anyerror!*DateData {
     return getDateData(this_val) orelse realm_mod.throwTypeError(arena, "Date.prototype method called on an incompatible receiver");
+}
+
+/// Date.prototype.toTemporalInstant(): the Temporal.Instant for this Date's
+/// [[DateValue]]. An Invalid Date is a RangeError (not a TypeError — the brand
+/// is fine, the *value* is not a valid epoch time).
+pub fn nativeDateToTemporalInstant(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const dd = try requireDate(arena, this_val);
+    if (!dd.valid) return realm_mod.throwRangeError(arena, "Invalid Date has no Temporal.Instant");
+    const instant = @import("temporal/instant.zig");
+    const shared = @import("temporal/shared.zig");
+    return instant.makeInstant(arena, @as(i128, dd.ms) * shared.NS_PER_MILLI);
 }
 
 /// Brand check + validity: throws a TypeError for a non-Date receiver, returns
@@ -397,7 +408,83 @@ fn parseExpandedYear(s: []const u8, pos: *usize) ?i32 {
     };
     pos.* += 1;
     const digits = parseDigits(s, pos, 6) orelse return null;
+    // "-000000" would denote year 0 BCE with a negative sign, which the grammar
+    // (§21.4.1.15) explicitly forbids.
+    if (sign < 0 and digits == 0) return null;
     return sign * digits;
+}
+
+/// Parse the two formats `Date.prototype.toString` and `toUTCString` produce, so
+/// `Date.parse(d.toString())` round-trips (§21.4.3.2 requires it):
+///   "Thu Jan 01 1970 00:00:00 GMT+0000 (…)"  and  "Thu, 01 Jan 1970 00:00:00 GMT"
+fn parseLegacyDateString(s: []const u8) ?i64 {
+    var it = std.mem.tokenizeAny(u8, s, " ,");
+    // Weekday name, present in both formats; its value is not used.
+    const wd = it.next() orelse return null;
+    if (monthIndex(wd) != null) return null;
+    var tok = it.next() orelse return null;
+
+    var month: i32 = undefined;
+    var day: i32 = undefined;
+    if (monthIndex(tok)) |m| {
+        // toString: <wday> <Mon> <DD> <YYYY> …
+        month = m;
+        day = parseAll(it.next() orelse return null) orelse return null;
+    } else {
+        // toUTCString: <wday>, <DD> <Mon> <YYYY> …
+        day = parseAll(tok) orelse return null;
+        month = monthIndex(it.next() orelse return null) orelse return null;
+    }
+    const year = parseAll(it.next() orelse return null) orelse return null;
+
+    tok = it.next() orelse return null;
+    var hms = std.mem.splitScalar(u8, tok, ':');
+    const hour = parseAll(hms.next() orelse return null) orelse return null;
+    const min_ = parseAll(hms.next() orelse return null) orelse return null;
+    const sec_ = parseAll(hms.next() orelse return null) orelse return null;
+    if (hms.next() != null) return null;
+
+    // "GMT" (toUTCString) or "GMT+HHMM" (toString). This engine is UTC-only, so
+    // the offset is always zero, but accept and apply any well-formed one.
+    var offset_min: i32 = 0;
+    if (it.next()) |zone| {
+        if (!std.mem.startsWith(u8, zone, "GMT")) return null;
+        const rest = zone[3..];
+        if (rest.len != 0) {
+            if (rest.len != 5) return null;
+            const sign: i32 = switch (rest[0]) {
+                '+' => 1,
+                '-' => -1,
+                else => return null,
+            };
+            const oh = parseAll(rest[1..3]) orelse return null;
+            const om = parseAll(rest[3..5]) orelse return null;
+            if (oh > 23 or om > 59) return null;
+            offset_min = sign * (oh * 60 + om);
+        }
+        // A trailing "(Coordinated Universal Time)" is a comment; ignore the rest.
+    }
+
+    if (month < 0 or month > 11) return null;
+    if (day < 1 or day > daysInMonth(month, year)) return null;
+    if (hour > 24 or min_ > 59 or sec_ > 59) return null;
+    return fieldsToMs(year, month, day, hour, min_, sec_, 0) - @as(i64, offset_min) * 60_000;
+}
+
+fn monthIndex(name: []const u8) ?i32 {
+    for (MON, 0..) |m, i| {
+        if (std.mem.eql(u8, m, name)) return @intCast(i);
+    }
+    return null;
+}
+
+/// Parse a token that must be entirely decimal digits.
+fn parseAll(tok: []const u8) ?i32 {
+    if (tok.len == 0) return null;
+    var pos: usize = 0;
+    const v = parseDigits(tok, &pos, tok.len) orelse return null;
+    if (pos != tok.len) return null;
+    return v;
 }
 
 /// Parse the ES2015 §21.4.1.18 Date Time String Format (ISO 8601 subset) into
@@ -517,9 +604,11 @@ pub fn nativeDateParse(arena: std.mem.Allocator, _: Value, args: []const Value) 
             return val_mod.makeNumber(arena, std.math.nan(f64));
         }
     }
-    if (parseIsoDateString(s)) |ms| {
-        return val_mod.makeNumber(arena, @floatFromInt(ms));
-    }
+    // Date Time String Format first, then the legacy formats `toString` /
+    // `toUTCString` emit. TimeClip rejects anything outside ±8.64e15 ms.
+    const parsed = parseIsoDateString(s) orelse parseLegacyDateString(s) orelse
+        return val_mod.makeNumber(arena, std.math.nan(f64));
+    if (timeClip(@floatFromInt(parsed))) |ms| return val_mod.makeNumber(arena, @floatFromInt(ms));
     return val_mod.makeNumber(arena, std.math.nan(f64));
 }
 
@@ -554,10 +643,10 @@ fn makeFullYear(year: f64) f64 {
 
 pub fn nativeDateCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     // Called as a plain function (no `new`): ES 21.4.2.1 step 1 — ignore all
-    // arguments and return the current time as a string. Construction always
-    // passes a fresh object (with Date.prototype) as `this`; a plain call passes
-    // undefined (strict) which we treat as the function form.
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
+    // arguments and return the current time as a string. NewTarget, not the
+    // shape of `this`, is what distinguishes the two: a sloppy-mode `Date()`
+    // receives globalThis, which is an object.
+    if (!realm_mod.active_constructing or this_val.bits == 0 or this_val.unbox() != .object) {
         const now_val = try createDateObject(arena, std.time.milliTimestamp(), true);
         return nativeDateToString(arena, now_val, &[_]Value{});
     }
@@ -582,7 +671,8 @@ pub fn nativeDateCtor(arena: std.mem.Allocator, this_val: Value, args: []const V
                 is_invalid = true;
                 break :blk 0;
             }
-            const tv = try realm_mod.toNumberValue(arena, prim);
+            // Spec ToNumber: a Symbol/BigInt primitive is a TypeError, not NaN.
+            const tv = try coercion.toNumberThrowing(arena, prim);
             if (timeClip(tv)) |clamped| break :blk clamped;
             is_invalid = true;
             break :blk 0;
@@ -883,7 +973,7 @@ pub fn nativeDateSetMonth(arena: std.mem.Allocator, this_val: Value, args: []con
     const f = msToFields(dd.ms);
     var nums: [2]f64 = undefined;
     const n = try coerceArgs(arena, args, &nums);
-    if (!base_valid) return applyResult(arena, dd, null);
+    if (!base_valid) return nanNoWrite(arena);
     const month = nums[0];
     const day = if (n > 1) nums[1] else @as(f64, @floatFromInt(f.day));
     return applyResult(arena, dd, composeTime(@floatFromInt(f.year), month, day, @floatFromInt(f.hour), @floatFromInt(f.min), @floatFromInt(f.sec), @floatFromInt(f.ms)));
@@ -895,7 +985,7 @@ pub fn nativeDateSetDate(arena: std.mem.Allocator, this_val: Value, args: []cons
     const f = msToFields(dd.ms);
     var nums: [1]f64 = undefined;
     _ = try coerceArgs(arena, args, &nums);
-    if (!base_valid) return applyResult(arena, dd, null);
+    if (!base_valid) return nanNoWrite(arena);
     return applyResult(arena, dd, composeTime(@floatFromInt(f.year), @floatFromInt(f.month), nums[0], @floatFromInt(f.hour), @floatFromInt(f.min), @floatFromInt(f.sec), @floatFromInt(f.ms)));
 }
 
@@ -905,7 +995,7 @@ pub fn nativeDateSetHours(arena: std.mem.Allocator, this_val: Value, args: []con
     const f = msToFields(dd.ms);
     var nums: [4]f64 = undefined;
     const n = try coerceArgs(arena, args, &nums);
-    if (!base_valid) return applyResult(arena, dd, null);
+    if (!base_valid) return nanNoWrite(arena);
     const hour = nums[0];
     const min = if (n > 1) nums[1] else @as(f64, @floatFromInt(f.min));
     const sec = if (n > 2) nums[2] else @as(f64, @floatFromInt(f.sec));
@@ -919,7 +1009,7 @@ pub fn nativeDateSetMinutes(arena: std.mem.Allocator, this_val: Value, args: []c
     const f = msToFields(dd.ms);
     var nums: [3]f64 = undefined;
     const n = try coerceArgs(arena, args, &nums);
-    if (!base_valid) return applyResult(arena, dd, null);
+    if (!base_valid) return nanNoWrite(arena);
     const min = nums[0];
     const sec = if (n > 1) nums[1] else @as(f64, @floatFromInt(f.sec));
     const ms = if (n > 2) nums[2] else @as(f64, @floatFromInt(f.ms));
@@ -932,7 +1022,7 @@ pub fn nativeDateSetSeconds(arena: std.mem.Allocator, this_val: Value, args: []c
     const f = msToFields(dd.ms);
     var nums: [2]f64 = undefined;
     const n = try coerceArgs(arena, args, &nums);
-    if (!base_valid) return applyResult(arena, dd, null);
+    if (!base_valid) return nanNoWrite(arena);
     const sec = nums[0];
     const ms = if (n > 1) nums[1] else @as(f64, @floatFromInt(f.ms));
     return applyResult(arena, dd, composeTime(@floatFromInt(f.year), @floatFromInt(f.month), @floatFromInt(f.day), @floatFromInt(f.hour), @floatFromInt(f.min), sec, ms));
@@ -944,7 +1034,7 @@ pub fn nativeDateSetMilliseconds(arena: std.mem.Allocator, this_val: Value, args
     const f = msToFields(dd.ms);
     var nums: [1]f64 = undefined;
     _ = try coerceArgs(arena, args, &nums);
-    if (!base_valid) return applyResult(arena, dd, null);
+    if (!base_valid) return nanNoWrite(arena);
     return applyResult(arena, dd, composeTime(@floatFromInt(f.year), @floatFromInt(f.month), @floatFromInt(f.day), @floatFromInt(f.hour), @floatFromInt(f.min), @floatFromInt(f.sec), nums[0]));
 }
 

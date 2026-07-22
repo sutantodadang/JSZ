@@ -1254,6 +1254,9 @@ pub var active_global_object: ?*JsObject = null;
 
 /// Phase 4b: thread-locals for prototype access from builtin fns.
 pub var active_array_proto: ?*JsObject = null;
+/// %Array% of the running realm — ArraySpeciesCreate compares a cross-realm
+/// species constructor against its OWN realm's %Array% (ES 23.1.3.4 step 3.b).
+pub var active_array_ctor: ?*JsObject = null;
 pub var active_object_proto: ?*JsObject = null;
 /// Phase 4b: thread-local for String.prototype (autoboxing lookup).
 pub var active_string_proto: ?*JsObject = null;
@@ -1513,7 +1516,9 @@ fn nativeSuppressedErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []
 
 fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     // new Object() / Object(): if arg is an object return it, else create new.
-    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
+    // Functions are objects too — `Object(f) === f` must hold, and testing only
+    // for `.object` boxed them into a fresh plain object instead.
+    if (args.len > 0 and isObjectLike(args[0])) {
         return args[0];
     }
     // ToObject for a primitive arg: box it in a wrapper carrying [[PrimitiveValue]]
@@ -4069,6 +4074,7 @@ pub const ThreadLocalSnapshot = struct {
     err_ReferenceError: ?*JsObject,
     err_AggregateError: ?*JsObject,
     err_URIError: ?*JsObject,
+    array_ctor: ?*JsObject,
     ab_proto: ?*JsObject,
     ab_ctor: ?*JsObject,
     sab_proto: ?*JsObject,
@@ -4117,6 +4123,7 @@ pub const ThreadLocalSnapshot = struct {
             .err_ReferenceError = error_proto_ReferenceError,
             .err_AggregateError = error_proto_AggregateError,
             .err_URIError = error_proto_URIError,
+            .array_ctor = active_array_ctor,
             .ab_proto = typed_array_mod.active_arraybuffer_proto,
             .ab_ctor = typed_array_mod.active_arraybuffer_ctor,
             .sab_proto = typed_array_mod.active_sharedarraybuffer_proto,
@@ -4136,6 +4143,7 @@ pub const ThreadLocalSnapshot = struct {
         active_global_env = self.global_env;
         active_global_object = self.global_object;
         active_array_proto = self.array_proto;
+        active_array_ctor = self.array_ctor;
         active_object_proto = self.object_proto;
         active_string_proto = self.string_proto;
         active_number_proto = self.number_proto;
@@ -4224,6 +4232,10 @@ pub const Realm = struct {
     ab_prototype: ?*JsObject = null,
     sab_prototype: ?*JsObject = null,
     dv_prototype: ?*JsObject = null,
+    /// %Array% of this realm (see `active_array_ctor`).
+    array_ctor: ?*JsObject = null,
+    /// %Promise.prototype% of this realm (OrdinaryCreateFromConstructor fallback).
+    promise_prototype: ?*JsObject = null,
     /// %TypedArray%.prototype (shared base of all per-kind TA prototype chains).
     ta_shared_prototype: ?*JsObject = null,
     /// Per-kind TypedArray prototypes, indexed by typed_array.TAKind.
@@ -4598,6 +4610,7 @@ pub const Realm = struct {
         _ = try array_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Array"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try array_proto.defineOwnData("constructor", try val_mod.makeObject(arena, array_ctor_obj), .{ .writable = true, .enumerable = false, .configurable = true });
         try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
+        active_array_ctor = array_ctor_obj;
 
         const string_ctor_obj = try JsObject.create(arena, null);
         try string_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, string_proto), .{ .writable = false, .enumerable = false, .configurable = false });
@@ -5189,6 +5202,8 @@ pub const Realm = struct {
     /// (i.e. right after Realm.init, before any other realm overwrites the
     /// thread-locals). Used by GetPrototypeFromConstructor's realm fallback.
     pub fn captureIntrinsics(self: *Realm) void {
+        self.array_ctor = active_array_ctor;
+        self.promise_prototype = active_promise_proto;
         self.ab_prototype = typed_array_mod.active_arraybuffer_proto;
         self.sab_prototype = typed_array_mod.active_sharedarraybuffer_proto;
         self.dv_prototype = typed_array_mod.active_dataview_proto;
@@ -5443,6 +5458,7 @@ pub const Realm = struct {
             active_heap = null;
         }
         active_array_proto = null;
+        active_array_ctor = null;
         active_object_proto = null;
         active_string_proto = null;
         active_number_proto = null;

@@ -435,7 +435,7 @@ fn isConcatSpreadable(arena: std.mem.Allocator, v: Value) !bool {
         const is_undef = spreadable.bits == 0 or spreadable.unbox() == .undefined_;
         if (!is_undef) return val_mod.toBoolean(spreadable);
     }
-    return v.toPtr().object.is_array;
+    return isArraySpec(arena, v);
 }
 
 pub fn nativeConcat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1124,14 +1124,53 @@ fn arrayCreate(arena: std.mem.Allocator, length: usize) !Value {
     return val_mod.makeObject(arena, a);
 }
 
+/// Type(v) is Object. Callables carry their own Value tags in this engine, so a
+/// bare `unbox() == .object` test misses every function.
+fn isObjectLike(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .object, .function, .bc_function, .native_function => true,
+        else => false,
+    };
+}
+
+/// IsArray (§7.2.2): unwraps Proxy layers to the ultimate target; a REVOKED
+/// proxy anywhere in the chain is a TypeError, not `false`.
+fn isArraySpec(arena: std.mem.Allocator, v: Value) anyerror!bool {
+    if (v.bits == 0 or v.unbox() != .object) return false;
+    const proxy_mod = @import("proxy.zig");
+    var o = v.toPtr().object;
+    var depth: usize = 0;
+    while (o.internal_kind == .proxy and depth < 64) : (depth += 1) {
+        const t = proxy_mod.proxyTarget(o) orelse return proxy_mod.throwRevoked(arena);
+        if (t.bits == 0 or t.unbox() != .object) return false;
+        o = t.toPtr().object;
+    }
+    return o.is_array;
+}
+
 /// ES ArraySpeciesCreate(originalArray, length): create the result array via the
 /// original array's constructor[@@species] when overridden, else a plain Array.
 fn arraySpeciesCreate(arena: std.mem.Allocator, original: Value, length: usize) !Value {
-    const is_array = original.bits != 0 and original.unbox() == .object and original.toPtr().object.is_array;
-    if (!is_array) return arrayCreate(arena, length);
+    if (!try isArraySpec(arena, original)) return arrayCreate(arena, length);
     var C: Value = if (realm_mod.active_context) |ctx| try ctx.getProp(arena, original, "constructor") else Value{ .bits = 0 };
-    // If C is an Object, C = Get(C, @@species); null → undefined.
-    if (C.bits != 0 and C.unbox() == .object) {
+    // §23.1.3.4 step 3.b: a constructor from ANOTHER realm that is that realm's
+    // own %Array% is treated as absent — the result is a plain array of the
+    // running realm, and @@species is never even read.
+    if (arrIsConstructor(C)) {
+        if (realm_mod.getFunctionRealm(C)) |rc| {
+            if (rc.array_ctor) |other_array| {
+                const same_realm = rc.array_ctor == realm_mod.active_array_ctor;
+                if (!same_realm and C.unbox() == .object and C.toPtr().object == other_array)
+                    return arrayCreate(arena, length);
+            }
+        }
+    }
+    // If C is an Object, C = Get(C, @@species); null → undefined. "Object" here
+    // includes functions — this engine gives callables their own Value tags, and
+    // testing only for `.object` silently skipped the @@species read for a
+    // `constructor` that was a plain function.
+    if (isObjectLike(C)) {
         if (realm_mod.active_sym_species) |sym| {
             C = if (realm_mod.active_context) |ctx| try ctx.getPropSym(arena, C, sym) else Value{ .bits = 0 };
             if (C.bits != 0 and C.unbox() == .null_) C = Value{ .bits = 0 };
