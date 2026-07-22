@@ -889,7 +889,10 @@ fn genSet(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
     };
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
     if (realm_mod.active_context) |ctx| {
-        try ctx.setProp(arena, this_val, key, v);
+        // Every element write in this file comes from a spec step of the form
+        // Set(O, ToString(i), v, true) — the THROWING form. A read-only or
+        // setter-less accessor target must raise TypeError, not fail silently.
+        try ctx.setPropThrow(arena, this_val, key, v);
         return;
     }
     if (this_val.isHeapPtr() and this_val.toPtr().* == .object)

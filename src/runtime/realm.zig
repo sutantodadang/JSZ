@@ -4740,7 +4740,11 @@ pub const Realm = struct {
         // Capture Symbol.iterator and register Array.prototype[Symbol.iterator].
         active_sym_iterator = symbol_ctor.getOwn("iterator");
         if (active_sym_iterator) |symv| {
-            try array_proto.setSym(symv, try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeArrayValues));
+            // §23.1.3.41: Array.prototype[@@iterator] is the SAME function object
+            // as Array.prototype.values, not a second copy of it.
+            const values_fn = array_proto.get("values") orelse
+                try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeArrayValues);
+            try array_proto.setSym(symv, values_fn);
             // String.prototype[@@iterator] — by-code-point iteration (overridable
             // and deletable, so it is a writable/configurable own property).
             try string_proto.setSymAttr(symv, try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeStringValues, "[Symbol.iterator]", 0), .{ .writable = true, .enumerable = false, .configurable = true });

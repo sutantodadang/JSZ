@@ -2152,6 +2152,10 @@ fn makeWrapIterator(arena: std.mem.Allocator, d: *IterHelperData) !Value {
 
 /// Array.prototype[Symbol.iterator] (and values()): index iterator over `this`.
 pub fn nativeArrayValues(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    // CreateArrayIterator step 1 is ToObject(this), so a null/undefined receiver
+    // is a TypeError rather than an immediately-done iterator.
+    if (this_val.bits == 0 or this_val.isNullish())
+        try setTypeError(arena, "Array.prototype.values called on null or undefined");
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const d = try arena.create(SeqIterData);
         d.* = .{ .seq = this_val, .kind = .value };
