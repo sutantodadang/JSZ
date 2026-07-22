@@ -267,6 +267,10 @@ pub const MemberExpr = struct {
     /// element is a private method, which is non-writable, so a later
     /// `obj.#m = v` is a TypeError instead of a field update.
     private_method: bool = false,
+    /// Set by the class desugaring on a public field initializer's assignment
+    /// target: DefineField is CreateDataPropertyOrThrow, so it must not run a
+    /// setter inherited from the prototype chain. Compiles to DEFINE_DATA.
+    define_data: bool = false,
 };
 
 pub const FuncExpr = struct {

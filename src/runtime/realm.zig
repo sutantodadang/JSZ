@@ -3055,7 +3055,16 @@ fn nativeBigIntCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
                 return error.JsException;
             }
             if (@abs(x) < 9.0e18) return val_mod.makeBigIntFromI64(arena, @intFromFloat(x));
-            const s = try std.fmt.allocPrint(arena, "{d}", .{x});
+            // Past i64 the shortest round-trip decimal ("4.503599627370495e21")
+            // is NOT the value's exact integer, and NumberToBigInt is exact. Any
+            // such x is a normalized double whose significand scales by a
+            // non-negative power of two, so mantissa << exp reproduces it bit for
+            // bit (1024 bits of range, plus slack for the shift).
+            const raw: u64 = @bitCast(@abs(x));
+            const mantissa: u64 = (raw & 0xf_ffff_ffff_ffff) | (1 << 52);
+            const shift: u32 = @intCast(@as(i32, @intCast((raw >> 52) & 0x7ff)) - 1075);
+            const exact: u1100 = @as(u1100, mantissa) << @intCast(shift);
+            const s = try std.fmt.allocPrint(arena, "{s}{d}", .{ if (x < 0) "-" else "", exact });
             return val_mod.makeBigIntFromLiteral(arena, s) catch throwTypeError(arena, "Cannot convert number to a BigInt");
         },
         else => return throwTypeError(arena, "Cannot convert value to a BigInt"),
@@ -5053,6 +5062,10 @@ pub const Realm = struct {
             _ = try intl_obj.defineOwnData("getCanonicalLocales", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeGetCanonicalLocales, "getCanonicalLocales", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             // Intl.supportedValuesOf (static)
             _ = try intl_obj.defineOwnData("supportedValuesOf", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeSupportedValuesOf, "supportedValuesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+            // §8.1.1: the Intl namespace object's own @@toStringTag is "Intl",
+            // so `Object.prototype.toString.call(Intl)` is "[object Intl]".
+            if (active_sym_to_string_tag) |tag_sym|
+                _ = try intl_obj.defineOwnDataSym(tag_sym, try val_mod.makeString(arena, "Intl"), .{ .writable = false, .enumerable = false, .configurable = true });
             try env.define("Intl", try val_mod.makeObject(arena, intl_obj));
         }
 

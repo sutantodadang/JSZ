@@ -1669,6 +1669,31 @@ fn appendDecomp(out: *std.ArrayList(u21), arena: std.mem.Allocator, cp: u21, com
     }
 }
 
+/// NFD of `s`, as code points. `Intl.Collator` needs the decomposed form to
+/// separate a character's base letter from its accents.
+pub fn nfdCodePoints(arena: std.mem.Allocator, s: []const u8) ![]u21 {
+    var cps = std.ArrayList(u21){};
+    var i: usize = 0;
+    while (i < s.len) {
+        var dec = decodeWtf8At(s, i);
+        var consumed = dec.len;
+        // A string built from `𝅗𝅥` escapes stores the pair as two
+        // 3-byte sequences; the decomposition table is keyed on the code point,
+        // so recombine before looking it up.
+        if (dec.cp >= 0xD800 and dec.cp <= 0xDBFF and i + dec.len < s.len) {
+            const lo = decodeWtf8At(s, i + dec.len);
+            if (lo.cp >= 0xDC00 and lo.cp <= 0xDFFF) {
+                dec.cp = 0x10000 + ((dec.cp - 0xD800) << 10) + (lo.cp - 0xDC00);
+                consumed += lo.len;
+            }
+        }
+        try appendDecomp(&cps, arena, dec.cp, false);
+        i += consumed;
+    }
+    canonicalOrder(cps.items);
+    return cps.items;
+}
+
 /// Canonical ordering: stable-sort each maximal run of combining marks (ccc > 0)
 /// by combining class (UAX #15 D109).
 fn canonicalOrder(cps: []u21) void {

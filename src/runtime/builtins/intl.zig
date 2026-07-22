@@ -29,6 +29,10 @@ const coercion_mod = @import("coercion.zig");
 // date/time objects, and `Temporal.X.prototype.toLocaleString` routes through
 // this module's en-US formatter (see temporalEpochMs / temporalToLocaleString).
 const t_shared = @import("temporal/shared.zig");
+const str_mod = @import("string_proto.zig");
+const unorm = @import("unicode_normalize.zig");
+const uprops = @import("unicode_prop_tables.zig");
+const ucase = @import("unicode_case_tables.zig");
 const t_instant = @import("temporal/instant.zig");
 const t_pdate = @import("temporal/plain_date.zig");
 const t_ptime = @import("temporal/plain_time.zig");
@@ -41,6 +45,7 @@ const t_calendar = @import("temporal/calendar.zig");
 const t_tzdata = @import("temporal/tzdata.zig");
 const nfmt = @import("intl_number.zig");
 const locale_id = @import("intl_locale_id.zig");
+const likely = @import("intl_likely_subtags.zig");
 
 // Intl.NumberFormat lives in `intl_number.zig`; re-export the pieces the realm
 // registration and the sibling services (ListFormat / RelativeTimeFormat) use.
@@ -358,28 +363,100 @@ fn resolveDtfTimeZone(arena: std.mem.Allocator, s: []const u8) !DtfZone {
 /// The ten digits of each decimal numbering system this build can render, as
 /// UTF-8 (§11.5.5 uses them for every numeric date-time field). `null` for an
 /// identifier we have no digits for — the caller then falls back to `latn`.
+/// Table 4 of ECMA-402: every numbering system with a simple digit mapping.
+/// `Intl.supportedValuesOf("numberingSystem")` reports exactly these.
+pub const numbering_systems = [_]struct { []const u8, [10][]const u8 }{
+    .{ "adlm", [10][]const u8{ "\u{1e950}", "\u{1e951}", "\u{1e952}", "\u{1e953}", "\u{1e954}", "\u{1e955}", "\u{1e956}", "\u{1e957}", "\u{1e958}", "\u{1e959}" } },
+    .{ "ahom", [10][]const u8{ "\u{11730}", "\u{11731}", "\u{11732}", "\u{11733}", "\u{11734}", "\u{11735}", "\u{11736}", "\u{11737}", "\u{11738}", "\u{11739}" } },
+    .{ "arab", [10][]const u8{ "\u{660}", "\u{661}", "\u{662}", "\u{663}", "\u{664}", "\u{665}", "\u{666}", "\u{667}", "\u{668}", "\u{669}" } },
+    .{ "arabext", [10][]const u8{ "\u{6f0}", "\u{6f1}", "\u{6f2}", "\u{6f3}", "\u{6f4}", "\u{6f5}", "\u{6f6}", "\u{6f7}", "\u{6f8}", "\u{6f9}" } },
+    .{ "bali", [10][]const u8{ "\u{1b50}", "\u{1b51}", "\u{1b52}", "\u{1b53}", "\u{1b54}", "\u{1b55}", "\u{1b56}", "\u{1b57}", "\u{1b58}", "\u{1b59}" } },
+    .{ "beng", [10][]const u8{ "\u{9e6}", "\u{9e7}", "\u{9e8}", "\u{9e9}", "\u{9ea}", "\u{9eb}", "\u{9ec}", "\u{9ed}", "\u{9ee}", "\u{9ef}" } },
+    .{ "bhks", [10][]const u8{ "\u{11c50}", "\u{11c51}", "\u{11c52}", "\u{11c53}", "\u{11c54}", "\u{11c55}", "\u{11c56}", "\u{11c57}", "\u{11c58}", "\u{11c59}" } },
+    .{ "brah", [10][]const u8{ "\u{11066}", "\u{11067}", "\u{11068}", "\u{11069}", "\u{1106a}", "\u{1106b}", "\u{1106c}", "\u{1106d}", "\u{1106e}", "\u{1106f}" } },
+    .{ "cakm", [10][]const u8{ "\u{11136}", "\u{11137}", "\u{11138}", "\u{11139}", "\u{1113a}", "\u{1113b}", "\u{1113c}", "\u{1113d}", "\u{1113e}", "\u{1113f}" } },
+    .{ "cham", [10][]const u8{ "\u{aa50}", "\u{aa51}", "\u{aa52}", "\u{aa53}", "\u{aa54}", "\u{aa55}", "\u{aa56}", "\u{aa57}", "\u{aa58}", "\u{aa59}" } },
+    .{ "deva", [10][]const u8{ "\u{966}", "\u{967}", "\u{968}", "\u{969}", "\u{96a}", "\u{96b}", "\u{96c}", "\u{96d}", "\u{96e}", "\u{96f}" } },
+    .{ "diak", [10][]const u8{ "\u{11950}", "\u{11951}", "\u{11952}", "\u{11953}", "\u{11954}", "\u{11955}", "\u{11956}", "\u{11957}", "\u{11958}", "\u{11959}" } },
+    .{ "fullwide", [10][]const u8{ "\u{ff10}", "\u{ff11}", "\u{ff12}", "\u{ff13}", "\u{ff14}", "\u{ff15}", "\u{ff16}", "\u{ff17}", "\u{ff18}", "\u{ff19}" } },
+    .{ "gara", [10][]const u8{ "\u{10d40}", "\u{10d41}", "\u{10d42}", "\u{10d43}", "\u{10d44}", "\u{10d45}", "\u{10d46}", "\u{10d47}", "\u{10d48}", "\u{10d49}" } },
+    .{ "gong", [10][]const u8{ "\u{11da0}", "\u{11da1}", "\u{11da2}", "\u{11da3}", "\u{11da4}", "\u{11da5}", "\u{11da6}", "\u{11da7}", "\u{11da8}", "\u{11da9}" } },
+    .{ "gonm", [10][]const u8{ "\u{11d50}", "\u{11d51}", "\u{11d52}", "\u{11d53}", "\u{11d54}", "\u{11d55}", "\u{11d56}", "\u{11d57}", "\u{11d58}", "\u{11d59}" } },
+    .{ "gujr", [10][]const u8{ "\u{ae6}", "\u{ae7}", "\u{ae8}", "\u{ae9}", "\u{aea}", "\u{aeb}", "\u{aec}", "\u{aed}", "\u{aee}", "\u{aef}" } },
+    .{ "gukh", [10][]const u8{ "\u{16130}", "\u{16131}", "\u{16132}", "\u{16133}", "\u{16134}", "\u{16135}", "\u{16136}", "\u{16137}", "\u{16138}", "\u{16139}" } },
+    .{ "guru", [10][]const u8{ "\u{a66}", "\u{a67}", "\u{a68}", "\u{a69}", "\u{a6a}", "\u{a6b}", "\u{a6c}", "\u{a6d}", "\u{a6e}", "\u{a6f}" } },
+    .{ "hanidec", [10][]const u8{ "\u{3007}", "\u{4e00}", "\u{4e8c}", "\u{4e09}", "\u{56db}", "\u{4e94}", "\u{516d}", "\u{4e03}", "\u{516b}", "\u{4e5d}" } },
+    .{ "hmng", [10][]const u8{ "\u{16b50}", "\u{16b51}", "\u{16b52}", "\u{16b53}", "\u{16b54}", "\u{16b55}", "\u{16b56}", "\u{16b57}", "\u{16b58}", "\u{16b59}" } },
+    .{ "hmnp", [10][]const u8{ "\u{1e140}", "\u{1e141}", "\u{1e142}", "\u{1e143}", "\u{1e144}", "\u{1e145}", "\u{1e146}", "\u{1e147}", "\u{1e148}", "\u{1e149}" } },
+    .{ "java", [10][]const u8{ "\u{a9d0}", "\u{a9d1}", "\u{a9d2}", "\u{a9d3}", "\u{a9d4}", "\u{a9d5}", "\u{a9d6}", "\u{a9d7}", "\u{a9d8}", "\u{a9d9}" } },
+    .{ "kali", [10][]const u8{ "\u{a900}", "\u{a901}", "\u{a902}", "\u{a903}", "\u{a904}", "\u{a905}", "\u{a906}", "\u{a907}", "\u{a908}", "\u{a909}" } },
+    .{ "kawi", [10][]const u8{ "\u{11f50}", "\u{11f51}", "\u{11f52}", "\u{11f53}", "\u{11f54}", "\u{11f55}", "\u{11f56}", "\u{11f57}", "\u{11f58}", "\u{11f59}" } },
+    .{ "khmr", [10][]const u8{ "\u{17e0}", "\u{17e1}", "\u{17e2}", "\u{17e3}", "\u{17e4}", "\u{17e5}", "\u{17e6}", "\u{17e7}", "\u{17e8}", "\u{17e9}" } },
+    .{ "knda", [10][]const u8{ "\u{ce6}", "\u{ce7}", "\u{ce8}", "\u{ce9}", "\u{cea}", "\u{ceb}", "\u{cec}", "\u{ced}", "\u{cee}", "\u{cef}" } },
+    .{ "krai", [10][]const u8{ "\u{16d70}", "\u{16d71}", "\u{16d72}", "\u{16d73}", "\u{16d74}", "\u{16d75}", "\u{16d76}", "\u{16d77}", "\u{16d78}", "\u{16d79}" } },
+    .{ "lana", [10][]const u8{ "\u{1a80}", "\u{1a81}", "\u{1a82}", "\u{1a83}", "\u{1a84}", "\u{1a85}", "\u{1a86}", "\u{1a87}", "\u{1a88}", "\u{1a89}" } },
+    .{ "lanatham", [10][]const u8{ "\u{1a90}", "\u{1a91}", "\u{1a92}", "\u{1a93}", "\u{1a94}", "\u{1a95}", "\u{1a96}", "\u{1a97}", "\u{1a98}", "\u{1a99}" } },
+    .{ "laoo", [10][]const u8{ "\u{ed0}", "\u{ed1}", "\u{ed2}", "\u{ed3}", "\u{ed4}", "\u{ed5}", "\u{ed6}", "\u{ed7}", "\u{ed8}", "\u{ed9}" } },
+    .{ "latn", [10][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" } },
+    .{ "lepc", [10][]const u8{ "\u{1c40}", "\u{1c41}", "\u{1c42}", "\u{1c43}", "\u{1c44}", "\u{1c45}", "\u{1c46}", "\u{1c47}", "\u{1c48}", "\u{1c49}" } },
+    .{ "limb", [10][]const u8{ "\u{1946}", "\u{1947}", "\u{1948}", "\u{1949}", "\u{194a}", "\u{194b}", "\u{194c}", "\u{194d}", "\u{194e}", "\u{194f}" } },
+    .{ "mathbold", [10][]const u8{ "\u{1d7ce}", "\u{1d7cf}", "\u{1d7d0}", "\u{1d7d1}", "\u{1d7d2}", "\u{1d7d3}", "\u{1d7d4}", "\u{1d7d5}", "\u{1d7d6}", "\u{1d7d7}" } },
+    .{ "mathdbl", [10][]const u8{ "\u{1d7d8}", "\u{1d7d9}", "\u{1d7da}", "\u{1d7db}", "\u{1d7dc}", "\u{1d7dd}", "\u{1d7de}", "\u{1d7df}", "\u{1d7e0}", "\u{1d7e1}" } },
+    .{ "mathmono", [10][]const u8{ "\u{1d7f6}", "\u{1d7f7}", "\u{1d7f8}", "\u{1d7f9}", "\u{1d7fa}", "\u{1d7fb}", "\u{1d7fc}", "\u{1d7fd}", "\u{1d7fe}", "\u{1d7ff}" } },
+    .{ "mathsanb", [10][]const u8{ "\u{1d7ec}", "\u{1d7ed}", "\u{1d7ee}", "\u{1d7ef}", "\u{1d7f0}", "\u{1d7f1}", "\u{1d7f2}", "\u{1d7f3}", "\u{1d7f4}", "\u{1d7f5}" } },
+    .{ "mathsans", [10][]const u8{ "\u{1d7e2}", "\u{1d7e3}", "\u{1d7e4}", "\u{1d7e5}", "\u{1d7e6}", "\u{1d7e7}", "\u{1d7e8}", "\u{1d7e9}", "\u{1d7ea}", "\u{1d7eb}" } },
+    .{ "mlym", [10][]const u8{ "\u{d66}", "\u{d67}", "\u{d68}", "\u{d69}", "\u{d6a}", "\u{d6b}", "\u{d6c}", "\u{d6d}", "\u{d6e}", "\u{d6f}" } },
+    .{ "modi", [10][]const u8{ "\u{11650}", "\u{11651}", "\u{11652}", "\u{11653}", "\u{11654}", "\u{11655}", "\u{11656}", "\u{11657}", "\u{11658}", "\u{11659}" } },
+    .{ "mong", [10][]const u8{ "\u{1810}", "\u{1811}", "\u{1812}", "\u{1813}", "\u{1814}", "\u{1815}", "\u{1816}", "\u{1817}", "\u{1818}", "\u{1819}" } },
+    .{ "mroo", [10][]const u8{ "\u{16a60}", "\u{16a61}", "\u{16a62}", "\u{16a63}", "\u{16a64}", "\u{16a65}", "\u{16a66}", "\u{16a67}", "\u{16a68}", "\u{16a69}" } },
+    .{ "mtei", [10][]const u8{ "\u{abf0}", "\u{abf1}", "\u{abf2}", "\u{abf3}", "\u{abf4}", "\u{abf5}", "\u{abf6}", "\u{abf7}", "\u{abf8}", "\u{abf9}" } },
+    .{ "mymr", [10][]const u8{ "\u{1040}", "\u{1041}", "\u{1042}", "\u{1043}", "\u{1044}", "\u{1045}", "\u{1046}", "\u{1047}", "\u{1048}", "\u{1049}" } },
+    .{ "mymrepka", [10][]const u8{ "\u{116da}", "\u{116db}", "\u{116dc}", "\u{116dd}", "\u{116de}", "\u{116df}", "\u{116e0}", "\u{116e1}", "\u{116e2}", "\u{116e3}" } },
+    .{ "mymrpao", [10][]const u8{ "\u{116d0}", "\u{116d1}", "\u{116d2}", "\u{116d3}", "\u{116d4}", "\u{116d5}", "\u{116d6}", "\u{116d7}", "\u{116d8}", "\u{116d9}" } },
+    .{ "mymrshan", [10][]const u8{ "\u{1090}", "\u{1091}", "\u{1092}", "\u{1093}", "\u{1094}", "\u{1095}", "\u{1096}", "\u{1097}", "\u{1098}", "\u{1099}" } },
+    .{ "mymrtlng", [10][]const u8{ "\u{a9f0}", "\u{a9f1}", "\u{a9f2}", "\u{a9f3}", "\u{a9f4}", "\u{a9f5}", "\u{a9f6}", "\u{a9f7}", "\u{a9f8}", "\u{a9f9}" } },
+    .{ "nagm", [10][]const u8{ "\u{1e4f0}", "\u{1e4f1}", "\u{1e4f2}", "\u{1e4f3}", "\u{1e4f4}", "\u{1e4f5}", "\u{1e4f6}", "\u{1e4f7}", "\u{1e4f8}", "\u{1e4f9}" } },
+    .{ "newa", [10][]const u8{ "\u{11450}", "\u{11451}", "\u{11452}", "\u{11453}", "\u{11454}", "\u{11455}", "\u{11456}", "\u{11457}", "\u{11458}", "\u{11459}" } },
+    .{ "nkoo", [10][]const u8{ "\u{7c0}", "\u{7c1}", "\u{7c2}", "\u{7c3}", "\u{7c4}", "\u{7c5}", "\u{7c6}", "\u{7c7}", "\u{7c8}", "\u{7c9}" } },
+    .{ "olck", [10][]const u8{ "\u{1c50}", "\u{1c51}", "\u{1c52}", "\u{1c53}", "\u{1c54}", "\u{1c55}", "\u{1c56}", "\u{1c57}", "\u{1c58}", "\u{1c59}" } },
+    .{ "onao", [10][]const u8{ "\u{1e5f1}", "\u{1e5f2}", "\u{1e5f3}", "\u{1e5f4}", "\u{1e5f5}", "\u{1e5f6}", "\u{1e5f7}", "\u{1e5f8}", "\u{1e5f9}", "\u{1e5fa}" } },
+    .{ "orya", [10][]const u8{ "\u{b66}", "\u{b67}", "\u{b68}", "\u{b69}", "\u{b6a}", "\u{b6b}", "\u{b6c}", "\u{b6d}", "\u{b6e}", "\u{b6f}" } },
+    .{ "osma", [10][]const u8{ "\u{104a0}", "\u{104a1}", "\u{104a2}", "\u{104a3}", "\u{104a4}", "\u{104a5}", "\u{104a6}", "\u{104a7}", "\u{104a8}", "\u{104a9}" } },
+    .{ "outlined", [10][]const u8{ "\u{1ccf0}", "\u{1ccf1}", "\u{1ccf2}", "\u{1ccf3}", "\u{1ccf4}", "\u{1ccf5}", "\u{1ccf6}", "\u{1ccf7}", "\u{1ccf8}", "\u{1ccf9}" } },
+    .{ "rohg", [10][]const u8{ "\u{10d30}", "\u{10d31}", "\u{10d32}", "\u{10d33}", "\u{10d34}", "\u{10d35}", "\u{10d36}", "\u{10d37}", "\u{10d38}", "\u{10d39}" } },
+    .{ "saur", [10][]const u8{ "\u{a8d0}", "\u{a8d1}", "\u{a8d2}", "\u{a8d3}", "\u{a8d4}", "\u{a8d5}", "\u{a8d6}", "\u{a8d7}", "\u{a8d8}", "\u{a8d9}" } },
+    .{ "segment", [10][]const u8{ "\u{1fbf0}", "\u{1fbf1}", "\u{1fbf2}", "\u{1fbf3}", "\u{1fbf4}", "\u{1fbf5}", "\u{1fbf6}", "\u{1fbf7}", "\u{1fbf8}", "\u{1fbf9}" } },
+    .{ "shrd", [10][]const u8{ "\u{111d0}", "\u{111d1}", "\u{111d2}", "\u{111d3}", "\u{111d4}", "\u{111d5}", "\u{111d6}", "\u{111d7}", "\u{111d8}", "\u{111d9}" } },
+    .{ "sind", [10][]const u8{ "\u{112f0}", "\u{112f1}", "\u{112f2}", "\u{112f3}", "\u{112f4}", "\u{112f5}", "\u{112f6}", "\u{112f7}", "\u{112f8}", "\u{112f9}" } },
+    .{ "sinh", [10][]const u8{ "\u{de6}", "\u{de7}", "\u{de8}", "\u{de9}", "\u{dea}", "\u{deb}", "\u{dec}", "\u{ded}", "\u{dee}", "\u{def}" } },
+    .{ "sora", [10][]const u8{ "\u{110f0}", "\u{110f1}", "\u{110f2}", "\u{110f3}", "\u{110f4}", "\u{110f5}", "\u{110f6}", "\u{110f7}", "\u{110f8}", "\u{110f9}" } },
+    .{ "sund", [10][]const u8{ "\u{1bb0}", "\u{1bb1}", "\u{1bb2}", "\u{1bb3}", "\u{1bb4}", "\u{1bb5}", "\u{1bb6}", "\u{1bb7}", "\u{1bb8}", "\u{1bb9}" } },
+    .{ "sunu", [10][]const u8{ "\u{11bf0}", "\u{11bf1}", "\u{11bf2}", "\u{11bf3}", "\u{11bf4}", "\u{11bf5}", "\u{11bf6}", "\u{11bf7}", "\u{11bf8}", "\u{11bf9}" } },
+    .{ "takr", [10][]const u8{ "\u{116c0}", "\u{116c1}", "\u{116c2}", "\u{116c3}", "\u{116c4}", "\u{116c5}", "\u{116c6}", "\u{116c7}", "\u{116c8}", "\u{116c9}" } },
+    .{ "talu", [10][]const u8{ "\u{19d0}", "\u{19d1}", "\u{19d2}", "\u{19d3}", "\u{19d4}", "\u{19d5}", "\u{19d6}", "\u{19d7}", "\u{19d8}", "\u{19d9}" } },
+    .{ "tamldec", [10][]const u8{ "\u{be6}", "\u{be7}", "\u{be8}", "\u{be9}", "\u{bea}", "\u{beb}", "\u{bec}", "\u{bed}", "\u{bee}", "\u{bef}" } },
+    .{ "telu", [10][]const u8{ "\u{c66}", "\u{c67}", "\u{c68}", "\u{c69}", "\u{c6a}", "\u{c6b}", "\u{c6c}", "\u{c6d}", "\u{c6e}", "\u{c6f}" } },
+    .{ "thai", [10][]const u8{ "\u{e50}", "\u{e51}", "\u{e52}", "\u{e53}", "\u{e54}", "\u{e55}", "\u{e56}", "\u{e57}", "\u{e58}", "\u{e59}" } },
+    .{ "tibt", [10][]const u8{ "\u{f20}", "\u{f21}", "\u{f22}", "\u{f23}", "\u{f24}", "\u{f25}", "\u{f26}", "\u{f27}", "\u{f28}", "\u{f29}" } },
+    .{ "tirh", [10][]const u8{ "\u{114d0}", "\u{114d1}", "\u{114d2}", "\u{114d3}", "\u{114d4}", "\u{114d5}", "\u{114d6}", "\u{114d7}", "\u{114d8}", "\u{114d9}" } },
+    .{ "tnsa", [10][]const u8{ "\u{16ac0}", "\u{16ac1}", "\u{16ac2}", "\u{16ac3}", "\u{16ac4}", "\u{16ac5}", "\u{16ac6}", "\u{16ac7}", "\u{16ac8}", "\u{16ac9}" } },
+    .{ "tols", [10][]const u8{ "\u{11de0}", "\u{11de1}", "\u{11de2}", "\u{11de3}", "\u{11de4}", "\u{11de5}", "\u{11de6}", "\u{11de7}", "\u{11de8}", "\u{11de9}" } },
+    .{ "vaii", [10][]const u8{ "\u{a620}", "\u{a621}", "\u{a622}", "\u{a623}", "\u{a624}", "\u{a625}", "\u{a626}", "\u{a627}", "\u{a628}", "\u{a629}" } },
+    .{ "wara", [10][]const u8{ "\u{118e0}", "\u{118e1}", "\u{118e2}", "\u{118e3}", "\u{118e4}", "\u{118e5}", "\u{118e6}", "\u{118e7}", "\u{118e8}", "\u{118e9}" } },
+    .{ "wcho", [10][]const u8{ "\u{1e2f0}", "\u{1e2f1}", "\u{1e2f2}", "\u{1e2f3}", "\u{1e2f4}", "\u{1e2f5}", "\u{1e2f6}", "\u{1e2f7}", "\u{1e2f8}", "\u{1e2f9}" } },
+};
+
+pub fn isSupportedNumberingSystem(ns: []const u8) bool {
+    for (numbering_systems) |e| if (std.mem.eql(u8, ns, e[0])) return true;
+    return false;
+}
+
+pub fn numberingSystemDigitsFor(ns: []const u8) ?[10][]const u8 {
+    return numberingSystemDigits(ns);
+}
+
 fn numberingSystemDigits(ns: []const u8) ?[10][]const u8 {
-    const table = .{
-        .{ "latn", [10][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" } },
-        .{ "arab", [10][]const u8{ "\u{0660}", "\u{0661}", "\u{0662}", "\u{0663}", "\u{0664}", "\u{0665}", "\u{0666}", "\u{0667}", "\u{0668}", "\u{0669}" } },
-        .{ "arabext", [10][]const u8{ "\u{06f0}", "\u{06f1}", "\u{06f2}", "\u{06f3}", "\u{06f4}", "\u{06f5}", "\u{06f6}", "\u{06f7}", "\u{06f8}", "\u{06f9}" } },
-        .{ "beng", [10][]const u8{ "\u{09e6}", "\u{09e7}", "\u{09e8}", "\u{09e9}", "\u{09ea}", "\u{09eb}", "\u{09ec}", "\u{09ed}", "\u{09ee}", "\u{09ef}" } },
-        .{ "deva", [10][]const u8{ "\u{0966}", "\u{0967}", "\u{0968}", "\u{0969}", "\u{096a}", "\u{096b}", "\u{096c}", "\u{096d}", "\u{096e}", "\u{096f}" } },
-        .{ "fullwide", [10][]const u8{ "\u{ff10}", "\u{ff11}", "\u{ff12}", "\u{ff13}", "\u{ff14}", "\u{ff15}", "\u{ff16}", "\u{ff17}", "\u{ff18}", "\u{ff19}" } },
-        .{ "gujr", [10][]const u8{ "\u{0ae6}", "\u{0ae7}", "\u{0ae8}", "\u{0ae9}", "\u{0aea}", "\u{0aeb}", "\u{0aec}", "\u{0aed}", "\u{0aee}", "\u{0aef}" } },
-        .{ "guru", [10][]const u8{ "\u{0a66}", "\u{0a67}", "\u{0a68}", "\u{0a69}", "\u{0a6a}", "\u{0a6b}", "\u{0a6c}", "\u{0a6d}", "\u{0a6e}", "\u{0a6f}" } },
-        .{ "hanidec", [10][]const u8{ "\u{3007}", "\u{4e00}", "\u{4e8c}", "\u{4e09}", "\u{56db}", "\u{4e94}", "\u{516d}", "\u{4e03}", "\u{516b}", "\u{4e5d}" } },
-        .{ "khmr", [10][]const u8{ "\u{17e0}", "\u{17e1}", "\u{17e2}", "\u{17e3}", "\u{17e4}", "\u{17e5}", "\u{17e6}", "\u{17e7}", "\u{17e8}", "\u{17e9}" } },
-        .{ "knda", [10][]const u8{ "\u{0ce6}", "\u{0ce7}", "\u{0ce8}", "\u{0ce9}", "\u{0cea}", "\u{0ceb}", "\u{0cec}", "\u{0ced}", "\u{0cee}", "\u{0cef}" } },
-        .{ "mlym", [10][]const u8{ "\u{0d66}", "\u{0d67}", "\u{0d68}", "\u{0d69}", "\u{0d6a}", "\u{0d6b}", "\u{0d6c}", "\u{0d6d}", "\u{0d6e}", "\u{0d6f}" } },
-        .{ "mymr", [10][]const u8{ "\u{1040}", "\u{1041}", "\u{1042}", "\u{1043}", "\u{1044}", "\u{1045}", "\u{1046}", "\u{1047}", "\u{1048}", "\u{1049}" } },
-        .{ "orya", [10][]const u8{ "\u{0b66}", "\u{0b67}", "\u{0b68}", "\u{0b69}", "\u{0b6a}", "\u{0b6b}", "\u{0b6c}", "\u{0b6d}", "\u{0b6e}", "\u{0b6f}" } },
-        .{ "tamldec", [10][]const u8{ "\u{0be6}", "\u{0be7}", "\u{0be8}", "\u{0be9}", "\u{0bea}", "\u{0beb}", "\u{0bec}", "\u{0bed}", "\u{0bee}", "\u{0bef}" } },
-        .{ "telu", [10][]const u8{ "\u{0c66}", "\u{0c67}", "\u{0c68}", "\u{0c69}", "\u{0c6a}", "\u{0c6b}", "\u{0c6c}", "\u{0c6d}", "\u{0c6e}", "\u{0c6f}" } },
-        .{ "thai", [10][]const u8{ "\u{0e50}", "\u{0e51}", "\u{0e52}", "\u{0e53}", "\u{0e54}", "\u{0e55}", "\u{0e56}", "\u{0e57}", "\u{0e58}", "\u{0e59}" } },
-        .{ "tibt", [10][]const u8{ "\u{0f20}", "\u{0f21}", "\u{0f22}", "\u{0f23}", "\u{0f24}", "\u{0f25}", "\u{0f26}", "\u{0f27}", "\u{0f28}", "\u{0f29}" } },
-    };
-    inline for (table) |e| if (std.mem.eql(u8, ns, e[0])) return e[1];
+    for (numbering_systems) |e| if (std.mem.eql(u8, ns, e[0])) return e[1];
     return null;
 }
 
@@ -865,8 +942,8 @@ pub fn nativeDateTimeFormatFormatRangeToParts(arena: std.mem.Allocator, this_val
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
     for (parts.items) |p| {
         const o = try dnEmptyObj(arena);
-        try o.set("type", try val_mod.makeString(arena, p.type));
-        try o.set("value", try val_mod.makeString(arena, p.value));
+        try defineData(o, "type", try val_mod.makeString(arena, p.type));
+        try defineData(o, "value", try val_mod.makeString(arena, p.value));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
     return val_mod.makeObject(arena, arr);
@@ -885,8 +962,8 @@ pub fn nativeDateTimeFormatFormatToParts(arena: std.mem.Allocator, this_val: Val
             try JsObject.createOnHeap(h, realm_mod.active_object_proto)
         else
             try JsObject.create(arena, realm_mod.active_object_proto);
-        try o.set("type", try val_mod.makeString(arena, p.type));
-        try o.set("value", try val_mod.makeString(arena, p.value));
+        try defineData(o, "type", try val_mod.makeString(arena, p.type));
+        try defineData(o, "value", try val_mod.makeString(arena, p.value));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
     return val_mod.makeObject(arena, arr);
@@ -1360,10 +1437,10 @@ pub fn nativeDateTimeFormatResolved(arena: std.mem.Allocator, this_val: Value, _
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
-    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
-    try r.set("calendar", try val_mod.makeString(arena, readOpt(o, "__dtf_calendar")));
-    try r.set("numberingSystem", try val_mod.makeString(arena, readOpt(o, "__dtf_numbering")));
-    try r.set("timeZone", try val_mod.makeString(arena, readOpt(o, "__dtf_tz")));
+    try defineData(r, "locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
+    try defineData(r, "calendar", try val_mod.makeString(arena, readOpt(o, "__dtf_calendar")));
+    try defineData(r, "numberingSystem", try val_mod.makeString(arena, readOpt(o, "__dtf_numbering")));
+    try defineData(r, "timeZone", try val_mod.makeString(arena, readOpt(o, "__dtf_tz")));
 
     const date_style = readOpt(o, "__dtf_dateStyle");
     const time_style = readOpt(o, "__dtf_timeStyle");
@@ -1371,21 +1448,21 @@ pub fn nativeDateTimeFormatResolved(arena: std.mem.Allocator, this_val: Value, _
     // field — a date-only formatter reports neither, even for `-u-hc-`.
     if (readOpt(o, "__dtf_hour").len > 0 or time_style.len > 0) {
         const hc = readOpt(o, "__dtf_hourCycle");
-        try r.set("hourCycle", try val_mod.makeString(arena, hc));
-        try r.set("hour12", try val_mod.makeBool(arena, std.mem.eql(u8, hc, "h11") or std.mem.eql(u8, hc, "h12")));
+        try defineData(r, "hourCycle", try val_mod.makeString(arena, hc));
+        try defineData(r, "hour12", try val_mod.makeBool(arena, std.mem.eql(u8, hc, "h11") or std.mem.eql(u8, hc, "h12")));
     }
     if (date_style.len == 0 and time_style.len == 0) {
         for (dtf_components) |c| {
             const v = readOpt(o, c.slot);
-            if (v.len > 0) try r.set(c.key, try val_mod.makeString(arena, v));
+            if (v.len > 0) try defineData(r, c.key, try val_mod.makeString(arena, v));
         }
         const frac = readNum(o, "__dtf_fracSec");
-        if (frac > 0) try r.set("fractionalSecondDigits", try val_mod.makeNumber(arena, frac));
+        if (frac > 0) try defineData(r, "fractionalSecondDigits", try val_mod.makeNumber(arena, frac));
         const tzn = readOpt(o, "__dtf_tzName");
-        if (tzn.len > 0) try r.set("timeZoneName", try val_mod.makeString(arena, tzn));
+        if (tzn.len > 0) try defineData(r, "timeZoneName", try val_mod.makeString(arena, tzn));
     } else {
-        if (date_style.len > 0) try r.set("dateStyle", try val_mod.makeString(arena, date_style));
-        if (time_style.len > 0) try r.set("timeStyle", try val_mod.makeString(arena, time_style));
+        if (date_style.len > 0) try defineData(r, "dateStyle", try val_mod.makeString(arena, date_style));
+        if (time_style.len > 0) try defineData(r, "timeStyle", try val_mod.makeString(arena, time_style));
     }
     return val_mod.makeObject(arena, r);
 }
@@ -1401,24 +1478,130 @@ pub fn nativeCollatorCtor(arena: std.mem.Allocator, this_val: Value, args: []con
         this_val.toPtr().object
     else
         try legacyServiceObj(arena, active_collator_proto);
-    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
+    const locales = if (args.len > 0) args[0] else Value{};
     // InitializeCollator (§10.1.2) reads the options in this exact order.
     const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
     const usage = (try dnGetOption(arena, options, "usage", &.{ "sort", "search" }, "sort")).?;
     _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+    var co_opt: ?[]const u8 = null;
     if (try dnGetOption(arena, options, "collation", &.{}, null)) |c| {
         if (!isWellFormedNumberingSystem(c)) return throwRangeError(arena, "invalid collation");
+        co_opt = try lowerDup(arena, c);
     }
-    const numeric = (try dnGetBoolOption(arena, options, "numeric")) orelse false;
-    const caseFirst = (try dnGetOption(arena, options, "caseFirst", &.{ "upper", "lower", "false" }, "false")).?;
+    const numeric_opt = try dnGetBoolOption(arena, options, "numeric");
+    const case_first_opt = try dnGetOption(arena, options, "caseFirst", &.{ "upper", "lower", "false" }, null);
     const sensitivity = (try dnGetOption(arena, options, "sensitivity", &.{ "base", "accent", "case", "variant" }, "variant")).?;
-    const ignore_punct = (try dnGetBoolOption(arena, options, "ignorePunctuation")) orelse false;
+
+    // ResolveLocale over the three relevant extension keys. A value taken from
+    // the requested tag stays in `resolvedOptions().locale`; one supplied by an
+    // option does not (unless it happens to agree with the tag).
+    const req = try resolveLocaleRequest(arena, locales);
+    var kept: [3][2][]const u8 = undefined;
+    var n_kept: usize = 0;
+
+    var collation: []const u8 = "default";
+    var co_from_tag = false;
+    if (try req.keyword(arena, "co")) |ext| {
+        if (isSupportedCollation(req.base, ext)) {
+            collation = ext;
+            co_from_tag = true;
+        }
+    }
+    if (co_opt) |opt| {
+        if (isSupportedCollation(req.base, opt)) {
+            if (co_from_tag and !std.mem.eql(u8, opt, collation)) co_from_tag = false;
+            collation = opt;
+        }
+    }
+    if (co_from_tag) {
+        kept[n_kept] = .{ "co", collation };
+        n_kept += 1;
+    }
+
+    // `-u-kn` with no value means `true` (a missing type value is the boolean
+    // key's "true"), so an empty keyword must not read as absent.
+    var numeric = false;
+    var kn_from_tag = false;
+    if (try req.keyword(arena, "kn")) |ext| {
+        if (ext.len == 0 or std.mem.eql(u8, ext, "true")) {
+            numeric = true;
+            kn_from_tag = true;
+        } else if (std.mem.eql(u8, ext, "false")) {
+            numeric = false;
+            kn_from_tag = true;
+        }
+    }
+    if (numeric_opt) |opt| {
+        if (kn_from_tag and opt != numeric) kn_from_tag = false;
+        numeric = opt;
+    }
+    if (kn_from_tag) {
+        kept[n_kept] = .{ "kn", if (numeric) "true" else "false" };
+        n_kept += 1;
+    }
+
+    var case_first: []const u8 = "false";
+    var kf_from_tag = false;
+    if (try req.keyword(arena, "kf")) |ext| {
+        for ([_][]const u8{ "upper", "lower", "false" }) |v| {
+            if (std.mem.eql(u8, ext, v)) {
+                case_first = v;
+                kf_from_tag = true;
+            }
+        }
+    }
+    if (case_first_opt) |opt| {
+        if (kf_from_tag and !std.mem.eql(u8, opt, case_first)) kf_from_tag = false;
+        case_first = opt;
+    }
+    if (kf_from_tag) {
+        kept[n_kept] = .{ "kf", case_first };
+        n_kept += 1;
+    }
+    try storeResolvedLocale(arena, obj, req.base, kept[0..n_kept]);
+
+    // ignorePunctuation defaults to true only for the locales whose CLDR root
+    // collation sets `alternate=shifted` (the South-East Asian scripts).
+    const ignore_punct = (try dnGetBoolOption(arena, options, "ignorePunctuation")) orelse
+        defaultIgnorePunctuation(req.base);
     try obj.set("__col_ignorePunctuation", try val_mod.makeBool(arena, ignore_punct));
     try obj.set("__col_usage", try val_mod.makeString(arena, usage));
     try obj.set("__col_sensitivity", try val_mod.makeString(arena, sensitivity));
     try obj.set("__col_numeric", try val_mod.makeBool(arena, numeric));
-    try obj.set("__col_caseFirst", try val_mod.makeString(arena, caseFirst));
+    try obj.set("__col_caseFirst", try val_mod.makeString(arena, case_first));
+    try obj.set("__col_collation", try val_mod.makeString(arena, if (std.mem.eql(u8, usage, "search")) "default" else collation));
     return val_mod.makeObject(arena, obj);
+}
+
+/// The `-u-co-` collations this build accepts for a locale: the root ones plus
+/// the language's own CLDR tailorings.
+fn isSupportedCollation(locale: []const u8, co: []const u8) bool {
+    if (std.mem.eql(u8, co, "standard") or std.mem.eql(u8, co, "search")) return false;
+    for ([_][]const u8{ "emoji", "eor" }) |v| if (std.mem.eql(u8, co, v)) return true;
+    const lang = primaryLanguage(locale);
+    const table = [_]struct { l: []const u8, cos: []const []const u8 }{
+        .{ .l = "de", .cos = &.{"phonebk"} },
+        .{ .l = "es", .cos = &.{"trad"} },
+        .{ .l = "zh", .cos = &.{ "pinyin", "stroke", "zhuyin", "gb2312han", "big5han", "unihan" } },
+        .{ .l = "ja", .cos = &.{"unihan"} },
+        .{ .l = "ko", .cos = &.{ "unihan", "searchjl" } },
+        .{ .l = "sv", .cos = &.{"reformed"} },
+        .{ .l = "hi", .cos = &.{"trad"} },
+        .{ .l = "si", .cos = &.{"dict"} },
+    };
+    for (table) |row| {
+        if (!std.mem.eql(u8, row.l, lang)) continue;
+        for (row.cos) |v| if (std.mem.eql(u8, co, v)) return true;
+    }
+    return false;
+}
+
+/// CLDR gives these languages `alternate="shifted"` in their root collation, so
+/// `ignorePunctuation` defaults to true for them.
+fn defaultIgnorePunctuation(locale: []const u8) bool {
+    const lang = primaryLanguage(locale);
+    for ([_][]const u8{ "th", "lo", "km", "my" }) |v| if (std.mem.eql(u8, lang, v)) return true;
+    return false;
 }
 
 /// §10.3.3 `get Intl.Collator.prototype.compare`: an accessor returning a
@@ -1438,46 +1621,141 @@ fn asciiLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }
 
-/// Case/base-insensitive byte comparison used when `sensitivity` is `base`/`accent`.
-fn orderCaseInsensitive(a: []const u8, b: []const u8) std.math.Order {
-    var i: usize = 0;
-    while (i < a.len and i < b.len) : (i += 1) {
-        const ca = asciiLower(a[i]);
-        const cb = asciiLower(b[i]);
-        if (ca != cb) return if (ca < cb) .lt else .gt;
+// A three-level approximation of the UCA root collation. Full DUCET weights are
+// out of scope, but the level structure is what `sensitivity`, `caseFirst` and
+// `ignorePunctuation` are actually defined over, so modelling it directly gets
+// the observable behaviour right for the Latin/Greek/Cyrillic ranges the suite
+// exercises: strings are decomposed (NFD), then split into a primary key of
+// case-folded base characters, a secondary key of the combining marks, and a
+// tertiary key of the per-character case.
+
+/// Simple lowercase of one code point (collation only needs the 1:1 mappings).
+fn collFold(cp: u21) u21 {
+    if (cp < 128) return if (cp >= 'A' and cp <= 'Z') cp + 32 else cp;
+    if (ucase.lookup(ucase.to_lower, cp)) |m| {
+        if (m.len == 1) return m[0];
     }
-    if (a.len == b.len) return .eq;
-    return if (a.len < b.len) .lt else .gt;
+    return cp;
 }
 
-/// Numeric collation (`numeric: true`): digit runs compare by numeric value,
-/// everything else byte-wise (optionally case-insensitive).
-fn orderNumeric(a: []const u8, b: []const u8, case_insensitive: bool) std.math.Order {
+fn inProp(name: []const u8, cp: u21) bool {
+    const ranges = uprops.lookup(name) orelse return false;
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const r = ranges[mid];
+        if (cp < r[0]) {
+            hi = mid;
+        } else if (cp > r[1]) {
+            lo = mid + 1;
+        } else return true;
+    }
+    return false;
+}
+
+/// The "variable" characters `ignorePunctuation` drops: punctuation, symbols
+/// and whitespace (CLDR `alternate=shifted`).
+fn isVariableChar(cp: u21) bool {
+    return inProp("P", cp) or inProp("Z", cp) or inProp("S", cp);
+}
+
+const CollKey = struct {
+    /// Case-folded base characters.
+    primary: []const u21,
+    /// The combining marks, in canonical order.
+    secondary: []const u21,
+    /// 1 for an uppercase character, 0 otherwise — one entry per primary.
+    tertiary: []const u8,
+};
+
+/// The German *search* collation expands the umlauts, so `\u00c4` matches `AE`
+/// at the primary level (they still differ at the secondary level, which is
+/// what keeps a `sort` collator ordering them the other way round).
+fn searchExpansion(lang: []const u8, cp: u21) ?[]const u21 {
+    if (!std.mem.eql(u8, lang, "de")) return null;
+    return switch (cp) {
+        'a' => &[_]u21{ 'a', 'e' },
+        'o' => &[_]u21{ 'o', 'e' },
+        'u' => &[_]u21{ 'u', 'e' },
+        0xDF => &[_]u21{ 's', 's' }, // sharp s
+        else => null,
+    };
+}
+
+fn collationKey(
+    arena: std.mem.Allocator,
+    s: []const u8,
+    ignore_punct: bool,
+    search_lang: ?[]const u8,
+) !CollKey {
+    const cps = try str_mod.nfdCodePoints(arena, s);
+    var primary = std.ArrayListUnmanaged(u21){};
+    var secondary = std.ArrayListUnmanaged(u21){};
+    var tertiary = std.ArrayListUnmanaged(u8){};
+    for (cps, 0..) |cp, i| {
+        if (unorm.ccc(cp) != 0) {
+            try secondary.append(arena, cp);
+            continue;
+        }
+        if (ignore_punct and isVariableChar(cp)) continue;
+        const folded = collFold(cp);
+        // The case level only ranks cased characters: a digit or symbol
+        // contributes nothing, so "007" and "7" still tie once the primary
+        // level has compared them numerically.
+        const cased = inProp("Cased", cp);
+        const upper: u8 = @intFromBool(folded != cp);
+        // The expansion only applies to a base letter that actually carries a
+        // diaeresis (or to the sharp s, which stands alone).
+        const expand: ?[]const u21 = if (search_lang) |lang| blk: {
+            const diaeresis = cp == 0xDF or (i + 1 < cps.len and cps[i + 1] == 0x308);
+            break :blk if (diaeresis) searchExpansion(lang, folded) else null;
+        } else null;
+        if (expand) |seq| {
+            for (seq) |e| {
+                try primary.append(arena, e);
+                if (cased) try tertiary.append(arena, upper);
+            }
+            continue;
+        }
+        try primary.append(arena, folded);
+        if (cased) try tertiary.append(arena, upper);
+    }
+    return .{ .primary = primary.items, .secondary = secondary.items, .tertiary = tertiary.items };
+}
+
+fn orderCps(a: []const u21, b: []const u21) std.math.Order {
+    var i: usize = 0;
+    while (i < a.len and i < b.len) : (i += 1) {
+        if (a[i] != b[i]) return if (a[i] < b[i]) .lt else .gt;
+    }
+    return std.math.order(a.len, b.len);
+}
+
+/// Numeric collation over the primary key: a run of decimal digits compares by
+/// value rather than code point, so "item2" sorts before "item10".
+fn orderCpsNumeric(a: []const u21, b: []const u21) std.math.Order {
     var i: usize = 0;
     var j: usize = 0;
     while (i < a.len and j < b.len) {
         const da = a[i] >= '0' and a[i] <= '9';
         const db = b[j] >= '0' and b[j] <= '9';
         if (da and db) {
-            // Extract both digit runs.
             var ai = i;
             while (ai < a.len and a[ai] >= '0' and a[ai] <= '9') ai += 1;
             var bj = j;
             while (bj < b.len and b[bj] >= '0' and b[bj] <= '9') bj += 1;
-            // Strip leading zeros, then compare by significant length, then value.
             var sa = a[i..ai];
             var sb = b[j..bj];
             while (sa.len > 1 and sa[0] == '0') sa = sa[1..];
             while (sb.len > 1 and sb[0] == '0') sb = sb[1..];
             if (sa.len != sb.len) return if (sa.len < sb.len) .lt else .gt;
-            const c = std.mem.order(u8, sa, sb);
+            const c = orderCps(sa, sb);
             if (c != .eq) return c;
             i = ai;
             j = bj;
         } else {
-            const ca = if (case_insensitive) asciiLower(a[i]) else a[i];
-            const cb = if (case_insensitive) asciiLower(b[j]) else b[j];
-            if (ca != cb) return if (ca < cb) .lt else .gt;
+            if (a[i] != b[j]) return if (a[i] < b[j]) .lt else .gt;
             i += 1;
             j += 1;
         }
@@ -1486,34 +1764,103 @@ fn orderNumeric(a: []const u8, b: []const u8, case_insensitive: bool) std.math.O
     return if (i >= a.len) .lt else .gt;
 }
 
+fn orderCase(a: []const u8, b: []const u8, upper_first: bool) std.math.Order {
+    var i: usize = 0;
+    while (i < a.len and i < b.len) : (i += 1) {
+        if (a[i] == b[i]) continue;
+        const a_upper = a[i] == 1;
+        return if (a_upper == upper_first) .lt else .gt;
+    }
+    return std.math.order(a.len, b.len);
+}
+
+/// CompareStrings (§10.3.3): the level comparison `sensitivity` selects.
+fn collatorCompareStrings(
+    arena: std.mem.Allocator,
+    x: []const u8,
+    y: []const u8,
+    sensitivity: []const u8,
+    numeric: bool,
+    case_first: []const u8,
+    ignore_punct: bool,
+) !std.math.Order {
+    return collatorCompareStringsIn(arena, x, y, sensitivity, numeric, case_first, ignore_punct, null);
+}
+
+fn collatorCompareStringsIn(
+    arena: std.mem.Allocator,
+    x: []const u8,
+    y: []const u8,
+    sensitivity: []const u8,
+    numeric: bool,
+    case_first: []const u8,
+    ignore_punct: bool,
+    search_lang: ?[]const u8,
+) !std.math.Order {
+    const ka = try collationKey(arena, x, ignore_punct, search_lang);
+    const kb = try collationKey(arena, y, ignore_punct, search_lang);
+    const p = if (numeric) orderCpsNumeric(ka.primary, kb.primary) else orderCps(ka.primary, kb.primary);
+    if (p != .eq) return p;
+    const use_secondary = !std.mem.eql(u8, sensitivity, "base") and !std.mem.eql(u8, sensitivity, "case");
+    const use_tertiary = !std.mem.eql(u8, sensitivity, "base") and !std.mem.eql(u8, sensitivity, "accent");
+    if (use_secondary) {
+        const sec = orderCps(ka.secondary, kb.secondary);
+        if (sec != .eq) return sec;
+    }
+    if (use_tertiary) {
+        const ter = orderCase(ka.tertiary, kb.tertiary, std.mem.eql(u8, case_first, "upper"));
+        if (ter != .eq) return ter;
+    }
+    return .eq;
+}
+
 pub fn nativeCollatorCompare(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const a: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string) args[0].unbox().string else "";
-    const b: []const u8 = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() == .string) args[1].unbox().string else "";
-    var sensitivity: []const u8 = "variant";
-    var numeric = false;
-    // Bound compare passes the collator via native userdata; a plain prototype call
-    // arrives with the collator as `this`.
+    // Bound compare passes the collator via native userdata; a plain prototype
+    // call arrives with the collator as `this`.
     const col_obj: ?*JsObject = if (val_mod.g_active_native_data) |d|
         @ptrCast(@alignCast(d))
     else if (this_val.bits != 0 and this_val.unbox() == .object)
         this_val.toPtr().object
     else
         null;
+    var sensitivity: []const u8 = "variant";
+    var case_first: []const u8 = "false";
+    var numeric = false;
+    var ignore_punct = false;
+    var usage: []const u8 = "sort";
+    var collation: []const u8 = "default";
+    var locale: []const u8 = default_locale;
     if (col_obj) |o| {
+        if (o.get("__col_usage")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            usage = v.unbox().string;
+        };
+        if (o.get("__col_collation")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            collation = v.unbox().string;
+        };
+        if (o.getOwn("[[intl_locale]]")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            locale = v.unbox().string;
+        };
         if (o.get("__col_sensitivity")) |v| if (v.bits != 0 and v.unbox() == .string) {
             sensitivity = v.unbox().string;
+        };
+        if (o.get("__col_caseFirst")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            case_first = v.unbox().string;
         };
         if (o.get("__col_numeric")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
             numeric = v.unbox().boolean;
         };
+        if (o.get("__col_ignorePunctuation")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
+            ignore_punct = v.unbox().boolean;
+        };
     }
-    const case_insensitive = std.mem.eql(u8, sensitivity, "base") or std.mem.eql(u8, sensitivity, "accent");
-    const order = if (numeric)
-        orderNumeric(a, b, case_insensitive)
-    else if (case_insensitive)
-        orderCaseInsensitive(a, b)
-    else
-        std.mem.order(u8, a, b);
+    // Both arguments are ToString'd (a Symbol therefore throws).
+    const a = try t_shared.valueToString(arena, if (args.len > 0) args[0] else Value{});
+    const b = try t_shared.valueToString(arena, if (args.len > 1) args[1] else Value{});
+    // German expands the umlauts in both its `search` collation and its
+    // `phonebk` tailoring, so "\u00c4" sorts (and matches) as "AE".
+    const expand = std.mem.eql(u8, usage, "search") or std.mem.eql(u8, collation, "phonebk");
+    const search_lang: ?[]const u8 = if (expand) primaryLanguage(locale) else null;
+    const order = try collatorCompareStringsIn(arena, a, b, sensitivity, numeric, case_first, ignore_punct, search_lang);
     const r: f64 = switch (order) {
         .lt => -1,
         .eq => 0,
@@ -1534,9 +1881,13 @@ pub fn nativeCollatorResolved(arena: std.mem.Allocator, this_val: Value, _: []co
     var sensitivity: []const u8 = "variant";
     var numeric = false;
     var caseFirst: []const u8 = "false";
+    var collation: []const u8 = "default";
     var ignore_punct = false;
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const o = this_val.toPtr().object;
+        if (o.get("__col_collation")) |v| if (v.bits != 0 and v.unbox() == .string) {
+            collation = v.unbox().string;
+        };
         if (o.get("__col_usage")) |v| if (v.bits != 0 and v.unbox() == .string) {
             usage = v.unbox().string;
         };
@@ -1553,13 +1904,13 @@ pub fn nativeCollatorResolved(arena: std.mem.Allocator, this_val: Value, _: []co
             ignore_punct = v.unbox().boolean;
         };
     }
-    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
-    try r.set("usage", try val_mod.makeString(arena, usage));
-    try r.set("sensitivity", try val_mod.makeString(arena, sensitivity));
-    try r.set("ignorePunctuation", try val_mod.makeBool(arena, ignore_punct));
-    try r.set("collation", try val_mod.makeString(arena, "default"));
-    try r.set("numeric", try val_mod.makeBool(arena, numeric));
-    try r.set("caseFirst", try val_mod.makeString(arena, caseFirst));
+    try defineData(r, "locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
+    try defineData(r, "usage", try val_mod.makeString(arena, usage));
+    try defineData(r, "sensitivity", try val_mod.makeString(arena, sensitivity));
+    try defineData(r, "ignorePunctuation", try val_mod.makeBool(arena, ignore_punct));
+    try defineData(r, "collation", try val_mod.makeString(arena, collation));
+    try defineData(r, "numeric", try val_mod.makeBool(arena, numeric));
+    try defineData(r, "caseFirst", try val_mod.makeString(arena, caseFirst));
     return val_mod.makeObject(arena, r);
 }
 
@@ -1651,7 +2002,9 @@ fn uExtKeyword(u_ext: []const u8, key: []const u8) ?[]const u8 {
         }
         pos = dash + 1;
     }
-    if (val_of) |k| if (std.ascii.eqlIgnoreCase(k, key) and val_end > val_start) return u_ext[val_start..val_end];
+    // A trailing key with no type value ("-u-kn") is present with the empty
+    // value, which for a boolean key means `true`.
+    if (val_of) |k| if (std.ascii.eqlIgnoreCase(k, key)) return u_ext[val_start..val_end];
     return null;
 }
 
@@ -1678,6 +2031,133 @@ fn canonSubtag(arena: std.mem.Allocator, s: []const u8, kind: enum { lang, scrip
     return buf;
 }
 
+/// The `-u-` body of `tag` (already canonical), plus everything after the
+/// language id that is *not* the `-u-` sequence, so the two can be recombined.
+const TagSections = struct {
+    lang_id: []const u8,
+    u_body: []const u8,
+    /// Other extension / private-use sequences, each with its leading '-'.
+    others: []const u8,
+};
+
+fn splitTagSections(arena: std.mem.Allocator, tag: []const u8) !TagSections {
+    const lang_id = locale_id.languageIdOf(tag);
+    var u_body: []const u8 = "";
+    var others = std.ArrayListUnmanaged(u8){};
+    var pos = lang_id.len;
+    while (pos < tag.len) {
+        // Each section starts at "-<singleton>-".
+        const seq_start = pos + 1; // skip the '-'
+        const end = extSeqEnd(tag, seq_start + 2);
+        if (tag[seq_start] == 'u') {
+            u_body = tag[@min(seq_start + 2, tag.len)..end];
+        } else {
+            try others.appendSlice(arena, tag[pos..end]);
+        }
+        pos = end;
+    }
+    return .{ .lang_id = lang_id, .u_body = u_body, .others = others.items };
+}
+
+/// InsertUnicodeExtensionAndCanonicalize: merge `pairs` (key, value — an empty
+/// value spells the bare `true` form) into `tag`'s `-u-` extension, replacing
+/// any keyword already there, and re-canonicalize. Returns null when the result
+/// is not a valid `unicode_locale_id`.
+fn insertUnicodeKeywords(arena: std.mem.Allocator, tag: []const u8, pairs: []const [2][]const u8) !?[]const u8 {
+    const sec = try splitTagSections(arena, tag);
+
+    var attributes = std.ArrayListUnmanaged([]const u8){};
+    var keys = std.ArrayListUnmanaged([]const u8){};
+    var values = std.ArrayListUnmanaged([]const u8){};
+    var it = std.mem.splitScalar(u8, sec.u_body, '-');
+    var cur_key: ?usize = null;
+    while (it.next()) |sub| {
+        if (sub.len == 0) continue;
+        if (sub.len == 2) {
+            try keys.append(arena, sub);
+            try values.append(arena, "");
+            cur_key = keys.items.len - 1;
+        } else if (cur_key) |k| {
+            values.items[k] = if (values.items[k].len == 0)
+                sub
+            else
+                try std.mem.concat(arena, u8, &.{ values.items[k], "-", sub });
+        } else {
+            try attributes.append(arena, sub);
+        }
+    }
+    for (pairs) |kv| {
+        var found = false;
+        for (keys.items, 0..) |k, i| {
+            if (std.mem.eql(u8, k, kv[0])) {
+                values.items[i] = kv[1];
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try keys.append(arena, kv[0]);
+            try values.append(arena, kv[1]);
+        }
+    }
+
+    var out = std.ArrayListUnmanaged(u8){};
+    try out.appendSlice(arena, sec.lang_id);
+    if (attributes.items.len > 0 or keys.items.len > 0) {
+        try out.appendSlice(arena, "-u");
+        for (attributes.items) |a| {
+            try out.append(arena, '-');
+            try out.appendSlice(arena, a);
+        }
+        for (keys.items, values.items) |k, v| {
+            try out.append(arena, '-');
+            try out.appendSlice(arena, k);
+            if (v.len > 0) {
+                try out.append(arena, '-');
+                try out.appendSlice(arena, v);
+            }
+        }
+    }
+    try out.appendSlice(arena, sec.others);
+    return locale_id.canonicalize(arena, out.items);
+}
+
+/// The value of `-u-<key>` in a canonical tag: null when absent, "" for the
+/// bare (implicit `true`) form.
+fn tagKeyword(arena: std.mem.Allocator, tag: []const u8, key: []const u8) !?[]const u8 {
+    const sec = try splitTagSections(arena, tag);
+    var it = std.mem.splitScalar(u8, sec.u_body, '-');
+    var in_key = false;
+    var value = std.ArrayListUnmanaged(u8){};
+    while (it.next()) |sub| {
+        if (sub.len == 2) {
+            if (in_key) return value.items;
+            in_key = std.mem.eql(u8, sub, key);
+        } else if (in_key) {
+            if (value.items.len > 0) try value.append(arena, '-');
+            try value.appendSlice(arena, sub);
+        }
+    }
+    return if (in_key) value.items else null;
+}
+
+/// A `variants` option must be one or more distinct `unicode_variant_subtag`s.
+fn validVariantsOption(s: []const u8) bool {
+    if (s.len == 0) return false;
+    var seen: [16][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '-');
+    while (it.next()) |sub| {
+        if (!isVariantSubtag(sub)) return false;
+        for (seen[0..n]) |p| if (std.ascii.eqlIgnoreCase(p, sub)) return false;
+        if (n < seen.len) {
+            seen[n] = sub;
+            n += 1;
+        }
+    }
+    return true;
+}
+
 pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const constructing = realm_mod.active_constructing;
     realm_mod.active_constructing = false;
@@ -1697,41 +2177,89 @@ pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         }
         return throwTypeErrorIntl(arena, "Intl.Locale: tag must be a string or an object");
     };
-    if (!dnValidLanguageId(stripUnicodeExtension(tag_raw))) return throwRangeError(arena, "invalid language tag");
     const options_v = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
 
-    const parts = parseLocaleTag(tag_raw);
-    var language = try canonSubtag(arena, parts.language, .lang);
-    var script = try canonSubtag(arena, parts.script, .script);
-    var region = try canonSubtag(arena, parts.region, .region);
-
-    // ApplyOptionsToTag: each subtag option must be structurally valid on its
-    // own before it replaces the one parsed out of the tag.
+    // ApplyOptionsToTag (§14.1.2): the tag must be a `unicode_locale_id`, and
+    // each language-id option must be structurally valid on its own before it
+    // replaces the subtag parsed out of the tag. The options are read in this
+    // exact order — `constructor-getter-order.js` asserts it.
+    var lang_opt: ?[]const u8 = null;
     if (try dnGetOption(arena, options_v, "language", &.{}, null)) |v| {
         if (!dnIsLangSubtag(v)) return throwRangeError(arena, "invalid language option");
-        language = try canonSubtag(arena, v, .lang);
+        lang_opt = v;
     }
+    var script_opt: ?[]const u8 = null;
     if (try dnGetOption(arena, options_v, "script", &.{}, null)) |v| {
         if (!dnIsScript(v)) return throwRangeError(arena, "invalid script option");
-        script = try canonSubtag(arena, v, .script);
+        script_opt = v;
     }
+    var region_opt: ?[]const u8 = null;
     if (try dnGetOption(arena, options_v, "region", &.{}, null)) |v| {
         if (!dnIsRegion(v)) return throwRangeError(arena, "invalid region option");
-        region = try canonSubtag(arena, v, .region);
+        region_opt = v;
+    }
+    var variants_opt: ?[]const u8 = null;
+    if (try dnGetOption(arena, options_v, "variants", &.{}, null)) |v| {
+        if (!validVariantsOption(v)) return throwRangeError(arena, "invalid variants option");
+        variants_opt = v;
     }
 
-    // baseName = language[-script][-region]
-    var bn = std.ArrayListUnmanaged(u8){};
-    try bn.appendSlice(arena, language);
-    if (script.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, script);
+    var tag = (try locale_id.canonicalize(arena, tag_raw)) orelse
+        return throwRangeError(arena, "invalid language tag");
+
+    if (lang_opt != null or script_opt != null or region_opt != null or variants_opt != null) {
+        const sec = try splitTagSections(arena, tag);
+        const parts = parseLocaleTag(sec.lang_id);
+        var rebuilt = std.ArrayListUnmanaged(u8){};
+        try rebuilt.appendSlice(arena, lang_opt orelse parts.language);
+        for ([_]?[]const u8{ script_opt orelse nonEmpty(parts.script), region_opt orelse nonEmpty(parts.region), variants_opt orelse nonEmpty(parts.variants) }) |maybe| {
+            if (maybe) |s| {
+                try rebuilt.append(arena, '-');
+                try rebuilt.appendSlice(arena, s);
+            }
+        }
+        try rebuilt.appendSlice(arena, tag[sec.lang_id.len..]);
+        tag = (try locale_id.canonicalize(arena, rebuilt.items)) orelse
+            return throwRangeError(arena, "invalid language tag");
     }
-    if (region.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, region);
+
+    // ApplyUnicodeExtensionToTag: an option overrides the tag's keyword for each
+    // relevant extension key, and the surviving keywords are folded back into
+    // the `-u-` sequence (which re-canonicalizes and re-sorts them).
+    var kw = std.ArrayListUnmanaged([2][]const u8){};
+    for ([_][2][]const u8{
+        .{ "calendar", "ca" },
+        .{ "collation", "co" },
+    }) |pair| {
+        if (try dnGetOption(arena, options_v, pair[0], &.{}, null)) |v| {
+            if (!isWellFormedNumberingSystem(v)) return throwRangeError(arena, "invalid Unicode extension value");
+            try kw.append(arena, .{ pair[1], try lowerDup(arena, v) });
+        }
     }
-    const base_name = bn.items;
+    if (try dnGetOption(arena, options_v, "hourCycle", &.{ "h11", "h12", "h23", "h24" }, null)) |v|
+        try kw.append(arena, .{ "hc", v });
+    if (try dnGetOption(arena, options_v, "caseFirst", &.{ "upper", "lower", "false" }, null)) |v|
+        try kw.append(arena, .{ "kf", v });
+    if (try dnGetBoolOption(arena, options_v, "numeric")) |b|
+        try kw.append(arena, .{ "kn", if (b) "true" else "false" });
+    if (try dnGetOption(arena, options_v, "numberingSystem", &.{}, null)) |v| {
+        if (!isWellFormedNumberingSystem(v)) return throwRangeError(arena, "invalid Unicode extension value");
+        try kw.append(arena, .{ "nu", try lowerDup(arena, v) });
+    }
+    // WeekdayToString: 0..7 name a weekday (0 and 7 both being Sunday), and any
+    // other value is used verbatim provided it is a well-formed `type` sequence.
+    if (try optStrCoerced(arena, options_v, "firstDayOfWeek")) |raw| {
+        const id = weekdayId(raw) orelse blk: {
+            if (!isWellFormedNumberingSystem(raw))
+                return throwRangeError(arena, "invalid firstDayOfWeek value for Intl.Locale");
+            break :blk try lowerDup(arena, raw);
+        };
+        try kw.append(arena, .{ "fw", id });
+    }
+    if (kw.items.len > 0) {
+        tag = (try insertUnicodeKeywords(arena, tag, kw.items)) orelse
+            return throwRangeError(arena, "invalid language tag");
+    }
 
     const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
         this_val.toPtr().object
@@ -1739,49 +2267,48 @@ pub fn nativeLocaleCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
-    // Locale fields live in hidden `[[loc_*]]` internal slots (spec exposes them
-    // via prototype accessor getters, registered by registerLocaleAccessors).
-    try obj.set("[[loc_language]]", try val_mod.makeString(arena, language));
-    try obj.set("[[loc_script]]", try val_mod.makeString(arena, script));
-    try obj.set("[[loc_region]]", try val_mod.makeString(arena, region));
-    try obj.set("[[loc_baseName]]", try val_mod.makeString(arena, base_name));
-    try obj.set("__locale_tag", try val_mod.makeString(arena, base_name));
-    // Unicode extension keyword options (spec §14.1 ApplyOptionsToTag +
-    // ApplyUnicodeExtensionToTag): reflect ca/co/nu/hourCycle/caseFirst when
-    // supplied so `new Intl.Locale(tag, {calendar}).calendar` round-trips. The
-    // value is lower-cased (canonical `type` form). Absent options stay absent.
+    try storeLocaleSlots(arena, obj, tag);
+    return val_mod.makeObject(arena, obj);
+}
+
+fn nonEmpty(s: []const u8) ?[]const u8 {
+    return if (s.len == 0) null else s;
+}
+
+/// Derive every `[[loc_*]]` slot from the finished `[[Locale]]` tag. The spec
+/// defines each accessor as a projection of the tag, so the slots are only a
+/// cache — keeping them in one place stops them drifting from `toString()`.
+fn storeLocaleSlots(arena: std.mem.Allocator, obj: *JsObject, tag: []const u8) !void {
+    const sec = try splitTagSections(arena, tag);
+    const parts = parseLocaleTag(sec.lang_id);
+    try obj.set("[[loc_language]]", try val_mod.makeString(arena, parts.language));
+    try obj.set("[[loc_script]]", try val_mod.makeString(arena, parts.script));
+    try obj.set("[[loc_region]]", try val_mod.makeString(arena, parts.region));
+    try obj.set("[[loc_variants]]", try val_mod.makeString(arena, parts.variants));
+    try obj.set("[[loc_baseName]]", try val_mod.makeString(arena, sec.lang_id));
+    try obj.set("__locale_tag", try val_mod.makeString(arena, tag));
+
     for ([_][2][]const u8{
-        .{ "calendar", "[[loc_calendar]]" },
-        .{ "collation", "[[loc_collation]]" },
-        .{ "numberingSystem", "[[loc_numberingSystem]]" },
+        .{ "ca", "[[loc_calendar]]" },
+        .{ "co", "[[loc_collation]]" },
+        .{ "hc", "[[loc_hourCycle]]" },
+        .{ "kf", "[[loc_caseFirst]]" },
+        .{ "nu", "[[loc_numberingSystem]]" },
     }) |pair| {
-        if (try dnGetOption(arena, options_v, pair[0], &.{}, null)) |v| {
-            if (!isWellFormedNumberingSystem(v)) return throwRangeError(arena, "invalid Unicode extension value");
-            try obj.set(pair[1], try val_mod.makeString(arena, try lowerDup(arena, v)));
+        if (try tagKeyword(arena, tag, pair[0])) |v| {
+            try obj.set(pair[1], try val_mod.makeString(arena, v));
+        } else {
+            _ = try obj.deleteOwn(pair[1]);
         }
     }
-    if (try dnGetOption(arena, options_v, "hourCycle", &.{ "h11", "h12", "h23", "h24" }, null)) |v|
-        try obj.set("[[loc_hourCycle]]", try val_mod.makeString(arena, v));
-    if (try dnGetOption(arena, options_v, "caseFirst", &.{ "upper", "lower", "false" }, null)) |v|
-        try obj.set("[[loc_caseFirst]]", try val_mod.makeString(arena, v));
-    try obj.set("[[loc_numeric]]", try val_mod.makeBool(arena, (try dnGetBoolOption(arena, options_v, "numeric")) orelse false));
-
-    // Variant subtags (§14.3.7 `variants`): canonical lowercase, `undefined`
-    // when the tag has none.
-    if (parts.variants.len > 0)
-        try obj.set("[[loc_variants]]", try val_mod.makeString(arena, try lowerDup(arena, parts.variants)));
-
-    // `firstDayOfWeek` (§14.1.2): the option wins over the tag's `-u-fw-` keyword.
-    // Both accept a weekday id ("mon".."sun"); the option additionally accepts
-    // 0..7, where 0 and 7 both mean Sunday.
-    const fw_raw: ?[]const u8 = (try optStrCoerced(arena, options_v, "firstDayOfWeek")) orelse uExtKeyword(parts.u_ext, "fw");
-    if (fw_raw) |raw| {
-        const id = weekdayId(raw) orelse
-            return throwRangeError(arena, "invalid firstDayOfWeek value for Intl.Locale");
-        try obj.set("[[loc_firstDayOfWeek]]", try val_mod.makeString(arena, id));
+    // `-u-kn` (bare) and `-u-kn-true` both mean numeric collation.
+    const kn = try tagKeyword(arena, tag, "kn");
+    try obj.set("[[loc_numeric]]", try val_mod.makeBool(arena, kn != null and !std.mem.eql(u8, kn.?, "false")));
+    if (try tagKeyword(arena, tag, "fw")) |v| {
+        if (weekdayId(v)) |id| try obj.set("[[loc_firstDayOfWeek]]", try val_mod.makeString(arena, id));
+    } else {
+        _ = try obj.deleteOwn("[[loc_firstDayOfWeek]]");
     }
-
-    return val_mod.makeObject(arena, obj);
 }
 
 /// Drop a `-u-…`/`-x-…` extension sequence so the leading `unicode_language_id`
@@ -1939,10 +2466,43 @@ pub fn storeResolvedLocale(arena: std.mem.Allocator, obj: *JsObject, base: []con
     for (sorted) |kv| {
         try out.append(arena, '-');
         try out.appendSlice(arena, kv[0]);
+        // The canonical spelling of a boolean key's `true` is the bare key.
+        if (std.mem.eql(u8, kv[1], "true")) continue;
         try out.append(arena, '-');
         try out.appendSlice(arena, kv[1]);
     }
     try obj.set("[[intl_locale]]", try val_mod.makeString(arena, out.items));
+}
+
+/// ResolveLocale for a service whose only relevant extension key is `nu`: the
+/// requested tag's `-u-nu-` value wins unless the options supply a supported one
+/// that differs, and the resolved locale keeps the keyword only when it actually
+/// came from the tag. Stores `[[Locale]]` on `obj` and returns the numbering
+/// system to format with.
+pub fn resolveNumberingSystem(
+    arena: std.mem.Allocator,
+    obj: *JsObject,
+    locales: Value,
+    opt_nu: ?[]const u8,
+) anyerror![]const u8 {
+    const req = try resolveLocaleRequest(arena, locales);
+    var value: []const u8 = "latn";
+    var from_tag = false;
+    if (try req.keyword(arena, "nu")) |ext| {
+        if (isSupportedNumberingSystem(ext)) {
+            value = ext;
+            from_tag = true;
+        }
+    }
+    if (opt_nu) |opt| {
+        if (isSupportedNumberingSystem(opt)) {
+            if (from_tag and !std.mem.eql(u8, opt, value)) from_tag = false;
+            value = opt;
+        }
+    }
+    var kept: [1][2][]const u8 = .{.{ "nu", value }};
+    try storeResolvedLocale(arena, obj, req.base, if (from_tag) kept[0..1] else kept[0..0]);
+    return value;
 }
 
 /// The `[[Locale]]` stored by `resolveAndStoreLocale`, or the default.
@@ -2032,7 +2592,8 @@ pub fn nativeSupportedValuesOf(arena: std.mem.Allocator, _: Value, args: []const
     inline for (@typeInfo(t_calendar.CalendarId).@"enum".fields, 0..) |f, ci| {
         calendars[ci] = (@as(t_calendar.CalendarId, @enumFromInt(f.value))).str();
     }
-    const numbering = [_][]const u8{"latn"};
+    var numbering: [numbering_systems.len][]const u8 = undefined;
+    inline for (numbering_systems, 0..) |e, ni| numbering[ni] = e[0];
     const empty = [_][]const u8{};
 
     const items: []const []const u8 = if (std.mem.eql(u8, key, "calendar"))
@@ -2075,13 +2636,12 @@ pub fn nativeSupportedValuesOf(arena: std.mem.Allocator, _: Value, args: []const
 }
 
 pub fn nativeLocaleToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits != 0 and this_val.unbox() == .object) {
-        if (this_val.toPtr().object.get("__locale_tag")) |v| {
-            if (v.bits != 0 and v.unbox() == .string) return val_mod.makeString(arena, v.unbox().string);
-        }
-        if (this_val.toPtr().object.get("[[loc_baseName]]")) |v| {
-            if (v.bits != 0 and v.unbox() == .string) return val_mod.makeString(arena, v.unbox().string);
-        }
+    const o = try requireLocale(arena, this_val);
+    if (o.getOwn("__locale_tag")) |v| {
+        if (v.bits != 0 and v.unbox() == .string) return val_mod.makeString(arena, v.unbox().string);
+    }
+    if (o.getOwn("[[loc_baseName]]")) |v| {
+        if (v.bits != 0 and v.unbox() == .string) return val_mod.makeString(arena, v.unbox().string);
     }
     return val_mod.makeString(arena, "");
 }
@@ -2121,79 +2681,146 @@ fn requireLocale(arena: std.mem.Allocator, this_val: Value) anyerror!*JsObject {
     return this_val.toPtr().object;
 }
 
-/// AddLikelySubtags, restricted to the languages a dependency-free build can
-/// carry. Unlisted languages fall back to a Latin script and a region derived
-/// from the language subtag, which keeps `maximize()` total.
-fn likelySubtags(lang: []const u8) struct { script: []const u8, region: []const u8 } {
-    const table = [_]struct { l: []const u8, s: []const u8, r: []const u8 }{
-        .{ .l = "en", .s = "Latn", .r = "US" }, .{ .l = "und", .s = "Latn", .r = "US" },
-        .{ .l = "fr", .s = "Latn", .r = "FR" }, .{ .l = "de", .s = "Latn", .r = "DE" },
-        .{ .l = "es", .s = "Latn", .r = "ES" }, .{ .l = "it", .s = "Latn", .r = "IT" },
-        .{ .l = "pt", .s = "Latn", .r = "BR" }, .{ .l = "nl", .s = "Latn", .r = "NL" },
-        .{ .l = "sv", .s = "Latn", .r = "SE" }, .{ .l = "pl", .s = "Latn", .r = "PL" },
-        .{ .l = "tr", .s = "Latn", .r = "TR" }, .{ .l = "ru", .s = "Cyrl", .r = "RU" },
-        .{ .l = "uk", .s = "Cyrl", .r = "UA" }, .{ .l = "el", .s = "Grek", .r = "GR" },
-        .{ .l = "he", .s = "Hebr", .r = "IL" }, .{ .l = "ar", .s = "Arab", .r = "EG" },
-        .{ .l = "fa", .s = "Arab", .r = "IR" }, .{ .l = "hi", .s = "Deva", .r = "IN" },
-        .{ .l = "th", .s = "Thai", .r = "TH" }, .{ .l = "ko", .s = "Kore", .r = "KR" },
-        .{ .l = "ja", .s = "Jpan", .r = "JP" }, .{ .l = "zh", .s = "Hans", .r = "CN" },
-    };
-    for (table) |e| if (std.mem.eql(u8, e.l, lang)) return .{ .script = e.s, .region = e.r };
-    return .{ .script = "Latn", .region = "US" };
+/// The `unicode_language_id` fields the likely-subtags algorithms operate on.
+const LangIdTriple = struct {
+    language: []const u8,
+    script: []const u8 = "",
+    region: []const u8 = "",
+
+    fn eql(a: LangIdTriple, b: LangIdTriple) bool {
+        return std.mem.eql(u8, a.language, b.language) and
+            std.mem.eql(u8, a.script, b.script) and
+            std.mem.eql(u8, a.region, b.region);
+    }
+};
+
+fn likelyRow(table: []const [3][]const u8, key: []const u8) ?[2][]const u8 {
+    for (table) |row| if (std.mem.eql(u8, row[0], key)) return .{ row[1], row[2] };
+    return null;
 }
 
-/// Build a new Intl.Locale from already-canonical subtags, carrying the
-/// receiver's Unicode-extension slots across (§14.3.3/§14.3.4 re-run the
-/// constructor on the transformed tag).
-fn makeLocaleFrom(arena: std.mem.Allocator, src: *JsObject, language: []const u8, script: []const u8, region: []const u8) anyerror!Value {
+/// AddLikelySubtags (UTS #35 §4.3). Null when CLDR has no entry that matches —
+/// the tag is then left exactly as it is.
+fn addLikelySubtags(arena: std.mem.Allocator, t: LangIdTriple) !?LangIdTriple {
+    const und = t.language.len == 0 or std.mem.eql(u8, t.language, "und");
+    if (!und and t.script.len > 0 and t.region.len > 0) return t;
+
+    if (und) {
+        if (t.script.len > 0) {
+            const e = likelyRow(&likely.by_script, t.script) orelse return null;
+            var lang = e[0];
+            // A script+region pair can name a different language than the script
+            // alone ("und-Cyrl-RO" is Bulgarian, not Russian).
+            if (t.region.len > 0) {
+                const key = try std.fmt.allocPrint(arena, "{s}-{s}", .{ t.script, t.region });
+                for (likely.by_script_region) |row| {
+                    if (std.mem.eql(u8, row[0], key)) {
+                        lang = row[1];
+                        break;
+                    }
+                }
+            }
+            return .{ .language = lang, .script = t.script, .region = if (t.region.len > 0) t.region else e[1] };
+        }
+        if (t.region.len > 0) {
+            const e = likelyRow(&likely.by_region, t.region) orelse return null;
+            return .{ .language = e[0], .script = e[1], .region = t.region };
+        }
+        const e = likelyRow(&likely.by_language, "und") orelse return null;
+        return .{ .language = "en", .script = e[0], .region = e[1] };
+    }
+
+    const lang_entry = likelyRow(&likely.by_language, t.language);
+    if (t.script.len > 0) {
+        // A language+script pair can imply a different region than the language
+        // alone ("en-Shaw" is spoken in GB, not US).
+        const key = try std.fmt.allocPrint(arena, "{s}-{s}", .{ t.language, t.script });
+        var region = t.region;
+        if (region.len == 0) {
+            for (likely.by_language_script) |row| {
+                if (std.mem.eql(u8, row[0], key)) {
+                    region = row[1];
+                    break;
+                }
+            }
+        }
+        if (region.len == 0) region = (lang_entry orelse return null)[1];
+        return .{ .language = t.language, .script = t.script, .region = region };
+    }
+    const e = lang_entry orelse return null;
+    var script = e[0];
+    // A language+region pair can imply a different script ("zh-TW" is Hant).
+    if (t.region.len > 0) {
+        const key = try std.fmt.allocPrint(arena, "{s}-{s}", .{ t.language, t.region });
+        for (likely.by_language_region) |row| {
+            if (std.mem.eql(u8, row[0], key)) {
+                script = row[1];
+                break;
+            }
+        }
+    }
+    return .{ .language = t.language, .script = script, .region = if (t.region.len > 0) t.region else e[1] };
+}
+
+/// RemoveLikelySubtags: the shortest tag that maximizes back to the same thing.
+fn removeLikelySubtags(arena: std.mem.Allocator, t: LangIdTriple) !LangIdTriple {
+    const max = (try addLikelySubtags(arena, t)) orelse return t;
+    const trials = [_]LangIdTriple{
+        .{ .language = max.language },
+        .{ .language = max.language, .region = max.region },
+        .{ .language = max.language, .script = max.script },
+    };
+    for (trials) |trial| {
+        if (try addLikelySubtags(arena, trial)) |m| {
+            if (m.eql(max)) return trial;
+        }
+    }
+    return max;
+}
+
+/// Build a new Intl.Locale whose language id is `t` but which keeps the
+/// receiver's variants, extensions and private-use sequence (§14.3.3/§14.3.4
+/// only touch the language/script/region subtags).
+fn makeLocaleFrom(arena: std.mem.Allocator, src: *JsObject, t: LangIdTriple) anyerror!Value {
+    const old_tag = if (src.getOwn("__locale_tag")) |v| v.unbox().string else "und";
+    const sec = try splitTagSections(arena, old_tag);
+    const variants = parseLocaleTag(sec.lang_id).variants;
+
+    var out = std.ArrayListUnmanaged(u8){};
+    try out.appendSlice(arena, t.language);
+    for ([_][]const u8{ t.script, t.region, variants }) |piece| {
+        if (piece.len == 0) continue;
+        try out.append(arena, '-');
+        try out.appendSlice(arena, piece);
+    }
+    try out.appendSlice(arena, old_tag[sec.lang_id.len..]);
+    const tag = (try locale_id.canonicalize(arena, out.items)) orelse out.items;
+
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, active_locale_proto orelse realm_mod.active_object_proto)
     else
         try JsObject.create(arena, active_locale_proto orelse realm_mod.active_object_proto);
-    var bn = std.ArrayListUnmanaged(u8){};
-    try bn.appendSlice(arena, language);
-    if (script.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, script);
-    }
-    if (region.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, region);
-    }
-    try obj.set("[[loc_language]]", try val_mod.makeString(arena, language));
-    try obj.set("[[loc_script]]", try val_mod.makeString(arena, script));
-    try obj.set("[[loc_region]]", try val_mod.makeString(arena, region));
-    try obj.set("[[loc_baseName]]", try val_mod.makeString(arena, bn.items));
-    try obj.set("__locale_tag", try val_mod.makeString(arena, bn.items));
-    for ([_][]const u8{ "[[loc_calendar]]", "[[loc_collation]]", "[[loc_numberingSystem]]", "[[loc_hourCycle]]", "[[loc_caseFirst]]", "[[loc_numeric]]" }) |slot| {
-        if (src.getOwn(slot)) |v| try obj.set(slot, v);
-    }
+    try storeLocaleSlots(arena, obj, tag);
     return val_mod.makeObject(arena, obj);
+}
+
+fn localeTriple(o: *JsObject) LangIdTriple {
+    return .{
+        .language = if (o.getOwn("[[loc_language]]")) |v| v.unbox().string else "und",
+        .script = if (o.getOwn("[[loc_script]]")) |v| v.unbox().string else "",
+        .region = if (o.getOwn("[[loc_region]]")) |v| v.unbox().string else "",
+    };
 }
 
 pub fn nativeLocaleMaximize(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const o = try requireLocale(arena, this_val);
-    const lang = if (o.getOwn("[[loc_language]]")) |v| v.unbox().string else "und";
-    var script = if (o.getOwn("[[loc_script]]")) |v| v.unbox().string else "";
-    var region = if (o.getOwn("[[loc_region]]")) |v| v.unbox().string else "";
-    const likely = likelySubtags(lang);
-    if (script.len == 0) script = likely.script;
-    if (region.len == 0) region = likely.region;
-    return makeLocaleFrom(arena, o, if (std.mem.eql(u8, lang, "und")) "en" else lang, script, region);
+    const t = localeTriple(o);
+    return makeLocaleFrom(arena, o, (try addLikelySubtags(arena, t)) orelse t);
 }
 
 pub fn nativeLocaleMinimize(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const o = try requireLocale(arena, this_val);
-    const lang0 = if (o.getOwn("[[loc_language]]")) |v| v.unbox().string else "und";
-    const lang = if (std.mem.eql(u8, lang0, "und")) "en" else lang0;
-    const script = if (o.getOwn("[[loc_script]]")) |v| v.unbox().string else "";
-    const region = if (o.getOwn("[[loc_region]]")) |v| v.unbox().string else "";
-    // RemoveLikelySubtags: drop a subtag exactly when AddLikelySubtags would put
-    // it back.
-    const likely = likelySubtags(lang);
-    const keep_script = script.len > 0 and !std.mem.eql(u8, script, likely.script);
-    const keep_region = region.len > 0 and !std.mem.eql(u8, region, likely.region);
-    return makeLocaleFrom(arena, o, lang, if (keep_script) script else "", if (keep_region) region else "");
+    return makeLocaleFrom(arena, o, try removeLikelySubtags(arena, localeTriple(o)));
 }
 
 // ------------------------------------------------------- Intl.Locale-info ---
@@ -2267,7 +2894,7 @@ pub fn nativeLocaleGetTextInfo(arena: std.mem.Allocator, this_val: Value, _: []c
         };
     }
     const r = try dnEmptyObj(arena);
-    try r.set("direction", try val_mod.makeString(arena, if (rtl) "rtl" else "ltr"));
+    try defineData(r, "direction", try val_mod.makeString(arena, if (rtl) "rtl" else "ltr"));
     return val_mod.makeObject(arena, r);
 }
 
@@ -2278,14 +2905,14 @@ pub fn nativeLocaleGetWeekInfo(arena: std.mem.Allocator, this_val: Value, _: []c
     const o = try requireLocale(arena, this_val);
     const first: f64 = if (localeSlotStr(o, "[[loc_firstDayOfWeek]]")) |id| weekdayNumber(id) else 7;
     const r = try dnEmptyObj(arena);
-    try r.set("firstDay", try val_mod.makeNumber(arena, first));
+    try defineData(r, "firstDay", try val_mod.makeNumber(arena, first));
     const weekend = if (realm_mod.active_heap) |h|
         try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
     else
         try JsObject.createArray(arena, realm_mod.active_array_proto);
     try weekend.set("0", try val_mod.makeNumber(arena, 6));
     try weekend.set("1", try val_mod.makeNumber(arena, 7));
-    try r.set("weekend", try val_mod.makeObject(arena, weekend));
+    try defineData(r, "weekend", try val_mod.makeObject(arena, weekend));
     return val_mod.makeObject(arena, r);
 }
 
@@ -2310,11 +2937,11 @@ pub fn registerLocaleAccessors(arena: std.mem.Allocator, proto: *JsObject) !void
     try locAccessor(arena, proto, "language", "[[loc_language]]", false);
     try locAccessor(arena, proto, "script", "[[loc_script]]", true);
     try locAccessor(arena, proto, "region", "[[loc_region]]", true);
-    try locAccessor(arena, proto, "calendar", "[[loc_calendar]]", true);
-    try locAccessor(arena, proto, "collation", "[[loc_collation]]", true);
-    try locAccessor(arena, proto, "hourCycle", "[[loc_hourCycle]]", true);
-    try locAccessor(arena, proto, "caseFirst", "[[loc_caseFirst]]", true);
-    try locAccessor(arena, proto, "numberingSystem", "[[loc_numberingSystem]]", true);
+    try locAccessor(arena, proto, "calendar", "[[loc_calendar]]", false);
+    try locAccessor(arena, proto, "collation", "[[loc_collation]]", false);
+    try locAccessor(arena, proto, "hourCycle", "[[loc_hourCycle]]", false);
+    try locAccessor(arena, proto, "caseFirst", "[[loc_caseFirst]]", false);
+    try locAccessor(arena, proto, "numberingSystem", "[[loc_numberingSystem]]", false);
     try locAccessor(arena, proto, "numeric", "[[loc_numeric]]", false);
     try locAccessor(arena, proto, "variants", "[[loc_variants]]", true);
     try locAccessor(arena, proto, "firstDayOfWeek", "[[loc_firstDayOfWeek]]", true);
@@ -2403,6 +3030,12 @@ fn lfBuildParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) 
         style = v.unbox().string;
     };
     const items = try stringListFromIterable(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
+    return listPartsFor(arena, items, typ, style);
+}
+
+/// CreatePartsFromList over an already-materialized list of strings, split out
+/// so `Intl.DurationFormat` can reuse the same en list patterns.
+fn listPartsFor(arena: std.mem.Allocator, items: []const []const u8, typ: []const u8, style: []const u8) ![]NumberPart {
     var parts: std.ArrayList(NumberPart) = .empty;
     if (items.len == 0) return parts.items;
     if (items.len == 1) {
@@ -2450,8 +3083,8 @@ pub fn nativeListFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, 
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
     for (parts) |p| {
         const o = try dnEmptyObj(arena);
-        try o.set("type", try val_mod.makeString(arena, p.type));
-        try o.set("value", try val_mod.makeString(arena, p.value));
+        try defineData(o, "type", try val_mod.makeString(arena, p.type));
+        try defineData(o, "value", try val_mod.makeString(arena, p.value));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
     return val_mod.makeObject(arena, arr);
@@ -2475,9 +3108,9 @@ pub fn nativeListFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []
             style = v.unbox().string;
         };
     }
-    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
-    try r.set("type", try val_mod.makeString(arena, typ));
-    try r.set("style", try val_mod.makeString(arena, style));
+    try defineData(r, "locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
+    try defineData(r, "type", try val_mod.makeString(arena, typ));
+    try defineData(r, "style", try val_mod.makeString(arena, style));
     return val_mod.makeObject(arena, r);
 }
 
@@ -2553,11 +3186,11 @@ pub fn nativePluralRulesResolved(arena: std.mem.Allocator, this_val: Value, _: [
             ordinal = std.mem.eql(u8, v.unbox().string, "ordinal");
         };
     }
-    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
-    try r.set("type", try val_mod.makeString(arena, if (ordinal) "ordinal" else "cardinal"));
-    try r.set("minimumIntegerDigits", try val_mod.makeNumber(arena, 1));
-    try r.set("minimumFractionDigits", try val_mod.makeNumber(arena, 0));
-    try r.set("maximumFractionDigits", try val_mod.makeNumber(arena, 3));
+    try defineData(r, "locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
+    try defineData(r, "type", try val_mod.makeString(arena, if (ordinal) "ordinal" else "cardinal"));
+    try defineData(r, "minimumIntegerDigits", try val_mod.makeNumber(arena, 1));
+    try defineData(r, "minimumFractionDigits", try val_mod.makeNumber(arena, 0));
+    try defineData(r, "maximumFractionDigits", try val_mod.makeNumber(arena, 3));
     // pluralCategories: a real Array — en-US ordinal has one/two/few/other,
     // cardinal one/other.
     const cats = try JsObject.createArray(arena, realm_mod.active_array_proto);
@@ -2566,7 +3199,7 @@ pub fn nativePluralRulesResolved(arena: std.mem.Allocator, this_val: Value, _: [
     else
         &.{ "one", "other" };
     for (names) |n| try cats.appendElement(try val_mod.makeString(arena, n));
-    try r.set("pluralCategories", try val_mod.makeObject(arena, cats));
+    try defineData(r, "pluralCategories", try val_mod.makeObject(arena, cats));
     return val_mod.makeObject(arena, r);
 }
 
@@ -2684,9 +3317,9 @@ pub fn nativeRelativeTimeFormatFormatToParts(arena: std.mem.Allocator, this_val:
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
     for (parts) |p| {
         const o = try dnEmptyObj(arena);
-        try o.set("type", try val_mod.makeString(arena, p.type));
-        try o.set("value", try val_mod.makeString(arena, p.value));
-        if (p.source) |unit| try o.set("unit", try val_mod.makeString(arena, unit));
+        try defineData(o, "type", try val_mod.makeString(arena, p.type));
+        try defineData(o, "value", try val_mod.makeString(arena, p.value));
+        if (p.source) |unit| try defineData(o, "unit", try val_mod.makeString(arena, unit));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
     return val_mod.makeObject(arena, arr);
@@ -2710,14 +3343,22 @@ pub fn nativeRelativeTimeFormatResolved(arena: std.mem.Allocator, this_val: Valu
             style = v.unbox().string;
         };
     }
-    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
-    try r.set("style", try val_mod.makeString(arena, style));
-    try r.set("numeric", try val_mod.makeString(arena, numeric));
-    try r.set("numberingSystem", try val_mod.makeString(arena, "latn"));
+    try defineData(r, "locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
+    try defineData(r, "style", try val_mod.makeString(arena, style));
+    try defineData(r, "numeric", try val_mod.makeString(arena, numeric));
+    try defineData(r, "numberingSystem", try val_mod.makeString(arena, "latn"));
     return val_mod.makeObject(arena, r);
 }
 
 // ----------------------------------------------------------------- DisplayNames ---
+
+/// CreateDataPropertyOrThrow. Every `resolvedOptions()` result and
+/// `formatToParts` part is built with [[DefineOwnProperty]], so a setter planted
+/// on Object.prototype can neither intercept nor observe the write
+/// (`taint-Object-prototype.js`).
+pub fn defineData(o: *JsObject, key: []const u8, v: Value) !void {
+    _ = try o.defineOwnData(key, v, .{ .writable = true, .enumerable = true, .configurable = true });
+}
 
 fn dnEmptyObj(arena: std.mem.Allocator) !*JsObject {
     return if (realm_mod.active_heap) |h|
@@ -2916,12 +3557,12 @@ pub fn nativeDisplayNamesResolved(arena: std.mem.Allocator, this_val: Value, _: 
     const o = this_val.toPtr().object;
     const r = try dnEmptyObj(arena);
     const typ = o.getOwn("__dn_type").?.unbox().string;
-    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
-    try r.set("style", o.getOwn("__dn_style") orelse try val_mod.makeString(arena, "long"));
-    try r.set("type", try val_mod.makeString(arena, typ));
-    try r.set("fallback", o.getOwn("__dn_fallback") orelse try val_mod.makeString(arena, "code"));
+    try defineData(r, "locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
+    try defineData(r, "style", o.getOwn("__dn_style") orelse try val_mod.makeString(arena, "long"));
+    try defineData(r, "type", try val_mod.makeString(arena, typ));
+    try defineData(r, "fallback", o.getOwn("__dn_fallback") orelse try val_mod.makeString(arena, "code"));
     if (std.mem.eql(u8, typ, "language"))
-        try r.set("languageDisplay", o.getOwn("__dn_langdisplay") orelse try val_mod.makeString(arena, "dialect"));
+        try defineData(r, "languageDisplay", o.getOwn("__dn_langdisplay") orelse try val_mod.makeString(arena, "dialect"));
     return val_mod.makeObject(arena, r);
 }
 
@@ -3015,40 +3656,24 @@ pub fn nativeDurationFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
 /// `Temporal.Duration.prototype.toLocaleString`.
 fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerror!Value {
     try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
-    const opts: ?Value = if (args.len > 1) args[1] else null;
-    if (opts) |ov| {
-        if (ov.bits != 0 and ov.unbox() != .undefined_ and ov.unbox() != .object)
-            return throwTypeErrorIntl(arena, "options must be an object");
-    }
+    // GetOptionsObject: a non-undefined, non-Object options argument is a
+    // TypeError, and every read below is a real [[Get]], in spec order.
+    const opts = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
 
     // localeMatcher must be "lookup" or "best fit" when present (else RangeError).
-    _ = try dfGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" });
+    _ = try dnGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
 
     // numberingSystem — must be a well-formed Unicode `type` value when present.
-    const nu = optStr(opts, "numberingSystem") orelse "latn";
-    if (opts) |ov| if (ov.bits != 0 and ov.unbox() == .object) {
-        if (ov.toPtr().object.get("numberingSystem")) |nv| if (nv.bits != 0 and nv.unbox() != .undefined_) {
-            const nstr = try t_shared.valueToString(arena, nv);
-            if (!isWellFormedNumberingSystem(nstr))
-                return throwRangeError(arena, "invalid numberingSystem");
-        };
-    };
+    var nu: []const u8 = "latn";
+    if (try dnGetOption(arena, opts, "numberingSystem", &.{}, null)) |nstr| {
+        if (!isWellFormedNumberingSystem(nstr))
+            return throwRangeError(arena, "invalid numberingSystem");
+        nu = nstr;
+    }
     try obj.set("__df_nu", try val_mod.makeString(arena, nu));
 
-    const base_style = (try dfGetOption(arena, opts, "style", &.{ "long", "short", "narrow", "digital" })) orelse "short";
+    const base_style = (try dnGetOption(arena, opts, "style", &.{ "long", "short", "narrow", "digital" }, "short")).?;
     try obj.set("__df_style", try val_mod.makeString(arena, base_style));
-
-    // fractionalDigits: 0..9 or absent (-1 sentinel).
-    var frac: f64 = -1;
-    if (opts) |ov| if (ov.bits != 0 and ov.unbox() == .object) {
-        if (ov.toPtr().object.get("fractionalDigits")) |fv| if (fv.bits != 0 and fv.unbox() != .undefined_) {
-            const n = try realm_mod.toNumberValue(arena, fv);
-            if (!std.math.isFinite(n) or n < 0 or n > 9 or n != @trunc(n))
-                return throwRangeError(arena, "fractionalDigits out of range");
-            frac = n;
-        };
-    };
-    try obj.set("__df_frac", try val_mod.makeNumber(arena, frac));
 
     // GetDurationUnitOptions for each unit, in table order.
     var prev_style: []const u8 = "";
@@ -3064,7 +3689,7 @@ fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerr
                 n_allowed += 1;
             }
         }
-        var style = try dfGetOption(arena, opts, uname, allowed_buf[0..n_allowed]);
+        var style = try dnGetOption(arena, opts, uname, allowed_buf[0..n_allowed], null);
         var display_default: []const u8 = "always";
         if (style == null) {
             if (is_digital) {
@@ -3090,12 +3715,22 @@ fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerr
             if (i == 5 or i == 6) style = "2-digit";
         }
         const disp_key = try std.fmt.allocPrint(arena, "{s}Display", .{uname});
-        const display = (try dfGetOption(arena, opts, disp_key, &.{ "auto", "always" })) orelse display_default;
+        const display = (try dnGetOption(arena, opts, disp_key, &.{ "auto", "always" }, null)) orelse display_default;
 
         try obj.set(try std.fmt.allocPrint(arena, "__df_s{d}", .{i}), try val_mod.makeString(arena, style.?));
         try obj.set(try std.fmt.allocPrint(arena, "__df_d{d}", .{i}), try val_mod.makeString(arena, display));
         prev_style = style.?;
     }
+
+    // fractionalDigits is read last, after every per-unit option: 0..9, or the
+    // -1 sentinel when absent.
+    var frac: f64 = -1;
+    if (try dnGetNumOption(arena, opts, "fractionalDigits")) |n| {
+        if (!std.math.isFinite(n) or n < 0 or n > 9 or n != @trunc(n))
+            return throwRangeError(arena, "fractionalDigits out of range");
+        frac = n;
+    }
+    try obj.set("__df_frac", try val_mod.makeNumber(arena, frac));
 
     return val_mod.makeObject(arena, obj);
 }
@@ -3139,6 +3774,16 @@ pub fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror
     if (locales.unbox() == .string) {
         try out.append(arena, locales.unbox().string);
         return out.items;
+    }
+    // An Intl.Locale is a one-element list of its [[Locale]] — never an
+    // array-like, and `toString` is not consulted.
+    if (locales.unbox() == .object) {
+        if (locales.toPtr().object.getOwn("__locale_tag")) |lt| {
+            if (lt.bits != 0 and lt.unbox() == .string) {
+                try out.append(arena, lt.unbox().string);
+                return out.items;
+            }
+        }
     }
     // Every other primitive is ToObject-boxed, so inherited index/length
     // properties on e.g. Number.prototype are still seen.
@@ -3229,56 +3874,93 @@ fn dfReadStr(o: *JsObject, key: []const u8, default: []const u8) []const u8 {
     return default;
 }
 
-/// Append an integer magnitude (given as a non-negative f64) with optional en
-/// grouping (comma every three digits). `neg` prints a leading minus. Values
-/// beyond u64 range fall back to a plain decimal so huge (but valid) durations
-/// format without overflow — their exact digits are not asserted by test262.
-fn dfAppendMagnitude(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), mag: f64, neg: bool, grouping: bool) !void {
-    if (neg) try buf.append(arena, '-');
-    var tmp: [40]u8 = undefined;
-    const s = if (mag < 18446744073709551615.0)
-        std.fmt.bufPrint(&tmp, "{d}", .{@as(u64, @intFromFloat(mag))}) catch unreachable
-    else
-        std.fmt.bufPrint(&tmp, "{d:.0}", .{mag}) catch (std.fmt.bufPrint(&tmp, "0", .{}) catch unreachable);
-    if (!grouping) {
-        try buf.appendSlice(arena, s);
-        return;
+/// One duration field's value: either a plain amount, or the exact decimal
+/// string that folding sub-second fields into fractional seconds produced (that
+/// sum can carry more significant digits than an f64 holds).
+const DfValue = union(enum) {
+    num: f64,
+    dec: []const u8,
+
+    /// The spec's `value != 0` display test. A fractional-seconds string is
+    /// never equal to the number 0, so it always displays.
+    fn isNonZero(self: DfValue) bool {
+        return switch (self) {
+            .num => |n| n != 0,
+            .dec => true,
+        };
     }
-    const first = s.len % 3;
-    for (s, 0..) |c, i| {
-        if (i != 0 and (i % 3) == first) try buf.append(arena, ',');
-        try buf.append(arena, c);
-    }
+};
+
+/// ToIntegerIfIntegral of a duration field, as an exact i128. Duration fields
+/// are integers below 2**53, so the cast is lossless.
+fn dfExact(x: f64) i128 {
+    if (!std.math.isFinite(x)) return 0;
+    return @intFromFloat(@trunc(x));
 }
 
-/// Format one standalone unit ("1 year", "2 yrs", "3w"). `first_shown` gates the
-/// sign (only the first displayed field keeps a negative sign).
-fn dfFormatStandalone(arena: std.mem.Allocator, unit_idx: usize, style: []const u8, value: f64, first_shown: bool) ![]const u8 {
-    const neg = first_shown and value < 0;
-    const mag = @abs(value);
-    var num = std.ArrayListUnmanaged(u8){};
-    try dfAppendMagnitude(arena, &num, mag, neg, true);
-    // English plural: |value| == 1 → "one" category (sign does not affect it).
-    const one = mag == 1;
-    const forms = DF_FORMS[unit_idx];
-    if (std.mem.eql(u8, style, "narrow")) {
-        return std.fmt.allocPrint(arena, "{s}{s}", .{ num.items, forms.narrow });
-    } else if (std.mem.eql(u8, style, "short")) {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ num.items, if (one) forms.short_one else forms.short_other });
+/// The seconds/milliseconds/microseconds amount with every finer field folded
+/// into its fractional part, as an exact decimal string. `exponent` is 9 for
+/// seconds, 6 for milliseconds and 3 for microseconds — the number of decimal
+/// places one whole unit spans in nanoseconds.
+fn dfToFractional(arena: std.mem.Allocator, fields: *const [10]f64, exponent: u5) !DfValue {
+    const secs = fields[6];
+    const ms = fields[7];
+    const us = fields[8];
+    const ns = fields[9];
+    // No sub-second remainder: the field keeps its own (possibly negative-zero)
+    // value, which is what carries the sign for a leading unit.
+    switch (exponent) {
+        9 => if (ms == 0 and us == 0 and ns == 0) return .{ .num = secs },
+        6 => if (us == 0 and ns == 0) return .{ .num = ms },
+        else => if (ns == 0) return .{ .num = us },
     }
-    // long (default for standalone)
-    return std.fmt.allocPrint(arena, "{s} {s}", .{ num.items, if (one) forms.long_one else forms.long_other });
+
+    var total: i128 = dfExact(ns);
+    if (exponent >= 9) total += dfExact(secs) * 1_000_000_000;
+    if (exponent >= 6) total += dfExact(ms) * 1_000_000;
+    total += dfExact(us) * 1_000;
+
+    var scale: i128 = 1;
+    for (0..exponent) |_| scale *= 10;
+    const q = @divTrunc(total, scale);
+    // Truncated remainder (sign of the dividend), then its magnitude: the
+    // fractional digits are unsigned and the sign rides on the quotient.
+    const r: i128 = @intCast(@abs(@rem(total, scale)));
+
+    var frac_buf: [40]u8 = undefined;
+    const frac = std.fmt.bufPrint(&frac_buf, "{d}", .{r}) catch "0";
+    var buf = std.ArrayListUnmanaged(u8){};
+    // `q` is 0 for a sub-unit magnitude, so a leading "-" would be dropped;
+    // reproduce the reference algorithm, which formats the quotient as-is.
+    try buf.writer(arena).print("{d}.", .{q});
+    for (frac.len..exponent) |_| try buf.append(arena, '0');
+    try buf.appendSlice(arena, frac);
+    return .{ .dec = buf.items };
 }
 
-pub fn nativeDurationFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+/// The NumberFormat singular unit name for a duration field ("years" → "year").
+fn dfSingular(unit: []const u8) []const u8 {
+    return unit[0 .. unit.len - 1];
+}
+
+/// PartitionDurationFormatPattern (ECMA-402 §13.5.7). Each formatted field
+/// becomes a run of NumberFormat parts (with `source` carrying the singular
+/// unit name); consecutive numeric fields are joined by ":" into one list
+/// element, and the elements are then run through the en `unit` list pattern.
+fn dfBuildParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) ![]NumberPart {
     if (this_val.bits == 0 or this_val.unbox() != .object)
-        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype.format called on incompatible receiver");
+        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype method called on incompatible receiver");
     const o = this_val.toPtr().object;
     if (o.get("__df_style") == null)
-        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype.format called on incompatible receiver");
+        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype method called on incompatible receiver");
 
     const d = try t_duration.toTemporalDuration(arena, if (args.len > 0) args[0] else try val_mod.makeUndefined(arena));
-    const fields = [_]f64{ d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, d.milliseconds, d.microseconds, d.nanoseconds };
+    // A Duration record holds mathematical integers, so a `-0` field argument
+    // arrives as `+0` and must not make the whole duration read as negative.
+    var fields = [_]f64{ d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, d.milliseconds, d.microseconds, d.nanoseconds };
+    for (&fields) |*f| {
+        if (f.* == 0) f.* = 0;
+    }
 
     const base_style = dfReadStr(o, "__df_style", "short");
     const frac_digits: i32 = if (o.get("__df_frac")) |fv| (if (fv.bits != 0 and fv.unbox() == .number) @intFromFloat(fv.unbox().number) else -1) else -1;
@@ -3292,113 +3974,132 @@ pub fn nativeDurationFormatFormat(arena: std.mem.Allocator, this_val: Value, arg
         displays[i] = dfReadStr(o, std.fmt.bufPrint(&db, "__df_d{d}", .{i}) catch unreachable, "auto");
     }
 
-    var elements = std.ArrayListUnmanaged([]const u8){};
-    var first_shown = true;
+    const any_negative = blk: {
+        for (fields) |f| if (f < 0) break :blk true;
+        break :blk false;
+    };
 
-    var i: usize = 0;
-    while (i < 10) : (i += 1) {
+    // One entry per list element; a numeric clock group accumulates into the
+    // element the first of its fields opened.
+    var elements = std.ArrayListUnmanaged(std.ArrayListUnmanaged(NumberPart)){};
+    var need_separator = false;
+    var display_negative_sign = true;
+
+    for (DF_UNITS, 0..) |uname, i| {
+        var value: DfValue = .{ .num = fields[i] };
         const style = styles[i];
         const display = displays[i];
         const numeric = dfIsNumericStyle(style);
+        var max_frac: ?u32 = null;
+        var min_frac: ?u32 = null;
+        var trunc_rounding = false;
+        var done = false;
 
-        // Sub-second units (i>=7) that are numeric are folded into fractional
-        // seconds by the clock group; they never render standalone here.
-        if (numeric and i >= 7) continue;
-
-        if (!numeric) {
-            const value = fields[i];
-            if (value != 0 or std.mem.eql(u8, display, "always")) {
-                try elements.append(arena, try dfFormatStandalone(arena, i, style, value, first_shown));
-                first_shown = false;
-            }
-            continue;
+        // Numeric seconds and sub-seconds collapse into a single fractional
+        // amount as soon as the *next* field is rendered numerically.
+        if (i >= 6 and i <= 8 and dfIsNumericStyle(styles[i + 1])) {
+            const exponent: u5 = switch (i) {
+                6 => 9,
+                7 => 6,
+                else => 3,
+            };
+            value = try dfToFractional(arena, &fields, exponent);
+            max_frac = if (frac_digits >= 0) @intCast(frac_digits) else 9;
+            min_frac = if (frac_digits >= 0) @intCast(frac_digits) else 0;
+            trunc_rounding = true;
+            done = true;
         }
 
-        // Numeric clock group starting at unit i (one of hours/minutes/seconds).
-        // Consecutive numeric time units join with ":"; seconds folds any numeric
-        // sub-second fields into a fractional part. `j` stops at the first
-        // non-numeric time unit (or past seconds).
-        var clock = std.ArrayListUnmanaged(u8){};
-        var wrote_any = false;
-        var j = i;
-        while (j <= 6) : (j += 1) {
-            if (!dfIsNumericStyle(styles[j])) break;
-            const value = fields[j];
-            const disp = displays[j];
-            const show = value != 0 or std.mem.eql(u8, disp, "always") or wrote_any;
-            if (!show) continue;
-            if (wrote_any) try clock.append(arena, ':');
-            const two_digit = std.mem.eql(u8, styles[j], "2-digit");
-            const neg = first_shown and value < 0;
-            const mag = @abs(value);
-            if (neg) try clock.append(arena, '-');
-            if (j == 6) {
-                // seconds: fold sub-seconds into a fractional part.
-                try dfAppendClockSeconds(arena, &clock, &fields, frac_digits, two_digit);
+        // A numeric "minutes" that precedes a shown seconds field must render
+        // even when it is zero, so the clock does not lose its "0:" segment.
+        var display_required = false;
+        if (i == 5 and need_separator) {
+            display_required = std.mem.eql(u8, displays[6], "always") or
+                fields[6] != 0 or fields[7] != 0 or fields[8] != 0 or fields[9] != 0;
+        }
+
+        if (value.isNonZero() or !std.mem.eql(u8, display, "auto") or display_required) {
+            var sign_display: []const u8 = "auto";
+            if (display_negative_sign) {
+                display_negative_sign = false;
+                // The first rendered field carries the whole duration's sign,
+                // even when it is itself zero.
+                if (value == .num and value.num == 0 and any_negative) value = .{ .num = -0.0 };
             } else {
-                if (two_digit and mag < 10) try clock.append(arena, '0');
-                try dfAppendMagnitude(arena, &clock, mag, false, false);
+                sign_display = "never";
             }
-            wrote_any = true;
-            first_shown = false;
+
+            const standalone = !numeric;
+            const nf_opt = nfmt.NfOptions{
+                .style = if (standalone) "unit" else "decimal",
+                .unit = if (standalone) dfSingular(uname) else "",
+                .unit_display = if (standalone) style else "short",
+                .use_grouping = if (standalone) "auto" else "false",
+                .min_int = @as(u32, if (std.mem.eql(u8, style, "2-digit")) 2 else 1),
+                .min_frac = min_frac orelse 0,
+                .max_frac = max_frac orelse 3,
+                .rounding_mode = if (trunc_rounding) nfmt.RoundMode.trunc else nfmt.RoundMode.half_expand,
+                .sign_display = sign_display,
+            };
+            const num_parts = switch (value) {
+                .num => |n| try nfmt.formatNumberParts(arena, n, nf_opt),
+                .dec => |s| try nfmt.formatDecimalStringParts(arena, s, nf_opt),
+            };
+
+            var list: *std.ArrayListUnmanaged(NumberPart) = undefined;
+            if (need_separator) {
+                list = &elements.items[elements.items.len - 1];
+                try list.append(arena, .{ .type = "literal", .value = ":" });
+            } else {
+                try elements.append(arena, .{});
+                list = &elements.items[elements.items.len - 1];
+            }
+            for (num_parts) |p|
+                try list.append(arena, .{ .type = p.type, .value = p.value, .source = dfSingular(uname) });
+            if (!need_separator and numeric) need_separator = true;
         }
-        if (wrote_any) try elements.append(arena, clock.items);
-        i = j - 1; // resume at the first unit the clock group did not consume
+
+        if (done) break;
     }
 
-    // Join the list. Unit-style ListFormat: long/short/digital → ", "; narrow → " ".
-    const sep: []const u8 = if (std.mem.eql(u8, base_style, "narrow")) " " else ", ";
-    var out = std.ArrayListUnmanaged(u8){};
-    for (elements.items, 0..) |e, idx| {
-        if (idx != 0) try out.appendSlice(arena, sep);
-        try out.appendSlice(arena, e);
+    // Join the elements with the en `unit`-type list pattern; "digital" borrows
+    // the "short" list style.
+    var strings = std.ArrayListUnmanaged([]const u8){};
+    for (elements.items) |el| {
+        var s = std.ArrayListUnmanaged(u8){};
+        for (el.items) |p| try s.appendSlice(arena, p.value);
+        try strings.append(arena, s.items);
     }
+    const list_style: []const u8 = if (std.mem.eql(u8, base_style, "digital")) "short" else base_style;
+    var out = std.ArrayListUnmanaged(NumberPart){};
+    var next: usize = 0;
+    for (try listPartsFor(arena, strings.items, "unit", list_style)) |p| {
+        if (std.mem.eql(u8, p.type, "element")) {
+            try out.appendSlice(arena, elements.items[next].items);
+            next += 1;
+        } else {
+            try out.append(arena, .{ .type = p.type, .value = p.value });
+        }
+    }
+    return out.items;
+}
+
+pub fn nativeDurationFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    var out = std.ArrayListUnmanaged(u8){};
+    for (try dfBuildParts(arena, this_val, args)) |p| try out.appendSlice(arena, p.value);
     return val_mod.makeString(arena, out.items);
 }
 
-/// Append the seconds component of a numeric clock. Sub-second fields carry up
-/// into whole seconds (e.g. 56s + 1234567ms = "1290.567"), so the whole part is
-/// computed from the total nanoseconds (i128, no overflow) and the fractional
-/// part is truncated to `frac_digits` (or the shortest exact form when absent).
-fn dfAppendClockSeconds(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), fields: *const [10]f64, frac_digits: i32, two_digit: bool) !void {
-    const total_ns: i128 = @as(i128, @intFromFloat(@abs(fields[6]))) * 1_000_000_000 +
-        @as(i128, @intFromFloat(@abs(fields[7]))) * 1_000_000 +
-        @as(i128, @intFromFloat(@abs(fields[8]))) * 1_000 +
-        @as(i128, @intFromFloat(@abs(fields[9])));
-    const whole: u64 = @intCast(@divTrunc(total_ns, 1_000_000_000));
-    const frac_ns: u32 = @intCast(@mod(total_ns, 1_000_000_000));
-
-    if (two_digit and whole < 10) try buf.append(arena, '0');
-    var nb: [24]u8 = undefined;
-    try buf.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{whole}) catch unreachable);
-
-    var frac: [9]u8 = undefined;
-    _ = std.fmt.bufPrint(&frac, "{d:0>9}", .{frac_ns}) catch unreachable;
-    if (frac_digits >= 0) {
-        const dd: usize = @intCast(frac_digits);
-        if (dd == 0) return;
-        try buf.append(arena, '.');
-        try buf.appendSlice(arena, frac[0..dd]);
-    } else {
-        if (frac_ns == 0) return;
-        var end: usize = 9;
-        while (end > 0 and frac[end - 1] == '0') : (end -= 1) {}
-        try buf.append(arena, '.');
-        try buf.appendSlice(arena, frac[0..end]);
-    }
-}
-
 pub fn nativeDurationFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    // Minimal: return the whole formatted string as one { type:"literal", value } part.
-    const s_val = try nativeDurationFormatFormat(arena, this_val, args);
+    const parts = try dfBuildParts(arena, this_val, args);
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
-    const part = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
-    else
-        try JsObject.create(arena, realm_mod.active_object_proto);
-    try part.set("type", try val_mod.makeString(arena, "literal"));
-    try part.set("value", s_val);
-    try arr.appendElement(try val_mod.makeObject(arena, part));
+    for (parts) |p| {
+        const part = try dnEmptyObj(arena);
+        try defineData(part, "type", try val_mod.makeString(arena, p.type));
+        try defineData(part, "value", try val_mod.makeString(arena, p.value));
+        if (p.source) |unit| try defineData(part, "unit", try val_mod.makeString(arena, unit));
+        try arr.appendElement(try val_mod.makeObject(arena, part));
+    }
     return val_mod.makeObject(arena, arr);
 }
 
@@ -3410,18 +4111,18 @@ pub fn nativeDurationFormatResolved(arena: std.mem.Allocator, this_val: Value, _
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
-    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
-    try r.set("numberingSystem", try val_mod.makeString(arena, dfReadStr(o, "__df_nu", "latn")));
-    try r.set("style", try val_mod.makeString(arena, dfReadStr(o, "__df_style", "short")));
+    try defineData(r, "locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
+    try defineData(r, "numberingSystem", try val_mod.makeString(arena, dfReadStr(o, "__df_nu", "latn")));
+    try defineData(r, "style", try val_mod.makeString(arena, dfReadStr(o, "__df_style", "short")));
     for (DF_UNITS, 0..) |uname, i| {
         var sk: [8]u8 = undefined;
         var dk: [8]u8 = undefined;
-        try r.set(uname, try val_mod.makeString(arena, dfReadStr(o, std.fmt.bufPrint(&sk, "__df_s{d}", .{i}) catch unreachable, "short")));
+        try defineData(r, uname, try val_mod.makeString(arena, dfReadStr(o, std.fmt.bufPrint(&sk, "__df_s{d}", .{i}) catch unreachable, "short")));
         const disp_key = try std.fmt.allocPrint(arena, "{s}Display", .{uname});
-        try r.set(disp_key, try val_mod.makeString(arena, dfReadStr(o, std.fmt.bufPrint(&dk, "__df_d{d}", .{i}) catch unreachable, "auto")));
+        try defineData(r, disp_key, try val_mod.makeString(arena, dfReadStr(o, std.fmt.bufPrint(&dk, "__df_d{d}", .{i}) catch unreachable, "auto")));
     }
     const frac_digits: i32 = if (o.get("__df_frac")) |fv| (if (fv.bits != 0 and fv.unbox() == .number) @intFromFloat(fv.unbox().number) else -1) else -1;
-    if (frac_digits >= 0) try r.set("fractionalDigits", try val_mod.makeNumber(arena, @floatFromInt(frac_digits)));
+    if (frac_digits >= 0) try defineData(r, "fractionalDigits", try val_mod.makeNumber(arena, @floatFromInt(frac_digits)));
     return val_mod.makeObject(arena, r);
 }
 
@@ -3449,9 +4150,19 @@ test "intl: canonSubtag casing" {
 }
 
 test "intl: collator case-insensitive order" {
-    try std.testing.expectEqual(std.math.Order.eq, orderCaseInsensitive("Apple", "apple"));
-    try std.testing.expectEqual(std.math.Order.lt, orderCaseInsensitive("apple", "banana"));
-    try std.testing.expectEqual(std.math.Order.gt, orderCaseInsensitive("Banana", "apple"));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cmp = struct {
+        fn f(al: std.mem.Allocator, x: []const u8, y: []const u8) !std.math.Order {
+            return collatorCompareStrings(al, x, y, "accent", false, "false", false);
+        }
+    }.f;
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "Apple", "apple"));
+    try std.testing.expectEqual(std.math.Order.lt, try cmp(a, "apple", "banana"));
+    try std.testing.expectEqual(std.math.Order.gt, try cmp(a, "Banana", "apple"));
+    // Canonically equivalent spellings of "ö" collate as one string.
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "o\u{308}", "\u{f6}"));
 }
 
 test "intl: listformat en-US phrasing" {
@@ -3480,11 +4191,19 @@ test "intl: singularUnit strips plural s" {
 }
 
 test "intl: numeric collation order" {
-    try std.testing.expectEqual(std.math.Order.gt, orderNumeric("10", "2", false));
-    try std.testing.expectEqual(std.math.Order.lt, orderNumeric("a2", "a10", false));
-    try std.testing.expectEqual(std.math.Order.lt, orderNumeric("file9", "file10", false));
-    try std.testing.expectEqual(std.math.Order.eq, orderNumeric("2", "2", false));
-    try std.testing.expectEqual(std.math.Order.gt, orderNumeric("item20", "item3", false));
-    try std.testing.expectEqual(std.math.Order.eq, orderNumeric("007", "7", false));
-    try std.testing.expectEqual(std.math.Order.eq, orderNumeric("A1", "a1", true));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cmp = struct {
+        fn f(al: std.mem.Allocator, x: []const u8, y: []const u8, sens: []const u8) !std.math.Order {
+            return collatorCompareStrings(al, x, y, sens, true, "false", false);
+        }
+    }.f;
+    try std.testing.expectEqual(std.math.Order.gt, try cmp(a, "10", "2", "variant"));
+    try std.testing.expectEqual(std.math.Order.lt, try cmp(a, "a2", "a10", "variant"));
+    try std.testing.expectEqual(std.math.Order.lt, try cmp(a, "file9", "file10", "variant"));
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "2", "2", "variant"));
+    try std.testing.expectEqual(std.math.Order.gt, try cmp(a, "item20", "item3", "variant"));
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "007", "7", "variant"));
+    try std.testing.expectEqual(std.math.Order.eq, try cmp(a, "A1", "a1", "accent"));
 }

@@ -26,6 +26,7 @@ const dnGetOption = intl.dnGetOption;
 const dnGetNumOption = intl.dnGetNumOption;
 const coerceOptionsToObject = intl.coerceOptionsToObject;
 const resolveAndStoreLocale = intl.resolveAndStoreLocale;
+const resolveNumberingSystem = intl.resolveNumberingSystem;
 const isWellFormedNumberingSystem = intl.isWellFormedNumberingSystem;
 const upperDup = intl.upperDup;
 const resolvedLocaleOf = intl.resolvedLocaleOf;
@@ -266,7 +267,7 @@ fn addOne(arena: std.mem.Allocator, a: []const u8) ![]const u8 {
 // ------------------------------------------------------------------- rounding ---
 
 /// ECMA-402 roundingMode.
-const RoundMode = enum {
+pub const RoundMode = enum {
     ceil,
     floor,
     expand,
@@ -548,7 +549,7 @@ fn roundingTypeToString(t: RoundingType) []const u8 {
 }
 
 /// The resolved NumberFormat options that affect output.
-const NfOptions = struct {
+pub const NfOptions = struct {
     locale: []const u8 = "en-US",
     style: []const u8 = "decimal",
     currency: []const u8 = "USD",
@@ -556,6 +557,8 @@ const NfOptions = struct {
     currency_sign: []const u8 = "standard",
     unit: []const u8 = "",
     unit_display: []const u8 = "short",
+    /// Unicode numbering system whose digits replace the ASCII ones.
+    numbering_system: []const u8 = "latn",
     notation: []const u8 = "standard",
     compact_display: []const u8 = "short",
     min_int: u32 = 1,
@@ -666,25 +669,57 @@ fn unitSymbol(unit: []const u8, long: bool) []const u8 {
     return unit;
 }
 
-/// The wrapping for `style: "unit"`. Units the locale table does not list get a
-/// generic "<number> <symbol>" shape (with `x-per-y` spelled out when long).
-fn unitForm(arena: std.mem.Allocator, ld: *const data.LocaleData, opt: NfOptions) !data.UnitForm {
+/// The locale's simple-unit forms for `name`, or null when it lists none.
+/// `is_one` picks the CLDR `one` plural form where the locale distinguishes it.
+fn simpleUnitForm(ld: *const data.LocaleData, name: []const u8, display: []const u8, is_one: bool) ?data.UnitForm {
     for (ld.units) |e| {
-        if (!std.mem.eql(u8, e.unit, opt.unit)) continue;
-        if (std.mem.eql(u8, opt.unit_display, "narrow")) return e.narrow;
-        if (std.mem.eql(u8, opt.unit_display, "long")) return e.long;
-        return e.short;
+        if (!std.mem.eql(u8, e.unit, name)) continue;
+        if (std.mem.eql(u8, display, "narrow")) return if (is_one) e.narrow_one orelse e.narrow else e.narrow;
+        if (std.mem.eql(u8, display, "long")) return if (is_one) e.long_one orelse e.long else e.long;
+        return if (is_one) e.short_one orelse e.short else e.short;
     }
+    return null;
+}
+
+/// The `perUnitPattern` tail a compound unit appends after its numerator.
+fn perUnitTail(ld: *const data.LocaleData, name: []const u8, display: []const u8) []const u8 {
+    for (ld.units) |e| {
+        if (!std.mem.eql(u8, e.unit, name)) continue;
+        if (std.mem.eql(u8, display, "narrow")) return e.per_narrow;
+        if (std.mem.eql(u8, display, "long")) return e.per_long;
+        return e.per_short;
+    }
+    return "";
+}
+
+/// The wrapping for `style: "unit"`. A compound `x-per-y` uses the numerator's
+/// form plus the denominator's `perUnitPattern`; units the locale table does not
+/// list at all fall back to a generic "<number> <symbol>" shape.
+fn unitForm(arena: std.mem.Allocator, ld: *const data.LocaleData, opt: NfOptions, is_one: bool) !data.UnitForm {
+    if (simpleUnitForm(ld, opt.unit, opt.unit_display, is_one)) |f| return f;
+
     const long = std.mem.eql(u8, opt.unit_display, "long");
     const sep: []const u8 = if (std.mem.eql(u8, opt.unit_display, "narrow")) "" else " ";
     if (std.mem.indexOf(u8, opt.unit, "-per-")) |i| {
-        const num = unitSymbol(opt.unit[0..i], long);
-        const den = unitSymbol(opt.unit[i + 5 ..], long);
+        const num_name = opt.unit[0..i];
+        const den_name = opt.unit[i + 5 ..];
+        const num: data.UnitForm = simpleUnitForm(ld, num_name, opt.unit_display, is_one) orelse
+            .{ .sep = sep, .suffix = unitSymbol(num_name, long) };
+        const tail = perUnitTail(ld, den_name, opt.unit_display);
+        if (tail.len > 0) {
+            return .{
+                .prefix = num.prefix,
+                .prefix_sep = num.prefix_sep,
+                .sep = num.sep,
+                .suffix = try std.fmt.allocPrint(arena, "{s}{s}", .{ num.suffix, tail }),
+            };
+        }
+        const den = unitSymbol(den_name, long);
         const joined = if (long)
-            try std.fmt.allocPrint(arena, "{s} per {s}", .{ num, den })
+            try std.fmt.allocPrint(arena, "{s} per {s}", .{ num.suffix, den })
         else
-            try std.fmt.allocPrint(arena, "{s}/{s}", .{ num, den });
-        return .{ .sep = sep, .suffix = joined };
+            try std.fmt.allocPrint(arena, "{s}/{s}", .{ num.suffix, den });
+        return .{ .sep = num.sep, .suffix = joined };
     }
     return .{ .sep = sep, .suffix = unitSymbol(opt.unit, long) };
 }
@@ -692,6 +727,17 @@ fn unitForm(arena: std.mem.Allocator, ld: *const data.LocaleData, opt: NfOptions
 /// Emit the digits of `digit_str` as alternating integer/group runs plus the
 /// decimal and fraction parts, which is what distinguishes formatToParts from a
 /// plain grouped string.
+/// Rewrite an ASCII digit run into the formatter's numbering system.
+fn localizeDigits(arena: std.mem.Allocator, s: []const u8, opt: NfOptions) ![]const u8 {
+    if (std.mem.eql(u8, opt.numbering_system, "latn")) return s;
+    const digits = intl.numberingSystemDigitsFor(opt.numbering_system) orelse return s;
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |c| {
+        if (c >= '0' and c <= '9') try out.appendSlice(arena, digits[c - '0']) else try out.append(arena, c);
+    }
+    return out.items;
+}
+
 fn emitDigits(
     arena: std.mem.Allocator,
     parts: *std.ArrayList(NumberPart),
@@ -782,7 +828,11 @@ fn partitionNumberPattern(arena: std.mem.Allocator, dec_in: Decimal, opt: NfOpti
     const accounting = is_currency and ld.accounting_parens and
         std.mem.eql(u8, opt.currency_sign, "accounting") and sign == .negative;
 
-    const unit_form: data.UnitForm = if (is_unit) try unitForm(arena, ld, opt) else .{};
+    // CLDR plural selection for the unit name. In en the `one` category is
+    // "i = 1 and v = 0" — an integer 1 with no visible fraction digits — applied
+    // to the value actually rendered, so a compacted 1000 ("1K") stays plural.
+    const is_one_plural = is_unit and exponent == 0 and std.mem.eql(u8, body, "1");
+    const unit_form: data.UnitForm = if (is_unit) try unitForm(arena, ld, opt, is_one_plural) else .{};
     const cur_symbol: []const u8 = if (is_currency) blk: {
         if (std.mem.eql(u8, opt.currency_display, "code")) break :blk opt.currency;
         if (std.mem.eql(u8, opt.currency_display, "name")) break :blk opt.currency;
@@ -853,6 +903,16 @@ fn partitionNumberPattern(arena: std.mem.Allocator, dec_in: Decimal, opt: NfOpti
         try parts.append(arena, .{ .type = "unit", .value = unit_form.suffix });
     }
     if (accounting) try parts.append(arena, .{ .type = "literal", .value = ")" });
+
+    // The numbering system only rewrites digit runs; separators and affixes come
+    // from the locale data and stay as they are.
+    if (!std.mem.eql(u8, opt.numbering_system, "latn")) {
+        for (parts.items) |*p| {
+            if (std.mem.eql(u8, p.type, "integer") or std.mem.eql(u8, p.type, "fraction") or
+                std.mem.eql(u8, p.type, "exponentInteger"))
+                p.value = try localizeDigits(arena, p.value, opt);
+        }
+    }
     return parts.items;
 }
 
@@ -874,6 +934,13 @@ pub fn formatNumber(arena: std.mem.Allocator, value: f64, opt: NfOptions) ![]con
 /// into its own patterns and needs the part list, not the joined string.
 pub fn formatNumberParts(arena: std.mem.Allocator, value: f64, opt: NfOptions) ![]NumberPart {
     return partitionNumberPattern(arena, try decimalFromF64(arena, value), opt);
+}
+
+/// Format an exact decimal string (`"-1.500000000"`). `Intl.DurationFormat`
+/// needs this: the fractional seconds it folds sub-second fields into can carry
+/// more significant digits than an f64 holds.
+pub fn formatDecimalStringParts(arena: std.mem.Allocator, s: []const u8, opt: NfOptions) ![]NumberPart {
+    return partitionNumberPattern(arena, try decimalFromString(arena, s), opt);
 }
 
 // -------------------------------------------------------------- option parsing ---
@@ -952,56 +1019,17 @@ fn getUseGrouping(arena: std.mem.Allocator, options: Value, fallback: []const u8
 /// InitializeNumberFormat (§15.1.2) reads the options in the order below; each
 /// read goes through GetOption so a throwing getter propagates and an
 /// out-of-range value is a RangeError before any later option is touched.
-pub fn nativeNumberFormatCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    // Intl.NumberFormat is callable without `new` (§15.1.1 ChainNumberFormat);
-    // the plain call still yields an instance, so fall back to the service's own
-    // prototype rather than a bare object.
-    const constructing = realm_mod.active_constructing;
-    realm_mod.active_constructing = false;
-    const obj = if (constructing and this_val.bits != 0 and this_val.unbox() == .object)
-        this_val.toPtr().object
-    else
-        try legacyServiceObj(arena);
-    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
-    const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
-
-    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
-    if (try dnGetOption(arena, options, "numberingSystem", &.{}, null)) |ns| {
-        if (!isWellFormedNumberingSystem(ns)) return throwRangeError(arena, "invalid numberingSystem");
-    }
-
-    // SetNumberFormatUnitOptions (§15.1.3).
-    const style = (try dnGetOption(arena, options, "style", &.{ "decimal", "percent", "currency", "unit" }, "decimal")).?;
-    const is_currency = std.mem.eql(u8, style, "currency");
-    const currency_opt = try dnGetOption(arena, options, "currency", &.{}, null);
-    if (currency_opt) |c| {
-        if (!isWellFormedCurrencyCode(c)) return throwRangeError(arena, "invalid currency code");
-    } else if (is_currency) {
-        return throwTypeErrorIntl(arena, "Intl.NumberFormat: `currency` is required when style is \"currency\"");
-    }
-    const currency_display = (try dnGetOption(arena, options, "currencyDisplay", &.{ "code", "symbol", "narrowSymbol", "name" }, "symbol")).?;
-    const currency_sign = (try dnGetOption(arena, options, "currencySign", &.{ "standard", "accounting" }, "standard")).?;
-    const unit_opt = try dnGetOption(arena, options, "unit", &.{}, null);
-    if (unit_opt) |u| {
-        if (!isWellFormedUnitIdentifier(u)) return throwRangeError(arena, "invalid unit identifier");
-    } else if (std.mem.eql(u8, style, "unit")) {
-        return throwTypeErrorIntl(arena, "Intl.NumberFormat: `unit` is required when style is \"unit\"");
-    }
-    const unit_display = (try dnGetOption(arena, options, "unitDisplay", &.{ "short", "narrow", "long" }, "short")).?;
-    const currency = try upperDup(arena, currency_opt orelse "USD");
-
-    const notation = (try dnGetOption(arena, options, "notation", &.{ "standard", "scientific", "engineering", "compact" }, "standard")).?;
-    const is_compact = std.mem.eql(u8, notation, "compact");
-
-    // Per-style digit defaults; a currency's own fraction-digit count applies
-    // only in "standard" notation (§15.1.2 step 19).
-    const std_currency = is_currency and std.mem.eql(u8, notation, "standard");
-    const default_min: u32 = if (std_currency) data.currencyDigits(currency) else 0;
-    const default_max: u32 = if (std_currency)
-        data.currencyDigits(currency)
-    else if (std.mem.eql(u8, style, "percent")) 0 else 3;
-
-    // SetNumberFormatDigitOptions (§15.1.4).
+/// SetNumberFormatDigitOptions (§15.1.4). Shared by Intl.NumberFormat and
+/// Intl.PluralRules, which selects its plural category from the number as this
+/// same rounding would render it.
+pub fn setDigitOptions(
+    arena: std.mem.Allocator,
+    options: Value,
+    obj: *JsObject,
+    default_min: u32,
+    default_max: u32,
+    is_compact: bool,
+) anyerror!void {
     const min_int = if (try dnGetNumOption(arena, options, "minimumIntegerDigits")) |m| blk: {
         if (std.math.isNan(m) or m < 1 or m > 21) return throwRangeError(arena, "minimumIntegerDigits is out of range");
         break :blk @as(u32, @intFromFloat(@floor(m)));
@@ -1081,6 +1109,74 @@ pub fn nativeNumberFormatCtor(arena: std.mem.Allocator, this_val: Value, args: [
             return throwRangeError(arena, "roundingIncrement requires equal min/max fraction digits");
     }
 
+
+    try obj.set("__intl_minInt", try val_mod.makeNumber(arena, @floatFromInt(min_int)));
+    try obj.set("__intl_minFrac", try val_mod.makeNumber(arena, @floatFromInt(min_frac)));
+    try obj.set("__intl_maxFrac", try val_mod.makeNumber(arena, @floatFromInt(max_frac)));
+    try obj.set("__intl_minSig", try val_mod.makeNumber(arena, @floatFromInt(min_sig)));
+    try obj.set("__intl_maxSig", try val_mod.makeNumber(arena, @floatFromInt(max_sig)));
+    try obj.set("__intl_roundType", try val_mod.makeString(arena, roundingTypeToString(rounding_type)));
+    try obj.set("__intl_roundMode", try val_mod.makeString(arena, mode_str));
+    try obj.set("__intl_roundPriority", try val_mod.makeString(arena, priority));
+    try obj.set("__intl_trailingZero", try val_mod.makeString(arena, trailing_zero));
+    try obj.set("__intl_roundInc", try val_mod.makeNumber(arena, @floatFromInt(inc)));
+}
+
+pub fn nativeNumberFormatCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // Intl.NumberFormat is callable without `new` (§15.1.1 ChainNumberFormat);
+    // the plain call still yields an instance, so fall back to the service's own
+    // prototype rather than a bare object.
+    const constructing = realm_mod.active_constructing;
+    realm_mod.active_constructing = false;
+    const obj = if (constructing and this_val.bits != 0 and this_val.unbox() == .object)
+        this_val.toPtr().object
+    else
+        try legacyServiceObj(arena);
+    const locales = if (args.len > 0) args[0] else Value{};
+    const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
+
+    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+    var nu_opt: ?[]const u8 = null;
+    if (try dnGetOption(arena, options, "numberingSystem", &.{}, null)) |ns| {
+        if (!isWellFormedNumberingSystem(ns)) return throwRangeError(arena, "invalid numberingSystem");
+        nu_opt = ns;
+    }
+    const nu = try resolveNumberingSystem(arena, obj, locales, nu_opt);
+    try obj.set("__intl_numberingSystem", try val_mod.makeString(arena, nu));
+
+    // SetNumberFormatUnitOptions (§15.1.3).
+    const style = (try dnGetOption(arena, options, "style", &.{ "decimal", "percent", "currency", "unit" }, "decimal")).?;
+    const is_currency = std.mem.eql(u8, style, "currency");
+    const currency_opt = try dnGetOption(arena, options, "currency", &.{}, null);
+    if (currency_opt) |c| {
+        if (!isWellFormedCurrencyCode(c)) return throwRangeError(arena, "invalid currency code");
+    } else if (is_currency) {
+        return throwTypeErrorIntl(arena, "Intl.NumberFormat: `currency` is required when style is \"currency\"");
+    }
+    const currency_display = (try dnGetOption(arena, options, "currencyDisplay", &.{ "code", "symbol", "narrowSymbol", "name" }, "symbol")).?;
+    const currency_sign = (try dnGetOption(arena, options, "currencySign", &.{ "standard", "accounting" }, "standard")).?;
+    const unit_opt = try dnGetOption(arena, options, "unit", &.{}, null);
+    if (unit_opt) |u| {
+        if (!isWellFormedUnitIdentifier(u)) return throwRangeError(arena, "invalid unit identifier");
+    } else if (std.mem.eql(u8, style, "unit")) {
+        return throwTypeErrorIntl(arena, "Intl.NumberFormat: `unit` is required when style is \"unit\"");
+    }
+    const unit_display = (try dnGetOption(arena, options, "unitDisplay", &.{ "short", "narrow", "long" }, "short")).?;
+    const currency = try upperDup(arena, currency_opt orelse "USD");
+
+    const notation = (try dnGetOption(arena, options, "notation", &.{ "standard", "scientific", "engineering", "compact" }, "standard")).?;
+    const is_compact = std.mem.eql(u8, notation, "compact");
+
+    // Per-style digit defaults; a currency's own fraction-digit count applies
+    // only in "standard" notation (§15.1.2 step 19).
+    const std_currency = is_currency and std.mem.eql(u8, notation, "standard");
+    const default_min: u32 = if (std_currency) data.currencyDigits(currency) else 0;
+    const default_max: u32 = if (std_currency)
+        data.currencyDigits(currency)
+    else if (std.mem.eql(u8, style, "percent")) 0 else 3;
+
+    try setDigitOptions(arena, options, obj, default_min, default_max, is_compact);
+
     const compact_display = (try dnGetOption(arena, options, "compactDisplay", &.{ "short", "long" }, "short")).?;
     const group = try getUseGrouping(arena, options, if (is_compact) "min2" else "auto");
     const sign_display = (try dnGetOption(arena, options, "signDisplay", &.{ "auto", "never", "always", "exceptZero", "negative" }, "auto")).?;
@@ -1093,18 +1189,8 @@ pub fn nativeNumberFormatCtor(arena: std.mem.Allocator, this_val: Value, args: [
     try obj.set("__intl_unitDisplay", try val_mod.makeString(arena, unit_display));
     try obj.set("__intl_notation", try val_mod.makeString(arena, notation));
     try obj.set("__intl_compactDisplay", try val_mod.makeString(arena, compact_display));
-    try obj.set("__intl_minInt", try val_mod.makeNumber(arena, @floatFromInt(min_int)));
-    try obj.set("__intl_minFrac", try val_mod.makeNumber(arena, @floatFromInt(min_frac)));
-    try obj.set("__intl_maxFrac", try val_mod.makeNumber(arena, @floatFromInt(max_frac)));
-    try obj.set("__intl_minSig", try val_mod.makeNumber(arena, @floatFromInt(min_sig)));
-    try obj.set("__intl_maxSig", try val_mod.makeNumber(arena, @floatFromInt(max_sig)));
-    try obj.set("__intl_roundType", try val_mod.makeString(arena, roundingTypeToString(rounding_type)));
     try obj.set("__intl_group", try val_mod.makeString(arena, group));
     try obj.set("__intl_sign", try val_mod.makeString(arena, sign_display));
-    try obj.set("__intl_roundMode", try val_mod.makeString(arena, mode_str));
-    try obj.set("__intl_roundInc", try val_mod.makeNumber(arena, @floatFromInt(inc)));
-    try obj.set("__intl_roundPriority", try val_mod.makeString(arena, priority));
-    try obj.set("__intl_trailingZero", try val_mod.makeString(arena, trailing_zero));
     const created = try val_mod.makeObject(arena, obj);
     if (constructing) return created;
     return intl.chainLegacyService(this_val, created, intl.numberFormatProto());
@@ -1137,6 +1223,51 @@ fn slotNum(o: ?*JsObject, key: []const u8, dflt: u32) u32 {
     return @intFromFloat(n);
 }
 
+/// The CLDR plural-rule operands of a number, as `Intl.PluralRules` would
+/// render it: the rules are defined over the *formatted* decimal, so the digit
+/// options decide `v`/`w`/`f`/`t` and the notation decides `e`.
+pub const PluralOperands = struct {
+    /// Absolute value.
+    n: f64 = 0,
+    /// Integer digits.
+    i: u64 = 0,
+    /// Number of visible fraction digits, with trailing zeros.
+    v: u32 = 0,
+    /// Number of visible fraction digits, without trailing zeros.
+    w: u32 = 0,
+    /// Visible fraction digits, with trailing zeros, as an integer.
+    f: u64 = 0,
+    /// Visible fraction digits, without trailing zeros, as an integer.
+    t: u64 = 0,
+    /// Compact / scientific exponent.
+    e: i32 = 0,
+};
+
+pub fn pluralOperands(arena: std.mem.Allocator, this_val: Value, x: f64) !PluralOperands {
+    if (!std.math.isFinite(x)) return .{ .n = @abs(x) };
+    var opt = readNfOptions(this_val);
+    opt.style = "decimal";
+    const ld = data.forLocale(opt.locale);
+    const dec = try decimalFromF64(arena, @abs(x));
+    const exponent = try computeExponent(arena, opt, ld, dec);
+    var scaled = dec;
+    scaled.e -= exponent;
+    const body = (try formatNumericToString(arena, opt, scaled)).string;
+
+    var res = PluralOperands{ .n = @abs(x), .e = exponent };
+    const dot = std.mem.indexOfScalar(u8, body, '.');
+    const int_str = if (dot) |d| body[0..d] else body;
+    const frac_str = if (dot) |d| body[d + 1 ..] else "";
+    res.i = std.fmt.parseInt(u64, int_str, 10) catch 0;
+    res.v = @intCast(frac_str.len);
+    var trimmed = frac_str;
+    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '0') trimmed = trimmed[0 .. trimmed.len - 1];
+    res.w = @intCast(trimmed.len);
+    if (frac_str.len > 0) res.f = std.fmt.parseInt(u64, frac_str, 10) catch 0;
+    if (trimmed.len > 0) res.t = std.fmt.parseInt(u64, trimmed, 10) catch 0;
+    return res;
+}
+
 fn readNfOptions(this_val: Value) NfOptions {
     var r = NfOptions{};
     if (this_val.bits == 0 or this_val.unbox() != .object) return r;
@@ -1148,6 +1279,7 @@ fn readNfOptions(this_val: Value) NfOptions {
     r.currency_sign = slotStr(o, "__intl_currencySign", "standard");
     r.unit = slotStr(o, "__intl_unit", "");
     r.unit_display = slotStr(o, "__intl_unitDisplay", "short");
+    r.numbering_system = slotStr(o, "__intl_numberingSystem", "latn");
     r.notation = slotStr(o, "__intl_notation", "standard");
     r.compact_display = slotStr(o, "__intl_compactDisplay", "short");
     r.min_int = slotNum(o, "__intl_minInt", 1);
@@ -1197,9 +1329,9 @@ pub fn partsToArray(arena: std.mem.Allocator, parts: []const NumberPart) !Value 
             try JsObject.createOnHeap(h, realm_mod.active_object_proto)
         else
             try JsObject.create(arena, realm_mod.active_object_proto);
-        try o.set("type", try val_mod.makeString(arena, p.type));
-        try o.set("value", try val_mod.makeString(arena, p.value));
-        if (p.source) |src| try o.set("source", try val_mod.makeString(arena, src));
+        try intl.defineData(o, "type", try val_mod.makeString(arena, p.type));
+        try intl.defineData(o, "value", try val_mod.makeString(arena, p.value));
+        if (p.source) |src| try intl.defineData(o, "source", try val_mod.makeString(arena, src));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
     return val_mod.makeObject(arena, arr);
@@ -1276,43 +1408,43 @@ pub fn nativeNumberFormatResolved(arena: std.mem.Allocator, this_raw: Value, _: 
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
 
-    try r.set("locale", try val_mod.makeString(arena, opt.locale));
-    try r.set("numberingSystem", try val_mod.makeString(arena, "latn"));
-    try r.set("style", try val_mod.makeString(arena, opt.style));
+    try intl.defineData(r, "locale", try val_mod.makeString(arena, opt.locale));
+    try intl.defineData(r, "numberingSystem", try val_mod.makeString(arena, slotStr(o, "__intl_numberingSystem", "latn")));
+    try intl.defineData(r, "style", try val_mod.makeString(arena, opt.style));
     if (std.mem.eql(u8, opt.style, "currency")) {
-        try r.set("currency", try val_mod.makeString(arena, opt.currency));
-        try r.set("currencyDisplay", try val_mod.makeString(arena, opt.currency_display));
-        try r.set("currencySign", try val_mod.makeString(arena, opt.currency_sign));
+        try intl.defineData(r, "currency", try val_mod.makeString(arena, opt.currency));
+        try intl.defineData(r, "currencyDisplay", try val_mod.makeString(arena, opt.currency_display));
+        try intl.defineData(r, "currencySign", try val_mod.makeString(arena, opt.currency_sign));
     }
     if (std.mem.eql(u8, opt.style, "unit")) {
-        try r.set("unit", try val_mod.makeString(arena, opt.unit));
-        try r.set("unitDisplay", try val_mod.makeString(arena, opt.unit_display));
+        try intl.defineData(r, "unit", try val_mod.makeString(arena, opt.unit));
+        try intl.defineData(r, "unitDisplay", try val_mod.makeString(arena, opt.unit_display));
     }
-    try r.set("minimumIntegerDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.min_int)));
+    try intl.defineData(r, "minimumIntegerDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.min_int)));
     const has_frac = opt.rounding_type != .significant_digits;
     const has_sig = opt.rounding_type != .fraction_digits;
     if (has_frac) {
-        try r.set("minimumFractionDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.min_frac)));
-        try r.set("maximumFractionDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.max_frac)));
+        try intl.defineData(r, "minimumFractionDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.min_frac)));
+        try intl.defineData(r, "maximumFractionDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.max_frac)));
     }
     if (has_sig) {
-        try r.set("minimumSignificantDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.min_sig)));
-        try r.set("maximumSignificantDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.max_sig)));
+        try intl.defineData(r, "minimumSignificantDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.min_sig)));
+        try intl.defineData(r, "maximumSignificantDigits", try val_mod.makeNumber(arena, @floatFromInt(opt.max_sig)));
     }
     // `useGrouping` round-trips its string forms; only an explicit off is false.
     if (std.mem.eql(u8, opt.use_grouping, "false")) {
-        try r.set("useGrouping", try val_mod.makeBool(arena, false));
+        try intl.defineData(r, "useGrouping", try val_mod.makeBool(arena, false));
     } else {
-        try r.set("useGrouping", try val_mod.makeString(arena, opt.use_grouping));
+        try intl.defineData(r, "useGrouping", try val_mod.makeString(arena, opt.use_grouping));
     }
-    try r.set("notation", try val_mod.makeString(arena, opt.notation));
+    try intl.defineData(r, "notation", try val_mod.makeString(arena, opt.notation));
     if (std.mem.eql(u8, opt.notation, "compact"))
-        try r.set("compactDisplay", try val_mod.makeString(arena, opt.compact_display));
-    try r.set("signDisplay", try val_mod.makeString(arena, opt.sign_display));
-    try r.set("roundingIncrement", try val_mod.makeNumber(arena, @floatFromInt(opt.rounding_increment)));
-    try r.set("roundingMode", try val_mod.makeString(arena, slotStr(o, "__intl_roundMode", "halfExpand")));
-    try r.set("roundingPriority", try val_mod.makeString(arena, slotStr(o, "__intl_roundPriority", "auto")));
-    try r.set("trailingZeroDisplay", try val_mod.makeString(arena, slotStr(o, "__intl_trailingZero", "auto")));
+        try intl.defineData(r, "compactDisplay", try val_mod.makeString(arena, opt.compact_display));
+    try intl.defineData(r, "signDisplay", try val_mod.makeString(arena, opt.sign_display));
+    try intl.defineData(r, "roundingIncrement", try val_mod.makeNumber(arena, @floatFromInt(opt.rounding_increment)));
+    try intl.defineData(r, "roundingMode", try val_mod.makeString(arena, slotStr(o, "__intl_roundMode", "halfExpand")));
+    try intl.defineData(r, "roundingPriority", try val_mod.makeString(arena, slotStr(o, "__intl_roundPriority", "auto")));
+    try intl.defineData(r, "trailingZeroDisplay", try val_mod.makeString(arena, slotStr(o, "__intl_trailingZero", "auto")));
     return val_mod.makeObject(arena, r);
 }
 

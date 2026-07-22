@@ -326,6 +326,16 @@ pub const Op = enum(u8) {
     /// declaration or a parameter between the block and the var scope gets no
     /// var binding and no sync. Declared last (JIT ordinal stability).
     SYNC_ANNEXB_FN,
+    /// DEFINE_DATA | 5 | op, Robj u8, Kname u16-LE, Rval u8. CreateDataProperty:
+    /// defines an own enumerable/writable/configurable data property, bypassing
+    /// setters inherited from the prototype chain. Object-literal data
+    /// properties and class fields use this, not SET_PROP.
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    DEFINE_DATA,
+    /// DEFINE_DATA_DYN | 4 | op, Robj u8, Rkey u8, Rval u8. DEFINE_DATA with a
+    /// runtime property key (string, symbol, or index).
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    DEFINE_DATA_DYN,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -427,6 +437,8 @@ pub fn instrSize(op: Op) usize {
         .DEFINE_PRIVATE => 6,
         .MARK_DIRECT_EVAL => 1,
         .DEFINE_LOCAL => 4,
+        .DEFINE_DATA => 5,
+        .DEFINE_DATA_DYN => 4,
         .SYNC_ANNEXB_FN => 3,
         .IN => 4,
         .DELETE_PROP => 4,
