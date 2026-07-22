@@ -1599,7 +1599,16 @@ fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
 fn nativeArrayIsArray(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
-        return val_mod.makeBool(arena, args[0].toPtr().object.is_array);
+        // IsArray (§7.2.2) recurses through Proxy targets, and a REVOKED proxy is
+        // a TypeError rather than `false`.
+        var o = args[0].toPtr().object;
+        var depth: usize = 0;
+        while (o.internal_kind == .proxy and depth < 64) : (depth += 1) {
+            const target = proxy_mod.proxyTarget(o) orelse return proxy_mod.throwRevoked(arena);
+            if (target.bits == 0 or target.unbox() != .object) return val_mod.makeBool(arena, false);
+            o = target.toPtr().object;
+        }
+        return val_mod.makeBool(arena, o.is_array);
     }
     return val_mod.makeBool(arena, false);
 }
@@ -3445,7 +3454,7 @@ fn wrapperTag(obj: *JsObject) ?[]const u8 {
 }
 
 // ---- Object.prototype.toString / valueOf ----
-fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+pub fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     // ES 20.1.3.6: "[object " + builtinTag + "]". undefined/null get special tags.
     if (this_val.bits == 0) return val_mod.makeString(arena, "[object Undefined]");
     const builtin_tag: []const u8 = switch (this_val.unbox()) {
@@ -4207,8 +4216,12 @@ pub const Realm = struct {
         // Build Object.prototype (proto = null, as per spec).
         const object_proto = try JsObject.create(arena, null);
 
-        // Build Array.prototype (proto = Object.prototype).
+        // Build Array.prototype (proto = Object.prototype). §23.1.3: it is itself
+        // an Array exotic object with length 0, so `Array.isArray(Array.prototype)`
+        // is true and `Array.prototype.length` is 0 (not undefined).
         const array_proto = try JsObject.create(arena, object_proto);
+        array_proto.is_array = true;
+        array_proto.array_length = 0;
 
         // Build Object constructor object: a JsObject with a "create" property.
         const object_ctor = try JsObject.create(arena, null);
@@ -5273,6 +5286,10 @@ pub const Realm = struct {
         }
 
         const hp_array_proto = try heap.allocateObject(hp_proto);
+        // %Array.prototype% is itself an Array exotic object (§23.1.3); the
+        // heap-migrated copy must keep that brand and its length.
+        hp_array_proto.is_array = self.array_prototype.is_array;
+        hp_array_proto.array_length = self.array_prototype.array_length;
         for (self.array_prototype.ownKeys()) |k| {
             const a = self.array_prototype.ownAttr(k) orelse obj_mod.PropAttr{};
             if (a.is_accessor) {

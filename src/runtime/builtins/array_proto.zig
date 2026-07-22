@@ -363,9 +363,10 @@ pub fn nativeArrayToString(arena: std.mem.Allocator, this_val: Value, _: []const
             (cuni == .object and join_fn.toPtr().object.get("__call__") != null);
         if (callable) return fpm.invokeCallback(arena, this_val, join_fn, &[_]Value{});
     }
-    // Fallback: "[object Array]"-style tag via the array's own elements is not
-    // applicable here; emulate Object.prototype.toString minimal output.
-    return val_mod.makeString(arena, "[object Array]");
+    // §23.1.3.36 step 4: a non-callable `join` falls back to
+    // %Object.prototype.toString%, which brands by the RECEIVER — so
+    // `Array.prototype.toString.call(true)` is "[object Boolean]".
+    return realm_mod.nativeObjectProtoToString(arena, this_val, &[_]Value{});
 }
 
 /// ES Object.prototype.toLocaleString: return ? Invoke(this, "toString").
