@@ -876,13 +876,17 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
     if (super_name) |sname| {
         if (!m.is_static) {
             const sup_cls = nodeIdent(p, sname) orelse return null;
-            const sup_proto = nodeMember(p, sup_cls, "prototype") orelse return null;
+            const sup_proto_raw = nodeMember(p, sup_cls, "prototype") orelse return null;
+            const sup_null = p.makeNode(.null_literal, s, s, .{ .null_literal = {} }) orelse return null;
+            const sup_proto = nullHeritageGuard(p, sname, sup_proto_raw, sup_null, s) orelse return null;
             const sup_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "super", .init = sup_proto } }) orelse return null;
             // Bindings used by `super.PROP = V` desugar (rewriteSuperPropAssign):
             // `__sproto__` is the parent prototype (Set base) and `__superthis`
             // the Receiver — here `this`, the method's receiver.
             const sup_cls2 = nodeIdent(p, sname) orelse return null;
-            const sup_proto2 = nodeMember(p, sup_cls2, "prototype") orelse return null;
+            const sup_proto2_raw = nodeMember(p, sup_cls2, "prototype") orelse return null;
+            const sup_null2 = p.makeNode(.null_literal, s, s, .{ .null_literal = {} }) orelse return null;
+            const sup_proto2 = nullHeritageGuard(p, sname, sup_proto2_raw, sup_null2, s) orelse return null;
             const sproto_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__sproto__", .init = sup_proto2 } }) orelse return null;
             const this_node = p.makeNode(.this_expr, s, s, .{ .this_expr = {} }) orelse return null;
             const sthis_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__superthis", .init = this_node } }) orelse return null;
@@ -1012,6 +1016,22 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     });
 }
 
+/// `<super> === null ? <null_alt> : <super_expr>` — a class may extend `null`,
+/// in which case the prototype parent is `null` and the constructor's
+/// [[Prototype]] is %Function.prototype%, not the heritage value. The desugar
+/// is source-level, so the branch is emitted as a conditional expression rather
+/// than resolved at parse time (`extends (cond ? null : Base)` is legal).
+fn nullHeritageGuard(p: *Parser, super_name: []const u8, super_expr: *Node, null_alt: *Node, at: u32) ?*Node {
+    const lhs = p.makeNode(.identifier, at, at, .{ .identifier = super_name }) orelse return null;
+    const rhs = p.makeNode(.null_literal, at, at, .{ .null_literal = {} }) orelse return null;
+    const test_ = p.makeNode(.binary_expr, at, at, .{
+        .binary_expr = .{ .op = .strict_eq, .left = lhs, .right = rhs },
+    }) orelse return null;
+    return p.makeNode(.conditional_expr, at, at, .{
+        .conditional_expr = .{ .test_ = test_, .consequent = null_alt, .alternate = super_expr },
+    });
+}
+
 /// The parsed `extends` clause. A non-identifier heritage expression (e.g.
 /// `extends fn(await x)`) is hoisted into a `var __super__ = <expr>;` emitted
 /// before the class body, so everything downstream can refer to it by name.
@@ -1023,8 +1043,18 @@ const Heritage = struct {
 fn parseHeritage(p: *Parser) ?Heritage {
     if (!p.match(.kw_extends)) return Heritage{};
     const h = p.parseCallMemberExpr() orelse return null;
-    if (h.kind == .identifier) return Heritage{ .super_name = h.data.identifier };
-    return Heritage{ .super_name = "__super__", .expr = h };
+    // Always snapshot into a fresh binding, even for a bare identifier: the
+    // ClassHeritage is evaluated once at class-definition time, but `super()`
+    // and the prototype wiring below read the name later. `chain = class
+    // extends chain {}` would otherwise make the class its own superclass
+    // (infinite `super()` recursion), and two classes in one scope would share
+    // a single `__super__`.
+    const name = std.fmt.allocPrint(p.arena, "__super_{d}__", .{p.param_destruct_counter}) catch {
+        p.had_error = true;
+        return null;
+    };
+    p.param_destruct_counter += 1;
+    return Heritage{ .super_name = name, .expr = h };
 }
 
 /// How a class's constructor is named and bound. The declaration form
@@ -1114,7 +1144,7 @@ fn emitClassStatements(
     var out = std.ArrayList(*Node){};
     if (heritage_expr) |he| {
         const hv = p.makeNode(.var_decl, start, start, .{
-            .var_decl = .{ .kind = .var_, .name = "__super__", .init = he },
+            .var_decl = .{ .kind = .var_, .name = super_name.?, .init = he },
         }) orelse return null;
         out.append(p.arena, hv) catch return null;
     }
@@ -1143,9 +1173,11 @@ fn emitClassStatements(
         // `__superthis`, the object returned by the super() call above.
         {
             const sp_cls = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
-            const sp_proto = p.makeNode(.member_expr, start, start, .{
+            const sp_proto_raw = p.makeNode(.member_expr, start, start, .{
                 .member_expr = .{ .object = sp_cls, .property = (p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null), .computed = false },
             }) orelse return null;
+            const sp_null = p.makeNode(.null_literal, start, start, .{ .null_literal = {} }) orelse return null;
+            const sp_proto = nullHeritageGuard(p, sname, sp_proto_raw, sp_null, start) orelse return null;
             const sproto_decl = p.makeNode(.var_decl, start, start, .{
                 .var_decl = .{ .kind = .var_, .name = "__sproto__", .init = sp_proto },
             }) orelse return null;
@@ -1268,7 +1300,13 @@ fn emitClassStatements(
                 .member_expr = .{ .object = id_o, .property = id_sp, .computed = false },
             }) orelse return null;
             const a_cls = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
-            const a_sup = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
+            const a_sup_raw = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
+            const fn_id = p.makeNode(.identifier, start, start, .{ .identifier = "Function" }) orelse return null;
+            const fn_proto_id = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
+            const fn_proto = p.makeNode(.member_expr, start, start, .{
+                .member_expr = .{ .object = fn_id, .property = fn_proto_id, .computed = false },
+            }) orelse return null;
+            const a_sup = nullHeritageGuard(p, sname, a_sup_raw, fn_proto, start) orelse return null;
             var sp_args = std.ArrayList(*Node){};
             sp_args.append(p.arena, a_cls) catch return null;
             sp_args.append(p.arena, a_sup) catch return null;
@@ -1297,8 +1335,10 @@ fn emitClassStatements(
             .member_expr = .{ .object = id_super, .property = id_super_proto, .computed = false },
         }) orelse return null;
 
+        const null_proto = p.makeNode(.null_literal, start, start, .{ .null_literal = {} }) orelse return null;
+        const create_arg = nullHeritageGuard(p, sname, super_proto, null_proto, start) orelse return null;
         var args_create = std.ArrayList(*Node){};
-        args_create.append(p.arena, super_proto) catch return null;
+        args_create.append(p.arena, create_arg) catch return null;
         const rhs_create = p.makeNode(.call_expr, start, start, .{
             .call_expr = .{ .callee = callee_create, .args = args_create.items },
         }) orelse return null;
@@ -1568,7 +1608,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
             } else {
                 init_node = p.makeNode(.identifier, 0, 0, .{ .identifier = synth }) orelse return null;
             }
-            const vd = p.makeNode(.var_decl, 0, 0, .{ .var_decl = .{ .kind = .let, .name = orig, .init = init_node } }) orelse return null;
+            const vd = p.makeNode(.var_decl, 0, 0, .{ .var_decl = .{ .kind = .let, .name = orig, .init = init_node, .param_init = true } }) orelse return null;
             lets.append(p.arena, vd) catch {
                 p.had_error = true;
                 return null;

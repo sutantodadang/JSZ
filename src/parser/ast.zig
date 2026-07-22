@@ -376,6 +376,10 @@ pub const VarDecl = struct {
     name: []const u8,
     init: ?*Node,
     using_kind: UsingKind = .none,
+    /// Synthesized by the default-parameter TDZ desugar: this `let` re-binds a
+    /// formal parameter from its synthetic `__arg_N` slot, so its initializer is
+    /// parameter-scope code even though it now sits in the body.
+    param_init: bool = false,
 };
 
 pub const FuncDecl = struct {

@@ -122,10 +122,12 @@ pub const Context = struct {
     }
 
     pub fn invokeJs(self: *Context, arena: std.mem.Allocator, this_val: Value, fn_val: Value, args: []const Value) anyerror!Value {
+        if (stackExhausted()) return throwStackOverflow(arena);
         return self.invoke_fn(self.ptr, arena, this_val, fn_val, args);
     }
 
     pub fn construct(self: *Context, arena: std.mem.Allocator, ctor_val: Value, args: []const Value) anyerror!Value {
+        if (stackExhausted()) return throwStackOverflow(arena);
         return self.construct_fn(self.ptr, arena, ctor_val, args);
     }
 
@@ -138,6 +140,7 @@ pub const Context = struct {
     }
 
     pub fn constructNewTarget(self: *Context, arena: std.mem.Allocator, ctor_val: Value, args: []const Value, new_target: Value) anyerror!Value {
+        if (stackExhausted()) return throwStackOverflow(arena);
         return self.construct_nt_fn(self.ptr, arena, ctor_val, args, new_target);
     }
 
@@ -229,6 +232,40 @@ pub fn nativeDeadlineExceeded() bool {
 
 /// Thread-local reentrant callback depth counter.
 pub var callback_depth: u32 = 0;
+
+/// Highest C-stack address seen inside the engine — an approximation of where
+/// the stack began. The bytecode VM keeps its call frames on the heap, so plain
+/// JS recursion costs no C stack; but every native round trip back into JS (a
+/// `Reflect.construct` driving `super()`, a Proxy trap, an accessor) costs real
+/// frames, and 8 MiB runs out well before `callback_depth` reaches its cap.
+var stack_base: usize = 0;
+
+/// Refuse re-entry once this much C stack has been consumed, leaving room for
+/// the throw path itself to unwind on the default 8 MiB thread stack.
+const stack_budget_bytes: usize = 5 * 1024 * 1024;
+
+/// True when a further native → JS re-entry would risk overflowing the C stack.
+pub fn stackExhausted() bool {
+    const sp = @frameAddress();
+    if (sp > stack_base) {
+        stack_base = sp;
+        return false;
+    }
+    return stack_base - sp > stack_budget_bytes;
+}
+
+fn throwStackOverflow(arena: std.mem.Allocator) anyerror {
+    const obj = if (active_heap) |heap|
+        JsObject.createOnHeap(heap, error_proto_RangeError) catch null
+    else
+        JsObject.create(arena, error_proto_RangeError) catch null;
+    if (obj) |err_obj| {
+        err_obj.set("message", val_mod.makeString(arena, "Maximum call stack size exceeded") catch Value{}) catch {};
+        err_obj.set("name", val_mod.makeString(arena, "RangeError") catch Value{}) catch {};
+        pending_exception = val_mod.makeObject(arena, err_obj) catch Value{};
+    }
+    return error.JsException;
+}
 
 // ---------------------------------------------------------------- natives ---
 

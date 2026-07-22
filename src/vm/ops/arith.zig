@@ -56,22 +56,23 @@ pub inline fn opSub(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        const res = self.bigIntArithChecked(lv, rv, .sub) catch |e| {
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .sub) catch |e| {
             if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in BigInt arithmetic")) |oc| return oc;
+            if (try self.raisePendingException("error in subtraction")) |oc| return oc;
             return null;
         };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const ln = try self.toNumberCoerced(lv);
-        const rn = try self.toNumberCoerced(rv);
-        ac.mode = .unknown;
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, ln - rn);
-    } else if (val_mod.smiArith(lv, rv, '-')) |s| {
+    if (val_mod.smiArith(lv, rv, '-')) |s| {
         frame.registers[rdst] = s;
         ac.mode = .number_pair;
     } else {
@@ -97,22 +98,23 @@ pub inline fn opMul(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        const res = self.bigIntArithChecked(lv, rv, .mul) catch |e| {
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .mul) catch |e| {
             if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in BigInt arithmetic")) |oc| return oc;
+            if (try self.raisePendingException("error in multiplication")) |oc| return oc;
             return null;
         };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const ln = try self.toNumberCoerced(lv);
-        const rn = try self.toNumberCoerced(rv);
-        ac.mode = .unknown;
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, ln * rn);
-    } else if (val_mod.smiArith(lv, rv, '*')) |s| {
+    if (val_mod.smiArith(lv, rv, '*')) |s| {
         frame.registers[rdst] = s;
         ac.mode = .number_pair;
     } else {
@@ -138,30 +140,23 @@ pub inline fn opDiv(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        const res = self.bigIntArithChecked(lv, rv, .div) catch |e| {
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .div) catch |e| {
             if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in BigInt arithmetic")) |oc| return oc;
+            if (try self.raisePendingException("error in division")) |oc| return oc;
             return null;
         };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        ac.mode = .unknown;
-        const ln = self.toNumberCoerced(lv) catch |e| {
-            if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in ToPrimitive")) |oc| return oc;
-            return null;
-        };
-        const rn = self.toNumberCoerced(rv) catch |e| {
-            if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in ToPrimitive")) |oc| return oc;
-            return null;
-        };
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, ln / rn);
-    } else {
+    {
         const r = if (ac.mode == .number_pair and bcv.isNumberValue(lv) and bcv.isNumberValue(rv))
             lv.unbox().number / rv.unbox().number
         else
@@ -184,23 +179,23 @@ pub inline fn opMod(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        const res = self.bigIntArithChecked(lv, rv, .mod) catch |e| {
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .mod) catch |e| {
             if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in BigInt arithmetic")) |oc| return oc;
+            if (try self.raisePendingException("error in remainder")) |oc| return oc;
             return null;
         };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const l = try self.toNumberCoerced(lv);
-        const r = try self.toNumberCoerced(rv);
-        ac.mode = .unknown;
-        const res = bcv.jsRemainder(l, r);
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, res);
-    } else {
+    {
         const l = if (ac.mode == .number_pair and bcv.isNumberValue(lv) and bcv.isNumberValue(rv))
             lv.unbox().number
         else
@@ -245,12 +240,21 @@ pub inline fn opNeg(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const sv = frame.registers[rsrc];
-    if (sv.bits != 0 and sv.unbox() == .bigint) {
-        frame.registers[rdst] = try val_mod.bigIntNegate(self.arena, sv);
-    } else if (bcv.isObjectOperand(sv)) {
-        const n = try self.toNumberCoerced(sv);
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, -n);
-    } else {
+    if (bcv.BcVm.isBigOperand(sv) or bcv.isObjectOperand(sv)) {
+        // ToNumeric before the Number-vs-BigInt split: `-Object(1n)` is `-1n`.
+        const n = self.toNumeric(sv) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in negation")) |oc| return oc;
+            return null;
+        };
+        const res = if (bcv.BcVm.isBigOperand(n))
+            try val_mod.bigIntNegate(self.arena, n)
+        else
+            try val_mod.makeNumber(self.arena, -bcv.toNumber(n));
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        return null;
+    }
+    {
         frame.registers[rdst] = try val_mod.makeNumber(self.arena, -bcv.toNumber(sv));
     }
     return null;
@@ -308,23 +312,23 @@ pub inline fn opBitAnd(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        const res = self.bigIntBitChecked(lv, rv, .band) catch |e| {
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .band) catch |e| {
             if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in BigInt bitwise op")) |oc| return oc;
+            if (try self.raisePendingException("error in bitwise and")) |oc| return oc;
             return null;
         };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const lo = try self.toInt32Coerced(lv);
-        const ro = try self.toInt32Coerced(rv);
-        ac.mode = .unknown;
-        const r: i32 = lo & ro;
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
-    } else {
+    {
         const l = if (ac.mode == .number_pair and bcv.isNumberValue(lv) and bcv.isNumberValue(rv))
             @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
         else
@@ -352,23 +356,23 @@ pub inline fn opBitOr(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        const res = self.bigIntBitChecked(lv, rv, .bor) catch |e| {
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .bor) catch |e| {
             if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in BigInt bitwise op")) |oc| return oc;
+            if (try self.raisePendingException("error in bitwise or")) |oc| return oc;
             return null;
         };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const lo = try self.toInt32Coerced(lv);
-        const ro = try self.toInt32Coerced(rv);
-        ac.mode = .unknown;
-        const r: i32 = lo | ro;
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
-    } else {
+    {
         const l = if (ac.mode == .number_pair and bcv.isNumberValue(lv) and bcv.isNumberValue(rv))
             @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
         else
@@ -396,23 +400,23 @@ pub inline fn opBitXor(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        const res = self.bigIntBitChecked(lv, rv, .bxor) catch |e| {
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .bxor) catch |e| {
             if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in BigInt bitwise op")) |oc| return oc;
+            if (try self.raisePendingException("error in bitwise xor")) |oc| return oc;
             return null;
         };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const lo = try self.toInt32Coerced(lv);
-        const ro = try self.toInt32Coerced(rv);
-        ac.mode = .unknown;
-        const r: i32 = lo ^ ro;
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
-    } else {
+    {
         const l = if (ac.mode == .number_pair and bcv.isNumberValue(lv) and bcv.isNumberValue(rv))
             @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
         else
@@ -440,23 +444,23 @@ pub inline fn opShl(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        const res = self.bigIntBitChecked(lv, rv, .shl) catch |e| {
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .shl) catch |e| {
             if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in BigInt shift")) |oc| return oc;
+            if (try self.raisePendingException("error in left shift")) |oc| return oc;
             return null;
         };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const l = try self.toInt32Coerced(lv);
-        const shift: u5 = @intCast((try self.toUint32Coerced(rv)) & 0x1F);
-        ac.mode = .unknown;
-        const r: i32 = l << shift;
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
-    } else {
+    {
         const l = if (ac.mode == .number_pair and bcv.isNumberValue(lv) and bcv.isNumberValue(rv))
             @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
         else
@@ -484,23 +488,23 @@ pub inline fn opShr(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        const res = self.bigIntBitChecked(lv, rv, .shr) catch |e| {
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .shr) catch |e| {
             if (e != error.JsException) return e;
-            if (try self.raisePendingException("error in BigInt shift")) |oc| return oc;
+            if (try self.raisePendingException("error in right shift")) |oc| return oc;
             return null;
         };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const l = try self.toInt32Coerced(lv);
-        const shift: u5 = @intCast((try self.toUint32Coerced(rv)) & 0x1F);
-        ac.mode = .unknown;
-        const r: i32 = l >> shift;
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
-    } else {
+    {
         const l = if (ac.mode == .number_pair and bcv.isNumberValue(lv) and bcv.isNumberValue(rv))
             @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
         else
@@ -528,20 +532,23 @@ pub inline fn opUshr(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
     const ac = &@constCast(frame.func.arith_ic_table)[site_pc];
-    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv)) {
-        _ = self.throwTypeErr("BigInts have no unsigned right shift, use >> instead") catch {};
+    // ApplyStringOrNumericBinaryOperator ToNumeric's BOTH operands before
+    // the Number-vs-BigInt split, so an object wrapping a BigInt
+    // (`Object(1n)` on either side) unwraps instead of reporting a
+    // mixed-type TypeError. See BcVm.numericBinaryOp.
+    if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+    {
+        const res = self.numericBinaryOp(lv, rv, .ushr) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in unsigned right shift")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
         ac.mode = .unknown;
-        if (try self.raisePendingException("BigInt >>> unsupported")) |oc| return oc;
         return null;
     }
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const l = try self.toInt32Coerced(lv);
-        const u: u32 = @bitCast(l);
-        const shift: u5 = @intCast((try self.toUint32Coerced(rv)) & 0x1F);
-        ac.mode = .unknown;
-        const r: u32 = u >> shift;
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
-    } else {
+    {
         const l = if (ac.mode == .number_pair and bcv.isNumberValue(lv) and bcv.isNumberValue(rv))
             @as(i32, @intFromFloat(@trunc(lv.unbox().number)))
         else
@@ -565,12 +572,21 @@ pub inline fn opBitNot(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const sv = frame.registers[rsrc];
-    if (bcv.BcVm.isBigOperand(sv)) {
-        frame.registers[rdst] = try val_mod.bigIntBitNot(self.arena, sv);
-    } else if (bcv.isObjectOperand(sv)) {
-        const r: i32 = ~(try self.toInt32Coerced(sv));
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
-    } else {
+    if (bcv.BcVm.isBigOperand(sv) or bcv.isObjectOperand(sv)) {
+        // ToNumeric before the Number-vs-BigInt split: `~Object(1n)` is `~1n`.
+        const n = self.toNumeric(sv) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in bitwise not")) |oc| return oc;
+            return null;
+        };
+        const res = if (bcv.BcVm.isBigOperand(n))
+            try val_mod.bigIntBitNot(self.arena, n)
+        else
+            try val_mod.makeNumber(self.arena, @floatFromInt(~bcv.toInt32(n)));
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        return null;
+    }
+    {
         const r: i32 = ~bcv.toInt32(sv);
         frame.registers[rdst] = try val_mod.makeNumber(self.arena, @floatFromInt(r));
     }
@@ -584,13 +600,21 @@ pub inline fn opInc(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const sv = frame.registers[rsrc];
-    if (bcv.BcVm.isBigOperand(sv)) {
-        const one = try val_mod.makeBigIntFromI64(self.arena, 1);
-        frame.registers[rdst] = try val_mod.bigIntBinary(self.arena, sv, one, .add);
-    } else if (bcv.isObjectOperand(sv)) {
-        const n = try self.toNumberCoerced(sv);
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, n + 1.0);
-    } else {
+    if (bcv.BcVm.isBigOperand(sv) or bcv.isObjectOperand(sv)) {
+        // ToNumeric before the Number-vs-BigInt split (ES ApplyUpdate).
+        const n = self.toNumeric(sv) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in increment")) |oc| return oc;
+            return null;
+        };
+        const res = if (bcv.BcVm.isBigOperand(n)) blk: {
+            const one = try val_mod.makeBigIntFromI64(self.arena, 1);
+            break :blk try val_mod.bigIntBinary(self.arena, n, one, .add);
+        } else try val_mod.makeNumber(self.arena, bcv.toNumber(n) + 1.0);
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        return null;
+    }
+    {
         frame.registers[rdst] = try val_mod.makeNumber(self.arena, bcv.toNumber(sv) + 1.0);
     }
     return null;
@@ -603,13 +627,21 @@ pub inline fn opDec(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rsrc = code[frame.pc];
     frame.pc += 1;
     const sv = frame.registers[rsrc];
-    if (bcv.BcVm.isBigOperand(sv)) {
-        const one = try val_mod.makeBigIntFromI64(self.arena, 1);
-        frame.registers[rdst] = try val_mod.bigIntBinary(self.arena, sv, one, .sub);
-    } else if (bcv.isObjectOperand(sv)) {
-        const n = try self.toNumberCoerced(sv);
-        self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeNumber(self.arena, n - 1.0);
-    } else {
+    if (bcv.BcVm.isBigOperand(sv) or bcv.isObjectOperand(sv)) {
+        // ToNumeric before the Number-vs-BigInt split (ES ApplyUpdate).
+        const n = self.toNumeric(sv) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in decrement")) |oc| return oc;
+            return null;
+        };
+        const res = if (bcv.BcVm.isBigOperand(n)) blk: {
+            const one = try val_mod.makeBigIntFromI64(self.arena, 1);
+            break :blk try val_mod.bigIntBinary(self.arena, n, one, .sub);
+        } else try val_mod.makeNumber(self.arena, bcv.toNumber(n) - 1.0);
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = res;
+        return null;
+    }
+    {
         frame.registers[rdst] = try val_mod.makeNumber(self.arena, bcv.toNumber(sv) - 1.0);
     }
     return null;

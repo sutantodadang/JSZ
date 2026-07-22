@@ -683,7 +683,10 @@ fn setBindingByName(self: *BcVm, frame: *BcCallFrame, name: []const u8, value: V
     // both reassignment of an existing global and sloppy implicit-global
     // creation). A freshly created implicit global is configurable/deletable;
     // a reassignment preserves the existing (var → non-configurable) descriptor.
-    mirrorGlobalBinding(frame, name, value, true);
+    // A top-level `let`/`const`/`class` is deliberately NOT mirrored — see
+    // Environment.isGlobalVarBinding.
+    if (frame.env.isGlobalVarBinding(name, frame.inherited_env_floor))
+        mirrorGlobalBinding(frame, name, value, true);
     return null;
 }
 

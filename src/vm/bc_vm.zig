@@ -263,6 +263,12 @@ pub const BcVm = struct {
     /// global one. Saved/restored around every dispatch, so a call made from
     /// within the eval'd code does not inherit it.
     direct_eval_call: bool = false,
+    /// One-shot companion to `direct_eval_mark`, raised by MARK_PARAM_EVAL when
+    /// the direct eval sits in a formal-parameter initializer.
+    param_eval_mark: bool = false,
+    /// True while dispatching such a call: `bcEval` then rejects a top-level
+    /// `var arguments` in the eval'd source.
+    param_eval_call: bool = false,
     /// Phase 4d: context for re-entry from native callbacks.
     context: @import("../runtime/realm.zig").Context = undefined,
     /// Phase 9: optional JIT profiler. Null = no profiling (zero hot-path cost).
@@ -594,7 +600,11 @@ pub const BcVm = struct {
             return error.JsException;
         }
         switch (ctor.unbox()) {
-            .bc_function => {
+            .bc_function => |cl| {
+                if (!cl.isConstructor()) {
+                    realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                    return error.JsException;
+                }
                 const proto = try self.protoFromNewTarget(new_target, ctor, self.realm.object_prototype);
                 const new_obj = if (self.heap) |heap|
                     try JsObject.createOnHeap(heap, proto)
@@ -894,6 +904,19 @@ pub const BcVm = struct {
         if (!eval_is_strict) {
             var var_names = std.ArrayList([]const u8){};
             collectEvalVarNames(stmts, &var_names, self.arena);
+            // §19.2.1.3 step 5.d: a name already bound between the eval's
+            // LexicalEnvironment and its VariableEnvironment cannot be
+            // re-declared as a var. For a direct eval in a formal-parameter
+            // initializer that name is `arguments`, which the enclosing
+            // (non-arrow) function's parameter scope already binds.
+            if (self.param_eval_call) {
+                for (var_names.items) |vn| {
+                    if (std.mem.eql(u8, vn, "arguments")) {
+                        realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", "Identifier 'arguments' has already been declared");
+                        return error.JsException;
+                    }
+                }
+            }
             // Step 5.d: a top-level `var` whose name collides with a lexical
             // (`let`/`const`) binding anywhere between the eval's LexicalEnvironment
             // and its VariableEnvironment is a SyntaxError — eval must not create a
@@ -1482,6 +1505,7 @@ pub const BcVm = struct {
                 .PUT_REF => if (try load_ops.opPutRef(self, frame)) |o| return o,
                 .DEFINE_GLOBAL => if (try load_ops.opDefineGlobal(self, frame)) |o| return o,
                 .MARK_DIRECT_EVAL => self.direct_eval_mark = true,
+                .MARK_PARAM_EVAL => self.param_eval_mark = true,
                 .DEFINE_LOCAL => if (try load_ops.opDefineLocal(self, frame)) |o| return o,
                 .SYNC_ANNEXB_FN => if (try load_ops.opSyncAnnexBFn(self, frame)) |o| return o,
                 .GET_LOCAL => if (try load_ops.opGetLocal(self, frame)) |o| return o,
@@ -1645,7 +1669,7 @@ pub const BcVm = struct {
             .bc_function => {
                 // Generators and async functions are not constructors (spec 15.5.2 / 15.6.2).
                 const cl = callee_val.toPtr().bc_function;
-                if (cl.func.is_generator or cl.func.is_async) {
+                if (!cl.isConstructor()) {
                     self.last_exception_value = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
                     return "__js_exception__";
                 }
@@ -3430,10 +3454,14 @@ pub const BcVm = struct {
         // also *be* %eval% (§13.3.6.1 step 6), so `var eval = f; eval(s)` is an
         // ordinary call to f — and the flag must not survive into it, or f's own
         // call to the real eval would inherit the caller's scope.
+        const prev_param_eval = self.param_eval_call;
         self.direct_eval_call = self.direct_eval_mark and
             @import("../runtime/realm.zig").isEvalIntrinsic(callee_val);
+        self.param_eval_call = self.direct_eval_call and self.param_eval_mark;
         self.direct_eval_mark = false;
+        self.param_eval_mark = false;
         defer self.direct_eval_call = prev_direct_eval;
+        defer self.param_eval_call = prev_param_eval;
         const frame = &self.frames.items[self.frames.items.len - 1];
         if (callee_val.bits == 0) {
             return try std.fmt.allocPrint(self.arena, "TypeError: undefined is not a function", .{});
@@ -4708,6 +4736,51 @@ pub const BcVm = struct {
         if (prim.bits != 0 and prim.unbox() == .symbol)
             return self.throwTypeErr("Cannot convert a Symbol value to a number");
         return val_mod.makeNumber(self.arena, toNumber(prim));
+    }
+
+    /// The binary operators driven by ApplyStringOrNumericBinaryOperator, minus
+    /// `+` (which also has a string case — see `jsAdd`) and `**` (see `expOp`).
+    pub const NumericOp = enum { sub, mul, div, mod, band, bor, bxor, shl, shr, ushr };
+
+    /// ApplyStringOrNumericBinaryOperator for an operand pair that is not a pair
+    /// of plain numbers. Both sides are ToNumeric'd — i.e. ToPrimitive'd —
+    /// *before* the Number-vs-BigInt decision, so `Object(1n) & 2n` behaves as
+    /// `1n & 2n` rather than reporting a mixed-type TypeError.
+    pub fn numericBinaryOp(self: *BcVm, lv: Value, rv: Value, op: NumericOp) !Value {
+        const l = try self.toNumeric(lv);
+        const r = try self.toNumeric(rv);
+        const l_big = l.unbox() == .bigint;
+        const r_big = r.unbox() == .bigint;
+        if (l_big != r_big)
+            return self.throwTypeErr("Cannot mix BigInt and other types, use explicit conversions");
+        if (l_big) return switch (op) {
+            .sub => self.bigIntArithChecked(l, r, .sub),
+            .mul => self.bigIntArithChecked(l, r, .mul),
+            .div => self.bigIntArithChecked(l, r, .div),
+            .mod => self.bigIntArithChecked(l, r, .mod),
+            .band => self.bigIntBitChecked(l, r, .band),
+            .bor => self.bigIntBitChecked(l, r, .bor),
+            .bxor => self.bigIntBitChecked(l, r, .bxor),
+            .shl => self.bigIntBitChecked(l, r, .shl),
+            .shr => self.bigIntBitChecked(l, r, .shr),
+            .ushr => self.throwTypeErr("BigInts have no unsigned right shift, use >> instead"),
+        };
+        const ln = toNumber(l);
+        const rn = toNumber(r);
+        const shift: u5 = @intCast(toUint32(r) & 0x1F);
+        const num: f64 = switch (op) {
+            .sub => ln - rn,
+            .mul => ln * rn,
+            .div => ln / rn,
+            .mod => jsRemainder(ln, rn),
+            .band => @floatFromInt(toInt32(l) & toInt32(r)),
+            .bor => @floatFromInt(toInt32(l) | toInt32(r)),
+            .bxor => @floatFromInt(toInt32(l) ^ toInt32(r)),
+            .shl => @floatFromInt(toInt32(l) << shift),
+            .shr => @floatFromInt(toInt32(l) >> shift),
+            .ushr => @floatFromInt(@as(u32, @bitCast(toInt32(l))) >> shift),
+        };
+        return val_mod.makeNumber(self.arena, num);
     }
 
     /// Exponentiation runtime semantics (ES sec-exp-operator). ToNumeric both
