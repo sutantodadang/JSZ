@@ -25,6 +25,10 @@ pub const Lexer = struct {
     prev_kind: ?TokenKind,
     /// Allocator used for string escape processing only.
     allocator: std.mem.Allocator,
+    /// Annex B.1.1 HTML-like comments (`<!--` and a line-leading `-->`) are part
+    /// of the Script grammar only. Cleared by `Parser.parseModule`, where the
+    /// same character sequences must stay punctuators (and so a SyntaxError).
+    allow_html_comments: bool = true,
 
     pub fn init(source: []const u8, allocator: std.mem.Allocator) Lexer {
         return Lexer{
@@ -143,17 +147,29 @@ pub const Lexer = struct {
                 self.column = 1;
                 continue;
             }
+            // Annex B.1.1 SingleLineHTMLOpenComment: `<!--` runs to end of line.
+            if (self.allow_html_comments and c == '<' and
+                std.mem.startsWith(u8, self.source[self.pos..], "<!--"))
+            {
+                self.skipToLineEnd();
+                continue;
+            }
+            // Annex B.1.1 SingleLineHTMLCloseComment: `-->` runs to end of line,
+            // but only where the rest of the line before it is whitespace and
+            // delimited comments — which is exactly "a line terminator (or the
+            // start of input) has been passed without producing a token".
+            if (self.allow_html_comments and c == '-' and
+                (lt_before or self.pos == 0) and
+                std.mem.startsWith(u8, self.source[self.pos..], "-->"))
+            {
+                self.skipToLineEnd();
+                continue;
+            }
             // Line comment
             if (c == '/' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '/') {
                 self.pos += 2;
                 self.column += 2;
-                while (self.pos < self.source.len) {
-                    const d = self.source[self.pos];
-                    if (d == '\n' or d == '\r') break;
-                    if (self.isUnicodeLineTerm()) break;
-                    self.pos += 1;
-                    self.column += 1;
-                }
+                self.skipToLineEnd();
                 // The line terminator itself will be consumed on the next iteration.
                 continue;
             }
@@ -188,6 +204,18 @@ pub const Lexer = struct {
             break;
         }
         return lt_before;
+    }
+
+    /// Advance past every character up to (but not including) the next line
+    /// terminator. Shared by `//`, `<!--` and `-->` comment forms.
+    fn skipToLineEnd(self: *Lexer) void {
+        while (self.pos < self.source.len) {
+            const d = self.source[self.pos];
+            if (d == '\n' or d == '\r') break;
+            if (self.isUnicodeLineTerm()) break;
+            self.pos += 1;
+            self.column += 1;
+        }
     }
 
     /// Determine if '/' starts a regex based on the previous token kind.

@@ -378,6 +378,9 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__jszAsyncDone__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncDone));
         try realm.global_env.define("__jszAsyncFail__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeAsyncFail));
         try realm.global_env.define("__jszModuleReject__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeModuleReject));
+        // Annex B.3.6 `document.all` stand-in, built on request so the exotic
+        // never exists unless a host (the test262 $262 shim) asks for it.
+        try realm.global_env.define("__jszMakeHTMLDDA__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeHTMLDDA));
 
         try realm.registerRoots();
         self.realm = realm;

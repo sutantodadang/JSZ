@@ -391,7 +391,23 @@ pub const FnCompiler = struct {
                 }
                 const mark = blocked.items.len;
                 for (bs.body) |c| try self.collectLexicalNames(c, blocked);
-                for (bs.body) |c| try self.collectAnnexBNames(c, blocked, out, true);
+                // This block's own declarations are classified against the
+                // enclosing bindings plus its `let`/`const`.
+                for (bs.body) |c| {
+                    if (c.kind == .function_decl) try self.collectAnnexBNames(c, blocked, out, true);
+                }
+                // A block-level function declaration is itself a *lexical*
+                // binding of this block, so it blocks the extension for any
+                // declaration nested deeper: turning `function f` two blocks
+                // down into `var f` would collide with this `f` and be an early
+                // error (B.3.3.1 step 1.a.ii).
+                for (bs.body) |c| {
+                    if (c.kind == .function_decl)
+                        try self.addHoistName(blocked, c.data.function_decl.name);
+                }
+                for (bs.body) |c| {
+                    if (c.kind != .function_decl) try self.collectAnnexBNames(c, blocked, out, true);
+                }
                 blocked.shrinkRetainingCapacity(mark);
             },
             .if_stmt => {
@@ -503,11 +519,10 @@ pub const FnCompiler = struct {
                 if (node.data.try_stmt.handler) |h| try self.collectLexicalNames(h.body, list);
                 if (node.data.try_stmt.finalizer) |f| try self.collectLexicalNames(f, list);
             },
-            .switch_stmt => {
-                for (node.data.switch_stmt.cases) |case| {
-                    for (case.body) |c| try self.collectLexicalNames(c, list);
-                }
-            },
+            // A switch's CaseBlock is its own declarative environment shared by
+            // every clause (handled by lowerSwitchStmt via ENTER_SCOPE), so its
+            // `let`/`const` must NOT be hoisted into this enclosing scope.
+            .switch_stmt => {},
             .labeled_stmt => try self.collectLexicalNames(node.data.labeled_stmt.body, list),
             else => {},
         }
@@ -1099,7 +1114,20 @@ pub const FnCompiler = struct {
         return r_result;
     }
 
+    /// Annex B keeps `f() = v`, `f() += v`, `f()++` and `for (f() in o)` out of
+    /// the early-error grammar: a CallExpression is a valid AssignmentTarget for
+    /// parsing purposes, and the ReferenceError happens at runtime instead —
+    /// after the call itself has been evaluated, and before anything to its
+    /// right (the RHS, the operand's ToNumeric coercion) runs. Returns null when
+    /// `target` is not a call, so callers fall through to the ordinary path.
+    pub fn emitCallTargetRefError(self: *Self, target: *ast.Node, line: u32) error{OutOfMemory}!?u8 {
+        if (target.kind != .call_expr) return null;
+        _ = try self.compileExpr(target);
+        return try self.emitThrowError("ReferenceError", "Invalid assignment target", line);
+    }
+
     pub fn compileAssign(self: *Self, a: ast.AssignExpr, line: u32) error{OutOfMemory}!u8 {
+        if (try self.emitCallTargetRefError(a.target, line)) |r| return r;
         if (a.op == .assign) {
             // Peephole: x = x + 1 / x = x - 1 -> INC/DEC
             if (a.target.kind == .identifier and a.value.kind == .binary_expr) {
@@ -1955,6 +1983,7 @@ pub const FnCompiler = struct {
     }
 
     pub fn compileUpdate(self: *Self, u: ast.UpdateExpr, line: u32) error{OutOfMemory}!u8 {
+        if (try self.emitCallTargetRefError(u.operand, line)) |r| return r;
         const r_old = try self.compileExpr(u.operand);
 
         if (u.prefix) {
@@ -2549,6 +2578,12 @@ pub const FnCompiler = struct {
             {
                 var blocked: std.ArrayList([]const u8) = .empty;
                 for (self.param_names) |p| try self.addHoistName(&blocked, p);
+                // B.3.3.1 skips the name "arguments" whenever the enclosing
+                // function has an arguments object: `{ function arguments(){} }`
+                // stays block-scoped rather than clobbering it. `implicit_return`
+                // marks Script/eval code, which has no arguments object, and an
+                // arrow resolves `arguments` lexically.
+                if (!implicit_return and !self.is_arrow) try self.addHoistName(&blocked, "arguments");
                 for (body) |stmt| try self.collectLexicalNames(stmt, &blocked);
                 for (body) |stmt| try self.collectAnnexBNames(stmt, &blocked, &self.annexb_fn_names, false);
             }

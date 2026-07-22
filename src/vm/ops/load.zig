@@ -41,11 +41,22 @@ fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value, conf
     mirrorGlobalBindingOpts(frame, name, value, configurable, false);
 }
 
+/// The environment record a `var`/function declaration made by this frame binds
+/// into. Ordinary code binds in its own scope; non-strict eval code hoists into
+/// the enclosing VariableEnvironment instead (§19.2.1.3 EvalDeclarationInstantiation
+/// runs its var-scoped instantiation against `varEnv`, the calling context's
+/// VariableEnvironment, while `let`/`const` stay in the eval's own `lexEnv`).
+/// `Environment.varScope` already stops at the eval scope itself for a *strict*
+/// eval, whose vars are confined to it.
+inline fn varTargetEnv(frame: *BcCallFrame) *Environment {
+    return if (frame.func.is_eval) frame.env.varScope() else frame.env;
+}
+
 /// `declare_only` mirrors CreateGlobalVarBinding's "if the property already
 /// exists, leave it (and its value) alone" clause — used by HOIST_VAR, which
 /// only has to *reserve* the name at scope entry.
 fn mirrorGlobalBindingOpts(frame: *BcCallFrame, name: []const u8, value: Value, configurable: bool, declare_only: bool) void {
-    if (frame.env.parent != null) return;
+    if (varTargetEnv(frame).parent != null) return;
     // ES module top-level declarations live in the Module Environment Record
     // and must NOT become own-properties of the global object (spec §16.2.1.6).
     if (frame.func.is_module) return;
@@ -228,6 +239,18 @@ pub inline fn opGetGlobalOpt(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+/// CreateGlobalVarBinding step 5 gates the whole binding creation on
+/// `HasOwnProperty(globalObject, N)` being false. When the global object already
+/// carries the name, the global Environment Record keeps resolving it through
+/// its object record, so declaring a shadowing declarative binding here would
+/// reset an existing global to `undefined` (`Object.defineProperty(globalThis,
+/// "f", {value: "x"}); eval("var f")` must still read `"x"`).
+fn globalObjectHasOwn(frame: *BcCallFrame, name: []const u8) bool {
+    const gt = frame.env.lookup("globalThis") catch return false;
+    if (gt.bits == 0 or gt.unbox() != .object) return false;
+    return gt.toPtr().object.hasOwn(name);
+}
+
 pub inline fn opHoistVar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const lo = code[frame.pc];
@@ -237,7 +260,11 @@ pub inline fn opHoistVar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name = frame.func.chunk.constants[kidx].toPtr().string;
     const undef = try val_mod.makeUndefined(self.arena);
-    frame.env.hoistVar(name, undef) catch return error.OutOfMemory;
+    const target = varTargetEnv(frame);
+    const shadows_global = target.parent == null and !frame.func.is_module and
+        !(name.len >= 2 and name[0] == '_' and name[1] == '_') and
+        !target.bindings.contains(name) and globalObjectHasOwn(frame, name);
+    if (!shadows_global) target.hoistVar(name, undef) catch return error.OutOfMemory;
     // ES §9.1.1.4.17 CreateGlobalVarBinding: a top-level `var`/function name in
     // Script or eval code reserves an own property of the global object at
     // declaration-instantiation time, even when it is never assigned (`var x;`
@@ -471,13 +498,11 @@ pub inline fn opDefineGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const name_val = frame.func.chunk.constants[kidx];
     const name = name_val.toPtr().string;
     const value = frame.registers[rsrc];
-    // Try assign first (update existing binding), else define.
+    // Try assign first (update existing binding), else define. A var/function
+    // declaration in non-strict eval code belongs to the calling
+    // VariableEnvironment, not to the eval's own declarative scope.
     frame.env.assign(name, value) catch {
-        if (frame.env.parent == null) {
-            frame.env.define(name, value) catch return error.OutOfMemory;
-        } else {
-            frame.env.define(name, value) catch return error.OutOfMemory;
-        }
+        varTargetEnv(frame).define(name, value) catch return error.OutOfMemory;
     };
     // Top-level `var`/function declarations are also own properties of the
     // global object (observable as `globalThis.name`). Script-level ones are
@@ -531,7 +556,12 @@ pub inline fn opSyncAnnexBFn(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const name = frame.func.chunk.constants[kidx].toPtr().string;
     const value = frame.env.lookup(name) catch return null;
     const target = frame.env.varScope();
-    target.assign(name, value) catch return null;
+    // A missing declarative binding is not a failure at global scope: when the
+    // name is already an own property of the global object, CreateGlobalVarBinding
+    // deliberately created no binding (see opHoistVar), and this
+    // SetMutableBinding routes through the global Environment Record's object
+    // record instead — so still mirror the value out.
+    target.assign(name, value) catch {};
     mirrorGlobalBindingIn(frame, target, name, value, false);
     return null;
 }

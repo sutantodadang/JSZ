@@ -378,7 +378,10 @@ const DOLLAR262_PRELUDE =
     \\  // become global lexical bindings that survive the call.
     \\  evalScript: function(s) { return __jszEvalScript__(s); },
     \\  AbstractModuleSource: function AbstractModuleSource() {},
-    \\  IsHTMLDDA: function IsHTMLDDA() {}
+    \\  // A real [[IsHTMLDDA]] exotic (Annex B.3.6): emulates `undefined` in
+    \\  // typeof / ToBoolean / `==`, and returns null when called with no
+    \\  // arguments or a single empty string.
+    \\  IsHTMLDDA: __jszMakeHTMLDDA__()
     \\};
     \\var __moduleSourceCache__ = Object.create(null);
     \\function __moduleSource__(spec) {

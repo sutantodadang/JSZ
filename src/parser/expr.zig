@@ -306,16 +306,23 @@ pub fn parseAssignmentExpr(p: *Parser) ?*Node {
     {
         const save_lexer = p.lexer;
         const save_cur = p.current;
+        const save_had_error = p.had_error;
+        const save_error_info = p.error_info;
         p.async_kw_start = p.current.start; // `async` position for the source span
         _ = p.advance(); // consume `async`
         const candidate = p.parseAssignmentExprCore(true);
         if (candidate) |c| {
             if (c.kind == .function_expr and c.data.function_expr.is_arrow) return c;
         }
-        if (p.had_error) return candidate;
-        // Not an arrow — rewind so `async` parses as a normal identifier.
+        // Not an arrow — rewind so `async` parses as a normal identifier. This
+        // includes the case where the speculative parse *failed*: the failure is
+        // evidence about the arrow reading only (`async() = 1` is a well-formed
+        // call in an assignment target position, but `() = 1` is not an
+        // ArrowParameters), so discard it and let the real parse report.
         p.lexer = save_lexer;
         p.current = save_cur;
+        p.had_error = save_had_error;
+        p.error_info = save_error_info;
     }
     return p.parseAssignmentExprCore(false);
 }
@@ -431,6 +438,22 @@ pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
             arrowParamError(p);
             return null;
         },
+    }
+    // ArrowFormalParameters are UniqueFormalParameters (§15.3.1) — duplicates
+    // are an early SyntaxError even in sloppy code. Destructuring params carry
+    // unique synthetic `__param_N` names, so only the written identifiers (plus
+    // a rest binding) can collide.
+    if (p.arrow_rest_param) |r| {
+        for (params.items) |n| {
+            if (std.mem.eql(u8, n, r)) {
+                parser_file.rejectDuplicateParams(p);
+                return null;
+            }
+        }
+    }
+    if (parser_file.hasDuplicateName(params.items)) {
+        parser_file.rejectDuplicateParams(p);
+        return null;
     }
     return params.items;
 }
@@ -953,6 +976,9 @@ pub fn parseBinaryExpr(p: *Parser, min_prec: u8) ?*Node {
     while (true) {
         const prec = infixPrec(p.current.kind);
         if (prec == 0 or prec <= min_prec) break;
+        // [~In] productions: inside a `for` head's initializer, `in` is the
+        // for-in separator, not the relational operator (`for (var a = b in c)`).
+        if (p.current.kind == .kw_in and p.no_in) break;
         if (p.current.kind == .left_paren or p.current.kind == .left_bracket or p.current.kind == .dot) {
             // Call/member — handled in parseUnaryExpr's postfix loop, not here.
             break;
@@ -1061,6 +1087,14 @@ pub fn isMethodKeyStart(kind: anytype) bool {
 }
 
 pub fn parseUnaryExpr(p: *Parser) ?*Node {
+    // A [~In] restriction covers only the operator chain it was set for, not the
+    // insides of an operand: `for (var a = (b in c) in d)` and `f(b in c)` both
+    // re-enter the [+In] grammar. Clearing it for the whole operand (parens,
+    // arguments, computed member keys, literals) and restoring on the way out
+    // gives that scoping with one save/restore instead of one per nested form.
+    const saved_no_in = p.no_in;
+    p.no_in = false;
+    defer p.no_in = saved_no_in;
     const start = p.current.start;
     // Phase 8: `await X` desugars to a call __await__(X) (synchronous-drain await).
     // Works at module top level and inside any function; no VM changes needed.
@@ -1741,6 +1775,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     return null;
                 }
             }
+            p.require_unique_params = true;
             const am_params = p.parseFunctionParams() orelse return null;
             p.super_used = false;
             const prev_gen = p.in_generator_function;
@@ -1785,6 +1820,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             // ES6 computed method `{ [expr](params) { body } }` ≡ a function-valued
             // property with a runtime-evaluated key.
             if (p.check(.left_paren)) {
+                p.require_unique_params = true;
                 const cm_params = p.parseFunctionParams() orelse return null;
                 p.super_used = false;
                 const cm_body = p.parseFunctionBody() orelse return null;
@@ -1902,6 +1938,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 p.error_info = parser_file.ParseError{ .message = "expected accessor name", .line = p.current.line, .column = p.current.column };
                 return null;
             }
+            p.require_unique_params = true;
             const acc_params = p.parseFunctionParams() orelse return null;
             p.super_used = false;
             const acc_body = p.parseFunctionBody() orelse return null;
@@ -1932,6 +1969,8 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
         }
         // ES6 method shorthand: `name(params) { body }` ≡ `name: function(params){body}`.
         if (p.check(.left_paren)) {
+            // A MethodDefinition takes UniqueFormalParameters (§15.4.1).
+            p.require_unique_params = true;
             const m_params = p.parseFunctionParams() orelse return null;
             p.super_used = false;
             const m_body = p.parseFunctionBody() orelse return null;
