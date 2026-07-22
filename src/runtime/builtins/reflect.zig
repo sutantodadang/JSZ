@@ -912,7 +912,12 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
 
 pub fn nativeReflectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
-    if (args.len == 0 or !isObj(args[0])) return val_mod.makeUndefined(arena);
+    // A function target is an ordinary object too: `length`/`name` (and, for a
+    // bc closure, everything on its backing object) are own properties.
+    // Object.getOwnPropertyDescriptor already synthesizes those, so share it
+    // rather than duplicating the native-entry descriptor tables here.
+    if (!isObj(args[0]))
+        return @import("object_methods.zig").nativeObjectGetOwnPropertyDescriptor(arena, .{}, args);
     const obj = args[0].toPtr().object;
 
     if (args.len < 2) return val_mod.makeUndefined(arena);

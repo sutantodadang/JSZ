@@ -82,6 +82,30 @@ pub fn checkStrictBindingName(p: *Parser, name: []const u8, line: u32, column: u
     return false;
 }
 
+/// True when `names` binds the same identifier twice. Parameter lists are short,
+/// so the quadratic scan beats building a set.
+pub fn hasDuplicateName(names: []const []const u8) bool {
+    for (names, 0..) |a, i| {
+        for (names[i + 1 ..]) |b| {
+            if (std.mem.eql(u8, a, b)) return true;
+        }
+    }
+    return false;
+}
+
+/// Record the early SyntaxError for a parameter list that binds a name twice
+/// (§15.1.2/§15.2.1/§15.3.1: duplicates survive only in a sloppy, simple
+/// FormalParameters of a function declaration or expression).
+pub fn rejectDuplicateParams(p: *Parser) void {
+    if (p.had_error) return;
+    p.had_error = true;
+    p.error_info = ParseError{
+        .message = "duplicate parameter name not allowed in this context",
+        .line = p.current.line,
+        .column = p.current.column,
+    };
+}
+
 pub const ParseResult = union(enum) {
     ok: []*Node,
     err: ParseError,
@@ -194,6 +218,26 @@ pub const Parser = struct {
     /// `parseFunctionBody`. Drained (set to empty) on consumption. Built into a
     /// local list per param-list so nested function/arrow defaults can't clobber it.
     pending_param_prelude: []const *Node = &.{},
+    /// BoundNames of the FormalParameters just parsed, before the
+    /// default-parameter TDZ desugar renames them to `__arg_N`. Read by the
+    /// immediately-following `parseFunctionBody` to enforce §15.2.1: a
+    /// body-level `let`/`const` may not redeclare a parameter.
+    pending_param_names: []const []const u8 = &.{},
+    /// True when those FormalParameters bound the same name twice. Legal in a
+    /// sloppy, simple-parameter-list function declaration/expression, and an
+    /// early SyntaxError everywhere else — including when the body turns out to
+    /// carry a "use strict" prologue, which only `parseFunctionBody` can see.
+    pending_params_duplicate: bool = false,
+    /// Set by callers that parse UniqueFormalParameters (method definitions,
+    /// accessors, class constructors), where duplicate BoundNames are an early
+    /// SyntaxError regardless of strictness. Consumed by `parseFunctionParams`.
+    require_unique_params: bool = false,
+    /// [~In]: suppress `in` as a relational operator while parsing a `for` head's
+    /// variable initializer, where it separates the head from the enumerated
+    /// object instead (Annex B.3.5 `for (var a = 0 in obj)`). Saved/restored
+    /// around the initializer so a parenthesized or nested expression — which
+    /// re-enters the [+In] grammar — is unaffected.
+    no_in: bool = false,
     /// True when parsing direct/indirect `eval()` code. Eval code is a Script
     /// (sec-scripts §A.5), so `import`/`export` *declarations* are early
     /// SyntaxErrors — unlike the CJS-desugar bundle source run via parseScript,
@@ -506,6 +550,9 @@ pub const Parser = struct {
     pub fn parseModule(self: *Parser) ParseResult {
         self.is_module = true;
         self.strict = true; // §11.2.2: module code is always strict.
+        // Annex B.1.1 HTML-like comments are Script-only: `<!--` / `-->` in
+        // module code are ordinary punctuators, i.e. a SyntaxError.
+        self.lexer.allow_html_comments = false;
         var stmts = std.ArrayList(*Node){};
         const li_start = self.live_imports.items.len;
         const le_start = self.live_exports.items.len;

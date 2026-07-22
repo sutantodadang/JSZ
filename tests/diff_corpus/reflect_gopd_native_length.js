@@ -1,0 +1,1 @@
+var d = Reflect.getOwnPropertyDescriptor(Math.max, "length"); [d.value, d.writable, d.enumerable, d.configurable].join(",")

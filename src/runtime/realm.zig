@@ -3544,11 +3544,16 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
                 try src.appendSlice(arena, try rawToStr(arena, a));
             }
         }
-        try src.appendSlice(arena, "){");
+        // CreateDynamicFunction assembles exactly
+        // `<kind> anonymous(<P>\n) {\n<body>\n}` — the line terminators are
+        // load-bearing, not cosmetic: without them a trailing `//` or Annex B
+        // `<!--` in the parameter list or body would comment out the source's
+        // own closing `)` / `}`.
+        try src.appendSlice(arena, "\n) {\n");
         if (args.len > 0) {
             try src.appendSlice(arena, try rawToStr(arena, args[args.len - 1]));
         }
-        try src.appendSlice(arena, "})");
+        try src.appendSlice(arena, "\n})");
         // NewTarget [[Prototype]] override for dynamic generator/async-generator
         // functions (CreateDynamicFunction step 18: proto from newTarget's realm).
         // IMPORTANT: capture pending_new_target BEFORE evalSource/shadowEval, because
@@ -3672,6 +3677,31 @@ fn nativeFunctionToString(arena: std.mem.Allocator, this_val: Value, _: []const 
 pub fn nativeCreateRealm(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
     const ctx = active_context orelse return val_mod.makeUndefined(arena);
     return ctx.createRealm(arena);
+}
+
+// ---- Annex B.3.6: [[IsHTMLDDA]] ----
+/// `[[Call]]` for the `document.all` stand-in: returns null when invoked with no
+/// arguments, or with `""` as the *first* argument (test262 INTERPRETING.md).
+/// That is what makes `"".match(documentAll)` and `"".replace(documentAll)` —
+/// which pass the subject string as argument 0 — evaluate to null. Any other
+/// call yields undefined.
+fn nativeHTMLDDACall(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const empty_call = args.len == 0 or
+        (args[0].bits != 0 and args[0].unbox() == .string and args[0].toPtr().string.len == 0);
+    if (empty_call) return val_mod.makeNull(arena);
+    return val_mod.makeUndefined(arena);
+}
+
+/// Backing for `__jszMakeHTMLDDA__()`. Produces a fresh callable object carrying
+/// the [[IsHTMLDDA]] slot; the exotic `typeof`/ToBoolean/IsLooselyEqual behavior
+/// keys off `internal_kind`, and being an ordinary object means the usual
+/// property machinery (defineProperty, symbol keys) works on it unchanged.
+pub fn nativeMakeHTMLDDA(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    const proto: ?*JsObject = if (active_function_proto) |p| p else null;
+    const o = try JsObject.create(arena, proto);
+    o.internal_kind = .htmldda;
+    try o.set("__call__", try val_mod.makeNativeFunctionNamed(arena, nativeHTMLDDACall, "IsHTMLDDA", 0));
+    return val_mod.makeObject(arena, o);
 }
 
 /// Packed eval data for secondary realm evalScript native function.
@@ -4665,9 +4695,10 @@ pub const Realm = struct {
         if (active_sym_unscopables) |unsym| {
             const unsc_list = try JsObject.create(arena, null);
             const unsc_names = [_][]const u8{
-                "copyWithin", "entries",  "fill",       "find",     "findIndex",
-                "findLast",   "flat",     "flatMap",    "includes", "keys",
-                "toReversed", "toSorted", "toSpliced",  "values",   "findLastIndex",
+                "at",         "copyWithin", "entries",   "fill",     "find",
+                "findIndex",  "findLast",   "flat",      "flatMap",  "includes",
+                "keys",       "toReversed", "toSorted",  "toSpliced", "values",
+                "findLastIndex",
             };
             for (unsc_names) |nm| {
                 _ = try unsc_list.defineOwnData(nm, try val_mod.makeBool(arena, true), .{ .writable = true, .enumerable = true, .configurable = true });

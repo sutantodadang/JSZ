@@ -328,6 +328,8 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             continue;
         }
 
+        // A MethodDefinition takes UniqueFormalParameters (§15.4.1).
+        p.require_unique_params = true;
         const mparams = p.parseFunctionParams() orelse return null;
         const prev_gen = p.in_generator_function;
         p.in_generator_function = is_generator;
@@ -1547,6 +1549,36 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         if (!p.match(.comma)) break;
     }
     _ = p.expect(.right_paren) orelse return null;
+    // Duplicate BoundNames. Decided here, on the names as written: the TDZ
+    // desugar below rewrites them to `__arg_N`, and a destructuring parameter
+    // already carries a unique synthetic `__param_N`. A sloppy, simple
+    // parameter list of a function declaration/expression may repeat a name;
+    // UniqueFormalParameters (methods, accessors) and any non-simple list may
+    // not, and neither may strict code. A "use strict" prologue in the body is
+    // only visible later, so `parseFunctionBody` re-checks the saved flag.
+    const unique_required = p.require_unique_params;
+    p.require_unique_params = false;
+    var bound = std.ArrayList([]const u8){};
+    bound.appendSlice(p.arena, params.items) catch {
+        p.had_error = true;
+        return null;
+    };
+    if (rest_param) |r| bound.append(p.arena, r) catch {
+        p.had_error = true;
+        return null;
+    };
+    const simple = rest_param == null and param_prelude.items.len == 0 and blk: {
+        for (defaults.items) |d| {
+            if (d != null) break :blk false;
+        }
+        break :blk true;
+    };
+    p.pending_param_names = bound.items;
+    p.pending_params_duplicate = parser_file.hasDuplicateName(bound.items);
+    if (p.pending_params_duplicate and (unique_required or p.strict or !simple)) {
+        parser_file.rejectDuplicateParams(p);
+        return null;
+    }
     // TDZ for default parameters: a non-simple parameter list (one with a
     // default) puts every parameter in a TDZ until its own initializer, so a
     // default referencing a not-yet-initialized parameter is a ReferenceError
@@ -1603,6 +1635,12 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     // functions/arrows inside the body reuse the same staging field.
     const param_prelude = p.pending_param_prelude;
     p.pending_param_prelude = &.{};
+    // Same staging discipline as the prelude: a nested function/arrow in this
+    // body parses its own parameters and would otherwise overwrite these.
+    const param_names = p.pending_param_names;
+    const params_duplicate = p.pending_params_duplicate;
+    p.pending_param_names = &.{};
+    p.pending_params_duplicate = false;
     _ = p.expect(.left_brace) orelse return null;
     p.fn_nesting_depth += 1;
     // A function body is strict if it inherits strictness from the enclosing
@@ -1628,6 +1666,33 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
         p.drainExtraStmts(&body);
     }
     p.applyLiveBindings(body.items, li_start, le_start, la_start);
+    // §15.2.1: a "use strict" prologue makes the *whole* function strict, which
+    // retroactively outlaws a duplicate parameter name; and a body-level
+    // `let`/`const` may never redeclare a parameter (LexicallyDeclaredNames of
+    // the FunctionStatementList must be disjoint from BoundNames of the
+    // FormalParameters). Both are only decidable once the body has been read.
+    if (!p.had_error) {
+        if (params_duplicate and p.strict) {
+            parser_file.rejectDuplicateParams(p);
+        } else if (param_names.len > 0) {
+            for (body.items) |s| {
+                if (s.kind != .var_decl) continue;
+                const vd = s.data.var_decl;
+                if (vd.kind != .let and vd.kind != .const_) continue;
+                for (param_names) |pn| {
+                    if (!std.mem.eql(u8, pn, vd.name)) continue;
+                    p.had_error = true;
+                    p.error_info = parser_file.ParseError{
+                        .message = "lexical declaration cannot redeclare a parameter",
+                        .line = p.current.line,
+                        .column = p.current.column,
+                    };
+                    break;
+                }
+                if (p.had_error) break;
+            }
+        }
+    }
     p.strict = saved_strict;
     p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;

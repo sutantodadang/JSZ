@@ -162,7 +162,13 @@ fn requireObjectCoercible(arena: std.mem.Allocator, v: Value) anyerror!void {
 /// is present but not callable.
 fn getSymMethodOf(arena: std.mem.Allocator, v: Value, sym: Value) anyerror!?Value {
     if (v.bits == 0 or v.unbox() != .object) return null;
-    const m = v.toPtr().object.getSym(sym) orelse return null;
+    // GetMethod is defined in terms of [[Get]], so an accessor-backed @@match /
+    // @@replace / @@split must have its getter *invoked* (and its result used) —
+    // reading the raw slot would hand back the get/set holder object instead.
+    const m = if (realm_mod.active_context) |ctx|
+        try ctx.getPropSym(arena, v, sym)
+    else
+        v.toPtr().object.getSym(sym) orelse return null;
     if (m.bits == 0) return null;
     switch (m.unbox()) {
         .undefined_, .null_ => return null,
@@ -769,7 +775,10 @@ fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .bc_function, .native_function => true,
-        .object => |obj| obj.internal_kind == .bound_function,
+        // A built-in constructor object (and the Annex B `document.all` stand-in)
+        // keeps its [[Call]] behind the `__call__` slot; `invokeCallback` routes
+        // both through the VM, so IsCallable has to agree.
+        .object => |obj| obj.internal_kind == .bound_function or obj.get("__call__") != null,
         else => false,
     };
 }

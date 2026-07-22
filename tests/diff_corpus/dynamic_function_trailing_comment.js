@@ -1,0 +1,1 @@
+Function("a", "return a //trailing line comment")(7)

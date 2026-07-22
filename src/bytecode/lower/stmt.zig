@@ -907,6 +907,10 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             // head is an AssignmentPattern (or member target) with no declaration.
             // Assign each iteration's value into it via the destructuring helper.
             .array_literal, .object_literal, .member_expr => try self.compileDestructure(fo.left, rval, line),
+            // `for (f() of it)`: Annex B parses it, and assigning to the call's
+            // result is a runtime ReferenceError once the loop actually reaches
+            // the binding step.
+            .call_expr => _ = try self.emitCallTargetRefError(fo.left, line),
             else => {},
         }
         self.sp = iter_sp;
@@ -985,8 +989,24 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     //     ri++
     //     jmp loop
     const fi = node.data.for_in_stmt;
+    // A directly-enclosing label (consumed here) lets `break L`/`continue L`
+    // target this for-in loop.
+    const loop_lbl = self.pending_label;
+    self.pending_label = null;
     // Save sp; allocate rkeys, ri, rlen as a contiguous block.
     const base_sp = self.sp;
+    const outer_depth = self.block_scope_depth;
+    // Annex B.3.5: a `var` for-in head may carry an initializer, which is
+    // evaluated and assigned to the binding *before* the enumerated object
+    // (`for (var a = 0 in stored = a, {})` leaves `stored` at 0).
+    if (fi.left.kind == .var_decl) {
+        const vd = fi.left.data.var_decl;
+        if (vd.init) |init_expr| {
+            const rinit = try self.compileExpr(init_expr);
+            try self.emitStore(vd.name, rinit, line);
+            self.sp = base_sp;
+        }
+    }
     // Evaluate object into a temp register.
     const robj_tmp = try self.compileExpr(fi.right);
     // Allocate permanent registers: rkeys, ri, rlen.
@@ -1037,6 +1057,19 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     try self.emitU8(rkeys);
     try self.emitU8(ri);
 
+    // A `let`/`const` for-in binding is fresh per iteration (closures created in
+    // the body capture a distinct binding each pass), and is scoped to the loop
+    // rather than the enclosing block. Wrap each iteration's binding + body in
+    // its own block scope — the same shape the for-of path above uses.
+    const is_lexical_loopvar = fi.left.kind == .var_decl and
+        fi.left.data.var_decl.name.len > 0 and
+        (fi.left.data.var_decl.kind == .let or fi.left.data.var_decl.kind == .const_);
+    if (is_lexical_loopvar) {
+        try self.emitOp(.ENTER_SCOPE, line);
+        self.block_scope_depth += 1;
+        try self.emitHoistLexical(fi.left.data.var_decl.name, line);
+    }
+
     // assign loop variable = rkey
     // fi.left is either var_decl (var k) or an identifier expr
     switch (fi.left.kind) {
@@ -1062,12 +1095,32 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
             try self.emitU8(@intCast((name_idx >> 8) & 0xFF));
             try self.emitU8(rkey);
         },
+        // `for (f() in o)`: same Annex B runtime ReferenceError as for-of.
+        .call_expr => _ = try self.emitCallTargetRefError(fi.left, line),
         else => {},
     }
     self.freeReg(); // free rkey
 
+    // Register the loop so `break`/`continue` (labeled or innermost) resolve to
+    // it. scope_depth is the depth *outside* the per-iteration scope, so both
+    // unwind it before jumping.
+    try self.loop_stack.append(self.arena, LoopCtx{
+        .label = loop_lbl,
+        .scope_depth = outer_depth,
+        .finally_depth = self.finally_stack.items.len,
+        .continue_finally_depth = self.finally_stack.items.len,
+    });
+
     // body
     try self.compileStmt(fi.body, last_expr_reg);
+
+    if (is_lexical_loopvar) {
+        try self.emitOp(.EXIT_SCOPE, line);
+        self.block_scope_depth -= 1;
+    }
+
+    // `continue` lands here: advance to the next key, then re-test.
+    const continue_offset = self.currentOffset();
 
     // ri++
     const rone = self.allocReg();
@@ -1088,7 +1141,9 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     self.patchJump(back_offset, loop_start);
 
     // patch exit
-    self.patchJump(patch_exit, self.currentOffset());
+    const exit_offset = self.currentOffset();
+    self.patchJump(patch_exit, exit_offset);
+    self.resolveLoop(continue_offset, exit_offset);
 
     // restore sp to base_sp (free rlen, ri, rkeys, robj_tmp)
     self.sp = base_sp;
@@ -1104,6 +1159,27 @@ pub fn lowerSwitchStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
     // switch whose selected clauses produce nothing completes with `undefined`
     // rather than leaving the enclosing script's running value in place.
     try self.resetCompletion(line);
+
+    // §14.12.4 CaseBlockEvaluation: the whole case block is ONE declarative
+    // environment shared by every clause, created after the discriminant is
+    // evaluated and before any CaseClause selector runs. Its `let`/`const` and
+    // its function declarations are instantiated here, exactly as for a block.
+    var lex_names: std.ArrayList([]const u8) = .empty;
+    var fn_decls: std.ArrayList(*Node) = .empty;
+    for (sw.cases) |case| {
+        for (case.body) |child| {
+            try self.collectLexicalNames(child, &lex_names);
+            if (child.kind == .function_decl) try fn_decls.append(self.arena, child);
+        }
+    }
+    const has_scope = lex_names.items.len > 0 or fn_decls.items.len > 0;
+    if (has_scope) {
+        try self.emitOp(.ENTER_SCOPE, line);
+        self.block_scope_depth += 1;
+        for (lex_names.items) |nm| try self.emitHoistLexical(nm, line);
+        var fd_reg: ?u8 = null;
+        for (fn_decls.items) |fd| try lowerBlockFunctionDecl(self, fd, &fd_reg);
+    }
 
     // We'll collect patch offsets for end-of-switch breaks.
     // Each case that matches jumps to its body.
@@ -1177,6 +1253,13 @@ pub fn lowerSwitchStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
             }
         }
         for (case.body) |stmt| {
+            // Already instantiated at case-block entry above. Reaching the
+            // declaration is where Annex B.3.3 copies its value out to the var
+            // scope (see lowerBlockStmt).
+            if (has_scope and stmt.kind == .function_decl) {
+                try self.emitAnnexBSync(stmt, stmt.start);
+                continue;
+            }
             try self.compileStmt(stmt, last_expr_reg);
         }
     }
@@ -1193,6 +1276,11 @@ pub fn lowerSwitchStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
     for (ctx.break_patches.items) |bp| self.patchJump(bp, end_offset);
     ctx.break_patches.deinit(self.arena);
     ctx.continue_patches.deinit(self.arena);
+
+    if (has_scope) {
+        try self.emitOp(.EXIT_SCOPE, line);
+        self.block_scope_depth -= 1;
+    }
 }
 
 pub fn lowerLabeledStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {

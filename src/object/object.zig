@@ -103,7 +103,7 @@ pub const JsObject = struct {
     /// Arena-allocated; MUST NOT be traversed by markObject.
     internal_slot: ?*anyopaque = null,
     /// Phase 4c/4d: discriminator for internal_slot type.
-    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, weakref, finalization_registry, promise, generator, async_generator, return_completion, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function, mapped_arguments, map_iterator, set_iterator, array_iterator, iterator_helper, temporal_instant, temporal_duration, temporal_plain_date, temporal_plain_time, temporal_plain_date_time, temporal_zoned_date_time, temporal_plain_year_month, temporal_plain_month_day, promise_resolver, disposable_stack, async_disposable_stack } = .none,
+    internal_kind: enum(u8) { none, regexp, bound_function, date, map, set, weakmap, weakset, weakref, finalization_registry, promise, generator, async_generator, return_completion, proxy, array_buffer, typed_array, data_view, shared_array_buffer, module_namespace, shadow_realm, wrapped_function, mapped_arguments, map_iterator, set_iterator, array_iterator, iterator_helper, temporal_instant, temporal_duration, temporal_plain_date, temporal_plain_time, temporal_plain_date_time, temporal_zoned_date_time, temporal_plain_year_month, temporal_plain_month_day, promise_resolver, disposable_stack, async_disposable_stack, htmldda } = .none,
     /// Back-pointer (opaque `*BcClosure`) when this object is the lazily-created
     /// backing store for a bytecode function's own properties. A function is one
     /// ECMAScript object, but jsz splits it across two representations — the
@@ -854,11 +854,17 @@ pub const JsObject = struct {
     }
 
     /// If own `key` is an accessor, return the holder Value (boxing get/set).
+    /// The holder is always an object with `get`/`set` members; a slot flagged
+    /// as an accessor but carrying anything else is malformed, and reporting it
+    /// as an accessor would hand every caller a value they unconditionally
+    /// dereference as an object.
     pub fn ownAccessorHolder(self: *JsObject, key: []const u8) ?Value {
         const slot = self.shape.key_to_slot.get(key) orelse return null;
         if (slot >= self.attrs.items.len or !self.attrs.items[slot].is_accessor) return null;
         if (slot >= self.slots.items.len) return null;
-        return self.slots.items[slot];
+        const holder = self.slots.items[slot];
+        if (holder.bits == 0 or holder.unbox() != .object) return null;
+        return holder;
     }
 
     /// Attribute bits at a resolved own slot.
@@ -1002,6 +1008,8 @@ pub const JsObject = struct {
         for (self.sym_props.items) |sp| {
             if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
                 if (!sp.attr.is_accessor) return null;
+                // Same well-formedness guard as the string-keyed path above.
+                if (sp.value.bits == 0 or sp.value.unbox() != .object) return null;
                 return sp.value;
             }
         }

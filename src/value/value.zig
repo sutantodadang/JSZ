@@ -134,8 +134,21 @@ pub fn toBoolean(v: Value) bool {
         .number => |n| n != 0.0 and !std.math.isNan(n),
         .string => |s| s.len > 0,
         .bigint => |b| !b.toConst().eqlZero(),
+        // Annex B.3.6: an object with an [[IsHTMLDDA]] internal slot (the host's
+        // `document.all`) is falsy, so `if (document.all)` picks the
+        // no-document.all branch on engines that still provide it.
+        .object => |o| o.internal_kind != .htmldda,
         else => true,
     };
+}
+
+/// True for the host-provided `document.all` stand-in: an object that emulates
+/// `undefined` in `typeof`, ToBoolean and IsLooselyEqual (Annex B.3.6), while
+/// still being an ordinary callable object everywhere else.
+pub fn isHTMLDDA(v: Value) bool {
+    if (v.bits == 0) return false;
+    if (v.unbox() != .object) return false;
+    return v.toPtr().object.internal_kind == .htmldda;
 }
 
 /// ES StrWhiteSpace trim for StringToBigInt/ToNumber. Beyond ASCII whitespace the

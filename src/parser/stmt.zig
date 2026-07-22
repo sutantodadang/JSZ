@@ -990,7 +990,27 @@ pub fn parseForStmt(p: *Parser) ?*Node {
                 // Handle initializer if present
                 var init_val: ?*Node = null;
                 if (p.match(.eq)) {
+                    // [~In]: `in` here separates the head from the enumerated
+                    // object, so it must not be consumed as an operator.
+                    p.no_in = true;
                     init_val = p.parseAssignmentExpr();
+                    p.no_in = false;
+                }
+                // Annex B.3.5: a `var` for-in head may carry an initializer
+                // (`for (var a = 0 in obj)`). It is evaluated once, before the
+                // enumerated object, and assigned to the binding; the loop then
+                // proceeds as an ordinary for-in.
+                if (init_val != null and decl_kind == .var_ and p.check(.kw_in)) {
+                    _ = p.advance(); // consume `in`
+                    const right = p.parseExpression() orelse return null;
+                    _ = p.expect(.right_paren) orelse return null;
+                    const body = p.parseStatement() orelse return null;
+                    const left = p.makeNode(.var_decl, name_tok.start, name_tok.end, .{
+                        .var_decl = .{ .kind = .var_, .name = name_tok.value_str, .init = init_val },
+                    }) orelse return null;
+                    return p.makeNode(.for_in_stmt, start, p.current.start, .{
+                        .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = false },
+                    });
                 }
                 if (decl_kind == .const_ and init_val == null) {
                     if (!p.had_error) {

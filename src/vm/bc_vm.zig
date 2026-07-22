@@ -2345,6 +2345,12 @@ pub const BcVm = struct {
     /// `Symbol.toPrimitive`/`valueOf`/`toString` — then re-compared. Everything
     /// else delegates to the pure `jsAbstractEqual`.
     pub fn abstractEqual(self: *BcVm, x: Value, y: Value) anyerror!bool {
+        // Annex B.3.6 adds exactly two clauses to IsLooselyEqual: an
+        // [[IsHTMLDDA]] object is equal to `undefined` and to `null`. Every
+        // other pairing (including against a string or number) keeps the
+        // ordinary ToPrimitive path below.
+        if (val_mod.isHTMLDDA(x) and isNullish(y)) return true;
+        if (val_mod.isHTMLDDA(y) and isNullish(x)) return true;
         const x_obj = isObjectOperand(x);
         const y_obj = isObjectOperand(y);
         if (x_obj and !y_obj) {
@@ -4922,6 +4928,12 @@ pub fn classifyTypeof(v: Value) struct {
         .bigint => .{ .tag = .bigint, .shape = null, .result = "bigint" },
         .function, .bc_function, .native_function => .{ .tag = .function_like, .shape = null, .result = "function" },
         .object => |obj| blk: {
+            // Annex B.3.6: `typeof document.all` is "undefined". Classify it
+            // exactly as a real `undefined` (tag + null shape) rather than as a
+            // shape-keyed object, so the per-site cache can never serve this
+            // answer to an ordinary object that happens to share its shape.
+            if (obj.internal_kind == .htmldda)
+                break :blk .{ .tag = .undefined_, .shape = null, .result = "undefined" };
             const callable = isCallableValue(v);
             break :blk .{
                 .tag = if (callable) .function_like else .object_like,
@@ -4972,7 +4984,7 @@ pub fn typeofValue(v: Value) []const u8 {
         .symbol => "symbol",
         .function => "function",
         .bc_function => "function",
-        .object => if (isCallableValue(v)) "function" else "object",
+        .object => if (val_mod.isHTMLDDA(v)) "undefined" else if (isCallableValue(v)) "function" else "object",
         .native_function => "function",
         .bigint => "bigint",
     };
@@ -5155,14 +5167,25 @@ fn bigIntEqualsString(arena: std.mem.Allocator, big: Value, s: []const u8) bool 
     return val_mod.bigIntEql(big, yb);
 }
 
+fn isNullish(v: Value) bool {
+    if (v.bits == 0) return true;
+    return switch (v.unbox()) {
+        .null_, .undefined_ => true,
+        else => false,
+    };
+}
+
 pub fn jsAbstractEqual(x: Value, y: Value) bool {
     const tx = typeTag(x);
     const ty = typeTag(y);
     if (tx == ty) return jsStrictEqual(x, y);
     // `null` and `undefined` are loosely equal only to each other — never to a
     // boolean, number, or string (e.g. `null == false` is false).
-    const x_nullish = tx == .null_ or tx == .undefined_;
-    const y_nullish = ty == .null_ or ty == .undefined_;
+    // Annex B.3.6: an [[IsHTMLDDA]] object is loosely equal to both `null` and
+    // `undefined` (and to nothing else they are equal to). Checked before the
+    // nullish rule so the object side satisfies it.
+    const x_nullish = tx == .null_ or tx == .undefined_ or val_mod.isHTMLDDA(x);
+    const y_nullish = ty == .null_ or ty == .undefined_ or val_mod.isHTMLDDA(y);
     if (x_nullish or y_nullish) return x_nullish and y_nullish;
     if (tx == .number and ty == .string) return toNumber(x) == toNumber(y);
     if (tx == .string and ty == .number) return toNumber(x) == toNumber(y);
