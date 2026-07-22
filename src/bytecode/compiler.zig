@@ -1800,7 +1800,12 @@ pub const FnCompiler = struct {
             const kidx = try self.addConstant(sv);
             // Class-desugar private-element installation: create the element
             // rather than requiring an existing one (PrivateFieldAdd).
-            try self.emitOp(if (me.private_define) .DEFINE_PRIVATE else .SET_PROP, line);
+            try self.emitOp(if (me.private_define)
+                .DEFINE_PRIVATE
+            else if (me.define_data)
+                .DEFINE_DATA
+            else
+                .SET_PROP, line);
             try self.emitU8(robj);
             try self.emitU16(kidx);
             try self.emitU8(rval);
@@ -1831,7 +1836,7 @@ pub const FnCompiler = struct {
                 return;
             }
             const rkey = try self.compileExpr(me.property);
-            try self.emitOp(.SET_PROP_DYN, line);
+            try self.emitOp(if (me.define_data) .DEFINE_DATA_DYN else .SET_PROP_DYN, line);
             try self.emitU8(robj);
             try self.emitU8(rkey);
             try self.emitU8(rval);
@@ -1877,7 +1882,9 @@ pub const FnCompiler = struct {
                 const rkey = try self.compileExpr(key_node);
                 const rval = try self.compileExpr(prop.value);
                 if (prop.kind == .init) {
-                    try self.emitOp(.SET_PROP_DYN, line);
+                    // PropertyDefinitionEvaluation is CreateDataPropertyOrThrow,
+                    // so an inherited setter on Object.prototype never runs.
+                    try self.emitOp(.DEFINE_DATA_DYN, line);
                     try self.emitU8(robj);
                     try self.emitU8(rkey);
                     try self.emitU8(rval);
@@ -1902,7 +1909,9 @@ pub const FnCompiler = struct {
             const sv = try val_mod.makeString(self.arena, prop.key);
             const kidx = try self.addConstant(sv);
             if (prop.kind == .init) {
-                try self.emitOp(.SET_PROP, line);
+                // `__proto__: v` is not a property definition at all — it sets
+                // [[Prototype]] — so it keeps the ordinary [[Set]] path.
+                try self.emitOp(if (std.mem.eql(u8, prop.key, "__proto__")) .SET_PROP else .DEFINE_DATA, line);
                 try self.emitU8(robj);
                 try self.emitU16(kidx);
                 try self.emitU8(rval);

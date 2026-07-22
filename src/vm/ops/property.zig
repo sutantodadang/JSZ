@@ -409,6 +409,101 @@ pub inline fn opDefinePrivate(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+/// The object a define targets: a class constructor is a `bc_function`, whose
+/// properties live on its backing object.
+fn defineTarget(self: *BcVm, obj_val: val_mod.Value) !?*@import("../../object/object.zig").JsObject {
+    if (obj_val.bits == 0) return null;
+    return switch (obj_val.unbox()) {
+        .object => |o| o,
+        .bc_function => blk: {
+            const realm_mod = @import("../../runtime/realm.zig");
+            const ctx = realm_mod.active_context orelse break :blk null;
+            break :blk try ctx.backingObject(self.arena, obj_val);
+        },
+        else => null,
+    };
+}
+
+fn createDataThrow(self: *BcVm) !?RunOutcome {
+    const exc = try self.makeErrorObjectBc("TypeError", "Cannot define property");
+    self.last_exception_value = exc;
+    const found = try self.throwException(exc);
+    if (!found) {
+        const exc_msg = try bcv.formatExceptionMessage(self.arena, exc);
+        return RunOutcome{ .exception_value = .{ .msg = exc_msg, .value = exc } };
+    }
+    return null;
+}
+
+/// DEFINE_DATA — CreateDataPropertyOrThrow with a constant key. Object-literal
+/// data properties and class fields *define*; they must not run a setter
+/// inherited from Object.prototype, and a rejected definition (a frozen or
+/// non-extensible target) is a TypeError.
+pub inline fn opDefineData(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const robj = code[frame.pc];
+    frame.pc += 1;
+    const lo = code[frame.pc];
+    frame.pc += 1;
+    const hi = code[frame.pc];
+    frame.pc += 1;
+    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+    const rval = code[frame.pc];
+    frame.pc += 1;
+    const key = frame.func.chunk.constants[kidx].toPtr().string;
+    const obj = (try defineTarget(self, frame.registers[robj])) orelse return null;
+    const ok = obj.defineOwnData(key, frame.registers[rval], .{
+        .writable = true,
+        .enumerable = true,
+        .configurable = true,
+    }) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error defining property")) |oc| return oc;
+        return null;
+    };
+    if (!ok) return createDataThrow(self);
+    return null;
+}
+
+/// DEFINE_DATA_DYN — CreateDataPropertyOrThrow with a runtime key.
+pub inline fn opDefineDataDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const robj = code[frame.pc];
+    frame.pc += 1;
+    const rkey = code[frame.pc];
+    frame.pc += 1;
+    const rval = code[frame.pc];
+    frame.pc += 1;
+    const key_val = frame.registers[rkey];
+    const val = frame.registers[rval];
+    const obj = (try defineTarget(self, frame.registers[robj])) orelse return null;
+    if (key_val.bits != 0 and key_val.unbox() == .symbol) {
+        const sym_ok = obj.defineOwnDataSym(key_val, val, .{
+            .writable = true,
+            .enumerable = true,
+            .configurable = true,
+        }) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error defining property")) |oc| return oc;
+            return null;
+        };
+        if (!sym_ok) return createDataThrow(self);
+        return null;
+    }
+    const key = try bcv.valueToStringArena(self.arena, key_val);
+    const ok = obj.defineOwnData(key, val, .{
+        .writable = true,
+        .enumerable = true,
+        .configurable = true,
+    }) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error defining property")) |oc| return oc;
+        return null;
+    };
+    if (!ok) return createDataThrow(self);
+    return null;
+}
+
 pub inline fn opSetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const site_pc = frame.pc - 1;

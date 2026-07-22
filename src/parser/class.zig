@@ -395,6 +395,9 @@ fn markPrivateDefine(n: *Node, is_method: bool) *Node {
     {
         n.data.member_expr.private_define = true;
         n.data.member_expr.private_method = is_method;
+    } else if (n.kind == .member_expr and !is_method) {
+        // A public field is DefineField: CreateDataPropertyOrThrow, not [[Set]].
+        n.data.member_expr.define_data = true;
     }
     return n;
 }

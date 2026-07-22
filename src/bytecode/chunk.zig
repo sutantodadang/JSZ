@@ -481,7 +481,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
                 try writer.print(" R{d} = R{d}[K{d}]", .{ rdst, robj, kidx });
             }
         },
-        .SET_PROP_DYN => {
+        .SET_PROP_DYN, .DEFINE_DATA_DYN => {
             const robj = code[new_pc];
             new_pc += 1;
             const rkey = code[new_pc];
@@ -489,6 +489,18 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const rval = code[new_pc];
             new_pc += 1;
             try writer.print(" R{d}[R{d}] = R{d}", .{ robj, rkey, rval });
+        },
+        .DEFINE_DATA => {
+            const robj = code[new_pc];
+            new_pc += 1;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
+            const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+            const rval = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d}[K{d}] = R{d}", .{ robj, kidx, rval });
         },
         .GET_PROP_DYN => {
             const rdst = code[new_pc];

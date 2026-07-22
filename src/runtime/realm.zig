@@ -5062,6 +5062,10 @@ pub const Realm = struct {
             _ = try intl_obj.defineOwnData("getCanonicalLocales", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeGetCanonicalLocales, "getCanonicalLocales", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             // Intl.supportedValuesOf (static)
             _ = try intl_obj.defineOwnData("supportedValuesOf", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeSupportedValuesOf, "supportedValuesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
+            // §8.1.1: the Intl namespace object's own @@toStringTag is "Intl",
+            // so `Object.prototype.toString.call(Intl)` is "[object Intl]".
+            if (active_sym_to_string_tag) |tag_sym|
+                _ = try intl_obj.defineOwnDataSym(tag_sym, try val_mod.makeString(arena, "Intl"), .{ .writable = false, .enumerable = false, .configurable = true });
             try env.define("Intl", try val_mod.makeObject(arena, intl_obj));
         }
 
