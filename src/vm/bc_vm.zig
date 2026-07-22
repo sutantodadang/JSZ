@@ -2040,15 +2040,21 @@ pub const BcVm = struct {
     /// Set a symbol-keyed own property. Functions are objects: a bc_function
     /// stores symbol props on its backing object (e.g. `fn[Symbol.iterator]=…`).
     pub fn setPropSym(self: *BcVm, obj_val: Value, sym_key: Value, value: Value) !void {
-        if (obj_val.bits == 0) return;
+        _ = try self.setPropSymChecked(obj_val, sym_key, value);
+    }
+
+    /// OrdinarySet with a symbol key, reporting success so a strict-mode store
+    /// can throw. False means the write was rejected (non-writable own property,
+    /// setter-less accessor, or a new property on a non-extensible object).
+    pub fn setPropSymChecked(self: *BcVm, obj_val: Value, sym_key: Value, value: Value) !bool {
+        if (obj_val.bits == 0) return true;
         const obj = switch (obj_val.unbox()) {
             .object => |o| o,
             .bc_function => |c| try self.closureBackingObj(c),
-            else => return,
+            else => return true,
         };
         if (obj.internal_kind == .proxy) {
-            _ = try self.proxySet(obj_val, obj, sym_key, value, obj_val);
-            return;
+            return try self.proxySet(obj_val, obj, sym_key, value, obj_val);
         }
         // M16: Module Namespace exotic [[Set]] always fails.
         if (obj.internal_kind == .module_namespace) {
@@ -2065,22 +2071,24 @@ pub const BcVm = struct {
             if (depth >= 64) break;
             depth += 1;
             if (o.internal_kind == .proxy and o != obj) {
-                _ = try self.proxySet(obj_val, o, sym_key, value, obj_val);
-                return;
+                return try self.proxySet(obj_val, o, sym_key, value, obj_val);
             }
             if (o.getOwnSymEntry(sym_key)) |sp| {
                 if (sp.attr.is_accessor) {
                     const setter = accessorMember(sp.value, "set");
-                    if (isCallable(setter)) _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
-                    return;
+                    if (!isCallable(setter)) return false; // accessor with no setter
+                    _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
+                    return true;
                 }
+                // An inherited non-writable data property also blocks the write.
+                if (o != obj and !sp.attr.writable) return false;
                 // A data property found on `obj` itself is overwritten in place;
                 // one inherited from a prototype is shadowed by a new own property.
                 break;
             }
             cur = o.proto;
         }
-        try obj.setSym(sym_key, value);
+        return obj.setSymChecked(sym_key, value);
     }
 
     /// Proxy `get` trap dispatch: `handler.get(target, key, receiver)`, falling

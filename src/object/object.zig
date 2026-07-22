@@ -925,15 +925,40 @@ pub const JsObject = struct {
 
     /// Set/upsert an own symbol-keyed property. Honors writable / extensible.
     pub fn setSym(self: *JsObject, sym_key: Value, value: Value) !void {
-        return self.setSymAttr(sym_key, value, .{});
+        _ = try self.setSymChecked(sym_key, value);
     }
 
+    /// OrdinarySet for a symbol key: returns false when the write is rejected
+    /// (existing non-writable property, or a new property on a non-extensible
+    /// object) so a strict-mode store can raise the required TypeError.
+    /// Overwriting an existing data property changes only [[Value]] — the
+    /// attributes are NOT reset to the defaults (which would silently un-seal a
+    /// sealed property).
+    pub fn setSymChecked(self: *JsObject, sym_key: Value, value: Value) !bool {
+        if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return false;
+        const target = sym_key.toPtr().symbol;
+        for (self.sym_props.items) |*sp| {
+            if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
+                if (!sp.attr.writable) return false;
+                sp.value = value;
+                self.gcWrite(value);
+                return true;
+            }
+        }
+        if (!self.extensible) return false;
+        try self.sym_props.append(self.arena, .{ .key = sym_key, .value = value, .attr = .{} });
+        self.gcWrite(value);
+        return true;
+    }
+
+    /// CreateDataProperty/DefineOwnProperty for a symbol key: sets value AND
+    /// attributes (used by object literals, class members and defineProperty).
     pub fn setSymAttr(self: *JsObject, sym_key: Value, value: Value, attr: PropAttr) !void {
         if (sym_key.bits == 0 or sym_key.unbox() != .symbol) return;
         const target = sym_key.toPtr().symbol;
         for (self.sym_props.items) |*sp| {
             if (sp.key.bits != 0 and sp.key.unbox() == .symbol and sp.key.toPtr().symbol == target) {
-                if (!sp.attr.writable) return;
+                if (!sp.attr.writable and !sp.attr.configurable) return;
                 sp.value = value;
                 sp.attr = attr;
                 self.gcWrite(value);

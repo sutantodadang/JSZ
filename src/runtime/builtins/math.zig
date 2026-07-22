@@ -30,7 +30,6 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     }
     // Functions
     const func_fns = .{
-        .{ "abs", nativeAbs },
         .{ "floor", nativeFloor },
         .{ "ceil", nativeCeil },
         .{ "round", nativeRound },
@@ -68,6 +67,9 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     inline for (func_fns) |pair| {
         try math_obj.set(pair[0], try val_mod.makeNativeFunctionNamed(arena, pair[1], pair[0], 0));
     }
+    // `abs` is registered explicitly: the by-name length table is shared with
+    // Temporal.Duration.prototype.abs, whose length is 0.
+    try math_obj.set("abs", try val_mod.makeNativeFunctionNamedLen(arena, nativeAbs, "abs", 1));
     // Math.min/max spec `.length` is 2. Named explicitly: the plain *Len
     // constructor leaves `.name` unset, which reports "" instead of "min"/"max".
     try math_obj.set("min", try val_mod.makeNativeFunctionNamedLen(arena, nativeMin, "min", 2));

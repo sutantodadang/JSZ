@@ -444,11 +444,15 @@ pub inline fn opSetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             }
         }
     } else if (key_val.bits != 0 and key_val.unbox() == .symbol) {
-        self.setPropSym(obj_val, key_val, val) catch |e| {
+        const sym_ok = self.setPropSymChecked(obj_val, key_val, val) catch |e| {
             if (e != error.JsException) return e;
             if (try self.raisePendingException("error in setter")) |oc| return oc;
             return null;
         };
+        if (!sym_ok and frame.func.is_strict) {
+            if (try strictAssignThrow(self)) |oc| return oc;
+            return null;
+        }
     } else {
         // Numeric index on a dense array: store by integer index, no key string.
         // For a real Array, [[Set]] bottoms out in the same ordinary element

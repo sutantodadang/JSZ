@@ -49,6 +49,51 @@ fn sameValue(x: Value, y: Value) bool {
 }
 
 /// Object.keys(o): returns array of own enumerable string property names.
+/// EnumerableOwnProperties(O, kind) — §7.3.24 — for a Proxy receiver. Every step
+/// is observable: [[OwnPropertyKeys]], then [[GetOwnProperty]] per key to filter
+/// on [[Enumerable]], then [[Get]] for the value kinds. Returns null when `obj`
+/// is not a Proxy, so ordinary objects keep their direct property-table walk.
+fn proxyEnumerableOwnProperties(
+    arena: std.mem.Allocator,
+    target: Value,
+    obj: *JsObject,
+    kind: enum { key, value, key_value },
+) anyerror!?Value {
+    if (obj.internal_kind != .proxy) return null;
+    const realm_mod = @import("../realm.zig");
+    const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
+    const arr = try JsObject.createArray(arena, arr_proto);
+    const keys = (try proxy_mod.proxyOwnKeys(arena, obj)) orelse &[_]Value{};
+    var i: u32 = 0;
+    for (keys) |kv| {
+        // Symbol keys never appear in keys/values/entries.
+        if (!(kv.bits != 0 and kv.unbox() == .string)) continue;
+        const desc = try nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ target, kv });
+        if (desc.bits == 0 or desc.unbox() != .object) continue;
+        const enumerable = desc.toPtr().object.get("enumerable") orelse Value{};
+        if (!val_mod.toBoolean(enumerable)) continue;
+        const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        i += 1;
+        if (kind == .key) {
+            try arr.set(idx_key, kv);
+            continue;
+        }
+        const ctx = realm_mod.active_context orelse return throwTypeError(arena, "no active context");
+        const v = try ctx.getProp(arena, target, try realm_mod.stringPrimitive(arena, kv));
+        if (kind == .value) {
+            try arr.set(idx_key, v);
+        } else {
+            const pair = try JsObject.createArray(arena, arr_proto);
+            try pair.set("0", kv);
+            try pair.set("1", v);
+            pair.array_length = 2;
+            try arr.set(idx_key, try val_mod.makeObject(arena, pair));
+        }
+    }
+    arr.array_length = i;
+    return @as(?Value, try val_mod.makeObject(arena, arr));
+}
+
 pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
@@ -93,21 +138,7 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
         return val_mod.makeObject(arena, arr);
     }
 
-    // Proxy: ownKeys trap (string keys only for Object.keys).
-    if (obj.internal_kind == .proxy) {
-        if (try proxy_mod.proxyOwnKeys(arena, obj)) |keys| {
-            var pi: u32 = 0;
-            for (keys) |kv| {
-                if (kv.bits != 0 and kv.unbox() == .string) {
-                    const idx_key = try std.fmt.allocPrint(arena, "{d}", .{pi});
-                    try arr.set(idx_key, kv);
-                    pi += 1;
-                }
-            }
-            arr.array_length = pi;
-        }
-        return val_mod.makeObject(arena, arr);
-    }
+    if (try proxyEnumerableOwnProperties(arena, input, obj, .key)) |r| return r;
 
     // M15: TypedArray integer indices (all enumerable per spec).
     var ta_key_count: u32 = 0;
@@ -190,6 +221,8 @@ pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Valu
         arr.array_length = 0;
         return val_mod.makeObject(arena, arr);
     };
+
+    if (try proxyEnumerableOwnProperties(arena, input, obj, .value)) |r| return r;
 
     // M15: TypedArray integer-indexed element values come first (all enumerable).
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
@@ -352,6 +385,8 @@ pub fn nativeObjectEntries(arena: std.mem.Allocator, _: Value, args: []const Val
         arr.array_length = 0;
         return val_mod.makeObject(arena, arr);
     };
+
+    if (try proxyEnumerableOwnProperties(arena, input, obj, .key_value)) |r| return r;
 
     // M15: TypedArray integer-indexed [index, value] pairs come first.
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {

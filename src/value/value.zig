@@ -302,6 +302,45 @@ pub fn bigIntBitNot(arena: std.mem.Allocator, v: Value) !Value {
     return makeBigInt(arena, t.toConst());
 }
 
+/// BigInt.asIntN / BigInt.asUintN core: reduce `v` modulo 2**bits, then (when
+/// `signed`) reinterpret the top bit as a sign. `v` must be `.bigint`.
+/// Returns error.Overflow when the result would need an unreasonable number of
+/// limbs (a huge `bits` with a negative operand), which the caller reports as a
+/// RangeError — the same escape hatch V8 uses.
+pub fn bigIntAsIntN(arena: std.mem.Allocator, v: Value, bits: u64, signed: bool) !Value {
+    const c = v.toPtr().bigint.toConst();
+    if (bits == 0 or c.eqlZero()) return makeBigIntFromI64(arena, 0);
+    // Fast path: the value already fits in `bits` two's-complement bits, so the
+    // modulo is the identity. Also the only way a huge `bits` stays tractable.
+    const magnitude_bits = c.bitCountAbs();
+    const fits = if (c.positive)
+        (if (signed) magnitude_bits < bits else magnitude_bits <= bits)
+    else
+        (signed and c.bitCountTwosComp() <= bits);
+    if (fits) return v;
+    if (bits > 1 << 24) return error.Overflow; // ~2 MiB of limbs; refuse politely
+
+    const nbits: usize = @intCast(bits);
+    var one = try std.math.big.int.Managed.initSet(arena, 1);
+    var modulus = try std.math.big.int.Managed.init(arena);
+    try modulus.shiftLeft(&one, nbits);
+    var val = try c.toManaged(arena);
+    var q = try std.math.big.int.Managed.init(arena);
+    var r = try std.math.big.int.Managed.init(arena);
+    // Floored division: the remainder takes the divisor's (positive) sign, so
+    // `r` lands in [0, 2**bits) exactly like the spec's `modulo`.
+    try q.divFloor(&r, &val, &modulus);
+    if (!signed) return makeBigInt(arena, r.toConst());
+    var half = try std.math.big.int.Managed.init(arena);
+    try half.shiftLeft(&one, nbits - 1);
+    if (r.toConst().order(half.toConst()).compare(.gte)) {
+        var signed_r = try std.math.big.int.Managed.init(arena);
+        try signed_r.sub(&r, &modulus);
+        return makeBigInt(arena, signed_r.toConst());
+    }
+    return makeBigInt(arena, r.toConst());
+}
+
 /// BigInt negation (unary minus). `v` must be `.bigint`.
 pub fn bigIntNegate(arena: std.mem.Allocator, v: Value) !Value {
     var m = try v.toPtr().bigint.toConst().toManaged(arena);

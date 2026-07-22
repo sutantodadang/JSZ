@@ -3049,6 +3049,53 @@ fn nativeBigIntCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
     }
 }
 
+/// ES ToBigInt (7.1.13). Unlike `BigInt(x)`, a Number argument is a TypeError —
+/// there is no implicit Number→BigInt conversion.
+fn toBigIntValue(arena: std.mem.Allocator, v_in: Value) anyerror!Value {
+    var v = v_in;
+    if (v.bits == 0) return throwTypeError(arena, "Cannot convert undefined to a BigInt");
+    if (!coercion_mod.isPrimitive(v))
+        v = (try coercion_mod.toPrimitive(arena, v, .number)) orelse
+            return throwTypeError(arena, "Cannot convert object to a BigInt");
+    return switch (v.unbox()) {
+        .bigint => v,
+        .boolean => |b| val_mod.makeBigIntFromI64(arena, if (b) 1 else 0),
+        .string => |s| val_mod.stringToBigInt(arena, s) catch
+            throwSyntaxError(arena, "Cannot convert string to a BigInt"),
+        .number => throwTypeError(arena, "Cannot convert a Number to a BigInt"),
+        .symbol => throwTypeError(arena, "Cannot convert a Symbol value to a BigInt"),
+        else => throwTypeError(arena, "Cannot convert value to a BigInt"),
+    };
+}
+
+/// ES ToIndex (7.1.22): ToIntegerOrInfinity, then reject anything outside
+/// [0, 2**53-1] with a RangeError. `undefined` is 0.
+fn toIndexValue(arena: std.mem.Allocator, v: Value) anyerror!u64 {
+    const n = try coercion_mod.toNumberThrowing(arena, v);
+    const i = if (std.math.isNan(n)) 0 else std.math.trunc(n);
+    if (i < 0 or i > 9007199254740991.0) return throwRangeError(arena, "Invalid index");
+    return @intFromFloat(i);
+}
+
+/// BigInt.asIntN(bits, bigint) / BigInt.asUintN(bits, bigint) — §21.2.2.1-2.
+/// ToIndex(bits) runs BEFORE ToBigInt(bigint); tests observe that order.
+fn bigIntAsN(arena: std.mem.Allocator, args: []const Value, signed: bool) anyerror!Value {
+    const bits = try toIndexValue(arena, if (args.len > 0) args[0] else Value{});
+    const big = try toBigIntValue(arena, if (args.len > 1) args[1] else Value{});
+    return val_mod.bigIntAsIntN(arena, big, bits, signed) catch |e| switch (e) {
+        error.Overflow => throwRangeError(arena, "BigInt is too large"),
+        else => e,
+    };
+}
+
+fn nativeBigIntAsIntN(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return bigIntAsN(arena, args, true);
+}
+
+fn nativeBigIntAsUintN(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return bigIntAsN(arena, args, false);
+}
+
 /// thisBigIntValue(this): primitive bigint, or a BigInt wrapper's [[PrimitiveValue]].
 fn bigIntThisValue(arena: std.mem.Allocator, this_val: Value) anyerror!Value {
     if (this_val.bits != 0) {
@@ -3069,14 +3116,12 @@ fn nativeBigIntProtoToString(arena: std.mem.Allocator, this_val: Value, args: []
     const b = try bigIntThisValue(arena, this_val);
     var radix: i64 = 10;
     if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_) {
-        const prim = (try coercion_mod.toPrimitive(arena, args[0], .number)) orelse args[0];
-        const rn: f64 = switch (prim.unbox()) {
-            .number => |n| n,
-            .boolean => |bo| if (bo) 1 else 0,
-            else => 10,
-        };
+        // ToIntegerOrInfinity, i.e. a full ToNumber: a Symbol or BigInt radix is a
+        // TypeError, and `null`/non-numeric strings coerce to 0 (→ RangeError),
+        // not to the default 10.
+        const rn = try coercion_mod.toNumberThrowing(arena, args[0]);
         if (std.math.isNan(rn)) return throwRangeError(arena, "toString() radix must be between 2 and 36");
-        radix = @intFromFloat(@trunc(rn));
+        radix = val_mod.f64ToI64Sat(rn);
     }
     if (radix < 2 or radix > 36) return throwRangeError(arena, "toString() radix must be between 2 and 36");
     const s = try b.toPtr().bigint.toConst().toStringAlloc(arena, @intCast(radix), .lower);
@@ -4187,8 +4232,8 @@ pub const Realm = struct {
         try object_ctor.defineOwnDataForced("prototype", proto_val, .{ .writable = false, .enumerable = false, .configurable = false });
 
         // Define "Object" in global env as the constructor object.
-        _ = try object_ctor.defineOwnData("name", try val_mod.makeString(arena, "Object"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try object_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try object_ctor.defineOwnData("name", try val_mod.makeString(arena, "Object"), .{ .writable = false, .enumerable = false, .configurable = true });
         const ctor_val = try val_mod.makeObject(arena, object_ctor);
         try env.define("Object", ctor_val);
 
@@ -4286,8 +4331,8 @@ pub const Realm = struct {
                 // configurable / non-writable. assert.throws and
                 // Function.prototype.toString rely on `name`.
                 const nlen_attr: obj_mod.PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-                _ = try ctor_obj.defineOwnData("name", try val_mod.makeString(a, name), nlen_attr);
                 _ = try ctor_obj.defineOwnData("length", try val_mod.makeNumber(a, len), nlen_attr);
+                _ = try ctor_obj.defineOwnData("name", try val_mod.makeString(a, name), nlen_attr);
                 return val_mod.makeObject(a, ctor_obj);
             }
         }.make;
@@ -4523,8 +4568,8 @@ pub const Realm = struct {
         // Array.fromAsync: non-enumerable to satisfy prop-desc test (§23.1.2.1)
         const from_async_attr = obj_mod.PropAttr{ .writable = true, .enumerable = false, .configurable = true };
         _ = try array_ctor_obj.defineOwnData("fromAsync", try val_mod.makeNativeFunctionNamed(arena, nativeArrayFromAsync, "fromAsync", 1), from_async_attr);
-        _ = try array_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Array"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try array_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try array_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Array"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try array_proto.defineOwnData("constructor", try val_mod.makeObject(arena, array_ctor_obj), .{ .writable = true, .enumerable = false, .configurable = true });
         try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
 
@@ -4535,8 +4580,8 @@ pub const Realm = struct {
         try string_ctor_obj.set("fromCodePoint", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCodePoint, "fromCodePoint", 1));
         try string_ctor_obj.set("raw", try val_mod.makeNativeFunctionNamed(arena, nativeStringRaw, "raw", 1));
         try string_proto.set("constructor", try val_mod.makeObject(arena, string_ctor_obj));
-        _ = try string_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "String"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try string_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try string_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "String"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("String", try val_mod.makeObject(arena, string_ctor_obj));
 
         const number_proto = try JsObject.create(arena, object_proto);
@@ -4570,12 +4615,12 @@ pub const Realm = struct {
         _ = try number_ctor_obj.defineOwnData("isNaN", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsNaN, "isNaN", 1), num_method_attr);
         _ = try number_ctor_obj.defineOwnData("isSafeInteger", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsSafeInteger, "isSafeInteger", 1), num_method_attr);
         try number_proto.set("constructor", try val_mod.makeObject(arena, number_ctor_obj));
-        _ = try number_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Number"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try number_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try number_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Number"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
 
         // ---- BigInt(value) global (conversion function; literals `1n` lex
-        // independently). ponytail: asIntN/asUintN/prototype not added yet.
+        // independently).
         const bigint_ctor_obj = try JsObject.create(arena, null);
         try bigint_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBigIntCtor));
         // BigInt.prototype: real object so `BigInt.prototype.toString = ...` and
@@ -4599,8 +4644,10 @@ pub const Realm = struct {
             try bigint_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, bigint_proto), .{ .writable = false, .enumerable = false, .configurable = false });
             active_bigint_proto = bigint_proto;
         }
-        _ = try bigint_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
+        try bigint_ctor_obj.set("asIntN", try val_mod.makeNativeFunctionNamedLen(arena, nativeBigIntAsIntN, "asIntN", 2));
+        try bigint_ctor_obj.set("asUintN", try val_mod.makeNativeFunctionNamedLen(arena, nativeBigIntAsUintN, "asUintN", 2));
         _ = try bigint_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try bigint_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("BigInt", try val_mod.makeObject(arena, bigint_ctor_obj));
 
         // ---- Function constructor (minimal): callable object so `typeof Function`
@@ -4611,8 +4658,8 @@ pub const Realm = struct {
         try function_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, function_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try function_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeFunctionCtor));
         try function_proto.set("constructor", try val_mod.makeObject(arena, function_ctor_obj));
-        _ = try function_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Function"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try function_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try function_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Function"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Function", try val_mod.makeObject(arena, function_ctor_obj));
         active_function_ctor = function_ctor_obj;
 
@@ -4627,8 +4674,8 @@ pub const Realm = struct {
         try boolean_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, boolean_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try boolean_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBooleanCtor));
         try boolean_proto.set("constructor", try val_mod.makeObject(arena, boolean_ctor_obj));
-        _ = try boolean_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Boolean"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try boolean_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try boolean_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Boolean"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Boolean", try val_mod.makeObject(arena, boolean_ctor_obj));
         try env.define("isNaN", try val_mod.makeNativeFunctionNamed(arena, nativeIsNaN, "isNaN", 1));
         try env.define("eval", try val_mod.makeNativeFunctionNamed(arena, nativeEval, "eval", 1));
@@ -4673,8 +4720,8 @@ pub const Realm = struct {
         // Symbol.prototype.constructor === Symbol, and the `description` accessor
         // (a getter holder `{ get: nativeFn }`, matching the live-reexport pattern).
         try symbol_proto.set("constructor", try val_mod.makeObject(arena, symbol_ctor));
-        _ = try symbol_ctor.defineOwnData("name", try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try symbol_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try symbol_ctor.defineOwnData("name", try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
         const sym_desc_holder = try JsObject.create(arena, null);
         try sym_desc_holder.set("get", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolDescriptionGet, "get", 0));
         _ = try symbol_proto.defineOwnAccessor("description", try val_mod.makeObject(arena, sym_desc_holder), .{
@@ -4755,6 +4802,16 @@ pub const Realm = struct {
             } else |_| {}
         }
         active_sym_species = symbol_ctor.getOwn("species");
+        // `get C[@@species]` on the constructors whose prototype methods use
+        // SpeciesConstructor (§23.1.2.5 / §27.2.4.7 / §22.2.5.2). Registered here
+        // because the well-known symbols only exist after Symbol init.
+        if (active_sym_species) |spec_sym| {
+            for ([_][]const u8{ "Array", "Promise", "RegExp" }) |ctor_name| {
+                const cv = env.lookup(ctor_name) catch continue;
+                if (cv.bits == 0 or cv.unbox() != .object) continue;
+                try es2015_collections_mod.defineSymGetter(arena, cv.toPtr().object, spec_sym, es2015_collections_mod.nativeSpeciesReturnThis, "get [Symbol.species]");
+            }
+        }
         active_sym_is_concat_spreadable = symbol_ctor.getOwn("isConcatSpreadable");
         // Capture the RegExp-related well-known symbols and install the
         // RegExp.prototype[@@match/@@replace/@@search/@@split/@@matchAll] methods
@@ -4803,8 +4860,8 @@ pub const Realm = struct {
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
         _ = try proxy_ctor.defineOwnData("revocable", try val_mod.makeNativeFunctionNamed(arena, proxy_mod.nativeProxyRevocable, "revocable", 2), .{ .writable = true, .enumerable = false, .configurable = true });
-        _ = try proxy_ctor.defineOwnData("name", try val_mod.makeString(arena, "Proxy"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try proxy_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 2), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try proxy_ctor.defineOwnData("name", try val_mod.makeString(arena, "Proxy"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
 
         // ---- Intl (en-US, dependency-free) ----
@@ -4824,8 +4881,8 @@ pub const Realm = struct {
                     _ = try proto.defineOwnData("constructor", try val_mod.makeObject(a, ctor), .{ .writable = true, .enumerable = false, .configurable = true });
                     if (active_sym_to_string_tag) |tag_sym|
                         _ = try proto.defineOwnDataSym(tag_sym, try val_mod.makeString(a, tag), .{ .writable = false, .enumerable = false, .configurable = true });
-                    _ = try ctor.defineOwnData("name", try val_mod.makeString(a, cname), .{ .writable = false, .enumerable = false, .configurable = true });
                     _ = try ctor.defineOwnData("length", try val_mod.makeNumber(a, @floatFromInt(len)), .{ .writable = false, .enumerable = false, .configurable = true });
+                    _ = try ctor.defineOwnData("name", try val_mod.makeString(a, cname), .{ .writable = false, .enumerable = false, .configurable = true });
                     if (has_slo)
                         _ = try ctor.defineOwnData("supportedLocalesOf", try val_mod.makeNativeFunctionNamed(a, intl_mod.nativeDurationFormatSupportedLocalesOf, "supportedLocalesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
                 }
@@ -4942,8 +4999,8 @@ pub const Realm = struct {
             try df_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDurationFormatCtor));
             _ = try df_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, df_proto), .{ .writable = false, .enumerable = false, .configurable = false });
             _ = try df_proto.defineOwnData("constructor", try val_mod.makeObject(arena, df_ctor), .{ .writable = true, .enumerable = false, .configurable = true });
-            _ = try df_ctor.defineOwnData("name", try val_mod.makeString(arena, "DurationFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
             _ = try df_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+            _ = try df_ctor.defineOwnData("name", try val_mod.makeString(arena, "DurationFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
             _ = try df_ctor.defineOwnData("supportedLocalesOf", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatSupportedLocalesOf, "supportedLocalesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             try intl_obj.set("DurationFormat", try val_mod.makeObject(arena, df_ctor));
             // Intl.Segmenter, plus the two prototypes `segment()` produces. Both

@@ -53,6 +53,17 @@ pub fn trap(handler: Value, name: []const u8) ?Value {
 pub fn getTrap(arena: std.mem.Allocator, handler: Value, name: []const u8) anyerror!?Value {
     if (handler.bits == 0 or handler.unbox() != .object) return null;
     const ho = handler.toPtr().object;
+    // GetMethod uses [[Get]], so a handler that is ITSELF a Proxy must have its
+    // own `get` trap consulted for the trap lookup. The raw shape walk below
+    // would find nothing on such a handler and silently forward to the target.
+    if (ho.internal_kind == .proxy) {
+        if (realm_mod.active_context) |ctx| {
+            const t = try ctx.getProp(arena, handler, name);
+            if (t.bits == 0 or t.isNullish()) return null;
+            if (!function_proto.isCallableFn(t)) return throwProxy(arena, "proxy handler trap is not a function");
+            return t;
+        }
+    }
     // GetMethod uses [[Get]]: an accessor trap property must have its getter
     // invoked (side effects and abrupt throws propagate).
     const loc = ho.findProperty(name) orelse return null;

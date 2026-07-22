@@ -29,8 +29,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !*JsObject {
     try promise_ctor_obj.set("withResolvers", try val_mod.makeNativeFunctionNamed(arena, nativePromiseWithResolvers, "withResolvers", 0));
     try promise_ctor_obj.set("try", try val_mod.makeNativeFunctionNamed(arena, nativePromiseTry, "try", 1));
     try promise_proto.set("finally", try val_mod.makeNativeFunctionNamed(arena, nativePromiseFinally, "finally", 0));
-    _ = try promise_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Promise"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try promise_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try promise_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Promise"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try promise_proto.defineOwnData("constructor", try val_mod.makeObject(arena, promise_ctor_obj), .{ .writable = true, .enumerable = false, .configurable = true });
     try ctx.env.define("Promise", try val_mod.makeObject(arena, promise_ctor_obj));
     return promise_proto;
@@ -199,6 +199,12 @@ fn enqueueReactionJob(arena: std.mem.Allocator, r: Reaction, state: PromiseState
 
 /// Materialize a TypeError object as a plain Value (for rejecting a promise with
 /// a real Error instance, e.g. self-resolution — not a string).
+/// Raise a TypeError from a Promise built-in.
+fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+    realm_mod.pending_exception = makeTypeErrorValue(arena, msg);
+    return error.JsException;
+}
+
 fn makeTypeErrorValue(arena: std.mem.Allocator, msg: []const u8) Value {
     realm_mod.throwTypeError(arena, msg) catch {};
     const v = realm_mod.pending_exception;
@@ -294,6 +300,12 @@ fn nativePromiseResolver(arena: std.mem.Allocator, this_val: Value, args: []cons
 }
 
 pub fn nativePromiseCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // §27.2.3.1 steps 1-2: `Promise(fn)` without `new` is a TypeError, and a
+    // non-callable executor is rejected before the promise is even created.
+    if (!realm_mod.active_constructing)
+        return throwTypeError(arena, "Promise constructor cannot be invoked without 'new'");
+    if (!(args.len > 0 and isCallable(args[0])))
+        return throwTypeError(arena, "Promise resolver is not a function");
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const o = this_val.toPtr().object;
         const d = try arena.create(PromiseData);
@@ -1077,9 +1089,20 @@ pub fn nativePromiseThen(arena: std.mem.Allocator, this_val: Value, args: []cons
 /// A sentinel target for capability-mode reactions, which never touch `next_data`.
 var dummy_promise_data: PromiseData = .{};
 
+/// Promise.prototype.catch(onRejected) — §27.2.5.1 is literally
+/// `Invoke(this, "then", « undefined, onRejected »)`, so it works on ANY object
+/// (even a primitive with an inherited `then`), and a user `then` override on
+/// the receiver is honoured.
 pub fn nativePromiseCatch(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const on_rejected = if (args.len > 0) args[0] else Value{};
-    return nativePromiseThen(arena, this_val, &[_]Value{ Value{}, on_rejected });
+    const on_rejected = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const undef = try val_mod.makeUndefined(arena);
+    if (this_val.isNullish())
+        return throwTypeError(arena, "Promise.prototype.catch called on null or undefined");
+    const ctx = realm_mod.active_context orelse
+        return nativePromiseThen(arena, this_val, &[_]Value{ undef, on_rejected });
+    const then_fn = try ctx.getProp(arena, this_val, "then");
+    if (!isCallable(then_fn)) return throwTypeError(arena, "then is not a function");
+    return fn_proto.invokeCallback(arena, this_val, then_fn, &[_]Value{ undef, on_rejected });
 }
 
 fn runReactionJob(arena: std.mem.Allocator, job: Job) void {

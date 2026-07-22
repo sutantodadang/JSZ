@@ -477,8 +477,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     const ctor = try intrinsics.makeCtor(arena, proto, nativeCtor, ctx.function_proto);
     try intrinsics.setMethod(arena, ctor, "from", nativeFrom);
     try intrinsics.setMethod(arena, ctor, "compare", nativeCompare);
-    _ = try ctor.defineOwnData("name", try val_mod.makeString(arena, "PlainYearMonth"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try ctor.defineOwnData("length", try val_mod.makeNumber(arena, 2), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try ctor.defineOwnData("name", try val_mod.makeString(arena, "PlainYearMonth"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try proto.defineOwnData("constructor", try val_mod.makeObject(arena, ctor), .{ .writable = true, .enumerable = false, .configurable = true });
     ctor_obj = ctor;
 }

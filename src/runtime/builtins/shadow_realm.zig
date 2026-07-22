@@ -86,8 +86,8 @@ pub fn register(arena: std.mem.Allocator, env: *Environment, object_proto: *JsOb
         .enumerable = false,
         .configurable = false,
     });
-    _ = try ctor.defineOwnData("name", try val_mod.makeString(arena, "ShadowRealm"), fn_prop_attr);
     _ = try ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), fn_prop_attr);
+    _ = try ctor.defineOwnData("name", try val_mod.makeString(arena, "ShadowRealm"), fn_prop_attr);
 
     const ctor_val = try val_mod.makeObject(arena, ctor);
     _ = try proto.defineOwnData("constructor", ctor_val, .{ .writable = true, .enumerable = false, .configurable = true });

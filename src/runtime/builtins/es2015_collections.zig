@@ -77,8 +77,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     active_map_iter_proto = map_iter_proto;
 
     const map_ctor = try JsObject.create(arena, ctx.function_proto);
-    _ = try map_ctor.defineOwnData("name", try val_mod.makeString(arena, "Map"), mn);
     _ = try map_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), mn);
+    _ = try map_ctor.defineOwnData("name", try val_mod.makeString(arena, "Map"), mn);
     _ = try map_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, map_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     _ = try map_ctor.defineOwnData("groupBy", try val_mod.makeNativeFunctionNamed(arena, nativeMapGroupBy, "groupBy", 2), mm);
     try map_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeMapCtor));
@@ -117,8 +117,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
     const sn: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
     const set_ctor = try JsObject.create(arena, ctx.function_proto);
-    _ = try set_ctor.defineOwnData("name", try val_mod.makeString(arena, "Set"), sn);
     _ = try set_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), sn);
+    _ = try set_ctor.defineOwnData("name", try val_mod.makeString(arena, "Set"), sn);
     _ = try set_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, set_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try set_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeSetCtor));
     _ = try set_proto.defineOwnData("constructor", try val_mod.makeObject(arena, set_ctor), sm);
@@ -137,8 +137,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
     const wm_ctor = try JsObject.create(arena, ctx.function_proto);
     const wm_nlen: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-    _ = try wm_ctor.defineOwnData("name", try val_mod.makeString(arena, "WeakMap"), wm_nlen);
     _ = try wm_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), wm_nlen);
+    _ = try wm_ctor.defineOwnData("name", try val_mod.makeString(arena, "WeakMap"), wm_nlen);
     _ = try wm_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, wm_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try wm_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakMapCtor));
     _ = try wm_proto.defineOwnData("constructor", try val_mod.makeObject(arena, wm_ctor), wm_m);
@@ -154,8 +154,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
     const ws_ctor = try JsObject.create(arena, ctx.function_proto);
     const ws_nlen: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-    _ = try ws_ctor.defineOwnData("name", try val_mod.makeString(arena, "WeakSet"), ws_nlen);
     _ = try ws_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), ws_nlen);
+    _ = try ws_ctor.defineOwnData("name", try val_mod.makeString(arena, "WeakSet"), ws_nlen);
     _ = try ws_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, ws_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try ws_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakSetCtor));
     _ = try ws_proto.defineOwnData("constructor", try val_mod.makeObject(arena, ws_ctor), ws_m);
@@ -169,8 +169,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
     const wr_ctor = try JsObject.create(arena, ctx.function_proto);
     const wr_nlen: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-    _ = try wr_ctor.defineOwnData("name", try val_mod.makeString(arena, "WeakRef"), wr_nlen);
     _ = try wr_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), wr_nlen);
+    _ = try wr_ctor.defineOwnData("name", try val_mod.makeString(arena, "WeakRef"), wr_nlen);
     _ = try wr_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, wr_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try wr_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeWeakRefCtor));
     _ = try wr_proto.defineOwnData("constructor", try val_mod.makeObject(arena, wr_ctor), wr_m);
@@ -185,8 +185,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
 
     const fr_ctor = try JsObject.create(arena, ctx.function_proto);
     const fr_nlen: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-    _ = try fr_ctor.defineOwnData("name", try val_mod.makeString(arena, "FinalizationRegistry"), fr_nlen);
     _ = try fr_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), fr_nlen);
+    _ = try fr_ctor.defineOwnData("name", try val_mod.makeString(arena, "FinalizationRegistry"), fr_nlen);
     _ = try fr_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, fr_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try fr_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeFinRegCtor));
     _ = try fr_proto.defineOwnData("constructor", try val_mod.makeObject(arena, fr_ctor), fr_m);
@@ -258,13 +258,13 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
 }
 
 /// get [Symbol.species] — returns the `this` value (the constructor itself).
-fn nativeSpeciesReturnThis(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+pub fn nativeSpeciesReturnThis(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     _ = arena;
     return this_val;
 }
 
 /// Install a getter-only accessor under a symbol key on `obj`.
-fn defineSymGetter(arena: std.mem.Allocator, obj: *JsObject, sym_key: Value, getter: val_mod.NativeFnPtr, name: []const u8) !void {
+pub fn defineSymGetter(arena: std.mem.Allocator, obj: *JsObject, sym_key: Value, getter: val_mod.NativeFnPtr, name: []const u8) !void {
     const holder = try JsObject.create(arena, null);
     try holder.set("get", try val_mod.makeNativeFunctionNamed(arena, getter, name, 0));
     try obj.setSymAttr(sym_key, try val_mod.makeObject(arena, holder), .{ .writable = false, .enumerable = false, .configurable = true, .is_accessor = true });
@@ -4194,8 +4194,8 @@ pub fn registerIteratorGlobal(ctx: *const intrinsics.Ctx) !void {
     const nc: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
 
     const iter_ctor = try JsObject.create(arena, ctx.function_proto);
-    _ = try iter_ctor.defineOwnData("name", try val_mod.makeString(arena, "Iterator"), nc);
     _ = try iter_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), nc);
+    _ = try iter_ctor.defineOwnData("name", try val_mod.makeString(arena, "Iterator"), nc);
     _ = try iter_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, iter_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     _ = try iter_ctor.defineOwnData("from", try val_mod.makeNativeFunctionNamed(arena, nativeIteratorFrom, "from", 1), cfg);
     _ = try iter_ctor.defineOwnData("concat", try val_mod.makeNativeFunctionNamed(arena, nativeIteratorConcat, "concat", 0), cfg);
