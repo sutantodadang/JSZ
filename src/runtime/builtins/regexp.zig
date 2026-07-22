@@ -1968,8 +1968,18 @@ fn scanGroupNames(alloc: std.mem.Allocator, src: []const u8, total_caps: *u32) !
 
 // ============================================================= Matcher ========
 
-pub const CaptureSpan = struct { start: usize, end: usize };
-pub const INVALID_CAP = CaptureSpan{ .start = 0, .end = 0 };
+pub const CaptureSpan = struct {
+    start: usize,
+    end: usize,
+
+    /// True when the group did not participate in the match. The sentinel must
+    /// not be `{0, 0}`: that is a *real* empty capture at the start of the
+    /// subject (`/(a*)b/.exec("b")` captures `""`, not `undefined`).
+    pub fn unset(self: CaptureSpan) bool {
+        return self.start == std.math.maxInt(usize);
+    }
+};
+pub const INVALID_CAP = CaptureSpan{ .start = std.math.maxInt(usize), .end = std.math.maxInt(usize) };
 
 /// Match result: position after the match + capture array.
 const MatchState = struct {
@@ -2270,7 +2280,7 @@ fn matchNode(
         .back_ref => |idx| {
             if (idx >= MAX_CAPTURES) return pos;
             const cap = caps[idx];
-            if (cap.start == 0 and cap.end == 0) {
+            if (cap.unset()) {
                 return pos;
             }
             const captured = input[cap.start..cap.end];
@@ -2696,7 +2706,7 @@ const PikeVM = struct {
                 var gi: usize = 1;
                 var touched = false;
                 while (gi < MAX_CAPTURES and 2 * gi + 1 < self.ns) : (gi += 1) {
-                    if (tmp[gi].start == 0 and tmp[gi].end == 0) continue;
+                    if (tmp[gi].unset()) continue;
                     merged[2 * gi] = @intCast(tmp[gi].start);
                     merged[2 * gi + 1] = @intCast(tmp[gi].end);
                     touched = true;
@@ -3131,7 +3141,7 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
     var i: u32 = 1;
     while (i <= cr.num_captures and i < MAX_CAPTURES) : (i += 1) {
         const cap = result.state.captures[i];
-        const cap_val: Value = if (cap.start == 0 and cap.end == 0 and i > 0)
+        const cap_val: Value = if (cap.unset() and i > 0)
             try val_mod.makeUndefined(arena)
         else
             try val_mod.makeString(arena, try arena.dupe(u8, s[cap.start..cap.end]));
@@ -3160,7 +3170,7 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
         // so a non-participating duplicate never clobbers a real capture.
         for (cr.group_names) |ni| {
             const cap = if (ni.idx < MAX_CAPTURES) result.state.captures[ni.idx] else INVALID_CAP;
-            if (cap.start == 0 and cap.end == 0) continue;
+            if (cap.unset()) continue;
             try gobj.set(ni.name, try val_mod.makeString(arena, try arena.dupe(u8, s[cap.start..cap.end])));
         }
         break :grp try val_mod.makeObject(arena, gobj);
@@ -3179,7 +3189,7 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
             else
                 result.state.captures[k];
             const key = try std.fmt.allocPrint(arena, "{d}", .{k});
-            if (k > 0 and span.start == 0 and span.end == 0) {
+            if (k > 0 and span.unset()) {
                 try ind.set(key, try val_mod.makeUndefined(arena));
                 continue;
             }
@@ -3200,7 +3210,7 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
             }
             for (cr.group_names) |ni| {
                 const cap = if (ni.idx < MAX_CAPTURES) result.state.captures[ni.idx] else INVALID_CAP;
-                if (cap.start == 0 and cap.end == 0) continue;
+                if (cap.unset()) continue;
                 const pair = try JsObject.createArray(arena, arr_proto);
                 try pair.set("0", try val_mod.makeNumber(arena, @floatFromInt(cap.start)));
                 try pair.set("1", try val_mod.makeNumber(arena, @floatFromInt(cap.end)));
@@ -3247,7 +3257,7 @@ fn updateLegacyState(s: []const u8, start: usize, end: usize, captures: []const 
     var i: u32 = 1;
     while (i <= num_captures and i < MAX_CAPTURES) : (i += 1) {
         const cap = captures[i];
-        if (cap.start == 0 and cap.end == 0) continue; // group did not participate
+        if (cap.unset()) continue; // group did not participate
         const val = s[cap.start..cap.end];
         if (i <= 9) legacy_state.groups[i - 1] = val;
         last_paren = val;
@@ -3496,9 +3506,18 @@ fn getSubstitution(
         }
         const d = replacement[i + 1];
         switch (d) {
-            '$' => { try out.append(arena, '$'); i += 2; },
-            '&' => { try out.appendSlice(arena, matched); i += 2; },
-            '`' => { try out.appendSlice(arena, str[0..position]); i += 2; },
+            '$' => {
+                try out.append(arena, '$');
+                i += 2;
+            },
+            '&' => {
+                try out.appendSlice(arena, matched);
+                i += 2;
+            },
+            '`' => {
+                try out.appendSlice(arena, str[0..position]);
+                i += 2;
+            },
             '\'' => {
                 const tail_start = @min(position + matched.len, str.len);
                 try out.appendSlice(arena, str[tail_start..]);
@@ -3540,7 +3559,10 @@ fn getSubstitution(
                     i += 1;
                 }
             },
-            else => { try out.append(arena, '$'); i += 1; },
+            else => {
+                try out.append(arena, '$');
+                i += 1;
+            },
         }
     }
     return out.items;
@@ -4036,14 +4058,15 @@ test "regexp: pattern early errors" {
     // A quantifier needs an Atom, and an assertion is not one (except the
     // Annex B `(?=)`/`(?!)` exception, checked below).
     const rejected = [_][2][]const u8{
-        .{ "a**", "" },      .{ "+a", "" },       .{ "(*)", "" },
-        .{ "a{1}{1,}", "" }, .{ "{1}", "" },      .{ "^*", "" },
+        .{ "a**", "" },      .{ "+a", "" },      .{ "(*)", "" },
+        .{ "a{1}{1,}", "" }, .{ "{1}", "" },     .{ "^*", "" },
         .{ "$*", "" },       .{ "(?<=a)*", "" },
         // /u tightens the grammar: no Annex B literals or legacy escapes.
-        .{ "(?=.)*", "u" },  .{ "a{1", "u" },     .{ "}", "u" },
-        .{ "]", "u" },       .{ "\\1", "u" },     .{ "\\01", "u" },
-        .{ "\\x", "u" },     .{ "\\c", "u" },     .{ "\\A", "u" },
-        .{ "[\\d-a]", "u" }, .{ "[a-\\d]", "u" }, .{ "[\\c]", "u" },
+        .{ "(?=.)*", "u" },
+        .{ "a{1", "u" },     .{ "}", "u" },      .{ "]", "u" },
+        .{ "\\1", "u" },     .{ "\\01", "u" },   .{ "\\x", "u" },
+        .{ "\\c", "u" },     .{ "\\A", "u" },    .{ "[\\d-a]", "u" },
+        .{ "[a-\\d]", "u" }, .{ "[\\c]", "u" },
     };
     for (rejected) |c| {
         std.testing.expectError(error.InvalidPattern, compileRegex(alloc, c[0], c[1])) catch |e| {
@@ -4052,11 +4075,11 @@ test "regexp: pattern early errors" {
         };
     }
     const accepted = [_][2][]const u8{
-        .{ "a??", "" },      .{ "(?=a)*", "" },  .{ "{", "" },
-        .{ "]", "" },        .{ "a{", "" },      .{ "\\c", "" },
-        .{ "\\1", "" },      .{ "[\\d-a]", "" }, .{ "\\x", "" },
-        .{ "\\1(a)", "u" },  .{ "\\$", "u" },    .{ "[\\-]", "u" },
-        .{ "\\cA", "u" },    .{ "[\\b]", "u" },
+        .{ "a??", "" },     .{ "(?=a)*", "" },  .{ "{", "" },
+        .{ "]", "" },       .{ "a{", "" },      .{ "\\c", "" },
+        .{ "\\1", "" },     .{ "[\\d-a]", "" }, .{ "\\x", "" },
+        .{ "\\1(a)", "u" }, .{ "\\$", "u" },    .{ "[\\-]", "u" },
+        .{ "\\cA", "u" },   .{ "[\\b]", "u" },
     };
     for (accepted) |c| {
         _ = compileRegex(alloc, c[0], c[1]) catch |e| {

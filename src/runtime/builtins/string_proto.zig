@@ -643,7 +643,7 @@ fn splitByRegex(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mod.C
         var ci: u32 = 1;
         while (ci <= cr.num_captures) : (ci += 1) {
             const cap = m.state.captures[ci];
-            const cv = if (cap.start == 0 and cap.end == 0)
+            const cv = if (cap.unset())
                 try val_mod.makeUndefined(arena)
             else
                 try val_mod.makeString(arena, try arena.dupe(u8, s[cap.start..cap.end]));
@@ -696,7 +696,7 @@ fn doExec(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mod.Compile
     var i: u32 = 1;
     while (i <= cr.num_captures) : (i += 1) {
         const cap = result.state.captures[i];
-        const cv: Value = if (cap.start == 0 and cap.end == 0)
+        const cv: Value = if (cap.unset())
             try val_mod.makeUndefined(arena)
         else
             try val_mod.makeString(arena, try arena.dupe(u8, s[cap.start..cap.end]));
@@ -917,7 +917,7 @@ fn doReplaceWithFn(arena: std.mem.Allocator, s: []const u8, cr: *const regexp_mo
         var ci: u32 = 1;
         while (ci <= n_caps) : (ci += 1) {
             const cap = m.state.captures[ci];
-            if (cap.start == 0 and cap.end == 0) {
+            if (cap.unset()) {
                 cb_args[ci] = try val_mod.makeUndefined(arena);
             } else {
                 cb_args[ci] = try val_mod.makeString(arena, s[cap.start..cap.end]);
@@ -1357,16 +1357,13 @@ pub fn nativeSubstr(arena: std.mem.Allocator, this_val: Value, args: []const Val
         break :blk if (u > len) len else u;
     };
 
-    const size: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_)
-        blk: {
-            const n: f64 = try argToInteger(arena, args[1]);
-            if (n <= 0.0 or std.math.isNan(n)) break :blk 0;
-            const u: usize = @intCast(val_mod.f64ToI64Sat(n));
-            const max = len - start;
-            break :blk if (u > max) max else u;
-        }
-    else
-        len - start;
+    const size: usize = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_) blk: {
+        const n: f64 = try argToInteger(arena, args[1]);
+        if (n <= 0.0 or std.math.isNan(n)) break :blk 0;
+        const u: usize = @intCast(val_mod.f64ToI64Sat(n));
+        const max = len - start;
+        break :blk if (u > max) max else u;
+    } else len - start;
 
     return val_mod.makeString(arena, try cuSliceAlloc(arena, s, start, start + size));
 }

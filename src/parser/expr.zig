@@ -1070,13 +1070,32 @@ pub fn numericLiteralKey(p: *Parser) ?[]const u8 {
 
 pub fn isAwaitOperandStart(kind: anytype) bool {
     return switch (kind) {
-        .identifier, .number, .string, .left_paren, .left_bracket, .left_brace,
-        .bang, .tilde, .minus, .plus, .kw_typeof, .kw_void, .kw_delete,
-        .kw_new, .kw_function, .kw_class, .kw_this, .kw_true, .kw_false,
-        .kw_null, .plus_plus, .minus_minus,
+        .identifier,
+        .number,
+        .string,
+        .left_paren,
+        .left_bracket,
+        .left_brace,
+        .bang,
+        .tilde,
+        .minus,
+        .plus,
+        .kw_typeof,
+        .kw_void,
+        .kw_delete,
+        .kw_new,
+        .kw_function,
+        .kw_class,
+        .kw_this,
+        .kw_true,
+        .kw_false,
+        .kw_null,
+        .plus_plus,
+        .minus_minus,
         // `await import(spec)` / `await import.meta.f()` and `await super.m()`
         // in an async method: both start a legal unary operand.
-        .kw_import, .kw_super,
+        .kw_import,
+        .kw_super,
         => true,
         else => false,
     };
@@ -1205,8 +1224,33 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
                 .new_expr = .{ .callee = callee, .args = args },
             }) orelse return null;
             // Allow member access and calls on the result of `new`: e.g. new Foo().bar()
+            var new_optional = false;
             while (true) {
-                if (p.check(.left_paren)) {
+                if (p.match(.question_dot)) {
+                    // `new Foo().bar()?.baz` — a MemberExpression rooted at `new`
+                    // continues into an optional chain like any other.
+                    new_optional = true;
+                    if (p.check(.left_paren)) {
+                        const opt_args = p.parseArgs() orelse return null;
+                        new_node = p.makeNode(.call_expr, new_node.start, p.current.start, .{
+                            .call_expr = .{ .callee = new_node, .args = opt_args, .optional = true },
+                        }) orelse return null;
+                    } else if (p.match(.left_bracket)) {
+                        const opt_prop = p.parseExpression() orelse return null;
+                        _ = p.expect(.right_bracket) orelse return null;
+                        new_node = p.makeNode(.member_expr, new_node.start, p.current.start, .{
+                            .member_expr = .{ .object = new_node, .property = opt_prop, .computed = true, .optional = true },
+                        }) orelse return null;
+                    } else {
+                        const opt_tok = p.expectIdentifierName() orelse return null;
+                        const opt_id = p.makeNode(.identifier, opt_tok.start, opt_tok.end, .{
+                            .identifier = opt_tok.value_str,
+                        }) orelse return null;
+                        new_node = p.makeNode(.member_expr, new_node.start, p.current.start, .{
+                            .member_expr = .{ .object = new_node, .property = opt_id, .computed = false, .optional = true },
+                        }) orelse return null;
+                    }
+                } else if (p.check(.left_paren)) {
                     const call_args = p.parseArgs() orelse return null;
                     new_node = p.makeNode(.call_expr, new_node.start, p.current.start, .{
                         .call_expr = .{ .callee = new_node, .args = call_args },
@@ -1228,6 +1272,11 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
                 } else {
                     break;
                 }
+            }
+            if (new_optional) {
+                new_node = p.makeNode(.optional_chain, new_node.start, new_node.end, .{
+                    .optional_chain = new_node,
+                }) orelse return null;
             }
             return new_node;
         },

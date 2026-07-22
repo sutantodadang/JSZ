@@ -37,8 +37,25 @@ const t_zdt = @import("temporal/zoned_date_time.zig");
 const t_pym = @import("temporal/plain_year_month.zig");
 const t_pmd = @import("temporal/plain_month_day.zig");
 const t_duration = @import("temporal/duration.zig");
+const t_calendar = @import("temporal/calendar.zig");
+const t_tzdata = @import("temporal/tzdata.zig");
+const nfmt = @import("intl_number.zig");
+const locale_id = @import("intl_locale_id.zig");
 
-fn getNum(v: Value) f64 {
+// Intl.NumberFormat lives in `intl_number.zig`; re-export the pieces the realm
+// registration and the sibling services (ListFormat / RelativeTimeFormat) use.
+pub const NumberPart = nfmt.NumberPart;
+pub const nativeNumberFormatCtor = nfmt.nativeNumberFormatCtor;
+pub const nativeNumberFormatFormat = nfmt.nativeNumberFormatFormat;
+pub const nativeNumberFormatFormatGetter = nfmt.nativeNumberFormatFormatGetter;
+pub const nativeNumberFormatFormatToParts = nfmt.nativeNumberFormatFormatToParts;
+pub const nativeNumberFormatFormatRange = nfmt.nativeNumberFormatFormatRange;
+pub const nativeNumberFormatFormatRangeToParts = nfmt.nativeNumberFormatFormatRangeToParts;
+pub const nativeNumberFormatResolved = nfmt.nativeNumberFormatResolved;
+const partsToArray = nfmt.partsToArray;
+const range_separator = nfmt.range_separator;
+
+pub fn getNum(v: Value) f64 {
     if (v.bits == 0) return std.math.nan(f64);
     return switch (v.unbox()) {
         .number => |n| n,
@@ -96,323 +113,6 @@ fn optBool(opts: ?Value, key: []const u8) ?bool {
     return v.unbox().boolean;
 }
 
-fn pow10(n: u32) u64 {
-    var r: u64 = 1;
-    var i: u32 = 0;
-    while (i < n) : (i += 1) r *= 10;
-    return r;
-}
-
-/// Format `int_part` (a non-negative integer) with ASCII thousands separators.
-fn groupInteger(arena: std.mem.Allocator, int_part: u64, group: bool) ![]const u8 {
-    const digits = try std.fmt.allocPrint(arena, "{d}", .{int_part});
-    if (!group or digits.len <= 3) return digits;
-    var out = std.ArrayListUnmanaged(u8){};
-    const first = digits.len % 3;
-    var idx: usize = 0;
-    if (first != 0) {
-        try out.appendSlice(arena, digits[0..first]);
-        idx = first;
-    }
-    while (idx < digits.len) : (idx += 3) {
-        if (out.items.len > 0) try out.append(arena, ',');
-        try out.appendSlice(arena, digits[idx .. idx + 3]);
-    }
-    return out.items;
-}
-
-/// The resolved NumberFormat options that affect digit output.
-const NfOptions = struct {
-    style: []const u8 = "decimal",
-    currency: []const u8 = "USD",
-    currency_display: []const u8 = "symbol",
-    /// `style: "unit"` identifier ("" when the style is not "unit").
-    unit: []const u8 = "",
-    unit_display: []const u8 = "short",
-    min_frac: u32 = 0,
-    max_frac: u32 = 3,
-    group: bool = true,
-    sign_display: []const u8 = "auto",
-    /// Significant digits take precedence over fraction digits when set.
-    min_sig: u32 = 0,
-    max_sig: u32 = 0,
-    use_sig: bool = false,
-    rounding_mode: RoundMode = .half_expand,
-    /// Round to a multiple of this many units of the last fraction digit.
-    rounding_increment: u32 = 1,
-    /// trailingZeroDisplay "stripIfInteger".
-    strip_if_integer: bool = false,
-};
-
-/// ECMA-402 roundingMode.
-const RoundMode = enum {
-    ceil,
-    floor,
-    expand,
-    trunc,
-    half_ceil,
-    half_floor,
-    half_expand,
-    half_trunc,
-    half_even,
-};
-
-fn roundModeFromString(s_: []const u8) ?RoundMode {
-    const table = .{
-        .{ "ceil", RoundMode.ceil },
-        .{ "floor", RoundMode.floor },
-        .{ "expand", RoundMode.expand },
-        .{ "trunc", RoundMode.trunc },
-        .{ "halfCeil", RoundMode.half_ceil },
-        .{ "halfFloor", RoundMode.half_floor },
-        .{ "halfExpand", RoundMode.half_expand },
-        .{ "halfTrunc", RoundMode.half_trunc },
-        .{ "halfEven", RoundMode.half_even },
-    };
-    inline for (table) |e| if (std.mem.eql(u8, s_, e[0])) return e[1];
-    return null;
-}
-
-/// GetUnsignedRoundingMode: how to round a *magnitude*, given the sign of the
-/// value it came from. "ceil" on a negative number rounds its magnitude down.
-const UnsignedMode = enum { zero, infinity, half_zero, half_infinity, half_even };
-
-fn unsignedRoundingMode(mode: RoundMode, negative: bool) UnsignedMode {
-    return switch (mode) {
-        .ceil => if (negative) .zero else .infinity,
-        .floor => if (negative) .infinity else .zero,
-        .expand => .infinity,
-        .trunc => .zero,
-        .half_ceil => if (negative) .half_zero else .half_infinity,
-        .half_floor => if (negative) .half_infinity else .half_zero,
-        .half_expand => .half_infinity,
-        .half_trunc => .half_zero,
-        .half_even => .half_even,
-    };
-}
-
-/// Round a non-negative magnitude to an integer under an unsigned mode.
-fn roundMagnitude(x: f64, mode: UnsignedMode) f64 {
-    const fl = @floor(x);
-    const frac = x - fl;
-    if (frac == 0) return fl;
-    return switch (mode) {
-        .zero => fl,
-        .infinity => fl + 1,
-        .half_zero => if (frac > 0.5) fl + 1 else fl,
-        .half_infinity => if (frac >= 0.5) fl + 1 else fl,
-        .half_even => if (frac > 0.5) fl + 1 else if (frac < 0.5) fl else (if (@mod(fl, 2) == 0) fl else fl + 1),
-    };
-}
-
-/// One element of a `formatToParts` result.
-pub const NumberPart = struct {
-    type: []const u8,
-    value: []const u8,
-    /// Which end of a range this part came from. Only `formatRangeToParts`
-    /// reports it; plain `formatToParts` parts leave it null.
-    source: ?[]const u8 = null,
-};
-
-/// Core en-US number formatting, as the `formatToParts` part list. `format` is
-/// the concatenation of these values, so both share one implementation and
-/// cannot drift apart.
-fn formatNumberParts(arena: std.mem.Allocator, value: f64, opt: NfOptions) ![]NumberPart {
-    const style = opt.style;
-    const currency = opt.currency;
-    const group = opt.group;
-    const sign_display = opt.sign_display;
-    var parts: std.ArrayList(NumberPart) = .empty;
-    if (std.math.isNan(value)) {
-        try parts.append(arena, .{ .type = "nan", .value = "NaN" });
-        return parts.items;
-    }
-
-    var n = value;
-    // ECMA-402 counts -0 as negative, so `format(-0)` is "-0".
-    const negative = std.math.signbit(n);
-    n = @abs(n);
-
-    const is_percent = std.mem.eql(u8, style, "percent");
-    const is_currency = std.mem.eql(u8, style, "currency");
-    if (is_percent) n *= 100;
-
-    var min_frac = opt.min_frac;
-    var max_frac = opt.max_frac;
-    // Significant digits, when requested, fix the digit positions instead:
-    // express them as an equivalent fraction-digit window plus, when the value
-    // is wider than maxSig, a power-of-ten increment that zeroes the low
-    // integer digits (123456 at 3 significant digits is 123,000).
-    var sig_increment: u64 = 1;
-    if (opt.use_sig and n != 0 and !std.math.isInf(n)) {
-        const e: i32 = @intFromFloat(@floor(@log10(n)));
-        const max_sig: i32 = @intCast(opt.max_sig);
-        const min_sig: i32 = @intCast(opt.min_sig);
-        if (e + 1 >= max_sig) {
-            max_frac = 0;
-            min_frac = 0;
-            const shift = e + 1 - max_sig;
-            sig_increment = pow10(@intCast(@min(shift, 18)));
-        } else {
-            max_frac = @intCast(@min(max_sig - 1 - e, 18));
-            min_frac = if (min_sig - 1 - e > 0) @intCast(@min(min_sig - 1 - e, 18)) else 0;
-        }
-    } else if (opt.use_sig) {
-        max_frac = if (opt.min_sig > 1) opt.min_sig - 1 else 0;
-        min_frac = max_frac;
-    }
-    if (max_frac < min_frac) max_frac = min_frac;
-    // `pow10(max_frac)` must fit u64 (10^18 < 2^63) and f64 carries only ~17
-    // significant digits, so a larger fraction-digit count cannot be represented;
-    // clamp the scale exponent to avoid integer overflow in pow10.
-    if (max_frac > 18) max_frac = 18;
-    // roundingIncrement counts units of the last fraction digit, and per spec
-    // applies only in fraction-digit mode.
-    const increment: u64 = if (opt.use_sig) sig_increment else @max(opt.rounding_increment, 1);
-
-    // signDisplay: auto (default) / always / exceptZero / negative / never.
-    const sign_prefix: []const u8 = blk: {
-        if (std.mem.eql(u8, sign_display, "never")) break :blk "";
-        // exceptZero and negative suppress the sign on zero (including -0),
-        // so they must be tested before the sign bit.
-        if (std.mem.eql(u8, sign_display, "exceptZero")) {
-            if (value == 0 or std.math.isNan(value)) break :blk "";
-            break :blk if (negative) "-" else "+";
-        }
-        if (std.mem.eql(u8, sign_display, "negative")) {
-            if (value == 0 or std.math.isNan(value)) break :blk "";
-            break :blk if (negative) "-" else "";
-        }
-        if (negative) break :blk "-";
-        if (std.mem.eql(u8, sign_display, "always")) break :blk "+";
-        break :blk "";
-    };
-    var cur_prefix: []const u8 = "";
-    var suffix: []const u8 = "";
-    if (is_currency) {
-        // currencyDisplay "code" writes the ISO code followed by a NBSP; the
-        // symbol forms abut the digits directly.
-        const sym = currencySymbol(currency);
-        // A code used in place of a symbol (either explicitly, or because this
-        // build has no symbol for it) is separated from the digits by a NBSP.
-        cur_prefix = if (std.mem.eql(u8, opt.currency_display, "code") or std.mem.eql(u8, sym, currency))
-            try std.fmt.allocPrint(arena, "{s}\u{00a0}", .{currency})
-        else
-            sym;
-    }
-    if (is_percent) suffix = "%";
-
-    if (sign_prefix.len > 0) {
-        try parts.append(arena, .{
-            .type = if (sign_prefix[0] == '-') "minusSign" else "plusSign",
-            .value = sign_prefix,
-        });
-    }
-    if (cur_prefix.len > 0) try parts.append(arena, .{ .type = "currency", .value = cur_prefix });
-
-    if (std.math.isInf(value)) {
-        try parts.append(arena, .{ .type = "infinity", .value = "\u{221e}" });
-        if (suffix.len > 0) try parts.append(arena, .{ .type = "percentSign", .value = suffix });
-        return parts.items;
-    }
-
-    const scale = pow10(max_frac);
-    const scale_f: f64 = @floatFromInt(scale);
-    const inc_f: f64 = @floatFromInt(increment);
-    const umode = unsignedRoundingMode(opt.rounding_mode, negative);
-    // Round in units of `increment`, then scale back up.
-    const scaled: f64 = roundMagnitude(n * scale_f / inc_f, umode) * inc_f;
-    // Guard the float→int conversion: a value large enough to overflow u64 (or NaN)
-    // would panic @intFromFloat. Saturate instead of crashing.
-    const scaled_u: u64 = if (std.math.isNan(scaled) or scaled < 0 or scaled >= 1.8446744073709552e19)
-        std.math.maxInt(u64)
-    else
-        @intFromFloat(scaled);
-    const int_part = scaled_u / scale;
-    const frac_part = scaled_u % scale;
-
-    // The integer digits are emitted as alternating integer/group runs, which is
-    // what distinguishes formatToParts from a plain grouped string.
-    const int_str = try groupInteger(arena, int_part, group);
-    var run_start: usize = 0;
-    for (int_str, 0..) |c, i| {
-        if (c != ',') continue;
-        try parts.append(arena, .{ .type = "integer", .value = int_str[run_start..i] });
-        try parts.append(arena, .{ .type = "group", .value = "," });
-        run_start = i + 1;
-    }
-    try parts.append(arena, .{ .type = "integer", .value = int_str[run_start..] });
-
-    // Fraction: zero-pad to max_frac, then trim trailing zeros down to min_frac.
-    if (max_frac > 0 and !(opt.strip_if_integer and frac_part == 0)) {
-        const buf = try std.fmt.allocPrint(arena, "{d:0>[1]}", .{ frac_part, max_frac });
-        var keep = buf.len;
-        while (keep > min_frac and buf[keep - 1] == '0') keep -= 1;
-        if (keep > 0) {
-            try parts.append(arena, .{ .type = "decimal", .value = "." });
-            try parts.append(arena, .{ .type = "fraction", .value = buf[0..keep] });
-        }
-    }
-
-    if (suffix.len > 0) try parts.append(arena, .{ .type = "percentSign", .value = suffix });
-    // `style: "unit"` appends the unit after a space (en-US "short"/"long"; the
-    // per-unit pattern nuances of CLDR are approximated by one shape).
-    if (opt.unit.len > 0 and std.mem.eql(u8, style, "unit")) {
-        try parts.append(arena, .{ .type = "literal", .value = " " });
-        const long = std.mem.eql(u8, opt.unit_display, "long");
-        const sym = unitSymbol(opt.unit, long);
-        // The long form is a full English noun, so it pluralizes.
-        try parts.append(arena, .{ .type = "unit", .value = if (long and @abs(value) != 1)
-            try std.fmt.allocPrint(arena, "{s}s", .{sym})
-        else
-            sym });
-    }
-    return parts.items;
-}
-
-/// `format`: the part values concatenated.
-fn formatNumber(arena: std.mem.Allocator, value: f64, opt: NfOptions) ![]const u8 {
-    const parts = try formatNumberParts(arena, value, opt);
-    var out: std.ArrayList(u8) = .empty;
-    for (parts) |p| try out.appendSlice(arena, p.value);
-    return out.items;
-}
-
-/// The en-US symbol for `code`, or the code itself when this build has no
-/// symbol for it (which is what ECMA-402 falls back to).
-fn currencySymbol(code: []const u8) []const u8 {
-    if (std.mem.eql(u8, code, "USD")) return "$";
-    if (std.mem.eql(u8, code, "EUR")) return "\u{20ac}";
-    if (std.mem.eql(u8, code, "GBP")) return "\u{a3}";
-    if (std.mem.eql(u8, code, "JPY")) return "\u{a5}";
-    if (std.mem.eql(u8, code, "CNY")) return "CN\u{a5}";
-    if (std.mem.eql(u8, code, "KRW")) return "\u{20a9}";
-    if (std.mem.eql(u8, code, "INR")) return "\u{20b9}";
-    if (std.mem.eql(u8, code, "VND")) return "\u{20ab}";
-    return code;
-}
-
-/// en-US short unit symbols; unlisted units fall back to the identifier itself.
-fn unitSymbol(unit: []const u8, long: bool) []const u8 {
-    if (long) return unit;
-    const table = [_]struct { u: []const u8, s: []const u8 }{
-        .{ .u = "meter", .s = "m" },        .{ .u = "kilometer", .s = "km" },
-        .{ .u = "centimeter", .s = "cm" },  .{ .u = "millimeter", .s = "mm" },
-        .{ .u = "mile", .s = "mi" },        .{ .u = "foot", .s = "ft" },
-        .{ .u = "inch", .s = "in" },        .{ .u = "yard", .s = "yd" },
-        .{ .u = "gram", .s = "g" },         .{ .u = "kilogram", .s = "kg" },
-        .{ .u = "ounce", .s = "oz" },       .{ .u = "pound", .s = "lb" },
-        .{ .u = "second", .s = "sec" },     .{ .u = "minute", .s = "min" },
-        .{ .u = "hour", .s = "hr" },        .{ .u = "day", .s = "days" },
-        .{ .u = "week", .s = "wks" },       .{ .u = "month", .s = "mths" },
-        .{ .u = "year", .s = "yrs" },       .{ .u = "byte", .s = "byte" },
-        .{ .u = "percent", .s = "%" },      .{ .u = "liter", .s = "L" },
-        .{ .u = "celsius", .s = "\u{b0}C" }, .{ .u = "fahrenheit", .s = "\u{b0}F" },
-    };
-    for (table) |e| if (std.mem.eql(u8, e.u, unit)) return e.s;
-    return unit;
-}
-
 pub fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.error_proto_RangeError)
@@ -435,14 +135,6 @@ pub fn throwTypeErrorIntl(arena: std.mem.Allocator, msg: []const u8) anyerror {
     return error.JsException;
 }
 
-/// Coerce an Intl fraction-digits option to u32. Per ECMA-402 these must be
-/// integers in a bounded range; a NaN / negative / huge value would panic
-/// `@intFromFloat`, so validate and throw RangeError (the spec error) instead.
-fn toFracDigits(arena: std.mem.Allocator, m: f64) anyerror!u32 {
-    if (std.math.isNan(m) or m < 0 or m > 100) return throwRangeError(arena, "fraction digits value is out of range");
-    return @intFromFloat(@floor(m));
-}
-
 /// Prototypes of the three legacy services (§10/§11/§15), captured at realm
 /// setup so a `new`-less call still produces a real instance.
 var active_number_format_proto: ?*JsObject = null;
@@ -455,6 +147,48 @@ pub fn registerLegacyServiceProtos(nf: *JsObject, dtf: *JsObject, col: *JsObject
     active_collator_proto = col;
 }
 
+/// The `new`-less `Intl.NumberFormat(...)` path, for `intl_number.zig`.
+pub fn numberFormatServiceObj(arena: std.mem.Allocator) !*JsObject {
+    return legacyServiceObj(arena, active_number_format_proto);
+}
+
+/// %Intl.NumberFormat.prototype%, for `intl_number.zig`'s legacy chaining.
+pub fn numberFormatProto() ?*JsObject {
+    return active_number_format_proto;
+}
+
+/// ChainNumberFormat / ChainDateTimeFormat / ChainCollator: a `new`-less call
+/// whose `this` already inherits from the service's prototype does not build a
+/// fresh instance — it hangs `created` off the receiver under
+/// %Intl%.[[FallbackSymbol]] and returns the receiver (ECMA-402 §8.1).
+pub fn chainLegacyService(this_val: Value, created: Value, proto: ?*JsObject) !Value {
+    const target = proto orelse return created;
+    if (this_val.bits == 0 or this_val.unbox() != .object) return created;
+    const recv = this_val.toPtr().object;
+    var walk: ?*JsObject = recv.proto;
+    while (walk) |p| : (walk = p.proto) {
+        if (p == target) break;
+    } else return created;
+    const sym = realm_mod.active_sym_intl_fallback orelse return created;
+    try recv.setSymAttr(sym, created, .{ .writable = false, .enumerable = false, .configurable = false });
+    return this_val;
+}
+
+/// UnwrapNumberFormat / UnwrapDateTimeFormat: `format` and `resolvedOptions`
+/// accept the wrapper a `new`-less call produced and operate on the instance it
+/// carries. The lookup is an ordinary [[Get]], so a Proxy in between observes it.
+pub fn unwrapLegacyService(arena: std.mem.Allocator, this_val: Value, brand: []const u8) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object) return this_val;
+    if (this_val.toPtr().object.getOwn(brand) != null) return this_val;
+    const sym = realm_mod.active_sym_intl_fallback orelse return this_val;
+    const inner = if (realm_mod.active_context) |c|
+        try c.getPropSym(arena, this_val, sym)
+    else
+        (this_val.toPtr().object.getSym(sym) orelse Value{});
+    if (inner.bits != 0 and inner.unbox() == .object) return inner;
+    return this_val;
+}
+
 fn legacyServiceObj(arena: std.mem.Allocator, proto: ?*JsObject) !*JsObject {
     const p = proto orelse realm_mod.active_object_proto;
     return if (realm_mod.active_heap) |h|
@@ -463,32 +197,17 @@ fn legacyServiceObj(arena: std.mem.Allocator, proto: ?*JsObject) !*JsObject {
         try JsObject.create(arena, p);
 }
 
-fn upperDup(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+pub fn upperDup(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     const buf = try arena.alloc(u8, s.len);
     for (s, 0..) |c, i| buf[i] = std.ascii.toUpper(c);
     return buf;
-}
-
-/// Significant-digit options are restricted to 1..21.
-fn toSigDigits(arena: std.mem.Allocator, m: f64) anyerror!u32 {
-    if (std.math.isNan(m) or m < 1 or m > 21) return throwRangeError(arena, "significant digits value is out of range");
-    return @intFromFloat(@floor(m));
-}
-
-/// roundingIncrement is restricted to this exact set by ECMA-402.
-fn isValidRoundingIncrement(x: f64) bool {
-    if (x != @floor(x)) return false;
-    for ([_]f64{ 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000 }) |v| {
-        if (x == v) return true;
-    }
-    return false;
 }
 
 // ----------------------------------------------------------------- NumberFormat ---
 
 /// GetOption(options, key, number, …): reads through the active context (so a
 /// throwing getter propagates) and ToNumber-coerces. Absent/undefined → null.
-fn dnGetNumOption(arena: std.mem.Allocator, options: Value, key: []const u8) anyerror!?f64 {
+pub fn dnGetNumOption(arena: std.mem.Allocator, options: Value, key: []const u8) anyerror!?f64 {
     const v = if (realm_mod.active_context) |c|
         try c.getProp(arena, options, key)
     else if (options.bits != 0 and options.unbox() == .object)
@@ -499,390 +218,204 @@ fn dnGetNumOption(arena: std.mem.Allocator, options: Value, key: []const u8) any
     return try realm_mod.toNumberValue(arena, v);
 }
 
-/// IsWellFormedCurrencyCode: exactly three ASCII letters.
-fn isWellFormedCurrencyCode(s: []const u8) bool {
-    if (s.len != 3) return false;
-    for (s) |c| if (!std.ascii.isAlphabetic(c)) return false;
+// --------------------------------------------------------------- DateTimeFormat ---
+
+/// The date-time component options, in the order `CreateDateTimeFormat` reads
+/// them (§11.1.2 step 36 — Table 7 order, which `constructor-options-order.js`
+/// observes) together with the values each one accepts.
+const dtf_components = [_]struct { key: []const u8, slot: []const u8, allowed: []const []const u8 }{
+    .{ .key = "weekday", .slot = "__dtf_weekday", .allowed = &.{ "narrow", "short", "long" } },
+    .{ .key = "era", .slot = "__dtf_era", .allowed = &.{ "narrow", "short", "long" } },
+    .{ .key = "year", .slot = "__dtf_year", .allowed = &.{ "2-digit", "numeric" } },
+    .{ .key = "month", .slot = "__dtf_month", .allowed = &.{ "2-digit", "numeric", "narrow", "short", "long" } },
+    .{ .key = "day", .slot = "__dtf_day", .allowed = &.{ "2-digit", "numeric" } },
+    .{ .key = "dayPeriod", .slot = "__dtf_dayPeriod", .allowed = &.{ "narrow", "short", "long" } },
+    .{ .key = "hour", .slot = "__dtf_hour", .allowed = &.{ "2-digit", "numeric" } },
+    .{ .key = "minute", .slot = "__dtf_minute", .allowed = &.{ "2-digit", "numeric" } },
+    .{ .key = "second", .slot = "__dtf_second", .allowed = &.{ "2-digit", "numeric" } },
+};
+
+const dtf_styles = [_][]const u8{ "full", "long", "medium", "short" };
+
+/// A Unicode `type` subtag: `alphanum{3,8}` joined by `-`. Both the `calendar`
+/// and `numberingSystem` options must match it (§11.1.2 steps 5 / 8) — anything
+/// else is a RangeError before the value is even looked up.
+fn isWellFormedUnicodeType(s: []const u8) bool {
+    var it = std.mem.splitScalar(u8, s, '-');
+    var any = false;
+    while (it.next()) |seg| {
+        any = true;
+        if (seg.len < 3 or seg.len > 8) return false;
+        for (seg) |c| if (!std.ascii.isAlphanumeric(c)) return false;
+    }
+    return any;
+}
+
+/// A resolved DateTimeFormat time zone: the identifier `resolvedOptions()`
+/// reports (never Link-canonicalized — §11.1.2 keeps the requested spelling),
+/// the zone whose offsets and name it formats with, and its fixed UTC offset in
+/// milliseconds. `id` and `zone` differ only for a tzdb Link.
+const DtfZone = struct { id: []const u8, zone: []const u8, offset_ms: i64 };
+
+/// tzdb `backward` Links for the zones this build ships offsets for. The Link
+/// name stays visible in `resolvedOptions().timeZone`, but formatting has to
+/// follow the target — `Asia/Calcutta` and `Asia/Kolkata` must agree.
+const iana_links = [_][2][]const u8{
+    .{ "Asia/Calcutta", "Asia/Kolkata" },
+    .{ "America/Buenos_Aires", "America/Argentina/Buenos_Aires" },
+    .{ "Asia/Chongqing", "Asia/Shanghai" },
+    .{ "Australia/Canberra", "Australia/Sydney" },
+    .{ "Europe/Kiev", "Europe/Kyiv" },
+    .{ "Europe/Nicosia", "Asia/Nicosia" },
+    .{ "US/Eastern", "America/New_York" },
+    .{ "US/Central", "America/Chicago" },
+    .{ "US/Mountain", "America/Denver" },
+    .{ "US/Pacific", "America/Los_Angeles" },
+};
+
+/// True for a syntactically valid IANA identifier: `Area/Location[/Sub]`, ASCII
+/// only. Names without a `/` are the legacy non-IANA abbreviations (`PST`,
+/// `IST`, …) that ECMA-402 rejects, and a non-ASCII byte is never valid.
+fn isPlausibleIanaName(s: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, s, '/') == null) return false;
+    var it = std.mem.splitScalar(u8, s, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or seg.len > 14) return false;
+        for (seg) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '+' and c != '.') return false;
+        }
+    }
     return true;
 }
 
-/// IsWellFormedUnitIdentifier: a sanctioned single unit, or `x-per-y` over two
-/// of them.
-fn isWellFormedUnitIdentifier(s: []const u8) bool {
-    if (std.mem.indexOf(u8, s, "-per-")) |i|
-        return isSanctionedUnit(s[0..i]) and isSanctionedUnit(s[i + 5 ..]);
-    return isSanctionedUnit(s);
-}
-
-fn isSanctionedUnit(s: []const u8) bool {
-    const units = [_][]const u8{
-        "acre",       "bit",        "byte",   "celsius",     "centimeter", "day",        "degree",     "fahrenheit",
-        "fluid-ounce", "foot",      "gallon", "gigabit",     "gigabyte",   "gram",       "hectare",    "hour",
-        "inch",       "kilobit",    "kilobyte", "kilogram",  "kilometer",  "liter",      "megabit",    "megabyte",
-        "meter",      "microsecond", "mile",  "mile-scandinavian", "milliliter", "millimeter", "millisecond", "minute",
-        "month",      "nanosecond", "ounce",  "percent",     "petabyte",   "pound",      "second",     "stone",
-        "terabit",    "terabyte",   "week",   "yard",        "year",
+/// Parse a `±HH`, `±HHMM` or `±HH:MM` offset identifier into minutes.
+fn parseOffsetMinutes(s: []const u8) ?i64 {
+    if (s.len < 3) return null;
+    const sign: i64 = switch (s[0]) {
+        '+' => 1,
+        '-' => -1,
+        else => return null,
     };
-    for (units) |u| if (std.mem.eql(u8, u, s)) return true;
-    return false;
+    const body = s[1..];
+    var h: i64 = 0;
+    var m: i64 = 0;
+    if (body.len == 2) {
+        h = std.fmt.parseInt(i64, body, 10) catch return null;
+    } else if (body.len == 4) {
+        h = std.fmt.parseInt(i64, body[0..2], 10) catch return null;
+        m = std.fmt.parseInt(i64, body[2..4], 10) catch return null;
+    } else if (body.len == 5 and body[2] == ':') {
+        h = std.fmt.parseInt(i64, body[0..2], 10) catch return null;
+        m = std.fmt.parseInt(i64, body[3..5], 10) catch return null;
+    } else return null;
+    if (h > 23 or m > 59) return null;
+    return sign * (h * 60 + m);
 }
 
-/// `new Intl.NumberFormat(locales, options)` — store resolved options on `this`.
-/// InitializeNumberFormat (§15.1.2) reads the options in the order below; each
-/// read goes through GetOption so a throwing getter propagates and an
-/// out-of-range value is a RangeError before any later option is touched.
-pub fn nativeNumberFormatCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    // Intl.NumberFormat is callable without `new` (§15.1.1 ChainNumberFormat);
-    // the plain call still yields an instance, so fall back to the service's own
-    // prototype rather than a bare object.
-    const constructing = realm_mod.active_constructing;
-    realm_mod.active_constructing = false;
-    const obj = if (constructing and this_val.bits != 0 and this_val.unbox() == .object)
-        this_val.toPtr().object
-    else
-        try legacyServiceObj(arena, active_number_format_proto);
-    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
-    const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
+/// The `Etc/GMT±N` family, whose sign is POSIX-inverted (`Etc/GMT-3` is UTC+3).
+/// Returns the offset in minutes, or null when `s` is not one of them.
+fn etcGmtOffsetMinutes(s: []const u8) ?i64 {
+    if (!std.mem.startsWith(u8, s, "Etc/GMT")) return null;
+    const rest = s["Etc/GMT".len..];
+    if (rest.len == 0) return 0;
+    const sign: i64 = switch (rest[0]) {
+        '+' => -1,
+        '-' => 1,
+        else => return null,
+    };
+    const n = std.fmt.parseInt(i64, rest[1..], 10) catch return null;
+    if (n > 14) return null;
+    return sign * n * 60;
+}
 
-    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
-    if (try dnGetOption(arena, options, "numberingSystem", &.{}, null)) |ns| {
-        if (!isWellFormedNumberingSystem(ns)) return throwRangeError(arena, "invalid numberingSystem");
+/// Resolve the `timeZone` option (§11.1.2 step 30). Unlike Temporal's resolver
+/// this keeps the requested spelling — `Asia/Calcutta` stays `Asia/Calcutta` —
+/// and accepts any well-formed IANA name, since this build ships offsets for
+/// only a fraction of the database.
+fn resolveDtfTimeZone(arena: std.mem.Allocator, s: []const u8) !DtfZone {
+    if (std.ascii.eqlIgnoreCase(s, "UTC")) return .{ .id = "UTC", .zone = "UTC", .offset_ms = 0 };
+    if (parseOffsetMinutes(s)) |mins| {
+        // A zero offset has one canonical spelling: "-00:00" resolves to "+00:00".
+        const sign: u8 = if (mins < 0) '-' else '+';
+        const abs: u64 = @intCast(@abs(mins));
+        const id = try std.fmt.allocPrint(arena, "{c}{d:0>2}:{d:0>2}", .{ sign, abs / 60, abs % 60 });
+        return .{ .id = id, .zone = id, .offset_ms = mins * 60_000 };
     }
-    const style = (try dnGetOption(arena, options, "style", &.{ "decimal", "percent", "currency", "unit" }, "decimal")).?;
-    const is_currency = std.mem.eql(u8, style, "currency");
-    const currency_opt = try dnGetOption(arena, options, "currency", &.{}, null);
-    if (currency_opt) |c| {
-        if (!isWellFormedCurrencyCode(c)) return throwRangeError(arena, "invalid currency code");
-    } else if (is_currency) {
-        return throwTypeErrorIntl(arena, "Intl.NumberFormat: `currency` is required when style is \"currency\"");
+    if (etcGmtOffsetMinutes(s)) |mins| return .{ .id = s, .zone = s, .offset_ms = mins * 60_000 };
+    for ([_][]const u8{ "GMT", "Etc/UTC", "Etc/UCT", "Etc/Universal", "Etc/Zulu", "Etc/Greenwich" }) |z| {
+        if (std.mem.eql(u8, s, z)) return .{ .id = s, .zone = s, .offset_ms = 0 };
     }
-    const currency_display = (try dnGetOption(arena, options, "currencyDisplay", &.{ "code", "symbol", "narrowSymbol", "name" }, "symbol")).?;
-    const currency_sign = (try dnGetOption(arena, options, "currencySign", &.{ "standard", "accounting" }, "standard")).?;
-    const unit_opt = try dnGetOption(arena, options, "unit", &.{}, null);
-    if (unit_opt) |u| {
-        if (!isWellFormedUnitIdentifier(u)) return throwRangeError(arena, "invalid unit identifier");
-    } else if (std.mem.eql(u8, style, "unit")) {
-        return throwTypeErrorIntl(arena, "Intl.NumberFormat: `unit` is required when style is \"unit\"");
+    var target = s;
+    for (iana_links) |link| {
+        if (std.mem.eql(u8, s, link[0])) target = link[1];
     }
-    const unit_display = (try dnGetOption(arena, options, "unitDisplay", &.{ "short", "narrow", "long" }, "short")).?;
+    if (t_tzdata.lookupDef(target)) |def|
+        return .{ .id = s, .zone = target, .offset_ms = @as(i64, def.std_offset_sec) * 1000 };
+    if (isPlausibleIanaName(s)) return .{ .id = s, .zone = target, .offset_ms = 0 };
+    return throwRangeError(arena, "invalid time zone");
+}
 
-    const currency = try upperDup(arena, currency_opt orelse "USD");
-    const is_jpy = std.mem.eql(u8, currency, "JPY");
-    // Default fraction digits per style (en-US).
-    const default_min: u32 = if (is_currency) (if (is_jpy) 0 else 2) else 0;
-    const default_max: u32 = if (is_currency) (if (is_jpy) 0 else 2) else if (std.mem.eql(u8, style, "percent")) 0 else 3;
+/// The ten digits of each decimal numbering system this build can render, as
+/// UTF-8 (§11.5.5 uses them for every numeric date-time field). `null` for an
+/// identifier we have no digits for — the caller then falls back to `latn`.
+fn numberingSystemDigits(ns: []const u8) ?[10][]const u8 {
+    const table = .{
+        .{ "latn", [10][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" } },
+        .{ "arab", [10][]const u8{ "\u{0660}", "\u{0661}", "\u{0662}", "\u{0663}", "\u{0664}", "\u{0665}", "\u{0666}", "\u{0667}", "\u{0668}", "\u{0669}" } },
+        .{ "arabext", [10][]const u8{ "\u{06f0}", "\u{06f1}", "\u{06f2}", "\u{06f3}", "\u{06f4}", "\u{06f5}", "\u{06f6}", "\u{06f7}", "\u{06f8}", "\u{06f9}" } },
+        .{ "beng", [10][]const u8{ "\u{09e6}", "\u{09e7}", "\u{09e8}", "\u{09e9}", "\u{09ea}", "\u{09eb}", "\u{09ec}", "\u{09ed}", "\u{09ee}", "\u{09ef}" } },
+        .{ "deva", [10][]const u8{ "\u{0966}", "\u{0967}", "\u{0968}", "\u{0969}", "\u{096a}", "\u{096b}", "\u{096c}", "\u{096d}", "\u{096e}", "\u{096f}" } },
+        .{ "fullwide", [10][]const u8{ "\u{ff10}", "\u{ff11}", "\u{ff12}", "\u{ff13}", "\u{ff14}", "\u{ff15}", "\u{ff16}", "\u{ff17}", "\u{ff18}", "\u{ff19}" } },
+        .{ "gujr", [10][]const u8{ "\u{0ae6}", "\u{0ae7}", "\u{0ae8}", "\u{0ae9}", "\u{0aea}", "\u{0aeb}", "\u{0aec}", "\u{0aed}", "\u{0aee}", "\u{0aef}" } },
+        .{ "guru", [10][]const u8{ "\u{0a66}", "\u{0a67}", "\u{0a68}", "\u{0a69}", "\u{0a6a}", "\u{0a6b}", "\u{0a6c}", "\u{0a6d}", "\u{0a6e}", "\u{0a6f}" } },
+        .{ "hanidec", [10][]const u8{ "\u{3007}", "\u{4e00}", "\u{4e8c}", "\u{4e09}", "\u{56db}", "\u{4e94}", "\u{516d}", "\u{4e03}", "\u{516b}", "\u{4e5d}" } },
+        .{ "khmr", [10][]const u8{ "\u{17e0}", "\u{17e1}", "\u{17e2}", "\u{17e3}", "\u{17e4}", "\u{17e5}", "\u{17e6}", "\u{17e7}", "\u{17e8}", "\u{17e9}" } },
+        .{ "knda", [10][]const u8{ "\u{0ce6}", "\u{0ce7}", "\u{0ce8}", "\u{0ce9}", "\u{0cea}", "\u{0ceb}", "\u{0cec}", "\u{0ced}", "\u{0cee}", "\u{0cef}" } },
+        .{ "mlym", [10][]const u8{ "\u{0d66}", "\u{0d67}", "\u{0d68}", "\u{0d69}", "\u{0d6a}", "\u{0d6b}", "\u{0d6c}", "\u{0d6d}", "\u{0d6e}", "\u{0d6f}" } },
+        .{ "mymr", [10][]const u8{ "\u{1040}", "\u{1041}", "\u{1042}", "\u{1043}", "\u{1044}", "\u{1045}", "\u{1046}", "\u{1047}", "\u{1048}", "\u{1049}" } },
+        .{ "orya", [10][]const u8{ "\u{0b66}", "\u{0b67}", "\u{0b68}", "\u{0b69}", "\u{0b6a}", "\u{0b6b}", "\u{0b6c}", "\u{0b6d}", "\u{0b6e}", "\u{0b6f}" } },
+        .{ "tamldec", [10][]const u8{ "\u{0be6}", "\u{0be7}", "\u{0be8}", "\u{0be9}", "\u{0bea}", "\u{0beb}", "\u{0bec}", "\u{0bed}", "\u{0bee}", "\u{0bef}" } },
+        .{ "telu", [10][]const u8{ "\u{0c66}", "\u{0c67}", "\u{0c68}", "\u{0c69}", "\u{0c6a}", "\u{0c6b}", "\u{0c6c}", "\u{0c6d}", "\u{0c6e}", "\u{0c6f}" } },
+        .{ "thai", [10][]const u8{ "\u{0e50}", "\u{0e51}", "\u{0e52}", "\u{0e53}", "\u{0e54}", "\u{0e55}", "\u{0e56}", "\u{0e57}", "\u{0e58}", "\u{0e59}" } },
+        .{ "tibt", [10][]const u8{ "\u{0f20}", "\u{0f21}", "\u{0f22}", "\u{0f23}", "\u{0f24}", "\u{0f25}", "\u{0f26}", "\u{0f27}", "\u{0f28}", "\u{0f29}" } },
+    };
+    inline for (table) |e| if (std.mem.eql(u8, ns, e[0])) return e[1];
+    return null;
+}
 
-    // SetNumberFormatDigitOptions (§15.1.3).
-    const min_int = if (try dnGetNumOption(arena, options, "minimumIntegerDigits")) |m| blk: {
-        if (std.math.isNan(m) or m < 1 or m > 21) return throwRangeError(arena, "minimumIntegerDigits is out of range");
-        break :blk @as(u32, @intFromFloat(@floor(m)));
-    } else 1;
-    const min_frac_v = try dnGetNumOption(arena, options, "minimumFractionDigits");
-    const max_frac_v = try dnGetNumOption(arena, options, "maximumFractionDigits");
-    const min_sig_v = try dnGetNumOption(arena, options, "minimumSignificantDigits");
-    const max_sig_v = try dnGetNumOption(arena, options, "maximumSignificantDigits");
-    const min_frac: u32 = if (min_frac_v) |m| try toFracDigits(arena, m) else default_min;
-    const max_frac: u32 = if (max_frac_v) |m| try toFracDigits(arena, m) else @max(default_max, min_frac);
-    if (min_frac > max_frac) return throwRangeError(arena, "minimumFractionDigits exceeds maximumFractionDigits");
-
-    const notation = (try dnGetOption(arena, options, "notation", &.{ "standard", "scientific", "engineering", "compact" }, "standard")).?;
-    _ = try dnGetOption(arena, options, "compactDisplay", &.{ "short", "long" }, "short");
-    const grouping_v = if (realm_mod.active_context) |c| try c.getProp(arena, options, "useGrouping") else Value{};
-    const group: bool = if (grouping_v.bits == 0 or grouping_v.unbox() == .undefined_)
-        true
-    else if (grouping_v.unbox() == .string) blk: {
-        const gs = grouping_v.unbox().string;
-        for ([_][]const u8{ "min2", "auto", "always", "true", "false" }) |a| {
-            if (std.mem.eql(u8, a, gs)) break :blk !std.mem.eql(u8, gs, "false");
+/// Rewrite the ASCII digits of every numeric part into `ns`. The decimal mark
+/// before the fractional-second digits follows the same script.
+fn applyNumberingSystem(arena: std.mem.Allocator, parts: []DTPart, ns: []const u8) !void {
+    const digits = numberingSystemDigits(ns) orelse return;
+    if (std.mem.eql(u8, ns, "latn")) return;
+    const arabic_script = std.mem.eql(u8, ns, "arab") or std.mem.eql(u8, ns, "arabext");
+    for (parts) |*p| {
+        if (arabic_script and std.mem.eql(u8, p.type, "literal") and std.mem.eql(u8, p.value, ".")) {
+            p.value = "\u{066b}";
+            continue;
         }
-        return throwRangeError(arena, "invalid useGrouping");
-    } else val_mod.toBoolean(grouping_v);
-    const sign_display = (try dnGetOption(arena, options, "signDisplay", &.{ "auto", "never", "always", "exceptZero", "negative" }, "auto")).?;
-    const mode_str = (try dnGetOption(arena, options, "roundingMode", &.{}, "halfExpand")).?;
-    if (roundModeFromString(mode_str) == null) return throwRangeError(arena, "invalid roundingMode");
-    var inc: u32 = 1;
-    if (try dnGetNumOption(arena, options, "roundingIncrement")) |ri| {
-        if (!isValidRoundingIncrement(ri)) return throwRangeError(arena, "invalid roundingIncrement");
-        inc = @intFromFloat(ri);
+        if (std.mem.indexOfNone(u8, p.value, "0123456789") != null) continue;
+        if (p.value.len == 0) continue;
+        var out = std.ArrayListUnmanaged(u8){};
+        for (p.value) |c| try out.appendSlice(arena, digits[c - '0']);
+        p.value = out.items;
     }
-    if (try dnGetOption(arena, options, "trailingZeroDisplay", &.{ "auto", "stripIfInteger" }, "auto")) |tz| {
-        if (std.mem.eql(u8, tz, "stripIfInteger"))
-            try obj.set("__intl_stripZero", try val_mod.makeBool(arena, true));
-    }
-
-    try obj.set("__intl_style", try val_mod.makeString(arena, style));
-    try obj.set("__intl_currency", try val_mod.makeString(arena, currency));
-    try obj.set("__intl_currencyDisplay", try val_mod.makeString(arena, currency_display));
-    try obj.set("__intl_currencySign", try val_mod.makeString(arena, currency_sign));
-    if (unit_opt) |u| try obj.set("__intl_unit", try val_mod.makeString(arena, u));
-    try obj.set("__intl_unitDisplay", try val_mod.makeString(arena, unit_display));
-    try obj.set("__intl_notation", try val_mod.makeString(arena, notation));
-    try obj.set("__intl_minInt", try val_mod.makeNumber(arena, @floatFromInt(min_int)));
-    try obj.set("__intl_minFrac", try val_mod.makeNumber(arena, @floatFromInt(min_frac)));
-    try obj.set("__intl_maxFrac", try val_mod.makeNumber(arena, @floatFromInt(max_frac)));
-    try obj.set("__intl_group", try val_mod.makeBool(arena, group));
-    try obj.set("__intl_sign", try val_mod.makeString(arena, sign_display));
-    try obj.set("__intl_roundMode", try val_mod.makeString(arena, mode_str));
-    try obj.set("__intl_roundInc", try val_mod.makeNumber(arena, @floatFromInt(inc)));
-
-    if (min_sig_v != null or max_sig_v != null) {
-        const min_sig = if (min_sig_v) |m| try toSigDigits(arena, m) else 1;
-        const max_sig = if (max_sig_v) |m| try toSigDigits(arena, m) else 21;
-        if (min_sig > max_sig) return throwRangeError(arena, "minimumSignificantDigits exceeds maximumSignificantDigits");
-        try obj.set("__intl_minSig", try val_mod.makeNumber(arena, @floatFromInt(min_sig)));
-        try obj.set("__intl_maxSig", try val_mod.makeNumber(arena, @floatFromInt(max_sig)));
-    }
-    return val_mod.makeObject(arena, obj);
 }
 
-pub fn nativeNumberFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    // The bound format function passes its NumberFormat via native userdata; a
-    // direct `nf.format(x)` call arrives with the instance as `this`.
-    const recv: Value = if (val_mod.g_active_native_data) |d|
-        try val_mod.makeObject(arena, @ptrCast(@alignCast(d)))
-    else
-        this_val;
-    try requireNumberFormat(arena, recv);
-    const n = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
-    const s = try formatNumber(arena, n, readNfOptions(recv));
-    return val_mod.makeString(arena, s);
+/// The locale's default hour cycle. Only Japanese differs among the locales the
+/// suite exercises (`resolvedOptions/hourCycle-default.js` asserts exactly this).
+fn defaultHourCycle(locale: []const u8) []const u8 {
+    return if (std.mem.eql(u8, primaryLanguage(locale), "ja")) "h11" else "h12";
 }
 
-/// §15.3.3 `get Intl.NumberFormat.prototype.format`: an accessor whose getter
-/// returns a function bound to this instance, created once and cached in the
-/// `[[BoundFormat]]` slot so repeated reads give the same object.
-pub fn nativeNumberFormatFormatGetter(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    try requireNumberFormat(arena, this_val);
-    const o = this_val.toPtr().object;
-    if (o.getOwn("[[BoundFormat]]")) |bound| return bound;
-    const bound = try val_mod.makeNativeFunctionDataLen(arena, nativeNumberFormatFormat, @ptrCast(o), 1);
-    _ = try o.defineOwnData("[[BoundFormat]]", bound, .{ .writable = false, .enumerable = false, .configurable = false });
-    return bound;
-}
-
-/// Brand check: our NumberFormat instances carry the internal `__intl_style`
-/// marker, so anything without it is not an initialized NumberFormat.
-fn requireNumberFormat(arena: std.mem.Allocator, this_val: Value) !void {
-    if (this_val.bits == 0 or this_val.unbox() != .object or
-        this_val.toPtr().object.getOwn("__intl_style") == null)
-        return realm_mod.throwTypeError(arena, "called on incompatible receiver");
-}
-
-fn readNfOptions(this_val: Value) NfOptions {
-    var r = NfOptions{};
-    if (this_val.bits == 0 or this_val.unbox() != .object) return r;
-    const o = this_val.toPtr().object;
-    if (o.get("__intl_style")) |v| if (v.bits != 0 and v.unbox() == .string) {
-        r.style = v.unbox().string;
-    };
-    if (o.get("__intl_currency")) |v| if (v.bits != 0 and v.unbox() == .string) {
-        r.currency = v.unbox().string;
-    };
-    if (o.get("__intl_minFrac")) |v| if (v.bits != 0 and v.unbox() == .number) {
-        r.min_frac = @intFromFloat(v.unbox().number);
-    };
-    if (o.get("__intl_maxFrac")) |v| if (v.bits != 0 and v.unbox() == .number) {
-        r.max_frac = @intFromFloat(v.unbox().number);
-    };
-    if (o.get("__intl_group")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
-        r.group = v.unbox().boolean;
-    };
-    if (o.get("__intl_sign")) |v| if (v.bits != 0 and v.unbox() == .string) {
-        r.sign_display = v.unbox().string;
-    };
-    if (o.get("__intl_roundMode")) |v| if (v.bits != 0 and v.unbox() == .string) {
-        r.rounding_mode = roundModeFromString(v.unbox().string) orelse .half_expand;
-    };
-    if (o.get("__intl_roundInc")) |v| if (v.bits != 0 and v.unbox() == .number) {
-        r.rounding_increment = @intFromFloat(v.unbox().number);
-    };
-    if (o.get("__intl_minSig")) |v| if (v.bits != 0 and v.unbox() == .number) {
-        r.min_sig = @intFromFloat(v.unbox().number);
-        r.use_sig = true;
-    };
-    if (o.get("__intl_maxSig")) |v| if (v.bits != 0 and v.unbox() == .number) {
-        r.max_sig = @intFromFloat(v.unbox().number);
-    };
-    if (o.get("__intl_stripZero")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
-        r.strip_if_integer = v.unbox().boolean;
-    };
-    if (o.get("__intl_currencyDisplay")) |v| if (v.bits != 0 and v.unbox() == .string) {
-        r.currency_display = v.unbox().string;
-    };
-    if (o.get("__intl_unit")) |v| if (v.bits != 0 and v.unbox() == .string) {
-        r.unit = v.unbox().string;
-    };
-    if (o.get("__intl_unitDisplay")) |v| if (v.bits != 0 and v.unbox() == .string) {
-        r.unit_display = v.unbox().string;
-    };
-    return r;
-}
-
-fn nfParts(arena: std.mem.Allocator, this_val: Value, value: f64) ![]NumberPart {
-    const r = readNfOptions(this_val);
-    return formatNumberParts(arena, value, r);
-}
-
-/// Build the JS array of `{type, value}` objects `formatToParts` returns.
-fn partsToArray(arena: std.mem.Allocator, parts: []const NumberPart) !Value {
-    const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
-    for (parts) |p| {
-        const o = if (realm_mod.active_heap) |h|
-            try JsObject.createOnHeap(h, realm_mod.active_object_proto)
-        else
-            try JsObject.create(arena, realm_mod.active_object_proto);
-        try o.set("type", try val_mod.makeString(arena, p.type));
-        try o.set("value", try val_mod.makeString(arena, p.value));
-        if (p.source) |src| try o.set("source", try val_mod.makeString(arena, src));
-        try arr.appendElement(try val_mod.makeObject(arena, o));
-    }
-    return val_mod.makeObject(arena, arr);
-}
-
-pub fn nativeNumberFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    try requireNumberFormat(arena, this_val);
-    const n = if (args.len > 0) getNum(args[0]) else std.math.nan(f64);
-    return partsToArray(arena, try nfParts(arena, this_val, n));
-}
-
-/// The en-US range separator is an en dash with no surrounding spaces.
-const range_separator = "\u{2013}";
-
-/// `formatRange` / `formatRangeToParts`. When both ends format identically the
-/// spec collapses the range to the single approximate value; we format the two
-/// ends and join them, which is what the en-US pattern does.
-fn rangeParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) ![]NumberPart {
-    try requireNumberFormat(arena, this_val);
-    // Both endpoints are required: undefined is a TypeError, NaN a RangeError.
-    const start = if (args.len > 0) args[0] else Value{};
-    const end = if (args.len > 1) args[1] else Value{};
-    if (start.bits == 0 or start.unbox() == .undefined_ or end.bits == 0 or end.unbox() == .undefined_)
-        return realm_mod.throwTypeError(arena, "formatRange requires two arguments");
-    // ToIntlMathematicalValue rejects Symbols rather than coercing them.
-    if (start.unbox() == .symbol or end.unbox() == .symbol)
-        return realm_mod.throwTypeError(arena, "cannot convert a Symbol to a number");
-    const a = getNum(start);
-    const b = getNum(end);
-    if (std.math.isNan(a) or std.math.isNan(b)) return throwRangeError(arena, "formatRange arguments must not be NaN");
-    var out: std.ArrayList(NumberPart) = .empty;
-    for (try nfParts(arena, this_val, a)) |p| {
-        try out.append(arena, .{ .type = p.type, .value = p.value, .source = "startRange" });
-    }
-    try out.append(arena, .{ .type = "literal", .value = range_separator, .source = "shared" });
-    for (try nfParts(arena, this_val, b)) |p| {
-        try out.append(arena, .{ .type = p.type, .value = p.value, .source = "endRange" });
-    }
-    return out.items;
-}
-
-pub fn nativeNumberFormatFormatRange(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const parts = try rangeParts(arena, this_val, args);
-    var out: std.ArrayList(u8) = .empty;
-    for (parts) |p| try out.appendSlice(arena, p.value);
-    return val_mod.makeString(arena, out.items);
-}
-
-pub fn nativeNumberFormatFormatRangeToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return partsToArray(arena, try rangeParts(arena, this_val, args));
-}
-
-/// `nf.resolvedOptions()` — en-US, latn numbering system.
-pub fn nativeNumberFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    const r = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
-    else
-        try JsObject.create(arena, realm_mod.active_object_proto);
-    var style: []const u8 = "decimal";
-    var currency: []const u8 = "";
-    var min_frac: f64 = 0;
-    var max_frac: f64 = 3;
-    var group = true;
-    var sign_display: []const u8 = "auto";
-    if (this_val.bits != 0 and this_val.unbox() == .object) {
-        const o = this_val.toPtr().object;
-        if (o.get("__intl_style")) |v| if (v.bits != 0 and v.unbox() == .string) {
-            style = v.unbox().string;
-        };
-        if (o.get("__intl_sign")) |v| if (v.bits != 0 and v.unbox() == .string) {
-            sign_display = v.unbox().string;
-        };
-        if (o.get("__intl_currency")) |v| if (v.bits != 0 and v.unbox() == .string) {
-            currency = v.unbox().string;
-        };
-        if (o.get("__intl_minFrac")) |v| if (v.bits != 0 and v.unbox() == .number) {
-            min_frac = v.unbox().number;
-        };
-        if (o.get("__intl_maxFrac")) |v| if (v.bits != 0 and v.unbox() == .number) {
-            max_frac = v.unbox().number;
-        };
-        if (o.get("__intl_group")) |v| if (v.bits != 0 and v.unbox() == .boolean) {
-            group = v.unbox().boolean;
-        };
-    }
-    const o = if (this_val.bits != 0 and this_val.unbox() == .object) this_val.toPtr().object else null;
-    const slotStr = struct {
-        fn f(obj: ?*JsObject, key: []const u8, dflt: []const u8) []const u8 {
-            const oo = obj orelse return dflt;
-            const v = oo.get(key) orelse return dflt;
-            if (v.bits == 0 or v.unbox() != .string) return dflt;
-            return v.unbox().string;
-        }
-    }.f;
-    // Property order follows table 12 of §15.4.5 (the resolvedOptions test walks
-    // Object.keys in order).
-    try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
-    try r.set("numberingSystem", try val_mod.makeString(arena, "latn"));
-    try r.set("style", try val_mod.makeString(arena, style));
-    if (std.mem.eql(u8, style, "currency")) {
-        try r.set("currency", try val_mod.makeString(arena, if (currency.len > 0) currency else "USD"));
-        try r.set("currencyDisplay", try val_mod.makeString(arena, slotStr(o, "__intl_currencyDisplay", "symbol")));
-        try r.set("currencySign", try val_mod.makeString(arena, slotStr(o, "__intl_currencySign", "standard")));
-    }
-    if (std.mem.eql(u8, style, "unit")) {
-        try r.set("unit", try val_mod.makeString(arena, slotStr(o, "__intl_unit", "")));
-        try r.set("unitDisplay", try val_mod.makeString(arena, slotStr(o, "__intl_unitDisplay", "short")));
-    }
-    var min_int: f64 = 1;
-    if (o) |oo| if (oo.get("__intl_minInt")) |v| if (v.bits != 0 and v.unbox() == .number) {
-        min_int = v.unbox().number;
-    };
-    try r.set("minimumIntegerDigits", try val_mod.makeNumber(arena, min_int));
-    const has_sig = if (o) |oo| oo.get("__intl_minSig") != null else false;
-    if (has_sig) {
-        const oo = o.?;
-        if (oo.get("__intl_minSig")) |v| try r.set("minimumSignificantDigits", v);
-        if (oo.get("__intl_maxSig")) |v| try r.set("maximumSignificantDigits", v);
-    } else {
-        try r.set("minimumFractionDigits", try val_mod.makeNumber(arena, min_frac));
-        try r.set("maximumFractionDigits", try val_mod.makeNumber(arena, max_frac));
-    }
-    // Match modern Node semantics: grouping on → "auto", explicitly off → false.
-    if (group) {
-        try r.set("useGrouping", try val_mod.makeString(arena, "auto"));
-    } else {
-        try r.set("useGrouping", try val_mod.makeBool(arena, false));
-    }
-    try r.set("notation", try val_mod.makeString(arena, slotStr(o, "__intl_notation", "standard")));
-    try r.set("signDisplay", try val_mod.makeString(arena, sign_display));
-    try r.set("roundingIncrement", try val_mod.makeNumber(arena, blk: {
-        const oo = o orelse break :blk 1;
-        const v = oo.get("__intl_roundInc") orelse break :blk 1;
-        break :blk if (v.bits != 0 and v.unbox() == .number) v.unbox().number else 1;
-    }));
-    try r.set("roundingMode", try val_mod.makeString(arena, slotStr(o, "__intl_roundMode", "halfExpand")));
-    try r.set("roundingPriority", try val_mod.makeString(arena, "auto"));
-    try r.set("trailingZeroDisplay", try val_mod.makeString(arena, blk: {
-        const oo = o orelse break :blk "auto";
-        const v = oo.get("__intl_stripZero") orelse break :blk "auto";
-        break :blk if (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) "stripIfInteger" else "auto";
-    }));
-    return val_mod.makeObject(arena, r);
-}
-
-// --------------------------------------------------------------- DateTimeFormat ---
-
+/// `new Intl.DateTimeFormat(locales, options)` — CreateDateTimeFormat (§11.1.2).
+///
+/// Every option is read through `dnGetOption`, in the spec's order, so throwing
+/// getters propagate and an out-of-range value is rejected before the next read.
+/// The resolved state lives in `__dtf_*` own properties that `format` and
+/// `resolvedOptions` read back; a component that was not requested is stored as
+/// the empty string.
 pub fn nativeDateTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const opts: ?Value = if (args.len > 1) args[1] else null;
     // Legacy service: `Intl.DateTimeFormat(...)` without `new` still yields an
     // instance (§11.1.1 ChainDateTimeFormat).
     const constructing = realm_mod.active_constructing;
@@ -892,47 +425,174 @@ pub fn nativeDateTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
     else
         try legacyServiceObj(arena, active_date_time_format_proto);
 
-    try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
-    // Component options are stored verbatim (empty string == absent). `format`
-    // reads them back off `this`. When no date/time component is requested, the
-    // en-US default is a numeric year/month/day (the classic `M/D/YYYY`).
-    const weekday = optStr(opts, "weekday") orelse "";
-    var year = optStr(opts, "year") orelse "";
-    var month = optStr(opts, "month") orelse "";
-    var day = optStr(opts, "day") orelse "";
-    const hour = optStr(opts, "hour") orelse "";
-    const minute = optStr(opts, "minute") orelse "";
-    const second = optStr(opts, "second") orelse "";
-    const has_any = weekday.len + year.len + month.len + day.len + hour.len + minute.len + second.len > 0;
-    if (!has_any) {
-        year = "numeric";
-        month = "numeric";
-        day = "numeric";
+    const req = try resolveLocaleRequest(arena, if (args.len > 0) args[0] else Value{});
+    // CreateDateTimeFormat uses CoerceOptionsToObject: a primitive `options` is
+    // boxed rather than rejected (only null/undefined are special).
+    const options = try coerceOptionsToObject(arena, if (args.len > 1) args[1] else null);
+
+    _ = try dnGetOption(arena, options, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
+
+    const calendar_opt = try dnGetOption(arena, options, "calendar", &.{}, null);
+    if (calendar_opt) |c| {
+        if (!isWellFormedUnicodeType(c)) return throwRangeError(arena, "invalid calendar");
     }
+    const numbering_opt = try dnGetOption(arena, options, "numberingSystem", &.{}, null);
+    if (numbering_opt) |n| {
+        if (!isWellFormedUnicodeType(n)) return throwRangeError(arena, "invalid numberingSystem");
+    }
+
+    const hour12 = try dnGetBoolOption(arena, options, "hour12");
+    // An explicit hour12 supersedes hourCycle entirely — including the `-u-hc-`
+    // extension — but hourCycle is still read (and validated) first.
+    const hour_cycle_opt = try dnGetOption(arena, options, "hourCycle", &.{ "h11", "h12", "h23", "h24" }, null);
+
+    const tz_opt = try dnGetOption(arena, options, "timeZone", &.{}, null);
+
+    // Table 7 components, then the styles.
+    var comps: [dtf_components.len][]const u8 = undefined;
+    for (dtf_components, 0..) |c, i| {
+        comps[i] = (try dnGetOption(arena, options, c.key, c.allowed, null)) orelse "";
+    }
+    const frac_sec: u32 = if (try dnGetNumOption(arena, options, "fractionalSecondDigits")) |f| blk: {
+        if (std.math.isNan(f) or f < 1 or f > 3) return throwRangeError(arena, "fractionalSecondDigits is out of range");
+        break :blk @intFromFloat(@floor(f));
+    } else 0;
+    const tz_name = (try dnGetOption(arena, options, "timeZoneName", &.{
+        "short", "long", "shortOffset", "longOffset", "shortGeneric", "longGeneric",
+    }, null)) orelse "";
+    _ = try dnGetOption(arena, options, "formatMatcher", &.{ "basic", "best fit" }, "best fit");
+    const date_style = (try dnGetOption(arena, options, "dateStyle", &dtf_styles, null)) orelse "";
+    const time_style = (try dnGetOption(arena, options, "timeStyle", &dtf_styles, null)) orelse "";
+
+    // `needDefaults` skips the `era` and `timeZoneName` rows of Table 7 (§11.1.2
+    // step 41.a): neither pins a date down, so `{ era: "narrow" }` still gets the
+    // numeric year/month/day default.
+    var needs_defaults = frac_sec == 0;
+    for (dtf_components, comps) |c, v| {
+        if (v.len > 0 and !std.mem.eql(u8, c.key, "era")) needs_defaults = false;
+    }
+    const has_comp = !needs_defaults or tz_name.len > 0;
+    // dateStyle/timeStyle are shorthands for a whole pattern and cannot be mixed
+    // with individual components (§11.1.2 step 39).
+    if ((date_style.len > 0 or time_style.len > 0) and has_comp)
+        return realm_mod.throwTypeError(arena, "dateStyle/timeStyle may not be used with other date-time component options");
+
+    // ResolveLocale over the `ca` / `nu` / `hc` keys: an options value that this
+    // build supports wins and drops the extension from the resolved locale; only
+    // a keyword that actually took effect is echoed back.
+    var kept: [3][2][]const u8 = undefined;
+    var kept_n: usize = 0;
+    const calendar = blk: {
+        const from_opt = if (calendar_opt) |c| t_calendar.canonicalize(c) else null;
+        if (from_opt) |id| {
+            const s = id.str();
+            if (try req.keyword(arena, "ca")) |ext| {
+                if (t_calendar.canonicalize(ext)) |eid| if (eid == id) {
+                    kept[kept_n] = .{ "ca", s };
+                    kept_n += 1;
+                };
+            }
+            break :blk s;
+        }
+        if (try req.keyword(arena, "ca")) |ext| {
+            if (t_calendar.canonicalize(ext)) |eid| {
+                kept[kept_n] = .{ "ca", eid.str() };
+                kept_n += 1;
+                break :blk eid.str();
+            }
+        }
+        break :blk "gregory";
+    };
+    const numbering = blk: {
+        if (numbering_opt) |raw| {
+            // Numbering-system identifiers are case-insensitive.
+            const n = try lowerDup(arena, raw);
+            if (numberingSystemDigits(n) != null) {
+                if (try req.keyword(arena, "nu")) |ext| if (std.mem.eql(u8, ext, n)) {
+                    kept[kept_n] = .{ "nu", n };
+                    kept_n += 1;
+                };
+                break :blk n;
+            }
+        }
+        if (try req.keyword(arena, "nu")) |ext| {
+            if (numberingSystemDigits(ext) != null) {
+                kept[kept_n] = .{ "nu", ext };
+                kept_n += 1;
+                break :blk ext;
+            }
+        }
+        break :blk "latn";
+    };
+    const hc_default = defaultHourCycle(req.base);
+    var hour_cycle: []const u8 = hc_default;
+    if (hour_cycle_opt) |hc| {
+        hour_cycle = hc;
+        if (try req.keyword(arena, "hc")) |ext| if (std.mem.eql(u8, ext, hc)) {
+            kept[kept_n] = .{ "hc", hc };
+            kept_n += 1;
+        };
+    } else if (try req.keyword(arena, "hc")) |ext| {
+        for ([_][]const u8{ "h11", "h12", "h23", "h24" }) |v| {
+            if (std.mem.eql(u8, ext, v)) {
+                hour_cycle = v;
+                kept[kept_n] = .{ "hc", v };
+                kept_n += 1;
+                break;
+            }
+        }
+    }
+    if (hour12) |h12| {
+        // A normative 2023 change dropped "h24" from this selection: the 24-hour
+        // clock always resolves to h23.
+        hour_cycle = if (!h12)
+            "h23"
+        else if (std.mem.eql(u8, hc_default, "h11") or std.mem.eql(u8, hc_default, "h23"))
+            "h11"
+        else
+            "h12";
+        // hour12 overrides the extension, so `-u-hc-` never survives with it.
+        var w: usize = 0;
+        for (kept[0..kept_n]) |k| {
+            if (std.mem.eql(u8, k[0], "hc")) continue;
+            kept[w] = k;
+            w += 1;
+        }
+        kept_n = w;
+    }
+    try storeResolvedLocale(arena, obj, req.base, kept[0..kept_n]);
+
+    const zone = if (tz_opt) |tz|
+        try resolveDtfTimeZone(arena, tz)
+    else
+        DtfZone{ .id = "UTC", .zone = "UTC", .offset_ms = 0 };
+
     // A "bare" formatter (no explicit component / style) resolves to date-only
     // for a legacy Date, but Temporal values pick their own default when
-    // formatted (see the per-kind adjustment in nativeDateTimeFormatFormat).
-    const is_bare = !has_any and (optStr(opts, "dateStyle") == null) and (optStr(opts, "timeStyle") == null);
-    // hour12 defaults to true for en-US; an explicit false (or hourCycle h23/h24)
-    // switches to 24-hour output.
-    var hour12 = optBool(opts, "hour12") orelse true;
-    if (optStr(opts, "hourCycle")) |hc| {
-        if (std.mem.eql(u8, hc, "h23") or std.mem.eql(u8, hc, "h24")) hour12 = false;
-        if (std.mem.eql(u8, hc, "h11") or std.mem.eql(u8, hc, "h12")) hour12 = true;
+    // formatted (see the per-kind adjustment in `buildDTFParts`).
+    const is_bare = needs_defaults and date_style.len == 0 and time_style.len == 0;
+    if (is_bare) {
+        comps[2] = "numeric"; // year
+        comps[3] = "numeric"; // month
+        comps[4] = "numeric"; // day
     }
-    const tz = optStr(opts, "timeZone") orelse "UTC";
 
-    try obj.set("__dtf_weekday", try val_mod.makeString(arena, weekday));
-    try obj.set("__dtf_year", try val_mod.makeString(arena, year));
-    try obj.set("__dtf_month", try val_mod.makeString(arena, month));
-    try obj.set("__dtf_day", try val_mod.makeString(arena, day));
-    try obj.set("__dtf_hour", try val_mod.makeString(arena, hour));
-    try obj.set("__dtf_minute", try val_mod.makeString(arena, minute));
-    try obj.set("__dtf_second", try val_mod.makeString(arena, second));
-    try obj.set("__dtf_hour12", try val_mod.makeBool(arena, hour12));
-    try obj.set("__dtf_tz", try val_mod.makeString(arena, tz));
+    for (dtf_components, comps) |c, v| try obj.set(c.slot, try val_mod.makeString(arena, v));
+    try obj.set("__dtf_fracSec", try val_mod.makeNumber(arena, @floatFromInt(frac_sec)));
+    try obj.set("__dtf_tzName", try val_mod.makeString(arena, tz_name));
+    try obj.set("__dtf_dateStyle", try val_mod.makeString(arena, date_style));
+    try obj.set("__dtf_timeStyle", try val_mod.makeString(arena, time_style));
+    try obj.set("__dtf_calendar", try val_mod.makeString(arena, calendar));
+    try obj.set("__dtf_numbering", try val_mod.makeString(arena, numbering));
+    try obj.set("__dtf_hourCycle", try val_mod.makeString(arena, hour_cycle));
+    try obj.set("__dtf_hour12", try val_mod.makeBool(arena, std.mem.eql(u8, hour_cycle, "h11") or std.mem.eql(u8, hour_cycle, "h12")));
+    try obj.set("__dtf_tz", try val_mod.makeString(arena, zone.id));
+    try obj.set("__dtf_tzZone", try val_mod.makeString(arena, zone.zone));
+    try obj.set("__dtf_tzOffsetMs", try val_mod.makeNumber(arena, @floatFromInt(zone.offset_ms)));
     try obj.set("__dtf_bare", try val_mod.makeBool(arena, is_bare));
-    return val_mod.makeObject(arena, obj);
+    const created = try val_mod.makeObject(arena, obj);
+    if (constructing) return created;
+    return chainLegacyService(this_val, created, active_date_time_format_proto);
 }
 
 const month_long = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
@@ -948,6 +608,39 @@ fn readOpt(o: *JsObject, key: []const u8) []const u8 {
     return "";
 }
 
+fn readNum(o: *JsObject, key: []const u8) f64 {
+    const v = o.get(key) orelse return 0;
+    if (v.bits != 0 and v.unbox() == .number) return v.unbox().number;
+    return 0;
+}
+
+/// The resolved date-time pattern: which components to render and how. Built
+/// from a DateTimeFormat's `__dtf_*` slots (or synthesized by `buildLocaleDTF`
+/// for `toLocaleString`), then handed to `renderDateTimeParts`.
+const DTFPattern = struct {
+    weekday: []const u8 = "",
+    era: []const u8 = "",
+    year: []const u8 = "",
+    month: []const u8 = "",
+    day: []const u8 = "",
+    day_period: []const u8 = "",
+    hour: []const u8 = "",
+    minute: []const u8 = "",
+    second: []const u8 = "",
+    frac_sec: u32 = 0,
+    tz_name: []const u8 = "",
+    hour12: bool = true,
+    /// The resolved time zone identifier, for the `timeZoneName` part.
+    tz_id: []const u8 = "UTC",
+
+    fn hasDate(self: DTFPattern) bool {
+        return self.weekday.len + self.era.len + self.year.len + self.month.len + self.day.len > 0;
+    }
+    fn hasTime(self: DTFPattern) bool {
+        return self.day_period.len + self.hour.len + self.minute.len + self.second.len > 0 or self.frac_sec > 0;
+    }
+};
+
 /// Append `val` to `out`, zero-padded to two digits when `style == "2-digit"`.
 fn appendField(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), val: i64, style: []const u8) !void {
     if (std.mem.eql(u8, style, "2-digit") and val >= 0 and val < 10) {
@@ -956,47 +649,96 @@ fn appendField(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), val: 
     try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{val}));
 }
 
+/// Drop from `p` every component the Temporal type `kind` cannot supply.
+/// Returns false when nothing is left — the "no overlap" TypeError of §11.5.2.
+fn restrictPatternToTemporal(p: *DTFPattern, kind: TemporalDTKind) bool {
+    // An Instant is a full point in time; every component applies.
+    if (kind == .instant) return true;
+    const keep_date = kind == .date or kind == .datetime;
+    const keep_time = kind == .time or kind == .datetime;
+    if (!keep_date and kind != .year_month and kind != .month_day) {
+        p.weekday = "";
+        p.era = "";
+        p.year = "";
+        p.month = "";
+        p.day = "";
+    } else if (kind == .year_month) {
+        p.weekday = "";
+        p.day = "";
+    } else if (kind == .month_day) {
+        p.weekday = "";
+        p.era = "";
+        p.year = "";
+    }
+    if (!keep_time) {
+        p.day_period = "";
+        p.hour = "";
+        p.minute = "";
+        p.second = "";
+        p.frac_sec = 0;
+    }
+    return p.hasDate() or p.hasTime();
+}
+
 /// Resolve `this` formatter + `args[0]` value into the ordered list of typed
 /// parts. Shared by `format` and `formatToParts`. Never returns empty (falls
 /// back to the numeric date pattern).
 fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) !std.ArrayListUnmanaged(DTPart) {
     const date_mod = @import("date.zig");
+    // HandleDateTimeValue (§11.5.2): a Temporal value contributes its own
+    // wall-clock fields; anything else is ToNumber-coerced and TimeClipped, so
+    // `format("lol")` and `format(NaN)` are both a RangeError.
     const ms: i64 = blk: {
-        if (args.len > 0 and args[0].bits != 0) {
-            if (args[0].unbox() == .number) {
-                const n = args[0].unbox().number;
-                // TimeClip: a non-finite or out-of-range time value is invalid.
-                if (!std.math.isFinite(n) or @abs(n) > 8.64e15) return realm_mod.throwRangeError(arena, "Invalid time value");
-                break :blk @intFromFloat(n);
-            }
-            if (args[0].unbox() == .object) {
-                if (date_mod.getDateMs(args[0])) |m| break :blk m;
-                if (temporalEpochMs(args[0])) |m| break :blk m;
+        if (args.len == 0 or args[0].bits == 0 or args[0].unbox() == .undefined_)
+            break :blk std.time.milliTimestamp();
+        if (args[0].unbox() == .object) {
+            if (temporalEpochMs(args[0])) |m| break :blk m;
+            if (date_mod.getDateData(args[0])) |dd| {
+                if (!dd.valid) return realm_mod.throwRangeError(arena, "Invalid time value");
+                break :blk dd.ms;
             }
         }
-        break :blk std.time.milliTimestamp();
+        // ToNumber rejects a Symbol rather than coercing it (our shared
+        // `toNumberValue` yields NaN there, which would surface as a RangeError).
+        if (args[0].unbox() == .symbol)
+            return realm_mod.throwTypeError(arena, "cannot convert a Symbol to a number");
+        const n = try realm_mod.toNumberValue(arena, args[0]);
+        if (!std.math.isFinite(n) or @abs(n) > 8.64e15) return realm_mod.throwRangeError(arena, "Invalid time value");
+        break :blk @intFromFloat(n);
     };
-    const f = date_mod.msToFieldsUtc(ms);
-
-    var weekday: []const u8 = "";
-    var year: []const u8 = "numeric";
-    var month: []const u8 = "numeric";
-    var day: []const u8 = "numeric";
-    var hour: []const u8 = "";
-    var minute: []const u8 = "";
-    var second: []const u8 = "";
-    var hour12: bool = true;
+    var p = DTFPattern{ .year = "numeric", .month = "numeric", .day = "numeric" };
+    var offset_ms: i64 = 0;
 
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const o = this_val.toPtr().object;
-        weekday = readOpt(o, "__dtf_weekday");
-        year = readOpt(o, "__dtf_year");
-        month = readOpt(o, "__dtf_month");
-        day = readOpt(o, "__dtf_day");
-        hour = readOpt(o, "__dtf_hour");
-        minute = readOpt(o, "__dtf_minute");
-        second = readOpt(o, "__dtf_second");
-        hour12 = if (o.get("__dtf_hour12")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else true;
+        p = .{
+            .weekday = readOpt(o, "__dtf_weekday"),
+            .era = readOpt(o, "__dtf_era"),
+            .year = readOpt(o, "__dtf_year"),
+            .month = readOpt(o, "__dtf_month"),
+            .day = readOpt(o, "__dtf_day"),
+            .day_period = readOpt(o, "__dtf_dayPeriod"),
+            .hour = readOpt(o, "__dtf_hour"),
+            .minute = readOpt(o, "__dtf_minute"),
+            .second = readOpt(o, "__dtf_second"),
+            .frac_sec = @intFromFloat(readNum(o, "__dtf_fracSec")),
+            .tz_name = readOpt(o, "__dtf_tzName"),
+            .hour12 = if (o.get("__dtf_hour12")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else true,
+            .tz_id = blk: {
+                const id = readOpt(o, "__dtf_tzZone");
+                break :blk if (id.len > 0) id else "UTC";
+            },
+        };
+        offset_ms = @intFromFloat(readNum(o, "__dtf_tzOffsetMs"));
+        // A named IANA zone's offset depends on the instant (DST), so resolve it
+        // here rather than freezing the standard offset at construction.
+        if (t_tzdata.lookupDef(p.tz_id)) |def| {
+            if (t_tzdata.offsetAt(def, @divFloor(ms, 1000))) |sec| offset_ms = @as(i64, sec) * 1000;
+        }
+        const date_style = readOpt(o, "__dtf_dateStyle");
+        const time_style = readOpt(o, "__dtf_timeStyle");
+        if (date_style.len > 0) applyDateStyle(date_style, &p);
+        if (time_style.len > 0) applyTimeStyle(time_style, &p);
 
         // A bare formatter (no explicit component) resolves to date-only for a
         // legacy Date, but a Temporal value picks its own default: date for
@@ -1007,44 +749,57 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
         if (bare and args.len > 0) {
             if (temporalKindOf(args[0])) |tk| switch (tk) {
                 .date => {},
-                .time => {
-                    weekday = "";
-                    year = "";
-                    month = "";
-                    day = "";
-                    hour = "numeric";
-                    minute = "numeric";
-                    second = "numeric";
-                },
+                .time => p = .{ .hour = "numeric", .minute = "numeric", .second = "numeric", .hour12 = p.hour12 },
                 .datetime, .instant, .zoned => {
-                    year = "numeric";
-                    month = "numeric";
-                    day = "numeric";
-                    hour = "numeric";
-                    minute = "numeric";
-                    second = "numeric";
+                    p.hour = "numeric";
+                    p.minute = "numeric";
+                    p.second = "numeric";
                 },
-                .year_month => {
-                    weekday = "";
-                    year = "numeric";
-                    month = "numeric";
-                    day = "";
-                },
-                .month_day => {
-                    weekday = "";
-                    year = "";
-                    month = "numeric";
-                    day = "numeric";
-                },
+                .year_month => p = .{ .era = p.era, .year = "numeric", .month = "numeric", .hour12 = p.hour12 },
+                .month_day => p = .{ .month = "numeric", .day = "numeric", .hour12 = p.hour12 },
             };
+        }
+        // A Temporal *plain* value carries no time zone of its own, so the
+        // formatter's `timeZoneName` has nothing to name (§11.5.2 drops it). An
+        // Instant is a real point in time, and a ZonedDateTime carries its own
+        // zone (only reachable through `toLocaleString`), so both keep it.
+        if (args.len > 0) {
+            if (temporalKindOf(args[0])) |tk| {
+                if (tk != .instant and tk != .zoned) p.tz_name = "";
+            }
+        }
+
+        // §11.5.2 derives a per-Temporal-type format by dropping the components
+        // that type has no fields for; when nothing survives, the value and the
+        // formatter do not overlap at all and formatting is a TypeError. Only a
+        // real Intl.DateTimeFormat goes through this — the synthetic formatters
+        // `toLocaleString` builds already match their receiver by construction.
+        if (args.len > 0 and o.getOwn("__dtf_hourCycle") != null) {
+            if (temporalKindOf(args[0])) |tk| {
+                if (tk == .zoned)
+                    return realm_mod.throwTypeError(arena, "Intl.DateTimeFormat.prototype.format does not support Temporal.ZonedDateTime");
+                if (!restrictPatternToTemporal(&p, tk))
+                    return realm_mod.throwTypeError(arena, "the formatter has no component this Temporal type provides");
+            }
         }
     }
 
+    // A Temporal plain type carries its own wall-clock fields; a legacy Date and
+    // a Temporal.Instant are points in time, so the zone offset applies to them.
+    const wall_clock = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object)
+        (if (temporalKindOf(args[0])) |tk| tk != .instant else false)
+    else
+        false;
+    const local_ms = if (wall_clock) ms else ms + offset_ms;
+    const f = date_mod.msToFieldsUtc(local_ms);
+
     var parts = std.ArrayListUnmanaged(DTPart){};
-    try renderDateTimeParts(arena, f, weekday, year, month, day, hour, minute, second, hour12, &parts);
+    try renderDateTimeParts(arena, f, p, &parts);
     if (parts.items.len == 0) {
-        try renderDateTimeParts(arena, f, "", "numeric", "numeric", "numeric", "", "", "", hour12, &parts);
+        try renderDateTimeParts(arena, f, .{ .year = "numeric", .month = "numeric", .day = "numeric", .hour12 = p.hour12 }, &parts);
     }
+    if (this_val.bits != 0 and this_val.unbox() == .object)
+        try applyNumberingSystem(arena, parts.items, readOpt(this_val.toPtr().object, "__dtf_numbering"));
     return parts;
 }
 
@@ -1066,9 +821,7 @@ pub fn nativeDateTimeFormatFormat(arena: std.mem.Allocator, this_val: Value, arg
 /// §11.3.3 `get Intl.DateTimeFormat.prototype.format`, mirroring NumberFormat's:
 /// an accessor whose getter returns a per-instance bound function.
 pub fn nativeDateTimeFormatFormatGetter(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object)
-        return throwTypeErrorIntl(arena, "get Intl.DateTimeFormat.prototype.format called on an incompatible receiver");
-    const o = this_val.toPtr().object;
+    const o = try requireDateTimeFormat(arena, this_val);
     if (o.getOwn("[[BoundFormat]]")) |bound| return bound;
     const bound = try val_mod.makeNativeFunctionDataLen(arena, nativeDateTimeFormatFormat, @ptrCast(o), 1);
     _ = try o.defineOwnData("[[BoundFormat]]", bound, .{ .writable = false, .enumerable = false, .configurable = false });
@@ -1079,6 +832,7 @@ pub fn nativeDateTimeFormatFormatGetter(arena: std.mem.Allocator, this_val: Valu
 /// "<start> – <end>", collapsing to the single formatted value when both ends
 /// produce identical text.
 fn dtfRangeParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) !std.ArrayListUnmanaged(DTPart) {
+    _ = try requireDateTimeFormat(arena, this_val);
     if (args.len < 2 or args[0].bits == 0 or args[0].unbox() == .undefined_ or
         args[1].bits == 0 or args[1].unbox() == .undefined_)
         return throwTypeErrorIntl(arena, "Intl.DateTimeFormat.prototype.formatRange: both ends are required");
@@ -1153,28 +907,47 @@ fn yearStr(arena: std.mem.Allocator, year: i64, style: []const u8) ![]const u8 {
     return tmp.items;
 }
 
+/// The en-US flexible day period for `hour` (CLDR `dayPeriods`): the noon
+/// singleton, then morning / afternoon / evening / night bands. `narrow`
+/// abbreviates only "noon".
+fn dayPeriodName(hour: i64, minute: i64, second: i64, style: []const u8) []const u8 {
+    if (hour == 12 and minute == 0 and second == 0)
+        return if (std.mem.eql(u8, style, "narrow")) "n" else "noon";
+    if (hour >= 6 and hour < 12) return "in the morning";
+    if (hour >= 12 and hour < 18) return "in the afternoon";
+    if (hour >= 18 and hour < 21) return "in the evening";
+    return "at night";
+}
+
+/// The `timeZoneName` part for the resolved zone. Only UTC and fixed-offset
+/// zones have real names here; a named IANA zone falls back to its identifier.
+fn timeZoneNameFor(arena: std.mem.Allocator, tz_id: []const u8, style: []const u8) ![]const u8 {
+    const is_utc = std.mem.eql(u8, tz_id, "UTC");
+    if (std.mem.eql(u8, style, "long")) return if (is_utc) "Coordinated Universal Time" else tz_id;
+    if (std.mem.eql(u8, style, "short")) return if (is_utc) "UTC" else tz_id;
+    // The offset styles render the zone's own offset; "GMT" alone for UTC.
+    if (is_utc) return "GMT";
+    if (tz_id.len > 0 and (tz_id[0] == '+' or tz_id[0] == '-'))
+        return std.fmt.allocPrint(arena, "GMT{s}", .{tz_id});
+    return tz_id;
+}
+
 /// Render the resolved components into typed parts (shared by `format` and
 /// `formatToParts`). Mirrors the en-US pattern: `Weekday, Month Day, Year,
 /// h:mm:ss AM/PM` with numeric fields joined by `/` and `:`.
 fn renderDateTimeParts(
     arena: std.mem.Allocator,
     f: @import("date.zig").DateFields,
-    weekday: []const u8,
-    year: []const u8,
-    month: []const u8,
-    day: []const u8,
-    hour: []const u8,
-    minute: []const u8,
-    second: []const u8,
-    hour12: bool,
+    p: DTFPattern,
     parts: *std.ArrayListUnmanaged(DTPart),
 ) !void {
+    const month = p.month;
     const named_month = month.len > 0 and !std.mem.eql(u8, month, "numeric") and !std.mem.eql(u8, month, "2-digit");
     var has_date = false;
 
-    if (weekday.len > 0) {
+    if (p.weekday.len > 0) {
         const idx: usize = @intCast(@mod(f.weekday, 7));
-        const name = if (std.mem.eql(u8, weekday, "short")) weekday_short[idx] else if (std.mem.eql(u8, weekday, "narrow")) weekday_narrow[idx] else weekday_long[idx];
+        const name = if (std.mem.eql(u8, p.weekday, "short")) weekday_short[idx] else if (std.mem.eql(u8, p.weekday, "narrow")) weekday_narrow[idx] else weekday_long[idx];
         try parts.append(arena, .{ .type = "weekday", .value = name });
         has_date = true;
     }
@@ -1184,58 +957,89 @@ fn renderDateTimeParts(
         const midx: usize = @intCast(@mod(f.month, 12));
         const mname = if (std.mem.eql(u8, month, "short")) month_short[midx] else if (std.mem.eql(u8, month, "narrow")) month_narrow[midx] else month_long[midx];
         try parts.append(arena, .{ .type = "month", .value = mname });
-        if (day.len > 0) {
+        if (p.day.len > 0) {
             try parts.append(arena, .{ .type = "literal", .value = " " });
-            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, day) });
+            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, p.day) });
         }
-        if (year.len > 0) {
+        if (p.year.len > 0) {
             try parts.append(arena, .{ .type = "literal", .value = ", " });
-            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, year) });
+            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, p.year) });
         }
         has_date = true;
-    } else if (month.len > 0 or day.len > 0 or year.len > 0) {
-        if (weekday.len > 0) try parts.append(arena, .{ .type = "literal", .value = ", " });
+    } else if (month.len > 0 or p.day.len > 0 or p.year.len > 0) {
+        if (p.weekday.len > 0) try parts.append(arena, .{ .type = "literal", .value = ", " });
         var first = true;
         if (month.len > 0) {
             try parts.append(arena, .{ .type = "month", .value = try fieldStr(arena, f.month + 1, month) });
             first = false;
         }
-        if (day.len > 0) {
+        if (p.day.len > 0) {
             if (!first) try parts.append(arena, .{ .type = "literal", .value = "/" });
-            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, day) });
+            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, p.day) });
             first = false;
         }
-        if (year.len > 0) {
+        if (p.year.len > 0) {
             if (!first) try parts.append(arena, .{ .type = "literal", .value = "/" });
-            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, year) });
+            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, p.year) });
         }
         has_date = true;
     }
+    // The ISO calendar has no eras, so `era` renders the proleptic Gregorian one.
+    if (p.era.len > 0) {
+        if (has_date) try parts.append(arena, .{ .type = "literal", .value = " " });
+        const bc = f.year <= 0;
+        try parts.append(arena, .{ .type = "era", .value = if (std.mem.eql(u8, p.era, "long"))
+            (if (bc) "Before Christ" else "Anno Domini")
+        else if (std.mem.eql(u8, p.era, "narrow"))
+            (if (bc) "B" else "A")
+        else
+            (if (bc) "BC" else "AD") });
+        has_date = true;
+    }
 
-    if (hour.len > 0 or minute.len > 0 or second.len > 0) {
+    const has_clock = p.hour.len > 0 or p.minute.len > 0 or p.second.len > 0;
+    if (has_clock or p.day_period.len > 0) {
         if (has_date) try parts.append(arena, .{ .type = "literal", .value = ", " });
-        if (hour.len > 0) {
+        if (p.hour.len > 0) {
             var h: i64 = f.hour;
             // en-US 24-hour clock (h23) always renders a 2-digit hour.
-            const hstyle = if (hour12) hour else "2-digit";
-            if (hour12) {
+            const hstyle = if (p.hour12) p.hour else "2-digit";
+            if (p.hour12) {
                 h = @mod(f.hour, 12);
                 if (h == 0) h = 12;
             }
             try parts.append(arena, .{ .type = "hour", .value = try fieldStr(arena, h, hstyle) });
         }
-        if (minute.len > 0) {
-            if (hour.len > 0) try parts.append(arena, .{ .type = "literal", .value = ":" });
-            try parts.append(arena, .{ .type = "minute", .value = try fieldStr(arena, f.min, if (hour.len > 0) "2-digit" else minute) });
+        if (p.minute.len > 0) {
+            if (p.hour.len > 0) try parts.append(arena, .{ .type = "literal", .value = ":" });
+            // The en-US clock patterns (`h:mm:ss`, `mm:ss`) pad every field that
+            // is not the leading one — and pad the minute whenever seconds follow.
+            const mstyle: []const u8 = if (p.hour.len > 0 or p.second.len > 0) "2-digit" else p.minute;
+            try parts.append(arena, .{ .type = "minute", .value = try fieldStr(arena, f.min, mstyle) });
         }
-        if (second.len > 0) {
-            if (hour.len > 0 or minute.len > 0) try parts.append(arena, .{ .type = "literal", .value = ":" });
-            try parts.append(arena, .{ .type = "second", .value = try fieldStr(arena, f.sec, if (hour.len > 0 or minute.len > 0) "2-digit" else second) });
+        if (p.second.len > 0) {
+            if (p.hour.len > 0 or p.minute.len > 0) try parts.append(arena, .{ .type = "literal", .value = ":" });
+            try parts.append(arena, .{ .type = "second", .value = try fieldStr(arena, f.sec, if (p.hour.len > 0 or p.minute.len > 0) "2-digit" else p.second) });
         }
-        if (hour12 and hour.len > 0) {
+        if (p.frac_sec > 0) {
+            // The sub-second digits are truncated, not rounded (§11.5.6 Table 9).
+            const ms3 = try std.fmt.allocPrint(arena, "{d:0>3}", .{@as(u64, @intCast(@mod(f.ms, 1000)))});
+            try parts.append(arena, .{ .type = "literal", .value = "." });
+            try parts.append(arena, .{ .type = "fractionalSecond", .value = ms3[0..p.frac_sec] });
+        }
+        // An explicit dayPeriod replaces the AM/PM marker of the 12-hour clock.
+        if (p.day_period.len > 0) {
+            if (has_clock) try parts.append(arena, .{ .type = "literal", .value = " " });
+            try parts.append(arena, .{ .type = "dayPeriod", .value = dayPeriodName(f.hour, f.min, f.sec, p.day_period) });
+        } else if (p.hour12 and p.hour.len > 0) {
             try parts.append(arena, .{ .type = "literal", .value = " " });
             try parts.append(arena, .{ .type = "dayPeriod", .value = if (f.hour < 12) "AM" else "PM" });
         }
+    }
+
+    if (p.tz_name.len > 0) {
+        if (parts.items.len > 0) try parts.append(arena, .{ .type = "literal", .value = " " });
+        try parts.append(arena, .{ .type = "timeZoneName", .value = try timeZoneNameFor(arena, p.tz_id, p.tz_name) });
     }
 }
 
@@ -1307,32 +1111,29 @@ fn temporalKindOf(v: Value) ?TemporalDTKind {
     };
 }
 
-fn applyDateStyle(ds: []const u8, w: *[]const u8, y: *[]const u8, mo: *[]const u8, d: *[]const u8) void {
+/// The en-US `dateStyle` patterns (CLDR `full`/`long`/`medium`/`short`).
+fn applyDateStyle(ds: []const u8, p: *DTFPattern) void {
+    p.year = "numeric";
+    p.month = "long";
+    p.day = "numeric";
     if (std.mem.eql(u8, ds, "full")) {
-        w.* = "long";
-        y.* = "numeric";
-        mo.* = "long";
-        d.* = "numeric";
-    } else if (std.mem.eql(u8, ds, "long")) {
-        y.* = "numeric";
-        mo.* = "long";
-        d.* = "numeric";
+        p.weekday = "long";
     } else if (std.mem.eql(u8, ds, "medium")) {
-        y.* = "numeric";
-        mo.* = "short";
-        d.* = "numeric";
-    } else { // "short"
-        y.* = "2-digit";
-        mo.* = "numeric";
-        d.* = "numeric";
+        p.month = "short";
+    } else if (std.mem.eql(u8, ds, "short")) {
+        p.year = "2-digit";
+        p.month = "numeric";
     }
 }
 
-fn applyTimeStyle(ts: []const u8, h: *[]const u8, mi: *[]const u8, se: *[]const u8) void {
-    h.* = "numeric";
-    mi.* = "2-digit";
+/// The en-US `timeStyle` patterns: `full`/`long` also name the time zone.
+fn applyTimeStyle(ts: []const u8, p: *DTFPattern) void {
+    p.hour = "numeric";
+    p.minute = "2-digit";
     // full/long/medium include seconds; short omits them.
-    if (!std.mem.eql(u8, ts, "short")) se.* = "2-digit";
+    if (!std.mem.eql(u8, ts, "short")) p.second = "2-digit";
+    if (std.mem.eql(u8, ts, "full")) p.tz_name = "long";
+    if (std.mem.eql(u8, ts, "long")) p.tz_name = "short";
 }
 
 /// `Temporal.X.prototype.toLocaleString([locales[, options]])`.
@@ -1370,8 +1171,27 @@ pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: [
     // A ZonedDateTime carries its own zone; a `timeZone` option is disallowed.
     if (kind == .zoned and optStr(opts_v, "timeZone") != null)
         return realm_mod.throwTypeError(arena, "Temporal.ZonedDateTime.toLocaleString does not accept a timeZone option");
-    const dtf = try buildLocaleDTF(arena, opts_v, required, defaults, restrict);
+    const dtf = try buildLocaleDTF(arena, if (args.len > 0) args[0] else Value{}, opts_v, required, defaults, restrict);
+    // A ZonedDateTime names its zone by default (Temporal §ZonedDateTime.toLocaleString).
+    if (kind == .zoned and dtfWantsDefaults(opts_v)) {
+        const o = dtf.toPtr().object;
+        try o.set("__dtf_tzName", try val_mod.makeString(arena, "short"));
+        if (t_zdt.getZoned(receiver)) |z| try o.set("__dtf_tzZone", try val_mod.makeString(arena, z.tz));
+    }
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
+}
+
+/// True when a `toLocaleString` options bag names no component and no style, so
+/// the receiver's whole default pattern applies (for a ZonedDateTime that
+/// includes the time-zone name).
+fn dtfWantsDefaults(opts_v: ?Value) bool {
+    for ([_][]const u8{
+        "weekday", "era",    "year",   "month",     "day",       "dayPeriod",
+        "hour",    "minute", "second", "dateStyle", "timeStyle", "timeZoneName",
+    }) |k| {
+        if (optStr(opts_v, k) != null) return false;
+    }
+    return optNum(opts_v, "fractionalSecondDigits") == null;
 }
 
 /// ToDateTimeOptions "required" families: which component family must be
@@ -1389,7 +1209,7 @@ pub const Restrict = enum { none, date_only, time_only, year_month_only, month_d
 /// `Date.prototype.toLocale*String`: parse options, validate conflicts, resolve
 /// the effective component styles, and return a DateTimeFormat-like object ready
 /// for `nativeDateTimeFormatFormat`.
-fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, defaults: LocaleDefaults, restrict: Restrict) anyerror!Value {
+fn buildLocaleDTF(arena: std.mem.Allocator, locales: Value, opts_v: ?Value, required: Required, defaults: LocaleDefaults, restrict: Restrict) anyerror!Value {
     const weekday = optStr(opts_v, "weekday");
     const era = optStr(opts_v, "era");
     const year = optStr(opts_v, "year");
@@ -1408,6 +1228,10 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
     const has_time_comp = hour != null or minute != null or second != null or
         day_period != null or frac_digits != null or tz_name != null;
     const has_comp = has_date_comp or has_time_comp;
+    // ToDateTimeOptions' `needDefaults` scan skips `era` and `timeZoneName`
+    // (§11.1.2 step 41.a): neither pins a date down on its own.
+    const has_pinning_comp = weekday != null or year != null or month != null or day != null or
+        hour != null or minute != null or second != null or day_period != null or frac_digits != null;
 
     // dateStyle/timeStyle cannot be combined with explicit component options
     // (GetDateTimeFormatPattern, Table "date-time component").
@@ -1428,17 +1252,18 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
         .none => {},
     }
 
-    var w = weekday orelse "";
-    var y = year orelse "";
-    var mo = month orelse "";
-    var d = day orelse "";
-    var h = hour orelse "";
-    var mi = minute orelse "";
-    var se = second orelse "";
     // ISO calendar: era (used above only for conflict detection) is not rendered.
-
-    if (date_style) |ds| applyDateStyle(ds, &w, &y, &mo, &d);
-    if (time_style) |ts| applyTimeStyle(ts, &h, &mi, &se);
+    var p = DTFPattern{
+        .weekday = weekday orelse "",
+        .year = year orelse "",
+        .month = month orelse "",
+        .day = day orelse "",
+        .hour = hour orelse "",
+        .minute = minute orelse "",
+        .second = second orelse "",
+    };
+    if (date_style) |ds| applyDateStyle(ds, &p);
+    if (time_style) |ts| applyTimeStyle(ts, &p);
 
     // ToDateTimeOptions: `needDefaults` is driven by the REQUIRED family only —
     // e.g. toLocaleDateString (required "date") still fills in year/month/day
@@ -1447,55 +1272,62 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
     // dateStyle/timeStyle suppress defaults entirely.
     var need_defaults = date_style == null and time_style == null;
     if (need_defaults) switch (required) {
-        .date => if (has_date_comp) {
+        .date => if (has_date_comp and has_pinning_comp) {
             need_defaults = false;
         },
-        .time => if (has_time_comp) {
+        .time => if (has_time_comp and has_pinning_comp) {
             need_defaults = false;
         },
-        .any => if (has_comp) {
+        .any => if (has_pinning_comp) {
             need_defaults = false;
         },
     };
     if (need_defaults) {
-        if (defaults == .date or defaults == .datetime) {
-            if (y.len == 0) y = "numeric";
-            if (mo.len == 0) mo = "numeric";
-            if (d.len == 0) d = "numeric";
+        if (defaults == .date or defaults == .datetime or defaults == .year_month) {
+            if (p.year.len == 0) p.year = "numeric";
+            if (p.month.len == 0) p.month = "numeric";
         }
+        if (defaults == .date or defaults == .datetime or defaults == .month_day) {
+            if (p.day.len == 0) p.day = "numeric";
+        }
+        if (defaults == .month_day and p.month.len == 0) p.month = "numeric";
         if (defaults == .time or defaults == .datetime) {
-            if (h.len == 0) h = "numeric";
-            if (mi.len == 0) mi = "numeric";
-            if (se.len == 0) se = "numeric";
-        }
-        if (defaults == .year_month) {
-            if (y.len == 0) y = "numeric";
-            if (mo.len == 0) mo = "numeric";
-        }
-        if (defaults == .month_day) {
-            if (mo.len == 0) mo = "numeric";
-            if (d.len == 0) d = "numeric";
+            if (p.hour.len == 0) p.hour = "numeric";
+            if (p.minute.len == 0) p.minute = "numeric";
+            if (p.second.len == 0) p.second = "numeric";
         }
     }
 
-    var hour12 = optBool(opts_v, "hour12") orelse true;
+    p.hour12 = optBool(opts_v, "hour12") orelse true;
     if (optStr(opts_v, "hourCycle")) |hc| {
-        if (std.mem.eql(u8, hc, "h23") or std.mem.eql(u8, hc, "h24")) hour12 = false;
-        if (std.mem.eql(u8, hc, "h11") or std.mem.eql(u8, hc, "h12")) hour12 = true;
+        if (std.mem.eql(u8, hc, "h23") or std.mem.eql(u8, hc, "h24")) p.hour12 = false;
+        if (std.mem.eql(u8, hc, "h11") or std.mem.eql(u8, hc, "h12")) p.hour12 = true;
     }
 
     const dtf = if (realm_mod.active_heap) |hp|
         try JsObject.createOnHeap(hp, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
-    try dtf.set("__dtf_weekday", try val_mod.makeString(arena, w));
-    try dtf.set("__dtf_year", try val_mod.makeString(arena, y));
-    try dtf.set("__dtf_month", try val_mod.makeString(arena, mo));
-    try dtf.set("__dtf_day", try val_mod.makeString(arena, d));
-    try dtf.set("__dtf_hour", try val_mod.makeString(arena, h));
-    try dtf.set("__dtf_minute", try val_mod.makeString(arena, mi));
-    try dtf.set("__dtf_second", try val_mod.makeString(arena, se));
-    try dtf.set("__dtf_hour12", try val_mod.makeBool(arena, hour12));
+    try dtf.set("__dtf_weekday", try val_mod.makeString(arena, p.weekday));
+    try dtf.set("__dtf_year", try val_mod.makeString(arena, p.year));
+    try dtf.set("__dtf_month", try val_mod.makeString(arena, p.month));
+    try dtf.set("__dtf_day", try val_mod.makeString(arena, p.day));
+    try dtf.set("__dtf_hour", try val_mod.makeString(arena, p.hour));
+    try dtf.set("__dtf_minute", try val_mod.makeString(arena, p.minute));
+    try dtf.set("__dtf_second", try val_mod.makeString(arena, p.second));
+    try dtf.set("__dtf_hour12", try val_mod.makeBool(arena, p.hour12));
+    try dtf.set("__dtf_dayPeriod", try val_mod.makeString(arena, p.day_period));
+    try dtf.set("__dtf_era", try val_mod.makeString(arena, p.era));
+    try dtf.set("__dtf_tzName", try val_mod.makeString(arena, p.tz_name));
+    // The numbering system comes from the requested locale exactly as it does
+    // for a real formatter, so `date.toLocaleString("th-u-nu-thai")` and
+    // `new Intl.DateTimeFormat("th-u-nu-thai").format(date)` agree.
+    const req = try resolveLocaleRequest(arena, locales);
+    const nu = blk: {
+        const ext = (try req.keyword(arena, "nu")) orelse break :blk "latn";
+        break :blk if (numberingSystemDigits(ext) != null) ext else "latn";
+    };
+    try dtf.set("__dtf_numbering", try val_mod.makeString(arena, nu));
     return val_mod.makeObject(arena, dtf);
 }
 
@@ -1504,40 +1336,56 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
 /// component set and format the Date through the shared en-US machinery.
 pub fn dateToLocaleString(arena: std.mem.Allocator, receiver: Value, args: []const Value, required: Required, defaults: LocaleDefaults) anyerror!Value {
     const opts_v: ?Value = if (args.len > 1) args[1] else null;
-    const dtf = try buildLocaleDTF(arena, opts_v, required, defaults, .none);
+    const dtf = try buildLocaleDTF(arena, if (args.len > 0) args[0] else Value{}, opts_v, required, defaults, .none);
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
 }
 
-/// `dtf.resolvedOptions()` — en-US, UTC-based, Gregorian.
+/// Brand check for the `format` accessor and `resolvedOptions` (§11.4): our
+/// instances carry the internal `__dtf_hourCycle` marker, so anything without
+/// it is not an initialized DateTimeFormat.
+fn requireDateTimeFormat(arena: std.mem.Allocator, this_val: Value) anyerror!*JsObject {
+    const recv = try unwrapLegacyService(arena, this_val, "__dtf_hourCycle");
+    if (recv.bits == 0 or recv.unbox() != .object or
+        recv.toPtr().object.getOwn("__dtf_hourCycle") == null)
+        return realm_mod.throwTypeError(arena, "called on incompatible receiver");
+    return recv.toPtr().object;
+}
+
+/// `dtf.resolvedOptions()` (§11.4.5). Properties are created in the order of
+/// Table 8, omitting the components that were not resolved; when dateStyle /
+/// timeStyle drove the pattern, those are reported instead of the components.
 pub fn nativeDateTimeFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const o = try requireDateTimeFormat(arena, this_val);
     const r = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
     try r.set("locale", try val_mod.makeString(arena, resolvedLocaleOf(this_val)));
-    try r.set("calendar", try val_mod.makeString(arena, "gregory"));
-    try r.set("numberingSystem", try val_mod.makeString(arena, "latn"));
-    if (this_val.bits != 0 and this_val.unbox() == .object) {
-        const o = this_val.toPtr().object;
-        const tz = readOpt(o, "__dtf_tz");
-        try r.set("timeZone", try val_mod.makeString(arena, if (tz.len > 0) tz else "UTC"));
-        const fields = [_][2][]const u8{
-            .{ "weekday", "__dtf_weekday" },   .{ "year", "__dtf_year" },
-            .{ "month", "__dtf_month" },       .{ "day", "__dtf_day" },
-            .{ "hour", "__dtf_hour" },         .{ "minute", "__dtf_minute" },
-            .{ "second", "__dtf_second" },
-        };
-        for (fields) |pair| {
-            const v = readOpt(o, pair[1]);
-            if (v.len > 0) try r.set(pair[0], try val_mod.makeString(arena, v));
+    try r.set("calendar", try val_mod.makeString(arena, readOpt(o, "__dtf_calendar")));
+    try r.set("numberingSystem", try val_mod.makeString(arena, readOpt(o, "__dtf_numbering")));
+    try r.set("timeZone", try val_mod.makeString(arena, readOpt(o, "__dtf_tz")));
+
+    const date_style = readOpt(o, "__dtf_dateStyle");
+    const time_style = readOpt(o, "__dtf_timeStyle");
+    // hourCycle / hour12 are reported only when the resolved pattern has an hour
+    // field — a date-only formatter reports neither, even for `-u-hc-`.
+    if (readOpt(o, "__dtf_hour").len > 0 or time_style.len > 0) {
+        const hc = readOpt(o, "__dtf_hourCycle");
+        try r.set("hourCycle", try val_mod.makeString(arena, hc));
+        try r.set("hour12", try val_mod.makeBool(arena, std.mem.eql(u8, hc, "h11") or std.mem.eql(u8, hc, "h12")));
+    }
+    if (date_style.len == 0 and time_style.len == 0) {
+        for (dtf_components) |c| {
+            const v = readOpt(o, c.slot);
+            if (v.len > 0) try r.set(c.key, try val_mod.makeString(arena, v));
         }
-        if (o.get("__dtf_hour") != null and readOpt(o, "__dtf_hour").len > 0) {
-            const h12 = if (o.get("__dtf_hour12")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else true;
-            try r.set("hour12", try val_mod.makeBool(arena, h12));
-            try r.set("hourCycle", try val_mod.makeString(arena, if (h12) "h12" else "h23"));
-        }
+        const frac = readNum(o, "__dtf_fracSec");
+        if (frac > 0) try r.set("fractionalSecondDigits", try val_mod.makeNumber(arena, frac));
+        const tzn = readOpt(o, "__dtf_tzName");
+        if (tzn.len > 0) try r.set("timeZoneName", try val_mod.makeString(arena, tzn));
     } else {
-        try r.set("timeZone", try val_mod.makeString(arena, "UTC"));
+        if (date_style.len > 0) try r.set("dateStyle", try val_mod.makeString(arena, date_style));
+        if (time_style.len > 0) try r.set("timeStyle", try val_mod.makeString(arena, time_style));
     }
     return val_mod.makeObject(arena, r);
 }
@@ -2010,45 +1858,9 @@ fn tagSubtags(arena: std.mem.Allocator, tag: []const u8) !?[][]const u8 {
 
 /// True when `tag` matches `unicode_locale_id`.
 pub fn isStructurallyValidLanguageTag(arena: std.mem.Allocator, tag: []const u8) !bool {
-    const subs = (try tagSubtags(arena, tag)) orelse return false;
-    var i: usize = 0;
-
-    // unicode_language_subtag
-    const lang = subs[i];
-    const lang_ok = isAllAlpha(lang) and ((lang.len >= 2 and lang.len <= 3) or (lang.len >= 5 and lang.len <= 8));
-    if (!lang_ok) return false;
-    i += 1;
-
-    // (sep unicode_script_subtag)?
-    if (i < subs.len and subs[i].len == 4 and isAllAlpha(subs[i])) i += 1;
-
-    // (sep unicode_region_subtag)?
-    if (i < subs.len and ((subs[i].len == 2 and isAllAlpha(subs[i])) or (subs[i].len == 3 and isAllDigit(subs[i])))) i += 1;
-
-    // (sep unicode_variant_subtag)* — each may appear at most once.
-    var variants = std.ArrayListUnmanaged([]const u8){};
-    while (i < subs.len and isVariantSubtag(subs[i])) : (i += 1) {
-        for (variants.items) |v| if (std.ascii.eqlIgnoreCase(v, subs[i])) return false;
-        try variants.append(arena, subs[i]);
-    }
-
-    // extensions* pu_extensions? — each singleton may appear at most once, and
-    // each must be followed by at least one subtag of its own.
-    var singletons = std.ArrayListUnmanaged(u8){};
-    while (i < subs.len) {
-        if (subs[i].len != 1) return false; // a non-singleton here is unparsable
-        const singleton = std.ascii.toLower(subs[i][0]);
-        for (singletons.items) |s| if (s == singleton) return false;
-        try singletons.append(arena, singleton);
-        i += 1;
-        const body_start = i;
-        // `x-` private use takes 1..8-character subtags; every other singleton
-        // requires 2..8.
-        const min_len: usize = if (singleton == 'x') 1 else 2;
-        while (i < subs.len and subs[i].len >= min_len and subs[i].len <= 8 and allAlnum(subs[i])) i += 1;
-        if (i == body_start) return false; // singleton with an empty body
-    }
-    return true;
+    // The canonicalizer is the authority on `unicode_locale_id` shape; it parses
+    // the `-t-`/`-u-` bodies the sketch below never modelled.
+    return (try locale_id.canonicalize(arena, tag)) != null;
 }
 
 /// The locale this build actually formats in; also the fallback when none of the
@@ -2072,10 +1884,65 @@ pub fn resolveAndStoreLocale(arena: std.mem.Allocator, obj: *JsObject, locales: 
     const requested = try canonicalizeLocaleList(arena, locales);
     var chosen: ?[]const u8 = null;
     for (requested) |t| {
-        const canon = try canonicalizeTag(arena, t);
+        // A service's `[[Locale]]` is the language id alone; its `-u-` keywords
+        // are resolved per key and re-attached by `storeResolvedLocale`.
+        const canon = locale_id.languageIdOf(try canonicalizeTag(arena, t));
         if (chosen == null and isAvailableLocale(canon)) chosen = canon;
     }
     try obj.set("[[intl_locale]]", try val_mod.makeString(arena, chosen orelse default_locale));
+}
+
+/// The locale a service resolved to, before its `-u-` keywords are re-attached.
+pub const LocaleRequest = struct {
+    /// `language[-Script][-REGION]`, already canonicalized.
+    base: []const u8,
+    /// The `-u-` extension body of the requested tag ("" when it carried none).
+    u_ext: []const u8,
+
+    /// The requested value of Unicode extension keyword `key`, if any. Keyword
+    /// values are case-insensitive, so this hands back the canonical lowercase.
+    pub fn keyword(self: LocaleRequest, arena: std.mem.Allocator, key: []const u8) !?[]const u8 {
+        const raw = uExtKeyword(self.u_ext, key) orelse return null;
+        return try lowerDup(arena, raw);
+    }
+};
+
+/// CanonicalizeLocaleList + LookupMatcher, keeping the `-u-` keywords of the
+/// tag that won. A service resolves each relevant key itself (an options value
+/// beats the extension) and then calls `storeResolvedLocale` with the keywords
+/// that actually took effect, so `resolvedOptions().locale` echoes only those.
+pub fn resolveLocaleRequest(arena: std.mem.Allocator, locales: Value) anyerror!LocaleRequest {
+    const requested = try canonicalizeLocaleList(arena, locales);
+    for (requested) |t| {
+        const canon = locale_id.languageIdOf(try canonicalizeTag(arena, t));
+        if (isAvailableLocale(canon)) return .{ .base = canon, .u_ext = parseLocaleTag(t).u_ext };
+    }
+    return .{ .base = default_locale, .u_ext = "" };
+}
+
+/// Store `base` extended with the `-u-` keywords that survived resolution, in
+/// canonical (key-sorted) order.
+pub fn storeResolvedLocale(arena: std.mem.Allocator, obj: *JsObject, base: []const u8, kept: []const [2][]const u8) !void {
+    if (kept.len == 0) {
+        try obj.set("[[intl_locale]]", try val_mod.makeString(arena, base));
+        return;
+    }
+    const sorted = try arena.dupe([2][]const u8, kept);
+    std.mem.sort([2][]const u8, sorted, {}, struct {
+        fn lt(_: void, a: [2][]const u8, b: [2][]const u8) bool {
+            return std.mem.lessThan(u8, a[0], b[0]);
+        }
+    }.lt);
+    var out = std.ArrayListUnmanaged(u8){};
+    try out.appendSlice(arena, base);
+    try out.appendSlice(arena, "-u");
+    for (sorted) |kv| {
+        try out.append(arena, '-');
+        try out.appendSlice(arena, kv[0]);
+        try out.append(arena, '-');
+        try out.appendSlice(arena, kv[1]);
+    }
+    try obj.set("[[intl_locale]]", try val_mod.makeString(arena, out.items));
 }
 
 /// The `[[Locale]]` stored by `resolveAndStoreLocale`, or the default.
@@ -2089,44 +1956,21 @@ pub fn resolvedLocaleOf(this_val: Value) []const u8 {
 /// Canonicalize one BCP-47 tag to `language[-Script][-REGION]` form. A tag that
 /// does not match `unicode_locale_id` is a RangeError (ES §9.2.1 step 7.c).
 pub fn canonicalizeTag(arena: std.mem.Allocator, tag: []const u8) ![]const u8 {
-    if (!try isStructurallyValidLanguageTag(arena, tag))
-        return throwRangeError(arena, "invalid language tag");
-    const parts = parseLocaleTag(tag);
-    const language = try canonSubtag(arena, parts.language, .lang);
-    const script = try canonSubtag(arena, parts.script, .script);
-    const region = try canonSubtag(arena, parts.region, .region);
-    var bn = std.ArrayListUnmanaged(u8){};
-    try bn.appendSlice(arena, language);
-    if (script.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, script);
-    }
-    if (region.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, region);
-    }
-    return bn.items;
+    return (try locale_id.canonicalize(arena, tag)) orelse
+        throwRangeError(arena, "invalid language tag");
 }
 
 /// `Intl.getCanonicalLocales(locales)` — accepts a string or array-like of tags,
 /// returns a de-duplicated array of canonical tags.
 pub fn nativeGetCanonicalLocales(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    var tags = std.ArrayListUnmanaged([]const u8){};
-    if (args.len > 0 and args[0].bits != 0) {
-        if (args[0].unbox() == .string) {
-            try tags.append(arena, args[0].unbox().string);
-        } else if (args[0].unbox() == .object) {
-            tags.items = try listElements(arena, args[0]);
-        }
-    }
+    const tags = try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{});
     const arr = if (realm_mod.active_heap) |h|
         try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
     else
         try JsObject.createArray(arena, realm_mod.active_array_proto);
     var seen = std.ArrayListUnmanaged([]const u8){};
     var n: usize = 0;
-    for (tags.items) |t| {
-        if (t.len == 0) continue;
+    for (tags) |t| {
         const canon = try canonicalizeTag(arena, t);
         var dup = false;
         for (seen.items) |s| if (std.mem.eql(u8, s, canon)) {
@@ -2183,7 +2027,11 @@ pub fn nativeSupportedValuesOf(arena: std.mem.Allocator, _: Value, args: []const
         "AUD", "BRL", "CAD", "CHF", "CNY", "EUR", "GBP", "HKD", "INR", "JPY",
         "KRW", "MXN", "NZD", "RUB", "SEK", "SGD", "TRY", "USD", "ZAR",
     };
-    const calendars = [_][]const u8{"gregory"};
+    // Every calendar `Intl.DateTimeFormat` resolves, in CalendarId order.
+    var calendars: [@typeInfo(t_calendar.CalendarId).@"enum".fields.len][]const u8 = undefined;
+    inline for (@typeInfo(t_calendar.CalendarId).@"enum".fields, 0..) |f, ci| {
+        calendars[ci] = (@as(t_calendar.CalendarId, @enumFromInt(f.value))).str();
+    }
     const numbering = [_][]const u8{"latn"};
     const empty = [_][]const u8{};
 
@@ -2198,7 +2046,7 @@ pub fn nativeSupportedValuesOf(arena: std.mem.Allocator, _: Value, args: []const
     else if (std.mem.eql(u8, key, "timeZone"))
         &time_zones
     else if (std.mem.eql(u8, key, "unit"))
-        &empty
+        &nfmt.sanctioned_units
     else
         return throwRangeError(arena, "invalid key for Intl.supportedValuesOf");
 
@@ -2813,7 +2661,7 @@ fn rtfBuildParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
     const av = @abs(value);
     const unit_name = if (av == 1) u else try std.fmt.allocPrint(arena, "{s}s", .{u});
     if (!past) try parts.append(arena, .{ .type = "literal", .value = "in " });
-    for (try formatNumberParts(arena, av, .{})) |np|
+    for (try nfmt.formatNumberParts(arena, av, .{})) |np|
         try parts.append(arena, .{ .type = np.type, .value = np.value, .source = u });
     try parts.append(arena, .{
         .type = "literal",
@@ -2901,7 +2749,7 @@ pub fn dnGetOptionsObject(arena: std.mem.Allocator, options: ?Value) anyerror!Va
 /// CoerceOptionsToObject (ES §9.2.14): the legacy services (Collator,
 /// NumberFormat, DateTimeFormat, PluralRules, RelativeTimeFormat) ToObject their
 /// `options` instead of rejecting a primitive.
-fn coerceOptionsToObject(arena: std.mem.Allocator, options: ?Value) anyerror!Value {
+pub fn coerceOptionsToObject(arena: std.mem.Allocator, options: ?Value) anyerror!Value {
     const o = options orelse return emptyOptions(arena);
     if (o.bits == 0 or o.unbox() == .undefined_) return emptyOptions(arena);
     if (o.unbox() == .object) return o;
@@ -2913,7 +2761,7 @@ fn coerceOptionsToObject(arena: std.mem.Allocator, options: ?Value) anyerror!Val
 /// context so a throwing getter propagates, ToString-coerces the value, and
 /// validates it against `allowed` (empty = accept any). Absent/undefined →
 /// `default`.
-fn dnGetOption(arena: std.mem.Allocator, options: Value, key: []const u8, allowed: []const []const u8, default: ?[]const u8) anyerror!?[]const u8 {
+pub fn dnGetOption(arena: std.mem.Allocator, options: Value, key: []const u8, allowed: []const []const u8, default: ?[]const u8) anyerror!?[]const u8 {
     const v = if (realm_mod.active_context) |c|
         try c.getProp(arena, options, key)
     else if (options.bits != 0 and options.unbox() == .object)
@@ -3233,10 +3081,14 @@ fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerr
                 }
             }
         }
-        // GetDurationUnitOptions step 6: a long/short/narrow style cannot follow a
-        // unit rendered with "numeric"/"2-digit".
-        if (dfIsNumericStyle(prev_style) and !dfIsNumericStyle(style.?))
-            return throwRangeError(arena, "Intl.DurationFormat: style cannot follow a numeric unit");
+        // GetDurationUnitOptions step 7: a long/short/narrow style cannot follow a
+        // unit rendered with "numeric"/"2-digit", and minutes/seconds in that
+        // position are always zero-padded — even when "numeric" was explicit.
+        if (dfIsNumericStyle(prev_style)) {
+            if (!dfIsNumericStyle(style.?))
+                return throwRangeError(arena, "Intl.DurationFormat: style cannot follow a numeric unit");
+            if (i == 5 or i == 6) style = "2-digit";
+        }
         const disp_key = try std.fmt.allocPrint(arena, "{s}Display", .{uname});
         const display = (try dfGetOption(arena, opts, disp_key, &.{ "auto", "always" })) orelse display_default;
 
@@ -3249,7 +3101,7 @@ fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerr
 }
 
 /// A Unicode `type` value: one or more `-`-separated 3..8 alphanumeric segments.
-fn isWellFormedNumberingSystem(s: []const u8) bool {
+pub fn isWellFormedNumberingSystem(s: []const u8) bool {
     if (s.len == 0) return false;
     var seg_len: usize = 0;
     for (s) |c| {
@@ -3288,9 +3140,17 @@ pub fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror
         try out.append(arena, locales.unbox().string);
         return out.items;
     }
-    if (locales.unbox() != .object) return out.items;
+    // Every other primitive is ToObject-boxed, so inherited index/length
+    // properties on e.g. Number.prototype are still seen.
+    const obj: Value = if (locales.unbox() == .object)
+        locales
+    else if (locales.unbox() == .symbol)
+        // A Symbol wrapper has no indices; the list is empty either way.
+        return out.items
+    else
+        try realm_mod.toObjectForThis(arena, locales);
     const ctx = realm_mod.active_context;
-    const len_v = if (ctx) |c| try c.getProp(arena, locales, "length") else Value{};
+    const len_v = if (ctx) |c| try c.getProp(arena, obj, "length") else Value{};
     // ToLength → ToNumber: a Symbol or BigInt length is a TypeError.
     if (len_v.bits != 0 and (len_v.unbox() == .symbol or len_v.unbox() == .bigint))
         return throwTypeErrorIntl(arena, "Cannot convert length to a number");
@@ -3298,12 +3158,19 @@ pub fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror
     var k: usize = 0;
     while (k < len) : (k += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{k});
-        const present = if (ctx) |c| try c.hasProp(arena, locales, key) else false;
+        const present = if (ctx) |c| try c.hasProp(arena, obj, key) else false;
         if (!present) continue;
-        const kv = if (ctx) |c| try c.getProp(arena, locales, key) else Value{};
+        const kv = if (ctx) |c| try c.getProp(arena, obj, key) else Value{};
         if (kv.bits != 0 and kv.unbox() == .string) {
             try out.append(arena, kv.unbox().string);
         } else if (kv.bits != 0 and kv.unbox() == .object) {
+            // An Intl.Locale element contributes its [[Locale]] directly.
+            if (kv.toPtr().object.get("__locale_tag")) |lt| {
+                if (lt.bits != 0 and lt.unbox() == .string) {
+                    try out.append(arena, lt.unbox().string);
+                    continue;
+                }
+            }
             try out.append(arena, try t_shared.valueToString(arena, kv));
         } else {
             return throwTypeErrorIntl(arena, "locale list element must be a String or Object");
@@ -3559,34 +3426,6 @@ pub fn nativeDurationFormatResolved(arena: std.mem.Allocator, this_val: Value, _
 }
 
 // ----------------------------------------------------------------------- tests ---
-
-test "intl: formatNumber decimal grouping" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("1,234,567.891", try formatNumber(a, 1234567.891, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 3, .group = true, .sign_display = "auto" }));
-    try std.testing.expectEqualStrings("1000", try formatNumber(a, 1000, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 3, .group = false, .sign_display = "auto" }));
-    try std.testing.expectEqualStrings("5.00", try formatNumber(a, 5, .{ .style = "decimal", .currency = "USD", .min_frac = 2, .max_frac = 3, .group = true, .sign_display = "auto" }));
-}
-
-test "intl: formatNumber currency and percent" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("-$1,234.50", try formatNumber(a, -1234.5, .{ .style = "currency", .currency = "USD", .min_frac = 2, .max_frac = 2, .group = true, .sign_display = "auto" }));
-    try std.testing.expectEqualStrings("26%", try formatNumber(a, 0.255, .{ .style = "percent", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "auto" }));
-}
-
-test "intl: formatNumber signDisplay" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("+5", try formatNumber(a, 5, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "always" }));
-    try std.testing.expectEqualStrings("+0", try formatNumber(a, 0, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "always" }));
-    try std.testing.expectEqualStrings("+5", try formatNumber(a, 5, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "exceptZero" }));
-    try std.testing.expectEqualStrings("0", try formatNumber(a, 0, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "exceptZero" }));
-    try std.testing.expectEqualStrings("5", try formatNumber(a, -5, .{ .style = "decimal", .currency = "USD", .min_frac = 0, .max_frac = 0, .group = true, .sign_display = "never" }));
-}
 
 test "intl: parseLocaleTag subtags" {
     const p = parseLocaleTag("zh-Hant-CN");
