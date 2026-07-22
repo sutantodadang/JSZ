@@ -351,11 +351,21 @@ pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const V
     const digits = try shared.getFractionalDigits(arena, opts);
     const mode = try shared.getRoundingMode(arena, opts, .trunc);
     const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
-    // timeZone option ignored (UTC). Rounding is on the epoch nanoseconds, so
-    // a carry past midnight moves the date for free.
-    const ns = shared.roundI128ToIncrement(ins.*, prec.increment, mode);
-    const s = try instantToStringPrec(arena, ns, prec);
-    return val_mod.makeString(arena, s);
+    const tz_v: ?Value = if (opts) |o| try shared.optionGet(arena, o, "timeZone") else null;
+    // Rounding is on the epoch nanoseconds, so a carry past midnight moves the
+    // date for free. The modes read as if the instant were positive.
+    const ns = shared.roundI128ToIncrementAsIfPositive(ins.*, prec.increment, mode);
+    if (tz_v) |v| {
+        if (v.unbox() != .string) return realm_mod.throwTypeError(arena, "time zone must be a string");
+        const timezone = @import("timezone.zig");
+        const zone = try timezone.toZoneAtInstant(arena, v.unbox().string, ns);
+        const s = try instantToStringPrec(arena, ns + zone.offset_ns, prec);
+        var buf = shared.Buf{};
+        try buf.appendSlice(arena, s[0 .. s.len - 1]); // drop the "Z"
+        try buf.appendSlice(arena, try timezone.formatOffset(arena, zone.offset_ns));
+        return val_mod.makeString(arena, buf.items);
+    }
+    return val_mod.makeString(arena, try instantToStringPrec(arena, ns, prec));
 }
 
 pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {

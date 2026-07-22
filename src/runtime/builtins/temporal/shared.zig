@@ -927,6 +927,26 @@ pub fn roundNumberToIncrement(x: f64, increment: f64, mode: RoundingMode) f64 {
     return rounded * increment;
 }
 
+/// RoundNumberToIncrementAsIfPositive: the rounding modes are applied as though
+/// `x` were positive, so "trunc" means towards -infinity even for a negative
+/// epoch instant (rounding an Instant down goes towards the Big Bang, not
+/// towards the epoch).
+pub fn roundI128ToIncrementAsIfPositive(x: i128, increment: i128, mode: RoundingMode) i128 {
+    if (increment == 0) return x;
+    const q = @divFloor(x, increment);
+    const r = x - q * increment; // 0 <= r < increment
+    if (r == 0) return x;
+    const twice = r * 2;
+    const round_up = switch (mode) {
+        .ceil, .expand => true,
+        .floor, .trunc => false,
+        .half_ceil, .half_expand => twice >= increment,
+        .half_floor, .half_trunc => twice > increment,
+        .half_even => if (twice == increment) @mod(q, 2) != 0 else twice > increment,
+    };
+    return (q + @as(i128, if (round_up) 1 else 0)) * increment;
+}
+
 /// i128 rounding (nanosecond precision): round `x` to a multiple of `increment`.
 pub fn roundI128ToIncrement(x: i128, increment: i128, mode: RoundingMode) i128 {
     if (increment == 0) return x;
@@ -1422,11 +1442,22 @@ pub fn getRoundingIncrement(arena: std.mem.Allocator, opts: ?*JsObject) !f64 {
     return t;
 }
 
+/// A unit-valued option: absent and "auto" mean different things to Duration
+/// rounding, which needs at least one of smallestUnit/largestUnit to be *given*.
+pub const UnitOption = union(enum) { absent, auto, unit: Unit };
+
+pub fn getTemporalUnitOption(arena: std.mem.Allocator, opts: ?*JsObject, key: []const u8) !UnitOption {
+    const s = (try readStringOption(arena, opts, key)) orelse return .absent;
+    if (std.mem.eql(u8, s, "auto")) return .auto;
+    return .{ .unit = unitFromString(s) orelse return realm_mod.throwRangeError(arena, "invalid temporal unit") };
+}
+
 /// Read a required or optional temporal unit option (e.g. "smallestUnit").
 pub fn getTemporalUnit(arena: std.mem.Allocator, opts: ?*JsObject, key: []const u8) !?Unit {
-    const s = (try readStringOption(arena, opts, key)) orelse return null;
-    if (std.mem.eql(u8, s, "auto")) return null;
-    return unitFromString(s) orelse realm_mod.throwRangeError(arena, "invalid temporal unit");
+    return switch (try getTemporalUnitOption(arena, opts, key)) {
+        .absent, .auto => null,
+        .unit => |u| u,
+    };
 }
 
 // -------------------------------------------------------- ToIntegerWithTrunc ---
