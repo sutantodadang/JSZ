@@ -328,17 +328,26 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     var opts: ?*JsObject = null;
     var smallest: ?shared.Unit = null;
     const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits != 0 and arg0.unbox() == .string) {
+    // round() requires an argument; undefined/missing is a TypeError.
+    if (arg0.bits == 0 or arg0.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "round() requires an options argument");
+    var inc: f64 = 1;
+    var mode: shared.RoundingMode = .half_expand;
+    if (arg0.unbox() == .string) {
         smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
     } else {
+        // Read order: roundingIncrement, roundingMode, smallestUnit; then validate.
         opts = try shared.getOptionsObject(arena, arg0);
+        inc = try shared.getRoundingIncrement(arena, opts);
+        mode = try shared.getRoundingMode(arena, opts, .half_expand);
         smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     }
     if (smallest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
     if (!isTimeUnit(smallest.?) and smallest.? != .day) return realm_mod.throwRangeError(arena, "invalid smallestUnit for PlainTime");
     if (smallest.? == .day) return realm_mod.throwRangeError(arena, "smallestUnit 'day' invalid for PlainTime");
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
+    // ValidateTemporalRoundingIncrement: increment must divide, and be strictly
+    // below, the unit's maximum (non-inclusive).
+    if (shared.maximumRoundingIncrement(smallest.?)) |maxv|
+        try shared.validateRoundingIncrement(arena, inc, maxv, false);
     const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
     var total = shared.timeToNanos(t.*);
     total = shared.roundI128ToIncrement(total, inc_ns, mode);

@@ -149,6 +149,9 @@ fn parseOffset(s: []const u8) ?i128 {
             scale = @divTrunc(scale, 10);
         }
     }
+    // A UTC offset's components have the same bounds as a clock: an out-of-range
+    // hour/minute/second (e.g. "-24:00") makes the whole string invalid.
+    if (h > 23 or m > 59 or sec > 59) return null;
     return sign * (h * shared.NS_PER_HOUR + m * shared.NS_PER_MINUTE + sec * shared.NS_PER_SECOND + frac_ns);
 }
 
@@ -202,8 +205,12 @@ fn toInstantNs(arena: std.mem.Allocator, v: Value) !i128 {
     if (getInstant(v)) |ins| return ins.*;
     const zdt = @import("zoned_date_time.zig");
     if (zdt.getZoned(v)) |z| return z.ns;
-    if (v.bits != 0 and v.unbox() == .string) return try parseInstantString(arena, v.unbox().string);
-    return realm_mod.throwTypeError(arena, "cannot convert to Temporal.Instant");
+    // ToTemporalInstant: any other value is coerced to a primitive with the
+    // string hint and must be a String (ToPrimitiveAndRequireString), then
+    // parsed — an object like {} yields "[object Object]" and a RangeError, a
+    // bare number yields a TypeError before parsing.
+    const str = try shared.toPrimitiveRequireString(arena, v);
+    return try parseInstantString(arena, str);
 }
 
 // ------------------------------------------------------------- prototype methods ---
@@ -299,18 +306,28 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     var opts: ?*JsObject = null;
     var smallest: ?shared.Unit = null;
     const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits != 0 and arg0.unbox() == .string) {
+    if (arg0.bits == 0 or arg0.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "round() requires an options argument");
+    var inc: f64 = 1;
+    var mode: shared.RoundingMode = .half_expand;
+    if (arg0.unbox() == .string) {
         smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
     } else {
         opts = try shared.getOptionsObject(arena, arg0);
+        inc = try shared.getRoundingIncrement(arena, opts);
+        mode = try shared.getRoundingMode(arena, opts, .half_expand);
         smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     }
     if (smallest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
     if (unitRank(smallest.?) < unitRank(.hour)) return realm_mod.throwRangeError(arena, "smallestUnit must be hour..nanosecond");
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
-    const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
-    const rounded = shared.roundI128ToIncrement(ins.*, inc_ns, mode);
+    // An Instant rounds within a day, so the increment's maximum is that unit's
+    // count per day (inclusive): e.g. hours→24, minutes→1440, ns→86400·10⁹.
+    const unit_ns = shared.unitLengthNanos(smallest.?).?;
+    const per_day: f64 = @floatFromInt(@divTrunc(shared.NS_PER_DAY, unit_ns));
+    try shared.validateRoundingIncrement(arena, inc, per_day, true);
+    const inc_ns = unit_ns * @as(i128, @intFromFloat(inc));
+    // Rounding modes apply as if the epoch were positive, so "trunc"/"floor" go
+    // towards the Big Bang (−∞), not towards the epoch.
+    const rounded = shared.roundI128ToIncrementAsIfPositive(ins.*, inc_ns, mode);
     return makeInstant(arena, rounded);
 }
 
