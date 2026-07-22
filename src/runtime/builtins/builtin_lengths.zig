@@ -628,6 +628,7 @@ const name_map = std.StaticStringMap(u8).initComptime(.{
     .{ "__defineSetter__", 2 },
     .{ "__lookupGetter__", 1 },
     .{ "__lookupSetter__", 1 },
+    .{ "abs", 1 },
     .{ "acos", 1 },
     .{ "acosh", 1 },
     .{ "adopt", 2 },

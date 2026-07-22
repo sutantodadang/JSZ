@@ -900,7 +900,7 @@ fn genSet(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
 /// if [[DefineOwnProperty]] fails (non-configurable existing prop, non-extensible
 /// target, exotic rejection). Used by concat/map/filter/splice/… which the spec
 /// defines with CreateDataProperty, not [[Set]].
-fn genCreate(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
+pub fn genCreate(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
     if (realm_mod.nativeDeadlineExceeded()) return error.OutOfMemory;
     // Fast path: dense real array (elements are always configurable/writable and
     // the array is extensible, so CreateDataProperty always succeeds).

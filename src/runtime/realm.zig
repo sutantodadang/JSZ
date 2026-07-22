@@ -1606,98 +1606,106 @@ fn nativeArrayIsArray(arena: std.mem.Allocator, _: Value, args: []const Value) a
 
 /// ES2015 Array.from(arrayLike [, mapFn [, thisArg]])
 /// Converts any array-like (length + indexed) or iterable to a real Array.
-fn nativeArrayFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    // Helper: create a new array with the given items.
-    const makeJsArray = struct {
-        fn make(alloc: std.mem.Allocator, items: []const Value) !Value {
-            const obj = if (active_heap) |heap|
-                try JsObject.createOnHeap(heap, active_array_proto)
-            else
-                try JsObject.create(alloc, active_array_proto);
-            obj.is_array = true;
-            for (items, 0..) |v, i| {
-                const key = try std.fmt.allocPrint(alloc, "{d}", .{i});
-                try obj.set(key, v);
-            }
-            obj.array_length = @intCast(items.len);
-            return val_mod.makeObject(alloc, obj);
+/// ArrayCreate(len) — a fresh real Array with [[ArrayLength]] = len and the
+/// current realm's %Array.prototype%. A length past the array index limit is a
+/// RangeError (§10.4.2.2 step 1).
+fn arrayCreate(arena: std.mem.Allocator, len: usize) anyerror!Value {
+    if (len > 4294967295) return throwRangeError(arena, "Invalid array length");
+    const obj = if (active_heap) |heap|
+        try JsObject.createOnHeap(heap, active_array_proto)
+    else
+        try JsObject.create(arena, active_array_proto);
+    obj.is_array = true;
+    obj.array_length = @intCast(len);
+    return val_mod.makeObject(arena, obj);
+}
+
+/// ArrayCreate(len) unless `C` is a constructor, in which case Construct(C, args)
+/// — the "which object do I fill in" step shared by Array.from and Array.of.
+fn arrayFromCtor(arena: std.mem.Allocator, ctx: *Context, c: Value, len: usize, pass_len: bool) anyerror!Value {
+    if (!reflect_mod.isConstructorVal(c)) return arrayCreate(arena, len);
+    if (pass_len) {
+        return ctx.construct(arena, c, &[_]Value{try val_mod.makeNumber(arena, @floatFromInt(len))});
+    }
+    return ctx.construct(arena, c, &[_]Value{});
+}
+
+/// ES2015 Array.from(items, mapfn, thisArg) — §23.1.2.1. `this` is the
+/// constructor to build with (subclass-aware), elements are installed with
+/// CreateDataPropertyOrThrow, and `length` is written with a throwing [[Set]].
+fn nativeArrayFrom(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const ctx = active_context orelse return throwTypeError(arena, "no active context");
+    const items = if (args.len > 0) args[0] else Value{};
+    const mapfn = if (args.len > 1) args[1] else Value{};
+    const this_arg = if (args.len > 2) args[2] else try val_mod.makeUndefined(arena);
+
+    // Step 2: mapfn is validated BEFORE `items` is touched at all.
+    var mapping = false;
+    if (!(mapfn.bits == 0 or mapfn.unbox() == .undefined_)) {
+        if (!isCallableVal(mapfn)) return throwTypeError(arena, "Array.from: mapfn is not a function");
+        mapping = true;
+    }
+
+    // Step 3: GetMethod(items, @@iterator) — this is what makes Array.from(null)
+    // a TypeError (GetV does ToObject on the base first).
+    if (items.bits == 0 or items.unbox() == .undefined_ or items.unbox() == .null_)
+        return throwTypeError(arena, "Array.from: items is null or undefined");
+    var using_iterator = Value{};
+    if (active_sym_iterator) |sym| {
+        const m = try ctx.getPropSym(arena, items, sym);
+        if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+            if (!isCallableVal(m)) return throwTypeError(arena, "Array.from: Symbol.iterator is not a function");
+            using_iterator = m;
         }
-    }.make;
+    }
 
-    if (args.len == 0 or args[0].bits == 0) return try makeJsArray(arena, &[_]Value{});
-    const src = args[0];
-    const map_fn = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_) args[1] else Value{};
-
-    var items = std.ArrayList(Value){};
-    const src_unboxed = src.unbox();
-    if (src_unboxed == .object) {
-        const obj = src_unboxed.object;
-        if (obj.internal_kind == .typed_array) {
-            // TypedArray: use taLoad to get each element as a JS Value.
-            if (typed_array_mod.getTd(src)) |td| {
-                var i: usize = 0;
-                while (i < td.length) : (i += 1) {
-                    try items.append(arena, try typed_array_mod.taLoad(arena, td, i));
+    if (using_iterator.bits != 0) {
+        const a = try arrayFromCtor(arena, ctx, this_val, 0, false);
+        const iterator = try function_proto_mod.invokeCallback(arena, items, using_iterator, &[_]Value{});
+        if (iterator.bits == 0 or iterator.unbox() != .object)
+            return throwTypeError(arena, "[Symbol.iterator]() returned a non-object");
+        const next_fn = try ctx.getProp(arena, iterator, "next");
+        if (!isCallableVal(next_fn)) return throwTypeError(arena, "iterator.next is not a function");
+        var k: usize = 0;
+        while (true) : (k += 1) {
+            const res = try function_proto_mod.invokeCallback(arena, iterator, next_fn, &[_]Value{});
+            if (res.bits == 0 or res.unbox() != .object)
+                return throwTypeError(arena, "iterator.next() returned a non-object");
+            if (isTruthyVal(try ctx.getProp(arena, res, "done"))) break;
+            const v = try ctx.getProp(arena, res, "value");
+            // A throw from mapfn or from installing the element closes the
+            // iterator before propagating (IteratorClose, §23.1.2.1 steps 5.g/5.i).
+            const mapped = if (mapping)
+                function_proto_mod.invokeCallback(arena, this_arg, mapfn, &[_]Value{ v, try val_mod.makeNumber(arena, @floatFromInt(k)) }) catch |e| {
+                    es2015_collections_mod.closeIterator(arena, iterator);
+                    return e;
                 }
-            }
-        } else if (obj.is_array) {
-            // Real Array: iterate by [[ArrayLength]] + indexed reads (length is
-            // the `array_length` slot, NOT an ordinary "length" property).
-            const len: usize = obj.getArrayLength();
-            var i: usize = 0;
-            var buf: [32]u8 = undefined;
-            while (i < len) : (i += 1) {
-                const key = try std.fmt.bufPrint(&buf, "{d}", .{i});
-                try items.append(arena, obj.get(key) orelse Value{});
-            }
-        } else if (try arrayFromIterate(arena, src, &items)) {
-            // Consumed via the @@iterator protocol (Set/Map/generators/custom).
-        } else {
-            // Generic array-like: read .length then [0..length-1].
-            const len_v = obj.get("length") orelse Value{};
-            // ToLength: NaN → 0, clamp to 2^53-1 (`{length: Infinity}` must not
-            // reach @intFromFloat). Array.from then builds the result with
-            // ArrayCreate(len), which is a RangeError past the array-length limit.
-            const raw = if (len_v.bits != 0 and len_v.unbox() == .number) len_v.unbox().number else 0;
-            const clamped = if (std.math.isNan(raw)) 0 else @max(0, @min(raw, 9007199254740991.0));
-            if (clamped > 4294967295.0) return throwRangeError(arena, "Invalid array length");
-            const len: usize = @intFromFloat(clamped);
-            var i: usize = 0;
-            var buf: [32]u8 = undefined;
-            while (i < len) : (i += 1) {
-                const key = try std.fmt.bufPrint(&buf, "{d}", .{i});
-                const v = obj.get(key) orelse Value{};
-                try items.append(arena, v);
-            }
+            else
+                v;
+            array_proto_mod.genCreate(arena, a, k, mapped) catch |e| {
+                es2015_collections_mod.closeIterator(arena, iterator);
+                return e;
+            };
         }
-    } else if (src_unboxed == .string) {
-        // String: each Unicode code unit becomes an element.
-        const s = src_unboxed.string;
-        var i: usize = 0;
-        while (i < s.len) {
-            const byte_len: usize = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-            const slice = if (i + byte_len <= s.len) s[i .. i + byte_len] else s[i .. i + 1];
-            const cv = try val_mod.makeString(arena, try arena.dupe(u8, slice));
-            try items.append(arena, cv);
-            i += byte_len;
-        }
-    } else if (src_unboxed != .null_ and src_unboxed != .undefined_) {
-        // Non-string primitive (number/boolean/symbol/bigint): GetMethod(items,
-        // @@iterator) coerces via ToObject, so a wrapper-prototype @@iterator
-        // (e.g. a custom Number.prototype[@@iterator]) is honoured.
-        _ = try arrayFromIterate(arena, src, &items);
+        try ctx.setPropThrow(arena, a, "length", try val_mod.makeNumber(arena, @floatFromInt(k)));
+        return a;
     }
 
-    // Apply mapFn if provided.
-    if (map_fn.bits != 0) {
-        const undef = try val_mod.makeUndefined(arena);
-        for (items.items, 0..) |v, i| {
-            const idx = try val_mod.makeNumber(arena, @floatFromInt(i));
-            items.items[i] = try function_proto_mod.invokeCallback(arena, undef, map_fn, &[_]Value{ v, idx });
-        }
+    // Array-like path.
+    const len = try toLengthValue(arena, try ctx.getProp(arena, items, "length"));
+    const a = try arrayFromCtor(arena, ctx, this_val, len, true);
+    var k: usize = 0;
+    while (k < len) : (k += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{k});
+        const kv = try ctx.getProp(arena, items, key);
+        const mapped = if (mapping)
+            try function_proto_mod.invokeCallback(arena, this_arg, mapfn, &[_]Value{ kv, try val_mod.makeNumber(arena, @floatFromInt(k)) })
+        else
+            kv;
+        try array_proto_mod.genCreate(arena, a, k, mapped);
     }
-
-    return try makeJsArray(arena, items.items);
+    try ctx.setPropThrow(arena, a, "length", try val_mod.makeNumber(arena, @floatFromInt(len)));
+    return a;
 }
 
 /// Consume `src` via the @@iterator protocol into `items`. Returns false when
@@ -1747,19 +1755,15 @@ fn isTruthyValue(v: Value) bool {
     return val_mod.toBoolean(v);
 }
 
-/// ES2015 Array.of(...args) — creates array from arguments (no special-case for length).
-fn nativeArrayOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const obj = if (active_heap) |heap|
-        try JsObject.createOnHeap(heap, active_array_proto)
-    else
-        try JsObject.create(arena, active_array_proto);
-    obj.is_array = true;
-    for (args, 0..) |v, i| {
-        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        try obj.set(key, v);
-    }
-    obj.array_length = @intCast(args.len);
-    return val_mod.makeObject(arena, obj);
+/// ES2015 Array.of(...items) — §23.1.2.3. Like Array.from, `this` is the
+/// constructor to build with, elements go in via CreateDataPropertyOrThrow, and
+/// `length` is written with a throwing [[Set]].
+fn nativeArrayOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const ctx = active_context orelse return throwTypeError(arena, "no active context");
+    const a = try arrayFromCtor(arena, ctx, this_val, args.len, true);
+    for (args, 0..) |v, i| try array_proto_mod.genCreate(arena, a, i, v);
+    try ctx.setPropThrow(arena, a, "length", try val_mod.makeNumber(arena, @floatFromInt(args.len)));
+    return a;
 }
 
 /// ES2023 Array.fromAsync(items, mapFn?, thisArg?) → Promise<Array>
@@ -4433,6 +4437,9 @@ pub const Realm = struct {
         // poison-pill accessors whose [[Get]] and [[Set]] are the shared
         // %ThrowTypeError% intrinsic (enumerable:false, configurable:true).
         const thrower = try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeThrowTypeError, "", 0);
+        // §10.2.4.1: %ThrowTypeError% is non-extensible and its `length`/`name`
+        // are non-configurable — unlike every other built-in function.
+        thrower.toPtr().native_function.frozen_intrinsic = true;
         active_throw_type_error = thrower;
         const thrower_holder = try JsObject.create(arena, null);
         try thrower_holder.set("get", thrower);

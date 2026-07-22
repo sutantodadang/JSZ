@@ -510,7 +510,7 @@ fn setTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror!void {
     return error.JsException;
 }
 
-fn closeIterator(arena: std.mem.Allocator, iter: Value) void {
+pub fn closeIterator(arena: std.mem.Allocator, iter: Value) void {
     if (iter.bits == 0 or iter.unbox() != .object) return;
     const ret_fn = iter.toPtr().object.get("return") orelse return;
     if (!isCallable(ret_fn)) return;

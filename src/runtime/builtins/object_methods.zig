@@ -1507,6 +1507,9 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
         const entry = arg0_unboxed.native_function;
         const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
         const desc = try JsObject.create(arena, obj_proto);
+        // Built-in `length`/`name` are configurable — except on %ThrowTypeError%,
+        // which the spec freezes (§10.2.4.1).
+        const cfg = !entry.frozen_intrinsic;
         if (std.mem.eql(u8, key, "name")) {
             if (entry.name_deleted) return val_mod.makeUndefined(arena);
             const name_val = if (entry.name) |n|
@@ -1516,14 +1519,14 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
             try desc.set("value", name_val);
             try desc.set("writable", try val_mod.makeBool(arena, false));
             try desc.set("enumerable", try val_mod.makeBool(arena, false));
-            try desc.set("configurable", try val_mod.makeBool(arena, true));
+            try desc.set("configurable", try val_mod.makeBool(arena, cfg));
             return val_mod.makeObject(arena, desc);
         } else if (std.mem.eql(u8, key, "length")) {
             if (entry.length_deleted) return val_mod.makeUndefined(arena);
             try desc.set("value", try val_mod.makeNumber(arena, @floatFromInt(entry.length)));
             try desc.set("writable", try val_mod.makeBool(arena, false));
             try desc.set("enumerable", try val_mod.makeBool(arena, false));
-            try desc.set("configurable", try val_mod.makeBool(arena, true));
+            try desc.set("configurable", try val_mod.makeBool(arena, cfg));
             return val_mod.makeObject(arena, desc);
         }
         return val_mod.makeUndefined(arena);
@@ -2193,8 +2196,10 @@ pub fn nativeObjectIsExtensible(arena: std.mem.Allocator, _: Value, args: []cons
             }
             break :blk val_mod.makeBool(arena, o.extensible);
         },
-        // Functions are ordinary (extensible) objects.
-        .native_function, .bc_function, .function => val_mod.makeBool(arena, true),
+        // Functions are ordinary (extensible) objects — except %ThrowTypeError%,
+        // which the spec creates non-extensible (§10.2.4.1).
+        .native_function => |e| val_mod.makeBool(arena, !e.frozen_intrinsic),
+        .bc_function, .function => val_mod.makeBool(arena, true),
         else => val_mod.makeBool(arena, false),
     };
 }

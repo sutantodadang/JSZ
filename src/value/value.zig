@@ -45,6 +45,10 @@ pub const NativeFnEntry = struct {
     /// Cross-realm: which Realm created this native function (opaque *Realm).
     /// Null = primary realm / untagged. Used by GetFunctionRealm.
     realm: ?*anyopaque = null,
+    /// %ThrowTypeError% only (§10.2.4.1): the intrinsic is created
+    /// non-extensible and its `length`/`name` are non-configurable, unlike every
+    /// other built-in function. Reflection paths consult this flag.
+    frozen_intrinsic: bool = false,
 
     pub fn invoke(self: NativeFnEntry, arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
         g_active_native_data = self.data;
