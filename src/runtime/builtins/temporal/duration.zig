@@ -31,7 +31,8 @@ fn requireDuration(arena: std.mem.Allocator, v: Value) !*DurationFields {
     return getDuration(v) orelse realm_mod.throwTypeError(arena, "not a Temporal.Duration");
 }
 
-pub fn makeDuration(arena: std.mem.Allocator, d: DurationFields) !Value {
+pub fn makeDuration(arena: std.mem.Allocator, d0: DurationFields) !Value {
+    const d = shared.normalizeZeroFields(d0);
     if (!isValidDuration(d)) return realm_mod.throwRangeError(arena, "invalid Duration");
     const slot = try arena.create(DurationFields);
     slot.* = d;
@@ -45,7 +46,8 @@ pub fn makeDuration(arena: std.mem.Allocator, d: DurationFields) !Value {
 }
 
 /// Populate a freshly-constructed `this` object (called via `new`).
-fn installInto(arena: std.mem.Allocator, this_val: Value, d: DurationFields) !Value {
+fn installInto(arena: std.mem.Allocator, this_val: Value, d0: DurationFields) !Value {
+    const d = shared.normalizeZeroFields(d0);
     if (!isValidDuration(d)) return realm_mod.throwRangeError(arena, "invalid Duration");
     const slot = try arena.create(DurationFields);
     slot.* = d;
@@ -121,12 +123,10 @@ fn toDurationFromFields(arena: std.mem.Allocator, o: *JsObject, require_any: boo
     var any = false;
     const names = [_][]const u8{ "days", "hours", "microseconds", "milliseconds", "minutes", "months", "nanoseconds", "seconds", "weeks", "years" };
     for (names) |name| {
-        if (o.get(name)) |fv| {
-            if (fv.bits != 0 and fv.unbox() != .undefined_) {
-                const n = try shared.toIntegerIfIntegral(arena, fv);
-                any = true;
-                assignField(&d, name, n);
-            }
+        if (try shared.optionGet(arena, o, name)) |fv| {
+            const n = try shared.toIntegerIfIntegral(arena, fv);
+            any = true;
+            assignField(&d, name, n);
         }
     }
     if (require_any and !any) return realm_mod.throwTypeError(arena, "duration-like object needs at least one field");
@@ -435,10 +435,7 @@ fn timePartNanos(d: DurationFields) i128 {
 fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
     const o = opts orelse return null;
     // Read relativeTo through [[Get]] so observers/getters run (option-read order).
-    const rv = if (realm_mod.active_context) |c|
-        try c.getProp(arena, try val_mod.makeObject(arena, o), "relativeTo")
-    else
-        (o.get("relativeTo") orelse Value{});
+    const rv = (try shared.optionGet(arena, o, "relativeTo")) orelse Value{};
     if (rv.bits == 0 or rv.isUndefined() or rv.isNull()) return null;
     // A ZonedDateTime relativeTo is reduced to its local calendar date (we do not
     // model per-day time-zone offset changes; correct for fixed-offset zones).
@@ -464,6 +461,19 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
                 return realm_mod.throwRangeError(arena, "relativeTo date out of range");
             return dt.date;
         }
+    }
+    // A property bag is read as a full ZonedDateTime-shaped bag (time, offset
+    // and timeZone included) even though only the date is kept: which fields are
+    // touched is observable.
+    if (rv.unbox() == .object) {
+        const bag = try pd.readDateBag(arena, rv.toPtr().object, .{ .time = true, .zoned = true });
+        // A bag naming a time zone is a *zoned* relativeTo, so its time zone and
+        // offset have to be validated even though only the date survives.
+        if (bag.time_zone != null) {
+            const z = try zdt.toTemporalZoned(arena, rv, null);
+            return zdt.localISODate(&z);
+        }
+        return try pd.dateFromBag(arena, bag, .constrain);
     }
     return try pd.toTemporalDate(arena, rv, .constrain);
 }
@@ -516,11 +526,6 @@ fn roundRelative(
     inc: f64,
     mode: shared.RoundingMode,
 ) !RelResult {
-    // Weeks can only be produced under a "year" or "week" largestUnit; requesting
-    // week rounding while the (default) largestUnit is "month" is a RangeError.
-    if (smallest == .week and largest == .month)
-        return realm_mod.throwRangeError(arena, "cannot round to weeks with a months largestUnit");
-
     const DAY = shared.NS_PER_DAY;
     const time_ns = timePartNanos(d0);
     // Fold the sub-day/over-day time into whole days plus a sub-day remainder.
@@ -636,17 +641,38 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     var opts: ?*JsObject = null;
     var smallest: ?shared.Unit = null;
     var largest: ?shared.Unit = null;
+    var given = false; // at least one of smallestUnit/largestUnit was supplied
+    var rel_date: ?shared.ISODate = null;
+    var mode: shared.RoundingMode = .half_expand;
+    var inc: f64 = 1;
     const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits != 0 and arg0.unbox() == .string) {
+    if (arg0.bits == 0 or arg0.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "round() requires an options argument");
+    if (arg0.unbox() == .string) {
         smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
+        given = true;
     } else {
+        // Alphabetical, and every read happens before any validation.
         opts = try shared.getOptionsObject(arena, arg0);
-        smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-        largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
+        switch (try shared.getTemporalUnitOption(arena, opts, "largestUnit")) {
+            .absent => {},
+            .auto => given = true,
+            .unit => |u| {
+                largest = u;
+                given = true;
+            },
+        }
+        rel_date = try readRelativeDate(arena, opts);
+        inc = try shared.getRoundingIncrement(arena, opts);
+        mode = try shared.getRoundingMode(arena, opts, .half_expand);
+        switch (try shared.getTemporalUnitOption(arena, opts, "smallestUnit")) {
+            .absent, .auto => {},
+            .unit => |u| {
+                smallest = u;
+                given = true;
+            },
+        }
     }
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
-    if (smallest == null and largest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit or largestUnit");
+    if (!given) return realm_mod.throwRangeError(arena, "round() requires smallestUnit or largestUnit");
 
     const small = smallest orelse shared.Unit.nanosecond;
     try validateIncrement(arena, small, inc);
@@ -659,7 +685,6 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
     // Anything touching calendar units (in the receiver or as a rounding unit)
     // needs a reference date; resolve relativeTo and use the calendar algorithm.
-    const rel_date = try readRelativeDate(arena, opts);
     const needs_relative = hasCalendarUnits(d.*) or isCalendarUnit(small) or isCalendarUnit(large);
     if (needs_relative) {
         const R = rel_date orelse return realm_mod.throwRangeError(arena, "Duration.round with calendar units requires relativeTo");
@@ -758,18 +783,22 @@ pub fn nativeTotal(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const d = try requireDuration(arena, this_val);
     var unit: ?shared.Unit = null;
     var opts: ?*JsObject = null;
+    var rel_date: ?shared.ISODate = null;
     const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits != 0 and arg0.unbox() == .string) {
+    if (arg0.bits == 0 or arg0.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "total() requires a unit argument");
+    if (arg0.unbox() == .string) {
         unit = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid unit");
     } else {
+        // "relativeTo" sorts before "unit", and both are read before validation.
         opts = try shared.getOptionsObject(arena, arg0);
+        rel_date = try readRelativeDate(arena, opts);
         unit = try shared.getTemporalUnit(arena, opts, "unit");
     }
     const u = unit orelse return realm_mod.throwRangeError(arena, "total() requires a unit");
 
     // Calendar units (in the receiver or as the target unit) need relativeTo.
     if (hasCalendarUnits(d.*) or isCalendarUnit(u)) {
-        const R = (try readRelativeDate(arena, opts)) orelse
+        const R = rel_date orelse
             return realm_mod.throwRangeError(arena, "Duration.total with calendar units requires relativeTo");
         const res = try roundRelative(arena, d.*, R, u, u, 1, .trunc);
         return val_mod.makeNumber(arena, res.total);

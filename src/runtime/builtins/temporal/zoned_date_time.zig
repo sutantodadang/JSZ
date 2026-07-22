@@ -211,7 +211,7 @@ fn od(s: []const u8, i: usize) ?i128 {
 }
 
 /// Convert a value to a ZonedDateTime (used by from/compare/equals/since/until).
-fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts: ?*JsObject) !ZonedDT {
+pub fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts: ?*JsObject) !ZonedDT {
     if (getZoned(v)) |z| return z.*;
     if (v.bits != 0 and v.unbox() == .object) {
         return try zonedFromFields(arena, v.toPtr().object, opts);
@@ -226,9 +226,9 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
     // ToTemporalZonedDateTime validates the calendar (ToTemporalCalendarIdentifier;
     // ISO strings ok) BEFORE requiring the timeZone field, so an invalid calendar
     // throws RangeError even when timeZone is absent.
-    const cal = if (o.get("calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
+    const cal = if (try shared.optionGet(arena, o, "calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
     // timeZone is required.
-    const tz_v = o.get("timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
+    const tz_v = try shared.optionGet(arena, o, "timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
     if (tz_v.bits != 0 and tz_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing timeZone");
     const zone = try toTimeZone(arena, tz_v, null);
     const overflow = try shared.getOverflow(arena, opts);
@@ -239,14 +239,14 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
 
     // offset property.
     var provided: ?i128 = null;
-    if (o.get("offset")) |ov| {
+    if (try shared.optionGet(arena, o, "offset")) |ov| {
         if (ov.bits != 0 and ov.unbox() != .undefined_) {
             if (ov.unbox() != .string) return realm_mod.throwTypeError(arena, "offset must be a string");
             provided = try parseOffsetValue(arena, ov.unbox().string);
         }
     }
-    const ns = try interpretOffset(arena, dt, zone.offset_ns, provided, offset_opt);
-    return .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = cal };
+    const ns = try interpretOffset(arena, zone.id, dt, zone.offset_ns, provided, offset_opt);
+    return .{ .ns = ns, .tz = zone.id, .offset_ns = zoneOffsetAt(zone.id, zone.offset_ns, ns), .calendar = cal };
 }
 
 /// Read the required/optional date+time fields from a property bag into an
@@ -300,20 +300,68 @@ fn f2i(f: f64) i32 {
     return @intFromFloat(f);
 }
 
-/// InterpretISODateTimeOffset for a fixed-offset zone.
-fn interpretOffset(arena: std.mem.Allocator, dt: ISODateTime, zone_offset: i128, provided: ?i128, opt: OffsetOption) !i128 {
-    const wall = wallNs(dt);
-    const off = provided orelse zone_offset;
-    switch (opt) {
-        .use => return wall - off,
-        .ignore => return wall - zone_offset,
-        .prefer => return wall - zone_offset, // fixed zone is always valid
-        .reject => {
-            if (provided != null and provided.? != zone_offset)
-                return realm_mod.throwRangeError(arena, "offset does not match time zone");
-            return wall - zone_offset;
-        },
+/// The zone's UTC offset at an exact instant. A fixed-offset identifier has no
+/// tzdata entry and never varies, so `fixed` stands in for it.
+pub fn zoneOffsetAt(tz: []const u8, fixed: i128, ns: i128) i128 {
+    const def = tzdata.lookupDef(tz) orelse return fixed;
+    const sec: i64 = @intCast(@divFloor(ns, shared.NS_PER_SECOND));
+    return @as(i128, tzdata.offsetAt(def, sec) orelse def.std_offset_sec) * shared.NS_PER_SECOND;
+}
+
+/// GetPossibleEpochNanoseconds: the instants a wall-clock time maps to, earliest
+/// first. A wall time inside a spring-forward gap has none; one inside a
+/// fall-back repetition has two. The candidate offsets are those in force a day
+/// either side of the wall time, which brackets any single transition.
+fn possibleInstants(tz: []const u8, fixed: i128, wall: i128) [2]?i128 {
+    var out: [2]?i128 = .{ null, null };
+    if (tzdata.lookupDef(tz) == null) {
+        out[0] = wall - fixed;
+        return out;
     }
+    const day = shared.NS_PER_DAY;
+    const before = zoneOffsetAt(tz, fixed, wall - day);
+    const after = zoneOffsetAt(tz, fixed, wall + day);
+    var n: usize = 0;
+    // The larger offset yields the earlier instant, so order the probes by it.
+    const hi = @max(before, after);
+    const lo = @min(before, after);
+    for ([_]i128{ hi, lo }) |o| {
+        if (o == lo and hi == lo and n > 0) continue;
+        const t = wall - o;
+        if (zoneOffsetAt(tz, fixed, t) == o) {
+            out[n] = t;
+            n += 1;
+        }
+    }
+    return out;
+}
+
+/// DisambiguatePossibleEpochNanoseconds with the default "compatible" policy:
+/// the earlier instant when the wall time repeats, and the time shifted forward
+/// past the gap when it does not exist at all.
+fn disambiguate(tz: []const u8, fixed: i128, wall: i128) i128 {
+    const p = possibleInstants(tz, fixed, wall);
+    if (p[0]) |t| return t;
+    // In a gap: interpret the wall time with the offset in force *before* the
+    // transition, which lands just after it.
+    const before = zoneOffsetAt(tz, fixed, wall - shared.NS_PER_DAY);
+    return wall - before;
+}
+
+/// InterpretISODateTimeOffset.
+fn interpretOffset(arena: std.mem.Allocator, tz: []const u8, dt: ISODateTime, zone_offset: i128, provided: ?i128, opt: OffsetOption) !i128 {
+    const wall = wallNs(dt);
+    const off = provided orelse return disambiguate(tz, zone_offset, wall);
+    if (opt == .use) return wall - off;
+    if (opt == .ignore) return disambiguate(tz, zone_offset, wall);
+    // "prefer" and "reject" both honour an offset that really occurs at this
+    // wall time; they differ only in what happens when none does.
+    for (possibleInstants(tz, zone_offset, wall)) |maybe_t| {
+        const t = maybe_t orelse continue;
+        if (zoneOffsetAt(tz, zone_offset, t) == off) return t;
+    }
+    if (opt == .reject) return realm_mod.throwRangeError(arena, "offset does not match time zone");
+    return disambiguate(tz, zone_offset, wall);
 }
 
 fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !ZonedDT {
@@ -325,8 +373,8 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
     const dt = shared.parseISODateTimeOpts(s, .{ .validate_calendar = true, .reject_utc = false }) catch return realm_mod.throwRangeError(arena, "invalid ZonedDateTime string");
     const str_off = extractStringOffset(arena, s) catch |e| return e;
     const offset_opt = try getOffsetOption(arena, opts, .reject);
-    const ns = try interpretOffset(arena, dt, zone.offset_ns, str_off, offset_opt);
-    return .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = dt.date.calendar };
+    const ns = try interpretOffset(arena, zone.id, dt, zone.offset_ns, str_off, offset_opt);
+    return .{ .ns = ns, .tz = zone.id, .offset_ns = zoneOffsetAt(zone.id, zone.offset_ns, ns), .calendar = dt.date.calendar };
 }
 
 /// Scan every `[...]` annotation on a ZonedDateTime string: require exactly one
@@ -334,6 +382,7 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
 /// non-ISO calendar annotation. Returns the time-zone annotation's inner id.
 fn extractAnnotations(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     var tz: ?[]const u8 = null;
+    var saw_calendar = false;
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         if (s[i] != '[') continue;
@@ -349,7 +398,12 @@ fn extractAnnotations(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
             if (tz != null) return realm_mod.throwRangeError(arena, "more than one time zone annotation");
             tz = inner;
         } else if (std.mem.startsWith(u8, inner, "u-ca=")) {
-            if (calendar.canonicalize(inner[5..]) == null) return realm_mod.throwRangeError(arena, "unsupported calendar");
+            // Only the first calendar annotation is meaningful; later ones are
+            // ignored outright, unknown value and all.
+            if (!saw_calendar) {
+                saw_calendar = true;
+                if (calendar.canonicalize(inner[5..]) == null) return realm_mod.throwRangeError(arena, "unsupported calendar");
+            }
         }
     }
     return tz orelse realm_mod.throwRangeError(arena, "ZonedDateTime string requires a time zone");
@@ -525,7 +579,7 @@ fn getHoursInDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     // Fixed-offset / unknown zones: every day is 24h. Named IANA zones with DST
     // may have 23h/25h days around a transition.
     const def = tzdata.lookupDef(z.tz) orelse return val_mod.makeNumber(arena, 24);
-    if (def.dst_rule == null) return val_mod.makeNumber(arena, 24);
+    if (def.rule == null) return val_mod.makeNumber(arena, 24);
 
     const day_start_ns = wallNs(.{ .date = localDT(z).date, .time = .{} }) - z.offset_ns;
     const day_end_ns = day_start_ns + shared.NS_PER_DAY;
@@ -596,6 +650,15 @@ pub fn nativeWithPlainTime(arena: std.mem.Allocator, this_val: Value, args: []co
     return makeZoned(arena, .{ .ns = ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
 }
 
+/// TimeZoneEquals: two identifiers name the same zone when they canonicalize to
+/// the same primary name — "Asia/Calcutta" and "Asia/Kolkata" are one zone.
+fn timeZoneEquals(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const ca = tzdata.canonicalName(a) orelse return false;
+    const cb = tzdata.canonicalName(b) orelse return false;
+    return std.mem.eql(u8, ca, cb);
+}
+
 pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
     const arg = if (args.len > 0) args[0] else Value{};
@@ -603,52 +666,24 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (getZoned(arg) != null or plain_date.getDate(arg) != null or plain_time.getTime(arg) != null or plain_date_time.getDateTime(arg) != null)
         return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
     const o = arg.toPtr().object;
-    if (o.get("calendar")) |c| if (c.bits != 0 and c.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set calendar");
-    if (o.get("timeZone")) |c| if (c.bits != 0 and c.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
+    if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    // The bag is read in full before any option is consulted; the "offset"
+    // field lands in its alphabetical slot among the rest.
+    const bag = try plain_date.readDateBag(arena, o, .{ .time = true, .zoned = true, .fixed_cal = z.calendar });
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
     const offset_opt = try getOffsetOption(arena, opts, .prefer);
 
-    const cur = localDT(z);
-    const merged = try plain_date.withDateFields(arena, cur.date, o, overflow);
-    var h: f64 = @floatFromInt(cur.time.hour);
-    var min: f64 = @floatFromInt(cur.time.minute);
-    var s: f64 = @floatFromInt(cur.time.second);
-    var ms: f64 = @floatFromInt(cur.time.millisecond);
-    var us: f64 = @floatFromInt(cur.time.microsecond);
-    var ns: f64 = @floatFromInt(cur.time.nanosecond);
-    var any = merged.any;
-    if (try readField(arena, o, "hour")) |x| { h = x; any = true; }
-    if (try readField(arena, o, "minute")) |x| { min = x; any = true; }
-    if (try readField(arena, o, "second")) |x| { s = x; any = true; }
-    if (try readField(arena, o, "millisecond")) |x| { ms = x; any = true; }
-    if (try readField(arena, o, "microsecond")) |x| { us = x; any = true; }
-    if (try readField(arena, o, "nanosecond")) |x| { ns = x; any = true; }
-    var provided: ?i128 = null;
-    if (o.get("offset")) |ov| {
-        if (ov.bits != 0 and ov.unbox() != .undefined_) {
-            if (ov.unbox() != .string) return realm_mod.throwTypeError(arena, "offset must be a string");
-            provided = try parseOffsetValue(arena, ov.unbox().string);
-            any = true;
-        }
-    }
-    if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
+    const provided: ?i128 = if (bag.offset) |os| try parseOffsetValue(arena, os) else null;
+    if (!bag.hasDateField() and !bag.hasTimeField() and provided == null)
+        return realm_mod.throwTypeError(arena, "with() needs at least one field");
 
-    const date = merged.date;
-    if (overflow == .reject) {
-        if (h > 23 or min > 59 or s > 59 or ms > 999 or us > 999 or ns > 999)
-            return realm_mod.throwRangeError(arena, "time out of range");
-    }
-    const time = ISOTime{
-        .hour = @intFromFloat(std.math.clamp(h, 0, 23)),
-        .minute = @intFromFloat(std.math.clamp(min, 0, 59)),
-        .second = @intFromFloat(std.math.clamp(s, 0, 59)),
-        .millisecond = @intFromFloat(std.math.clamp(ms, 0, 999)),
-        .microsecond = @intFromFloat(std.math.clamp(us, 0, 999)),
-        .nanosecond = @intFromFloat(std.math.clamp(ns, 0, 999)),
-    };
-    const new_ns = try interpretOffset(arena, .{ .date = date, .time = time }, z.offset_ns, provided, offset_opt);
-    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
+    const cur = localDT(z);
+    const merged = try plain_date.withDateFields(arena, cur.date, bag, overflow);
+    const time = try plain_date_time.timeFromBag(arena, bag, overflow, cur.time);
+    const new_ns = try interpretOffset(arena, z.tz, .{ .date = merged.date, .time = time }, z.offset_ns, provided, offset_opt);
+    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = zoneOffsetAt(z.tz, z.offset_ns, new_ns), .calendar = z.calendar });
 }
 
 // ---------------------------------------------------------------- arithmetic ---
@@ -706,74 +741,75 @@ fn unitRank(u: shared.Unit) u8 {
 fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, since: bool) !Value {
     const z = try requireZoned(arena, this_val);
     const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
-    if (!std.mem.eql(u8, z.tz, other.tz)) {
-        // Difference across different zones with calendar units is not
-        // representable without a common zone; only allow time-based largestUnit.
-    }
+    if (z.calendar != other.calendar) return realm_mod.throwRangeError(arena, "calendar mismatch");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
-    if (smallest == null) smallest = .nanosecond;
-    if (largest == null) largest = if (unitRank(smallest.?) < unitRank(.hour)) smallest.? else .hour;
-    if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    var mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
 
     // `since` negates `until` rather than swapping the operands: both anchor
     // their calendar walk on the receiver, and calendar arithmetic is not
-    // symmetric. Rounding runs mirrored, so the mode is negated too.
-    if (since) mode = shared.negateRoundingMode(mode);
+    // symmetric. Rounding runs mirrored, so the mode comes back negated.
+    const st = try shared.getDifferenceSettings(arena, opts, since, .datetime, &.{}, .nanosecond, .hour);
+    if (unitRank(st.largest) <= unitRank(.day)) {
+        // A date-unit difference is measured in local wall-clock terms, which
+        // only exists if both instants share a zone.
+        if (!timeZoneEquals(z.tz, other.tz))
+            return realm_mod.throwRangeError(arena, "time zone mismatch in date-unit difference");
+    }
     const from = z.*;
     const to = other;
 
     var result: shared.DurationFields = undefined;
     // Rank 0 is `year`, so "day or larger" is a *lower* rank.
-    if (unitRank(largest.?) <= unitRank(.day)) {
-        result = differenceZoned(from, to, largest.?);
+    if (unitRank(st.largest) <= unitRank(.day)) {
+        result = try differenceZoned(arena, from, to, st.largest);
     } else {
-        result = balanceTime(to.ns - from.ns, largest.?);
+        result = balanceTime(to.ns - from.ns, st.largest);
     }
-    result = roundResult(result, smallest.?, inc, mode, largest.?);
+    const lto = localDT(&to);
+    const dest_wall = @as(i128, shared.isoDateToEpochDays(lto.date.year, lto.date.month, lto.date.day)) *
+        shared.NS_PER_DAY + shared.timeToNanos(lto.time);
+    result = try plain_date_time.roundRelative(arena, localDT(&from), dest_wall, result, st.smallest, st.increment, st.mode, st.largest);
     if (since) result = shared.negateFields(result);
-    result.years = nz(result.years);
-    result.months = nz(result.months);
-    result.weeks = nz(result.weeks);
-    result.days = nz(result.days);
-    result.hours = nz(result.hours);
-    result.minutes = nz(result.minutes);
-    result.seconds = nz(result.seconds);
-    result.milliseconds = nz(result.milliseconds);
-    result.microseconds = nz(result.microseconds);
-    result.nanoseconds = nz(result.nanoseconds);
     return duration.makeDuration(arena, result);
 }
 
-/// Difference between two same-zone ZonedDateTimes with a calendar largest unit.
-fn differenceZoned(a: ZonedDT, b: ZonedDT, largest: shared.Unit) shared.DurationFields {
+/// DifferenceZonedDateTime with a calendar largest unit. The date part is
+/// measured on the wall clock, but the leftover time is the *exact* gap to the
+/// target instant: on a 23- or 25-hour DST day the two disagree, and only the
+/// exact gap is real elapsed time. Re-anchoring can overshoot, so the end date
+/// is walked back a day at a time until the leftover time stops pointing the
+/// wrong way.
+fn differenceZoned(arena: std.mem.Allocator, a: ZonedDT, b: ZonedDT, largest: shared.Unit) !shared.DurationFields {
+    _ = arena;
+    if (a.ns == b.ns) return .{};
+    const sign: i32 = if (b.ns > a.ns) 1 else -1;
     const la = localDT(&a);
     const lb = localDT(&b);
-    var ns_diff = shared.timeToNanos(lb.time) - shared.timeToNanos(la.time);
-    var d1 = la.date;
-    const d2 = lb.date;
-    const date_sign = plain_date.compareISODate(d1, d2);
-    if (ns_diff < 0 and date_sign < 0) {
-        d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) + 1);
-        d1.calendar = d2.calendar;
-        ns_diff += shared.NS_PER_DAY;
-    } else if (ns_diff > 0 and date_sign > 0) {
-        d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) - 1);
-        d1.calendar = d2.calendar;
-        ns_diff -= shared.NS_PER_DAY;
+
+    const max_correction: i32 = if (sign == 1) 2 else 1;
+    var correction: i32 = 0;
+    const time_diff = shared.timeToNanos(lb.time) - shared.timeToNanos(la.time);
+    // A time-of-day difference pointing against the overall direction already
+    // costs a day, so start there rather than discovering it a round later.
+    if ((time_diff > 0 and sign < 0) or (time_diff < 0 and sign > 0)) correction = 1;
+
+    while (correction <= max_correction) : (correction += 1) {
+        var inter_date = shared.balanceISODate(lb.date.year, lb.date.month, @as(i32, lb.date.day) - correction * sign);
+        inter_date.calendar = lb.date.calendar;
+        const inter_ns = disambiguate(a.tz, a.offset_ns, wallNs(.{ .date = inter_date, .time = la.time }));
+        const rem = b.ns - inter_ns;
+        const rem_sign: i32 = if (rem > 0) 1 else if (rem < 0) -1 else 0;
+        if (rem_sign == -sign) continue;
+        var date_dur = plain_date.differenceISODate(la.date, inter_date, largest);
+        const time_dur = balanceTime(rem, .hour);
+        date_dur.hours = time_dur.hours;
+        date_dur.minutes = time_dur.minutes;
+        date_dur.seconds = time_dur.seconds;
+        date_dur.milliseconds = time_dur.milliseconds;
+        date_dur.microseconds = time_dur.microseconds;
+        date_dur.nanoseconds = time_dur.nanoseconds;
+        return date_dur;
     }
-    var date_dur = plain_date.differenceISODate(d1, d2, largest);
-    const time_dur = balanceTime(ns_diff, .hour);
-    date_dur.hours = time_dur.hours;
-    date_dur.minutes = time_dur.minutes;
-    date_dur.seconds = time_dur.seconds;
-    date_dur.milliseconds = time_dur.milliseconds;
-    date_dur.microseconds = time_dur.microseconds;
-    date_dur.nanoseconds = time_dur.nanoseconds;
-    return date_dur;
+    return .{};
 }
 
 fn balanceTime(total_ns: i128, largest: shared.Unit) shared.DurationFields {
@@ -839,7 +875,7 @@ pub fn nativeEquals(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const z = try requireZoned(arena, this_val);
     const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
     // Equality is on the instant, the zone *and* the calendar.
-    return val_mod.makeBool(arena, z.ns == other.ns and std.mem.eql(u8, z.tz, other.tz) and
+    return val_mod.makeBool(arena, z.ns == other.ns and timeZoneEquals(z.tz, other.tz) and
         z.calendar == other.calendar);
 }
 
@@ -860,7 +896,7 @@ pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, ar
         dir = arg.unbox().string;
     } else if (arg.bits != 0 and arg.unbox() == .object) {
         const o = arg.toPtr().object;
-        const dv = o.get("direction") orelse return realm_mod.throwTypeError(arena, "missing direction");
+        const dv = try shared.optionGet(arena, o, "direction") orelse return realm_mod.throwTypeError(arena, "missing direction");
         if (dv.bits == 0 or dv.unbox() != .string) return realm_mod.throwTypeError(arena, "direction must be a string");
         dir = dv.unbox().string;
     } else if (arg.bits == 0 or arg.unbox() == .undefined_) {

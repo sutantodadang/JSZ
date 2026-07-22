@@ -477,8 +477,12 @@ pub fn parseISOTime(s0: []const u8) ParseError!ISOTime {
     // 8 leading digits followed by 'T').
     if (looksLikeDate(s)) {
         // PlainTime has no calendar but still rejects a bare `Z` UTC designator.
-        const dt = try parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = true, .require_time = true });
-        return dt.time;
+        // A near-date that is not one after all ("2021-13[-13:00]" — month 13)
+        // is unambiguously a time, so a failure here falls through rather than
+        // ending the parse.
+        if (parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = true, .require_time = true })) |dt| {
+            return dt.time;
+        } else |_| {}
     }
     // A time-only string may carry the ISO 8601 time designator prefix ("T"/"t"),
     // e.g. "T00:30" or "t003000.5". Consume it before parsing the time components.
@@ -927,6 +931,26 @@ pub fn roundNumberToIncrement(x: f64, increment: f64, mode: RoundingMode) f64 {
     return rounded * increment;
 }
 
+/// RoundNumberToIncrementAsIfPositive: the rounding modes are applied as though
+/// `x` were positive, so "trunc" means towards -infinity even for a negative
+/// epoch instant (rounding an Instant down goes towards the Big Bang, not
+/// towards the epoch).
+pub fn roundI128ToIncrementAsIfPositive(x: i128, increment: i128, mode: RoundingMode) i128 {
+    if (increment == 0) return x;
+    const q = @divFloor(x, increment);
+    const r = x - q * increment; // 0 <= r < increment
+    if (r == 0) return x;
+    const twice = r * 2;
+    const round_up = switch (mode) {
+        .ceil, .expand => true,
+        .floor, .trunc => false,
+        .half_ceil, .half_expand => twice >= increment,
+        .half_floor, .half_trunc => twice > increment,
+        .half_even => if (twice == increment) @mod(q, 2) != 0 else twice > increment,
+    };
+    return (q + @as(i128, if (round_up) 1 else 0)) * increment;
+}
+
 /// i128 rounding (nanosecond precision): round `x` to a multiple of `increment`.
 pub fn roundI128ToIncrement(x: i128, increment: i128, mode: RoundingMode) i128 {
     if (increment == 0) return x;
@@ -996,6 +1020,24 @@ fn roundHalfDown(q: f64) f64 {
     return fl;
 }
 
+/// The outer bound on a representable exact time: ±8.64e21 ns (100 million
+/// days), with a one-day slack that lets a wall-clock datetime sit just outside
+/// it as long as some zone offset could bring it back in.
+pub const NS_LIMIT: i128 = 8_640_000_000_000_000_000_000;
+
+/// ISODateTimeWithinLimits.
+pub fn isoDateTimeWithinLimits(d: ISODate, t: ISOTime) bool {
+    // Guard the multiplication below; anything this far out is out of range.
+    if (d.year > 300_000 or d.year < -300_000) return false;
+    const ns = @as(i128, isoDateToEpochDays(d.year, d.month, d.day)) * NS_PER_DAY + timeToNanos(t);
+    return ns > -(NS_LIMIT + NS_PER_DAY) and ns < NS_LIMIT + NS_PER_DAY;
+}
+
+/// ISODateWithinLimits: a date is representable when *noon* on it is.
+pub fn isoDateWithinLimits(d: ISODate) bool {
+    return isoDateTimeWithinLimits(d, .{ .hour = 12 });
+}
+
 /// Negate every Duration field. Adding 0.0 normalizes the -0.0 that negating a
 /// zero field would otherwise produce: a Duration field that is zero must read
 /// as +0 regardless of the duration's overall sign.
@@ -1011,6 +1053,25 @@ pub fn negateFields(d: DurationFields) DurationFields {
         .milliseconds = -d.milliseconds + 0.0,
         .microseconds = -d.microseconds + 0.0,
         .nanoseconds = -d.nanoseconds + 0.0,
+    };
+}
+
+/// Duration fields are mathematical values in the spec, so a zero field must
+/// surface as +0 no matter which intermediate produced it (a negative balance
+/// step readily yields -0.0). Adding 0.0 maps -0.0 to +0.0 and leaves every
+/// other value alone.
+pub fn normalizeZeroFields(d: DurationFields) DurationFields {
+    return .{
+        .years = d.years + 0.0,
+        .months = d.months + 0.0,
+        .weeks = d.weeks + 0.0,
+        .days = d.days + 0.0,
+        .hours = d.hours + 0.0,
+        .minutes = d.minutes + 0.0,
+        .seconds = d.seconds + 0.0,
+        .milliseconds = d.milliseconds + 0.0,
+        .microseconds = d.microseconds + 0.0,
+        .nanoseconds = d.nanoseconds + 0.0,
     };
 }
 
@@ -1071,6 +1132,93 @@ pub fn unitLengthNanos(u: Unit) ?i128 {
         .nanosecond => 1,
         else => null,
     };
+}
+
+/// Coarseness rank: year is the largest unit (0), nanosecond the smallest (9).
+/// The Unit enum is declared in that order, so the ordinal *is* the rank.
+pub fn unitRank(u: Unit) u8 {
+    return @intFromEnum(u);
+}
+
+/// LargerOfTwoTemporalUnits.
+pub fn largerOfTwoUnits(a: Unit, b: Unit) Unit {
+    return if (unitRank(a) <= unitRank(b)) a else b;
+}
+
+/// MaximumTemporalDurationRoundingIncrement: the dividend a rounding increment
+/// must divide for this smallest unit. Calendar units (year..day) are unbounded.
+pub fn maximumRoundingIncrement(u: Unit) ?f64 {
+    return switch (u) {
+        .year, .month, .week, .day => null,
+        .hour => 24,
+        .minute, .second => 60,
+        .millisecond, .microsecond, .nanosecond => 1000,
+    };
+}
+
+/// ValidateTemporalRoundingIncrement.
+pub fn validateRoundingIncrement(arena: std.mem.Allocator, increment: f64, dividend: f64, inclusive: bool) !void {
+    const maximum = if (inclusive) dividend else dividend - 1;
+    if (increment > maximum) return realm_mod.throwRangeError(arena, "roundingIncrement out of range");
+    if (@mod(dividend, increment) != 0) return realm_mod.throwRangeError(arena, "roundingIncrement must divide evenly");
+}
+
+// ------------------------------------------------------- difference settings ---
+
+/// Which units a difference operation accepts: date types take year..day, time
+/// types hour..nanosecond, datetime types everything.
+pub const UnitGroup = enum { date, time, datetime };
+
+fn unitInGroup(u: Unit, group: UnitGroup) bool {
+    return switch (group) {
+        .datetime => true,
+        .date => unitRank(u) <= unitRank(.day),
+        .time => unitRank(u) >= unitRank(.hour),
+    };
+}
+
+pub const DifferenceSettings = struct {
+    smallest: Unit,
+    largest: Unit,
+    mode: RoundingMode,
+    increment: f64,
+};
+
+/// GetDifferenceSettings. Every option is read and coerced *before* any
+/// algorithmic validation, in the spec's order: largestUnit, roundingIncrement,
+/// roundingMode, smallestUnit. `disallowed` names units this receiver rejects
+/// even though they belong to `group` (PlainYearMonth rejects week and day).
+pub fn getDifferenceSettings(
+    arena: std.mem.Allocator,
+    opts: ?*JsObject,
+    since: bool,
+    group: UnitGroup,
+    disallowed: []const Unit,
+    fallback_smallest: Unit,
+    smallest_largest_default: Unit,
+) !DifferenceSettings {
+    const largest_opt = try getTemporalUnit(arena, opts, "largestUnit");
+    const increment = try getRoundingIncrement(arena, opts);
+    var mode = try getRoundingMode(arena, opts, .trunc);
+    if (since) mode = negateRoundingMode(mode);
+    const smallest = (try getTemporalUnit(arena, opts, "smallestUnit")) orelse fallback_smallest;
+
+    for ([_]?Unit{ largest_opt, smallest }) |maybe_u| {
+        const u = maybe_u orelse continue;
+        if (!unitInGroup(u, group)) return realm_mod.throwRangeError(arena, "temporal unit not allowed here");
+        for (disallowed) |d| {
+            if (d == u) return realm_mod.throwRangeError(arena, "temporal unit not allowed here");
+        }
+    }
+
+    const largest = largest_opt orelse largerOfTwoUnits(smallest_largest_default, smallest);
+    if (unitRank(largest) > unitRank(smallest)) {
+        return realm_mod.throwRangeError(arena, "largestUnit must be larger than or equal to smallestUnit");
+    }
+    if (maximumRoundingIncrement(smallest)) |maximum| {
+        try validateRoundingIncrement(arena, increment, maximum, false);
+    }
+    return .{ .smallest = smallest, .largest = largest, .mode = mode, .increment = increment };
 }
 
 // -------------------------------------------------------------- option reading ---
@@ -1264,6 +1412,19 @@ pub fn readStringOption(arena: std.mem.Allocator, opts: ?*JsObject, key: []const
     return try valueToString(arena, v);
 }
 
+/// ToPrimitiveAndRequireString: coerce with the string hint, then insist the
+/// result really is a String. Used for the calendar fields (era, monthCode)
+/// whose spec type is String — a Number there is a TypeError, but an object
+/// with a toString is fine.
+pub fn toPrimitiveRequireString(arena: std.mem.Allocator, v: Value) ![]const u8 {
+    var prim = v;
+    if (v.bits != 0 and v.unbox() == .object) {
+        prim = (try coercion.toPrimitive(arena, v, .string)) orelse v;
+    }
+    if (prim.bits != 0 and prim.unbox() == .string) return prim.unbox().string;
+    return realm_mod.throwTypeError(arena, "expected a string value");
+}
+
 /// Read the "overflow" option: "constrain" (default) or "reject".
 pub const Overflow = enum { constrain, reject };
 pub fn getOverflow(arena: std.mem.Allocator, opts: ?*JsObject) !Overflow {
@@ -1303,11 +1464,22 @@ pub fn getRoundingIncrement(arena: std.mem.Allocator, opts: ?*JsObject) !f64 {
     return t;
 }
 
+/// A unit-valued option: absent and "auto" mean different things to Duration
+/// rounding, which needs at least one of smallestUnit/largestUnit to be *given*.
+pub const UnitOption = union(enum) { absent, auto, unit: Unit };
+
+pub fn getTemporalUnitOption(arena: std.mem.Allocator, opts: ?*JsObject, key: []const u8) !UnitOption {
+    const s = (try readStringOption(arena, opts, key)) orelse return .absent;
+    if (std.mem.eql(u8, s, "auto")) return .auto;
+    return .{ .unit = unitFromString(s) orelse return realm_mod.throwRangeError(arena, "invalid temporal unit") };
+}
+
 /// Read a required or optional temporal unit option (e.g. "smallestUnit").
 pub fn getTemporalUnit(arena: std.mem.Allocator, opts: ?*JsObject, key: []const u8) !?Unit {
-    const s = (try readStringOption(arena, opts, key)) orelse return null;
-    if (std.mem.eql(u8, s, "auto")) return null;
-    return unitFromString(s) orelse realm_mod.throwRangeError(arena, "invalid temporal unit");
+    return switch (try getTemporalUnitOption(arena, opts, key)) {
+        .absent, .auto => null,
+        .unit => |u| u,
+    };
 }
 
 // -------------------------------------------------------- ToIntegerWithTrunc ---

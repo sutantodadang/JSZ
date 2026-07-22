@@ -242,20 +242,13 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     const ins = try requireInstant(arena, this_val);
     const other = try toInstantNs(arena, if (args.len > 0) args[0] else Value{});
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
-    if (smallest == null) smallest = .nanosecond;
-    if (largest == null) largest = .second;
-    if (unitRank(smallest.?) < unitRank(.hour) or unitRank(largest.?) < unitRank(.hour))
-        return realm_mod.throwRangeError(arena, "Instant difference units must be hour..nanosecond");
-    if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
+    const st = try shared.getDifferenceSettings(arena, opts, since, .time, &.{}, .nanosecond, .second);
 
-    const diff = if (since) ins.* - other else other - ins.*;
-    const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
-    const rounded = shared.roundI128ToIncrement(diff, inc_ns, mode);
-    return duration.makeDuration(arena, balanceTime(rounded, largest.?));
+    const diff = other - ins.*;
+    const inc_ns = shared.unitLengthNanos(st.smallest).? * @as(i128, @intFromFloat(st.increment));
+    const rounded = shared.roundI128ToIncrement(diff, inc_ns, st.mode);
+    const balanced = balanceTime(rounded, st.largest);
+    return duration.makeDuration(arena, if (since) shared.negateFields(balanced) else balanced);
 }
 
 fn balanceTime(total_ns: i128, largest: shared.Unit) shared.DurationFields {
@@ -358,11 +351,21 @@ pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const V
     const digits = try shared.getFractionalDigits(arena, opts);
     const mode = try shared.getRoundingMode(arena, opts, .trunc);
     const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
-    // timeZone option ignored (UTC). Rounding is on the epoch nanoseconds, so
-    // a carry past midnight moves the date for free.
-    const ns = shared.roundI128ToIncrement(ins.*, prec.increment, mode);
-    const s = try instantToStringPrec(arena, ns, prec);
-    return val_mod.makeString(arena, s);
+    const tz_v: ?Value = if (opts) |o| try shared.optionGet(arena, o, "timeZone") else null;
+    // Rounding is on the epoch nanoseconds, so a carry past midnight moves the
+    // date for free. The modes read as if the instant were positive.
+    const ns = shared.roundI128ToIncrementAsIfPositive(ins.*, prec.increment, mode);
+    if (tz_v) |v| {
+        if (v.unbox() != .string) return realm_mod.throwTypeError(arena, "time zone must be a string");
+        const timezone = @import("timezone.zig");
+        const zone = try timezone.toZoneAtInstant(arena, v.unbox().string, ns);
+        const s = try instantToStringPrec(arena, ns + zone.offset_ns, prec);
+        var buf = shared.Buf{};
+        try buf.appendSlice(arena, s[0 .. s.len - 1]); // drop the "Z"
+        try buf.appendSlice(arena, try timezone.formatOffset(arena, zone.offset_ns));
+        return val_mod.makeString(arena, buf.items);
+    }
+    return val_mod.makeString(arena, try instantToStringPrec(arena, ns, prec));
 }
 
 pub fn nativeToJSON(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
