@@ -219,6 +219,10 @@ const ClassField = struct {
     name: []const u8 = "",
     computed_key: ?*Node = null,
     init: ?*Node = null,
+    /// ES2022 static initialization block (`static { ... }`). Carries the block's
+    /// statements instead of a key/initializer; kept in the same list as static
+    /// fields because the two run interleaved, in source order.
+    static_block: ?[]*Node = null,
 };
 
 const ClassBodyParse = struct {
@@ -241,6 +245,17 @@ fn nextTokenEndsName(p: *Parser) bool {
     return k == .left_paren or k == .eq or k == .semicolon or k == .right_brace;
 }
 
+/// Parse `static { ... }` — the ClassStaticBlockBody statement list, with `{`
+/// as the current token. It is its own function-like scope, so the body is
+/// parsed the same way a function body is; the extra rules are that `await` is
+/// reserved throughout (a nested function re-enables it, which
+/// `parseFunctionBody` handles by saving the flag), and `arguments` and
+/// `return` are Syntax Errors — the block has neither.
+fn parseStaticBlockBody(p: *Parser) ?[]*Node {
+    p.next_body_is_static_block = true;
+    return parseFunctionBody(p);
+}
+
 /// Parse the body of a class (`{` already consumed). Consumes the closing `}`.
 /// Handles `static`, `get`/`set` accessors, and computed `[expr]` keys.
 fn parseClassMembers(p: *Parser) ?ClassBodyParse {
@@ -255,6 +270,19 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             is_static = true;
             _ = p.advance();
         }
+        // ES2022 static initialization block: `static { ... }`. Its body is a
+        // statement list evaluated once at class-definition time with `this`
+        // bound to the constructor, so it is kept alongside the static fields
+        // (which it interleaves with) rather than as a member.
+        if (is_static and p.check(.left_brace)) {
+            const block = parseStaticBlockBody(p) orelse return null;
+            fields.append(p.arena, .{ .is_static = true, .static_block = block }) catch {
+                p.had_error = true;
+                return null;
+            };
+            continue;
+        }
+
         // Method [[SourceText]] excludes the `static` ClassElement prefix, so the
         // source span begins at the first token after `static` (the `async`/`*`/
         // `get`/`set` modifier or the method key itself).
@@ -711,6 +739,24 @@ fn appendDerivedInstanceFields(p: *Parser, list: *std.ArrayList(*Node), fields: 
 /// same wrapper; the result is identical.
 fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node {
     const s = p.current.start;
+    // ES2022 static initialization block: same `this`-is-the-class wrapper as a
+    // static field, but the block's whole statement list is the body and there
+    // is nothing to assign. `(function () { <body> }).call(ClassName);`
+    if (f.static_block) |block| {
+        const blk_fn = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
+            .name = null,
+            .params = &[_][]const u8{},
+            .body = block,
+            .is_arrow = false,
+        } }) orelse return null;
+        const blk_call_member = nodeMember(p, blk_fn, "call") orelse return null;
+        const blk_args = p.arena.alloc(*Node, 1) catch return null;
+        blk_args[0] = nodeIdent(p, class_name) orelse return null;
+        const blk_call = p.makeNode(.call_expr, s, s, .{
+            .call_expr = .{ .callee = blk_call_member, .args = blk_args },
+        }) orelse return null;
+        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = blk_call });
+    }
     const cls = nodeIdent(p, class_name) orelse return null;
     const lhs = if (f.computed_key) |k|
         (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = cls, .property = k, .computed = true } }) orelse return null)
@@ -1509,6 +1555,11 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
 }
 
 pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
+    // Formal parameters belong to the function being parsed, not to an enclosing
+    // class static initialization block, so a default like `x = await` or
+    // `{y = arguments}` is fine there.
+    const sb_saved = p.leaveStaticBlock();
+    defer p.restoreStaticBlock(sb_saved);
     _ = p.expect(.left_paren) orelse return null;
     var params = std.ArrayList([]const u8){};
     var defaults = std.ArrayList(?*Node){};
@@ -1711,6 +1762,20 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     p.pending_params_duplicate = false;
     _ = p.expect(.left_brace) orelse return null;
     p.fn_nesting_depth += 1;
+    // A nested function body establishes its own rules: a class static
+    // initialization block's restrictions on `await`, `arguments` and `return`
+    // stop at its boundary (`static { function f(await) {} }` is legal).
+    // parseStaticBlockBody re-arms them around its own call to this function.
+    const is_static_block = p.next_body_is_static_block;
+    p.next_body_is_static_block = false;
+    const saved_await_reserved = p.await_is_reserved;
+    const saved_in_static_block = p.in_static_block;
+    p.await_is_reserved = is_static_block;
+    p.in_static_block = is_static_block;
+    defer {
+        p.await_is_reserved = saved_await_reserved;
+        p.in_static_block = saved_in_static_block;
+    }
     // A function body is strict if it inherits strictness from the enclosing
     // code or carries its own "use strict" directive prologue. Restored on exit
     // so a strict function nested in sloppy code doesn't leak strictness back.

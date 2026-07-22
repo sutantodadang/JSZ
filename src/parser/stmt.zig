@@ -738,6 +738,7 @@ pub fn parseVarDeclarator(p: *Parser, kind: ast.VarKind) ?*Node {
     const yield_as_ident = p.check(.kw_yield) and !p.strict and !p.in_generator_function;
     const name_tok = if (p.check(.kw_of) or yield_as_ident) p.advance() else (p.expect(.identifier) orelse return null);
     const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
+    if (p.staticBlockReservedIdent(name)) |msg| return p.fail(msg);
     // Strict-mode early error: a future-reserved word (or `eval`/`arguments`)
     // may not be a binding identifier in strict code (ES §13.1.1, §12.7.2).
     if (p.strict and parser_file.isStrictReservedWord(name)) {
@@ -1277,6 +1278,10 @@ pub fn parseSwitchStmt(p: *Parser) ?*Node {
 
 pub fn parseReturnStmt(p: *Parser) ?*Node {
     const start = p.current.start;
+    // §15.7.1: a class static initialization block is not a function body, so
+    // `return` has nothing to return from.
+    if (p.in_static_block)
+        return p.fail("'return' is not allowed in a class static initialization block");
     _ = p.advance(); // consume 'return'
     // ASI rule: if next token has line terminator before it, return undefined.
     var value: ?*Node = null;

@@ -184,6 +184,10 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
         p.arrow_prelude = .{};
+        // An arrow body is its own function-like scope for the class-static-block
+        // restrictions: `static { () => { var await; } }` is legal.
+        const sb_saved = p.leaveStaticBlock();
+        defer p.restoreStaticBlock(sb_saved);
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
@@ -343,6 +347,10 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
         p.arrow_prelude = .{};
+        // An arrow body is its own function-like scope for the class-static-block
+        // restrictions: `static { () => { var await; } }` is legal.
+        const sb_saved = p.leaveStaticBlock();
+        defer p.restoreStaticBlock(sb_saved);
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
@@ -1132,6 +1140,13 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
     // (for top-level await in script tests). When followed by a non-operand token
     // (comma, semicolon, closing bracket, binary operator, etc.), `await` is an
     // identifier (e.g. `instanceof await` in `new await instanceof await`).
+    // In a class static initialization block `await` is neither an operator nor
+    // an identifier — the block is not async code, and the name is reserved.
+    if (p.await_is_reserved and p.current.kind == .identifier and
+        std.mem.eql(u8, p.current.value_str, "await"))
+    {
+        return p.fail("'await' is reserved in a class static initialization block");
+    }
     if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await") and
         (p.is_module or isAwaitOperandStart(p.peekNext().kind)))
     {
@@ -1184,10 +1199,13 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
                 const mt = p.expectIdentifierName() orelse return null;
                 if (!std.mem.eql(u8, mt.value_str, "target"))
                     return p.fail("SyntaxError: expected 'target' after 'new.'");
-                // §13.3.12.1: `new.target` is only legal in function code. Eval
-                // code inherits that from its calling context — a direct eval in
-                // a function may use it, an indirect eval (global code) may not.
-                if (p.eval_code and !p.eval_allow_new_target)
+                // §13.3.12.1: `new.target` is only legal in function code. At the
+                // TOP LEVEL of eval code that means the eval's calling context has
+                // to be a function — a direct eval inside one qualifies, an
+                // indirect eval (global code) never does. Inside a function
+                // literal the eval'd source declares itself, so `(0, eval)
+                // ('(function(){ new.target })')` stays legal.
+                if (p.eval_code and !p.eval_allow_new_target and p.fn_nesting_depth == 0)
                     return p.fail("new.target expression is not allowed here");
                 var nt_node = p.makeNode(.identifier, start, p.current.start, .{
                     .identifier = "__new_target__",
@@ -1725,6 +1743,7 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
                 return p.parseFunctionExpr(true);
             }
             const name = p.current.value_str;
+            if (p.staticBlockReservedIdent(name)) |msg| return p.fail(msg);
             _ = p.advance();
             // Special: 'undefined' identifier -> undefined literal
             if (std.mem.eql(u8, name, "undefined")) {
