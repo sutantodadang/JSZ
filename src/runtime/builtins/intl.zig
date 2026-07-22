@@ -1591,7 +1591,9 @@ const root_collations = [_][]const u8{ "emoji", "eor" };
 const collation_tailorings = [_]struct { l: []const u8, cos: []const []const u8 }{
     .{ .l = "de", .cos = &.{"phonebk"} },
     .{ .l = "es", .cos = &.{"trad"} },
-    .{ .l = "zh", .cos = &.{ "pinyin", "stroke", "zhuyin", "gb2312han", "big5han", "unihan" } },
+    // "gb2312", not "gb2312han": the BCP-47 key is at most 8 characters, so the
+    // longer CLDR name is not even a well-formed `-u-co-` type value.
+    .{ .l = "zh", .cos = &.{ "pinyin", "stroke", "zhuyin", "gb2312", "big5han", "unihan" } },
     .{ .l = "ja", .cos = &.{"unihan"} },
     .{ .l = "ko", .cos = &.{ "unihan", "searchjl" } },
     .{ .l = "sv", .cos = &.{"reformed"} },
@@ -3678,10 +3680,67 @@ pub fn nativeDisplayNamesOf(arena: std.mem.Allocator, this_val: Value, args: []c
     const fallback: []const u8 = if (o.getOwn("__dn_fallback")) |v| v.unbox().string else "code";
     const code = try t_shared.valueToString(arena, if (args.len > 0) args[0] else Value{});
     try dnValidateCode(arena, typ, code);
-    // No CLDR name data: with fallback "code" the (validated) code is returned;
-    // with "none" the absent name yields undefined. Both satisfy `typeof`.
+    if (dnEnglishName(typ, code)) |name| return val_mod.makeString(arena, name);
+    // Outside the tables there is no CLDR name data: with fallback "code" the
+    // (validated) code is returned; with "none" the absent name is undefined.
     if (std.mem.eql(u8, fallback, "none")) return val_mod.makeUndefined(arena);
     return val_mod.makeString(arena, code);
+}
+
+/// The en display name for `code`, for the types this build has data for. Every
+/// value `Intl.supportedValuesOf` advertises appears here, so a DisplayNames
+/// with `fallback: "none"` still names all of them.
+fn dnEnglishName(typ: []const u8, code: []const u8) ?[]const u8 {
+    const Row = struct { code: []const u8, name: []const u8 };
+    const calendars = [_]Row{
+        .{ .code = "iso8601", .name = "ISO-8601 Calendar" },
+        .{ .code = "gregory", .name = "Gregorian Calendar" },
+        .{ .code = "buddhist", .name = "Buddhist Calendar" },
+        .{ .code = "roc", .name = "Minguo Calendar" },
+        .{ .code = "japanese", .name = "Japanese Calendar" },
+        .{ .code = "coptic", .name = "Coptic Calendar" },
+        .{ .code = "ethiopic", .name = "Ethiopic Calendar" },
+        .{ .code = "ethioaa", .name = "Ethiopic Amete Alem Calendar" },
+        .{ .code = "islamic-civil", .name = "Islamic Calendar (tabular, civil epoch)" },
+        .{ .code = "islamic-tbla", .name = "Islamic Calendar (tabular, astronomical epoch)" },
+        .{ .code = "islamic-umalqura", .name = "Islamic Calendar (Umm al-Qura)" },
+        .{ .code = "persian", .name = "Persian Calendar" },
+        .{ .code = "indian", .name = "Indian National Calendar" },
+        .{ .code = "hebrew", .name = "Hebrew Calendar" },
+        .{ .code = "chinese", .name = "Chinese Calendar" },
+        .{ .code = "dangi", .name = "Dangi Calendar" },
+    };
+    const currencies = [_]Row{
+        .{ .code = "AUD", .name = "Australian Dollar" },
+        .{ .code = "BRL", .name = "Brazilian Real" },
+        .{ .code = "CAD", .name = "Canadian Dollar" },
+        .{ .code = "CHF", .name = "Swiss Franc" },
+        .{ .code = "CNY", .name = "Chinese Yuan" },
+        .{ .code = "EUR", .name = "Euro" },
+        .{ .code = "GBP", .name = "British Pound" },
+        .{ .code = "HKD", .name = "Hong Kong Dollar" },
+        .{ .code = "INR", .name = "Indian Rupee" },
+        .{ .code = "JPY", .name = "Japanese Yen" },
+        .{ .code = "KRW", .name = "South Korean Won" },
+        .{ .code = "MXN", .name = "Mexican Peso" },
+        .{ .code = "NZD", .name = "New Zealand Dollar" },
+        .{ .code = "RUB", .name = "Russian Ruble" },
+        .{ .code = "SEK", .name = "Swedish Krona" },
+        .{ .code = "SGD", .name = "Singapore Dollar" },
+        .{ .code = "TRY", .name = "Turkish Lira" },
+        .{ .code = "USD", .name = "US Dollar" },
+        .{ .code = "ZAR", .name = "South African Rand" },
+    };
+    const rows: []const Row = if (std.mem.eql(u8, typ, "calendar"))
+        &calendars
+    else if (std.mem.eql(u8, typ, "currency"))
+        &currencies
+    else
+        return null;
+    for (rows) |row| {
+        if (std.ascii.eqlIgnoreCase(row.code, code)) return row.name;
+    }
+    return null;
 }
 
 pub fn nativeDisplayNamesResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
