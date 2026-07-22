@@ -847,14 +847,6 @@ pub const BcVm = struct {
         // the currently-executing frame's function as the calling context.
         if (direct and self.frames.items[self.frames.items.len - 1].func.is_strict)
             p.strict = true;
-        const parse_result = p.parseScript();
-        const stmts = switch (parse_result) {
-            .ok => |s| s,
-            .err => |e| {
-                realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", e.message);
-                return error.JsException;
-            },
-        };
         // The scope the eval'd code is nested in, and the `this` it observes:
         // the caller's for a direct eval, the global scope / undefined otherwise.
         const outer_env: *Environment = if (direct)
@@ -865,6 +857,24 @@ pub const BcVm = struct {
             self.frames.items[self.frames.items.len - 1].this_val
         else
             Value{};
+        // SuperProperty is legal inside a direct eval whose calling context has a
+        // [[HomeObject]]. JSZ's class desugar marks exactly those contexts —
+        // methods, derived constructors and field initializers — by binding
+        // `__sproto__` (the parent prototype), which the eval inherits through
+        // the caller's chain, so its presence is the home-object test.
+        if (direct) {
+            if (outer_env.lookup("__sproto__")) |_| {
+                p.eval_allow_super_prop = true;
+            } else |_| {}
+        }
+        const parse_result = p.parseScript();
+        const stmts = switch (parse_result) {
+            .ok => |s| s,
+            .err => |e| {
+                realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", e.message);
+                return error.JsException;
+            },
+        };
         const eval_is_strict = parser_mod.hasUseStrict(stmts) or p.strict;
         // EvalDeclarationInstantiation (§19.2.1.3) validates the whole declaration
         // set BEFORE creating any binding, so a rejected declaration leaves no

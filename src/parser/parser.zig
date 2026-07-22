@@ -243,6 +243,12 @@ pub const Parser = struct {
     /// SyntaxErrors — unlike the CJS-desugar bundle source run via parseScript,
     /// which legitimately carries them. Set only by the `eval()` builtin.
     eval_code: bool,
+    /// Set with `eval_code` for a *direct* eval whose calling context supplies a
+    /// [[HomeObject]] — i.e. one nested in a method or a class field initializer,
+    /// detected by the VM from the `__sproto__` binding in the caller's scope
+    /// chain. Only then is SuperProperty (`super.x`) legal inside the eval'd
+    /// code; SuperCall never is, and an indirect eval permits neither.
+    eval_allow_super_prop: bool = false,
     /// True when the code currently being parsed is strict-mode code (a "use
     /// strict" directive prologue at script/eval/function scope, or module code).
     /// Drives the strict-only early SyntaxErrors: future-reserved words used as
