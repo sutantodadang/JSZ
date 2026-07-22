@@ -94,6 +94,13 @@ pub const BcClosure = struct {
     /// circular import with runtime/realm.zig). Null = primary realm / untagged.
     /// Read by GetFunctionRealm for GetPrototypeFromConstructor's realm fallback.
     realm: ?*anyopaque = null,
+    /// SetFunctionName applied at runtime to *this* closure (spec
+    /// MethodDefinitionEvaluation / PropertyDefinitionEvaluation with a computed
+    /// key). It cannot live on `func`, which is shared by every closure built
+    /// from the same function literal — `for (k of keys) o = {[k]: () => {}}`
+    /// must name each closure after its own key. Null → fall back to
+    /// `func.name`. Always read through `effectiveName`.
+    name_override: ?[]const u8 = null,
     /// Object Environment Records (`with` scopes, outermost first) that enclosed
     /// this function's definition site. A function declared inside `with (o)`
     /// keeps resolving free names through `o` when it is called later, from
@@ -101,6 +108,11 @@ pub const BcClosure = struct {
     /// that happened to run the `with`. Seeded into the callee frame's
     /// `with_stack` below its own entries; empty for the common case.
     with_scopes: []const @import("../value/value.zig").Value = &.{},
+
+    /// The `.name` this function reports, honouring a runtime SetFunctionName.
+    pub fn effectiveName(self: *const BcClosure) []const u8 {
+        return self.name_override orelse (self.func.name orelse "");
+    }
 };
 
 test "BcFunction fields exist" {

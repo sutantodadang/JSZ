@@ -156,6 +156,12 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name_val = frame.func.chunk.constants[kidx];
     const name = name_val.toPtr().string;
+    return getBindingByName(self, frame, rdst, name);
+}
+
+/// GetValue for an identifier Reference resolved by name (GET_GLOBAL, and the
+/// fallback for a GET_REF whose token designates nothing reusable).
+fn getBindingByName(self: *BcVm, frame: *BcCallFrame, rdst: u8, name: []const u8) !?RunOutcome {
     // `with` scopes (if any) shadow the lexical/global scope: an object whose
     // [[HasProperty]] is true provides the binding via [[Get]].
     if (frame.with_stack.items.len > 0) {
@@ -404,6 +410,190 @@ inline fn inheritedWith(self: *BcVm, frame: *BcCallFrame, name: []const u8) !?Va
     return withScan(self, frame, name, 0, frame.inherited_with);
 }
 
+// ------------------------------------------------- resolved references (§6.2.5)
+//
+// `x op= y`, `x = y` and `++x` must resolve the Reference for `x` ONCE, before
+// the right-hand side runs, and write through *that* Reference — even if the
+// binding it names has since moved or disappeared:
+//
+//     with (o) { x *= (delete o.x, 3) }   // still assigns o.x
+//     x = (eval("var x"), 1)              // still assigns the OUTER x
+//
+// A name-based SET_GLOBAL re-resolves and gets a different answer. The
+// RESOLVE_REF / GET_REF / PUT_REF trio carries the resolution across the RHS as
+// a token held in an ordinary register:
+//
+//   * an object Value — the binding object of an object Environment Record
+//     (a `with` scope), written through with [[Set]];
+//   * a number ≥ 0 — how many hops up the declarative environment chain the
+//     binding lives, assigned directly in that record;
+//   * -1 — resolved nowhere reusable; PUT_REF falls back to the plain
+//     name-based path (unresolvable references, the global object, and the
+//     cross-realm/inherited-floor cases all land here, unchanged).
+//
+// The compiler only emits them for functions that contain a `with` or a direct
+// `eval` (see `dynamic_scope` in compiler.zig), so the ordinary path — and the
+// int JIT, which pattern-matches GET_GLOBAL/SET_GLOBAL — is untouched.
+const REF_FALLBACK: f64 = -1;
+
+/// Nth parent of `env`, or null if the chain is shorter than `depth`.
+fn envAtDepth(env: *Environment, depth: usize) ?*Environment {
+    var cur = env;
+    var i: usize = 0;
+    while (i < depth) : (i += 1) cur = cur.parent orelse return null;
+    return cur;
+}
+
+/// Locate the binding for `name` and return it as a reference token. Mirrors the
+/// resolution order of `opGetGlobal`/`opSetGlobal`; anything those two reach by
+/// a path this cannot describe comes back as the fallback token.
+fn resolveRefToken(self: *BcVm, frame: *BcCallFrame, name: []const u8) !Value {
+    if (frame.with_stack.items.len > 0) {
+        if (try ownWith(self, frame, name)) |wobj| return wobj;
+    }
+    var depth: usize = 0;
+    var cur: ?*Environment = frame.env;
+    while (cur) |e| {
+        if (frame.inherited_env_floor) |floor| if (e == floor) break;
+        if (e.bindings.contains(name)) return val_mod.makeNumber(self.arena, @floatFromInt(depth));
+        cur = e.parent;
+        depth += 1;
+    }
+    if (try inheritedWith(self, frame, name)) |wobj| return wobj;
+    return val_mod.makeNumber(self.arena, REF_FALLBACK);
+}
+
+pub inline fn opResolveRef(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rref = code[frame.pc];
+    frame.pc += 1;
+    const lo = code[frame.pc];
+    frame.pc += 1;
+    const hi = code[frame.pc];
+    frame.pc += 1;
+    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+    const name = frame.func.chunk.constants[kidx].toPtr().string;
+    const token = try resolveRefToken(self, frame, name);
+    // resolveRefToken can run a with-object [[HasProperty]] trap, which may have
+    // reallocated self.frames — write through the re-fetched top frame.
+    self.frames.items[self.frames.items.len - 1].registers[rref] = token;
+    return null;
+}
+
+/// GET_REF: resolve the reference, record it in R[ref], and GetValue it into
+/// R[dst]. The read goes through the token so the binding object's
+/// [[HasProperty]] is not consulted a second time.
+pub inline fn opGetRef(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rdst = code[frame.pc];
+    frame.pc += 1;
+    const rref = code[frame.pc];
+    frame.pc += 1;
+    const lo = code[frame.pc];
+    frame.pc += 1;
+    const hi = code[frame.pc];
+    frame.pc += 1;
+    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+    const name = frame.func.chunk.constants[kidx].toPtr().string;
+    const token = try resolveRefToken(self, frame, name);
+    {
+        const top = &self.frames.items[self.frames.items.len - 1];
+        top.registers[rref] = token;
+    }
+    if (token.bits != 0 and token.unbox() == .object) {
+        const v = try self.getProp(token, name);
+        self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
+        return null;
+    }
+    const depth = token.unbox().number;
+    if (depth >= 0) {
+        if (envAtDepth(frame.env, @intFromFloat(depth))) |env| {
+            if (env.lookupUntil(name, env.parent)) |v| {
+                frame.registers[rdst] = v;
+                return null;
+            } else |err| switch (err) {
+                error.TemporalDeadZone => {
+                    const msg = try std.fmt.allocPrint(self.arena, "Cannot access '{s}' before initialization", .{name});
+                    const exc_val = try self.makeErrorObjectBc("ReferenceError", msg);
+                    self.last_exception_value = exc_val;
+                    const found = try self.throwException(exc_val);
+                    if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+                    return null;
+                },
+                else => {},
+            }
+        }
+    }
+    // Unresolvable through the token: replay the ordinary name-based read, which
+    // owns the ReferenceError / global-object fallbacks.
+    return getBindingByName(self, frame, rdst, name);
+}
+
+pub inline fn opPutRef(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rref = code[frame.pc];
+    frame.pc += 1;
+    const lo = code[frame.pc];
+    frame.pc += 1;
+    const hi = code[frame.pc];
+    frame.pc += 1;
+    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+    const rsrc = code[frame.pc];
+    frame.pc += 1;
+    const name = frame.func.chunk.constants[kidx].toPtr().string;
+    const value = frame.registers[rsrc];
+    const token = frame.registers[rref];
+
+    // Object Environment Record: SetMutableBinding [[Set]]s the binding object
+    // whether or not the property is still there (creating it when it is not);
+    // in strict code a vanished binding is a ReferenceError instead.
+    if (token.bits != 0 and token.unbox() == .object) {
+        const key = try val_mod.makeString(self.arena, name);
+        if (frame.func.is_strict and !try withHasBinding(self, token, key, name)) {
+            const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{name});
+            const exc_val = try self.makeErrorObjectBc("ReferenceError", msg);
+            self.last_exception_value = exc_val;
+            const found = try self.throwException(exc_val);
+            if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+            return null;
+        }
+        try self.setProp(token, name, value);
+        return null;
+    }
+    if (token.bits != 0 and token.unbox() == .number) {
+        const depth = token.unbox().number;
+        if (depth >= 0) {
+            if (envAtDepth(frame.env, @intFromFloat(depth))) |env| {
+                if (env.assignUntil(name, value, env.parent)) |_| {
+                    mirrorGlobalBinding(frame, name, value, true);
+                    return null;
+                } else |err| switch (err) {
+                    error.TemporalDeadZone => {
+                        const msg = try std.fmt.allocPrint(self.arena, "Cannot access '{s}' before initialization", .{name});
+                        const exc_val = try self.makeErrorObjectBc("ReferenceError", msg);
+                        self.last_exception_value = exc_val;
+                        const found = try self.throwException(exc_val);
+                        if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+                        return null;
+                    },
+                    error.ConstAssignment => {
+                        const msg = try std.fmt.allocPrint(self.arena, "Assignment to constant variable.", .{});
+                        const exc_val = try self.makeErrorObjectBc("TypeError", msg);
+                        self.last_exception_value = exc_val;
+                        const found = try self.throwException(exc_val);
+                        if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+                        return null;
+                    },
+                    // The binding was deleted after it was resolved — the
+                    // Reference is now unresolvable, so fall through.
+                    else => {},
+                }
+            }
+        }
+    }
+    return setBindingByName(self, frame, name, value);
+}
+
 pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const lo = code[frame.pc];
@@ -416,6 +606,12 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const name_val = frame.func.chunk.constants[kidx];
     const name = name_val.toPtr().string;
     const value = frame.registers[rsrc];
+    return setBindingByName(self, frame, name, value);
+}
+
+/// PutValue for an identifier Reference resolved by name (SET_GLOBAL, and the
+/// fallback for a PUT_REF whose token no longer designates a binding).
+fn setBindingByName(self: *BcVm, frame: *BcCallFrame, name: []const u8, value: Value) !?RunOutcome {
     const cur_is_strict = frame.func.is_strict;
     // `with` scopes: assign through an object whose [[HasProperty]] is true.
     if (frame.with_stack.items.len > 0) {

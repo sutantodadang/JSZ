@@ -1955,6 +1955,9 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 const cm_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                     .function_expr = .{
                         .name = null,
+                        // A concise method, like every other `{ k(){} }` form:
+                        // no own `prototype`, not a constructor.
+                        .is_method = true,
                         .params = cm_params.params,
                         .param_defaults = cm_params.param_defaults,
                         .rest_param = cm_params.rest_param,
@@ -2051,7 +2054,17 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             const acc_body = p.parseFunctionBody() orelse return null;
             const acc_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
-                    .name = null,
+                    // SetFunctionName(closure, propKey, "get"/"set"): an accessor's
+                    // `.name` is its key prefixed with the kind. `is_method` keeps
+                    // that name from being self-bound in the body (it is not a named
+                    // function expression) and drops the `prototype` property.
+                    // A computed key is named at runtime via SET_FN_NAME instead.
+                    .name = if (acc_computed_key != null) null else (std.fmt.allocPrint(
+                        p.arena,
+                        "{s} {s}",
+                        .{ if (acc_kind == .get) "get" else "set", aname },
+                    ) catch return null),
+                    .is_method = true,
                     .params = acc_params.params,
                     .param_defaults = acc_params.param_defaults,
                     .rest_param = acc_params.rest_param,

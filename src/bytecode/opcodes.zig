@@ -326,6 +326,31 @@ pub const Op = enum(u8) {
     /// declaration or a parameter between the block and the var scope gets no
     /// var binding and no sync. Declared last (JIT ordinal stability).
     SYNC_ANNEXB_FN,
+    /// SET_FN_NAME | 4 | op, Rfn u8, Rkey u8, prefix u8. Runtime
+    /// SetFunctionName(R[fn], R[key], prefix) for a computed property key:
+    /// a string key names the function directly, a symbol key names it
+    /// "[description]" (or "" when the symbol has no description). `prefix` is
+    /// 0 for none, 1 for "get ", 2 for "set ". Emitted only where the value is
+    /// syntactically an anonymous function definition, so the "only if the
+    /// function has no name yet" part of the spec is a compile-time decision.
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    SET_FN_NAME,
+    /// RESOLVE_REF | 4 | op, Rref u8, Kname u16-LE. Resolves the identifier
+    /// Reference for Kname and parks the resolution in R[ref] so a later PUT_REF
+    /// writes through *that* Reference rather than re-resolving the name. See
+    /// the "resolved references" block in vm/ops/load.zig for the token format.
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    RESOLVE_REF,
+    /// GET_REF | 5 | op, Rdst u8, Rref u8, Kname u16-LE. RESOLVE_REF plus
+    /// GetValue: R[dst] = the reference's current value. Used for the read half
+    /// of a compound assignment / update expression.
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    GET_REF,
+    /// PUT_REF | 5 | op, Rref u8, Kname u16-LE, Rsrc u8. PutValue through the
+    /// reference token in R[ref], falling back to SET_GLOBAL's name-based path
+    /// when the token no longer designates a binding.
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    PUT_REF,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -428,6 +453,10 @@ pub fn instrSize(op: Op) usize {
         .MARK_DIRECT_EVAL => 1,
         .DEFINE_LOCAL => 4,
         .SYNC_ANNEXB_FN => 3,
+        .SET_FN_NAME => 4,
+        .RESOLVE_REF => 4,
+        .GET_REF => 5,
+        .PUT_REF => 5,
         .IN => 4,
         .DELETE_PROP => 4,
         .CALL_SPREAD => 5,

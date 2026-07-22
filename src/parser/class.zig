@@ -586,6 +586,40 @@ fn manglePrivateNames(p: *Parser, parsed: *ClassBodyParse) bool {
     return true;
 }
 
+/// IsAnonymousFunctionDefinition(expr): the shapes whose `.name` comes from the
+/// surrounding definition. Mirrors the compiler's check of the same name.
+fn isAnonFnDef(node: *Node) bool {
+    return switch (node.kind) {
+        .function_expr => node.data.function_expr.name == null,
+        .call_expr => node.data.call_expr.anon_class_iife,
+        else => false,
+    };
+}
+
+/// A class field's initializer, wrapped in `__nameFn__(init, "<name>")` when it
+/// is an anonymous function definition — `class C { f = () => {} }` names the
+/// arrow "f", which the plain `this.f = () => {}` the field desugars to would
+/// not do. Computed keys are left alone: naming them would mean evaluating the
+/// key expression a second time.
+fn namedFieldInit(p: *Parser, f: ClassField, val: *Node) ?*Node {
+    return namedFieldInitOf(p, f, val, val);
+}
+
+/// As `namedFieldInit`, but for the static-field shape where the initializer has
+/// already been wrapped in `(function(){ return <init>; }).call(C)`: the
+/// anonymity test looks at the original `check` node while the wrapper `val` is
+/// what gets named.
+fn namedFieldInitOf(p: *Parser, f: ClassField, val: *Node, check: *Node) ?*Node {
+    if (f.computed_key != null or !isAnonFnDef(check)) return val;
+    const s = p.current.start;
+    const callee = nodeIdent(p, "__nameFn__") orelse return null;
+    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = f.name }) orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, val) catch return null;
+    args.append(p.arena, key) catch return null;
+    return p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+}
+
 /// Build an instance-field initializer statement: `this.<name> = <init>` (or
 /// `this[<computed>] = <init>`), with `undefined` when there is no initializer.
 /// A private name (`#x`) is emitted as a non-computed member, so it resolves to
@@ -597,7 +631,8 @@ fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
         (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = this_node, .property = k, .computed = true } }) orelse return null)
     else
         markPrivateDefine(nodeMember(p, this_node, f.name) orelse return null, false);
-    const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const raw = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const val = namedFieldInit(p, f, raw) orelse return null;
     const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
 }
@@ -619,7 +654,8 @@ fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
 fn makeDerivedInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
     const s = p.current.start;
     const superthis = nodeIdent(p, "__superthis") orelse return null;
-    const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const raw = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const val = namedFieldInit(p, f, raw) orelse return null;
 
     // Private fields: `__superthis.#name = init` (member assignment → PrivateFieldAdd).
     if (f.computed_key == null and f.name.len > 0 and f.name[0] == '#') {
@@ -693,7 +729,8 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
     const this_arg = nodeIdent(p, class_name) orelse return null;
     const call_args = p.arena.alloc(*Node, 1) catch return null;
     call_args[0] = this_arg;
-    const val = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = call_member, .args = call_args } }) orelse return null;
+    const call_val = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = call_member, .args = call_args } }) orelse return null;
+    const val = namedFieldInitOf(p, f, call_val, raw_init) orelse return null;
 
     const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
@@ -859,8 +896,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         props.append(p.arena, .{ .key = "enumerable", .value = f_val }) catch return null;
         props.append(p.arena, .{ .key = "configurable", .value = t_val }) catch return null;
         const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
-        const id_obj = nodeIdent(p, "Object") orelse return null;
-        const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+        const callee = defineMethodCallee(p, m.computed_key != null) orelse return null;
         var args = std.ArrayList(*Node){};
         args.append(p.arena, target) catch return null;
         args.append(p.arena, key_val) catch return null;
@@ -879,14 +915,23 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
     props.append(p.arena, .{ .key = "enumerable", .value = f_val }) catch return null;
     const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
 
-    const id_obj = nodeIdent(p, "Object") orelse return null;
-    const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+    const callee = defineMethodCallee(p, m.computed_key != null) orelse return null;
     var args = std.ArrayList(*Node){};
     args.append(p.arena, target) catch return null;
     args.append(p.arena, key_val) catch return null;
     args.append(p.arena, desc) catch return null;
     const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
+}
+
+/// Callee for the `Object.defineProperty(target, key, desc)` a class method
+/// desugars to. A computed key routes through `__defineNamedMethod__` instead:
+/// the method's `.name` is its property key, which is only known once the key
+/// expression has run, and that helper applies SetFunctionName before defining.
+fn defineMethodCallee(p: *Parser, computed: bool) ?*Node {
+    if (computed) return nodeIdent(p, "__defineNamedMethod__");
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    return nodeMember(p, id_obj, "defineProperty");
 }
 
 pub fn parseClassDeclStmt(p: *Parser) ?*Node {
@@ -1448,7 +1493,14 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
             .function_expr = .{ .name = null, .params = &[_][]const u8{}, .body = fn_body.items, .is_arrow = false },
         }) orelse return null;
         return p.makeNode(.call_expr, start, p.current.start, .{
-            .call_expr = .{ .callee = fn_expr, .args = &[_]*Node{} },
+            .call_expr = .{
+                .callee = fn_expr,
+                .args = &[_]*Node{},
+                // `class {}` with no binding identifier and no NamedEvaluation
+                // hint is an AnonymousFunctionDefinition; a computed-key property
+                // names the constructor after its key at runtime.
+                .anon_class_iife = !has_name and anon_name_hint == null,
+            },
         });
 }
 

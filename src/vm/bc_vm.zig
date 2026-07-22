@@ -1450,6 +1450,9 @@ pub const BcVm = struct {
                 .PUSH_WITH => if (try load_ops.opPushWith(self, frame)) |o| return o,
                 .POP_WITH => if (try load_ops.opPopWith(self, frame)) |o| return o,
                 .SET_GLOBAL => if (try load_ops.opSetGlobal(self, frame)) |o| return o,
+                .RESOLVE_REF => if (try load_ops.opResolveRef(self, frame)) |o| return o,
+                .GET_REF => if (try load_ops.opGetRef(self, frame)) |o| return o,
+                .PUT_REF => if (try load_ops.opPutRef(self, frame)) |o| return o,
                 .DEFINE_GLOBAL => if (try load_ops.opDefineGlobal(self, frame)) |o| return o,
                 .MARK_DIRECT_EVAL => self.direct_eval_mark = true,
                 .DEFINE_LOCAL => if (try load_ops.opDefineLocal(self, frame)) |o| return o,
@@ -1519,6 +1522,7 @@ pub const BcVm = struct {
                 .SET_PROP_DYN => if (try property_ops.opSetPropDyn(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR => if (try property_ops.opDefineAccessor(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR_DYN => if (try property_ops.opDefineAccessorDyn(self, frame)) |o| return o,
+                .SET_FN_NAME => if (try property_ops.opSetFnName(self, frame)) |o| return o,
                 .GET_THIS => if (try property_ops.opGetThis(self, frame)) |o| return o,
                 .IN => if (try property_ops.opIn(self, frame)) |o| return o,
                 .DELETE_PROP => if (try property_ops.opDeleteProp(self, frame)) |o| return o,
@@ -2667,7 +2671,7 @@ pub const BcVm = struct {
                 // configurable). `length` = declared arity; `name` = the bound
                 // function name ("" when anonymous and not named-evaluated).
                 if (std.mem.eql(u8, key, "name")) {
-                    const raw = closure.func.name orelse "";
+                    const raw = closure.effectiveName();
                     // Translate internal sentinels for anonymous default exports to "default".
                     const display = if (std.mem.eql(u8, raw, "__esm_dflt_fn__") or
                         std.mem.eql(u8, raw, "__esm_dflt_gen__")) "default" else raw;
@@ -2804,7 +2808,7 @@ pub const BcVm = struct {
         // (non-writable, non-enumerable, configurable). The virtual-resolution
         // fast path in getProp still short-circuits via `o.hasOwn` on these.
         {
-            const nm_raw = closure.func.name orelse "";
+            const nm_raw = closure.effectiveName();
             const nm = if (std.mem.eql(u8, nm_raw, "__esm_dflt_fn__") or
                 std.mem.eql(u8, nm_raw, "__esm_dflt_gen__")) "default" else nm_raw;
             const nec: @import("../object/object.zig").PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };

@@ -374,7 +374,7 @@ fn targetLenName(v: Value) struct { len: f64, name: []const u8 } {
     switch (v.unbox()) {
         .native_function => |e| return .{ .len = @floatFromInt(e.length), .name = e.name orelse "" },
         .function => |fv| return .{ .len = @floatFromInt(fv.params.len), .name = fv.name orelse "" },
-        .bc_function => |cl| return .{ .len = @floatFromInt(cl.func.arity), .name = cl.func.name orelse "" },
+        .bc_function => |cl| return .{ .len = @floatFromInt(cl.func.arity), .name = cl.effectiveName() },
         .object => |o| {
             var l: f64 = 0;
             if (o.getOwn("length")) |lv| {

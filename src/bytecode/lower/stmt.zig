@@ -1337,6 +1337,7 @@ pub fn lowerWithStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{
     // Completion value: `with` returns UpdateEmpty(bodyCompletion, undefined).
     try self.resetCompletion(line);
     self.with_depth += 1;
+    self.saw_dynamic_scope = true;
     try self.compileStmt(ws.body, last_expr_reg);
     self.with_depth -= 1;
     try self.emitOp(.POP_WITH, line);

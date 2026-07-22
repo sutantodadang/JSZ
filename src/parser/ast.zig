@@ -244,6 +244,11 @@ pub const CallExpr = struct {
     args: []*Node,
     /// ES2020 optional call `f?.(args)`.
     optional: bool = false,
+    /// This call is the IIFE a *nameless* `class {}` expression desugars to, so
+    /// it is an AnonymousFunctionDefinition for NamedEvaluation purposes: a
+    /// computed-key property (`{[k]: class {}}`) must SetFunctionName on the
+    /// constructor it returns.
+    anon_class_iife: bool = false,
 };
 
 pub const NewExpr = struct {
