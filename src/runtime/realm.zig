@@ -1534,6 +1534,8 @@ fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
             else
                 try JsObject.create(arena, p);
             try w.set("[[PrimitiveValue]]", args[0]);
+            // StringCreate: a boxed String is a String exotic object.
+            if (args[0].unbox() == .string) try installStringExotic(arena, w, args[0].unbox().string);
             return val_mod.makeObject(arena, w);
         }
     }
@@ -1565,9 +1567,28 @@ pub fn toObjectForThis(arena: std.mem.Allocator, v: Value) !Value {
         else
             try JsObject.create(arena, p);
         try w.set("[[PrimitiveValue]]", v);
+        // NOTE: deliberately NOT installing the String exotic index properties
+        // here. This runs on every sloppy-mode call with a primitive `this`, and
+        // materialising one property per code unit would make
+        // `hugeString.someSloppyMethod()` allocate proportionally to the string.
+        // The explicit boxing paths (Object(str), new String(str), and
+        // array_proto's ToObject) do install them.
         return val_mod.makeObject(arena, w);
     }
     return v;
+}
+
+/// Define a String exotic object's index properties and `length` on `obj`.
+pub fn installStringExotic(arena: std.mem.Allocator, obj: *JsObject, s: []const u8) !void {
+    const string_proto = @import("./builtins/string_proto.zig");
+    const cu_len = string_proto.cuLen(s);
+    var i: usize = 0;
+    while (i < cu_len) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const unit = string_proto.cuUnitAt(s, i).?;
+        _ = try obj.defineOwnData(key, try val_mod.makeString(arena, try string_proto.cuToString(arena, unit)), .{ .writable = false, .enumerable = true, .configurable = false });
+    }
+    _ = try obj.defineOwnData("length", try val_mod.makeNumber(arena, @floatFromInt(cu_len)), .{ .writable = false, .enumerable = false, .configurable = false });
 }
 
 fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -2232,15 +2253,7 @@ fn nativeStringCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
         // A String exotic object exposes each UTF-16 code unit as an own property
         // { enumerable, non-writable, non-configurable } plus an own non-enumerable
         // "length" (ES 10.4.3 StringCreate / String-exotic define-own-property).
-        const string_proto = @import("./builtins/string_proto.zig");
-        const cu_len = string_proto.cuLen(s);
-        var i: usize = 0;
-        while (i < cu_len) : (i += 1) {
-            const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-            const unit = string_proto.cuUnitAt(s, i).?;
-            _ = try obj.defineOwnData(key, try val_mod.makeString(arena, try string_proto.cuToString(arena, unit)), .{ .writable = false, .enumerable = true, .configurable = false });
-        }
-        _ = try obj.defineOwnData("length", try val_mod.makeNumber(arena, @floatFromInt(cu_len)), .{ .writable = false, .enumerable = false, .configurable = false });
+        try installStringExotic(arena, obj, s);
         return this_val;
     }
     return val_mod.makeString(arena, s);

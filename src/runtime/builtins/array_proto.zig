@@ -975,17 +975,11 @@ fn toObject(arena: std.mem.Allocator, v: Value) !Value {
         else
             try JsObject.create(arena, p);
         try w.set("[[PrimitiveValue]]", v);
-        // A String exotic object exposes each code unit as an own index property
-        // plus `length`, so array methods can read them (String is byte-indexed).
-        if (v.unbox() == .string) {
-            const s = v.toPtr().string;
-            var i: usize = 0;
-            while (i < s.len) : (i += 1) {
-                const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-                try w.set(key, try val_mod.makeString(arena, try arena.dupe(u8, s[i .. i + 1])));
-            }
-            try w.set("length", try val_mod.makeNumber(arena, @floatFromInt(s.len)));
-        }
+        // A String exotic object exposes each UTF-16 code unit as an own
+        // { enumerable, non-writable, non-configurable } index property plus a
+        // non-writable `length` — the attributes matter, because a mutating array
+        // method applied to a string receiver must fail with a TypeError.
+        if (v.unbox() == .string) try realm_mod.installStringExotic(arena, w, v.toPtr().string);
         return val_mod.makeObject(arena, w);
     }
     return v;

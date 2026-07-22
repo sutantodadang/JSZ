@@ -597,9 +597,15 @@ fn internalizeJSONProperty(arena: std.mem.Allocator, holder: *JsObject, name: []
         holder.get(name) orelse val_mod.makeUndefined(arena) catch unreachable;
     if (val.bits != 0 and val.unbox() == .object) {
         const val_obj = val.toPtr().object;
-        if (val_obj.is_array) {
-            const len = val_obj.array_length;
-            var i: u32 = 0;
+        if (try jsonIsArray(val_obj)) {
+            // LengthOfArrayLike is a real [[Get]]("length") + ToLength, so a
+            // Proxy trap / accessor / poisoned valueOf is observed here.
+            const len_v = if (realm_mod.active_context) |c|
+                try c.getProp(arena, val, "length")
+            else
+                val_mod.Value{};
+            const len = try realm_mod.toLengthValue(arena, len_v);
+            var i: usize = 0;
             while (i < len) : (i += 1) {
                 const prop = try std.fmt.allocPrint(arena, "{d}", .{i});
                 const child: ?*SrcNode = if (node) |n|
@@ -607,19 +613,14 @@ fn internalizeJSONProperty(arena: std.mem.Allocator, holder: *JsObject, name: []
                 else
                     null;
                 const new_elem = try internalizeJSONProperty(arena, val_obj, prop, reviver, child);
-                if (new_elem.bits == 0 or new_elem.unbox() == .undefined_) {
-                    _ = try val_obj.deleteOwn(prop);
-                } else {
-                    try val_obj.set(prop, new_elem);
-                }
+                try applyRevivedElement(arena, val, prop, new_elem);
             }
         } else {
-            // Snapshot enumerable own keys before iterating (reviver may mutate).
-            var keys = std.ArrayList([]const u8){};
-            for (val_obj.ownKeys()) |k| {
-                if (val_obj.isEnumerable(k)) try keys.append(arena, k);
-            }
-            for (keys.items) |p| {
+            // EnumerableOwnPropertyNames(val, key): [[OwnPropertyKeys]] then
+            // [[GetOwnProperty]] per key, both observable on a Proxy. Snapshotting
+            // up front also keeps a mutating reviver from changing what is visited.
+            const keys = try jsonOwnEnumerableKeys(arena, val, val_obj);
+            for (keys) |p| {
                 var child: ?*SrcNode = null;
                 if (node) |n| {
                     if (n.kind == .object) {
@@ -632,17 +633,75 @@ fn internalizeJSONProperty(arena: std.mem.Allocator, holder: *JsObject, name: []
                     }
                 }
                 const new_elem = try internalizeJSONProperty(arena, val_obj, p, reviver, child);
-                if (new_elem.bits == 0 or new_elem.unbox() == .undefined_) {
-                    _ = try val_obj.deleteOwn(p);
-                } else {
-                    try val_obj.set(p, new_elem);
-                }
+                try applyRevivedElement(arena, val, p, new_elem);
             }
         }
     }
     const name_v = try val_mod.makeString(arena, name);
     const ctx = try makeReviverContext(arena, node, val);
     return fpm.invokeCallback(arena, holder_v, reviver, &.{ name_v, val, ctx });
+}
+
+/// IsArray (§7.2.2) for the reviver walk: recurses through Proxy targets.
+fn jsonIsArray(obj_in: *JsObject) anyerror!bool {
+    const proxy_mod = @import("proxy.zig");
+    var o = obj_in;
+    var depth: usize = 0;
+    while (o.internal_kind == .proxy and depth < 64) : (depth += 1) {
+        const target = proxy_mod.proxyTarget(o) orelse return proxy_mod.throwRevoked(std.heap.page_allocator);
+        if (target.bits == 0 or target.unbox() != .object) return false;
+        o = target.toPtr().object;
+    }
+    return o.is_array;
+}
+
+/// Own enumerable STRING keys of `val`, via the observable [[OwnPropertyKeys]] +
+/// [[GetOwnProperty]] pair (Object.keys already implements exactly that).
+fn jsonOwnEnumerableKeys(arena: std.mem.Allocator, val: Value, val_obj: *JsObject) anyerror![][]const u8 {
+    const realm_mod = @import("../realm.zig");
+    var out = std.ArrayList([]const u8){};
+    if (val_obj.internal_kind == .proxy) {
+        const obj_methods = @import("object_methods.zig");
+        const arr = try obj_methods.nativeObjectKeys(arena, Value{}, &[_]Value{val});
+        if (arr.bits != 0 and arr.unbox() == .object) {
+            const ao = arr.toPtr().object;
+            var i: u32 = 0;
+            while (i < ao.getArrayLength()) : (i += 1) {
+                const k = try std.fmt.allocPrint(arena, "{d}", .{i});
+                const kv = ao.get(k) orelse continue;
+                try out.append(arena, try realm_mod.stringPrimitive(arena, kv));
+            }
+        }
+        return out.items;
+    }
+    for (val_obj.ownKeys()) |k| {
+        if (val_obj.isEnumerable(k)) try out.append(arena, k);
+    }
+    return out.items;
+}
+
+/// InternalizeJSONProperty steps 2.b.ii/iii: an undefined result DELETES the
+/// property (DeletePropertyOrThrow), anything else is installed with
+/// CreateDataPropertyOrThrow. Both are throwing forms; the old code used the
+/// silent `deleteOwn`/`set` pair.
+fn applyRevivedElement(arena: std.mem.Allocator, val: Value, prop: []const u8, new_elem: Value) anyerror!void {
+    const reflect = @import("reflect.zig");
+    const realm_mod = @import("../realm.zig");
+    const key_v = try val_mod.makeString(arena, prop);
+    if (new_elem.bits == 0 or new_elem.unbox() == .undefined_) {
+        // `Perform ? val.[[Delete]](P)` — a throw from a Proxy trap propagates,
+        // but a plain `false` result is discarded (there is no OrThrow here).
+        _ = try reflect.nativeReflectDeleteProperty(arena, Value{}, &[_]Value{ val, key_v });
+        return;
+    }
+    // CreateDataProperty, NOT CreateDataPropertyOrThrow: a non-configurable
+    // existing property makes the create fail SILENTLY and the old value stays.
+    const desc = try JsObject.create(arena, realm_mod.active_object_proto);
+    try desc.set("value", new_elem);
+    try desc.set("writable", try val_mod.makeBool(arena, true));
+    try desc.set("enumerable", try val_mod.makeBool(arena, true));
+    try desc.set("configurable", try val_mod.makeBool(arena, true));
+    _ = try reflect.nativeReflectDefineProperty(arena, Value{}, &[_]Value{ val, key_v, try val_mod.makeObject(arena, desc) });
 }
 
 /// Error-only variant of throwSyntaxError, usable in any `!T` return context.

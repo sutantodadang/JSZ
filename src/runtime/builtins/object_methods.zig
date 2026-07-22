@@ -463,6 +463,13 @@ pub fn nativeObjectFromEntries(arena: std.mem.Allocator, _: Value, args: []const
             return e;
         };
         // ToPropertyKey(key): a Symbol stays a symbol key; else ToString it.
+        // `toPrimitive` returns null for an ALREADY-primitive input, so a bare
+        // Symbol key must be recognised before calling it or it falls through to
+        // the ToString branch and the property is dropped.
+        if (key.bits != 0 and key.unbox() == .symbol) {
+            try out.setSymAttr(key, value, .{ .writable = true, .enumerable = true, .configurable = true });
+            continue;
+        }
         const prim = coercion_mod.toPrimitive(arena, key, .string) catch |e| {
             try iteratorCloseIgnore(arena, ctx, iter);
             return e;
