@@ -124,7 +124,14 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     // module-source object (`__moduleSource__(spec)`), an immutable binding.
     if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "source")) {
         const nn = p.peekNext();
-        if (nn.kind == .identifier and !std.mem.eql(u8, nn.value_str, "from")) {
+        // `from` after `source` is ambiguous: `import source from 'mod'` is an
+        // ordinary default import of a binding named `source`, while
+        // `import source from from 'mod'` binds the *source* to `from`. The
+        // token after it decides — a string ends the first form, a second `from`
+        // opens the FromClause of the second.
+        const nn_is_binding = nn.kind == .identifier and
+            (!std.mem.eql(u8, nn.value_str, "from") or p.peekNext2().kind != .string);
+        if (nn_is_binding) {
             _ = p.advance(); // consume `source`
             const bind_tok = p.expect(.identifier) orelse return null;
             if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
