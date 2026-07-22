@@ -1289,6 +1289,7 @@ pub fn parseCallMemberExpr(p: *Parser) ?*Node {
             }) orelse return null;
             base = p.rewriteSuperCall(raw_call) orelse return null;
         } else if (p.match(.dot)) {
+            const obj = base;
             const prop_tok = p.expectIdentifierName() orelse return null;
             const prop = p.makeNode(.identifier, prop_tok.start, prop_tok.end, .{
                 .identifier = prop_tok.value_str,
@@ -1296,12 +1297,15 @@ pub fn parseCallMemberExpr(p: *Parser) ?*Node {
             base = p.makeNode(.member_expr, base.start, p.current.start, .{
                 .member_expr = .{ .object = base, .property = prop, .computed = false },
             }) orelse return null;
+            if (superReadFollows(p, obj)) base = rewriteSuperPropRead(p, base) orelse return null;
         } else if (p.match(.left_bracket)) {
+            const obj = base;
             const prop = p.parseExpression() orelse return null;
             _ = p.expect(.right_bracket) orelse return null;
             base = p.makeNode(.member_expr, base.start, p.current.start, .{
                 .member_expr = .{ .object = base, .property = prop, .computed = true },
             }) orelse return null;
+            if (superReadFollows(p, obj)) base = rewriteSuperPropRead(p, base) orelse return null;
         } else {
             break;
         }
@@ -1399,6 +1403,65 @@ pub fn rewriteSuperPropAssign(p: *Parser, op: ast.AssignOp, target: *Node, value
     });
 }
 
+/// Rewrite a super-property *read* (`super.x` / `super[e]`) into
+/// `Reflect.get(__sproto__, key, __superthis)`.
+///
+/// JSZ desugars `super` to an ordinary scope binding whose value depends on the
+/// context: the parent prototype inside a method, but the super-call *helper
+/// function* inside a derived constructor. A plain member read off that binding
+/// therefore yields `undefined` in a derived constructor and in a field
+/// initializer, and even in a method it passes the wrong Receiver to an
+/// inherited getter. The spec's super reference is `Get(homeProto, key,
+/// thisValue)` — exactly `Reflect.get` with a distinct receiver — and
+/// `__sproto__` (the parent prototype) plus `__superthis` (the receiver) are
+/// already bound by every class desugar that admits `super`, so this one
+/// rewrite fixes methods, derived constructors and field initializers alike.
+/// It also makes `super.x` work inside a *direct* eval, which inherits those
+/// bindings through the caller's scope chain.
+///
+/// Only reads are rewritten: `super.x = v` is left for rewriteSuperPropAssign
+/// and `super.m()` for rewriteSuperCall, both of which need the member node
+/// intact. Callers use `superReadFollows` to make that distinction.
+fn rewriteSuperPropRead(p: *Parser, me_node: *Node) ?*Node {
+    const me = me_node.data.member_expr;
+    const start = me_node.start;
+    const end = me_node.end;
+    const key = if (me.computed)
+        me.property
+    else if (me.property.kind == .identifier)
+        (p.makeNode(.string_literal, start, end, .{ .string_literal = me.property.data.identifier }) orelse return null)
+    else
+        return null;
+    const id_reflect = p.makeNode(.identifier, start, end, .{ .identifier = "Reflect" }) orelse return null;
+    const id_get = p.makeNode(.identifier, start, end, .{ .identifier = "get" }) orelse return null;
+    const callee = p.makeNode(.member_expr, start, end, .{
+        .member_expr = .{ .object = id_reflect, .property = id_get, .computed = false },
+    }) orelse return null;
+    const id_proto = p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
+    const id_recv = p.makeNode(.identifier, start, end, .{ .identifier = "__superthis" }) orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, id_proto) catch return null;
+    args.append(p.arena, key) catch return null;
+    args.append(p.arena, id_recv) catch return null;
+    return p.makeNode(.call_expr, start, end, .{
+        .call_expr = .{ .callee = callee, .args = args.items },
+    });
+}
+
+/// True when a just-parsed `super.x` / `super[e]` member node is a plain *read*
+/// and so should go through rewriteSuperPropRead. The token that follows tells
+/// us which desugar owns it: `(` means a super method call (rewriteSuperCall),
+/// an assignment operator means a super-property write
+/// (rewriteSuperPropAssign), and `++`/`--` is an update whose existing
+/// (member-based) handling we leave untouched.
+fn superReadFollows(p: *Parser, obj: *Node) bool {
+    if (!(obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "super"))) return false;
+    return switch (p.current.kind) {
+        .left_paren, .plus_plus, .minus_minus => false,
+        else => !isAssignOp(p.current.kind),
+    };
+}
+
 /// Parse a member expression without call expressions (for `new` callee).
 /// Handles dot and bracket access but NOT `(` argument lists.
 pub fn parseNewCallee(p: *Parser) ?*Node {
@@ -1481,13 +1544,23 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
             return p.makeNode(.this_expr, start, end, .{ .this_expr = {} });
         },
         .kw_super => {
-            // `super` is only legal where the running execution context has a
-            // [[HomeObject]] / super constructor — which eval code never inherits
-            // here (an eval body is compiled as its own Script closure over the
-            // global environment). Both `super()` and `super.x` are therefore
-            // early SyntaxErrors in eval code, matching indirect eval in the spec
-            // and the derived-class-field-initializer cases that reach here.
-            if (p.eval_code) return p.fail("'super' keyword unexpected here");
+            // `super` is only legal where the running execution context supplies
+            // a [[HomeObject]] / super constructor. An *indirect* eval always
+            // runs as its own Script over the global environment and so never
+            // has either — both `super()` and `super.x` stay early SyntaxErrors
+            // there. A *direct* eval, though, inherits the caller's scope chain,
+            // and SuperProperty is legal inside one whenever the calling context
+            // is a method or a class field initializer (sec-performeval, "Eval
+            // Inside Initializer"). The VM sets `eval_allow_super_prop` after
+            // checking the caller's chain for the `__sproto__` binding that every
+            // super-admitting class desugar introduces. SuperCall stays rejected:
+            // a field initializer is not a constructor.
+            if (p.eval_code) {
+                const after = p.peekNext().kind;
+                const is_super_prop = after == .dot or after == .left_bracket;
+                if (!(is_super_prop and p.eval_allow_super_prop))
+                    return p.fail("'super' keyword unexpected here");
+            }
             _ = p.advance();
             p.super_used = true;
             return p.makeNode(.identifier, start, end, .{ .identifier = "super" });
