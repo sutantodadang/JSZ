@@ -211,7 +211,7 @@ fn od(s: []const u8, i: usize) ?i128 {
 }
 
 /// Convert a value to a ZonedDateTime (used by from/compare/equals/since/until).
-fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts: ?*JsObject) !ZonedDT {
+pub fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts: ?*JsObject) !ZonedDT {
     if (getZoned(v)) |z| return z.*;
     if (v.bits != 0 and v.unbox() == .object) {
         return try zonedFromFields(arena, v.toPtr().object, opts);
@@ -760,7 +760,7 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     var result: shared.DurationFields = undefined;
     // Rank 0 is `year`, so "day or larger" is a *lower* rank.
     if (unitRank(st.largest) <= unitRank(.day)) {
-        result = differenceZoned(from, to, st.largest);
+        result = try differenceZoned(arena, from, to, st.largest);
     } else {
         result = balanceTime(to.ns - from.ns, st.largest);
     }
@@ -772,32 +772,44 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     return duration.makeDuration(arena, result);
 }
 
-/// Difference between two same-zone ZonedDateTimes with a calendar largest unit.
-fn differenceZoned(a: ZonedDT, b: ZonedDT, largest: shared.Unit) shared.DurationFields {
+/// DifferenceZonedDateTime with a calendar largest unit. The date part is
+/// measured on the wall clock, but the leftover time is the *exact* gap to the
+/// target instant: on a 23- or 25-hour DST day the two disagree, and only the
+/// exact gap is real elapsed time. Re-anchoring can overshoot, so the end date
+/// is walked back a day at a time until the leftover time stops pointing the
+/// wrong way.
+fn differenceZoned(arena: std.mem.Allocator, a: ZonedDT, b: ZonedDT, largest: shared.Unit) !shared.DurationFields {
+    _ = arena;
+    if (a.ns == b.ns) return .{};
+    const sign: i32 = if (b.ns > a.ns) 1 else -1;
     const la = localDT(&a);
     const lb = localDT(&b);
-    var ns_diff = shared.timeToNanos(lb.time) - shared.timeToNanos(la.time);
-    var d1 = la.date;
-    const d2 = lb.date;
-    const date_sign = plain_date.compareISODate(d1, d2);
-    if (ns_diff < 0 and date_sign < 0) {
-        d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) + 1);
-        d1.calendar = d2.calendar;
-        ns_diff += shared.NS_PER_DAY;
-    } else if (ns_diff > 0 and date_sign > 0) {
-        d1 = shared.balanceISODate(d1.year, d1.month, @as(i32, d1.day) - 1);
-        d1.calendar = d2.calendar;
-        ns_diff -= shared.NS_PER_DAY;
+
+    const max_correction: i32 = if (sign == 1) 2 else 1;
+    var correction: i32 = 0;
+    const time_diff = shared.timeToNanos(lb.time) - shared.timeToNanos(la.time);
+    // A time-of-day difference pointing against the overall direction already
+    // costs a day, so start there rather than discovering it a round later.
+    if ((time_diff > 0 and sign < 0) or (time_diff < 0 and sign > 0)) correction = 1;
+
+    while (correction <= max_correction) : (correction += 1) {
+        var inter_date = shared.balanceISODate(lb.date.year, lb.date.month, @as(i32, lb.date.day) - correction * sign);
+        inter_date.calendar = lb.date.calendar;
+        const inter_ns = disambiguate(a.tz, a.offset_ns, wallNs(.{ .date = inter_date, .time = la.time }));
+        const rem = b.ns - inter_ns;
+        const rem_sign: i32 = if (rem > 0) 1 else if (rem < 0) -1 else 0;
+        if (rem_sign == -sign) continue;
+        var date_dur = plain_date.differenceISODate(la.date, inter_date, largest);
+        const time_dur = balanceTime(rem, .hour);
+        date_dur.hours = time_dur.hours;
+        date_dur.minutes = time_dur.minutes;
+        date_dur.seconds = time_dur.seconds;
+        date_dur.milliseconds = time_dur.milliseconds;
+        date_dur.microseconds = time_dur.microseconds;
+        date_dur.nanoseconds = time_dur.nanoseconds;
+        return date_dur;
     }
-    var date_dur = plain_date.differenceISODate(d1, d2, largest);
-    const time_dur = balanceTime(ns_diff, .hour);
-    date_dur.hours = time_dur.hours;
-    date_dur.minutes = time_dur.minutes;
-    date_dur.seconds = time_dur.seconds;
-    date_dur.milliseconds = time_dur.milliseconds;
-    date_dur.microseconds = time_dur.microseconds;
-    date_dur.nanoseconds = time_dur.nanoseconds;
-    return date_dur;
+    return .{};
 }
 
 fn balanceTime(total_ns: i128, largest: shared.Unit) shared.DurationFields {

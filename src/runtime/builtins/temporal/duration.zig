@@ -467,6 +467,12 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
     // touched is observable.
     if (rv.unbox() == .object) {
         const bag = try pd.readDateBag(arena, rv.toPtr().object, .{ .time = true, .zoned = true });
+        // A bag naming a time zone is a *zoned* relativeTo, so its time zone and
+        // offset have to be validated even though only the date survives.
+        if (bag.time_zone != null) {
+            const z = try zdt.toTemporalZoned(arena, rv, null);
+            return zdt.localISODate(&z);
+        }
         return try pd.dateFromBag(arena, bag, .constrain);
     }
     return try pd.toTemporalDate(arena, rv, .constrain);
@@ -520,11 +526,6 @@ fn roundRelative(
     inc: f64,
     mode: shared.RoundingMode,
 ) !RelResult {
-    // Weeks can only be produced under a "year" or "week" largestUnit; requesting
-    // week rounding while the (default) largestUnit is "month" is a RangeError.
-    if (smallest == .week and largest == .month)
-        return realm_mod.throwRangeError(arena, "cannot round to weeks with a months largestUnit");
-
     const DAY = shared.NS_PER_DAY;
     const time_ns = timePartNanos(d0);
     // Fold the sub-day/over-day time into whole days plus a sub-day remainder.
