@@ -1184,6 +1184,11 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
                 const mt = p.expectIdentifierName() orelse return null;
                 if (!std.mem.eql(u8, mt.value_str, "target"))
                     return p.fail("SyntaxError: expected 'target' after 'new.'");
+                // §13.3.12.1: `new.target` is only legal in function code. Eval
+                // code inherits that from its calling context — a direct eval in
+                // a function may use it, an indirect eval (global code) may not.
+                if (p.eval_code and !p.eval_allow_new_target)
+                    return p.fail("new.target expression is not allowed here");
                 var nt_node = p.makeNode(.identifier, start, p.current.start, .{
                     .identifier = "__new_target__",
                 }) orelse return null;
@@ -1919,6 +1924,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .name = if (ckey == null) mkey else null,
                     .params = am_params.params,
                     .param_defaults = am_params.param_defaults,
+                    .expected_argc = am_params.expected_argc,
                     .rest_param = am_params.rest_param,
                     .body = am_body,
                     .is_arrow = false,
@@ -1960,6 +1966,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                         .is_method = true,
                         .params = cm_params.params,
                         .param_defaults = cm_params.param_defaults,
+                        .expected_argc = cm_params.expected_argc,
                         .rest_param = cm_params.rest_param,
                         .body = cm_body,
                         .is_arrow = false,
@@ -2067,6 +2074,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_method = true,
                     .params = acc_params.params,
                     .param_defaults = acc_params.param_defaults,
+                    .expected_argc = acc_params.expected_argc,
                     .rest_param = acc_params.rest_param,
                     .body = acc_body,
                     .is_arrow = false,
@@ -2100,6 +2108,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .name = key,
                     .params = m_params.params,
                     .param_defaults = m_params.param_defaults,
+                    .expected_argc = m_params.expected_argc,
                     .rest_param = m_params.rest_param,
                     .body = m_body,
                     .is_arrow = false,
@@ -2341,6 +2350,7 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
             .name = name,
             .params = parsed_params.params,
             .param_defaults = parsed_params.param_defaults,
+            .expected_argc = parsed_params.expected_argc,
             .rest_param = parsed_params.rest_param,
             .body = body,
             .is_arrow = false,

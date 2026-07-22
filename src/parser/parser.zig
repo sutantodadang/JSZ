@@ -25,6 +25,11 @@ pub const ParamParse = struct {
     params: [][]const u8,
     param_defaults: []?*Node,
     rest_param: ?[]const u8,
+    /// ExpectedArgumentCount (§15.1.5) — the formal parameters before the first
+    /// defaulted or rest one, i.e. what `fn.length` reports. Captured here
+    /// because the default-parameter TDZ desugar in `parseFunctionParams`
+    /// rewrites the initializers into the body and clears `param_defaults`.
+    expected_argc: u16 = 0,
 };
 
 /// Check if first statement of body is "use strict" directive.
@@ -249,6 +254,12 @@ pub const Parser = struct {
     /// chain. Only then is SuperProperty (`super.x`) legal inside the eval'd
     /// code; SuperCall never is, and an indirect eval permits neither.
     eval_allow_super_prop: bool = false,
+    /// Set with `eval_code` for a direct eval whose calling context is a function
+    /// invocation, which is the only place `new.target` is legal (§13.3.12.1: it
+    /// is a SyntaxError unless the code is contained in function code). The VM
+    /// detects it from a `__new_target__` binding below the global scope, so an
+    /// indirect eval — which is global code — never gets it.
+    eval_allow_new_target: bool = false,
     /// True when the code currently being parsed is strict-mode code (a "use
     /// strict" directive prologue at script/eval/function scope, or module code).
     /// Drives the strict-only early SyntaxErrors: future-reserved words used as

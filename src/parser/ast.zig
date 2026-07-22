@@ -278,6 +278,9 @@ pub const FuncExpr = struct {
     name: ?[]const u8,
     params: [][]const u8,
     param_defaults: []?*Node = &[_]?*Node{},
+    /// ExpectedArgumentCount for `fn.length`; null → all of `params` counts.
+    /// See parser.ParamParse.expected_argc.
+    expected_argc: ?u16 = null,
     rest_param: ?[]const u8 = null,
     body: []*Node,
     is_arrow: bool = false,
@@ -375,6 +378,9 @@ pub const FuncDecl = struct {
     name: []const u8,
     params: [][]const u8,
     param_defaults: []?*Node = &[_]?*Node{},
+    /// ExpectedArgumentCount for `fn.length`; null → all of `params` counts.
+    /// See parser.ParamParse.expected_argc.
+    expected_argc: ?u16 = null,
     rest_param: ?[]const u8 = null,
     body: []*Node,
     is_generator: bool = false,

@@ -2786,6 +2786,10 @@ pub const FnCompiler = struct {
         // not constructors: propagate the flag so the VM omits the `prototype`
         // property for non-generator methods.
         child_fn.is_method = fe.is_method;
+        // `fn.length` counts only the parameters before the first defaulted one.
+        // The parser recorded that before its TDZ desugar rewrote the defaults
+        // into the body and cleared `param_defaults`.
+        if (fe.expected_argc) |n| child_fn.expected_argc = n;
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
         try self.child_functions.append(self.arena, child_fn);
@@ -2969,6 +2973,22 @@ fn mkSynthNode(arena: std.mem.Allocator, data: ast.Data) error{OutOfMemory}!*Nod
 /// argument is bound to undefined at call setup, so this also covers the
 /// "fewer arguments than parameters" case. Returns `body` unchanged when no
 /// parameter has a default.
+/// ExpectedArgumentCount (§15.1.5), which is what `Function.prototype.length`
+/// reports: the number of formal parameters before the first one that has an
+/// initializer or is a rest parameter. `function f(a, b = 1, c) {}` has length
+/// 1, not 3. A rest parameter is already excluded — it is carried separately
+/// from `params` — and a caller that supplies no `param_defaults` at all (a
+/// synthetic/desugared function) keeps the whole parameter list.
+fn expectedArgumentCount(params: [][]const u8, param_defaults: []const ?*Node) u16 {
+    if (param_defaults.len == 0) return @intCast(params.len);
+    var n: u16 = 0;
+    for (params, 0..) |_, i| {
+        if (i < param_defaults.len and param_defaults[i] != null) break;
+        n += 1;
+    }
+    return n;
+}
+
 fn applyParamDefaults(
     arena: std.mem.Allocator,
     params: [][]const u8,
@@ -3081,6 +3101,7 @@ pub fn compileFunctionStrict(
         .source_text = source_text,
         .nfe_name = nfe_name,
         .arity = @intCast(params.len),
+        .expected_argc = expectedArgumentCount(params, param_defaults),
         .chunk = chunk,
         .num_regs = num_regs,
         .child_functions = child_fns,
@@ -3132,6 +3153,7 @@ pub fn compileProgram(
         &[_]?*ast.Node{}, // no parameters → no defaults
         null,
     );
+    f.is_program = true;
     return f;
 }
 

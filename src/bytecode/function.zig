@@ -17,7 +17,13 @@ pub const BcFunction = struct {
     /// normal mutable binding, so `function f(){ f = 2 }` reassigns the outer
     /// binding rather than shadowing it.
     nfe_name: ?[]const u8 = null,
+    /// Number of declared formal parameters (excluding a rest parameter). Used
+    /// for call setup and the JIT's local-slot layout, NOT for `.length`.
     arity: u16,
+    /// ExpectedArgumentCount — what `Function.prototype.length` reports: the
+    /// parameters before the first defaulted or rest one. Differs from `arity`
+    /// for `function f(a, b = 1, c) {}` (length 1, arity 3).
+    expected_argc: u16 = 0,
     chunk: Chunk,
     num_regs: u16,
     /// Nested function literals referenced by NEW_CLOSURE funcIdx.
@@ -63,6 +69,10 @@ pub const BcFunction = struct {
     /// (no fresh child env), so top-level `var`/function declarations hoist into
     /// that environment — and, at global scope, become global-object properties.
     is_eval: bool = false,
+    /// This BcFunction is a Script / module / eval *top level*, not a function
+    /// literal. `new.target` is only legal in function code, so a direct eval
+    /// consults the frame stack for the nearest non-program frame.
+    is_program: bool = false,
     /// Phase 6: per-bytecode-site IC table, indexed by instruction PC.
     ic_table: []ic_mod.InlineCache,
     /// Phase 6: arithmetic fast-path feedback per instruction PC.

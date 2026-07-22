@@ -200,6 +200,8 @@ const ClassMember = struct {
     computed_key: ?*Node = null,
     params: [][]const u8 = &[_][]const u8{},
     param_defaults: []?*Node = &[_]?*Node{},
+    /// ExpectedArgumentCount for `fn.length` (see parser.ParamParse).
+    expected_argc: ?u16 = null,
     rest_param: ?[]const u8 = null,
     body: []*Node = &[_]*Node{},
     /// Source span of this member (name through end of body), captured in
@@ -355,6 +357,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
                 .computed_key = computed_key,
                 .params = mparams.params,
                 .param_defaults = mparams.param_defaults,
+                .expected_argc = mparams.expected_argc,
                 .rest_param = mparams.rest_param,
                 .body = mbody,
                 .src_start = member_start,
@@ -861,6 +864,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         .name = method_name,
         .params = m.params,
         .param_defaults = m.param_defaults,
+        .expected_argc = m.expected_argc,
         .rest_param = m.rest_param,
         .body = body,
         .is_arrow = false,
@@ -1631,6 +1635,17 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         parser_file.rejectDuplicateParams(p);
         return null;
     }
+    // ExpectedArgumentCount, captured before the TDZ desugar below clears the
+    // initializers: the parameters up to (not including) the first defaulted
+    // one. A rest parameter is already outside `params`.
+    const expected_argc: u16 = blk: {
+        var n: u16 = 0;
+        for (defaults.items) |d| {
+            if (d != null) break;
+            n += 1;
+        }
+        break :blk n;
+    };
     // TDZ for default parameters: a non-simple parameter list (one with a
     // default) puts every parameter in a TDZ until its own initializer, so a
     // default referencing a not-yet-initialized parameter is a ReferenceError
@@ -1678,6 +1693,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         .params = params.items,
         .param_defaults = defaults.items,
         .rest_param = rest_param,
+        .expected_argc = expected_argc,
     };
 }
 
