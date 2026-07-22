@@ -8,6 +8,7 @@
 //! DST transitions. Transitions are computed on the fly from the rule formula.
 
 const std = @import("std");
+const gen = @import("tzdata_zones.zig");
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -76,49 +77,53 @@ fn transTime(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8) i6
 
 // ── DST rule types ──────────────────────────────────────────────────────────
 
-const DstRule = struct {
-    start_month: u8,   // Transition to DST
-    start_weekday: u8, // Sunday=0
-    start_occurrence: i8, // positive = Nth, negative = last
-    start_hour: u8,
-    end_month: u8,      // Transition back to standard
-    end_weekday: u8,
-    end_occurrence: i8,
-    end_hour: u8,
-};
+const DstRule = gen.Rule;
 
 fn applyRule(r: *const DstRule, year: i32, std_offset_sec: i32, dst_save_sec: i32, start_out: *i64, end_out: *i64) void {
     // DST start transition
-    const start_day: u8 = if (r.start_occurrence > 0)
-        nthWeekday(year, r.start_month, @as(u8, @intCast(r.start_occurrence)), r.start_weekday)
+    const start_day: u8 = if (r.start_week < 5)
+        nthWeekday(year, r.start_month, r.start_week, r.start_dow)
     else
-        lastWeekday(year, r.start_month, r.start_weekday);
+        lastWeekday(year, r.start_month, r.start_dow);
     // Transition at local standard time (wall clock jumps forward).
-    start_out.* = transTime(year, r.start_month, start_day, r.start_hour, 0, 0) - @as(i64, std_offset_sec);
+    start_out.* = transTime(year, r.start_month, start_day, 0, 0, 0) + r.start_sec - @as(i64, std_offset_sec);
 
     // DST end transition
-    const end_day: u8 = if (r.end_occurrence > 0)
-        nthWeekday(year, r.end_month, @as(u8, @intCast(r.end_occurrence)), r.end_weekday)
+    const end_day: u8 = if (r.end_week < 5)
+        nthWeekday(year, r.end_month, r.end_week, r.end_dow)
     else
-        lastWeekday(year, r.end_month, r.end_weekday);
+        lastWeekday(year, r.end_month, r.end_dow);
     // Transition at local DST time (wall clock falls back).
-    end_out.* = transTime(year, r.end_month, end_day, r.end_hour, 0, 0) - @as(i64, std_offset_sec + dst_save_sec);
+    end_out.* = transTime(year, r.end_month, end_day, 0, 0, 0) + r.end_sec - @as(i64, std_offset_sec + dst_save_sec);
 }
 
 // ── Zone definition ─────────────────────────────────────────────────────────
 
-pub const ZoneDef = struct {
-    name: []const u8,
-    std_offset_sec: i32, // Standard time offset from UTC (seconds, positive east)
-    dst_save_sec: i32,   // Additional offset during DST (usually 3600)
-    dst_rule: ?DstRule,
-};
+pub const ZoneDef = gen.Zone;
 
 fn lookupZoneDef(name: []const u8) ?*const ZoneDef {
-    for (&ZONES) |*z| {
-        if (eqIgnoreCase(name, z.name)) return z;
+    // The generated table is sorted by case-folded name.
+    var lo: usize = 0;
+    var hi: usize = gen.zones.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (orderIgnoreCase(name, gen.zones[mid].name)) {
+            .lt => hi = mid,
+            .gt => lo = mid + 1,
+            .eq => return &gen.zones[mid],
+        }
     }
     return null;
+}
+
+fn orderIgnoreCase(a: []const u8, b: []const u8) std.math.Order {
+    const n = @min(a.len, b.len);
+    for (a[0..n], b[0..n]) |x, y| {
+        const lx = std.ascii.toLower(x);
+        const ly = std.ascii.toLower(y);
+        if (lx != ly) return if (lx < ly) .lt else .gt;
+    }
+    return std.math.order(a.len, b.len);
 }
 
 /// Look up a ZoneDef by name. Public for use in timezone.zig.
@@ -137,9 +142,9 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
 /// Return the UTC offset in seconds for a zone definition at Unix timestamp
 /// `unix_sec`. Handles both DST and non-DST zones.
 pub fn offsetAt(def: *const ZoneDef, unix_sec: i64) ?i32 {
-    if (def.dst_rule == null) return def.std_offset_sec;
+    if (def.rule == null) return def.std_offset_sec;
 
-    const rule = &def.dst_rule.?;
+    const rule = &def.rule.?;
     // Compute DST transitions for the year of the timestamp and adjacent years
     // to handle edge cases near year boundaries.
     const tyear = unixYear(unix_sec);
@@ -173,8 +178,8 @@ pub fn offsetAt(def: *const ZoneDef, unix_sec: i64) ?i32 {
 /// Find the next or previous DST transition for a zone at Unix timestamp
 /// `unix_sec`. Returns the transition time in Unix seconds, or null if none.
 pub fn findTransition(def: *const ZoneDef, unix_sec: i64, direction: enum { next, previous }) ?i64 {
-    if (def.dst_rule == null) return null;
-    const rule = &def.dst_rule.?;
+    if (def.rule == null) return null;
+    const rule = &def.rule.?;
     const tyear = unixYear(unix_sec);
     // Scan a ±50 year window and pick the nearest transition on the requested
     // side of `unix_sec`. Each year yields a DST-start and a DST-end transition;
@@ -210,299 +215,12 @@ fn unixYear(unix_sec: i64) i32 {
     return y;
 }
 
-// ── Zone list ───────────────────────────────────────────────────────────────
-// DST rules:
-//   US (2007+):  2nd Sun Mar 2:00 → 1st Sun Nov 2:00  (northern)
-//   EU:          Last Sun Mar 1:00 UTC → Last Sun Oct 1:00 UTC  (northern)
-//   AU (Sydney): 1st Sun Oct 2:00 → 1st Sun Apr 3:00 AEDT  (southern)
-//   NZ:          Last Sun Sep 2:00 → 1st Sun Apr 3:00 NZDT  (southern)
-
-const ZONES = [_]ZoneDef{
-    // ── No DST ──────────────────────────────────────────
-    .{ .name = "UTC", .std_offset_sec = 0, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Asia/Tokyo", .std_offset_sec = 9 * 3600, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Asia/Shanghai", .std_offset_sec = 8 * 3600, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Asia/Hong_Kong", .std_offset_sec = 8 * 3600, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Asia/Seoul", .std_offset_sec = 9 * 3600, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Asia/Singapore", .std_offset_sec = 8 * 3600, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Asia/Kolkata", .std_offset_sec = 5 * 3600 + 1800, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Asia/Dubai", .std_offset_sec = 4 * 3600, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Europe/Moscow", .std_offset_sec = 3 * 3600, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Africa/Cairo", .std_offset_sec = 2 * 3600, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "Africa/Lagos", .std_offset_sec = 3600, .dst_save_sec = 0, .dst_rule = null },
-    .{ .name = "America/Argentina/Buenos_Aires", .std_offset_sec = -3 * 3600, .dst_save_sec = 0, .dst_rule = null },
-
-    // ── US zones (2007+ rules) ──────────────────────────
-    .{
-        .name = "America/New_York",
-        .std_offset_sec = -5 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = 2, .start_hour = 2,
-            .end_month = 11, .end_weekday = 0, .end_occurrence = 1, .end_hour = 2,
-        },
-    },
-    .{
-        .name = "America/Chicago",
-        .std_offset_sec = -6 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = 2, .start_hour = 2,
-            .end_month = 11, .end_weekday = 0, .end_occurrence = 1, .end_hour = 2,
-        },
-    },
-    .{
-        .name = "America/Denver",
-        .std_offset_sec = -7 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = 2, .start_hour = 2,
-            .end_month = 11, .end_weekday = 0, .end_occurrence = 1, .end_hour = 2,
-        },
-    },
-    .{
-        .name = "America/Los_Angeles",
-        .std_offset_sec = -8 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = 2, .start_hour = 2,
-            .end_month = 11, .end_weekday = 0, .end_occurrence = 1, .end_hour = 2,
-        },
-    },
-    .{
-        .name = "America/Phoenix",
-        .std_offset_sec = -7 * 3600,
-        .dst_save_sec = 0,
-        .dst_rule = null,
-    },
-    .{
-        .name = "America/Anchorage",
-        .std_offset_sec = -9 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = 2, .start_hour = 2,
-            .end_month = 11, .end_weekday = 0, .end_occurrence = 1, .end_hour = 2,
-        },
-    },
-
-    // ── EU zones (last Sun Mar / last Sun Oct) ──────────
-    .{
-        .name = "Europe/London",
-        .std_offset_sec = 0,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Paris",
-        .std_offset_sec = 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Berlin",
-        .std_offset_sec = 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Rome",
-        .std_offset_sec = 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Madrid",
-        .std_offset_sec = 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Amsterdam",
-        .std_offset_sec = 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Stockholm",
-        .std_offset_sec = 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Prague",
-        .std_offset_sec = 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Warsaw",
-        .std_offset_sec = 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Budapest",
-        .std_offset_sec = 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Helsinki",
-        .std_offset_sec = 2 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = -1, .start_hour = 1,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 1,
-        },
-    },
-    .{
-        .name = "Europe/Istanbul",
-        .std_offset_sec = 3 * 3600,
-        .dst_save_sec = 0,
-        .dst_rule = null,
-    },
-
-    // ── Australia (southern hemisphere) ──────────────────
-    .{
-        .name = "Australia/Sydney",
-        .std_offset_sec = 10 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 10, .start_weekday = 0, .start_occurrence = 1, .start_hour = 2,
-            .end_month = 4, .end_weekday = 0, .end_occurrence = 1, .end_hour = 3,
-        },
-    },
-    .{
-        .name = "Australia/Melbourne",
-        .std_offset_sec = 10 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 10, .start_weekday = 0, .start_occurrence = 1, .start_hour = 2,
-            .end_month = 4, .end_weekday = 0, .end_occurrence = 1, .end_hour = 3,
-        },
-    },
-    .{
-        .name = "Australia/Brisbane",
-        .std_offset_sec = 10 * 3600,
-        .dst_save_sec = 0,
-        .dst_rule = null,
-    },
-    .{
-        .name = "Australia/Perth",
-        .std_offset_sec = 8 * 3600,
-        .dst_save_sec = 0,
-        .dst_rule = null,
-    },
-    .{
-        .name = "Australia/Adelaide",
-        .std_offset_sec = 9 * 3600 + 1800,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 10, .start_weekday = 0, .start_occurrence = 1, .start_hour = 2,
-            .end_month = 4, .end_weekday = 0, .end_occurrence = 1, .end_hour = 3,
-        },
-    },
-    .{
-        .name = "Australia/Darwin",
-        .std_offset_sec = 9 * 3600 + 1800,
-        .dst_save_sec = 0,
-        .dst_rule = null,
-    },
-
-    // ── Pacific ─────────────────────────────────────────
-    .{
-        .name = "Pacific/Auckland",
-        .std_offset_sec = 12 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 9, .start_weekday = 0, .start_occurrence = -1, .start_hour = 2,
-            .end_month = 4, .end_weekday = 0, .end_occurrence = 1, .end_hour = 3,
-        },
-    },
-    .{
-        .name = "Pacific/Fiji",
-        .std_offset_sec = 12 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 11, .start_weekday = 0, .start_occurrence = 1, .start_hour = 2,
-            .end_month = 1, .end_weekday = 0, .end_occurrence = 2, .end_hour = 3,
-        },
-    },
-    .{
-        .name = "Pacific/Honolulu",
-        .std_offset_sec = -10 * 3600,
-        .dst_save_sec = 0,
-        .dst_rule = null,
-    },
-
-    // ── Americas (non-US) ───────────────────────────────
-    .{
-        .name = "America/Toronto",
-        .std_offset_sec = -5 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = 2, .start_hour = 2,
-            .end_month = 11, .end_weekday = 0, .end_occurrence = 1, .end_hour = 2,
-        },
-    },
-    .{
-        .name = "America/Vancouver",
-        .std_offset_sec = -8 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 3, .start_weekday = 0, .start_occurrence = 2, .start_hour = 2,
-            .end_month = 11, .end_weekday = 0, .end_occurrence = 1, .end_hour = 2,
-        },
-    },
-    .{
-        .name = "America/Mexico_City",
-        .std_offset_sec = -6 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 4, .start_weekday = 0, .start_occurrence = 1, .start_hour = 2,
-            .end_month = 10, .end_weekday = 0, .end_occurrence = -1, .end_hour = 2,
-        },
-    },
-    .{
-        .name = "America/Sao_Paulo",
-        .std_offset_sec = -3 * 3600,
-        .dst_save_sec = 3600,
-        .dst_rule = .{
-            .start_month = 11, .start_weekday = 0, .start_occurrence = 1, .start_hour = 0,
-            .end_month = 2, .end_weekday = 0, .end_occurrence = 3, .end_hour = 0,
-        },
-    },
-};
+/// The name that stands for this zone's whole link group. Time-zone equality
+/// compares these, so "Asia/Calcutta" and "Asia/Kolkata" count as one zone.
+pub fn canonicalName(name: []const u8) ?[]const u8 {
+    const def = lookupZoneDef(name) orelse return null;
+    return gen.zones[def.canon].name;
+}
 
 /// Check if `name` is a known IANA zone. Case-insensitive.
 pub fn isKnownZone(name: []const u8) bool {

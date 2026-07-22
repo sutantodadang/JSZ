@@ -525,7 +525,7 @@ fn getHoursInDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     // Fixed-offset / unknown zones: every day is 24h. Named IANA zones with DST
     // may have 23h/25h days around a transition.
     const def = tzdata.lookupDef(z.tz) orelse return val_mod.makeNumber(arena, 24);
-    if (def.dst_rule == null) return val_mod.makeNumber(arena, 24);
+    if (def.rule == null) return val_mod.makeNumber(arena, 24);
 
     const day_start_ns = wallNs(.{ .date = localDT(z).date, .time = .{} }) - z.offset_ns;
     const day_end_ns = day_start_ns + shared.NS_PER_DAY;
@@ -594,6 +594,15 @@ pub fn nativeWithPlainTime(arena: std.mem.Allocator, this_val: Value, args: []co
     const cur = localDT(z);
     const ns = wallNs(.{ .date = cur.date, .time = time }) - z.offset_ns;
     return makeZoned(arena, .{ .ns = ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
+}
+
+/// TimeZoneEquals: two identifiers name the same zone when they canonicalize to
+/// the same primary name — "Asia/Calcutta" and "Asia/Kolkata" are one zone.
+fn timeZoneEquals(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const ca = tzdata.canonicalName(a) orelse return false;
+    const cb = tzdata.canonicalName(b) orelse return false;
+    return std.mem.eql(u8, ca, cb);
 }
 
 pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -688,7 +697,7 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     if (unitRank(st.largest) <= unitRank(.day)) {
         // A date-unit difference is measured in local wall-clock terms, which
         // only exists if both instants share a zone.
-        if (!std.mem.eql(u8, z.tz, other.tz))
+        if (!timeZoneEquals(z.tz, other.tz))
             return realm_mod.throwRangeError(arena, "time zone mismatch in date-unit difference");
     }
     const from = z.*;
@@ -797,7 +806,7 @@ pub fn nativeEquals(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const z = try requireZoned(arena, this_val);
     const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
     // Equality is on the instant, the zone *and* the calendar.
-    return val_mod.makeBool(arena, z.ns == other.ns and std.mem.eql(u8, z.tz, other.tz) and
+    return val_mod.makeBool(arena, z.ns == other.ns and timeZoneEquals(z.tz, other.tz) and
         z.calendar == other.calendar);
 }
 
