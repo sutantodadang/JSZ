@@ -106,33 +106,42 @@ pub fn toTemporalYearMonth(arena: std.mem.Allocator, v: Value, overflow: shared.
     return realm_mod.throwTypeError(arena, "cannot convert to Temporal.PlainYearMonth");
 }
 
+/// ToTemporalYearMonth with an options object: the field bag is read before the
+/// overflow option (both are observable).
+pub fn toTemporalYearMonthOpts(arena: std.mem.Allocator, v: Value, opts_v: ?Value) !ISODate {
+    if (v.bits != 0 and v.unbox() == .object and getYearMonth(v) == null) {
+        const bag = try plain_date.readDateBag(arena, v.toPtr().object, .{ .day = false });
+        const opts = try shared.getOptionsObject(arena, opts_v);
+        const overflow = try shared.getOverflow(arena, opts);
+        const cal_year = try plain_date.yearFromBag(arena, bag);
+        return resolveMonth(arena, bag, bag.calendar, cal_year, overflow);
+    }
+    const ym = try toTemporalYearMonth(arena, v, .constrain);
+    _ = try shared.getOverflow(arena, try shared.getOptionsObject(arena, opts_v));
+    return ym;
+}
+
 fn yearMonthFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISODate {
-    const cal = if (try shared.optionGet(arena, o, "calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
-    const cal_year = try plain_date.readCalendarYear(arena, o, cal);
+    // PlainYearMonth's field list has no "day", so the bag must not read one.
+    const bag = try plain_date.readDateBag(arena, o, .{ .day = false });
+    const cal_year = try plain_date.yearFromBag(arena, bag);
     // The stored ISO date is the first day of the calendar month.
-    return resolveMonth(arena, o, cal, cal_year, overflow);
+    return resolveMonth(arena, bag, bag.calendar, cal_year, overflow);
 }
 
 /// Turn whichever of "month" / "monthCode" is present into the ISO date of the
 /// first day of that calendar month.
-fn resolveMonth(arena: std.mem.Allocator, o: *JsObject, cal: calendar.CalendarId, cal_year: i32, overflow: shared.Overflow) !ISODate {
-    const month_v = try shared.optionGet(arena, o, "month");
-    const mc_v = try shared.optionGet(arena, o, "monthCode");
-    const has_month = month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_;
-    const has_code = mc_v != null and mc_v.?.bits != 0 and mc_v.?.unbox() != .undefined_;
-    if (has_code) {
-        if (mc_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
-        const mc = try shared.parseMonthCode(arena, mc_v.?.unbox().string, calendar.hasLeapMonths(cal));
+fn resolveMonth(arena: std.mem.Allocator, bag: plain_date.DateBag, cal: calendar.CalendarId, cal_year: i32, overflow: shared.Overflow) !ISODate {
+    if (bag.month_code) |code| {
+        const mc = try shared.parseMonthCode(arena, code, calendar.hasLeapMonths(cal));
         const iso = calendar.toIsoFromCode(cal, cal_year, mc.num, mc.leap, 1, overflow) catch
             return realm_mod.throwRangeError(arena, "year-month out of range");
-        if (has_month) {
-            const m = floatToI32(try shared.toIntegerWithTruncation(arena, month_v.?));
-            if (m != calendar.fields(cal, iso).month) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
+        if (bag.month) |m| {
+            if (floatToI32(m) != calendar.fields(cal, iso).month) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
         }
         return iso;
     }
-    if (!has_month) return realm_mod.throwTypeError(arena, "missing month or monthCode");
-    const month = floatToI32(try shared.toIntegerWithTruncation(arena, month_v.?));
+    const month = floatToI32(bag.month orelse return realm_mod.throwTypeError(arena, "missing month or monthCode"));
     // A month below 1 is always out of range; the upper bound is constrained or
     // rejected per the overflow option.
     if (month < 1) return realm_mod.throwRangeError(arena, "month out of range");
@@ -144,13 +153,7 @@ fn resolveMonth(arena: std.mem.Allocator, o: *JsObject, cal: calendar.CalendarId
 
 pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else Value{};
-    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    // A string argument is parsed before the options bag is consulted.
-    const parse_first = shared.isStringArg(v);
-    const overflow = if (parse_first) .constrain else try shared.getOverflow(arena, opts);
-    const d = try toTemporalYearMonth(arena, v, overflow);
-    if (parse_first) _ = try shared.getOverflow(arena, opts);
-    return makeYearMonth(arena, d);
+    return makeYearMonth(arena, try toTemporalYearMonthOpts(arena, v, if (args.len > 1) args[1] else null));
 }
 
 pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
@@ -225,22 +228,16 @@ pub fn nativeSubtract(arena: std.mem.Allocator, this_val: Value, args: []const V
 fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Value, since: bool) !Value {
     const ym = try requireYM(arena, this_val);
     const other = try toTemporalYearMonth(arena, if (args.len > 0) args[0] else Value{}, .constrain);
+    if (ym.calendar != other.calendar) return realm_mod.throwRangeError(arena, "calendar mismatch");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
-    if (smallest == null) smallest = .month;
-    if (largest == null) largest = .year;
-    // Only year/month units allowed.
-    if (unitRank(smallest.?) > 1 or unitRank(largest.?) > 1)
-        return realm_mod.throwRangeError(arena, "PlainYearMonth difference units must be year or month");
-    if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    var mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
-
     // `since` negates `until` rather than swapping the operands, and both keep
     // the receiver's calendar: rebuilding these as bare literals would silently
     // measure a non-ISO year-month difference in the ISO calendar.
-    if (since) mode = shared.negateRoundingMode(mode);
+    const st = try shared.getDifferenceSettings(arena, opts, since, .date, &.{ .week, .day }, .month, .year);
+    const smallest: ?shared.Unit = st.smallest;
+    const largest: ?shared.Unit = st.largest;
+    const mode = st.mode;
+    const inc = st.increment;
     var result = plain_date.differenceISODate(ym.*, other, largest.?);
     result.weeks = 0;
     result.days = 0;
@@ -292,40 +289,25 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const o = arg.toPtr().object;
     if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
     if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
-    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    const overflow = try shared.getOverflow(arena, opts);
     const cal = cur.calendar;
     const base = calendar.fields(cal, cur.*);
-    // Merge over the receiver's own calendar fields.
-    var year: i32 = base.year;
-    var any = false;
-    const era_v = if (calendar.hasEras(cal)) try shared.optionGet(arena, o, "era") else null;
-    const era_year_v = if (calendar.hasEras(cal)) try shared.optionGet(arena, o, "eraYear") else null;
-    const has_era = era_v != null and era_v.?.bits != 0 and era_v.?.unbox() != .undefined_;
-    const has_era_year = era_year_v != null and era_year_v.?.bits != 0 and era_year_v.?.unbox() != .undefined_;
-    if (has_era != has_era_year) return realm_mod.throwTypeError(arena, "era and eraYear must be provided together");
-    if (has_era) {
-        const era = try shared.valueToString(arena, era_v.?);
-        const ey = floatToI32(try shared.toIntegerWithTruncation(arena, era_year_v.?));
-        year = calendar.yearFromEra(cal, era, ey) orelse return realm_mod.throwRangeError(arena, "invalid era for this calendar");
-        any = true;
-    }
-    if (try readField(arena, o, "year")) |x| {
-        year = floatToI32(x);
-        any = true;
-    }
-    const month_v = try shared.optionGet(arena, o, "month");
-    const mc_v = try shared.optionGet(arena, o, "monthCode");
-    const has_month = month_v != null and month_v.?.bits != 0 and month_v.?.unbox() != .undefined_;
-    const has_code = mc_v != null and mc_v.?.bits != 0 and mc_v.?.unbox() != .undefined_;
-    if (has_month or has_code) any = true;
+    // Merge over the receiver's own calendar fields. The bag carries the
+    // receiver's calendar: `with` may not change it. It is read in full before
+    // the options object, which is observable.
+    const bag = try plain_date.readDateBag(arena, o, .{ .day = false, .fixed_cal = cal });
+    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
+    const overflow = try shared.getOverflow(arena, opts);
+    const any = bag.era != null or bag.era_year != null or bag.month != null or
+        bag.month_code != null or bag.year != null;
     if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
-    if (!has_month and !has_code) {
+    var year: i32 = base.year;
+    if (bag.era != null or bag.year != null) year = try plain_date.yearFromBag(arena, bag);
+    if (bag.month == null and bag.month_code == null) {
         const iso = calendar.toIsoFromCode(cal, year, base.code_num, base.code_leap, 1, overflow) catch
             return realm_mod.throwRangeError(arena, "year-month out of range");
         return makeYearMonth(arena, iso);
     }
-    return makeYearMonth(arena, try resolveMonth(arena, o, cal, year, overflow));
+    return makeYearMonth(arena, try resolveMonth(arena, bag, cal, year, overflow));
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {

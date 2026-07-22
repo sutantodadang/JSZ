@@ -31,7 +31,8 @@ fn requireDuration(arena: std.mem.Allocator, v: Value) !*DurationFields {
     return getDuration(v) orelse realm_mod.throwTypeError(arena, "not a Temporal.Duration");
 }
 
-pub fn makeDuration(arena: std.mem.Allocator, d: DurationFields) !Value {
+pub fn makeDuration(arena: std.mem.Allocator, d0: DurationFields) !Value {
+    const d = shared.normalizeZeroFields(d0);
     if (!isValidDuration(d)) return realm_mod.throwRangeError(arena, "invalid Duration");
     const slot = try arena.create(DurationFields);
     slot.* = d;
@@ -45,7 +46,8 @@ pub fn makeDuration(arena: std.mem.Allocator, d: DurationFields) !Value {
 }
 
 /// Populate a freshly-constructed `this` object (called via `new`).
-fn installInto(arena: std.mem.Allocator, this_val: Value, d: DurationFields) !Value {
+fn installInto(arena: std.mem.Allocator, this_val: Value, d0: DurationFields) !Value {
+    const d = shared.normalizeZeroFields(d0);
     if (!isValidDuration(d)) return realm_mod.throwRangeError(arena, "invalid Duration");
     const slot = try arena.create(DurationFields);
     slot.* = d;
@@ -121,12 +123,10 @@ fn toDurationFromFields(arena: std.mem.Allocator, o: *JsObject, require_any: boo
     var any = false;
     const names = [_][]const u8{ "days", "hours", "microseconds", "milliseconds", "minutes", "months", "nanoseconds", "seconds", "weeks", "years" };
     for (names) |name| {
-        if (o.get(name)) |fv| {
-            if (fv.bits != 0 and fv.unbox() != .undefined_) {
-                const n = try shared.toIntegerIfIntegral(arena, fv);
-                any = true;
-                assignField(&d, name, n);
-            }
+        if (try shared.optionGet(arena, o, name)) |fv| {
+            const n = try shared.toIntegerIfIntegral(arena, fv);
+            any = true;
+            assignField(&d, name, n);
         }
     }
     if (require_any and !any) return realm_mod.throwTypeError(arena, "duration-like object needs at least one field");
@@ -435,10 +435,7 @@ fn timePartNanos(d: DurationFields) i128 {
 fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
     const o = opts orelse return null;
     // Read relativeTo through [[Get]] so observers/getters run (option-read order).
-    const rv = if (realm_mod.active_context) |c|
-        try c.getProp(arena, try val_mod.makeObject(arena, o), "relativeTo")
-    else
-        (o.get("relativeTo") orelse Value{});
+    const rv = (try shared.optionGet(arena, o, "relativeTo")) orelse Value{};
     if (rv.bits == 0 or rv.isUndefined() or rv.isNull()) return null;
     // A ZonedDateTime relativeTo is reduced to its local calendar date (we do not
     // model per-day time-zone offset changes; correct for fixed-offset zones).

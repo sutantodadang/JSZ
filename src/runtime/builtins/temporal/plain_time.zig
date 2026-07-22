@@ -248,24 +248,15 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     const t = try requireTime(arena, this_val);
     const other = try toTemporalTime(arena, if (args.len > 0) args[0] else Value{}, .constrain);
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
-    if (smallest == null) smallest = .nanosecond;
-    if (largest == null) largest = .hour;
-    if (!isTimeUnit(smallest.?) or !isTimeUnit(largest.?)) return realm_mod.throwRangeError(arena, "PlainTime difference units must be hour..nanosecond");
-    if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
+    const st = try shared.getDifferenceSettings(arena, opts, since, .time, &.{}, .nanosecond, .hour);
 
-    // until(other) = other - this; since(other) = this - other. Rounding the
-    // signed difference with the original mode already points the right way.
-    const diff = if (since)
-        shared.timeToNanos(t.*) - shared.timeToNanos(other)
-    else
-        shared.timeToNanos(other) - shared.timeToNanos(t.*);
-    const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
-    const rounded = shared.roundI128ToIncrement(diff, inc_ns, mode);
-    return duration.makeDuration(arena, balanceTime(rounded, largest.?));
+    // Both operations measure this→other and `since` negates the result; the
+    // mirrored rounding mode comes back already negated from the settings.
+    const diff = shared.timeToNanos(other) - shared.timeToNanos(t.*);
+    const inc_ns = shared.unitLengthNanos(st.smallest).? * @as(i128, @intFromFloat(st.increment));
+    const rounded = shared.roundI128ToIncrement(diff, inc_ns, st.mode);
+    const balanced = balanceTime(rounded, st.largest);
+    return duration.makeDuration(arena, if (since) shared.negateFields(balanced) else balanced);
 }
 
 fn negateDur(d: shared.DurationFields) shared.DurationFields {

@@ -242,20 +242,13 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     const ins = try requireInstant(arena, this_val);
     const other = try toInstantNs(arena, if (args.len > 0) args[0] else Value{});
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
-    if (smallest == null) smallest = .nanosecond;
-    if (largest == null) largest = .second;
-    if (unitRank(smallest.?) < unitRank(.hour) or unitRank(largest.?) < unitRank(.hour))
-        return realm_mod.throwRangeError(arena, "Instant difference units must be hour..nanosecond");
-    if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    const mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
+    const st = try shared.getDifferenceSettings(arena, opts, since, .time, &.{}, .nanosecond, .second);
 
-    const diff = if (since) ins.* - other else other - ins.*;
-    const inc_ns = shared.unitLengthNanos(smallest.?).? * @as(i128, @intFromFloat(inc));
-    const rounded = shared.roundI128ToIncrement(diff, inc_ns, mode);
-    return duration.makeDuration(arena, balanceTime(rounded, largest.?));
+    const diff = other - ins.*;
+    const inc_ns = shared.unitLengthNanos(st.smallest).? * @as(i128, @intFromFloat(st.increment));
+    const rounded = shared.roundI128ToIncrement(diff, inc_ns, st.mode);
+    const balanced = balanceTime(rounded, st.largest);
+    return duration.makeDuration(arena, if (since) shared.negateFields(balanced) else balanced);
 }
 
 fn balanceTime(total_ns: i128, largest: shared.Unit) shared.DurationFields {

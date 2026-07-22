@@ -127,27 +127,45 @@ pub fn toTemporalDateTime(arena: std.mem.Allocator, v: Value, overflow: shared.O
     return realm_mod.throwTypeError(arena, "cannot convert to Temporal.PlainDateTime");
 }
 
+/// ToTemporalDateTime with an options object: the field bag is read before the
+/// overflow option (both are observable).
+pub fn toTemporalDateTimeOpts(arena: std.mem.Allocator, v: Value, opts_v: ?Value) !ISODateTime {
+    if (v.bits != 0 and v.unbox() == .object and getDateTime(v) == null) {
+        const zdt = @import("zoned_date_time.zig");
+        if (plain_date.getDate(v) == null and zdt.getZoned(v) == null) {
+            const bag = try plain_date.readDateBag(arena, v.toPtr().object, .{ .time = true });
+            const opts = try shared.getOptionsObject(arena, opts_v);
+            const overflow = try shared.getOverflow(arena, opts);
+            return dtFromBag(arena, bag, overflow);
+        }
+    }
+    const dt = try toTemporalDateTime(arena, v, .constrain);
+    _ = try shared.getOverflow(arena, try shared.getOptionsObject(arena, opts_v));
+    return dt;
+}
+
 fn dtFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISODateTime {
     // The date half is exactly PlainDate's field set (calendar, era/eraYear or
     // year, month or monthCode, day); the time fields are all optional.
-    const date = try plain_date.dateFromFields(arena, o, overflow);
-    const time = try readTimeFields(arena, o, overflow);
+    const bag = try plain_date.readDateBag(arena, o, .{ .time = true });
+    return dtFromBag(arena, bag, overflow);
+}
+
+pub fn dtFromBag(arena: std.mem.Allocator, bag: plain_date.DateBag, overflow: shared.Overflow) !ISODateTime {
+    const date = try plain_date.dateFromBag(arena, bag, overflow);
+    const time = try timeFromBag(arena, bag, overflow, .{});
     return .{ .date = date, .time = time };
 }
 
-fn readTimeFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISOTime {
-    var h: f64 = 0;
-    var min: f64 = 0;
-    var s: f64 = 0;
-    var ms: f64 = 0;
-    var us: f64 = 0;
-    var ns: f64 = 0;
-    if (try readField(arena, o, "hour")) |x| h = x;
-    if (try readField(arena, o, "minute")) |x| min = x;
-    if (try readField(arena, o, "second")) |x| s = x;
-    if (try readField(arena, o, "millisecond")) |x| ms = x;
-    if (try readField(arena, o, "microsecond")) |x| us = x;
-    if (try readField(arena, o, "nanosecond")) |x| ns = x;
+/// Build an ISOTime from whichever time fields the bag carries, falling back to
+/// `base` (all zeroes for `from`, the receiver's own time for `with`).
+pub fn timeFromBag(arena: std.mem.Allocator, bag: plain_date.DateBag, overflow: shared.Overflow, base: ISOTime) !ISOTime {
+    const h: f64 = bag.hour orelse @as(f64, @floatFromInt(base.hour));
+    const min: f64 = bag.minute orelse @as(f64, @floatFromInt(base.minute));
+    const s: f64 = bag.second orelse @as(f64, @floatFromInt(base.second));
+    const ms: f64 = bag.millisecond orelse @as(f64, @floatFromInt(base.millisecond));
+    const us: f64 = bag.microsecond orelse @as(f64, @floatFromInt(base.microsecond));
+    const ns: f64 = bag.nanosecond orelse @as(f64, @floatFromInt(base.nanosecond));
     if (overflow == .reject) {
         if (h > 23 or min > 59 or s > 59 or ms > 999 or us > 999 or ns > 999 or
             h < 0 or min < 0 or s < 0 or ms < 0 or us < 0 or ns < 0)
@@ -173,13 +191,7 @@ fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
 
 pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else Value{};
-    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    // A string argument is parsed before the options bag is consulted.
-    const parse_first = shared.isStringArg(v);
-    const overflow = if (parse_first) .constrain else try shared.getOverflow(arena, opts);
-    const dt = try toTemporalDateTime(arena, v, overflow);
-    if (parse_first) _ = try shared.getOverflow(arena, opts);
-    return makeDateTime(arena, dt);
+    return makeDateTime(arena, try toTemporalDateTimeOpts(arena, v, if (args.len > 1) args[1] else null));
 }
 
 pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
@@ -249,36 +261,29 @@ fn unitRank(u: shared.Unit) u8 {
 fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, since: bool) !Value {
     const dt = try requireDT(arena, this_val);
     const other = try toTemporalDateTime(arena, if (args.len > 0) args[0] else Value{}, .constrain);
+    if (dt.date.calendar != other.date.calendar) return realm_mod.throwRangeError(arena, "calendar mismatch");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    var smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
-    var largest = try shared.getTemporalUnit(arena, opts, "largestUnit");
-    if (smallest == null) smallest = .nanosecond;
-    if (largest == null) largest = if (unitRank(smallest.?) < unitRank(.day)) smallest.? else .day;
-    if (unitRank(largest.?) > unitRank(smallest.?)) return realm_mod.throwRangeError(arena, "largestUnit must be >= smallestUnit");
-    var mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const inc = try shared.getRoundingIncrement(arena, opts);
-
     // `since` negates `until` rather than swapping the operands: both anchor
     // their calendar walk on the receiver, and calendar arithmetic is not
-    // symmetric. Rounding runs mirrored, so the mode is negated too.
-    if (since) mode = shared.negateRoundingMode(mode);
+    // symmetric. Rounding runs mirrored, so the mode comes back negated.
+    const st = try shared.getDifferenceSettings(arena, opts, since, .datetime, &.{}, .nanosecond, .day);
     const from = dt.*;
     const to = other;
 
     var result: shared.DurationFields = undefined;
     // Rank 0 is `year`, so "day or larger" is a *lower* rank.
-    if (unitRank(largest.?) <= unitRank(.day)) {
+    if (unitRank(st.largest) <= unitRank(.day)) {
         // Calendar+time difference with day/week/month/year largest unit.
-        result = differenceDateTime(from, to, largest.?);
+        result = differenceDateTime(from, to, st.largest);
     } else {
         // Pure time balancing (largest is hour or smaller): convert everything.
         const total_ns = (shared.isoDateToEpochDays(to.date.year, to.date.month, to.date.day) -
             shared.isoDateToEpochDays(from.date.year, from.date.month, from.date.day)) * shared.NS_PER_DAY +
             (shared.timeToNanos(to.time) - shared.timeToNanos(from.time));
-        result = balanceTime(total_ns, largest.?);
+        result = balanceTime(total_ns, st.largest);
     }
     // Rounding: only for time-unit / day smallestUnit (approximate).
-    result = roundResult(result, smallest.?, inc, mode, largest.?);
+    result = roundResult(result, st.smallest, st.increment, st.mode, st.largest);
     if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
 }
@@ -368,43 +373,18 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (getDateTime(arg) != null or plain_date.getDate(arg) != null or plain_time.getTime(arg) != null)
         return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
     const o = arg.toPtr().object;
-    if (o.get("calendar") != null and o.get("calendar").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set calendar");
-    if (o.get("timeZone") != null and o.get("timeZone").?.unbox() != .undefined_) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
+    if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    const bag = try plain_date.readDateBag(arena, o, .{ .time = true, .fixed_cal = cur.date.calendar });
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
+    if (!bag.hasDateField() and !bag.hasTimeField()) return realm_mod.throwTypeError(arena, "with() needs at least one field");
 
-    // Date fields go through the shared calendar-aware merge; time fields are
-    // plain ISO components.
-    const merged = try plain_date.withDateFields(arena, cur.date, o, overflow);
-    var h: f64 = @floatFromInt(cur.time.hour);
-    var min: f64 = @floatFromInt(cur.time.minute);
-    var s: f64 = @floatFromInt(cur.time.second);
-    var ms: f64 = @floatFromInt(cur.time.millisecond);
-    var us: f64 = @floatFromInt(cur.time.microsecond);
-    var ns: f64 = @floatFromInt(cur.time.nanosecond);
-    var any = merged.any;
-    if (try readField(arena, o, "hour")) |x| { h = x; any = true; }
-    if (try readField(arena, o, "minute")) |x| { min = x; any = true; }
-    if (try readField(arena, o, "second")) |x| { s = x; any = true; }
-    if (try readField(arena, o, "millisecond")) |x| { ms = x; any = true; }
-    if (try readField(arena, o, "microsecond")) |x| { us = x; any = true; }
-    if (try readField(arena, o, "nanosecond")) |x| { ns = x; any = true; }
-    if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
-
-    const date = merged.date;
-    if (overflow == .reject) {
-        if (h > 23 or min > 59 or s > 59 or ms > 999 or us > 999 or ns > 999)
-            return realm_mod.throwRangeError(arena, "time out of range");
-    }
-    const time = ISOTime{
-        .hour = @intFromFloat(std.math.clamp(h, 0, 23)),
-        .minute = @intFromFloat(std.math.clamp(min, 0, 59)),
-        .second = @intFromFloat(std.math.clamp(s, 0, 59)),
-        .millisecond = @intFromFloat(std.math.clamp(ms, 0, 999)),
-        .microsecond = @intFromFloat(std.math.clamp(us, 0, 999)),
-        .nanosecond = @intFromFloat(std.math.clamp(ns, 0, 999)),
-    };
-    return makeDateTime(arena, .{ .date = date, .time = time });
+    // Date fields go through the shared calendar-aware merge; time fields fall
+    // back to the receiver's own wall-clock components.
+    const merged = try plain_date.withDateFields(arena, cur.date, bag, overflow);
+    const time = try timeFromBag(arena, bag, overflow, cur.time);
+    return makeDateTime(arena, .{ .date = merged.date, .time = time });
 }
 
 pub fn nativeWithPlainTime(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {

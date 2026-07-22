@@ -1014,6 +1014,25 @@ pub fn negateFields(d: DurationFields) DurationFields {
     };
 }
 
+/// Duration fields are mathematical values in the spec, so a zero field must
+/// surface as +0 no matter which intermediate produced it (a negative balance
+/// step readily yields -0.0). Adding 0.0 maps -0.0 to +0.0 and leaves every
+/// other value alone.
+pub fn normalizeZeroFields(d: DurationFields) DurationFields {
+    return .{
+        .years = d.years + 0.0,
+        .months = d.months + 0.0,
+        .weeks = d.weeks + 0.0,
+        .days = d.days + 0.0,
+        .hours = d.hours + 0.0,
+        .minutes = d.minutes + 0.0,
+        .seconds = d.seconds + 0.0,
+        .milliseconds = d.milliseconds + 0.0,
+        .microseconds = d.microseconds + 0.0,
+        .nanoseconds = d.nanoseconds + 0.0,
+    };
+}
+
 pub fn negateRoundingMode(mode: RoundingMode) RoundingMode {
     return switch (mode) {
         .ceil => .floor,
@@ -1071,6 +1090,93 @@ pub fn unitLengthNanos(u: Unit) ?i128 {
         .nanosecond => 1,
         else => null,
     };
+}
+
+/// Coarseness rank: year is the largest unit (0), nanosecond the smallest (9).
+/// The Unit enum is declared in that order, so the ordinal *is* the rank.
+pub fn unitRank(u: Unit) u8 {
+    return @intFromEnum(u);
+}
+
+/// LargerOfTwoTemporalUnits.
+pub fn largerOfTwoUnits(a: Unit, b: Unit) Unit {
+    return if (unitRank(a) <= unitRank(b)) a else b;
+}
+
+/// MaximumTemporalDurationRoundingIncrement: the dividend a rounding increment
+/// must divide for this smallest unit. Calendar units (year..day) are unbounded.
+pub fn maximumRoundingIncrement(u: Unit) ?f64 {
+    return switch (u) {
+        .year, .month, .week, .day => null,
+        .hour => 24,
+        .minute, .second => 60,
+        .millisecond, .microsecond, .nanosecond => 1000,
+    };
+}
+
+/// ValidateTemporalRoundingIncrement.
+pub fn validateRoundingIncrement(arena: std.mem.Allocator, increment: f64, dividend: f64, inclusive: bool) !void {
+    const maximum = if (inclusive) dividend else dividend - 1;
+    if (increment > maximum) return realm_mod.throwRangeError(arena, "roundingIncrement out of range");
+    if (@mod(dividend, increment) != 0) return realm_mod.throwRangeError(arena, "roundingIncrement must divide evenly");
+}
+
+// ------------------------------------------------------- difference settings ---
+
+/// Which units a difference operation accepts: date types take year..day, time
+/// types hour..nanosecond, datetime types everything.
+pub const UnitGroup = enum { date, time, datetime };
+
+fn unitInGroup(u: Unit, group: UnitGroup) bool {
+    return switch (group) {
+        .datetime => true,
+        .date => unitRank(u) <= unitRank(.day),
+        .time => unitRank(u) >= unitRank(.hour),
+    };
+}
+
+pub const DifferenceSettings = struct {
+    smallest: Unit,
+    largest: Unit,
+    mode: RoundingMode,
+    increment: f64,
+};
+
+/// GetDifferenceSettings. Every option is read and coerced *before* any
+/// algorithmic validation, in the spec's order: largestUnit, roundingIncrement,
+/// roundingMode, smallestUnit. `disallowed` names units this receiver rejects
+/// even though they belong to `group` (PlainYearMonth rejects week and day).
+pub fn getDifferenceSettings(
+    arena: std.mem.Allocator,
+    opts: ?*JsObject,
+    since: bool,
+    group: UnitGroup,
+    disallowed: []const Unit,
+    fallback_smallest: Unit,
+    smallest_largest_default: Unit,
+) !DifferenceSettings {
+    const largest_opt = try getTemporalUnit(arena, opts, "largestUnit");
+    const increment = try getRoundingIncrement(arena, opts);
+    var mode = try getRoundingMode(arena, opts, .trunc);
+    if (since) mode = negateRoundingMode(mode);
+    const smallest = (try getTemporalUnit(arena, opts, "smallestUnit")) orelse fallback_smallest;
+
+    for ([_]?Unit{ largest_opt, smallest }) |maybe_u| {
+        const u = maybe_u orelse continue;
+        if (!unitInGroup(u, group)) return realm_mod.throwRangeError(arena, "temporal unit not allowed here");
+        for (disallowed) |d| {
+            if (d == u) return realm_mod.throwRangeError(arena, "temporal unit not allowed here");
+        }
+    }
+
+    const largest = largest_opt orelse largerOfTwoUnits(smallest_largest_default, smallest);
+    if (unitRank(largest) > unitRank(smallest)) {
+        return realm_mod.throwRangeError(arena, "largestUnit must be larger than or equal to smallestUnit");
+    }
+    if (maximumRoundingIncrement(smallest)) |maximum| {
+        try validateRoundingIncrement(arena, increment, maximum, false);
+    }
+    return .{ .smallest = smallest, .largest = largest, .mode = mode, .increment = increment };
 }
 
 // -------------------------------------------------------------- option reading ---
@@ -1262,6 +1368,19 @@ pub fn readStringOption(arena: std.mem.Allocator, opts: ?*JsObject, key: []const
     const v = (try optionGet(arena, o, key)) orelse return null;
     if (v.bits == 0 or v.unbox() == .undefined_) return null;
     return try valueToString(arena, v);
+}
+
+/// ToPrimitiveAndRequireString: coerce with the string hint, then insist the
+/// result really is a String. Used for the calendar fields (era, monthCode)
+/// whose spec type is String — a Number there is a TypeError, but an object
+/// with a toString is fine.
+pub fn toPrimitiveRequireString(arena: std.mem.Allocator, v: Value) ![]const u8 {
+    var prim = v;
+    if (v.bits != 0 and v.unbox() == .object) {
+        prim = (try coercion.toPrimitive(arena, v, .string)) orelse v;
+    }
+    if (prim.bits != 0 and prim.unbox() == .string) return prim.unbox().string;
+    return realm_mod.throwTypeError(arena, "expected a string value");
 }
 
 /// Read the "overflow" option: "constrain" (default) or "reject".
