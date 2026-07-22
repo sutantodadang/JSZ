@@ -34,7 +34,7 @@ fn requireDT(arena: std.mem.Allocator, v: Value) !*ISODateTime {
 
 pub fn makeDateTime(arena: std.mem.Allocator, dt: ISODateTime) !Value {
     if (!shared.isValidISODate(dt.date.year, dt.date.month, dt.date.day)) return realm_mod.throwRangeError(arena, "invalid PlainDateTime");
-    if (dt.date.year < -271821 or dt.date.year > 275760) return realm_mod.throwRangeError(arena, "PlainDateTime year out of range");
+    if (!shared.isoDateTimeWithinLimits(dt.date, dt.time)) return realm_mod.throwRangeError(arena, "PlainDateTime out of range");
     const slot = try arena.create(ISODateTime);
     slot.* = dt;
     const obj = if (realm_mod.active_heap) |h|
@@ -113,6 +113,12 @@ fn f2i(f: f64) i32 {
 // ---------------------------------------------------------------- ToDateTime ---
 
 pub fn toTemporalDateTime(arena: std.mem.Allocator, v: Value, overflow: shared.Overflow) !ISODateTime {
+    const dt = try toTemporalDateTimeUnchecked(arena, v, overflow);
+    if (!shared.isoDateTimeWithinLimits(dt.date, dt.time)) return realm_mod.throwRangeError(arena, "PlainDateTime out of range");
+    return dt;
+}
+
+fn toTemporalDateTimeUnchecked(arena: std.mem.Allocator, v: Value, overflow: shared.Overflow) !ISODateTime {
     if (getDateTime(v)) |dt| return dt.*;
     if (v.bits != 0 and v.unbox() == .object) {
         if (plain_date.getDate(v)) |d| return .{ .date = d.*, .time = .{} };

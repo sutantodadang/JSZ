@@ -30,7 +30,7 @@ fn requireDate(arena: std.mem.Allocator, v: Value) !*ISODate {
 
 pub fn makeDate(arena: std.mem.Allocator, d: ISODate) !Value {
     if (!shared.isValidISODate(d.year, d.month, d.day)) return realm_mod.throwRangeError(arena, "invalid PlainDate");
-    if (d.year < -271821 or d.year > 275760) return realm_mod.throwRangeError(arena, "PlainDate year out of range");
+    if (!shared.isoDateWithinLimits(d)) return realm_mod.throwRangeError(arena, "PlainDate out of range");
     const slot = try arena.create(ISODate);
     slot.* = d;
     const obj = if (realm_mod.active_heap) |h|
@@ -106,6 +106,12 @@ pub fn isIsoCalendar(s: []const u8) bool {
 // ---------------------------------------------------------------- ToDate ---
 
 pub fn toTemporalDate(arena: std.mem.Allocator, v: Value, overflow: shared.Overflow) !ISODate {
+    const d = try toTemporalDateUnchecked(arena, v, overflow);
+    if (!shared.isoDateWithinLimits(d)) return realm_mod.throwRangeError(arena, "PlainDate out of range");
+    return d;
+}
+
+fn toTemporalDateUnchecked(arena: std.mem.Allocator, v: Value, overflow: shared.Overflow) !ISODate {
     if (getDate(v)) |d| return d.*;
     if (v.bits != 0 and v.unbox() == .object) {
         const pdt = @import("plain_date_time.zig");

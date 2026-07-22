@@ -477,8 +477,12 @@ pub fn parseISOTime(s0: []const u8) ParseError!ISOTime {
     // 8 leading digits followed by 'T').
     if (looksLikeDate(s)) {
         // PlainTime has no calendar but still rejects a bare `Z` UTC designator.
-        const dt = try parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = true, .require_time = true });
-        return dt.time;
+        // A near-date that is not one after all ("2021-13[-13:00]" — month 13)
+        // is unambiguously a time, so a failure here falls through rather than
+        // ending the parse.
+        if (parseISODateTimeOpts(s, .{ .validate_calendar = false, .reject_utc = true, .require_time = true })) |dt| {
+            return dt.time;
+        } else |_| {}
     }
     // A time-only string may carry the ISO 8601 time designator prefix ("T"/"t"),
     // e.g. "T00:30" or "t003000.5". Consume it before parsing the time components.
@@ -1014,6 +1018,24 @@ fn roundHalfDown(q: f64) f64 {
     const frac = q - fl;
     if (frac > 0.5) return fl + 1;
     return fl;
+}
+
+/// The outer bound on a representable exact time: ±8.64e21 ns (100 million
+/// days), with a one-day slack that lets a wall-clock datetime sit just outside
+/// it as long as some zone offset could bring it back in.
+pub const NS_LIMIT: i128 = 8_640_000_000_000_000_000_000;
+
+/// ISODateTimeWithinLimits.
+pub fn isoDateTimeWithinLimits(d: ISODate, t: ISOTime) bool {
+    // Guard the multiplication below; anything this far out is out of range.
+    if (d.year > 300_000 or d.year < -300_000) return false;
+    const ns = @as(i128, isoDateToEpochDays(d.year, d.month, d.day)) * NS_PER_DAY + timeToNanos(t);
+    return ns > -(NS_LIMIT + NS_PER_DAY) and ns < NS_LIMIT + NS_PER_DAY;
+}
+
+/// ISODateWithinLimits: a date is representable when *noon* on it is.
+pub fn isoDateWithinLimits(d: ISODate) bool {
+    return isoDateTimeWithinLimits(d, .{ .hour = 12 });
 }
 
 /// Negate every Duration field. Adding 0.0 normalizes the -0.0 that negating a

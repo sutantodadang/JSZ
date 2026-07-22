@@ -382,6 +382,7 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
 /// non-ISO calendar annotation. Returns the time-zone annotation's inner id.
 fn extractAnnotations(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     var tz: ?[]const u8 = null;
+    var saw_calendar = false;
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         if (s[i] != '[') continue;
@@ -397,7 +398,12 @@ fn extractAnnotations(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
             if (tz != null) return realm_mod.throwRangeError(arena, "more than one time zone annotation");
             tz = inner;
         } else if (std.mem.startsWith(u8, inner, "u-ca=")) {
-            if (calendar.canonicalize(inner[5..]) == null) return realm_mod.throwRangeError(arena, "unsupported calendar");
+            // Only the first calendar annotation is meaningful; later ones are
+            // ignored outright, unknown value and all.
+            if (!saw_calendar) {
+                saw_calendar = true;
+                if (calendar.canonicalize(inner[5..]) == null) return realm_mod.throwRangeError(arena, "unsupported calendar");
+            }
         }
     }
     return tz orelse realm_mod.throwRangeError(arena, "ZonedDateTime string requires a time zone");
