@@ -1516,7 +1516,9 @@ fn nativeSuppressedErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []
 
 fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     // new Object() / Object(): if arg is an object return it, else create new.
-    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
+    // Functions are objects too — `Object(f) === f` must hold, and testing only
+    // for `.object` boxed them into a fresh plain object instead.
+    if (args.len > 0 and isObjectLike(args[0])) {
         return args[0];
     }
     // ToObject for a primitive arg: box it in a wrapper carrying [[PrimitiveValue]]
@@ -4223,6 +4225,8 @@ pub const Realm = struct {
     dv_prototype: ?*JsObject = null,
     /// %Array% of this realm (see `active_array_ctor`).
     array_ctor: ?*JsObject = null,
+    /// %Promise.prototype% of this realm (OrdinaryCreateFromConstructor fallback).
+    promise_prototype: ?*JsObject = null,
     /// %TypedArray%.prototype (shared base of all per-kind TA prototype chains).
     ta_shared_prototype: ?*JsObject = null,
     /// Per-kind TypedArray prototypes, indexed by typed_array.TAKind.
@@ -5186,6 +5190,7 @@ pub const Realm = struct {
     /// thread-locals). Used by GetPrototypeFromConstructor's realm fallback.
     pub fn captureIntrinsics(self: *Realm) void {
         self.array_ctor = active_array_ctor;
+        self.promise_prototype = active_promise_proto;
         self.ab_prototype = typed_array_mod.active_arraybuffer_proto;
         self.sab_prototype = typed_array_mod.active_sharedarraybuffer_proto;
         self.dv_prototype = typed_array_mod.active_dataview_proto;
