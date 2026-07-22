@@ -187,6 +187,9 @@ fn lowerFunctionDeclInto(self: *FnCompiler, node: *Node, last_expr_reg: *?u8, lo
         fd.param_defaults,
         fd.source_text,
     );
+    // See compileFuncExpr: `fn.length` is the parser-recorded
+    // ExpectedArgumentCount, not the raw parameter count.
+    if (fd.expected_argc) |n| child_fn.expected_argc = n;
     const child_idx: u16 = @intCast(self.child_functions.items.len);
     try self.child_functions.append(self.arena, child_fn);
 
@@ -1337,6 +1340,7 @@ pub fn lowerWithStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{
     // Completion value: `with` returns UpdateEmpty(bodyCompletion, undefined).
     try self.resetCompletion(line);
     self.with_depth += 1;
+    self.saw_dynamic_scope = true;
     try self.compileStmt(ws.body, last_expr_reg);
     self.with_depth -= 1;
     try self.emitOp(.POP_WITH, line);

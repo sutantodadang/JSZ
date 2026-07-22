@@ -184,6 +184,10 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
         p.arrow_prelude = .{};
+        // An arrow body is its own function-like scope for the class-static-block
+        // restrictions: `static { () => { var await; } }` is legal.
+        const sb_saved = p.leaveStaticBlock();
+        defer p.restoreStaticBlock(sb_saved);
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
@@ -343,6 +347,10 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
         p.arrow_prelude = .{};
+        // An arrow body is its own function-like scope for the class-static-block
+        // restrictions: `static { () => { var await; } }` is legal.
+        const sb_saved = p.leaveStaticBlock();
+        defer p.restoreStaticBlock(sb_saved);
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
@@ -1132,6 +1140,13 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
     // (for top-level await in script tests). When followed by a non-operand token
     // (comma, semicolon, closing bracket, binary operator, etc.), `await` is an
     // identifier (e.g. `instanceof await` in `new await instanceof await`).
+    // In a class static initialization block `await` is neither an operator nor
+    // an identifier — the block is not async code, and the name is reserved.
+    if (p.await_is_reserved and p.current.kind == .identifier and
+        std.mem.eql(u8, p.current.value_str, "await"))
+    {
+        return p.fail("'await' is reserved in a class static initialization block");
+    }
     if (p.current.kind == .identifier and std.mem.eql(u8, p.current.value_str, "await") and
         (p.is_module or isAwaitOperandStart(p.peekNext().kind)))
     {
@@ -1184,6 +1199,14 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
                 const mt = p.expectIdentifierName() orelse return null;
                 if (!std.mem.eql(u8, mt.value_str, "target"))
                     return p.fail("SyntaxError: expected 'target' after 'new.'");
+                // §13.3.12.1: `new.target` is only legal in function code. At the
+                // TOP LEVEL of eval code that means the eval's calling context has
+                // to be a function — a direct eval inside one qualifies, an
+                // indirect eval (global code) never does. Inside a function
+                // literal the eval'd source declares itself, so `(0, eval)
+                // ('(function(){ new.target })')` stays legal.
+                if (p.eval_code and !p.eval_allow_new_target and p.fn_nesting_depth == 0)
+                    return p.fail("new.target expression is not allowed here");
                 var nt_node = p.makeNode(.identifier, start, p.current.start, .{
                     .identifier = "__new_target__",
                 }) orelse return null;
@@ -1720,6 +1743,7 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
                 return p.parseFunctionExpr(true);
             }
             const name = p.current.value_str;
+            if (p.staticBlockReservedIdent(name)) |msg| return p.fail(msg);
             _ = p.advance();
             // Special: 'undefined' identifier -> undefined literal
             if (std.mem.eql(u8, name, "undefined")) {
@@ -1919,6 +1943,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .name = if (ckey == null) mkey else null,
                     .params = am_params.params,
                     .param_defaults = am_params.param_defaults,
+                    .expected_argc = am_params.expected_argc,
                     .rest_param = am_params.rest_param,
                     .body = am_body,
                     .is_arrow = false,
@@ -1955,8 +1980,12 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 const cm_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                     .function_expr = .{
                         .name = null,
+                        // A concise method, like every other `{ k(){} }` form:
+                        // no own `prototype`, not a constructor.
+                        .is_method = true,
                         .params = cm_params.params,
                         .param_defaults = cm_params.param_defaults,
+                        .expected_argc = cm_params.expected_argc,
                         .rest_param = cm_params.rest_param,
                         .body = cm_body,
                         .is_arrow = false,
@@ -2051,9 +2080,20 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             const acc_body = p.parseFunctionBody() orelse return null;
             const acc_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
                 .function_expr = .{
-                    .name = null,
+                    // SetFunctionName(closure, propKey, "get"/"set"): an accessor's
+                    // `.name` is its key prefixed with the kind. `is_method` keeps
+                    // that name from being self-bound in the body (it is not a named
+                    // function expression) and drops the `prototype` property.
+                    // A computed key is named at runtime via SET_FN_NAME instead.
+                    .name = if (acc_computed_key != null) null else (std.fmt.allocPrint(
+                        p.arena,
+                        "{s} {s}",
+                        .{ if (acc_kind == .get) "get" else "set", aname },
+                    ) catch return null),
+                    .is_method = true,
                     .params = acc_params.params,
                     .param_defaults = acc_params.param_defaults,
+                    .expected_argc = acc_params.expected_argc,
                     .rest_param = acc_params.rest_param,
                     .body = acc_body,
                     .is_arrow = false,
@@ -2087,6 +2127,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .name = key,
                     .params = m_params.params,
                     .param_defaults = m_params.param_defaults,
+                    .expected_argc = m_params.expected_argc,
                     .rest_param = m_params.rest_param,
                     .body = m_body,
                     .is_arrow = false,
@@ -2328,6 +2369,7 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
             .name = name,
             .params = parsed_params.params,
             .param_defaults = parsed_params.param_defaults,
+            .expected_argc = parsed_params.expected_argc,
             .rest_param = parsed_params.rest_param,
             .body = body,
             .is_arrow = false,

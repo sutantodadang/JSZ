@@ -38,6 +38,13 @@ pub const LabelEntry = struct {
 /// `bcEval` reads it after compiling so `eval("break L")` throws a SyntaxError.
 pub var last_label_error: ?[]const u8 = null;
 
+/// Whether the function literal currently being compiled is lexically inside a
+/// scope that needs reference-carrying identifier assignment (see
+/// `FnCompiler.dynamic_scope`). Saved/restored around each nested
+/// `compileFunctionStrict`, so a closure defined inside a `with` body inherits
+/// the treatment even though its own body contains no `with`.
+var g_dynamic_scope_enclosing: bool = false;
+
 /// One entry of `finally_stack`: work an abrupt completion (`return`/`break`/
 /// `continue`, or a caught throw) must perform on its way out of a region that
 /// has a live PUSH_TRY handler. Every entry owns exactly one PUSH_TRY, so
@@ -158,6 +165,17 @@ pub const FnCompiler = struct {
     /// through the with-object environment (SET_GLOBAL) rather than a direct
     /// DEFINE_GLOBAL, since ResolveBinding("x") crosses the with-object env.
     with_depth: u32 = 0,
+    /// Set once this body is found to contain a `with` statement or a direct
+    /// `eval` — the two things that can change which binding an identifier
+    /// resolves to *between* the read and the write halves of an assignment.
+    /// Discovered mid-compile, so it drives a second compilation pass (see
+    /// compileFunctionStrict).
+    saw_dynamic_scope: bool = false,
+    /// Second pass: emit RESOLVE_REF/GET_REF/PUT_REF for identifier assignment
+    /// targets so PutValue writes through the Reference resolved before the RHS
+    /// ran. Off in the common case, which keeps SET_GLOBAL — and the int JIT's
+    /// pattern match on it — untouched.
+    dynamic_scope: bool = false,
     /// ES2020 optional chaining: while compiling an `optional_chain`, this points
     /// to the list of JMP_IF_NULLISH patch offsets emitted by optional links.
     /// They are all patched to the chain's short-circuit landing pad. null when
@@ -534,6 +552,51 @@ pub const FnCompiler = struct {
         const sv = try val_mod.makeString(self.arena, name);
         const kidx = try self.addConstant(sv);
         try self.emitOp(.SET_GLOBAL, line);
+        try self.emitU16(kidx);
+        try self.emitU8(rsrc);
+    }
+
+    /// Resolve the identifier Reference for `name` into `rref`, which the caller
+    /// must have allocated *below* every register the right-hand side will use
+    /// so it is still live at the matching `emitPutRef`. `read_into` (when
+    /// given) additionally receives GetValue of that reference.
+    fn emitResolveRef(self: *Self, name: []const u8, rref: u8, read_into: ?u8, line: u32) !void {
+        if (std.mem.eql(u8, name, "arguments")) self.saw_arguments = true;
+        const kidx = try self.addConstant(try val_mod.makeString(self.arena, name));
+        if (read_into) |rdst| {
+            try self.emitOp(.GET_REF, line);
+            try self.emitU8(rdst);
+            try self.emitU8(rref);
+            try self.emitU16(kidx);
+        } else {
+            try self.emitOp(.RESOLVE_REF, line);
+            try self.emitU8(rref);
+            try self.emitU16(kidx);
+        }
+    }
+
+    /// Once the PUT_REF has run, the reference register is dead — move the
+    /// expression's value down into it and drop everything above. Without this
+    /// the extra register would shift the result one slot up from where the
+    /// caller expects it, which matters wherever `compileExpr` results must land
+    /// in consecutive registers (call arguments, array elements, …).
+    fn collapseRef(self: *Self, rref: u8, rvalue: u8, line: u32) error{OutOfMemory}!u8 {
+        if (rvalue != rref) {
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(rref);
+            try self.emitU8(rvalue);
+        }
+        self.sp = rref + 1;
+        return rref;
+    }
+
+    /// PutValue through a reference produced by `emitResolveRef`; falls back to
+    /// the name-based store when there is none.
+    fn emitPutRef(self: *Self, rref: ?u8, name: []const u8, rsrc: u8, line: u32) !void {
+        const r = rref orelse return self.emitStore(name, rsrc, line);
+        const kidx = try self.addConstant(try val_mod.makeString(self.arena, name));
+        try self.emitOp(.PUT_REF, line);
+        try self.emitU8(r);
         try self.emitU16(kidx);
         try self.emitU8(rsrc);
     }
@@ -1137,8 +1200,10 @@ pub const FnCompiler = struct {
     pub fn compileAssign(self: *Self, a: ast.AssignExpr, line: u32) error{OutOfMemory}!u8 {
         if (try self.emitCallTargetRefError(a.target, line)) |r| return r;
         if (a.op == .assign) {
-            // Peephole: x = x + 1 / x = x - 1 -> INC/DEC
-            if (a.target.kind == .identifier and a.value.kind == .binary_expr) {
+            // Peephole: x = x + 1 / x = x - 1 -> INC/DEC. Skipped in a
+            // dynamic-scope pass, where the store must go through a Reference
+            // resolved before the read.
+            if (a.target.kind == .identifier and a.value.kind == .binary_expr and !self.dynamic_scope) {
                 const target_name = a.target.data.identifier;
                 const b = a.value.data.binary_expr;
                 if ((b.op == .add or b.op == .sub) and
@@ -1155,6 +1220,16 @@ pub const FnCompiler = struct {
                     return rsrc;
                 }
             }
+            // The LeftHandSideExpression's Reference is evaluated BEFORE the RHS
+            // (§13.15.2 step 1), and PutValue writes through that same
+            // Reference — so `x = (eval("var x"), 1)` assigns the outer `x`, not
+            // the one the eval just introduced.
+            var rref: ?u8 = null;
+            if (a.target.kind == .identifier and self.dynamic_scope) {
+                const r = self.allocReg();
+                try self.emitResolveRef(a.target.data.identifier, r, null, line);
+                rref = r;
+            }
             // NamedEvaluation: `x = function(){}` — inject binding name as hint.
             if (a.target.kind == .identifier and a.value.kind == .function_expr) {
                 self.name_hint = a.target.data.identifier;
@@ -1162,7 +1237,8 @@ pub const FnCompiler = struct {
             const rhs = try self.compileExpr(a.value);
             self.name_hint = null; // defensive clear (no-op if consumed inside)
             if (a.target.kind == .identifier) {
-                try self.emitStore(a.target.data.identifier, rhs, line);
+                try self.emitPutRef(rref, a.target.data.identifier, rhs, line);
+                if (rref) |r| return self.collapseRef(r, rhs, line);
             } else if (a.target.kind == .member_expr) {
                 try self.compileMemberWrite(a.target.data.member_expr, rhs, line);
             } else if (a.target.kind == .object_literal or a.target.kind == .array_literal) {
@@ -1179,8 +1255,17 @@ pub const FnCompiler = struct {
             .logical_and, .logical_or, .logical_nullish => return self.compileLogicalAssign(a, line),
             else => {},
         }
-        // Compound assignment.
-        const rcur = try self.compileExpr(a.target);
+        // Compound assignment. Like simple assignment, the target's Reference is
+        // resolved once up front; `rref` sits below `rcur` so resetting sp to
+        // rcur+1 after the RHS keeps it live for the PUT_REF.
+        var rref: ?u8 = null;
+        const rcur = if (a.target.kind == .identifier and self.dynamic_scope) blk: {
+            const r = self.allocReg();
+            const rval = self.allocReg();
+            try self.emitResolveRef(a.target.data.identifier, r, rval, line);
+            rref = r;
+            break :blk rval;
+        } else try self.compileExpr(a.target);
         const rrhs = try self.compileExpr(a.value);
         self.sp = rcur;
         self.sp += 1;
@@ -1207,7 +1292,8 @@ pub const FnCompiler = struct {
         try self.emitU8(rrhs);
 
         if (a.target.kind == .identifier) {
-            try self.emitStore(a.target.data.identifier, rdst, line);
+            try self.emitPutRef(rref, a.target.data.identifier, rdst, line);
+            if (rref) |r| return self.collapseRef(r, rdst, line);
         } else if (a.target.kind == .member_expr) {
             try self.compileMemberWrite(a.target.data.member_expr, rdst, line);
         }
@@ -1845,6 +1931,19 @@ pub const FnCompiler = struct {
         self.freeReg(); // free robj
     }
 
+    /// IsAnonymousFunctionDefinition(expr): the syntactic shapes whose `.name`
+    /// is supplied by the surrounding definition rather than by the literal
+    /// itself. Parenthesization is transparent (the parser does not keep a node
+    /// for it), so `(function(){})` lands here too — which matches the spec,
+    /// since a CoverParenthesizedExpression is an anonymous function definition.
+    fn isAnonymousFunctionDefinition(node: *Node) bool {
+        return switch (node.kind) {
+            .function_expr => node.data.function_expr.name == null,
+            .call_expr => node.data.call_expr.anon_class_iife,
+            else => false,
+        };
+    }
+
     pub fn compileObjectLiteral(self: *Self, ol: ast.ObjectLiteral, line: u32) error{OutOfMemory}!u8 {
         const robj = self.allocReg();
         try self.emitOp(.NEW_OBJECT, line);
@@ -1881,6 +1980,21 @@ pub const FnCompiler = struct {
             if (prop.computed_key) |key_node| {
                 const rkey = try self.compileExpr(key_node);
                 const rval = try self.compileExpr(prop.value);
+                // NamedEvaluation with a runtime key: `{[k]: () => {}}`,
+                // `{[k](){}}`, `{get [k](){}}` all name the function after the
+                // key (accessors with a "get "/"set " prefix). Only anonymous
+                // function definitions qualify — `{[k]: function f(){}}` and
+                // `{[k]: someFn}` keep their existing names.
+                if (isAnonymousFunctionDefinition(prop.value)) {
+                    try self.emitOp(.SET_FN_NAME, line);
+                    try self.emitU8(rval);
+                    try self.emitU8(rkey);
+                    try self.emitU8(switch (prop.kind) {
+                        .get => @as(u8, 1),
+                        .set => @as(u8, 2),
+                        else => @as(u8, 0),
+                    });
+                }
                 if (prop.kind == .init) {
                     // PropertyDefinitionEvaluation is CreateDataPropertyOrThrow,
                     // so an inherited setter on Object.prototype never runs.
@@ -2001,7 +2115,17 @@ pub const FnCompiler = struct {
 
     pub fn compileUpdate(self: *Self, u: ast.UpdateExpr, line: u32) error{OutOfMemory}!u8 {
         if (try self.emitCallTargetRefError(u.operand, line)) |r| return r;
-        const r_old = try self.compileExpr(u.operand);
+        // As with compound assignment, the operand's Reference is resolved once
+        // and reused for the write-back (`with (o) { x++ }` keeps assigning o.x
+        // even if reading it removed the property).
+        var rref: ?u8 = null;
+        const r_old = if (u.operand.kind == .identifier and self.dynamic_scope) blk: {
+            const r = self.allocReg();
+            const rval = self.allocReg();
+            try self.emitResolveRef(u.operand.data.identifier, r, rval, line);
+            rref = r;
+            break :blk rval;
+        } else try self.compileExpr(u.operand);
 
         if (u.prefix) {
             // Pre: compute new value, store, return new.
@@ -2010,13 +2134,14 @@ pub const FnCompiler = struct {
             try self.emitU8(r_new);
             try self.emitU8(r_old);
             if (u.operand.kind == .identifier) {
-                try self.emitStore(u.operand.data.identifier, r_new, line);
+                try self.emitPutRef(rref, u.operand.data.identifier, r_new, line);
             } else if (u.operand.kind == .member_expr) {
                 // Write the incremented value back to `obj.prop` / `obj[key]`.
                 // compileMemberWrite re-evaluates the object/key above r_new (it
                 // never clobbers r_new), matching the compound-assign lowering.
                 try self.compileMemberWrite(u.operand.data.member_expr, r_new, line);
             }
+            if (rref) |r| return self.collapseRef(r, r_new, line);
             return r_new;
         } else {
             // Post: compute new value, store, return OLD (coerced to numeric).
@@ -2033,13 +2158,14 @@ pub const FnCompiler = struct {
             try self.emitU8(r_scratch);
             try self.emitU8(r_old);
             if (u.operand.kind == .identifier) {
-                try self.emitStore(u.operand.data.identifier, r_scratch, line);
+                try self.emitPutRef(rref, u.operand.data.identifier, r_scratch, line);
             } else if (u.operand.kind == .member_expr) {
                 // Write the incremented value back to the member target while
                 // returning the pre-increment value held in r_old.
                 try self.compileMemberWrite(u.operand.data.member_expr, r_scratch, line);
             }
             self.freeReg(); // free r_scratch
+            if (rref) |r| return self.collapseRef(r, r_old, line);
             return r_old; // return old (numeric) value
         }
     }
@@ -2554,6 +2680,10 @@ pub const FnCompiler = struct {
             std.mem.eql(u8, c.callee.data.identifier, "eval"))
         {
             try self.emitOp(.MARK_DIRECT_EVAL, line);
+            // The eval'd source can introduce a binding that shadows one an
+            // assignment in this body already resolved, so identifier writes
+            // here must go through a Reference captured before the RHS ran.
+            self.saw_dynamic_scope = true;
             // The eval'd source may name `arguments`, which the enclosing
             // function cannot see by scanning its own body — so a direct eval
             // forces the arguments object to be materialized (§10.2.11 step 15
@@ -2665,6 +2795,10 @@ pub const FnCompiler = struct {
         // not constructors: propagate the flag so the VM omits the `prototype`
         // property for non-generator methods.
         child_fn.is_method = fe.is_method;
+        // `fn.length` counts only the parameters before the first defaulted one.
+        // The parser recorded that before its TDZ desugar rewrote the defaults
+        // into the body and cleared `param_defaults`.
+        if (fe.expected_argc) |n| child_fn.expected_argc = n;
 
         const child_idx: u16 = @intCast(self.child_functions.items.len);
         try self.child_functions.append(self.arena, child_fn);
@@ -2848,6 +2982,22 @@ fn mkSynthNode(arena: std.mem.Allocator, data: ast.Data) error{OutOfMemory}!*Nod
 /// argument is bound to undefined at call setup, so this also covers the
 /// "fewer arguments than parameters" case. Returns `body` unchanged when no
 /// parameter has a default.
+/// ExpectedArgumentCount (§15.1.5), which is what `Function.prototype.length`
+/// reports: the number of formal parameters before the first one that has an
+/// initializer or is a rest parameter. `function f(a, b = 1, c) {}` has length
+/// 1, not 3. A rest parameter is already excluded — it is carried separately
+/// from `params` — and a caller that supplies no `param_defaults` at all (a
+/// synthetic/desugared function) keeps the whole parameter list.
+fn expectedArgumentCount(params: [][]const u8, param_defaults: []const ?*Node) u16 {
+    if (param_defaults.len == 0) return @intCast(params.len);
+    var n: u16 = 0;
+    for (params, 0..) |_, i| {
+        if (i < param_defaults.len and param_defaults[i] != null) break;
+        n += 1;
+    }
+    return n;
+}
+
 fn applyParamDefaults(
     arena: std.mem.Allocator,
     params: [][]const u8,
@@ -2894,7 +3044,22 @@ pub fn compileFunctionStrict(
     param_defaults: []const ?*Node,
     source_text: ?[]const u8,
 ) error{OutOfMemory}!*BcFunction {
-    var fc = FnCompiler.init(arena, name, params);
+    // Phase 2: all variable access is env-based (GET_GLOBAL/SET_GLOBAL).
+    // Params are passed via env on CALL setup (see bc_vm.zig CALL handler).
+    // Register slots are used only for compiler temporaries.
+    // sp starts at 0; max_regs tracks highest allocated temporary register.
+
+    const body = try applyParamDefaults(arena, params, param_defaults, body_in);
+
+    const Setup = struct {
+        fn go(a: std.mem.Allocator, nm: ?[]const u8, ps: [][]const u8, dyn: bool) FnCompiler {
+            var c = FnCompiler.init(a, nm, ps);
+            c.dynamic_scope = dyn;
+            return c;
+        }
+    };
+
+    var fc = Setup.go(arena, name, params, g_dynamic_scope_enclosing);
     fc.nfe_name = nfe_name;
     fc.is_strict = is_strict;
     fc.is_async = is_async;
@@ -2902,13 +3067,27 @@ pub fn compileFunctionStrict(
     fc.is_generator = is_generator;
     fc.is_arrow = is_arrow;
 
-    // Phase 2: all variable access is env-based (GET_GLOBAL/SET_GLOBAL).
-    // Params are passed via env on CALL setup (see bc_vm.zig CALL handler).
-    // Register slots are used only for compiler temporaries.
-    // sp starts at 0; max_regs tracks highest allocated temporary register.
+    const outer_dynamic = g_dynamic_scope_enclosing;
+    g_dynamic_scope_enclosing = fc.dynamic_scope;
+    defer g_dynamic_scope_enclosing = outer_dynamic;
 
-    const body = try applyParamDefaults(arena, params, param_defaults, body_in);
     try fc.compileBody(body, implicit_return);
+
+    // `with` and direct `eval` are only discovered while compiling. When either
+    // turns up, redo the body with reference-carrying identifier assignment
+    // (see `dynamic_scope`) — including every nested function literal, which is
+    // why the flag is threaded through `g_dynamic_scope_enclosing`.
+    if (fc.saw_dynamic_scope and !fc.dynamic_scope) {
+        fc = Setup.go(arena, name, params, true);
+        fc.nfe_name = nfe_name;
+        fc.is_strict = is_strict;
+        fc.is_async = is_async;
+        fc.is_async_generator = is_async and is_generator;
+        fc.is_generator = is_generator;
+        fc.is_arrow = is_arrow;
+        g_dynamic_scope_enclosing = true;
+        try fc.compileBody(body, implicit_return);
+    }
 
     const chunk = try fc.builder.finalize(name orelse "<anonymous>", 0);
 
@@ -2931,6 +3110,7 @@ pub fn compileFunctionStrict(
         .source_text = source_text,
         .nfe_name = nfe_name,
         .arity = @intCast(params.len),
+        .expected_argc = expectedArgumentCount(params, param_defaults),
         .chunk = chunk,
         .num_regs = num_regs,
         .child_functions = child_fns,
@@ -2982,6 +3162,7 @@ pub fn compileProgram(
         &[_]?*ast.Node{}, // no parameters → no defaults
         null,
     );
+    f.is_program = true;
     return f;
 }
 

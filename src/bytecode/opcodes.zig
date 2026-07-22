@@ -336,6 +336,22 @@ pub const Op = enum(u8) {
     /// runtime property key (string, symbol, or index).
     /// Declared last (ordinal stability for the pinned JIT contract).
     DEFINE_DATA_DYN,
+    /// SET_FN_NAME | 4 | op, Rfn u8, Rkey u8, prefix u8. Runtime
+    /// SetFunctionName(R[fn], R[key], prefix) for a computed property key.
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    SET_FN_NAME,
+    /// RESOLVE_REF | 4 | op, Rref u8, Kname u16-LE. Resolves the identifier
+    /// Reference for Kname and parks the resolution in R[ref].
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    RESOLVE_REF,
+    /// GET_REF | 5 | op, Rdst u8, Rref u8, Kname u16-LE. RESOLVE_REF plus
+    /// GetValue: R[dst] = the reference's current value.
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    GET_REF,
+    /// PUT_REF | 5 | op, Rref u8, Kname u16-LE, Rsrc u8. PutValue through the
+    /// reference token in R[ref].
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    PUT_REF,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -440,6 +456,10 @@ pub fn instrSize(op: Op) usize {
         .DEFINE_DATA => 5,
         .DEFINE_DATA_DYN => 4,
         .SYNC_ANNEXB_FN => 3,
+        .SET_FN_NAME => 4,
+        .RESOLVE_REF => 4,
+        .GET_REF => 5,
+        .PUT_REF => 5,
         .IN => 4,
         .DELETE_PROP => 4,
         .CALL_SPREAD => 5,

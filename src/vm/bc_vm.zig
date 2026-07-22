@@ -866,6 +866,18 @@ pub const BcVm = struct {
             if (outer_env.lookup("__sproto__")) |_| {
                 p.eval_allow_super_prop = true;
             } else |_| {}
+            // §13.3.12.1: `new.target` needs function code around it. Eval code
+            // takes that from its calling context, so walk down to the nearest
+            // frame that is not itself eval code and ask whether it is a
+            // function literal rather than a Script/module top level.
+            var i = self.frames.items.len;
+            while (i > 0) {
+                i -= 1;
+                const cf = self.frames.items[i].func;
+                if (cf.is_eval) continue;
+                p.eval_allow_new_target = !cf.is_program;
+                break;
+            }
         }
         const parse_result = p.parseScript();
         const stmts = switch (parse_result) {
@@ -1176,6 +1188,21 @@ pub const BcVm = struct {
         nr.captureIntrinsics();
         snap.restore();
         nr.tagNativeFunctions();
+        // The class desugaring calls these two by name, so a class defined in
+        // this realm's code needs them in this realm's global environment.
+        // (The rest of the `__`-prefixed desugar helpers are still primary-realm
+        // only — a pre-existing gap, not widened here.)
+        {
+            const obj_methods = @import("../runtime/builtins/object_methods.zig");
+            try nr.global_env.define(
+                "__defineNamedMethod__",
+                try val_mod.makeNativeFunction(self.arena, obj_methods.nativeDefineNamedMethod),
+            );
+            try nr.global_env.define(
+                "__nameFn__",
+                try val_mod.makeNativeFunction(self.arena, obj_methods.nativeNameFn),
+            );
+        }
         // Cross-realm: make the secondary realm's well-known symbols *shared* with
         // the primary realm by replacing the Symbol constructor's properties directly.
         // Without this, a class defined via g.eval("get [Symbol.species]() { … }")
@@ -1450,6 +1477,9 @@ pub const BcVm = struct {
                 .PUSH_WITH => if (try load_ops.opPushWith(self, frame)) |o| return o,
                 .POP_WITH => if (try load_ops.opPopWith(self, frame)) |o| return o,
                 .SET_GLOBAL => if (try load_ops.opSetGlobal(self, frame)) |o| return o,
+                .RESOLVE_REF => if (try load_ops.opResolveRef(self, frame)) |o| return o,
+                .GET_REF => if (try load_ops.opGetRef(self, frame)) |o| return o,
+                .PUT_REF => if (try load_ops.opPutRef(self, frame)) |o| return o,
                 .DEFINE_GLOBAL => if (try load_ops.opDefineGlobal(self, frame)) |o| return o,
                 .MARK_DIRECT_EVAL => self.direct_eval_mark = true,
                 .DEFINE_LOCAL => if (try load_ops.opDefineLocal(self, frame)) |o| return o,
@@ -1521,6 +1551,7 @@ pub const BcVm = struct {
                 .DEFINE_DATA_DYN => if (try property_ops.opDefineDataDyn(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR => if (try property_ops.opDefineAccessor(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR_DYN => if (try property_ops.opDefineAccessorDyn(self, frame)) |o| return o,
+                .SET_FN_NAME => if (try property_ops.opSetFnName(self, frame)) |o| return o,
                 .GET_THIS => if (try property_ops.opGetThis(self, frame)) |o| return o,
                 .IN => if (try property_ops.opIn(self, frame)) |o| return o,
                 .DELETE_PROP => if (try property_ops.opDeleteProp(self, frame)) |o| return o,
@@ -2669,14 +2700,14 @@ pub const BcVm = struct {
                 // configurable). `length` = declared arity; `name` = the bound
                 // function name ("" when anonymous and not named-evaluated).
                 if (std.mem.eql(u8, key, "name")) {
-                    const raw = closure.func.name orelse "";
+                    const raw = closure.effectiveName();
                     // Translate internal sentinels for anonymous default exports to "default".
                     const display = if (std.mem.eql(u8, raw, "__esm_dflt_fn__") or
                         std.mem.eql(u8, raw, "__esm_dflt_gen__")) "default" else raw;
                     return val_mod.makeString(self.arena, display);
                 }
                 if (std.mem.eql(u8, key, "length")) {
-                    return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity));
+                    return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.expected_argc));
                 }
                 // Walk the backing object's prototype chain. For a subclass
                 // constructor (`class C extends Base`), `bcSetProto` set the
@@ -2806,11 +2837,11 @@ pub const BcVm = struct {
         // (non-writable, non-enumerable, configurable). The virtual-resolution
         // fast path in getProp still short-circuits via `o.hasOwn` on these.
         {
-            const nm_raw = closure.func.name orelse "";
+            const nm_raw = closure.effectiveName();
             const nm = if (std.mem.eql(u8, nm_raw, "__esm_dflt_fn__") or
                 std.mem.eql(u8, nm_raw, "__esm_dflt_gen__")) "default" else nm_raw;
             const nec: @import("../object/object.zig").PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-            _ = try o.defineOwnData("length", try val_mod.makeNumber(self.arena, @floatFromInt(closure.func.arity)), nec);
+            _ = try o.defineOwnData("length", try val_mod.makeNumber(self.arena, @floatFromInt(closure.func.expected_argc)), nec);
             _ = try o.defineOwnData("name", try val_mod.makeString(self.arena, nm), nec);
         }
         if (closure.func.is_generator) {

@@ -1732,6 +1732,44 @@ fn toPropertyKeyValue(arena: std.mem.Allocator, v: Value) !Value {
     return val_mod.makeString(arena, s);
 }
 
+/// `__nameFn__(fn, key)` → fn, after SetFunctionName(fn, key). Wraps a class
+/// field's initializer when that initializer is an anonymous function
+/// definition: `class C { f = function(){} }` names the function "f"
+/// (ClassFieldDefinitionEvaluation → NamedEvaluation), unlike the otherwise
+/// equivalent `this.f = function(){}`. The parser only emits the wrapper for
+/// shapes that qualify, so there is no anonymity check here.
+pub fn nativeNameFn(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const fn_val = if (args.len >= 1) args[0] else Value{};
+    const key = if (args.len >= 2) args[1] else Value{};
+    try @import("../../vm/ops/property.zig").setFunctionNameFromKey(arena, fn_val, key, 0);
+    return fn_val;
+}
+
+/// `__defineNamedMethod__(target, key, descriptor)` — the class-desugaring form
+/// of MethodDefinitionEvaluation for a *computed* key. It is Object.defineProperty
+/// preceded by SetFunctionName(fn, key[, "get"/"set"]): a class method's `.name`
+/// is its property key, which for `class C { [expr]() {} }` is only known at
+/// runtime. The descriptor carries exactly one of value/get/set, and that member
+/// picks the accessor prefix. ToPropertyKey runs once here (a key object's
+/// @@toPrimitive must not be observed twice) and the result is passed on.
+pub fn nativeDefineNamedMethod(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const target = if (args.len >= 1) args[0] else Value{};
+    const key = try toPropertyKeyValue(arena, if (args.len >= 2) args[1] else Value{});
+    const desc_val = if (args.len >= 3) args[2] else Value{};
+    if (desc_val.bits != 0 and desc_val.unbox() == .object) {
+        const desc = desc_val.toPtr().object;
+        const property_ops = @import("../../vm/ops/property.zig");
+        if (desc.getOwn("value")) |fv| {
+            try property_ops.setFunctionNameFromKey(arena, fv, key, 0);
+        } else if (desc.getOwn("get")) |gv| {
+            try property_ops.setFunctionNameFromKey(arena, gv, key, 1);
+        } else if (desc.getOwn("set")) |sv| {
+            try property_ops.setFunctionNameFromKey(arena, sv, key, 2);
+        }
+    }
+    return nativeObjectDefineProperty(arena, Value{}, &[_]Value{ target, key, desc_val });
+}
+
 pub fn nativeObjectDefineProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     // Proxy [[DefineOwnProperty]]: dispatch the `defineProperty` trap.
     if (args.len >= 1 and args[0].bits != 0 and args[0].unbox() == .object and

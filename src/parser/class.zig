@@ -200,6 +200,8 @@ const ClassMember = struct {
     computed_key: ?*Node = null,
     params: [][]const u8 = &[_][]const u8{},
     param_defaults: []?*Node = &[_]?*Node{},
+    /// ExpectedArgumentCount for `fn.length` (see parser.ParamParse).
+    expected_argc: ?u16 = null,
     rest_param: ?[]const u8 = null,
     body: []*Node = &[_]*Node{},
     /// Source span of this member (name through end of body), captured in
@@ -217,6 +219,10 @@ const ClassField = struct {
     name: []const u8 = "",
     computed_key: ?*Node = null,
     init: ?*Node = null,
+    /// ES2022 static initialization block (`static { ... }`). Carries the block's
+    /// statements instead of a key/initializer; kept in the same list as static
+    /// fields because the two run interleaved, in source order.
+    static_block: ?[]*Node = null,
 };
 
 const ClassBodyParse = struct {
@@ -239,6 +245,17 @@ fn nextTokenEndsName(p: *Parser) bool {
     return k == .left_paren or k == .eq or k == .semicolon or k == .right_brace;
 }
 
+/// Parse `static { ... }` — the ClassStaticBlockBody statement list, with `{`
+/// as the current token. It is its own function-like scope, so the body is
+/// parsed the same way a function body is; the extra rules are that `await` is
+/// reserved throughout (a nested function re-enables it, which
+/// `parseFunctionBody` handles by saving the flag), and `arguments` and
+/// `return` are Syntax Errors — the block has neither.
+fn parseStaticBlockBody(p: *Parser) ?[]*Node {
+    p.next_body_is_static_block = true;
+    return parseFunctionBody(p);
+}
+
 /// Parse the body of a class (`{` already consumed). Consumes the closing `}`.
 /// Handles `static`, `get`/`set` accessors, and computed `[expr]` keys.
 fn parseClassMembers(p: *Parser) ?ClassBodyParse {
@@ -253,6 +270,19 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             is_static = true;
             _ = p.advance();
         }
+        // ES2022 static initialization block: `static { ... }`. Its body is a
+        // statement list evaluated once at class-definition time with `this`
+        // bound to the constructor, so it is kept alongside the static fields
+        // (which it interleaves with) rather than as a member.
+        if (is_static and p.check(.left_brace)) {
+            const block = parseStaticBlockBody(p) orelse return null;
+            fields.append(p.arena, .{ .is_static = true, .static_block = block }) catch {
+                p.had_error = true;
+                return null;
+            };
+            continue;
+        }
+
         // Method [[SourceText]] excludes the `static` ClassElement prefix, so the
         // source span begins at the first token after `static` (the `async`/`*`/
         // `get`/`set` modifier or the method key itself).
@@ -355,6 +385,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
                 .computed_key = computed_key,
                 .params = mparams.params,
                 .param_defaults = mparams.param_defaults,
+                .expected_argc = mparams.expected_argc,
                 .rest_param = mparams.rest_param,
                 .body = mbody,
                 .src_start = member_start,
@@ -589,6 +620,40 @@ fn manglePrivateNames(p: *Parser, parsed: *ClassBodyParse) bool {
     return true;
 }
 
+/// IsAnonymousFunctionDefinition(expr): the shapes whose `.name` comes from the
+/// surrounding definition. Mirrors the compiler's check of the same name.
+fn isAnonFnDef(node: *Node) bool {
+    return switch (node.kind) {
+        .function_expr => node.data.function_expr.name == null,
+        .call_expr => node.data.call_expr.anon_class_iife,
+        else => false,
+    };
+}
+
+/// A class field's initializer, wrapped in `__nameFn__(init, "<name>")` when it
+/// is an anonymous function definition — `class C { f = () => {} }` names the
+/// arrow "f", which the plain `this.f = () => {}` the field desugars to would
+/// not do. Computed keys are left alone: naming them would mean evaluating the
+/// key expression a second time.
+fn namedFieldInit(p: *Parser, f: ClassField, val: *Node) ?*Node {
+    return namedFieldInitOf(p, f, val, val);
+}
+
+/// As `namedFieldInit`, but for the static-field shape where the initializer has
+/// already been wrapped in `(function(){ return <init>; }).call(C)`: the
+/// anonymity test looks at the original `check` node while the wrapper `val` is
+/// what gets named.
+fn namedFieldInitOf(p: *Parser, f: ClassField, val: *Node, check: *Node) ?*Node {
+    if (f.computed_key != null or !isAnonFnDef(check)) return val;
+    const s = p.current.start;
+    const callee = nodeIdent(p, "__nameFn__") orelse return null;
+    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = f.name }) orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, val) catch return null;
+    args.append(p.arena, key) catch return null;
+    return p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+}
+
 /// Build an instance-field initializer statement: `this.<name> = <init>` (or
 /// `this[<computed>] = <init>`), with `undefined` when there is no initializer.
 /// A private name (`#x`) is emitted as a non-computed member, so it resolves to
@@ -600,7 +665,8 @@ fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
         (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = this_node, .property = k, .computed = true } }) orelse return null)
     else
         markPrivateDefine(nodeMember(p, this_node, f.name) orelse return null, false);
-    const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const raw = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const val = namedFieldInit(p, f, raw) orelse return null;
     const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
 }
@@ -622,7 +688,8 @@ fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
 fn makeDerivedInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
     const s = p.current.start;
     const superthis = nodeIdent(p, "__superthis") orelse return null;
-    const val = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const raw = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
+    const val = namedFieldInit(p, f, raw) orelse return null;
 
     // Private fields: `__superthis.#name = init` (member assignment → PrivateFieldAdd).
     if (f.computed_key == null and f.name.len > 0 and f.name[0] == '#') {
@@ -675,6 +742,24 @@ fn appendDerivedInstanceFields(p: *Parser, list: *std.ArrayList(*Node), fields: 
 /// same wrapper; the result is identical.
 fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node {
     const s = p.current.start;
+    // ES2022 static initialization block: same `this`-is-the-class wrapper as a
+    // static field, but the block's whole statement list is the body and there
+    // is nothing to assign. `(function () { <body> }).call(ClassName);`
+    if (f.static_block) |block| {
+        const blk_fn = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
+            .name = null,
+            .params = &[_][]const u8{},
+            .body = block,
+            .is_arrow = false,
+        } }) orelse return null;
+        const blk_call_member = nodeMember(p, blk_fn, "call") orelse return null;
+        const blk_args = p.arena.alloc(*Node, 1) catch return null;
+        blk_args[0] = nodeIdent(p, class_name) orelse return null;
+        const blk_call = p.makeNode(.call_expr, s, s, .{
+            .call_expr = .{ .callee = blk_call_member, .args = blk_args },
+        }) orelse return null;
+        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = blk_call });
+    }
     const cls = nodeIdent(p, class_name) orelse return null;
     const lhs = if (f.computed_key) |k|
         (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = cls, .property = k, .computed = true } }) orelse return null)
@@ -696,7 +781,8 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
     const this_arg = nodeIdent(p, class_name) orelse return null;
     const call_args = p.arena.alloc(*Node, 1) catch return null;
     call_args[0] = this_arg;
-    const val = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = call_member, .args = call_args } }) orelse return null;
+    const call_val = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = call_member, .args = call_args } }) orelse return null;
+    const val = namedFieldInitOf(p, f, call_val, raw_init) orelse return null;
 
     const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
@@ -827,6 +913,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         .name = method_name,
         .params = m.params,
         .param_defaults = m.param_defaults,
+        .expected_argc = m.expected_argc,
         .rest_param = m.rest_param,
         .body = body,
         .is_arrow = false,
@@ -862,8 +949,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         props.append(p.arena, .{ .key = "enumerable", .value = f_val }) catch return null;
         props.append(p.arena, .{ .key = "configurable", .value = t_val }) catch return null;
         const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
-        const id_obj = nodeIdent(p, "Object") orelse return null;
-        const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+        const callee = defineMethodCallee(p, m.computed_key != null) orelse return null;
         var args = std.ArrayList(*Node){};
         args.append(p.arena, target) catch return null;
         args.append(p.arena, key_val) catch return null;
@@ -882,14 +968,23 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
     props.append(p.arena, .{ .key = "enumerable", .value = f_val }) catch return null;
     const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
 
-    const id_obj = nodeIdent(p, "Object") orelse return null;
-    const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+    const callee = defineMethodCallee(p, m.computed_key != null) orelse return null;
     var args = std.ArrayList(*Node){};
     args.append(p.arena, target) catch return null;
     args.append(p.arena, key_val) catch return null;
     args.append(p.arena, desc) catch return null;
     const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
+}
+
+/// Callee for the `Object.defineProperty(target, key, desc)` a class method
+/// desugars to. A computed key routes through `__defineNamedMethod__` instead:
+/// the method's `.name` is its property key, which is only known once the key
+/// expression has run, and that helper applies SetFunctionName before defining.
+fn defineMethodCallee(p: *Parser, computed: bool) ?*Node {
+    if (computed) return nodeIdent(p, "__defineNamedMethod__");
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    return nodeMember(p, id_obj, "defineProperty");
 }
 
 pub fn parseClassDeclStmt(p: *Parser) ?*Node {
@@ -1290,11 +1385,20 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
         .function_expr = .{ .name = null, .params = &[_][]const u8{}, .body = out.items, .is_arrow = false },
     }) orelse return null;
     return p.makeNode(.call_expr, start, p.current.start, .{
-        .call_expr = .{ .callee = fn_expr, .args = &[_]*Node{} },
+        .call_expr = .{
+            .callee = fn_expr,
+            .args = &[_]*Node{},
+            .anon_class_iife = !has_name and anon_name_hint == null,
+        },
     });
 }
 
 pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
+    // Formal parameters belong to the function being parsed, not to an enclosing
+    // class static initialization block, so a default like `x = await` or
+    // `{y = arguments}` is fine there.
+    const sb_saved = p.leaveStaticBlock();
+    defer p.restoreStaticBlock(sb_saved);
     _ = p.expect(.left_paren) orelse return null;
     var params = std.ArrayList([]const u8){};
     var defaults = std.ArrayList(?*Node){};
@@ -1421,6 +1525,17 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         parser_file.rejectDuplicateParams(p);
         return null;
     }
+    // ExpectedArgumentCount, captured before the TDZ desugar below clears the
+    // initializers: the parameters up to (not including) the first defaulted
+    // one. A rest parameter is already outside `params`.
+    const expected_argc: u16 = blk: {
+        var n: u16 = 0;
+        for (defaults.items) |d| {
+            if (d != null) break;
+            n += 1;
+        }
+        break :blk n;
+    };
     // TDZ for default parameters: a non-simple parameter list (one with a
     // default) puts every parameter in a TDZ until its own initializer, so a
     // default referencing a not-yet-initialized parameter is a ReferenceError
@@ -1468,6 +1583,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         .params = params.items,
         .param_defaults = defaults.items,
         .rest_param = rest_param,
+        .expected_argc = expected_argc,
     };
 }
 
@@ -1485,6 +1601,20 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     p.pending_params_duplicate = false;
     _ = p.expect(.left_brace) orelse return null;
     p.fn_nesting_depth += 1;
+    // A nested function body establishes its own rules: a class static
+    // initialization block's restrictions on `await`, `arguments` and `return`
+    // stop at its boundary (`static { function f(await) {} }` is legal).
+    // parseStaticBlockBody re-arms them around its own call to this function.
+    const is_static_block = p.next_body_is_static_block;
+    p.next_body_is_static_block = false;
+    const saved_await_reserved = p.await_is_reserved;
+    const saved_in_static_block = p.in_static_block;
+    p.await_is_reserved = is_static_block;
+    p.in_static_block = is_static_block;
+    defer {
+        p.await_is_reserved = saved_await_reserved;
+        p.in_static_block = saved_in_static_block;
+    }
     // A function body is strict if it inherits strictness from the enclosing
     // code or carries its own "use strict" directive prologue. Restored on exit
     // so a strict function nested in sloppy code doesn't leak strictness back.

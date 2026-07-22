@@ -25,6 +25,11 @@ pub const ParamParse = struct {
     params: [][]const u8,
     param_defaults: []?*Node,
     rest_param: ?[]const u8,
+    /// ExpectedArgumentCount (§15.1.5) — the formal parameters before the first
+    /// defaulted or rest one, i.e. what `fn.length` reports. Captured here
+    /// because the default-parameter TDZ desugar in `parseFunctionParams`
+    /// rewrites the initializers into the body and clears `param_defaults`.
+    expected_argc: u16 = 0,
 };
 
 /// Check if first statement of body is "use strict" directive.
@@ -155,6 +160,18 @@ pub const Parser = struct {
     /// M16 Phase 5: nesting depth inside function bodies. 0 = top-level module code;
     /// incremented by parseFunctionBody so import hoisting only applies at top level.
     fn_nesting_depth: u32,
+    /// Inside a class static initialization block, `await` is reserved: it is
+    /// neither an identifier nor an operator there (§15.7.1). Cleared when a
+    /// nested function body is entered — that body re-establishes its own rules,
+    /// so `static { function f(await) {} }` is legal.
+    await_is_reserved: bool = false,
+    /// Innermost function-like scope is a class static initialization block, so
+    /// `arguments` and `return` are Syntax Errors. Cleared, like
+    /// `await_is_reserved`, when a nested function body is entered.
+    in_static_block: bool = false,
+    /// One-shot: the next `parseFunctionBody` call is a ClassStaticBlockBody,
+    /// so it arms `await_is_reserved`/`in_static_block` instead of clearing them.
+    next_body_is_static_block: bool = false,
     /// M16 Phase 5: import statements collected at top level (fn_nesting_depth == 0)
     /// to be inserted before entry body stmts, so require() runs before any assertions.
     hoisted_import_stmts: std.ArrayList(*Node),
@@ -249,6 +266,12 @@ pub const Parser = struct {
     /// chain. Only then is SuperProperty (`super.x`) legal inside the eval'd
     /// code; SuperCall never is, and an indirect eval permits neither.
     eval_allow_super_prop: bool = false,
+    /// Set with `eval_code` for a direct eval whose calling context is a function
+    /// invocation, which is the only place `new.target` is legal (§13.3.12.1: it
+    /// is a SyntaxError unless the code is contained in function code). The VM
+    /// detects it from a `__new_target__` binding below the global scope, so an
+    /// indirect eval — which is global code — never gets it.
+    eval_allow_new_target: bool = false,
     /// True when the code currently being parsed is strict-mode code (a "use
     /// strict" directive prologue at script/eval/function scope, or module code).
     /// Drives the strict-only early SyntaxErrors: future-reserved words used as
@@ -474,6 +497,34 @@ pub const Parser = struct {
     // ---------------------------------------------------------------- parse ---
 
     /// Parse a complete script. Returns list of top-level statements or an error.
+    /// Suspend the class-static-block restrictions (`await` reserved,
+    /// `arguments`/`return` banned) for a nested function's parameter list or
+    /// body — those establish their own rules, so `static { (x = await) => {} }`
+    /// and `static { function f(){ arguments } }` are both legal. Pair with
+    /// `restoreStaticBlock`.
+    pub fn leaveStaticBlock(self: *Parser) [2]bool {
+        const saved = [2]bool{ self.await_is_reserved, self.in_static_block };
+        self.await_is_reserved = false;
+        self.in_static_block = false;
+        return saved;
+    }
+
+    pub fn restoreStaticBlock(self: *Parser, saved: [2]bool) void {
+        self.await_is_reserved = saved[0];
+        self.in_static_block = saved[1];
+    }
+
+    /// The early-error message for `name` used as an identifier directly inside
+    /// a class static initialization block, or null when it is fine there.
+    /// §15.7.1: the block has no `arguments` binding, and `await` is reserved.
+    pub fn staticBlockReservedIdent(self: *Parser, name: []const u8) ?[]const u8 {
+        if (self.await_is_reserved and std.mem.eql(u8, name, "await"))
+            return "'await' is reserved in a class static initialization block";
+        if (self.in_static_block and std.mem.eql(u8, name, "arguments"))
+            return "'arguments' is not allowed in a class static initialization block";
+        return null;
+    }
+
     pub fn parseScript(self: *Parser) ParseResult {
         var stmts = std.ArrayList(*Node){};
         const li_start = self.live_imports.items.len;

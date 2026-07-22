@@ -407,6 +407,48 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const knd: []const u8 = if (kind == 0) "get" else "set";
             try writer.print(" R{d}[R{d}] {s}= R{d}", .{ robj, rkey, knd, rfn });
         },
+        .RESOLVE_REF, .GET_REF, .PUT_REF => {
+            const first = code[new_pc];
+            new_pc += 1;
+            const rref = if (op == .GET_REF) blk: {
+                const r = code[new_pc];
+                new_pc += 1;
+                break :blk r;
+            } else first;
+            const lo = code[new_pc];
+            new_pc += 1;
+            const hi = code[new_pc];
+            new_pc += 1;
+            const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+            const nm: []const u8 = if (kidx < chunk.constants.len and
+                chunk.constants[kidx].bits != 0 and chunk.constants[kidx].unbox() == .string)
+                chunk.constants[kidx].unbox().string
+            else
+                "?";
+            switch (op) {
+                .RESOLVE_REF => try writer.print(" R{d} <- ref(\"{s}\")", .{ rref, nm }),
+                .GET_REF => try writer.print(" R{d} <- \"{s}\" (ref R{d})", .{ first, nm, rref }),
+                else => {
+                    const rsrc = code[new_pc];
+                    new_pc += 1;
+                    try writer.print(" ref R{d} \"{s}\" <- R{d}", .{ rref, nm, rsrc });
+                },
+            }
+        },
+        .SET_FN_NAME => {
+            const rfn = code[new_pc];
+            new_pc += 1;
+            const rkey = code[new_pc];
+            new_pc += 1;
+            const prefix = code[new_pc];
+            new_pc += 1;
+            const pfx: []const u8 = switch (prefix) {
+                1 => "get ",
+                2 => "set ",
+                else => "",
+            };
+            try writer.print(" R{d}.name = \"{s}\" + R{d}", .{ rfn, pfx, rkey });
+        },
         .ARRAY_APPEND => {
             const rarr = code[new_pc];
             new_pc += 1;

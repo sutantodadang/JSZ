@@ -656,6 +656,55 @@ pub inline fn opDefineAccessorDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome
     return null;
 }
 
+/// SetFunctionName(fn, propertyKey, prefix) — spec 10.2.9. The compiler only
+/// emits this where `fn` is syntactically an anonymous function definition, so
+/// there is no "already has a name" check to make here.
+pub fn setFunctionNameFromKey(
+    arena: std.mem.Allocator,
+    fn_val: Value,
+    key_val: Value,
+    prefix: u8,
+) !void {
+    if (fn_val.bits == 0 or fn_val.unbox() != .bc_function) return;
+    const closure = fn_val.unbox().bc_function;
+    // A symbol key contributes "[description]", or "" when the description is
+    // undefined; anything else is the key's string form.
+    const base: []const u8 = if (key_val.bits != 0 and key_val.unbox() == .symbol) blk: {
+        const desc = key_val.unbox().symbol.description orelse break :blk "";
+        break :blk try std.fmt.allocPrint(arena, "[{s}]", .{desc});
+    } else try bcv.valueToStringArena(arena, key_val);
+    const name = switch (prefix) {
+        1 => try std.fmt.allocPrint(arena, "get {s}", .{base}),
+        2 => try std.fmt.allocPrint(arena, "set {s}", .{base}),
+        else => base,
+    };
+    closure.name_override = name;
+    // The backing object materializes "name" as a real own property; if it
+    // already exists, keep it in sync with the override.
+    if (closure.obj) |op| {
+        const o: *JsObject = @ptrCast(@alignCast(op));
+        if (o.hasOwn("name")) {
+            _ = try o.defineOwnData("name", try val_mod.makeString(arena, name), .{
+                .writable = false,
+                .enumerable = false,
+                .configurable = true,
+            });
+        }
+    }
+}
+
+pub inline fn opSetFnName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rfn = code[frame.pc];
+    frame.pc += 1;
+    const rkey = code[frame.pc];
+    frame.pc += 1;
+    const prefix = code[frame.pc];
+    frame.pc += 1;
+    try setFunctionNameFromKey(self.arena, frame.registers[rfn], frame.registers[rkey], prefix);
+    return null;
+}
+
 pub inline fn opGetThis(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const rdst = code[frame.pc];

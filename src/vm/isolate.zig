@@ -354,6 +354,8 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__destrIterCloseThrow__", try val_mod.makeNativeFunction(arena, es2015.nativeDestrIterCloseThrow));
         try realm.global_env.define("__destrObjRest__", try val_mod.makeNativeFunction(arena, es2015.nativeDestrObjRest));
         try realm.global_env.define("__objSpreadInto__", try val_mod.makeNativeFunction(arena, es2015.nativeObjSpreadInto));
+        try realm.global_env.define("__defineNamedMethod__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/object_methods.zig").nativeDefineNamedMethod));
+        try realm.global_env.define("__nameFn__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/object_methods.zig").nativeNameFn));
         try realm.global_env.define("__makeNamespace__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeNamespace));
         // import-defer: `import defer * as ns` desugars to `__importDefer__(spec)`;
         // dynamic `import.defer(spec)` routes through `__importDeferDyn__`.
