@@ -1236,6 +1236,24 @@ pub const FnCompiler = struct {
                 try self.emitResolveRef(a.target.data.identifier, r, null, line);
                 rref = r;
             }
+            // `base[key] = rhs` evaluates the target's base and key EXPRESSIONS
+            // before the RHS (§13.15.2: the Reference comes first), though
+            // ToPropertyKey stays inside PutValue and so runs after it. The class
+            // desugar's private/define-data writes have no such observable
+            // reference and keep the simpler path.
+            var prepared: ?PreparedRef = null;
+            var rres: u8 = 0;
+            if (a.target.kind == .member_expr) {
+                const me = a.target.data.member_expr;
+                if (!me.private_define and !me.define_data) {
+                    // Reserve the result slot BEFORE the base/key registers: an
+                    // assignment in argument position must leave its value in the
+                    // lowest register it allocates, which is where the caller
+                    // expects the next contiguous argument.
+                    rres = self.allocReg();
+                    prepared = try self.prepareMemberRef(me);
+                }
+            }
             // NamedEvaluation: `x = function(){}` — inject binding name as hint.
             if (a.target.kind == .identifier and a.value.kind == .function_expr) {
                 self.name_hint = a.target.data.identifier;
@@ -1245,6 +1263,13 @@ pub const FnCompiler = struct {
             if (a.target.kind == .identifier) {
                 try self.emitPutRef(rref, a.target.data.identifier, rhs, line);
                 if (rref) |r| return self.collapseRef(r, rhs, line);
+            } else if (prepared) |pr| {
+                try self.emitPreparedWrite(pr, rhs, line);
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(rres);
+                try self.emitU8(rhs);
+                self.sp = rres + 1;
+                return rres;
             } else if (a.target.kind == .member_expr) {
                 try self.compileMemberWrite(a.target.data.member_expr, rhs, line);
             } else if (a.target.kind == .object_literal or a.target.kind == .array_literal) {

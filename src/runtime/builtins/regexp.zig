@@ -23,6 +23,7 @@
 const std = @import("std");
 const utab = @import("unicode_tables.zig");
 const uprop = @import("unicode_prop_tables.zig");
+const casefold = @import("unicode_casefold.zig");
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
@@ -232,6 +233,15 @@ pub fn utf8ByteLenAt(buf: []const u8, pos: usize) u8 {
     return decodeUtf8At(buf, pos).len;
 }
 
+/// Width of the code point at `pos` AS `/u` MODE SEES IT — a WTF-8 surrogate
+/// pair (how `\u{...}` escapes and String.fromCodePoint store astral
+/// characters) counts as the single 6-byte unit `decodeCpAt` folds it into.
+/// Scanning with `utf8ByteLenAt` instead would land in the middle of the pair
+/// and desynchronize from what the matcher just consumed.
+pub fn cpByteLenAt(buf: []const u8, pos: usize) u8 {
+    return decodeCpAt(buf, pos).len;
+}
+
 /// Decode one code point at `pos` the way `/u` and `/v` mode see the input.
 ///
 /// JSZ stores an astral character either as a single 4-byte UTF-8 sequence
@@ -331,6 +341,14 @@ pub const CharClass = struct {
 
     /// Match a Unicode codepoint (unicode mode).
     pub fn matchesCp(self: *const CharClass, cp: u21) bool {
+        const hit = self.containsCp(cp);
+        return if (self.negate) !hit else hit;
+    }
+
+    /// Membership BEFORE the leading `^` is applied. Case-insensitive matching
+    /// needs this: it has to test several case variants and negate the combined
+    /// result once, not once per variant.
+    pub fn containsCp(self: *const CharClass, cp: u21) bool {
         var hit = false;
         if (cp <= 255) {
             hit = self.bitmap[@intCast(cp)];
@@ -352,7 +370,7 @@ pub const CharClass = struct {
                 }
             }
         }
-        return if (self.negate) !hit else hit;
+        return hit;
     }
 
     /// Binary search a sorted, disjoint [lo,hi] range table for `cp`.
@@ -484,6 +502,11 @@ pub const RegexNode = union(enum) {
     },
     /// Phase 4d: backreference \1..\9
     back_ref: u8, // group index 1-9
+    /// ES2025 duplicate named capture groups: `\k<x>` when several groups share
+    /// the name `x`. The grammar guarantees they live in different alternatives,
+    /// so at most one has participated; the reference uses whichever is set and
+    /// matches the empty string when none is.
+    back_ref_multi: []const u32,
     /// ES2025 RegExp modifiers `(?ims-ims: ... )`: rebinds the i/m/s flags for
     /// the enclosed disjunction only. `add` and `remove` can never overlap --
     /// the parser rejects a modifier listed on both sides.
@@ -1018,6 +1041,67 @@ const PatternParser = struct {
         }
     }
 
+    /// Parse the ClassAtom that follows a `-` inside a character class and
+    /// return its code point. Ranges may be spelled with escapes on either side
+    /// (`[\x41-\x5A]`, `[\u{10401}-\u{10404}]`), which the per-escape cases
+    /// below cannot express on their own. A CharacterClassEscape stands for a
+    /// whole set and may never end a range.
+    fn parseClassRangeEnd(self: *PatternParser) ParseError!u21 {
+        if (self.eof()) return ParseError.InvalidPattern;
+        if (self.cur() != '\\') {
+            if (!self.unicode) {
+                const b = self.cur();
+                self.advance();
+                return b;
+            }
+            const dc = decodeUtf8At(self.src, self.pos);
+            self.pos += dc.len;
+            return dc.cp;
+        }
+        self.advance(); // backslash
+        if (self.eof()) return ParseError.InvalidPattern;
+        const e = self.cur();
+        self.advance();
+        return switch (e) {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            'v' => 0x0B,
+            'f' => 0x0C,
+            'b' => 0x08,
+            '0' => 0,
+            'x' => blk: {
+                if (self.pos + 1 >= self.src.len or
+                    hexVal(self.src[self.pos]) == null or
+                    hexVal(self.src[self.pos + 1]) == null)
+                {
+                    if (self.unicode) return ParseError.InvalidPattern;
+                    break :blk 'x';
+                }
+                const h1 = hexVal(self.src[self.pos]).?;
+                const h2 = hexVal(self.src[self.pos + 1]).?;
+                self.pos += 2;
+                break :blk @as(u21, h1) * 16 + h2;
+            },
+            'u' => try self.parseUEscape(),
+            'c' => blk: {
+                if (!self.eof() and isAsciiAlpha(self.cur())) {
+                    const v: u21 = self.cur() & 0x1F;
+                    self.advance();
+                    break :blk v;
+                }
+                if (self.unicode) return ParseError.InvalidPattern;
+                break :blk 'c';
+            },
+            'd', 'D', 'w', 'W', 's', 'S', 'p', 'P' => ParseError.InvalidPattern,
+            else => blk: {
+                if (self.unicode and !isSyntaxChar(e) and e != '/' and e != '-')
+                    return ParseError.InvalidPattern;
+                break :blk e;
+            },
+        };
+    }
+
     fn parseCharClass(self: *PatternParser) ParseError!RegexNode {
         if (self.eof() or self.cur() != '[') return ParseError.InvalidPattern;
         self.advance(); // consume [
@@ -1046,6 +1130,10 @@ const PatternParser = struct {
                     'd', 'D', 'w', 'W', 's', 'S', 'p', 'P' => true,
                     else => false,
                 };
+                // The code point this escape denotes, when it denotes exactly
+                // one — set below by the single-character cases so the range
+                // check after the switch can use it as a lower bound.
+                var single_cp: ?u21 = null;
                 if (self.unicode and is_set_escape and !self.eof() and self.cur() == '-' and
                     self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']')
                 {
@@ -1088,22 +1176,22 @@ const PatternParser = struct {
                             if (!is_s) cc.bitmap[@intCast(i)] = true;
                         }
                     },
-                    'n' => cc.addChar('\n'),
-                    't' => cc.addChar('\t'),
-                    'r' => cc.addChar('\r'),
-                    'v' => cc.addChar(0x0B),
-                    'f' => cc.addChar(0x0C),
+                    'n' => single_cp = '\n',
+                    't' => single_cp = '\t',
+                    'r' => single_cp = '\r',
+                    'v' => single_cp = 0x0B,
+                    'f' => single_cp = 0x0C,
                     // Inside a class `\b` is BACKSPACE, not a word boundary.
-                    'b' => cc.addChar(0x08),
+                    'b' => single_cp = 0x08,
                     '0' => {
                         if (self.unicode and !self.eof() and self.cur() >= '0' and self.cur() <= '9') {
                             return ParseError.InvalidPattern; // legacy octal
                         }
-                        cc.addChar(0);
+                        single_cp = 0;
                     },
                     'c' => {
                         if (!self.eof() and isAsciiAlpha(self.cur())) {
-                            cc.addChar(self.cur() & 0x1F);
+                            single_cp = self.cur() & 0x1F;
                             self.advance();
                         } else if (self.unicode) {
                             return ParseError.InvalidPattern;
@@ -1120,18 +1208,15 @@ const PatternParser = struct {
                             hexVal(self.src[self.pos + 1]) == null)
                         {
                             if (self.unicode) return ParseError.InvalidPattern;
-                            cc.addChar('x');
+                            single_cp = 'x';
                         } else {
                             const h1 = hexVal(self.src[self.pos]).?;
                             const h2 = hexVal(self.src[self.pos + 1]).?;
                             self.pos += 2;
-                            cc.addChar(@intCast(@as(u16, h1) * 16 + h2));
+                            single_cp = @as(u21, h1) * 16 + h2;
                         }
                     },
-                    'u' => {
-                        const cp = try self.parseUEscape();
-                        cc.addCpRange(self.alloc, cp, cp) catch return ParseError.OutOfMemory;
-                    },
+                    'u' => single_cp = try self.parseUEscape(),
                     'p', 'P' => {
                         if (!self.unicode) {
                             cc.addChar(esc);
@@ -1163,8 +1248,20 @@ const PatternParser = struct {
                         if (self.unicode and !isSyntaxChar(esc) and esc != '/' and esc != '-') {
                             return ParseError.InvalidPattern;
                         }
-                        cc.addChar(esc);
+                        single_cp = esc;
                     },
+                }
+                if (single_cp) |lo| {
+                    if (!self.eof() and self.cur() == '-' and
+                        self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']')
+                    {
+                        self.advance(); // consume -
+                        const hi = try self.parseClassRangeEnd();
+                        if (hi < lo) return ParseError.InvalidPattern;
+                        cc.addCpRange(self.alloc, lo, hi) catch return ParseError.OutOfMemory;
+                    } else {
+                        cc.addCpRange(self.alloc, lo, lo) catch return ParseError.OutOfMemory;
+                    }
                 }
             } else if (self.unicode and ch >= 0x80) {
                 // Non-ASCII codepoint start in unicode mode -- decode the full codepoint.
@@ -1197,29 +1294,11 @@ const PatternParser = struct {
                 self.advance();
                 if (!self.eof() and self.cur() == '-' and self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']') {
                     self.advance(); // consume -
-                    const end_ch_raw = self.cur();
-                    self.advance();
-                    const end_ch: u8 = if (end_ch_raw == '\\') blk: {
-                        if (self.eof()) return ParseError.InvalidPattern;
-                        const e = self.cur();
-                        self.advance();
-                        // `[a-\d]`: a CharacterClassEscape cannot end a range.
-                        if (self.unicode) switch (e) {
-                            'd', 'D', 'w', 'W', 's', 'S', 'p', 'P' => return ParseError.InvalidPattern,
-                            else => {},
-                        };
-                        break :blk switch (e) {
-                            'n' => '\n',
-                            't' => '\t',
-                            'r' => '\r',
-                            'v' => 0x0B,
-                            'f' => 0x0C,
-                            '0' => 0,
-                            else => e,
-                        };
-                    } else end_ch_raw;
-                    if (end_ch < start_ch) return ParseError.InvalidPattern;
-                    cc.addRange(start_ch, end_ch);
+                    // The endpoint may be an escape denoting any code point
+                    // (`[a-\u{10404}]`), so it is not limited to a byte.
+                    const end_cp = try self.parseClassRangeEnd();
+                    if (end_cp < start_ch) return ParseError.InvalidPattern;
+                    cc.addCpRange(self.alloc, start_ch, end_cp) catch return ParseError.OutOfMemory;
                 } else {
                     cc.addChar(start_ch);
                 }
@@ -1299,9 +1378,13 @@ const PatternParser = struct {
             if (self.eof()) return ParseError.InvalidPattern;
             const name = self.src[name_start..self.pos];
             self.advance(); // >
+            var hits = std.ArrayList(u32){};
             for (self.group_names) |ni| {
-                if (std.mem.eql(u8, ni.name, name)) return RegexNode{ .back_ref = @intCast(ni.idx) };
+                if (std.mem.eql(u8, ni.name, name))
+                    hits.append(self.alloc, ni.idx) catch return ParseError.OutOfMemory;
             }
+            if (hits.items.len == 1) return RegexNode{ .back_ref = @intCast(hits.items[0]) };
+            if (hits.items.len > 1) return RegexNode{ .back_ref_multi = hits.items };
             return ParseError.InvalidPattern; // unknown group name
         }
         return switch (c) {
@@ -1922,6 +2005,18 @@ fn isGroupNameChar(c: u8) bool {
 /// and non-capturing / assertion groups so indices match the parser exactly.
 fn scanGroupNames(alloc: std.mem.Allocator, src: []const u8, total_caps: *u32) ![]const NameIdx {
     var names = std.ArrayList(NameIdx){};
+    // Position of each named group within the Disjunction tree, as the chain of
+    // (disjunction id, alternative index) pairs from the root. Two same-named
+    // groups are legal exactly when some shared disjunction puts them in
+    // *different* alternatives (ES2025 duplicate named capture groups).
+    const PathEntry = struct { disj: u32, alt: u32 };
+    var stack = std.ArrayList(PathEntry){};
+    defer stack.deinit(alloc);
+    var paths = std.ArrayList([]const PathEntry){};
+    defer paths.deinit(alloc);
+    var next_disj: u32 = 1;
+    try stack.append(alloc, .{ .disj = 0, .alt = 0 });
+
     var cap: u32 = 0;
     var i: usize = 0;
     var in_class = false;
@@ -1941,7 +2036,20 @@ fn scanGroupNames(alloc: std.mem.Allocator, src: []const u8, total_caps: *u32) !
             i += 1;
             continue;
         }
+        if (c == '|') {
+            if (stack.items.len > 0) stack.items[stack.items.len - 1].alt += 1;
+            i += 1;
+            continue;
+        }
+        if (c == ')') {
+            if (stack.items.len > 1) _ = stack.pop();
+            i += 1;
+            continue;
+        }
         if (c == '(') {
+            // Every group — capturing or not — introduces a nested Disjunction.
+            const opened = PathEntry{ .disj = next_disj, .alt = 0 };
+            next_disj += 1;
             if (i + 1 < src.len and src[i + 1] == '?') {
                 // (?<name>...) is a named capture; (?<= / (?<! / (?: / (?= / (?!
                 // are assertions or non-capturing and take no index.
@@ -1952,17 +2060,40 @@ fn scanGroupNames(alloc: std.mem.Allocator, src: []const u8, total_caps: *u32) !
                     var j = i + 3;
                     while (j < src.len and src[j] != '>') j += 1;
                     try names.append(alloc, .{ .name = src[i + 3 .. j], .idx = cap });
+                    try paths.append(alloc, try alloc.dupe(PathEntry, stack.items));
+                    try stack.append(alloc, opened);
                     i = if (j < src.len) j + 1 else j;
                     continue;
                 }
+                try stack.append(alloc, opened);
                 i += 1;
                 continue;
             }
             cap += 1;
+            try stack.append(alloc, opened);
         }
         i += 1;
     }
     total_caps.* = cap;
+
+    // Early error: same name, and no enclosing disjunction separates them.
+    for (names.items, 0..) |a, ai| {
+        for (names.items[ai + 1 ..], ai + 1..) |b, bi| {
+            if (!std.mem.eql(u8, a.name, b.name)) continue;
+            const pa = paths.items[ai];
+            const pb = paths.items[bi];
+            var separated = false;
+            var k: usize = 0;
+            while (k < pa.len and k < pb.len) : (k += 1) {
+                if (pa[k].disj != pb[k].disj) break;
+                if (pa[k].alt != pb[k].alt) {
+                    separated = true;
+                    break;
+                }
+            }
+            if (!separated) return error.InvalidPattern;
+        }
+    }
     return names.items;
 }
 
@@ -2023,7 +2154,7 @@ pub fn matchAnywhere(
         }
         if (i >= input.len) break;
         // Under /u, advance by full codepoint to stay on codepoint boundaries.
-        i += if (regex.flags.cpMode()) @as(usize, utf8ByteLenAt(input, i)) else 1;
+        i += if (regex.flags.cpMode()) @as(usize, cpByteLenAt(input, i)) else 1;
     }
     return null;
 }
@@ -2066,28 +2197,15 @@ fn foldCase(c: u8) u8 {
 /// Handles ASCII + common Latin Extended-A/B pairs and a few other scripts.
 /// For a complete implementation a full fold table is needed; this covers
 /// the common cases (Latin, Greek uppercase-to-lowercase delta).
+/// Canonicalize under `/u` (§22.2.2.9.3): the *simple* case folding from
+/// CaseFolding.txt, so `/ſ/iu` matches "s" and `/K/iu` matches "k".
 fn foldCaseCp(cp: u21) u21 {
-    // ASCII fast path
+    // ASCII fast path — the table would give the same answer.
     if (cp < 0x80) {
         if (cp >= 'A' and cp <= 'Z') return cp + 32;
         return cp;
     }
-    // Latin-1 Supplement uppercase (U+00C0..U+00D6, U+00D8..U+00DE -> +0x20)
-    if (cp >= 0x00C0 and cp <= 0x00D6) return cp + 0x20;
-    if (cp >= 0x00D8 and cp <= 0x00DE) return cp + 0x20;
-    // Latin Extended-A: alternating upper/lower pairs (U+0100..U+012E even=upper)
-    if (cp >= 0x0100 and cp <= 0x012E and cp & 1 == 0) return cp + 1;
-    if (cp >= 0x0130 and cp <= 0x0136 and cp & 1 == 0) return cp + 1;
-    if (cp >= 0x0139 and cp <= 0x0148 and cp & 1 == 1) return cp + 1;
-    if (cp >= 0x014A and cp <= 0x0177 and cp & 1 == 0) return cp + 1;
-    if (cp == 0x0178) return 0x00FF;
-    if (cp >= 0x0179 and cp <= 0x017E and cp & 1 == 1) return cp + 1;
-    // Greek uppercase to lowercase (U+0391..U+03A9 -> +0x20, except U+03A2)
-    if (cp >= 0x0391 and cp <= 0x03A9 and cp != 0x03A2) return cp + 0x20;
-    // Cyrillic uppercase (U+0410..U+042F -> +0x20)
-    if (cp >= 0x0410 and cp <= 0x042F) return cp + 0x20;
-    // Already lowercase or no simple fold: return as-is.
-    return cp;
+    return casefold.simpleFold(cp);
 }
 // --- Shared single-position primitives (used by both matchNode and the Pike VM)
 // so the two execution engines agree on every character-level semantic.
@@ -2123,19 +2241,23 @@ fn consumeClass(input: []const u8, pos: usize, cc: *const CharClass, flags: *con
     if (pos >= input.len) return null;
     if (flags.cpMode()) {
         const dc = decodeCpAt(input, pos);
-        var cp = dc.cp;
-        if (flags.ignore_case) cp = foldCaseCp(cp);
-        var hit = cc.matchesCp(cp);
-        if (flags.ignore_case and !hit) {
-            const alt: u21 = if (cp >= 'a' and cp <= 'z')
-                cp - 32
-            else if (cp >= 'A' and cp <= 'Z')
-                cp + 32
-            else
-                cp;
-            if (alt != cp) hit = cc.matchesCp(alt);
+        const cp = dc.cp;
+        var raw = cc.containsCp(cp);
+        if (flags.ignore_case and !raw) {
+            // Canonicalize applies to the class members too, and the class stores
+            // them uncanonicalized — so try the subject's folding and every code
+            // point sharing it (`/[ſ]/iu` must match "s", and vice versa). The
+            // negation is applied once, after all variants have been tried.
+            const f = foldCaseCp(cp);
+            if (f != cp) raw = cc.containsCp(f);
+            if (!raw) for (casefold.unfold(f)) |u| {
+                if (u.cp != cp and cc.containsCp(u.cp)) {
+                    raw = true;
+                    break;
+                }
+            };
         }
-        if (!hit) return null;
+        if (!(if (cc.negate) !raw else raw)) return null;
         return pos + dc.len;
     } else {
         var c = input[pos];
@@ -2277,6 +2399,29 @@ fn matchNode(
                 return if (matched_lb) pos else null;
             }
         },
+        .back_ref_multi => |idxs| {
+            var chosen: ?CaptureSpan = null;
+            for (idxs) |i| {
+                if (i >= MAX_CAPTURES) continue;
+                if (!caps[i].unset()) {
+                    chosen = caps[i];
+                    break;
+                }
+            }
+            const cap = chosen orelse return pos;
+            const captured = input[cap.start..cap.end];
+            const clen = captured.len;
+            if (pos + clen > input.len) return null;
+            const slice = input[pos .. pos + clen];
+            if (flags.ignore_case) {
+                for (slice, captured) |a, b| {
+                    if (foldCase(a) != foldCase(b)) return null;
+                }
+            } else {
+                if (!std.mem.eql(u8, slice, captured)) return null;
+            }
+            return pos + clen;
+        },
         .back_ref => |idx| {
             if (idx >= MAX_CAPTURES) return pos;
             const cap = caps[idx];
@@ -2299,6 +2444,12 @@ fn matchNode(
     }
 }
 
+fn clearCaptures(caps: *[MAX_CAPTURES]CaptureSpan, range: ?CaptureRange) void {
+    const r = range orelse return;
+    var i: u32 = r.lo;
+    while (i <= r.hi and i < MAX_CAPTURES) : (i += 1) caps[i] = INVALID_CAP;
+}
+
 fn matchQuant(
     inner: *const RegexNode,
     min: u32,
@@ -2309,12 +2460,16 @@ fn matchQuant(
     caps: *[MAX_CAPTURES]CaptureSpan,
     flags: *const CompiledRegex.Flags,
 ) ?usize {
+    // RepeatMatcher resets the quantified atom's own captures before every
+    // repetition, so an earlier iteration's groups cannot leak into a later one.
+    const clear_range = captureRange(inner);
     if (lazy) {
         var count: u32 = 0;
         var pos = start;
 
         while (count < min) {
             const saved_caps = caps.*;
+            clearCaptures(caps, clear_range);
             const next = matchNode(inner, input, pos, caps, flags) orelse {
                 caps.* = saved_caps;
                 return null;
@@ -2340,6 +2495,7 @@ fn matchQuant(
 
         while (count < max) {
             const saved_caps = caps.*;
+            clearCaptures(caps, clear_range);
             const next = matchNode(inner, input, pos, caps, flags) orelse {
                 caps.* = saved_caps;
                 break;
@@ -2396,7 +2552,43 @@ const Inst = union(enum) {
     assert_wb, // \b
     assert_nwb, // \B
     look: *const RegexNode, // (?=)/(?!)/(?<=)/(?<!) — a look_ahead/look_behind node
+    /// Reset capture groups `lo..hi` (inclusive, 1-based) to unset. Emitted at
+    /// the head of every repetition of a quantified atom — RepeatMatcher clears
+    /// the atom's own captures before each iteration (ES §22.2.2.5.1).
+    clear: CaptureRange,
 };
+
+/// An inclusive 1-based range of capture-group indices.
+const CaptureRange = struct { lo: u32, hi: u32 };
+
+/// The span of capture-group indices contained in `node`, or null when it has
+/// none. Groups are numbered by opening paren, so any subtree's groups form a
+/// contiguous range.
+fn captureRange(node: *const RegexNode) ?CaptureRange {
+    return switch (node.*) {
+        .group => |g| blk: {
+            const inner = captureRange(g.inner);
+            break :blk .{ .lo = g.idx, .hi = if (inner) |r| @max(g.idx, r.hi) else g.idx };
+        },
+        .seq, .alt => |kids| blk: {
+            var acc: ?CaptureRange = null;
+            for (kids) |*k| acc = mergeRange(acc, captureRange(k));
+            break :blk acc;
+        },
+        .non_capturing => |inner| captureRange(inner),
+        .quant => |q| captureRange(q.inner),
+        .look_ahead => |la| captureRange(la.inner),
+        .look_behind => |lb| captureRange(lb.inner),
+        .modifier => |m| captureRange(m.inner),
+        else => null,
+    };
+}
+
+fn mergeRange(a: ?CaptureRange, b: ?CaptureRange) ?CaptureRange {
+    const x = a orelse return b;
+    const y = b orelse return a;
+    return .{ .lo = @min(x.lo, y.lo), .hi = @max(x.hi, y.hi) };
+}
 
 /// A compiled Pike-VM program: a flat instruction array plus the number of
 /// capture slots (2 per group, +2 for the whole match).
@@ -2439,11 +2631,17 @@ const ProgBuilder = struct {
         self.insts.items[at] = inst;
     }
 
+    /// Emit the head of one repetition: the atom's own captures are reset first.
+    fn compileRepBody(self: *ProgBuilder, inner: *const RegexNode, range: ?CaptureRange) void {
+        if (range) |r| _ = self.emit(.{ .clear = r });
+        self.compileNode(inner);
+    }
+
     /// Emit `inner`, then a greedy/lazy `?` (optional) around it.
-    fn compileQuest(self: *ProgBuilder, inner: *const RegexNode, lazy: bool) void {
+    fn compileQuest(self: *ProgBuilder, inner: *const RegexNode, lazy: bool, range: ?CaptureRange) void {
         const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
         const body = self.here();
-        self.compileNode(inner);
+        self.compileRepBody(inner, range);
         const exit = self.here();
         if (lazy) {
             self.patch(split_at, .{ .split = .{ .a = exit, .b = body } });
@@ -2453,11 +2651,11 @@ const ProgBuilder = struct {
     }
 
     /// Emit a greedy/lazy `*` (Kleene star) around `inner`.
-    fn compileStar(self: *ProgBuilder, inner: *const RegexNode, lazy: bool) void {
+    fn compileStar(self: *ProgBuilder, inner: *const RegexNode, lazy: bool, range: ?CaptureRange) void {
         const l1 = self.here();
         const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
         const body = self.here();
-        self.compileNode(inner);
+        self.compileRepBody(inner, range);
         _ = self.emit(.{ .jmp = l1 });
         const exit = self.here();
         if (lazy) {
@@ -2474,20 +2672,21 @@ const ProgBuilder = struct {
             self.failed = true;
             return;
         }
+        const range = captureRange(inner);
         var i: u32 = 0;
         while (i < min) : (i += 1) {
-            self.compileNode(inner);
+            self.compileRepBody(inner, range);
             if (self.failed) return;
         }
         if (max == inf) {
             // `{min,}` — the mandatory copies are done; a star covers the rest.
-            self.compileStar(inner, lazy);
+            self.compileStar(inner, lazy, range);
         } else {
             // `{min,max}` — (max-min) greedy/lazy optional copies. Contiguous
             // matching means flat optionals need no nesting to avoid gaps.
             var k: u32 = min;
             while (k < max) : (k += 1) {
-                self.compileQuest(inner, lazy);
+                self.compileQuest(inner, lazy, range);
                 if (self.failed) return;
             }
         }
@@ -2539,7 +2738,7 @@ const ProgBuilder = struct {
             .quant => |q| self.compileQuant(q.inner, q.min, q.max, q.lazy),
             .look_ahead, .look_behind => _ = self.emit(.{ .look = node }),
             // Backreference patterns never reach the Pike VM (has_backref gate).
-            .back_ref => self.failed = true,
+            .back_ref, .back_ref_multi => self.failed = true,
             // Flag decisions are baked into the emitted instructions, so a
             // mid-pattern rebind cannot be expressed; fall back to the
             // backtracker (compileRegex also gates on hasModifier).
@@ -2552,7 +2751,7 @@ const ProgBuilder = struct {
 /// lookaround). Such patterns are NP-hard and use the backtracking engine.
 fn hasBackref(node: *const RegexNode) bool {
     return switch (node.*) {
-        .back_ref => true,
+        .back_ref, .back_ref_multi => true,
         .seq => |nodes| blk: {
             for (nodes) |*c| if (hasBackref(c)) break :blk true;
             break :blk false;
@@ -2687,6 +2886,19 @@ const PikeVM = struct {
                     self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
                 }
             },
+            .clear => |r| {
+                const lo = 2 * @as(usize, r.lo);
+                const hi = @min(2 * @as(usize, r.hi) + 2, self.ns);
+                if (lo >= hi) {
+                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                } else {
+                    var saved: [2 * MAX_CAPTURES]isize = undefined;
+                    @memcpy(saved[0 .. hi - lo], caps[lo..hi]);
+                    @memset(caps[lo..hi], -1);
+                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                    @memcpy(caps[lo..hi], saved[0 .. hi - lo]);
+                }
+            },
             .assert_bol => if (testBol(input, sp, flags))
                 self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
             .assert_eol => if (testEol(input, sp, flags))
@@ -2798,7 +3010,7 @@ const PikeVM = struct {
             // width of the code point at `sp` under `u`/`v` — otherwise a
             // consuming instruction after a multi-byte code point would read from
             // the middle of a UTF-8 sequence.
-            sp += if (flags.cpMode() and sp < input.len) @as(usize, utf8ByteLenAt(input, sp)) else 1;
+            sp += if (flags.cpMode() and sp < input.len) @as(usize, cpByteLenAt(input, sp)) else 1;
         }
 
         if (!self.matched_valid) return null;
@@ -2916,29 +3128,35 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     const flags_arg = if (args.len > 1) args[1] else Value{};
     const flags_undefined = flags_arg.bits == 0 or flags_arg.unbox() == .undefined_;
 
-    // Step 1-2: `RegExp(re)` (no `new`, no flags) with a RegExp whose
-    // .constructor is %RegExp% returns that very object (§22.2.4.1).
+    // Step 1: IsRegExp(pattern) is observed once, up front — an @@match getter
+    // must not run again for the source/flags reads below.
+    const pattern_is_regexp = try isRegExpValue(arena, pattern_arg);
     const pattern_cr: ?*CompiledRegex = if (pattern_arg.bits != 0 and pattern_arg.unbox() == .object)
         getCompiledRegex(pattern_arg)
     else
         null;
-    if (!is_construct and flags_undefined and pattern_cr != null and try isRegExpValue(arena, pattern_arg)) {
-        const ctor_v = pattern_arg.toPtr().object.get("constructor");
-        if (ctor_v) |cv| {
-            if (cv.bits != 0 and cv.unbox() == .object and
-                active_regexp_ctor == cv.toPtr().object) return pattern_arg;
-        }
+
+    // Step 2.b: `RegExp(re)` (no `new`, no flags) whose .constructor is %RegExp%
+    // returns that very object — including a merely RegExp-*like* one (§22.2.4.1).
+    if (!is_construct and flags_undefined and pattern_is_regexp) {
+        const cv = try ctxGetProp(arena, pattern_arg, "constructor");
+        if (cv.bits != 0 and cv.unbox() == .object and
+            active_regexp_ctor == cv.toPtr().object) return pattern_arg;
     }
 
-    // Step 3/5 + RegExpInitialize: P is the source of a RegExp argument, else
-    // ToString(pattern) (undefined → ""); F is ToString(flags) (undefined → the
-    // RegExp argument's own flags, else "").
+    // Steps 4-6 + RegExpInitialize: P is the [[OriginalSource]] of a real RegExp,
+    // the `source` property of a RegExp-like object, else ToString(pattern)
+    // (undefined → ""); F likewise falls back to the pattern's own flags.
     const pattern_str: []const u8 = if (pattern_cr) |pcr| blk: {
         if (pattern_arg.toPtr().object.get("[[OriginalSource]]")) |sv| {
             if (sv.bits != 0 and sv.unbox() == .string) break :blk sv.toPtr().string;
         }
         _ = pcr;
         break :blk "";
+    } else if (pattern_is_regexp) blk: {
+        const sv = try ctxGetProp(arena, pattern_arg, "source");
+        if (sv.bits == 0 or sv.unbox() == .undefined_) break :blk "";
+        break :blk try realm_mod.stringPrimitive(arena, sv);
     } else if (pattern_arg.bits == 0 or pattern_arg.unbox() == .undefined_)
         ""
     else
@@ -2948,8 +3166,11 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
         try realm_mod.stringPrimitive(arena, flags_arg)
     else if (pattern_cr) |pcr|
         try flagsToString(arena, pcr.flags)
-    else
-        "";
+    else if (pattern_is_regexp) blk: {
+        const fv = try ctxGetProp(arena, pattern_arg, "flags");
+        if (fv.bits == 0 or fv.unbox() == .undefined_) break :blk "";
+        break :blk try realm_mod.stringPrimitive(arena, fv);
+    } else "";
 
     const cr = arena.create(CompiledRegex) catch return error.OutOfMemory;
     cr.* = compileRegex(arena, pattern_str, flags_str) catch {

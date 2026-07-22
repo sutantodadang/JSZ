@@ -197,6 +197,22 @@ pub const Environment = struct {
         return EnvError.NotDefined;
     }
 
+    /// True when `name` resolves — searching up from `self`, stopping before
+    /// `stop` — to a `var`-kind binding in the *global* environment record.
+    /// Those are the only bindings the global object mirrors as own properties:
+    /// a top-level `let`/`const`/`class` lives purely in the global declarative
+    /// record, and mirroring it would leave `globalThis.x` a second copy that a
+    /// `with (globalThis)` scope writes to while the real binding stays behind.
+    pub fn isGlobalVarBinding(self: *Environment, name: []const u8, stop: ?*Environment) bool {
+        var cur: ?*Environment = self;
+        while (cur) |e| {
+            if (stop) |s| if (e == s) return false;
+            if (e.bindings.getPtr(name)) |b| return e.parent == null and b.kind == .var_;
+            cur = e.parent;
+        }
+        return false;
+    }
+
     /// Assign an existing binding (walk up the chain).
     pub fn assign(self: *Environment, name: []const u8, value: Value) EnvError!void {
         if (self.bindings.getPtr(name)) |b| {
