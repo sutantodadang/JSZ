@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate a Zig zone table from the system IANA tz database."""
-import os, re, struct, hashlib, sys
+import os, re, struct, sys
 
 ROOT = "/usr/share/zoneinfo"
 SKIP_DIRS = {"posix", "right"}
@@ -31,6 +31,29 @@ def collect():
                 continue
             names[name] = data
     return names
+
+def tzif_v2(data):
+    """(transition_times, offsets_after_each, offset_before_first) from the v2 block."""
+    def counts(off):
+        return struct.unpack(">6I", data[off + 20:off + 44])
+    isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt = counts(0)
+    off2 = 44 + timecnt * 4 + timecnt + typecnt * 6 + charcnt + leapcnt * 8 + isstdcnt + isutcnt
+    isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt = counts(off2)
+    p = off2 + 44
+    times = list(struct.unpack(">%dq" % timecnt, data[p:p + timecnt * 8])) if timecnt else []
+    p += timecnt * 8
+    idx = list(data[p:p + timecnt])
+    p += timecnt
+    types = []
+    for i in range(typecnt):
+        gmtoff, isdst, abbrind = struct.unpack(">ibB", data[p + i * 6:p + i * 6 + 6])
+        types.append(gmtoff)
+    offsets = [types[i] for i in idx]
+    # The offset in force before the first transition: the first non-DST type,
+    # per the TZif spec's guidance, else type 0.
+    before = types[0] if types else 0
+    return times, offsets, before
+
 
 def footer(data):
     """The trailing POSIX TZ string of a TZif v2+ file."""
@@ -210,8 +233,42 @@ def main():
     out.append("    std_offset_sec: i32,")
     out.append("    dst_save_sec: i32 = 0,")
     out.append("    rule: ?Rule = null,")
+    out.append("    /// Slice of `trans_times`/`trans_offsets` holding this zone's historical")
+    out.append("    /// transitions; `first_offset_sec` applies before the earliest of them.")
+    out.append("    trans_start: u32 = 0,")
+    out.append("    trans_len: u32 = 0,")
+    out.append("    first_offset_sec: i32 = 0,")
     out.append("};")
     out.append("")
+    # One transition table per distinct source zone; links share their target's.
+    trans_times, trans_offsets, slice_of = [], [], {}
+    for n in names:
+        src_name = resolve(n)
+        if src_name in slice_of:
+            continue
+        raw = data_by_name.get(src_name) or data_by_name.get(n)
+        if raw is None:
+            continue
+        try:
+            times, offs, before = tzif_v2(raw)
+        except Exception:
+            continue
+        slice_of[src_name] = (len(trans_times), len(times), before)
+        trans_times.extend(times)
+        trans_offsets.extend(offs)
+
+    def emit_array(name, zig_type, values):
+        out.append("pub const %s = [_]%s{" % (name, zig_type))
+        for i in range(0, len(values), 16):
+            out.append("    " + " ".join("%d," % v for v in values[i:i + 16]))
+        out.append("};")
+        out.append("")
+
+    out.append("/// Historical UTC-offset transitions, concatenated across zones: each offset")
+    out.append("/// takes effect at the matching time and holds until the next one.")
+    emit_array("trans_times", "i64", trans_times)
+    emit_array("trans_offsets", "i32", trans_offsets)
+
     out.append("/// Sorted by case-folded name so lookups can binary-search case-insensitively.")
     out.append("pub const zones = [_]Zone{")
     unparsed = []
@@ -226,14 +283,16 @@ def main():
         else:
             std_off, dst_save, rule = parsed
         ci = index[canon_of[n]]
+        start, tlen, before = slice_of.get(src_name, (0, 0, 0))
+        tail = " .trans_start = %d, .trans_len = %d, .first_offset_sec = %d }," % (start, tlen, before)
         if rule is None:
-            out.append('    .{ .name = "%s", .canon = %d, .std_offset_sec = %d },' % (n, ci, std_off))
+            out.append('    .{ .name = "%s", .canon = %d, .std_offset_sec = %d,%s' % (n, ci, std_off, tail))
         else:
             (sm, sw, sd, ss), (em, ew, ed, es) = rule
             out.append('    .{ .name = "%s", .canon = %d, .std_offset_sec = %d, .dst_save_sec = %d, .rule = .{ '
                        '.start_month = %d, .start_week = %d, .start_dow = %d, .start_sec = %d, '
-                       '.end_month = %d, .end_week = %d, .end_dow = %d, .end_sec = %d } },'
-                       % (n, ci, std_off, dst_save, sm, sw, sd, ss, em, ew, ed, es))
+                       '.end_month = %d, .end_week = %d, .end_dow = %d, .end_sec = %d },%s'
+                       % (n, ci, std_off, dst_save, sm, sw, sd, ss, em, ew, ed, es, tail))
     out.append("};")
     out.append("")
     sys.stderr.write("zones: %d, unmodelled rules: %d %r\n" % (len(names), len(unparsed), unparsed[:10]))

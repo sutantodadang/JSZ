@@ -139,9 +139,39 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-/// Return the UTC offset in seconds for a zone definition at Unix timestamp
-/// `unix_sec`. Handles both DST and non-DST zones.
+/// Index of the last transition at or before `unix_sec`, or null when the
+/// instant precedes the zone's first recorded transition.
+fn transitionIndexAt(def: *const ZoneDef, unix_sec: i64) ?usize {
+    if (def.trans_len == 0) return null;
+    const start: usize = def.trans_start;
+    const end: usize = start + def.trans_len;
+    if (unix_sec < gen.trans_times[start]) return null;
+    var lo = start;
+    var hi = end; // invariant: trans_times[lo] <= unix_sec < trans_times[hi]
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (gen.trans_times[mid] <= unix_sec) lo = mid else hi = mid;
+    }
+    return lo;
+}
+
+/// The UTC offset in seconds for a zone at Unix timestamp `unix_sec`. History
+/// comes from the recorded transitions; past the last one the zone's recurring
+/// POSIX rule takes over (that is what it is for).
 pub fn offsetAt(def: *const ZoneDef, unix_sec: i64) ?i32 {
+    if (def.trans_len != 0) {
+        const last = @as(usize, def.trans_start) + def.trans_len - 1;
+        if (unix_sec < gen.trans_times[last]) {
+            const idx = transitionIndexAt(def, unix_sec) orelse return def.first_offset_sec;
+            return gen.trans_offsets[idx];
+        }
+    }
+    return ruleOffsetAt(def, unix_sec);
+}
+
+/// The offset the zone's recurring rule gives, for instants beyond the recorded
+/// transitions.
+fn ruleOffsetAt(def: *const ZoneDef, unix_sec: i64) ?i32 {
     if (def.rule == null) return def.std_offset_sec;
 
     const rule = &def.rule.?;
@@ -157,13 +187,9 @@ pub fn offsetAt(def: *const ZoneDef, unix_sec: i64) ?i32 {
         var end: i64 = undefined;
         applyRule(rule, y, def.std_offset_sec, def.dst_save_sec, &start, &end);
         if (start > end) {
-            // Southern hemisphere: DST spans year boundary.
-            // start = DST start (e.g. Oct), end = DST end (e.g. Apr next year)
-            if (end < start) {
-                // DST runs from start to end of next year.
-                if (unix_sec >= start and unix_sec < end + 365 * 86400) {
-                    return def.std_offset_sec + def.dst_save_sec;
-                }
+            // Southern hemisphere: DST spans the year boundary.
+            if (unix_sec >= start and unix_sec < end + 365 * 86400) {
+                return def.std_offset_sec + def.dst_save_sec;
             }
         } else {
             // Northern hemisphere: DST within one year.
@@ -175,9 +201,38 @@ pub fn offsetAt(def: *const ZoneDef, unix_sec: i64) ?i32 {
     return def.std_offset_sec;
 }
 
-/// Find the next or previous DST transition for a zone at Unix timestamp
-/// `unix_sec`. Returns the transition time in Unix seconds, or null if none.
+/// Find the next or previous UTC-offset transition for a zone at `unix_sec`.
+/// Returns the transition time in Unix seconds, or null if there is none.
 pub fn findTransition(def: *const ZoneDef, unix_sec: i64, direction: enum { next, previous }) ?i64 {
+    const start: usize = def.trans_start;
+    const end: usize = start + def.trans_len;
+    if (def.trans_len != 0) {
+        const last = gen.trans_times[end - 1];
+        switch (direction) {
+            .previous => {
+                if (unix_sec > gen.trans_times[start]) {
+                    if (unix_sec <= last) {
+                        const idx = transitionIndexAt(def, unix_sec - 1) orelse return null;
+                        return gen.trans_times[idx];
+                    }
+                    // Past the table: the rule may place one later still.
+                    return ruleTransition(def, unix_sec, .previous) orelse last;
+                }
+                return null;
+            },
+            .next => {
+                if (unix_sec < last) {
+                    const idx = transitionIndexAt(def, unix_sec) orelse return gen.trans_times[start];
+                    return gen.trans_times[idx + 1];
+                }
+                return ruleTransition(def, unix_sec, .next);
+            },
+        }
+    }
+    return ruleTransition(def, unix_sec, if (direction == .next) .next else .previous);
+}
+
+fn ruleTransition(def: *const ZoneDef, unix_sec: i64, direction: enum { next, previous }) ?i64 {
     if (def.rule == null) return null;
     const rule = &def.rule.?;
     const tyear = unixYear(unix_sec);

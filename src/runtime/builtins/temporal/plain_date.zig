@@ -307,6 +307,14 @@ pub fn compareISODate(a: ISODate, b: ISODate) i8 {
 /// intermediate math is i128 with range gates so out-of-range inputs surface as
 /// RangeError rather than an integer-cast panic.
 pub fn addISODate(date: ISODate, years: f64, months: f64, weeks: f64, days: f64, overflow: shared.Overflow, arena: std.mem.Allocator) !ISODate {
+    return addISODateDayOverflow(date, years, months, weeks, days, overflow, overflow, arena);
+}
+
+/// `addISODate` with the day clamp governed separately from the month-code
+/// resolution. PlainYearMonth arithmetic anchors on a synthetic day-of-month, so
+/// `reject` must not fire just because the target month is shorter — but it
+/// must still fire when the month code itself has no counterpart.
+pub fn addISODateDayOverflow(date: ISODate, years: f64, months: f64, weeks: f64, days: f64, overflow: shared.Overflow, day_overflow: shared.Overflow, arena: std.mem.Allocator) !ISODate {
     // Years and months are *calendar* units: shift them in the calendar's own
     // field space (constrain/reject the day there), then add weeks+days as a
     // plain epoch-day offset.
@@ -326,7 +334,7 @@ pub fn addISODate(date: ISODate, years: f64, months: f64, weeks: f64, days: f64,
 
     const dim = calendar.daysInMonth(cal, ym.year, ym.month);
     var day: i64 = f.day;
-    if (overflow == .reject) {
+    if (day_overflow == .reject) {
         if (day > dim) return realm_mod.throwRangeError(arena, "day out of range for month");
     } else {
         if (day > dim) day = dim;

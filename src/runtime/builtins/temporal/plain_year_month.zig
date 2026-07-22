@@ -215,7 +215,7 @@ fn nativeAddSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, 
         calendar.toIso(cal, f.year, f.month, calendar.daysInMonth(cal, f.year, f.month), .constrain) catch ym.*
     else
         ym.*;
-    const result = try plain_date.addISODate(anchor, dur.years, dur.months, dur.weeks, total_days, overflow, arena);
+    const result = try plain_date.addISODateDayOverflow(anchor, dur.years, dur.months, dur.weeks, total_days, overflow, .constrain, arena);
     // Renormalize onto the first day of the resulting *calendar* month.
     const rf = calendar.fields(cal, result);
     const first = calendar.toIso(cal, rf.year, rf.month, 1, .constrain) catch
@@ -306,7 +306,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
         bag.month_code != null or bag.year != null;
     if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
     var year: i32 = base.year;
-    if (bag.era != null or bag.year != null) year = try plain_date.yearFromBag(arena, bag);
+    if (bag.era != null or bag.era_year != null or bag.year != null) year = try plain_date.yearFromBag(arena, bag);
     if (bag.month == null and bag.month_code == null) {
         const iso = calendar.toIsoFromCode(cal, year, base.code_num, base.code_leap, 1, overflow) catch
             return realm_mod.throwRangeError(arena, "year-month out of range");

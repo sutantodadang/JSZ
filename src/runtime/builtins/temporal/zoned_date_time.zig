@@ -245,8 +245,8 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
             provided = try parseOffsetValue(arena, ov.unbox().string);
         }
     }
-    const ns = try interpretOffset(arena, dt, zone.offset_ns, provided, offset_opt);
-    return .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = cal };
+    const ns = try interpretOffset(arena, zone.id, dt, zone.offset_ns, provided, offset_opt);
+    return .{ .ns = ns, .tz = zone.id, .offset_ns = zoneOffsetAt(zone.id, zone.offset_ns, ns), .calendar = cal };
 }
 
 /// Read the required/optional date+time fields from a property bag into an
@@ -300,20 +300,68 @@ fn f2i(f: f64) i32 {
     return @intFromFloat(f);
 }
 
-/// InterpretISODateTimeOffset for a fixed-offset zone.
-fn interpretOffset(arena: std.mem.Allocator, dt: ISODateTime, zone_offset: i128, provided: ?i128, opt: OffsetOption) !i128 {
-    const wall = wallNs(dt);
-    const off = provided orelse zone_offset;
-    switch (opt) {
-        .use => return wall - off,
-        .ignore => return wall - zone_offset,
-        .prefer => return wall - zone_offset, // fixed zone is always valid
-        .reject => {
-            if (provided != null and provided.? != zone_offset)
-                return realm_mod.throwRangeError(arena, "offset does not match time zone");
-            return wall - zone_offset;
-        },
+/// The zone's UTC offset at an exact instant. A fixed-offset identifier has no
+/// tzdata entry and never varies, so `fixed` stands in for it.
+pub fn zoneOffsetAt(tz: []const u8, fixed: i128, ns: i128) i128 {
+    const def = tzdata.lookupDef(tz) orelse return fixed;
+    const sec: i64 = @intCast(@divFloor(ns, shared.NS_PER_SECOND));
+    return @as(i128, tzdata.offsetAt(def, sec) orelse def.std_offset_sec) * shared.NS_PER_SECOND;
+}
+
+/// GetPossibleEpochNanoseconds: the instants a wall-clock time maps to, earliest
+/// first. A wall time inside a spring-forward gap has none; one inside a
+/// fall-back repetition has two. The candidate offsets are those in force a day
+/// either side of the wall time, which brackets any single transition.
+fn possibleInstants(tz: []const u8, fixed: i128, wall: i128) [2]?i128 {
+    var out: [2]?i128 = .{ null, null };
+    if (tzdata.lookupDef(tz) == null) {
+        out[0] = wall - fixed;
+        return out;
     }
+    const day = shared.NS_PER_DAY;
+    const before = zoneOffsetAt(tz, fixed, wall - day);
+    const after = zoneOffsetAt(tz, fixed, wall + day);
+    var n: usize = 0;
+    // The larger offset yields the earlier instant, so order the probes by it.
+    const hi = @max(before, after);
+    const lo = @min(before, after);
+    for ([_]i128{ hi, lo }) |o| {
+        if (o == lo and hi == lo and n > 0) continue;
+        const t = wall - o;
+        if (zoneOffsetAt(tz, fixed, t) == o) {
+            out[n] = t;
+            n += 1;
+        }
+    }
+    return out;
+}
+
+/// DisambiguatePossibleEpochNanoseconds with the default "compatible" policy:
+/// the earlier instant when the wall time repeats, and the time shifted forward
+/// past the gap when it does not exist at all.
+fn disambiguate(tz: []const u8, fixed: i128, wall: i128) i128 {
+    const p = possibleInstants(tz, fixed, wall);
+    if (p[0]) |t| return t;
+    // In a gap: interpret the wall time with the offset in force *before* the
+    // transition, which lands just after it.
+    const before = zoneOffsetAt(tz, fixed, wall - shared.NS_PER_DAY);
+    return wall - before;
+}
+
+/// InterpretISODateTimeOffset.
+fn interpretOffset(arena: std.mem.Allocator, tz: []const u8, dt: ISODateTime, zone_offset: i128, provided: ?i128, opt: OffsetOption) !i128 {
+    const wall = wallNs(dt);
+    const off = provided orelse return disambiguate(tz, zone_offset, wall);
+    if (opt == .use) return wall - off;
+    if (opt == .ignore) return disambiguate(tz, zone_offset, wall);
+    // "prefer" and "reject" both honour an offset that really occurs at this
+    // wall time; they differ only in what happens when none does.
+    for (possibleInstants(tz, zone_offset, wall)) |maybe_t| {
+        const t = maybe_t orelse continue;
+        if (zoneOffsetAt(tz, zone_offset, t) == off) return t;
+    }
+    if (opt == .reject) return realm_mod.throwRangeError(arena, "offset does not match time zone");
+    return disambiguate(tz, zone_offset, wall);
 }
 
 fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !ZonedDT {
@@ -325,8 +373,8 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
     const dt = shared.parseISODateTimeOpts(s, .{ .validate_calendar = true, .reject_utc = false }) catch return realm_mod.throwRangeError(arena, "invalid ZonedDateTime string");
     const str_off = extractStringOffset(arena, s) catch |e| return e;
     const offset_opt = try getOffsetOption(arena, opts, .reject);
-    const ns = try interpretOffset(arena, dt, zone.offset_ns, str_off, offset_opt);
-    return .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = dt.date.calendar };
+    const ns = try interpretOffset(arena, zone.id, dt, zone.offset_ns, str_off, offset_opt);
+    return .{ .ns = ns, .tz = zone.id, .offset_ns = zoneOffsetAt(zone.id, zone.offset_ns, ns), .calendar = dt.date.calendar };
 }
 
 /// Scan every `[...]` annotation on a ZonedDateTime string: require exactly one
@@ -628,8 +676,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const cur = localDT(z);
     const merged = try plain_date.withDateFields(arena, cur.date, bag, overflow);
     const time = try plain_date_time.timeFromBag(arena, bag, overflow, cur.time);
-    const new_ns = try interpretOffset(arena, .{ .date = merged.date, .time = time }, z.offset_ns, provided, offset_opt);
-    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
+    const new_ns = try interpretOffset(arena, z.tz, .{ .date = merged.date, .time = time }, z.offset_ns, provided, offset_opt);
+    return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = zoneOffsetAt(z.tz, z.offset_ns, new_ns), .calendar = z.calendar });
 }
 
 // ---------------------------------------------------------------- arithmetic ---
