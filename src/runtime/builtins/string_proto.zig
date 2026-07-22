@@ -1522,28 +1522,164 @@ pub fn nativeLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []cons
 // Locale aliases
 // ---------------------------------------------------------------------------
 
+/// The language whose SpecialCasing tailoring `locales` selects, or "" for the
+/// (untailored) root. §19.1.2 TransformCase canonicalizes the whole list first,
+/// so an invalid tag anywhere in it is a RangeError even when it is never used.
+fn caseTailoringLanguage(arena: std.mem.Allocator, args: []const Value) ![]const u8 {
+    const intl_mod = @import("intl.zig");
+    const list = try intl_mod.canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{});
+    if (list.len == 0) return "";
+    const tag = list[0];
+    const end = std.mem.indexOfScalar(u8, tag, '-') orelse tag.len;
+    const lang = tag[0..end];
+    // Only the three tailorings SpecialCasing.txt defines are modelled.
+    for ([_][]const u8{ "tr", "az", "lt" }) |l| {
+        if (std.ascii.eqlIgnoreCase(lang, l)) return l;
+    }
+    return "";
+}
+
 pub fn nativeToLocaleLowerCase(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return nativeToLowerCase(arena, this_val, args);
+    const s = try coerceThis(arena, this_val);
+    const lang = try caseTailoringLanguage(arena, args);
+    if (lang.len == 0) return val_mod.makeString(arena, try caseConvert(arena, s, false));
+    return val_mod.makeString(arena, try caseConvertTailored(arena, s, false, lang));
 }
 
 pub fn nativeToLocaleUpperCase(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return nativeToUpperCase(arena, this_val, args);
+    const s = try coerceThis(arena, this_val);
+    const lang = try caseTailoringLanguage(arena, args);
+    if (lang.len == 0) return val_mod.makeString(arena, try caseConvert(arena, s, true));
+    return val_mod.makeString(arena, try caseConvertTailored(arena, s, true, lang));
+}
+
+/// One decoded code point of the input, remembering whether it was spelled as a
+/// surrogate pair so the output can reproduce the same bytes.
+const DecodedCp = struct { cp: u21, paired: bool, off: usize, len: usize };
+
+/// SpecialCasing's `More_Above`: some following character has combining class
+/// 230 (Above), with nothing of class 0 or 230 in between.
+fn moreAbove(cps: []const DecodedCp, idx: usize) bool {
+    var i = idx + 1;
+    while (i < cps.len) : (i += 1) {
+        const c = unorm.ccc(cps[i].cp);
+        if (c == 230) return true;
+        if (c == 0) return false;
+    }
+    return false;
+}
+
+/// SpecialCasing's `Before_Dot`: a COMBINING DOT ABOVE follows, with nothing of
+/// combining class 0 or 230 in between.
+fn beforeDot(cps: []const DecodedCp, idx: usize) bool {
+    var i = idx + 1;
+    while (i < cps.len) : (i += 1) {
+        if (cps[i].cp == 0x0307) return true;
+        const c = unorm.ccc(cps[i].cp);
+        if (c == 0 or c == 230) return false;
+    }
+    return false;
+}
+
+/// SpecialCasing's `After_I` / `After_Soft_Dotted`: scan backwards for the
+/// trigger character, stopping at anything of combining class 0 or 230.
+fn afterBase(cps: []const DecodedCp, idx: usize, soft_dotted: bool) bool {
+    var i = idx;
+    while (i > 0) {
+        i -= 1;
+        const cp = cps[i].cp;
+        if (soft_dotted) {
+            if (cpHasProp("Soft_Dotted", cp)) return true;
+        } else if (cp == 0x0049) return true;
+        const c = unorm.ccc(cp);
+        if (c == 0 or c == 230) return false;
+    }
+    return false;
+}
+
+/// Case conversion with the Turkish/Azeri/Lithuanian tailorings from
+/// SpecialCasing.txt. Every code point the tailoring does not name falls through
+/// to the same tables `caseConvert` uses.
+fn caseConvertTailored(arena: std.mem.Allocator, s: []const u8, to_upper: bool, lang: []const u8) ![]const u8 {
+    var cps = std.ArrayList(DecodedCp){};
+    var i: usize = 0;
+    while (i < s.len) {
+        const d = decodeCpJoined(s, i);
+        try cps.append(arena, .{ .cp = d.cp, .paired = d.paired, .off = i, .len = d.len });
+        i += d.len;
+    }
+
+    const turkic = std.mem.eql(u8, lang, "tr") or std.mem.eql(u8, lang, "az");
+    const table = if (to_upper) ucase.to_upper else ucase.to_lower;
+    var buf = std.ArrayList(u8){};
+    for (cps.items, 0..) |d, idx| {
+        // Each branch either emits its own replacement or falls through to the
+        // untailored mapping below.
+        const replacement: ?[]const u21 = blk: {
+            if (turkic) {
+                if (to_upper) {
+                    if (d.cp == 0x0069) break :blk &[_]u21{0x0130};
+                } else {
+                    if (d.cp == 0x0130) break :blk &[_]u21{0x0069};
+                    if (d.cp == 0x0307 and afterBase(cps.items, idx, false)) break :blk &[_]u21{};
+                    if (d.cp == 0x0049 and !beforeDot(cps.items, idx)) break :blk &[_]u21{0x0131};
+                }
+            } else { // Lithuanian
+                if (to_upper) {
+                    if (d.cp == 0x0307 and afterBase(cps.items, idx, true)) break :blk &[_]u21{};
+                } else {
+                    // Capital I/J/Į keep an explicit dot when more accents follow.
+                    if (moreAbove(cps.items, idx)) switch (d.cp) {
+                        0x0049 => break :blk &[_]u21{ 0x0069, 0x0307 },
+                        0x004A => break :blk &[_]u21{ 0x006A, 0x0307 },
+                        0x012E => break :blk &[_]u21{ 0x012F, 0x0307 },
+                        else => {},
+                    };
+                    switch (d.cp) {
+                        0x00CC => break :blk &[_]u21{ 0x0069, 0x0307, 0x0300 },
+                        0x00CD => break :blk &[_]u21{ 0x0069, 0x0307, 0x0301 },
+                        0x0128 => break :blk &[_]u21{ 0x0069, 0x0307, 0x0303 },
+                        else => {},
+                    }
+                }
+            }
+            break :blk null;
+        };
+        if (replacement) |rep| {
+            for (rep) |m| try encodeCpAs(&buf, arena, m, d.paired);
+        } else if (!to_upper and d.cp == 0x03A3 and isFinalSigma(s, d.off, d.len)) {
+            try encodeWtf8Cp(&buf, arena, 0x03C2);
+        } else if (ucase.lookup(table, d.cp)) |mapped| {
+            for (mapped) |m| try encodeCpAs(&buf, arena, m, d.paired);
+        } else {
+            try buf.appendSlice(arena, s[d.off .. d.off + d.len]);
+        }
+    }
+    return buf.items;
 }
 
 // ---------------------------------------------------------------------------
 // localeCompare
 // ---------------------------------------------------------------------------
 
-/// String.prototype.localeCompare(that) — byte-wise lexicographic order.
+/// String.prototype.localeCompare(that [, locales [, options]]) — §19.1.1.
+/// Both strings are coerced first, then an Intl.Collator is constructed from the
+/// remaining arguments and asked to compare them, so `localeCompare` and
+/// `new Intl.Collator(...).compare` agree by construction (including which
+/// arguments throw).
 pub fn nativeLocaleCompare(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const intl_mod = @import("intl.zig");
     const s = try coerceThis(arena, this_val);
-    const that = if (args.len > 0) try argToStr(arena, args[0]) else "undefined";
-    const result: f64 = switch (std.mem.order(u8, s, that)) {
-        .lt => -1.0,
-        .eq => 0.0,
-        .gt => 1.0,
-    };
-    return val_mod.makeNumber(arena, result);
+    const that = if (args.len > 0) try argToString(arena, args[0]) else "undefined";
+    const collator = try intl_mod.collatorFor(
+        arena,
+        if (args.len > 1) args[1] else Value{},
+        if (args.len > 2) args[2] else Value{},
+    );
+    return intl_mod.nativeCollatorCompare(arena, collator, &[_]Value{
+        try val_mod.makeString(arena, s),
+        try val_mod.makeString(arena, that),
+    });
 }
 
 // ---------------------------------------------------------------------------

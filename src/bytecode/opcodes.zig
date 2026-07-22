@@ -352,6 +352,13 @@ pub const Op = enum(u8) {
     /// reference token in R[ref].
     /// Declared last (ordinal stability for the pinned JIT contract).
     PUT_REF,
+    /// MARK_PARAM_EVAL | 1 | op. Companion to MARK_DIRECT_EVAL, emitted only
+    /// when that direct eval sits in a formal-parameter initializer of a
+    /// function that has an `arguments` binding. Such an eval may not declare
+    /// `var arguments` — the parameter scope already binds the name, so
+    /// EvalDeclarationInstantiation reports a SyntaxError.
+    /// Declared last (ordinal stability for the pinned JIT contract).
+    MARK_PARAM_EVAL,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -452,6 +459,7 @@ pub fn instrSize(op: Op) usize {
         .ARRAY_APPEND_HOLE => 3,
         .DEFINE_PRIVATE => 6,
         .MARK_DIRECT_EVAL => 1,
+        .MARK_PARAM_EVAL => 1,
         .DEFINE_LOCAL => 4,
         .DEFINE_DATA => 5,
         .DEFINE_DATA_DYN => 4,

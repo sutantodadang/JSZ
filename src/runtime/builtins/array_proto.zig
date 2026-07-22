@@ -318,7 +318,7 @@ pub fn valueToJsString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
 /// One element of the toLocaleString algorithm: undefined/null → "", otherwise
 /// ToString(? Invoke(element, "toLocaleString")). Resolves the method through
 /// the proto chain (incl. boxed primitives) and fires user overrides.
-pub fn elemLocaleString(arena: std.mem.Allocator, elem: Value) anyerror![]const u8 {
+pub fn elemLocaleString(arena: std.mem.Allocator, elem: Value, args: []const Value) anyerror![]const u8 {
     if (elem.bits == 0) return "";
     switch (elem.unbox()) {
         .undefined_, .null_ => return "",
@@ -329,21 +329,33 @@ pub fn elemLocaleString(arena: std.mem.Allocator, elem: Value) anyerror![]const 
         try ctx.getProp(arena, elem, "toLocaleString")
     else
         Value{};
-    const r = try fpm.invokeCallback(arena, elem, m, &[_]Value{});
+    const r = try fpm.invokeCallback(arena, elem, m, args);
     return valueToJsString(arena, r);
+}
+
+/// ECMA-402 §19.5.1 replaces the ES `Invoke(element, "toLocaleString")` with
+/// `Invoke(element, "toLocaleString", « locales, options »)` — always two
+/// arguments, `undefined` when the caller passed none.
+fn localeArgPair(arena: std.mem.Allocator, args: []const Value) ![2]Value {
+    const undef = try val_mod.makeUndefined(arena);
+    return .{
+        if (args.len > 0 and args[0].bits != 0) args[0] else undef,
+        if (args.len > 1 and args[1].bits != 0) args[1] else undef,
+    };
 }
 
 /// ES Array.prototype.toLocaleString: join elements, each via Invoke
 /// "toLocaleString", with the implementation-defined list separator ",".
-pub fn nativeArrayToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+pub fn nativeArrayToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireCoercible(arena, this_val);
     const len = try genLength(arena, this_val);
+    const pair = try localeArgPair(arena, args);
     var buf = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < len) : (i += 1) {
         if (i > 0) try buf.appendSlice(arena, ",");
         const elem = try genGet(arena, this_val, i);
-        try buf.appendSlice(arena, try elemLocaleString(arena, elem));
+        try buf.appendSlice(arena, try elemLocaleString(arena, elem, &pair));
     }
     return val_mod.makeString(arena, buf.items);
 }

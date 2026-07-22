@@ -1259,6 +1259,10 @@ pub fn pluralOperands(arena: std.mem.Allocator, this_val: Value, x: f64) !Plural
     const int_str = if (dot) |d| body[0..d] else body;
     const frac_str = if (dot) |d| body[d + 1 ..] else "";
     res.i = std.fmt.parseInt(u64, int_str, 10) catch 0;
+    // CLDR's `n`/`i` always describe the full value; only `e` records that a
+    // compact/scientific notation scaled it down. So French reads 1c6 as
+    // i = 1000000 (→ "many"), not as the mantissa 1 (→ "one").
+    if (exponent != 0) res.i = @intFromFloat(@min(@floor(@abs(x)), @as(f64, 1e18)));
     res.v = @intCast(frac_str.len);
     var trimmed = frac_str;
     while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '0') trimmed = trimmed[0 .. trimmed.len - 1];

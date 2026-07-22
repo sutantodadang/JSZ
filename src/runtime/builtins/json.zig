@@ -140,12 +140,14 @@ fn getV(arena: std.mem.Allocator, holder: Value, key: []const u8) anyerror!Value
 }
 
 /// IsArray(v): unwraps proxy layers to their target (spec IsArray recursion).
-fn isArrayValue(v: Value) bool {
+/// §7.2.2 step 3.a makes a *revoked* proxy a TypeError rather than "not an
+/// array", so this can throw.
+fn isArrayValue(arena: std.mem.Allocator, v: Value) anyerror!bool {
     if (!isObj(v)) return false;
     var obj = v.toPtr().object;
     var depth: usize = 0;
     while (obj.internal_kind == .proxy and depth < 64) : (depth += 1) {
-        const t = px.proxyTarget(obj) orelse return false;
+        const t = px.proxyTarget(obj) orelse return px.throwRevoked(arena);
         if (!isObj(t)) return false;
         obj = t.toPtr().object;
     }
@@ -346,7 +348,7 @@ fn serializeProperty(st: *SerState, holder: Value, key: []const u8, indent: []co
                 return null;
             }
             if (jsonIsCallable(value)) return null;
-            if (isArrayValue(value)) return try serializeArray(st, value, indent);
+            if (try isArrayValue(st.arena, value)) return try serializeArray(st, value, indent);
             return try serializeObject(st, value, indent);
         },
         .function, .bc_function, .native_function, .symbol => return null,
@@ -441,7 +443,7 @@ pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Val
     if (args.len > 1 and args[1].bits != 0) {
         if (jsonIsCallable(args[1])) {
             replacer = args[1];
-        } else if (isArrayValue(args[1])) {
+        } else if (try isArrayValue(arena, args[1])) {
             property_list = try buildPropertyList(arena, args[1]);
         }
     }

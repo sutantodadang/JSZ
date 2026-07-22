@@ -3530,17 +3530,24 @@ pub fn nativeTaLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []co
     return val_mod.makeNumber(arena, -1);
 }
 
-pub fn nativeTaToLocaleString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+pub fn nativeTaToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const td = getTd(this_val) orelse return throwTypeError(arena, "not a TypedArray");
     try validateTypedArray(arena, td);
     const array_proto = @import("array_proto.zig");
     const len = td.length;
+    // ECMA-402 §19.5.2 forwards locales/options to each element, always as two
+    // arguments.
+    const undef = try val_mod.makeUndefined(arena);
+    const pair = [2]Value{
+        if (args.len > 0 and args[0].bits != 0) args[0] else undef,
+        if (args.len > 1 and args[1].bits != 0) args[1] else undef,
+    };
     var buf = std.ArrayList(u8){};
     var i: usize = 0;
     while (i < len) : (i += 1) {
         if (i > 0) try buf.appendSlice(arena, ",");
         const ev = try taLoad(arena, td, i);
-        try buf.appendSlice(arena, try array_proto.elemLocaleString(arena, ev));
+        try buf.appendSlice(arena, try array_proto.elemLocaleString(arena, ev, &pair));
     }
     return val_mod.makeString(arena, buf.items);
 }
