@@ -77,31 +77,22 @@ pub fn isValidDuration(d: DurationFields) bool {
     if (@abs(d.months) >= two_pow_32) return false;
     if (@abs(d.weeks) >= two_pow_32) return false;
 
-    // The normative comparison is against exact mathematical reals. A coarse f64
-    // estimate decides everything except a narrow band around 2^53, where f64
-    // rounding (products exceed the 53-bit mantissa) is not trustworthy; there we
-    // recompute the exact nanosecond total in i128 and compare against 2^53·10^9.
-    const two_53: f64 = 9007199254740992.0;
-    const normf = d.days * 86400.0 + d.hours * 3600.0 + d.minutes * 60.0 +
-        d.seconds + d.milliseconds * 1e-3 + d.microseconds * 1e-6 + d.nanoseconds * 1e-9;
-    const absn = @abs(normf);
-    if (absn < two_53 - 1024.0) return true;
-    if (absn > two_53 + 1024.0) return false;
-    // Near the boundary every field is bounded (contribution ≤ ~2^53 s), so the
-    // i128 products below cannot overflow.
-    const ns_per_day: i128 = 86_400_000_000_000;
-    const ns_per_hour: i128 = 3_600_000_000_000;
-    const ns_per_min: i128 = 60_000_000_000;
-    const total_ns: i128 =
-        @as(i128, @intFromFloat(@abs(d.days))) * ns_per_day +
-        @as(i128, @intFromFloat(@abs(d.hours))) * ns_per_hour +
-        @as(i128, @intFromFloat(@abs(d.minutes))) * ns_per_min +
-        @as(i128, @intFromFloat(@abs(d.seconds))) * 1_000_000_000 +
-        @as(i128, @intFromFloat(@abs(d.milliseconds))) * 1_000_000 +
-        @as(i128, @intFromFloat(@abs(d.microseconds))) * 1_000 +
-        @as(i128, @intFromFloat(@abs(d.nanoseconds)));
-    const limit_ns: i128 = @as(i128, 9007199254740992) * 1_000_000_000; // 2^53 · 10^9
-    if (total_ns >= limit_ns) return false;
+    // The normative comparison is against exact mathematical reals, and an f64
+    // estimate of the nanosecond total is not trustworthy anywhere near the
+    // limit (the intermediate products blow past the 53-bit mantissa). So sum
+    // exactly: every field is an integer-valued f64, hence exactly an integer,
+    // and any single field whose magnitude alone dwarfs the limit short-circuits
+    // before its conversion could overflow.
+    const limit_ns: i256 = @as(i256, 9007199254740992) * 1_000_000_000; // 2^53 · 10^9
+    const scales = [_]i256{ 86_400_000_000_000, 3_600_000_000_000, 60_000_000_000, 1_000_000_000, 1_000_000, 1_000, 1 };
+    const times = [_]f64{ d.days, d.hours, d.minutes, d.seconds, d.milliseconds, d.microseconds, d.nanoseconds };
+    var total_ns: i256 = 0;
+    for (times, scales) |f, scale| {
+        const mag = @abs(f);
+        if (mag >= 1.0e30) return false; // 10^30 ns ≫ 2^53 s on its own
+        total_ns += @as(i256, @intFromFloat(mag)) * scale;
+        if (total_ns >= limit_ns) return false;
+    }
     return true;
 }
 

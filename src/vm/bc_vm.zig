@@ -5186,6 +5186,19 @@ pub fn jsLessThan(left: Value, right: Value) ?bool {
     if (lstr and rstr) {
         return std.mem.lessThan(u8, left.toPtr().string, right.toPtr().string);
     }
+    // BigInt comparisons are over mathematical values; `toNumber` would round
+    // both sides to f64 first and report 2**53+1n < 2**53+2n as false.
+    const lbig = left.bits != 0 and left.unbox() == .bigint;
+    const rbig = right.bits != 0 and right.unbox() == .bigint;
+    if (lbig and rbig) return val_mod.bigIntOrder(left, right) == .lt;
+    if (lbig and !rstr) {
+        const ord = val_mod.bigIntOrderNumber(left, toNumber(right)) orelse return null;
+        return ord == .lt;
+    }
+    if (rbig and !lstr) {
+        const ord = val_mod.bigIntOrderNumber(right, toNumber(left)) orelse return null;
+        return ord == .gt;
+    }
     const ln = toNumber(left);
     const rn = toNumber(right);
     if (std.math.isNan(ln) or std.math.isNan(rn)) return null;

@@ -2403,6 +2403,12 @@ fn lfBuildParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) 
         style = v.unbox().string;
     };
     const items = try stringListFromIterable(arena, if (args.len > 0) args[0] else Value{ .bits = 0 });
+    return listPartsFor(arena, items, typ, style);
+}
+
+/// CreatePartsFromList over an already-materialized list of strings, split out
+/// so `Intl.DurationFormat` can reuse the same en list patterns.
+fn listPartsFor(arena: std.mem.Allocator, items: []const []const u8, typ: []const u8, style: []const u8) ![]NumberPart {
     var parts: std.ArrayList(NumberPart) = .empty;
     if (items.len == 0) return parts.items;
     if (items.len == 1) {
@@ -3015,40 +3021,24 @@ pub fn nativeDurationFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
 /// `Temporal.Duration.prototype.toLocaleString`.
 fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerror!Value {
     try resolveAndStoreLocale(arena, obj, if (args.len > 0) args[0] else Value{});
-    const opts: ?Value = if (args.len > 1) args[1] else null;
-    if (opts) |ov| {
-        if (ov.bits != 0 and ov.unbox() != .undefined_ and ov.unbox() != .object)
-            return throwTypeErrorIntl(arena, "options must be an object");
-    }
+    // GetOptionsObject: a non-undefined, non-Object options argument is a
+    // TypeError, and every read below is a real [[Get]], in spec order.
+    const opts = try dnGetOptionsObject(arena, if (args.len > 1) args[1] else null);
 
     // localeMatcher must be "lookup" or "best fit" when present (else RangeError).
-    _ = try dfGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" });
+    _ = try dnGetOption(arena, opts, "localeMatcher", &.{ "lookup", "best fit" }, "best fit");
 
     // numberingSystem — must be a well-formed Unicode `type` value when present.
-    const nu = optStr(opts, "numberingSystem") orelse "latn";
-    if (opts) |ov| if (ov.bits != 0 and ov.unbox() == .object) {
-        if (ov.toPtr().object.get("numberingSystem")) |nv| if (nv.bits != 0 and nv.unbox() != .undefined_) {
-            const nstr = try t_shared.valueToString(arena, nv);
-            if (!isWellFormedNumberingSystem(nstr))
-                return throwRangeError(arena, "invalid numberingSystem");
-        };
-    };
+    var nu: []const u8 = "latn";
+    if (try dnGetOption(arena, opts, "numberingSystem", &.{}, null)) |nstr| {
+        if (!isWellFormedNumberingSystem(nstr))
+            return throwRangeError(arena, "invalid numberingSystem");
+        nu = nstr;
+    }
     try obj.set("__df_nu", try val_mod.makeString(arena, nu));
 
-    const base_style = (try dfGetOption(arena, opts, "style", &.{ "long", "short", "narrow", "digital" })) orelse "short";
+    const base_style = (try dnGetOption(arena, opts, "style", &.{ "long", "short", "narrow", "digital" }, "short")).?;
     try obj.set("__df_style", try val_mod.makeString(arena, base_style));
-
-    // fractionalDigits: 0..9 or absent (-1 sentinel).
-    var frac: f64 = -1;
-    if (opts) |ov| if (ov.bits != 0 and ov.unbox() == .object) {
-        if (ov.toPtr().object.get("fractionalDigits")) |fv| if (fv.bits != 0 and fv.unbox() != .undefined_) {
-            const n = try realm_mod.toNumberValue(arena, fv);
-            if (!std.math.isFinite(n) or n < 0 or n > 9 or n != @trunc(n))
-                return throwRangeError(arena, "fractionalDigits out of range");
-            frac = n;
-        };
-    };
-    try obj.set("__df_frac", try val_mod.makeNumber(arena, frac));
 
     // GetDurationUnitOptions for each unit, in table order.
     var prev_style: []const u8 = "";
@@ -3064,7 +3054,7 @@ fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerr
                 n_allowed += 1;
             }
         }
-        var style = try dfGetOption(arena, opts, uname, allowed_buf[0..n_allowed]);
+        var style = try dnGetOption(arena, opts, uname, allowed_buf[0..n_allowed], null);
         var display_default: []const u8 = "always";
         if (style == null) {
             if (is_digital) {
@@ -3090,12 +3080,22 @@ fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerr
             if (i == 5 or i == 6) style = "2-digit";
         }
         const disp_key = try std.fmt.allocPrint(arena, "{s}Display", .{uname});
-        const display = (try dfGetOption(arena, opts, disp_key, &.{ "auto", "always" })) orelse display_default;
+        const display = (try dnGetOption(arena, opts, disp_key, &.{ "auto", "always" }, null)) orelse display_default;
 
         try obj.set(try std.fmt.allocPrint(arena, "__df_s{d}", .{i}), try val_mod.makeString(arena, style.?));
         try obj.set(try std.fmt.allocPrint(arena, "__df_d{d}", .{i}), try val_mod.makeString(arena, display));
         prev_style = style.?;
     }
+
+    // fractionalDigits is read last, after every per-unit option: 0..9, or the
+    // -1 sentinel when absent.
+    var frac: f64 = -1;
+    if (try dnGetNumOption(arena, opts, "fractionalDigits")) |n| {
+        if (!std.math.isFinite(n) or n < 0 or n > 9 or n != @trunc(n))
+            return throwRangeError(arena, "fractionalDigits out of range");
+        frac = n;
+    }
+    try obj.set("__df_frac", try val_mod.makeNumber(arena, frac));
 
     return val_mod.makeObject(arena, obj);
 }
@@ -3229,56 +3229,93 @@ fn dfReadStr(o: *JsObject, key: []const u8, default: []const u8) []const u8 {
     return default;
 }
 
-/// Append an integer magnitude (given as a non-negative f64) with optional en
-/// grouping (comma every three digits). `neg` prints a leading minus. Values
-/// beyond u64 range fall back to a plain decimal so huge (but valid) durations
-/// format without overflow — their exact digits are not asserted by test262.
-fn dfAppendMagnitude(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), mag: f64, neg: bool, grouping: bool) !void {
-    if (neg) try buf.append(arena, '-');
-    var tmp: [40]u8 = undefined;
-    const s = if (mag < 18446744073709551615.0)
-        std.fmt.bufPrint(&tmp, "{d}", .{@as(u64, @intFromFloat(mag))}) catch unreachable
-    else
-        std.fmt.bufPrint(&tmp, "{d:.0}", .{mag}) catch (std.fmt.bufPrint(&tmp, "0", .{}) catch unreachable);
-    if (!grouping) {
-        try buf.appendSlice(arena, s);
-        return;
+/// One duration field's value: either a plain amount, or the exact decimal
+/// string that folding sub-second fields into fractional seconds produced (that
+/// sum can carry more significant digits than an f64 holds).
+const DfValue = union(enum) {
+    num: f64,
+    dec: []const u8,
+
+    /// The spec's `value != 0` display test. A fractional-seconds string is
+    /// never equal to the number 0, so it always displays.
+    fn isNonZero(self: DfValue) bool {
+        return switch (self) {
+            .num => |n| n != 0,
+            .dec => true,
+        };
     }
-    const first = s.len % 3;
-    for (s, 0..) |c, i| {
-        if (i != 0 and (i % 3) == first) try buf.append(arena, ',');
-        try buf.append(arena, c);
-    }
+};
+
+/// ToIntegerIfIntegral of a duration field, as an exact i128. Duration fields
+/// are integers below 2**53, so the cast is lossless.
+fn dfExact(x: f64) i128 {
+    if (!std.math.isFinite(x)) return 0;
+    return @intFromFloat(@trunc(x));
 }
 
-/// Format one standalone unit ("1 year", "2 yrs", "3w"). `first_shown` gates the
-/// sign (only the first displayed field keeps a negative sign).
-fn dfFormatStandalone(arena: std.mem.Allocator, unit_idx: usize, style: []const u8, value: f64, first_shown: bool) ![]const u8 {
-    const neg = first_shown and value < 0;
-    const mag = @abs(value);
-    var num = std.ArrayListUnmanaged(u8){};
-    try dfAppendMagnitude(arena, &num, mag, neg, true);
-    // English plural: |value| == 1 → "one" category (sign does not affect it).
-    const one = mag == 1;
-    const forms = DF_FORMS[unit_idx];
-    if (std.mem.eql(u8, style, "narrow")) {
-        return std.fmt.allocPrint(arena, "{s}{s}", .{ num.items, forms.narrow });
-    } else if (std.mem.eql(u8, style, "short")) {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ num.items, if (one) forms.short_one else forms.short_other });
+/// The seconds/milliseconds/microseconds amount with every finer field folded
+/// into its fractional part, as an exact decimal string. `exponent` is 9 for
+/// seconds, 6 for milliseconds and 3 for microseconds — the number of decimal
+/// places one whole unit spans in nanoseconds.
+fn dfToFractional(arena: std.mem.Allocator, fields: *const [10]f64, exponent: u5) !DfValue {
+    const secs = fields[6];
+    const ms = fields[7];
+    const us = fields[8];
+    const ns = fields[9];
+    // No sub-second remainder: the field keeps its own (possibly negative-zero)
+    // value, which is what carries the sign for a leading unit.
+    switch (exponent) {
+        9 => if (ms == 0 and us == 0 and ns == 0) return .{ .num = secs },
+        6 => if (us == 0 and ns == 0) return .{ .num = ms },
+        else => if (ns == 0) return .{ .num = us },
     }
-    // long (default for standalone)
-    return std.fmt.allocPrint(arena, "{s} {s}", .{ num.items, if (one) forms.long_one else forms.long_other });
+
+    var total: i128 = dfExact(ns);
+    if (exponent >= 9) total += dfExact(secs) * 1_000_000_000;
+    if (exponent >= 6) total += dfExact(ms) * 1_000_000;
+    total += dfExact(us) * 1_000;
+
+    var scale: i128 = 1;
+    for (0..exponent) |_| scale *= 10;
+    const q = @divTrunc(total, scale);
+    // Truncated remainder (sign of the dividend), then its magnitude: the
+    // fractional digits are unsigned and the sign rides on the quotient.
+    const r: i128 = @intCast(@abs(@rem(total, scale)));
+
+    var frac_buf: [40]u8 = undefined;
+    const frac = std.fmt.bufPrint(&frac_buf, "{d}", .{r}) catch "0";
+    var buf = std.ArrayListUnmanaged(u8){};
+    // `q` is 0 for a sub-unit magnitude, so a leading "-" would be dropped;
+    // reproduce the reference algorithm, which formats the quotient as-is.
+    try buf.writer(arena).print("{d}.", .{q});
+    for (frac.len..exponent) |_| try buf.append(arena, '0');
+    try buf.appendSlice(arena, frac);
+    return .{ .dec = buf.items };
 }
 
-pub fn nativeDurationFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+/// The NumberFormat singular unit name for a duration field ("years" → "year").
+fn dfSingular(unit: []const u8) []const u8 {
+    return unit[0 .. unit.len - 1];
+}
+
+/// PartitionDurationFormatPattern (ECMA-402 §13.5.7). Each formatted field
+/// becomes a run of NumberFormat parts (with `source` carrying the singular
+/// unit name); consecutive numeric fields are joined by ":" into one list
+/// element, and the elements are then run through the en `unit` list pattern.
+fn dfBuildParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) ![]NumberPart {
     if (this_val.bits == 0 or this_val.unbox() != .object)
-        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype.format called on incompatible receiver");
+        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype method called on incompatible receiver");
     const o = this_val.toPtr().object;
     if (o.get("__df_style") == null)
-        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype.format called on incompatible receiver");
+        return throwTypeErrorIntl(arena, "Intl.DurationFormat.prototype method called on incompatible receiver");
 
     const d = try t_duration.toTemporalDuration(arena, if (args.len > 0) args[0] else try val_mod.makeUndefined(arena));
-    const fields = [_]f64{ d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, d.milliseconds, d.microseconds, d.nanoseconds };
+    // A Duration record holds mathematical integers, so a `-0` field argument
+    // arrives as `+0` and must not make the whole duration read as negative.
+    var fields = [_]f64{ d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, d.milliseconds, d.microseconds, d.nanoseconds };
+    for (&fields) |*f| {
+        if (f.* == 0) f.* = 0;
+    }
 
     const base_style = dfReadStr(o, "__df_style", "short");
     const frac_digits: i32 = if (o.get("__df_frac")) |fv| (if (fv.bits != 0 and fv.unbox() == .number) @intFromFloat(fv.unbox().number) else -1) else -1;
@@ -3292,113 +3329,132 @@ pub fn nativeDurationFormatFormat(arena: std.mem.Allocator, this_val: Value, arg
         displays[i] = dfReadStr(o, std.fmt.bufPrint(&db, "__df_d{d}", .{i}) catch unreachable, "auto");
     }
 
-    var elements = std.ArrayListUnmanaged([]const u8){};
-    var first_shown = true;
+    const any_negative = blk: {
+        for (fields) |f| if (f < 0) break :blk true;
+        break :blk false;
+    };
 
-    var i: usize = 0;
-    while (i < 10) : (i += 1) {
+    // One entry per list element; a numeric clock group accumulates into the
+    // element the first of its fields opened.
+    var elements = std.ArrayListUnmanaged(std.ArrayListUnmanaged(NumberPart)){};
+    var need_separator = false;
+    var display_negative_sign = true;
+
+    for (DF_UNITS, 0..) |uname, i| {
+        var value: DfValue = .{ .num = fields[i] };
         const style = styles[i];
         const display = displays[i];
         const numeric = dfIsNumericStyle(style);
+        var max_frac: ?u32 = null;
+        var min_frac: ?u32 = null;
+        var trunc_rounding = false;
+        var done = false;
 
-        // Sub-second units (i>=7) that are numeric are folded into fractional
-        // seconds by the clock group; they never render standalone here.
-        if (numeric and i >= 7) continue;
-
-        if (!numeric) {
-            const value = fields[i];
-            if (value != 0 or std.mem.eql(u8, display, "always")) {
-                try elements.append(arena, try dfFormatStandalone(arena, i, style, value, first_shown));
-                first_shown = false;
-            }
-            continue;
+        // Numeric seconds and sub-seconds collapse into a single fractional
+        // amount as soon as the *next* field is rendered numerically.
+        if (i >= 6 and i <= 8 and dfIsNumericStyle(styles[i + 1])) {
+            const exponent: u5 = switch (i) {
+                6 => 9,
+                7 => 6,
+                else => 3,
+            };
+            value = try dfToFractional(arena, &fields, exponent);
+            max_frac = if (frac_digits >= 0) @intCast(frac_digits) else 9;
+            min_frac = if (frac_digits >= 0) @intCast(frac_digits) else 0;
+            trunc_rounding = true;
+            done = true;
         }
 
-        // Numeric clock group starting at unit i (one of hours/minutes/seconds).
-        // Consecutive numeric time units join with ":"; seconds folds any numeric
-        // sub-second fields into a fractional part. `j` stops at the first
-        // non-numeric time unit (or past seconds).
-        var clock = std.ArrayListUnmanaged(u8){};
-        var wrote_any = false;
-        var j = i;
-        while (j <= 6) : (j += 1) {
-            if (!dfIsNumericStyle(styles[j])) break;
-            const value = fields[j];
-            const disp = displays[j];
-            const show = value != 0 or std.mem.eql(u8, disp, "always") or wrote_any;
-            if (!show) continue;
-            if (wrote_any) try clock.append(arena, ':');
-            const two_digit = std.mem.eql(u8, styles[j], "2-digit");
-            const neg = first_shown and value < 0;
-            const mag = @abs(value);
-            if (neg) try clock.append(arena, '-');
-            if (j == 6) {
-                // seconds: fold sub-seconds into a fractional part.
-                try dfAppendClockSeconds(arena, &clock, &fields, frac_digits, two_digit);
+        // A numeric "minutes" that precedes a shown seconds field must render
+        // even when it is zero, so the clock does not lose its "0:" segment.
+        var display_required = false;
+        if (i == 5 and need_separator) {
+            display_required = std.mem.eql(u8, displays[6], "always") or
+                fields[6] != 0 or fields[7] != 0 or fields[8] != 0 or fields[9] != 0;
+        }
+
+        if (value.isNonZero() or !std.mem.eql(u8, display, "auto") or display_required) {
+            var sign_display: []const u8 = "auto";
+            if (display_negative_sign) {
+                display_negative_sign = false;
+                // The first rendered field carries the whole duration's sign,
+                // even when it is itself zero.
+                if (value == .num and value.num == 0 and any_negative) value = .{ .num = -0.0 };
             } else {
-                if (two_digit and mag < 10) try clock.append(arena, '0');
-                try dfAppendMagnitude(arena, &clock, mag, false, false);
+                sign_display = "never";
             }
-            wrote_any = true;
-            first_shown = false;
+
+            const standalone = !numeric;
+            const nf_opt = nfmt.NfOptions{
+                .style = if (standalone) "unit" else "decimal",
+                .unit = if (standalone) dfSingular(uname) else "",
+                .unit_display = if (standalone) style else "short",
+                .use_grouping = if (standalone) "auto" else "false",
+                .min_int = @as(u32, if (std.mem.eql(u8, style, "2-digit")) 2 else 1),
+                .min_frac = min_frac orelse 0,
+                .max_frac = max_frac orelse 3,
+                .rounding_mode = if (trunc_rounding) nfmt.RoundMode.trunc else nfmt.RoundMode.half_expand,
+                .sign_display = sign_display,
+            };
+            const num_parts = switch (value) {
+                .num => |n| try nfmt.formatNumberParts(arena, n, nf_opt),
+                .dec => |s| try nfmt.formatDecimalStringParts(arena, s, nf_opt),
+            };
+
+            var list: *std.ArrayListUnmanaged(NumberPart) = undefined;
+            if (need_separator) {
+                list = &elements.items[elements.items.len - 1];
+                try list.append(arena, .{ .type = "literal", .value = ":" });
+            } else {
+                try elements.append(arena, .{});
+                list = &elements.items[elements.items.len - 1];
+            }
+            for (num_parts) |p|
+                try list.append(arena, .{ .type = p.type, .value = p.value, .source = dfSingular(uname) });
+            if (!need_separator and numeric) need_separator = true;
         }
-        if (wrote_any) try elements.append(arena, clock.items);
-        i = j - 1; // resume at the first unit the clock group did not consume
+
+        if (done) break;
     }
 
-    // Join the list. Unit-style ListFormat: long/short/digital → ", "; narrow → " ".
-    const sep: []const u8 = if (std.mem.eql(u8, base_style, "narrow")) " " else ", ";
-    var out = std.ArrayListUnmanaged(u8){};
-    for (elements.items, 0..) |e, idx| {
-        if (idx != 0) try out.appendSlice(arena, sep);
-        try out.appendSlice(arena, e);
+    // Join the elements with the en `unit`-type list pattern; "digital" borrows
+    // the "short" list style.
+    var strings = std.ArrayListUnmanaged([]const u8){};
+    for (elements.items) |el| {
+        var s = std.ArrayListUnmanaged(u8){};
+        for (el.items) |p| try s.appendSlice(arena, p.value);
+        try strings.append(arena, s.items);
     }
+    const list_style: []const u8 = if (std.mem.eql(u8, base_style, "digital")) "short" else base_style;
+    var out = std.ArrayListUnmanaged(NumberPart){};
+    var next: usize = 0;
+    for (try listPartsFor(arena, strings.items, "unit", list_style)) |p| {
+        if (std.mem.eql(u8, p.type, "element")) {
+            try out.appendSlice(arena, elements.items[next].items);
+            next += 1;
+        } else {
+            try out.append(arena, .{ .type = p.type, .value = p.value });
+        }
+    }
+    return out.items;
+}
+
+pub fn nativeDurationFormatFormat(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    var out = std.ArrayListUnmanaged(u8){};
+    for (try dfBuildParts(arena, this_val, args)) |p| try out.appendSlice(arena, p.value);
     return val_mod.makeString(arena, out.items);
 }
 
-/// Append the seconds component of a numeric clock. Sub-second fields carry up
-/// into whole seconds (e.g. 56s + 1234567ms = "1290.567"), so the whole part is
-/// computed from the total nanoseconds (i128, no overflow) and the fractional
-/// part is truncated to `frac_digits` (or the shortest exact form when absent).
-fn dfAppendClockSeconds(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), fields: *const [10]f64, frac_digits: i32, two_digit: bool) !void {
-    const total_ns: i128 = @as(i128, @intFromFloat(@abs(fields[6]))) * 1_000_000_000 +
-        @as(i128, @intFromFloat(@abs(fields[7]))) * 1_000_000 +
-        @as(i128, @intFromFloat(@abs(fields[8]))) * 1_000 +
-        @as(i128, @intFromFloat(@abs(fields[9])));
-    const whole: u64 = @intCast(@divTrunc(total_ns, 1_000_000_000));
-    const frac_ns: u32 = @intCast(@mod(total_ns, 1_000_000_000));
-
-    if (two_digit and whole < 10) try buf.append(arena, '0');
-    var nb: [24]u8 = undefined;
-    try buf.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{whole}) catch unreachable);
-
-    var frac: [9]u8 = undefined;
-    _ = std.fmt.bufPrint(&frac, "{d:0>9}", .{frac_ns}) catch unreachable;
-    if (frac_digits >= 0) {
-        const dd: usize = @intCast(frac_digits);
-        if (dd == 0) return;
-        try buf.append(arena, '.');
-        try buf.appendSlice(arena, frac[0..dd]);
-    } else {
-        if (frac_ns == 0) return;
-        var end: usize = 9;
-        while (end > 0 and frac[end - 1] == '0') : (end -= 1) {}
-        try buf.append(arena, '.');
-        try buf.appendSlice(arena, frac[0..end]);
-    }
-}
-
 pub fn nativeDurationFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    // Minimal: return the whole formatted string as one { type:"literal", value } part.
-    const s_val = try nativeDurationFormatFormat(arena, this_val, args);
+    const parts = try dfBuildParts(arena, this_val, args);
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
-    const part = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.active_object_proto)
-    else
-        try JsObject.create(arena, realm_mod.active_object_proto);
-    try part.set("type", try val_mod.makeString(arena, "literal"));
-    try part.set("value", s_val);
-    try arr.appendElement(try val_mod.makeObject(arena, part));
+    for (parts) |p| {
+        const part = try dnEmptyObj(arena);
+        try part.set("type", try val_mod.makeString(arena, p.type));
+        try part.set("value", try val_mod.makeString(arena, p.value));
+        if (p.source) |unit| try part.set("unit", try val_mod.makeString(arena, unit));
+        try arr.appendElement(try val_mod.makeObject(arena, part));
+    }
     return val_mod.makeObject(arena, arr);
 }
 

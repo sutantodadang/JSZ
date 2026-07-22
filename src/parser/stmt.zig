@@ -1192,11 +1192,17 @@ pub fn parseForDestructuring(p: *Parser, start: u32, kind: ast.VarKind, for_awai
     p.destruct_kind = saved_kind;
     if (!ok) return null;
 
-    // Build the per-iteration destructuring declarations + original body.
+    // Build the per-iteration destructuring declarations + original body. The
+    // wrapper block is a real lexical scope for `let`/`const` heads: the names
+    // bound by the pattern belong to the loop's per-iteration environment, not
+    // to the block that encloses the `for` statement. Without it,
+    // `for (let {value} of parts)` would declare `value` in the enclosing block
+    // and poison any earlier read of an outer `value` with a TDZ error.
+    const lexical_head = kind == .let or kind == .const_;
     var body_stmts = std.ArrayList(*Node){};
     body_stmts.appendSlice(p.arena, decls_out.items) catch return null;
     body_stmts.append(p.arena, orig_body) catch return null;
-    const new_body = p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = body_stmts.items, .lexical_scope = false } }) orelse return null;
+    const new_body = p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = body_stmts.items, .lexical_scope = lexical_head } }) orelse return null;
     const left = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = kind, .name = tmp_name, .init = null } }) orelse return null;
     return p.makeNode(.for_in_stmt, start, p.current.start, .{
         .for_in_stmt = .{ .left = left, .right = right, .body = new_body, .iterate_values = iterate_values, .is_await = for_await },

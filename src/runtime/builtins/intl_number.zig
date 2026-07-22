@@ -266,7 +266,7 @@ fn addOne(arena: std.mem.Allocator, a: []const u8) ![]const u8 {
 // ------------------------------------------------------------------- rounding ---
 
 /// ECMA-402 roundingMode.
-const RoundMode = enum {
+pub const RoundMode = enum {
     ceil,
     floor,
     expand,
@@ -548,7 +548,7 @@ fn roundingTypeToString(t: RoundingType) []const u8 {
 }
 
 /// The resolved NumberFormat options that affect output.
-const NfOptions = struct {
+pub const NfOptions = struct {
     locale: []const u8 = "en-US",
     style: []const u8 = "decimal",
     currency: []const u8 = "USD",
@@ -666,25 +666,57 @@ fn unitSymbol(unit: []const u8, long: bool) []const u8 {
     return unit;
 }
 
-/// The wrapping for `style: "unit"`. Units the locale table does not list get a
-/// generic "<number> <symbol>" shape (with `x-per-y` spelled out when long).
-fn unitForm(arena: std.mem.Allocator, ld: *const data.LocaleData, opt: NfOptions) !data.UnitForm {
+/// The locale's simple-unit forms for `name`, or null when it lists none.
+/// `is_one` picks the CLDR `one` plural form where the locale distinguishes it.
+fn simpleUnitForm(ld: *const data.LocaleData, name: []const u8, display: []const u8, is_one: bool) ?data.UnitForm {
     for (ld.units) |e| {
-        if (!std.mem.eql(u8, e.unit, opt.unit)) continue;
-        if (std.mem.eql(u8, opt.unit_display, "narrow")) return e.narrow;
-        if (std.mem.eql(u8, opt.unit_display, "long")) return e.long;
-        return e.short;
+        if (!std.mem.eql(u8, e.unit, name)) continue;
+        if (std.mem.eql(u8, display, "narrow")) return if (is_one) e.narrow_one orelse e.narrow else e.narrow;
+        if (std.mem.eql(u8, display, "long")) return if (is_one) e.long_one orelse e.long else e.long;
+        return if (is_one) e.short_one orelse e.short else e.short;
     }
+    return null;
+}
+
+/// The `perUnitPattern` tail a compound unit appends after its numerator.
+fn perUnitTail(ld: *const data.LocaleData, name: []const u8, display: []const u8) []const u8 {
+    for (ld.units) |e| {
+        if (!std.mem.eql(u8, e.unit, name)) continue;
+        if (std.mem.eql(u8, display, "narrow")) return e.per_narrow;
+        if (std.mem.eql(u8, display, "long")) return e.per_long;
+        return e.per_short;
+    }
+    return "";
+}
+
+/// The wrapping for `style: "unit"`. A compound `x-per-y` uses the numerator's
+/// form plus the denominator's `perUnitPattern`; units the locale table does not
+/// list at all fall back to a generic "<number> <symbol>" shape.
+fn unitForm(arena: std.mem.Allocator, ld: *const data.LocaleData, opt: NfOptions, is_one: bool) !data.UnitForm {
+    if (simpleUnitForm(ld, opt.unit, opt.unit_display, is_one)) |f| return f;
+
     const long = std.mem.eql(u8, opt.unit_display, "long");
     const sep: []const u8 = if (std.mem.eql(u8, opt.unit_display, "narrow")) "" else " ";
     if (std.mem.indexOf(u8, opt.unit, "-per-")) |i| {
-        const num = unitSymbol(opt.unit[0..i], long);
-        const den = unitSymbol(opt.unit[i + 5 ..], long);
+        const num_name = opt.unit[0..i];
+        const den_name = opt.unit[i + 5 ..];
+        const num: data.UnitForm = simpleUnitForm(ld, num_name, opt.unit_display, is_one) orelse
+            .{ .sep = sep, .suffix = unitSymbol(num_name, long) };
+        const tail = perUnitTail(ld, den_name, opt.unit_display);
+        if (tail.len > 0) {
+            return .{
+                .prefix = num.prefix,
+                .prefix_sep = num.prefix_sep,
+                .sep = num.sep,
+                .suffix = try std.fmt.allocPrint(arena, "{s}{s}", .{ num.suffix, tail }),
+            };
+        }
+        const den = unitSymbol(den_name, long);
         const joined = if (long)
-            try std.fmt.allocPrint(arena, "{s} per {s}", .{ num, den })
+            try std.fmt.allocPrint(arena, "{s} per {s}", .{ num.suffix, den })
         else
-            try std.fmt.allocPrint(arena, "{s}/{s}", .{ num, den });
-        return .{ .sep = sep, .suffix = joined };
+            try std.fmt.allocPrint(arena, "{s}/{s}", .{ num.suffix, den });
+        return .{ .sep = num.sep, .suffix = joined };
     }
     return .{ .sep = sep, .suffix = unitSymbol(opt.unit, long) };
 }
@@ -782,7 +814,11 @@ fn partitionNumberPattern(arena: std.mem.Allocator, dec_in: Decimal, opt: NfOpti
     const accounting = is_currency and ld.accounting_parens and
         std.mem.eql(u8, opt.currency_sign, "accounting") and sign == .negative;
 
-    const unit_form: data.UnitForm = if (is_unit) try unitForm(arena, ld, opt) else .{};
+    // CLDR plural selection for the unit name. In en the `one` category is
+    // "i = 1 and v = 0" — an integer 1 with no visible fraction digits — applied
+    // to the value actually rendered, so a compacted 1000 ("1K") stays plural.
+    const is_one_plural = is_unit and exponent == 0 and std.mem.eql(u8, body, "1");
+    const unit_form: data.UnitForm = if (is_unit) try unitForm(arena, ld, opt, is_one_plural) else .{};
     const cur_symbol: []const u8 = if (is_currency) blk: {
         if (std.mem.eql(u8, opt.currency_display, "code")) break :blk opt.currency;
         if (std.mem.eql(u8, opt.currency_display, "name")) break :blk opt.currency;
@@ -874,6 +910,13 @@ pub fn formatNumber(arena: std.mem.Allocator, value: f64, opt: NfOptions) ![]con
 /// into its own patterns and needs the part list, not the joined string.
 pub fn formatNumberParts(arena: std.mem.Allocator, value: f64, opt: NfOptions) ![]NumberPart {
     return partitionNumberPattern(arena, try decimalFromF64(arena, value), opt);
+}
+
+/// Format an exact decimal string (`"-1.500000000"`). `Intl.DurationFormat`
+/// needs this: the fractional seconds it folds sub-second fields into can carry
+/// more significant digits than an f64 holds.
+pub fn formatDecimalStringParts(arena: std.mem.Allocator, s: []const u8, opt: NfOptions) ![]NumberPart {
+    return partitionNumberPattern(arena, try decimalFromString(arena, s), opt);
 }
 
 // -------------------------------------------------------------- option parsing ---

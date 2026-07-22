@@ -106,6 +106,53 @@ pub fn bigIntEql(x: Value, y: Value) bool {
     return x.toPtr().bigint.toConst().eql(y.toPtr().bigint.toConst());
 }
 
+/// Exact ordering of two BigInt Values (both must be `.bigint`). Relational
+/// operators must not route BigInts through f64, which silently collapses
+/// neighbours past 2^53.
+pub fn bigIntOrder(x: Value, y: Value) std.math.Order {
+    return x.toPtr().bigint.toConst().order(y.toPtr().bigint.toConst());
+}
+
+/// Enough limbs for any finite f64's integer part (1024 bits) plus slack.
+const F64IntLimbs = 24;
+
+/// Write the exact integer part of `t` (an integral f64) into `buf`.
+fn mutableFromIntegralF64(buf: []std.math.big.Limb, t: f64) std.math.big.int.Mutable {
+    var m = std.math.big.int.Mutable.init(buf, 0);
+    if (t == 0) return m;
+    const raw: u64 = @bitCast(@abs(t));
+    const exp_field: i32 = @intCast((raw >> 52) & 0x7ff);
+    if (exp_field == 0) return m; // subnormal: |t| < 1, integer part is 0
+    const mantissa: u64 = (raw & 0xf_ffff_ffff_ffff) | (1 << 52);
+    const shift: i32 = exp_field - 1075;
+    if (shift >= 0) {
+        m.set(@as(u1100, mantissa) << @intCast(shift));
+    } else if (shift > -64) {
+        m.set(mantissa >> @intCast(-shift));
+    } else {
+        return m; // |t| < 1
+    }
+    m.positive = t > 0;
+    return m;
+}
+
+/// Exact ordering of a BigInt against a Number, or null when the Number is NaN
+/// (the spec's "undefined" comparison result).
+pub fn bigIntOrderNumber(x: Value, num: f64) ?std.math.Order {
+    if (std.math.isNan(num)) return null;
+    if (std.math.isPositiveInf(num)) return .lt;
+    if (std.math.isNegativeInf(num)) return .gt;
+    const t = @trunc(num);
+    var buf: [F64IntLimbs]std.math.big.Limb = undefined;
+    const m = mutableFromIntegralF64(&buf, t);
+    const ord = x.toPtr().bigint.toConst().order(m.toConst());
+    if (ord != .eq) return ord;
+    // Equal integer parts: the Number's fractional remainder breaks the tie.
+    if (num > t) return .lt;
+    if (num < t) return .gt;
+    return .eq;
+}
+
 /// Parse a BigInt literal slice (no trailing `n`): optional 0x/0o/0b prefix
 /// selects the radix, otherwise base-10. Returns a boxed BigInt Value.
 pub fn makeBigIntFromLiteral(arena: std.mem.Allocator, lit: []const u8) !Value {
