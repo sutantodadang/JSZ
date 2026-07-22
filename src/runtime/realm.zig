@@ -1304,6 +1304,9 @@ pub var active_sym_to_string_tag: ?Value = null;
 pub var active_sym_species: ?Value = null;
 /// ES2015 Symbol.hasInstance well-known symbol value (instanceof dispatch).
 pub var active_sym_has_instance: ?Value = null;
+/// %Intl%.[[FallbackSymbol]] (ECMA-402 §8.1): the private key under which a
+/// `new`-less `Intl.NumberFormat(existingInstance)` stashes the real formatter.
+pub var active_sym_intl_fallback: ?Value = null;
 /// ES2015 Symbol.isConcatSpreadable well-known symbol value.
 pub var active_sym_is_concat_spreadable: ?Value = null;
 /// ES2023 Symbol.asyncIterator well-known symbol value.
@@ -1978,7 +1981,6 @@ fn faCloseOnAbrupt(arena: std.mem.Allocator, ctx: *Context, iterator: Value, err
     pending_exception = saved;
     return error.JsException;
 }
-
 
 /// Cycle-detection context for structuredClone — O(n) list scan is fine for
 /// typical object graphs; avoids a HashMap dependency in this file.
@@ -3061,6 +3063,14 @@ fn bigIntThisValue(arena: std.mem.Allocator, this_val: Value) anyerror!Value {
     return throwTypeError(arena, "BigInt.prototype method called on incompatible receiver");
 }
 
+/// BigInt.prototype.toLocaleString — like Number's, `new Intl.NumberFormat(…)
+/// .format(this)`; NumberFormat formats a BigInt exactly (no f64 round-trip).
+fn nativeBigIntProtoToLocaleString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const b = try bigIntThisValue(arena, this_val);
+    const nf = try intl_mod.nativeNumberFormatCtor(arena, Value{}, args);
+    return intl_mod.nativeNumberFormatFormat(arena, nf, &[_]Value{b});
+}
+
 fn nativeBigIntProtoToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const b = try bigIntThisValue(arena, this_val);
     var radix: i64 = 10;
@@ -3167,7 +3177,6 @@ fn nativeNumberProtoToLocaleString(arena: std.mem.Allocator, this_val: Value, ar
     return intl_mod.nativeNumberFormatFormat(arena, nf, &[_]Value{try val_mod.makeNumber(arena, n)});
 }
 
-
 const RADIX_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz";
 
 /// Stringify a finite f64 in an arbitrary radix 2..36 (ES Number::toString).
@@ -3264,8 +3273,13 @@ fn numberToExponentialImpl(arena: std.mem.Allocator, n: f64, f: i64) ![]const u8
         exp = @as(i64, @intFromFloat(@floor(log)));
         mant = abs_n / std.math.pow(f64, 10.0, @as(f64, @floatFromInt(exp)));
         // Clamp to [1, 10) due to floating-point rounding
-        if (mant >= 10.0) { mant /= 10.0; exp += 1; }
-        else if (mant < 1.0) { mant *= 10.0; exp -= 1; }
+        if (mant >= 10.0) {
+            mant /= 10.0;
+            exp += 1;
+        } else if (mant < 1.0) {
+            mant *= 10.0;
+            exp -= 1;
+        }
     }
 
     var buf = std.ArrayList(u8){};
@@ -4387,27 +4401,17 @@ pub const Realm = struct {
         }
         // hasOwnProperty on Object.prototype (non-enumerable, writable, configurable)
         const meth_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
-        _ = try object_proto.defineOwnData("hasOwnProperty",
-            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeHasOwnProperty, "hasOwnProperty", 1), meth_attr);
-        _ = try object_proto.defineOwnData("propertyIsEnumerable",
-            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativePropertyIsEnumerable, "propertyIsEnumerable", 1), meth_attr);
-        _ = try object_proto.defineOwnData("isPrototypeOf",
-            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsPrototypeOf, "isPrototypeOf", 1), meth_attr);
-        _ = try object_proto.defineOwnData("toString",
-            try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoToString, "toString", 0), meth_attr);
-        _ = try object_proto.defineOwnData("valueOf",
-            try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoValueOf, "valueOf", 0), meth_attr);
-        _ = try object_proto.defineOwnData("toLocaleString",
-            try val_mod.makeNativeFunctionNamed(arena, array_proto_mod.nativeObjectToLocaleString, "toLocaleString", 0), meth_attr);
+        _ = try object_proto.defineOwnData("hasOwnProperty", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeHasOwnProperty, "hasOwnProperty", 1), meth_attr);
+        _ = try object_proto.defineOwnData("propertyIsEnumerable", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativePropertyIsEnumerable, "propertyIsEnumerable", 1), meth_attr);
+        _ = try object_proto.defineOwnData("isPrototypeOf", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeObjectIsPrototypeOf, "isPrototypeOf", 1), meth_attr);
+        _ = try object_proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoToString, "toString", 0), meth_attr);
+        _ = try object_proto.defineOwnData("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeObjectProtoValueOf, "valueOf", 0), meth_attr);
+        _ = try object_proto.defineOwnData("toLocaleString", try val_mod.makeNativeFunctionNamed(arena, array_proto_mod.nativeObjectToLocaleString, "toLocaleString", 0), meth_attr);
         // Annex B §B.2.2.2-5: legacy accessor helpers on Object.prototype.
-        _ = try object_proto.defineOwnData("__defineGetter__",
-            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeDefineGetter, "__defineGetter__", 2), meth_attr);
-        _ = try object_proto.defineOwnData("__defineSetter__",
-            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeDefineSetter, "__defineSetter__", 2), meth_attr);
-        _ = try object_proto.defineOwnData("__lookupGetter__",
-            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeLookupGetter, "__lookupGetter__", 1), meth_attr);
-        _ = try object_proto.defineOwnData("__lookupSetter__",
-            try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeLookupSetter, "__lookupSetter__", 1), meth_attr);
+        _ = try object_proto.defineOwnData("__defineGetter__", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeDefineGetter, "__defineGetter__", 2), meth_attr);
+        _ = try object_proto.defineOwnData("__defineSetter__", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeDefineSetter, "__defineSetter__", 2), meth_attr);
+        _ = try object_proto.defineOwnData("__lookupGetter__", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeLookupGetter, "__lookupGetter__", 1), meth_attr);
+        _ = try object_proto.defineOwnData("__lookupSetter__", try val_mod.makeNativeFunctionNamed(arena, obj_methods_mod.nativeLookupSetter, "__lookupSetter__", 1), meth_attr);
         // Annex B §B.2.2.1: Object.prototype.__proto__ accessor (get/set the
         // receiver's [[Prototype]]). Enumerable:false, configurable:true.
         const proto_acc_holder = try JsObject.create(arena, null);
@@ -4420,14 +4424,10 @@ pub const Realm = struct {
 
         // ---- Phase 4d: Function.prototype (call, apply, bind) ----
         const function_proto = try JsObject.create(arena, object_proto);
-        _ = try function_proto.defineOwnData("call",
-            try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionCall, "call", 1), meth_attr);
-        _ = try function_proto.defineOwnData("apply",
-            try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionApply, "apply", 2), meth_attr);
-        _ = try function_proto.defineOwnData("bind",
-            try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionBind, "bind", 1), meth_attr);
-        _ = try function_proto.defineOwnData("toString",
-            try val_mod.makeNativeFunctionNamed(arena, nativeFunctionToString, "toString", 0), meth_attr);
+        _ = try function_proto.defineOwnData("call", try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionCall, "call", 1), meth_attr);
+        _ = try function_proto.defineOwnData("apply", try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionApply, "apply", 2), meth_attr);
+        _ = try function_proto.defineOwnData("bind", try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionBind, "bind", 1), meth_attr);
+        _ = try function_proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeFunctionToString, "toString", 0), meth_attr);
 
         // AddRestrictedFunctionProperties: "caller" and "arguments" are
         // poison-pill accessors whose [[Get]] and [[Set]] are the shared
@@ -4576,19 +4576,13 @@ pub const Realm = struct {
         {
             const bi_attr: obj_mod.PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
             const bigint_proto = try JsObject.create(arena, object_proto);
-            _ = try bigint_proto.defineOwnData("toString",
-                try val_mod.makeNativeFunctionNamed(arena, nativeBigIntProtoToString, "toString", 0), bi_attr);
-            _ = try bigint_proto.defineOwnData("toLocaleString",
-                try val_mod.makeNativeFunctionNamed(arena, nativeBigIntProtoToString, "toLocaleString", 0), bi_attr);
-            _ = try bigint_proto.defineOwnData("valueOf",
-                try val_mod.makeNativeFunctionNamed(arena, nativeBigIntProtoValueOf, "valueOf", 0), bi_attr);
+            _ = try bigint_proto.defineOwnData("toString", try val_mod.makeNativeFunctionNamed(arena, nativeBigIntProtoToString, "toString", 0), bi_attr);
+            _ = try bigint_proto.defineOwnData("toLocaleString", try val_mod.makeNativeFunctionNamed(arena, nativeBigIntProtoToLocaleString, "toLocaleString", 0), bi_attr);
+            _ = try bigint_proto.defineOwnData("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeBigIntProtoValueOf, "valueOf", 0), bi_attr);
             if (active_sym_to_string_tag) |tag_sym| {
-                _ = try bigint_proto.defineOwnDataSym(tag_sym,
-                    try val_mod.makeString(arena, "BigInt"),
-                    .{ .writable = false, .enumerable = false, .configurable = true });
+                _ = try bigint_proto.defineOwnDataSym(tag_sym, try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
             }
-            _ = try bigint_proto.defineOwnData("constructor",
-                try val_mod.makeObject(arena, bigint_ctor_obj), bi_attr);
+            _ = try bigint_proto.defineOwnData("constructor", try val_mod.makeObject(arena, bigint_ctor_obj), bi_attr);
             try bigint_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, bigint_proto), .{ .writable = false, .enumerable = false, .configurable = false });
             active_bigint_proto = bigint_proto;
         }
@@ -4695,9 +4689,9 @@ pub const Realm = struct {
         if (active_sym_unscopables) |unsym| {
             const unsc_list = try JsObject.create(arena, null);
             const unsc_names = [_][]const u8{
-                "at",         "copyWithin", "entries",   "fill",     "find",
-                "findIndex",  "findLast",   "flat",      "flatMap",  "includes",
-                "keys",       "toReversed", "toSorted",  "toSpliced", "values",
+                "at",            "copyWithin", "entries",  "fill",      "find",
+                "findIndex",     "findLast",   "flat",     "flatMap",   "includes",
+                "keys",          "toReversed", "toSorted", "toSpliced", "values",
                 "findLastIndex",
             };
             for (unsc_names) |nm| {
@@ -4722,6 +4716,8 @@ pub const Realm = struct {
             active_sym_has_instance = hi_sym;
             _ = try function_proto.defineOwnDataSym(hi_sym, try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeFunctionHasInstance, "[Symbol.hasInstance]", 1), .{ .writable = false, .enumerable = false, .configurable = false });
         }
+
+        active_sym_intl_fallback = try val_mod.makeSymbol(arena, "IntlLegacyConstructedSymbol");
 
         // Capture Symbol.toStringTag and Symbol.species.
         active_sym_to_string_tag = symbol_ctor.getOwn("toStringTag");
@@ -5050,10 +5046,10 @@ pub const Realm = struct {
         {
             const error_ctor_obj = error_ctor_val.toPtr().object;
             for ([_]Value{
-                type_error_ctor_val,   syntax_error_ctor_val,
-                range_error_ctor_val,  reference_error_ctor_val,
+                type_error_ctor_val,      syntax_error_ctor_val,
+                range_error_ctor_val,     reference_error_ctor_val,
                 aggregate_error_ctor_val, eval_error_ctor_val,
-                uri_error_ctor_val,    suppressed_error_ctor_val,
+                uri_error_ctor_val,       suppressed_error_ctor_val,
             }) |cv| {
                 const co = cv.toPtr().object;
                 co.proto = error_ctor_obj;
@@ -5282,7 +5278,21 @@ pub const Realm = struct {
                 // Reparent namespace objects (Math, JSON, Atomics, …) that are
                 // directly parented to old_object_proto (no "prototype" property).
                 if (ctor.proto == old_object_proto) ctor.proto = hp_proto;
-                const proto_v = ctor.getOwn("prototype") orelse continue;
+                const proto_v = ctor.getOwn("prototype") orelse {
+                    // A namespace's members are constructors in their own right
+                    // (Intl.NumberFormat, …); their prototypes need the same fix.
+                    for (ctor.ownKeys()) |k| {
+                        const mv = ctor.getOwn(k) orelse continue;
+                        if (mv.bits == 0 or mv.unbox() != .object) continue;
+                        const member = mv.toPtr().object;
+                        if (member.proto == old_object_proto) member.proto = hp_proto;
+                        const mp = member.getOwn("prototype") orelse continue;
+                        if (mp.bits == 0 or mp.unbox() != .object) continue;
+                        const mchild = mp.toPtr().object;
+                        if (mchild.proto == old_object_proto) mchild.proto = hp_proto;
+                    }
+                    continue;
+                };
                 if (proto_v.bits == 0 or proto_v.unbox() != .object) continue;
                 const child = proto_v.toPtr().object;
                 if (child.proto == old_object_proto) child.proto = hp_proto;
@@ -5338,6 +5348,7 @@ pub const Realm = struct {
         active_sym_iterator = null;
         active_sym_to_primitive = null;
         active_sym_to_string_tag = null;
+        active_sym_intl_fallback = null;
         active_sym_species = null;
         active_sym_module_ns = null;
         active_sym_deferred_id = null;

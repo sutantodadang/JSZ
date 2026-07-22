@@ -40,6 +40,7 @@ const t_duration = @import("temporal/duration.zig");
 const t_calendar = @import("temporal/calendar.zig");
 const t_tzdata = @import("temporal/tzdata.zig");
 const nfmt = @import("intl_number.zig");
+const locale_id = @import("intl_locale_id.zig");
 
 // Intl.NumberFormat lives in `intl_number.zig`; re-export the pieces the realm
 // registration and the sibling services (ListFormat / RelativeTimeFormat) use.
@@ -149,6 +150,43 @@ pub fn registerLegacyServiceProtos(nf: *JsObject, dtf: *JsObject, col: *JsObject
 /// The `new`-less `Intl.NumberFormat(...)` path, for `intl_number.zig`.
 pub fn numberFormatServiceObj(arena: std.mem.Allocator) !*JsObject {
     return legacyServiceObj(arena, active_number_format_proto);
+}
+
+/// %Intl.NumberFormat.prototype%, for `intl_number.zig`'s legacy chaining.
+pub fn numberFormatProto() ?*JsObject {
+    return active_number_format_proto;
+}
+
+/// ChainNumberFormat / ChainDateTimeFormat / ChainCollator: a `new`-less call
+/// whose `this` already inherits from the service's prototype does not build a
+/// fresh instance — it hangs `created` off the receiver under
+/// %Intl%.[[FallbackSymbol]] and returns the receiver (ECMA-402 §8.1).
+pub fn chainLegacyService(this_val: Value, created: Value, proto: ?*JsObject) !Value {
+    const target = proto orelse return created;
+    if (this_val.bits == 0 or this_val.unbox() != .object) return created;
+    const recv = this_val.toPtr().object;
+    var walk: ?*JsObject = recv.proto;
+    while (walk) |p| : (walk = p.proto) {
+        if (p == target) break;
+    } else return created;
+    const sym = realm_mod.active_sym_intl_fallback orelse return created;
+    try recv.setSymAttr(sym, created, .{ .writable = false, .enumerable = false, .configurable = false });
+    return this_val;
+}
+
+/// UnwrapNumberFormat / UnwrapDateTimeFormat: `format` and `resolvedOptions`
+/// accept the wrapper a `new`-less call produced and operate on the instance it
+/// carries. The lookup is an ordinary [[Get]], so a Proxy in between observes it.
+pub fn unwrapLegacyService(arena: std.mem.Allocator, this_val: Value, brand: []const u8) anyerror!Value {
+    if (this_val.bits == 0 or this_val.unbox() != .object) return this_val;
+    if (this_val.toPtr().object.getOwn(brand) != null) return this_val;
+    const sym = realm_mod.active_sym_intl_fallback orelse return this_val;
+    const inner = if (realm_mod.active_context) |c|
+        try c.getPropSym(arena, this_val, sym)
+    else
+        (this_val.toPtr().object.getSym(sym) orelse Value{});
+    if (inner.bits != 0 and inner.unbox() == .object) return inner;
+    return this_val;
 }
 
 fn legacyServiceObj(arena: std.mem.Allocator, proto: ?*JsObject) !*JsObject {
@@ -552,7 +590,9 @@ pub fn nativeDateTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
     try obj.set("__dtf_tzZone", try val_mod.makeString(arena, zone.zone));
     try obj.set("__dtf_tzOffsetMs", try val_mod.makeNumber(arena, @floatFromInt(zone.offset_ms)));
     try obj.set("__dtf_bare", try val_mod.makeBool(arena, is_bare));
-    return val_mod.makeObject(arena, obj);
+    const created = try val_mod.makeObject(arena, obj);
+    if (constructing) return created;
+    return chainLegacyService(this_val, created, active_date_time_format_proto);
 }
 
 const month_long = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
@@ -721,10 +761,11 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
         }
         // A Temporal *plain* value carries no time zone of its own, so the
         // formatter's `timeZoneName` has nothing to name (§11.5.2 drops it). An
-        // Instant is a real point in time and keeps it.
+        // Instant is a real point in time, and a ZonedDateTime carries its own
+        // zone (only reachable through `toLocaleString`), so both keep it.
         if (args.len > 0) {
             if (temporalKindOf(args[0])) |tk| {
-                if (tk != .instant) p.tz_name = "";
+                if (tk != .instant and tk != .zoned) p.tz_name = "";
             }
         }
 
@@ -1130,8 +1171,27 @@ pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: [
     // A ZonedDateTime carries its own zone; a `timeZone` option is disallowed.
     if (kind == .zoned and optStr(opts_v, "timeZone") != null)
         return realm_mod.throwTypeError(arena, "Temporal.ZonedDateTime.toLocaleString does not accept a timeZone option");
-    const dtf = try buildLocaleDTF(arena, opts_v, required, defaults, restrict);
+    const dtf = try buildLocaleDTF(arena, if (args.len > 0) args[0] else Value{}, opts_v, required, defaults, restrict);
+    // A ZonedDateTime names its zone by default (Temporal §ZonedDateTime.toLocaleString).
+    if (kind == .zoned and dtfWantsDefaults(opts_v)) {
+        const o = dtf.toPtr().object;
+        try o.set("__dtf_tzName", try val_mod.makeString(arena, "short"));
+        if (t_zdt.getZoned(receiver)) |z| try o.set("__dtf_tzZone", try val_mod.makeString(arena, z.tz));
+    }
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
+}
+
+/// True when a `toLocaleString` options bag names no component and no style, so
+/// the receiver's whole default pattern applies (for a ZonedDateTime that
+/// includes the time-zone name).
+fn dtfWantsDefaults(opts_v: ?Value) bool {
+    for ([_][]const u8{
+        "weekday", "era",    "year",   "month",     "day",       "dayPeriod",
+        "hour",    "minute", "second", "dateStyle", "timeStyle", "timeZoneName",
+    }) |k| {
+        if (optStr(opts_v, k) != null) return false;
+    }
+    return optNum(opts_v, "fractionalSecondDigits") == null;
 }
 
 /// ToDateTimeOptions "required" families: which component family must be
@@ -1149,7 +1209,7 @@ pub const Restrict = enum { none, date_only, time_only, year_month_only, month_d
 /// `Date.prototype.toLocale*String`: parse options, validate conflicts, resolve
 /// the effective component styles, and return a DateTimeFormat-like object ready
 /// for `nativeDateTimeFormatFormat`.
-fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, defaults: LocaleDefaults, restrict: Restrict) anyerror!Value {
+fn buildLocaleDTF(arena: std.mem.Allocator, locales: Value, opts_v: ?Value, required: Required, defaults: LocaleDefaults, restrict: Restrict) anyerror!Value {
     const weekday = optStr(opts_v, "weekday");
     const era = optStr(opts_v, "era");
     const year = optStr(opts_v, "year");
@@ -1168,6 +1228,10 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
     const has_time_comp = hour != null or minute != null or second != null or
         day_period != null or frac_digits != null or tz_name != null;
     const has_comp = has_date_comp or has_time_comp;
+    // ToDateTimeOptions' `needDefaults` scan skips `era` and `timeZoneName`
+    // (§11.1.2 step 41.a): neither pins a date down on its own.
+    const has_pinning_comp = weekday != null or year != null or month != null or day != null or
+        hour != null or minute != null or second != null or day_period != null or frac_digits != null;
 
     // dateStyle/timeStyle cannot be combined with explicit component options
     // (GetDateTimeFormatPattern, Table "date-time component").
@@ -1208,13 +1272,13 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
     // dateStyle/timeStyle suppress defaults entirely.
     var need_defaults = date_style == null and time_style == null;
     if (need_defaults) switch (required) {
-        .date => if (has_date_comp) {
+        .date => if (has_date_comp and has_pinning_comp) {
             need_defaults = false;
         },
-        .time => if (has_time_comp) {
+        .time => if (has_time_comp and has_pinning_comp) {
             need_defaults = false;
         },
-        .any => if (has_comp) {
+        .any => if (has_pinning_comp) {
             need_defaults = false;
         },
     };
@@ -1252,6 +1316,18 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
     try dtf.set("__dtf_minute", try val_mod.makeString(arena, p.minute));
     try dtf.set("__dtf_second", try val_mod.makeString(arena, p.second));
     try dtf.set("__dtf_hour12", try val_mod.makeBool(arena, p.hour12));
+    try dtf.set("__dtf_dayPeriod", try val_mod.makeString(arena, p.day_period));
+    try dtf.set("__dtf_era", try val_mod.makeString(arena, p.era));
+    try dtf.set("__dtf_tzName", try val_mod.makeString(arena, p.tz_name));
+    // The numbering system comes from the requested locale exactly as it does
+    // for a real formatter, so `date.toLocaleString("th-u-nu-thai")` and
+    // `new Intl.DateTimeFormat("th-u-nu-thai").format(date)` agree.
+    const req = try resolveLocaleRequest(arena, locales);
+    const nu = blk: {
+        const ext = (try req.keyword(arena, "nu")) orelse break :blk "latn";
+        break :blk if (numberingSystemDigits(ext) != null) ext else "latn";
+    };
+    try dtf.set("__dtf_numbering", try val_mod.makeString(arena, nu));
     return val_mod.makeObject(arena, dtf);
 }
 
@@ -1260,18 +1336,19 @@ fn buildLocaleDTF(arena: std.mem.Allocator, opts_v: ?Value, required: Required, 
 /// component set and format the Date through the shared en-US machinery.
 pub fn dateToLocaleString(arena: std.mem.Allocator, receiver: Value, args: []const Value, required: Required, defaults: LocaleDefaults) anyerror!Value {
     const opts_v: ?Value = if (args.len > 1) args[1] else null;
-    const dtf = try buildLocaleDTF(arena, opts_v, required, defaults, .none);
+    const dtf = try buildLocaleDTF(arena, if (args.len > 0) args[0] else Value{}, opts_v, required, defaults, .none);
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
 }
 
 /// Brand check for the `format` accessor and `resolvedOptions` (§11.4): our
 /// instances carry the internal `__dtf_hourCycle` marker, so anything without
 /// it is not an initialized DateTimeFormat.
-fn requireDateTimeFormat(arena: std.mem.Allocator, this_val: Value) !*JsObject {
-    if (this_val.bits == 0 or this_val.unbox() != .object or
-        this_val.toPtr().object.getOwn("__dtf_hourCycle") == null)
+fn requireDateTimeFormat(arena: std.mem.Allocator, this_val: Value) anyerror!*JsObject {
+    const recv = try unwrapLegacyService(arena, this_val, "__dtf_hourCycle");
+    if (recv.bits == 0 or recv.unbox() != .object or
+        recv.toPtr().object.getOwn("__dtf_hourCycle") == null)
         return realm_mod.throwTypeError(arena, "called on incompatible receiver");
-    return this_val.toPtr().object;
+    return recv.toPtr().object;
 }
 
 /// `dtf.resolvedOptions()` (§11.4.5). Properties are created in the order of
@@ -1781,45 +1858,9 @@ fn tagSubtags(arena: std.mem.Allocator, tag: []const u8) !?[][]const u8 {
 
 /// True when `tag` matches `unicode_locale_id`.
 pub fn isStructurallyValidLanguageTag(arena: std.mem.Allocator, tag: []const u8) !bool {
-    const subs = (try tagSubtags(arena, tag)) orelse return false;
-    var i: usize = 0;
-
-    // unicode_language_subtag
-    const lang = subs[i];
-    const lang_ok = isAllAlpha(lang) and ((lang.len >= 2 and lang.len <= 3) or (lang.len >= 5 and lang.len <= 8));
-    if (!lang_ok) return false;
-    i += 1;
-
-    // (sep unicode_script_subtag)?
-    if (i < subs.len and subs[i].len == 4 and isAllAlpha(subs[i])) i += 1;
-
-    // (sep unicode_region_subtag)?
-    if (i < subs.len and ((subs[i].len == 2 and isAllAlpha(subs[i])) or (subs[i].len == 3 and isAllDigit(subs[i])))) i += 1;
-
-    // (sep unicode_variant_subtag)* — each may appear at most once.
-    var variants = std.ArrayListUnmanaged([]const u8){};
-    while (i < subs.len and isVariantSubtag(subs[i])) : (i += 1) {
-        for (variants.items) |v| if (std.ascii.eqlIgnoreCase(v, subs[i])) return false;
-        try variants.append(arena, subs[i]);
-    }
-
-    // extensions* pu_extensions? — each singleton may appear at most once, and
-    // each must be followed by at least one subtag of its own.
-    var singletons = std.ArrayListUnmanaged(u8){};
-    while (i < subs.len) {
-        if (subs[i].len != 1) return false; // a non-singleton here is unparsable
-        const singleton = std.ascii.toLower(subs[i][0]);
-        for (singletons.items) |s| if (s == singleton) return false;
-        try singletons.append(arena, singleton);
-        i += 1;
-        const body_start = i;
-        // `x-` private use takes 1..8-character subtags; every other singleton
-        // requires 2..8.
-        const min_len: usize = if (singleton == 'x') 1 else 2;
-        while (i < subs.len and subs[i].len >= min_len and subs[i].len <= 8 and allAlnum(subs[i])) i += 1;
-        if (i == body_start) return false; // singleton with an empty body
-    }
-    return true;
+    // The canonicalizer is the authority on `unicode_locale_id` shape; it parses
+    // the `-t-`/`-u-` bodies the sketch below never modelled.
+    return (try locale_id.canonicalize(arena, tag)) != null;
 }
 
 /// The locale this build actually formats in; also the fallback when none of the
@@ -1843,7 +1884,9 @@ pub fn resolveAndStoreLocale(arena: std.mem.Allocator, obj: *JsObject, locales: 
     const requested = try canonicalizeLocaleList(arena, locales);
     var chosen: ?[]const u8 = null;
     for (requested) |t| {
-        const canon = try canonicalizeTag(arena, t);
+        // A service's `[[Locale]]` is the language id alone; its `-u-` keywords
+        // are resolved per key and re-attached by `storeResolvedLocale`.
+        const canon = locale_id.languageIdOf(try canonicalizeTag(arena, t));
         if (chosen == null and isAvailableLocale(canon)) chosen = canon;
     }
     try obj.set("[[intl_locale]]", try val_mod.makeString(arena, chosen orelse default_locale));
@@ -1871,7 +1914,7 @@ pub const LocaleRequest = struct {
 pub fn resolveLocaleRequest(arena: std.mem.Allocator, locales: Value) anyerror!LocaleRequest {
     const requested = try canonicalizeLocaleList(arena, locales);
     for (requested) |t| {
-        const canon = try canonicalizeTag(arena, t);
+        const canon = locale_id.languageIdOf(try canonicalizeTag(arena, t));
         if (isAvailableLocale(canon)) return .{ .base = canon, .u_ext = parseLocaleTag(t).u_ext };
     }
     return .{ .base = default_locale, .u_ext = "" };
@@ -1913,44 +1956,21 @@ pub fn resolvedLocaleOf(this_val: Value) []const u8 {
 /// Canonicalize one BCP-47 tag to `language[-Script][-REGION]` form. A tag that
 /// does not match `unicode_locale_id` is a RangeError (ES §9.2.1 step 7.c).
 pub fn canonicalizeTag(arena: std.mem.Allocator, tag: []const u8) ![]const u8 {
-    if (!try isStructurallyValidLanguageTag(arena, tag))
-        return throwRangeError(arena, "invalid language tag");
-    const parts = parseLocaleTag(tag);
-    const language = try canonSubtag(arena, parts.language, .lang);
-    const script = try canonSubtag(arena, parts.script, .script);
-    const region = try canonSubtag(arena, parts.region, .region);
-    var bn = std.ArrayListUnmanaged(u8){};
-    try bn.appendSlice(arena, language);
-    if (script.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, script);
-    }
-    if (region.len > 0) {
-        try bn.append(arena, '-');
-        try bn.appendSlice(arena, region);
-    }
-    return bn.items;
+    return (try locale_id.canonicalize(arena, tag)) orelse
+        throwRangeError(arena, "invalid language tag");
 }
 
 /// `Intl.getCanonicalLocales(locales)` — accepts a string or array-like of tags,
 /// returns a de-duplicated array of canonical tags.
 pub fn nativeGetCanonicalLocales(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    var tags = std.ArrayListUnmanaged([]const u8){};
-    if (args.len > 0 and args[0].bits != 0) {
-        if (args[0].unbox() == .string) {
-            try tags.append(arena, args[0].unbox().string);
-        } else if (args[0].unbox() == .object) {
-            tags.items = try listElements(arena, args[0]);
-        }
-    }
+    const tags = try canonicalizeLocaleList(arena, if (args.len > 0) args[0] else Value{});
     const arr = if (realm_mod.active_heap) |h|
         try JsObject.createArrayOnHeap(h, realm_mod.active_array_proto)
     else
         try JsObject.createArray(arena, realm_mod.active_array_proto);
     var seen = std.ArrayListUnmanaged([]const u8){};
     var n: usize = 0;
-    for (tags.items) |t| {
-        if (t.len == 0) continue;
+    for (tags) |t| {
         const canon = try canonicalizeTag(arena, t);
         var dup = false;
         for (seen.items) |s| if (std.mem.eql(u8, s, canon)) {
@@ -2007,7 +2027,11 @@ pub fn nativeSupportedValuesOf(arena: std.mem.Allocator, _: Value, args: []const
         "AUD", "BRL", "CAD", "CHF", "CNY", "EUR", "GBP", "HKD", "INR", "JPY",
         "KRW", "MXN", "NZD", "RUB", "SEK", "SGD", "TRY", "USD", "ZAR",
     };
-    const calendars = [_][]const u8{"gregory"};
+    // Every calendar `Intl.DateTimeFormat` resolves, in CalendarId order.
+    var calendars: [@typeInfo(t_calendar.CalendarId).@"enum".fields.len][]const u8 = undefined;
+    inline for (@typeInfo(t_calendar.CalendarId).@"enum".fields, 0..) |f, ci| {
+        calendars[ci] = (@as(t_calendar.CalendarId, @enumFromInt(f.value))).str();
+    }
     const numbering = [_][]const u8{"latn"};
     const empty = [_][]const u8{};
 
@@ -2022,7 +2046,7 @@ pub fn nativeSupportedValuesOf(arena: std.mem.Allocator, _: Value, args: []const
     else if (std.mem.eql(u8, key, "timeZone"))
         &time_zones
     else if (std.mem.eql(u8, key, "unit"))
-        &empty
+        &nfmt.sanctioned_units
     else
         return throwRangeError(arena, "invalid key for Intl.supportedValuesOf");
 
@@ -3057,10 +3081,14 @@ fn dfBuild(arena: std.mem.Allocator, obj: *JsObject, args: []const Value) anyerr
                 }
             }
         }
-        // GetDurationUnitOptions step 6: a long/short/narrow style cannot follow a
-        // unit rendered with "numeric"/"2-digit".
-        if (dfIsNumericStyle(prev_style) and !dfIsNumericStyle(style.?))
-            return throwRangeError(arena, "Intl.DurationFormat: style cannot follow a numeric unit");
+        // GetDurationUnitOptions step 7: a long/short/narrow style cannot follow a
+        // unit rendered with "numeric"/"2-digit", and minutes/seconds in that
+        // position are always zero-padded — even when "numeric" was explicit.
+        if (dfIsNumericStyle(prev_style)) {
+            if (!dfIsNumericStyle(style.?))
+                return throwRangeError(arena, "Intl.DurationFormat: style cannot follow a numeric unit");
+            if (i == 5 or i == 6) style = "2-digit";
+        }
         const disp_key = try std.fmt.allocPrint(arena, "{s}Display", .{uname});
         const display = (try dfGetOption(arena, opts, disp_key, &.{ "auto", "always" })) orelse display_default;
 
@@ -3112,9 +3140,17 @@ pub fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror
         try out.append(arena, locales.unbox().string);
         return out.items;
     }
-    if (locales.unbox() != .object) return out.items;
+    // Every other primitive is ToObject-boxed, so inherited index/length
+    // properties on e.g. Number.prototype are still seen.
+    const obj: Value = if (locales.unbox() == .object)
+        locales
+    else if (locales.unbox() == .symbol)
+        // A Symbol wrapper has no indices; the list is empty either way.
+        return out.items
+    else
+        try realm_mod.toObjectForThis(arena, locales);
     const ctx = realm_mod.active_context;
-    const len_v = if (ctx) |c| try c.getProp(arena, locales, "length") else Value{};
+    const len_v = if (ctx) |c| try c.getProp(arena, obj, "length") else Value{};
     // ToLength → ToNumber: a Symbol or BigInt length is a TypeError.
     if (len_v.bits != 0 and (len_v.unbox() == .symbol or len_v.unbox() == .bigint))
         return throwTypeErrorIntl(arena, "Cannot convert length to a number");
@@ -3122,12 +3158,19 @@ pub fn canonicalizeLocaleList(arena: std.mem.Allocator, locales: Value) anyerror
     var k: usize = 0;
     while (k < len) : (k += 1) {
         const key = try std.fmt.allocPrint(arena, "{d}", .{k});
-        const present = if (ctx) |c| try c.hasProp(arena, locales, key) else false;
+        const present = if (ctx) |c| try c.hasProp(arena, obj, key) else false;
         if (!present) continue;
-        const kv = if (ctx) |c| try c.getProp(arena, locales, key) else Value{};
+        const kv = if (ctx) |c| try c.getProp(arena, obj, key) else Value{};
         if (kv.bits != 0 and kv.unbox() == .string) {
             try out.append(arena, kv.unbox().string);
         } else if (kv.bits != 0 and kv.unbox() == .object) {
+            // An Intl.Locale element contributes its [[Locale]] directly.
+            if (kv.toPtr().object.get("__locale_tag")) |lt| {
+                if (lt.bits != 0 and lt.unbox() == .string) {
+                    try out.append(arena, lt.unbox().string);
+                    continue;
+                }
+            }
             try out.append(arena, try t_shared.valueToString(arena, kv));
         } else {
             return throwTypeErrorIntl(arena, "locale list element must be a String or Object");
