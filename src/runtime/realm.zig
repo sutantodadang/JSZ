@@ -515,6 +515,26 @@ pub fn nativeImportDeferDynamic(arena: std.mem.Allocator, _: Value, args: []cons
     return promise_mod.nativePromiseResolve(arena, Value{}, &[_]Value{ns});
 }
 
+/// Dynamic source-phase import: `import.source(spec)` (source-phase-imports).
+/// EvaluateImportCall with phase=source still coerces the specifier first (an
+/// abrupt ToString rejects with that exception), then asks the loaded module for
+/// its [[ModuleSource]]. A Source Text Module Record's GetModuleSource always
+/// throws a SyntaxError (§16.2.1.7.2) — and every module JSZ can load is a
+/// source text module — so the promise rejects with a SyntaxError.
+pub fn nativeImportSourceDynamic(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    _ = importSpecifierString(arena, args) catch |e| {
+        if (e != error.JsException) return e;
+        return rejectWithPending(arena);
+    };
+    const err_obj = if (active_heap) |h|
+        try JsObject.createOnHeap(h, error_proto_SyntaxError)
+    else
+        try JsObject.create(arena, error_proto_SyntaxError);
+    try err_obj.set("message", try val_mod.makeString(arena, "source phase imports are not available for source text modules"));
+    const err = try val_mod.makeObject(arena, err_obj);
+    return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{err});
+}
+
 /// GetModuleNamespace for the deferred phase: return the *single* deferred
 /// namespace exotic object for a given canonical module id, creating it on first
 /// request and caching it so static `import defer`, re-exported deferred
@@ -2716,6 +2736,31 @@ fn isObjectLike(v: Value) bool {
         .object, .native_function, .bc_function, .function => true,
         else => false,
     };
+}
+
+/// `__derivedReturn__(value, instance)` — the return-override rule a *derived*
+/// constructor applies to an explicit `return` (§10.2.2 [[Construct]] step 13).
+/// An Object result replaces the instance; `undefined` keeps it; anything else
+/// (`null` included, unlike a base class) is a TypeError. Reached only from the
+/// class desugar, which rewrites derived-constructor returns to call it.
+pub fn nativeDerivedReturn(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const v = if (args.len > 0) args[0] else Value{};
+    if (isObjectLike(v)) return v;
+    if (v.bits != 0 and v.unbox() != .undefined_)
+        return throwTypeError(arena, "Derived constructors may only return an object or undefined");
+    // `return undefined` (and a bare `return`) completes with the instance the
+    // parent constructor produced. Still undefined ⇒ super() was never called.
+    const instance = if (args.len > 1) args[1] else Value{};
+    if (instance.bits == 0 or instance.unbox() == .undefined_) {
+        const err_obj = if (active_heap) |h|
+            try JsObject.createOnHeap(h, error_proto_ReferenceError)
+        else
+            try JsObject.create(arena, error_proto_ReferenceError);
+        try err_obj.set("message", try val_mod.makeString(arena, "must call super constructor before returning from derived constructor"));
+        pending_exception = try val_mod.makeObject(arena, err_obj);
+        return error.JsException;
+    }
+    return instance;
 }
 
 /// set Error.prototype.stack (error-stack-accessor). Requires a String `v`

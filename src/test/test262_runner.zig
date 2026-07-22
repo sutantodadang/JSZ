@@ -600,18 +600,40 @@ fn runOneTest(allocator: std.mem.Allocator, source: []const u8, full_mode: bool,
     const is_module = hasModuleFlag(source);
     var module_bundle: ?[]const u8 = null;
     defer if (module_bundle) |b| allocator.free(b);
-    if (is_module and hasRelativeImport(full_source)) {
+    // A *script* test reaches the module graph only through a dynamic
+    // `import('./dep.js')`, whose specifier a real host resolves against the
+    // referencing script's path. Require the word `import` to actually appear in
+    // the test body before linking one: `hasRelativeImport` matches any `"./…"`
+    // string literal, and an unrelated test that merely mentions a path must keep
+    // running as bare source.
+    const links_modules = hasRelativeImport(full_source) and
+        (is_module or std.mem.indexOf(u8, source, "import") != null);
+    if (links_modules) {
         const base_dir = std.fs.path.dirname(test_path) orelse ".";
         // Register the entry under its own filename so self-/cyclic imports
         // (`import * as ns from './<thisfile>.js'`) resolve to the same record.
         const entry_id = std.fs.path.basename(test_path);
-        module_bundle = jsz.module_loader.buildBundle(allocator, base_dir, entry_id, full_source) catch null;
+        // The script bundle links the same dependency graph as the module one but
+        // leaves the entry as plain Script code. Its `"use strict"` prologue (for
+        // onlyStrict tests) must stay the very first token of the program, so the
+        // bundle is built from the source *after* the prologue and the prologue is
+        // re-prepended — which also makes the linked module factories strict, as
+        // module code always is.
+        module_bundle = if (is_module)
+            jsz.module_loader.buildBundle(allocator, base_dir, entry_id, full_source) catch null
+        else blk: {
+            const body = full_source[strict_prefix.len..];
+            const b = jsz.module_loader.buildScriptBundle(allocator, base_dir, entry_id, body) catch break :blk null;
+            if (strict_prefix.len == 0) break :blk b;
+            defer allocator.free(b);
+            break :blk std.fmt.allocPrint(allocator, "{s}{s}", .{ strict_prefix, b }) catch null;
+        };
     }
     const module_src = module_bundle orelse full_source;
     const result = if (is_module)
         ctx.evalModule(module_src, "<test262>")
     else
-        ctx.eval(full_source, "<test262>");
+        ctx.eval(module_src, "<test262>");
 
     // A resource-limit interrupt is neither a pass nor a fail — skip it so a
     // looping test cannot masquerade as a passing negative test.

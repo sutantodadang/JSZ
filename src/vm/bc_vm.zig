@@ -2755,6 +2755,9 @@ pub const BcVm = struct {
         else
             try JsObject.create(self.arena, fn_proto);
         closure.obj = o;
+        // Two-way link: the object is this function, so a [[Prototype]] slot (or
+        // any other place that stores a bare *JsObject) can recover the callable.
+        o.fn_closure = @ptrCast(closure);
         // Own `name`, `length`, and `prototype` descriptors for generator functions.
         // Eagerly defined here so Object.getOwnPropertyDescriptor works without a
         // prior .prototype access (closurePrototype short-circuits via getOwn).
@@ -5195,8 +5198,12 @@ pub fn jsStrictEqual(x: Value, y: Value) bool {
         .boolean => {
             return x.unbox().boolean == y.unbox().boolean;
         },
-        .function => return x.bits == y.bits,
-        .bc_function => return x.bits == y.bits,
+        // Compare the *referent*, not the box: a Value is a fresh heap cell each
+        // time one is built, so two Values naming the same function (e.g. `B` and
+        // the `Object.getPrototypeOf(D)` that resolved back to it) differ in
+        // `bits` while being the same ECMAScript object.
+        .function => return x.unbox().function == y.unbox().function,
+        .bc_function => return x.unbox().bc_function == y.unbox().bc_function,
         .object => return x.toPtr().object == y.toPtr().object,
         .native_function => return x.bits == y.bits,
         .symbol => return x.toPtr().symbol == y.toPtr().symbol,

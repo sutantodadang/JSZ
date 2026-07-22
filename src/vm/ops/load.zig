@@ -46,7 +46,15 @@ fn mirrorGlobalBinding(frame: *BcCallFrame, name: []const u8, value: Value, conf
 /// exists, leave it (and its value) alone" clause — used by HOIST_VAR, which
 /// only has to *reserve* the name at scope entry.
 fn mirrorGlobalBindingOpts(frame: *BcCallFrame, name: []const u8, value: Value, configurable: bool, declare_only: bool) void {
-    if (frame.env.varScope().parent != null) return;
+    mirrorGlobalBindingOptsIn(frame, frame.env, name, value, configurable, declare_only);
+}
+
+/// As `mirrorGlobalBindingOpts`, but for a caller that already resolved which
+/// environment record the binding was made in — the global object only mirrors
+/// bindings that landed in the global record itself. (Eval code runs in a child
+/// scope, so its own `frame.env` is never that record even when its `var`s are.)
+fn mirrorGlobalBindingOptsIn(frame: *BcCallFrame, target: *Environment, name: []const u8, value: Value, configurable: bool, declare_only: bool) void {
+    if (target.parent != null) return;
     // ES module top-level declarations live in the Module Environment Record
     // and must NOT become own-properties of the global object (spec §16.2.1.6).
     if (frame.func.is_module) return;
@@ -238,34 +246,19 @@ pub inline fn opHoistVar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name = frame.func.chunk.constants[kidx].toPtr().string;
     const undef = try val_mod.makeUndefined(self.arena);
-    // ES §19.2.1.3 EvalDeclarationInstantiation: eval's top-level `var`/function
-    // names are created in the *calling* context's VariableEnvironment, not in
-    // eval's own (lexical-only) scope. `varScope()` walks past eval's declarative
-    // env — which is marked `is_var_scope` only for strict eval, whose vars stay
-    // confined — to the enclosing function or global var scope. Non-eval frames
-    // already run their hoist prologue with `frame.env` == their var scope.
-    const target = if (frame.func.is_eval) frame.env.varScope() else frame.env;
-    // In the global environment record a "binding" is an own property of the
-    // global object, so CreateGlobalVarBinding leaves an existing one — and its
-    // value — alone. Our split record would otherwise shadow the property with a
-    // fresh `undefined` declarative binding, so seed it from the property.
-    const seed = if (target.parent == null and !target.bindings.contains(name))
-        (globalObjectOwn(frame, name) orelse undef)
-    else
-        undef;
-    // A binding eval introduces into a *function* var scope is deletable; a
-    // global one is deleted through the global object's [[Delete]] instead
-    // (mirrorGlobalBindingOpts makes that property configurable for eval).
-    if (frame.func.is_eval and target.parent != null)
-        target.hoistVarDeletable(name, seed) catch return error.OutOfMemory
-    else
-        target.hoistVar(name, seed) catch return error.OutOfMemory;
+    // EvalDeclarationInstantiation binds a `var`/function name into the running
+    // context's *VariableEnvironment*, not its LexicalEnvironment. For function
+    // and Script code those coincide, but sloppy eval runs in a fresh
+    // declarative scope whose vars belong to the enclosing function (or the
+    // global record) — so hoist into `varScope()`, which stops at that scope.
+    const var_env = frame.env.varScope();
+    var_env.hoistVar(name, undef) catch return error.OutOfMemory;
     // ES §9.1.1.4.17 CreateGlobalVarBinding: a top-level `var`/function name in
     // Script or eval code reserves an own property of the global object at
     // declaration-instantiation time, even when it is never assigned (`var x;`
     // still yields `globalThis.x === undefined`). Bindings introduced by eval
     // are deletable; Script-level ones are not.
-    mirrorGlobalBindingOpts(frame, name, undef, frame.func.is_eval, true);
+    mirrorGlobalBindingOptsIn(frame, var_env, name, undef, frame.func.is_eval, true);
     return null;
 }
 
