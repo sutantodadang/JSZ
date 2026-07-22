@@ -3,20 +3,41 @@
 const std = @import("std");
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
+const realm_mod = @import("../realm.zig");
+const coercion_mod = @import("coercion.zig");
 
 /// Symbol([description]) — called, not constructed. Returns a unique symbol.
 pub fn nativeSymbolCall(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    // §20.4.1.1 step 1: Symbol is not a constructor.
+    if (realm_mod.active_constructing)
+        return realm_mod.throwTypeError(arena, "Symbol is not a constructor");
     var desc: ?[]const u8 = null;
-    if (args.len > 0 and args[0].bits != 0) {
-        switch (args[0].unbox()) {
-            .undefined_ => {},
-            .string => |s| desc = try arena.dupe(u8, s),
-            .number => |n| desc = try val_mod.formatNumber(arena, n),
-            .boolean => |b| desc = if (b) "true" else "false",
-            else => {},
-        }
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_) {
+        // ToString(description) — observable, and a Symbol description throws.
+        desc = try toStringThrowing(arena, args[0]);
     }
     return val_mod.makeSymbol(arena, desc);
+}
+
+/// ES ToString with the abrupt paths the old inline switch swallowed: an object
+/// runs @@toPrimitive/toString/valueOf, and a Symbol is a TypeError.
+fn toStringThrowing(arena: std.mem.Allocator, v_in: Value) anyerror![]const u8 {
+    var v = v_in;
+    if (!coercion_mod.isPrimitive(v)) {
+        v = (try coercion_mod.toPrimitive(arena, v, .string)) orelse
+            return realm_mod.throwTypeError(arena, "Cannot convert object to primitive value");
+    }
+    if (v.bits == 0) return "undefined";
+    return switch (v.unbox()) {
+        .string => |s| try arena.dupe(u8, s),
+        .number => |n| try val_mod.formatNumber(arena, n),
+        .boolean => |b| if (b) "true" else "false",
+        .undefined_ => "undefined",
+        .null_ => "null",
+        .bigint => |bi| try val_mod.bigIntToString(arena, bi),
+        .symbol => realm_mod.throwTypeError(arena, "Cannot convert a Symbol value to a string"),
+        else => realm_mod.throwTypeError(arena, "Cannot convert value to a string"),
+    };
 }
 
 /// thisSymbolValue(v): the symbol primitive, unwrapping a boxed Symbol wrapper's
@@ -78,9 +99,9 @@ pub fn nativeSymbolToPrimitive(arena: std.mem.Allocator, this_val: Value, _: []c
 /// or undefined when it was created without one. `this` is the symbol primitive
 /// (or a boxed Symbol object, though autoboxing passes the primitive here).
 pub fn nativeSymbolDescriptionGet(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (thisSymbolValue(this_val)) |sd| {
-        if (sd.description) |d| return val_mod.makeString(arena, d);
-    }
+    const sd = thisSymbolValue(this_val) orelse
+        return realm_mod.throwTypeError(arena, "get Symbol.prototype.description requires that 'this' be a Symbol");
+    if (sd.description) |d| return val_mod.makeString(arena, d);
     return val_mod.makeUndefined(arena);
 }
 
@@ -102,10 +123,8 @@ pub fn resetRegistry() void {
 }
 
 pub fn nativeSymbolFor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const key: []const u8 = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .string)
-        args[0].toPtr().string
-    else
-        "undefined";
+    // §20.4.2.2 step 1: stringKey = ToString(key) — fully observable.
+    const key: []const u8 = try toStringThrowing(arena, if (args.len > 0) args[0] else Value{});
     for (registry_keys.items, 0..) |k, i| {
         if (std.mem.eql(u8, k, key)) return registry_syms.items[i];
     }
@@ -116,7 +135,10 @@ pub fn nativeSymbolFor(arena: std.mem.Allocator, _: Value, args: []const Value) 
 }
 
 pub fn nativeSymbolKeyFor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .symbol) {
+    // §20.4.2.6 step 1: a non-Symbol argument is a TypeError.
+    if (!(args.len > 0 and args[0].bits != 0 and args[0].unbox() == .symbol))
+        return realm_mod.throwTypeError(arena, "Symbol.keyFor requires a Symbol argument");
+    {
         const target = args[0].toPtr().symbol;
         for (registry_syms.items, 0..) |s, i| {
             if (s.bits != 0 and s.unbox() == .symbol and s.toPtr().symbol == target) {

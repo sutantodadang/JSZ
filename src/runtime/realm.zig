@@ -1537,6 +1537,8 @@ fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
             else
                 try JsObject.create(arena, p);
             try w.set("[[PrimitiveValue]]", args[0]);
+            // StringCreate: a boxed String is a String exotic object.
+            if (args[0].unbox() == .string) try installStringExotic(arena, w, args[0].unbox().string);
             return val_mod.makeObject(arena, w);
         }
     }
@@ -1568,9 +1570,28 @@ pub fn toObjectForThis(arena: std.mem.Allocator, v: Value) !Value {
         else
             try JsObject.create(arena, p);
         try w.set("[[PrimitiveValue]]", v);
+        // NOTE: deliberately NOT installing the String exotic index properties
+        // here. This runs on every sloppy-mode call with a primitive `this`, and
+        // materialising one property per code unit would make
+        // `hugeString.someSloppyMethod()` allocate proportionally to the string.
+        // The explicit boxing paths (Object(str), new String(str), and
+        // array_proto's ToObject) do install them.
         return val_mod.makeObject(arena, w);
     }
     return v;
+}
+
+/// Define a String exotic object's index properties and `length` on `obj`.
+pub fn installStringExotic(arena: std.mem.Allocator, obj: *JsObject, s: []const u8) !void {
+    const string_proto = @import("./builtins/string_proto.zig");
+    const cu_len = string_proto.cuLen(s);
+    var i: usize = 0;
+    while (i < cu_len) : (i += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        const unit = string_proto.cuUnitAt(s, i).?;
+        _ = try obj.defineOwnData(key, try val_mod.makeString(arena, try string_proto.cuToString(arena, unit)), .{ .writable = false, .enumerable = true, .configurable = false });
+    }
+    _ = try obj.defineOwnData("length", try val_mod.makeNumber(arena, @floatFromInt(cu_len)), .{ .writable = false, .enumerable = false, .configurable = false });
 }
 
 fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1602,105 +1623,122 @@ fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
 fn nativeArrayIsArray(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len > 0 and args[0].bits != 0 and args[0].unbox() == .object) {
-        return val_mod.makeBool(arena, args[0].toPtr().object.is_array);
+        // IsArray (§7.2.2) recurses through Proxy targets, and a REVOKED proxy is
+        // a TypeError rather than `false`.
+        var o = args[0].toPtr().object;
+        var depth: usize = 0;
+        while (o.internal_kind == .proxy and depth < 64) : (depth += 1) {
+            const target = proxy_mod.proxyTarget(o) orelse return proxy_mod.throwRevoked(arena);
+            if (target.bits == 0 or target.unbox() != .object) return val_mod.makeBool(arena, false);
+            o = target.toPtr().object;
+        }
+        return val_mod.makeBool(arena, o.is_array);
     }
     return val_mod.makeBool(arena, false);
 }
 
 /// ES2015 Array.from(arrayLike [, mapFn [, thisArg]])
 /// Converts any array-like (length + indexed) or iterable to a real Array.
-fn nativeArrayFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    // Helper: create a new array with the given items.
-    const makeJsArray = struct {
-        fn make(alloc: std.mem.Allocator, items: []const Value) !Value {
-            const obj = if (active_heap) |heap|
-                try JsObject.createOnHeap(heap, active_array_proto)
-            else
-                try JsObject.create(alloc, active_array_proto);
-            obj.is_array = true;
-            for (items, 0..) |v, i| {
-                const key = try std.fmt.allocPrint(alloc, "{d}", .{i});
-                try obj.set(key, v);
-            }
-            obj.array_length = @intCast(items.len);
-            return val_mod.makeObject(alloc, obj);
+/// ArrayCreate(len) — a fresh real Array with [[ArrayLength]] = len and the
+/// current realm's %Array.prototype%. A length past the array index limit is a
+/// RangeError (§10.4.2.2 step 1).
+fn arrayCreate(arena: std.mem.Allocator, len: usize) anyerror!Value {
+    if (len > 4294967295) return throwRangeError(arena, "Invalid array length");
+    const obj = if (active_heap) |heap|
+        try JsObject.createOnHeap(heap, active_array_proto)
+    else
+        try JsObject.create(arena, active_array_proto);
+    obj.is_array = true;
+    obj.array_length = @intCast(len);
+    return val_mod.makeObject(arena, obj);
+}
+
+/// ArrayCreate(len) unless `C` is a constructor, in which case Construct(C, args)
+/// — the "which object do I fill in" step shared by Array.from and Array.of.
+fn arrayFromCtor(arena: std.mem.Allocator, ctx: *Context, c: Value, len: usize, pass_len: bool) anyerror!Value {
+    if (!reflect_mod.isConstructorVal(c)) return arrayCreate(arena, len);
+    if (pass_len) {
+        return ctx.construct(arena, c, &[_]Value{try val_mod.makeNumber(arena, @floatFromInt(len))});
+    }
+    return ctx.construct(arena, c, &[_]Value{});
+}
+
+/// ES2015 Array.from(items, mapfn, thisArg) — §23.1.2.1. `this` is the
+/// constructor to build with (subclass-aware), elements are installed with
+/// CreateDataPropertyOrThrow, and `length` is written with a throwing [[Set]].
+fn nativeArrayFrom(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const ctx = active_context orelse return throwTypeError(arena, "no active context");
+    const items = if (args.len > 0) args[0] else Value{};
+    const mapfn = if (args.len > 1) args[1] else Value{};
+    const this_arg = if (args.len > 2) args[2] else try val_mod.makeUndefined(arena);
+
+    // Step 2: mapfn is validated BEFORE `items` is touched at all.
+    var mapping = false;
+    if (!(mapfn.bits == 0 or mapfn.unbox() == .undefined_)) {
+        if (!isCallableVal(mapfn)) return throwTypeError(arena, "Array.from: mapfn is not a function");
+        mapping = true;
+    }
+
+    // Step 3: GetMethod(items, @@iterator) — this is what makes Array.from(null)
+    // a TypeError (GetV does ToObject on the base first).
+    if (items.bits == 0 or items.unbox() == .undefined_ or items.unbox() == .null_)
+        return throwTypeError(arena, "Array.from: items is null or undefined");
+    var using_iterator = Value{};
+    if (active_sym_iterator) |sym| {
+        const m = try ctx.getPropSym(arena, items, sym);
+        if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
+            if (!isCallableVal(m)) return throwTypeError(arena, "Array.from: Symbol.iterator is not a function");
+            using_iterator = m;
         }
-    }.make;
+    }
 
-    if (args.len == 0 or args[0].bits == 0) return try makeJsArray(arena, &[_]Value{});
-    const src = args[0];
-    const map_fn = if (args.len > 1 and args[1].bits != 0 and args[1].unbox() != .undefined_) args[1] else Value{};
-
-    var items = std.ArrayList(Value){};
-    const src_unboxed = src.unbox();
-    if (src_unboxed == .object) {
-        const obj = src_unboxed.object;
-        if (obj.internal_kind == .typed_array) {
-            // TypedArray: use taLoad to get each element as a JS Value.
-            if (typed_array_mod.getTd(src)) |td| {
-                var i: usize = 0;
-                while (i < td.length) : (i += 1) {
-                    try items.append(arena, try typed_array_mod.taLoad(arena, td, i));
+    if (using_iterator.bits != 0) {
+        const a = try arrayFromCtor(arena, ctx, this_val, 0, false);
+        const iterator = try function_proto_mod.invokeCallback(arena, items, using_iterator, &[_]Value{});
+        if (iterator.bits == 0 or iterator.unbox() != .object)
+            return throwTypeError(arena, "[Symbol.iterator]() returned a non-object");
+        const next_fn = try ctx.getProp(arena, iterator, "next");
+        if (!isCallableVal(next_fn)) return throwTypeError(arena, "iterator.next is not a function");
+        var k: usize = 0;
+        while (true) : (k += 1) {
+            const res = try function_proto_mod.invokeCallback(arena, iterator, next_fn, &[_]Value{});
+            if (res.bits == 0 or res.unbox() != .object)
+                return throwTypeError(arena, "iterator.next() returned a non-object");
+            if (isTruthyVal(try ctx.getProp(arena, res, "done"))) break;
+            const v = try ctx.getProp(arena, res, "value");
+            // A throw from mapfn or from installing the element closes the
+            // iterator before propagating (IteratorClose, §23.1.2.1 steps 5.g/5.i).
+            const mapped = if (mapping)
+                function_proto_mod.invokeCallback(arena, this_arg, mapfn, &[_]Value{ v, try val_mod.makeNumber(arena, @floatFromInt(k)) }) catch |e| {
+                    es2015_collections_mod.closeIterator(arena, iterator);
+                    return e;
                 }
-            }
-        } else if (obj.is_array) {
-            // Real Array: iterate by [[ArrayLength]] + indexed reads (length is
-            // the `array_length` slot, NOT an ordinary "length" property).
-            const len: usize = obj.getArrayLength();
-            var i: usize = 0;
-            var buf: [32]u8 = undefined;
-            while (i < len) : (i += 1) {
-                const key = try std.fmt.bufPrint(&buf, "{d}", .{i});
-                try items.append(arena, obj.get(key) orelse Value{});
-            }
-        } else if (try arrayFromIterate(arena, src, &items)) {
-            // Consumed via the @@iterator protocol (Set/Map/generators/custom).
-        } else {
-            // Generic array-like: read .length then [0..length-1].
-            const len_v = obj.get("length") orelse Value{};
-            // ToLength: NaN → 0, clamp to 2^53-1 (`{length: Infinity}` must not
-            // reach @intFromFloat). Array.from then builds the result with
-            // ArrayCreate(len), which is a RangeError past the array-length limit.
-            const raw = if (len_v.bits != 0 and len_v.unbox() == .number) len_v.unbox().number else 0;
-            const clamped = if (std.math.isNan(raw)) 0 else @max(0, @min(raw, 9007199254740991.0));
-            if (clamped > 4294967295.0) return throwRangeError(arena, "Invalid array length");
-            const len: usize = @intFromFloat(clamped);
-            var i: usize = 0;
-            var buf: [32]u8 = undefined;
-            while (i < len) : (i += 1) {
-                const key = try std.fmt.bufPrint(&buf, "{d}", .{i});
-                const v = obj.get(key) orelse Value{};
-                try items.append(arena, v);
-            }
+            else
+                v;
+            array_proto_mod.genCreate(arena, a, k, mapped) catch |e| {
+                es2015_collections_mod.closeIterator(arena, iterator);
+                return e;
+            };
         }
-    } else if (src_unboxed == .string) {
-        // String: each Unicode code unit becomes an element.
-        const s = src_unboxed.string;
-        var i: usize = 0;
-        while (i < s.len) {
-            const byte_len: usize = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-            const slice = if (i + byte_len <= s.len) s[i .. i + byte_len] else s[i .. i + 1];
-            const cv = try val_mod.makeString(arena, try arena.dupe(u8, slice));
-            try items.append(arena, cv);
-            i += byte_len;
-        }
-    } else if (src_unboxed != .null_ and src_unboxed != .undefined_) {
-        // Non-string primitive (number/boolean/symbol/bigint): GetMethod(items,
-        // @@iterator) coerces via ToObject, so a wrapper-prototype @@iterator
-        // (e.g. a custom Number.prototype[@@iterator]) is honoured.
-        _ = try arrayFromIterate(arena, src, &items);
+        try ctx.setPropThrow(arena, a, "length", try val_mod.makeNumber(arena, @floatFromInt(k)));
+        return a;
     }
 
-    // Apply mapFn if provided.
-    if (map_fn.bits != 0) {
-        const undef = try val_mod.makeUndefined(arena);
-        for (items.items, 0..) |v, i| {
-            const idx = try val_mod.makeNumber(arena, @floatFromInt(i));
-            items.items[i] = try function_proto_mod.invokeCallback(arena, undef, map_fn, &[_]Value{ v, idx });
-        }
+    // Array-like path.
+    const len = try toLengthValue(arena, try ctx.getProp(arena, items, "length"));
+    const a = try arrayFromCtor(arena, ctx, this_val, len, true);
+    var k: usize = 0;
+    while (k < len) : (k += 1) {
+        const key = try std.fmt.allocPrint(arena, "{d}", .{k});
+        const kv = try ctx.getProp(arena, items, key);
+        const mapped = if (mapping)
+            try function_proto_mod.invokeCallback(arena, this_arg, mapfn, &[_]Value{ kv, try val_mod.makeNumber(arena, @floatFromInt(k)) })
+        else
+            kv;
+        try array_proto_mod.genCreate(arena, a, k, mapped);
     }
-
-    return try makeJsArray(arena, items.items);
+    try ctx.setPropThrow(arena, a, "length", try val_mod.makeNumber(arena, @floatFromInt(len)));
+    return a;
 }
 
 /// Consume `src` via the @@iterator protocol into `items`. Returns false when
@@ -1750,19 +1788,15 @@ fn isTruthyValue(v: Value) bool {
     return val_mod.toBoolean(v);
 }
 
-/// ES2015 Array.of(...args) — creates array from arguments (no special-case for length).
-fn nativeArrayOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const obj = if (active_heap) |heap|
-        try JsObject.createOnHeap(heap, active_array_proto)
-    else
-        try JsObject.create(arena, active_array_proto);
-    obj.is_array = true;
-    for (args, 0..) |v, i| {
-        const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-        try obj.set(key, v);
-    }
-    obj.array_length = @intCast(args.len);
-    return val_mod.makeObject(arena, obj);
+/// ES2015 Array.of(...items) — §23.1.2.3. Like Array.from, `this` is the
+/// constructor to build with, elements go in via CreateDataPropertyOrThrow, and
+/// `length` is written with a throwing [[Set]].
+fn nativeArrayOf(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const ctx = active_context orelse return throwTypeError(arena, "no active context");
+    const a = try arrayFromCtor(arena, ctx, this_val, args.len, true);
+    for (args, 0..) |v, i| try array_proto_mod.genCreate(arena, a, i, v);
+    try ctx.setPropThrow(arena, a, "length", try val_mod.makeNumber(arena, @floatFromInt(args.len)));
+    return a;
 }
 
 /// ES2023 Array.fromAsync(items, mapFn?, thisArg?) → Promise<Array>
@@ -2221,15 +2255,7 @@ fn nativeStringCtor(arena: std.mem.Allocator, this_val: Value, args: []const Val
         // A String exotic object exposes each UTF-16 code unit as an own property
         // { enumerable, non-writable, non-configurable } plus an own non-enumerable
         // "length" (ES 10.4.3 StringCreate / String-exotic define-own-property).
-        const string_proto = @import("./builtins/string_proto.zig");
-        const cu_len = string_proto.cuLen(s);
-        var i: usize = 0;
-        while (i < cu_len) : (i += 1) {
-            const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-            const unit = string_proto.cuUnitAt(s, i).?;
-            _ = try obj.defineOwnData(key, try val_mod.makeString(arena, try string_proto.cuToString(arena, unit)), .{ .writable = false, .enumerable = true, .configurable = false });
-        }
-        _ = try obj.defineOwnData("length", try val_mod.makeNumber(arena, @floatFromInt(cu_len)), .{ .writable = false, .enumerable = false, .configurable = false });
+        try installStringExotic(arena, obj, s);
         return this_val;
     }
     return val_mod.makeString(arena, s);
@@ -2339,22 +2365,8 @@ fn nativeStringFromCharCode(arena: std.mem.Allocator, _: Value, args: []const Va
 /// ES ToNumber that coerces objects via ToPrimitive(number) and throws on
 /// Symbol / BigInt (used by fromCodePoint's RangeError validation).
 pub fn toNumberCheckedRealm(arena: std.mem.Allocator, v: Value) anyerror!f64 {
-    if (v.bits == 0) return std.math.nan(f64);
-    switch (v.unbox()) {
-        .number => |n| return n,
-        .boolean => |b| return if (b) 1 else 0,
-        .null_ => return 0,
-        .undefined_ => return std.math.nan(f64),
-        .string => |s| return val_mod.jsStringToNumber(s),
-        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a number"),
-        .bigint => return throwTypeError(arena, "Cannot convert a BigInt value to a number"),
-        .object => {
-            const prim = (try coercion_mod.toPrimitive(arena, v, .number)) orelse return std.math.nan(f64);
-            if (prim.bits != 0 and prim.unbox() == .object) return std.math.nan(f64);
-            return toNumberCheckedRealm(arena, prim);
-        },
-        else => return std.math.nan(f64),
-    }
+    // An object with no callable valueOf/toString is a TypeError, not NaN.
+    return coercion_mod.toNumberThrowing(arena, v);
 }
 
 /// String.fromCodePoint(...codePoints): each argument must be a non-negative
@@ -2990,6 +3002,9 @@ fn numberPrimitive(arena: std.mem.Allocator, arg: Value) anyerror!f64 {
         .string => |s| val_mod.jsStringToNumber(s),
         .null_ => 0,
         .undefined_ => std.math.nan(f64),
+        // ToNumeric(Symbol) is a TypeError even for `Number(sym)` (only BigInt
+        // gets the special Number() carve-out above).
+        .symbol => throwTypeError(arena, "Cannot convert a Symbol value to a number"),
         .object => blk: {
             // ToNumber(ToPrimitive(arg, "number")) when a user hook applies.
             if (try coercion_mod.toPrimitive(arena, arg, .number)) |prim|
@@ -3047,6 +3062,53 @@ fn nativeBigIntCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
     }
 }
 
+/// ES ToBigInt (7.1.13). Unlike `BigInt(x)`, a Number argument is a TypeError —
+/// there is no implicit Number→BigInt conversion.
+fn toBigIntValue(arena: std.mem.Allocator, v_in: Value) anyerror!Value {
+    var v = v_in;
+    if (v.bits == 0) return throwTypeError(arena, "Cannot convert undefined to a BigInt");
+    if (!coercion_mod.isPrimitive(v))
+        v = (try coercion_mod.toPrimitive(arena, v, .number)) orelse
+            return throwTypeError(arena, "Cannot convert object to a BigInt");
+    return switch (v.unbox()) {
+        .bigint => v,
+        .boolean => |b| val_mod.makeBigIntFromI64(arena, if (b) 1 else 0),
+        .string => |s| val_mod.stringToBigInt(arena, s) catch
+            throwSyntaxError(arena, "Cannot convert string to a BigInt"),
+        .number => throwTypeError(arena, "Cannot convert a Number to a BigInt"),
+        .symbol => throwTypeError(arena, "Cannot convert a Symbol value to a BigInt"),
+        else => throwTypeError(arena, "Cannot convert value to a BigInt"),
+    };
+}
+
+/// ES ToIndex (7.1.22): ToIntegerOrInfinity, then reject anything outside
+/// [0, 2**53-1] with a RangeError. `undefined` is 0.
+fn toIndexValue(arena: std.mem.Allocator, v: Value) anyerror!u64 {
+    const n = try coercion_mod.toNumberThrowing(arena, v);
+    const i = if (std.math.isNan(n)) 0 else std.math.trunc(n);
+    if (i < 0 or i > 9007199254740991.0) return throwRangeError(arena, "Invalid index");
+    return @intFromFloat(i);
+}
+
+/// BigInt.asIntN(bits, bigint) / BigInt.asUintN(bits, bigint) — §21.2.2.1-2.
+/// ToIndex(bits) runs BEFORE ToBigInt(bigint); tests observe that order.
+fn bigIntAsN(arena: std.mem.Allocator, args: []const Value, signed: bool) anyerror!Value {
+    const bits = try toIndexValue(arena, if (args.len > 0) args[0] else Value{});
+    const big = try toBigIntValue(arena, if (args.len > 1) args[1] else Value{});
+    return val_mod.bigIntAsIntN(arena, big, bits, signed) catch |e| switch (e) {
+        error.Overflow => throwRangeError(arena, "BigInt is too large"),
+        else => e,
+    };
+}
+
+fn nativeBigIntAsIntN(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return bigIntAsN(arena, args, true);
+}
+
+fn nativeBigIntAsUintN(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return bigIntAsN(arena, args, false);
+}
+
 /// thisBigIntValue(this): primitive bigint, or a BigInt wrapper's [[PrimitiveValue]].
 fn bigIntThisValue(arena: std.mem.Allocator, this_val: Value) anyerror!Value {
     if (this_val.bits != 0) {
@@ -3075,14 +3137,12 @@ fn nativeBigIntProtoToString(arena: std.mem.Allocator, this_val: Value, args: []
     const b = try bigIntThisValue(arena, this_val);
     var radix: i64 = 10;
     if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_) {
-        const prim = (try coercion_mod.toPrimitive(arena, args[0], .number)) orelse args[0];
-        const rn: f64 = switch (prim.unbox()) {
-            .number => |n| n,
-            .boolean => |bo| if (bo) 1 else 0,
-            else => 10,
-        };
+        // ToIntegerOrInfinity, i.e. a full ToNumber: a Symbol or BigInt radix is a
+        // TypeError, and `null`/non-numeric strings coerce to 0 (→ RangeError),
+        // not to the default 10.
+        const rn = try coercion_mod.toNumberThrowing(arena, args[0]);
         if (std.math.isNan(rn)) return throwRangeError(arena, "toString() radix must be between 2 and 36");
-        radix = @intFromFloat(@trunc(rn));
+        radix = val_mod.f64ToI64Sat(rn);
     }
     if (radix < 2 or radix > 36) return throwRangeError(arena, "toString() radix must be between 2 and 36");
     const s = try b.toPtr().bigint.toConst().toStringAlloc(arena, @intCast(radix), .lower);
@@ -3229,8 +3289,10 @@ fn numberToRadixString(arena: std.mem.Allocator, n: f64, radix: i32) ![]const u8
 fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toString requires a Number");
     var radix: i32 = 10;
-    if (args.len > 0 and args[0].bits != 0) {
-        const r_raw = args[0].toF64();
+    if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_) {
+        // ToIntegerOrInfinity(radix) is a real ToNumber: an abrupt valueOf and a
+        // Symbol/BigInt radix must surface instead of silently becoming NaN → 0.
+        const r_raw = try toNumberCheckedRealm(arena, args[0]);
         const r_int: f64 = if (std.math.isNan(r_raw)) 0 else @trunc(r_raw);
         if (r_int < 2 or r_int > 36) return throwRangeError(arena, "toString() radix must be between 2 and 36");
         radix = @intFromFloat(r_int);
@@ -3419,7 +3481,7 @@ fn wrapperTag(obj: *JsObject) ?[]const u8 {
 }
 
 // ---- Object.prototype.toString / valueOf ----
-fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+pub fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     // ES 20.1.3.6: "[object " + builtinTag + "]". undefined/null get special tags.
     if (this_val.bits == 0) return val_mod.makeString(arena, "[object Undefined]");
     const builtin_tag: []const u8 = switch (this_val.unbox()) {
@@ -4181,8 +4243,12 @@ pub const Realm = struct {
         // Build Object.prototype (proto = null, as per spec).
         const object_proto = try JsObject.create(arena, null);
 
-        // Build Array.prototype (proto = Object.prototype).
+        // Build Array.prototype (proto = Object.prototype). §23.1.3: it is itself
+        // an Array exotic object with length 0, so `Array.isArray(Array.prototype)`
+        // is true and `Array.prototype.length` is 0 (not undefined).
         const array_proto = try JsObject.create(arena, object_proto);
+        array_proto.is_array = true;
+        array_proto.array_length = 0;
 
         // Build Object constructor object: a JsObject with a "create" property.
         const object_ctor = try JsObject.create(arena, null);
@@ -4197,8 +4263,8 @@ pub const Realm = struct {
         try object_ctor.defineOwnDataForced("prototype", proto_val, .{ .writable = false, .enumerable = false, .configurable = false });
 
         // Define "Object" in global env as the constructor object.
-        _ = try object_ctor.defineOwnData("name", try val_mod.makeString(arena, "Object"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try object_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try object_ctor.defineOwnData("name", try val_mod.makeString(arena, "Object"), .{ .writable = false, .enumerable = false, .configurable = true });
         const ctor_val = try val_mod.makeObject(arena, object_ctor);
         try env.define("Object", ctor_val);
 
@@ -4296,8 +4362,8 @@ pub const Realm = struct {
                 // configurable / non-writable. assert.throws and
                 // Function.prototype.toString rely on `name`.
                 const nlen_attr: obj_mod.PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-                _ = try ctor_obj.defineOwnData("name", try val_mod.makeString(a, name), nlen_attr);
                 _ = try ctor_obj.defineOwnData("length", try val_mod.makeNumber(a, len), nlen_attr);
+                _ = try ctor_obj.defineOwnData("name", try val_mod.makeString(a, name), nlen_attr);
                 return val_mod.makeObject(a, ctor_obj);
             }
         }.make;
@@ -4433,6 +4499,9 @@ pub const Realm = struct {
         // poison-pill accessors whose [[Get]] and [[Set]] are the shared
         // %ThrowTypeError% intrinsic (enumerable:false, configurable:true).
         const thrower = try val_mod.makeNativeFunctionNamed(arena, function_proto_mod.nativeThrowTypeError, "", 0);
+        // §10.2.4.1: %ThrowTypeError% is non-extensible and its `length`/`name`
+        // are non-configurable — unlike every other built-in function.
+        thrower.toPtr().native_function.frozen_intrinsic = true;
         active_throw_type_error = thrower;
         const thrower_holder = try JsObject.create(arena, null);
         try thrower_holder.set("get", thrower);
@@ -4516,8 +4585,8 @@ pub const Realm = struct {
         // Array.fromAsync: non-enumerable to satisfy prop-desc test (§23.1.2.1)
         const from_async_attr = obj_mod.PropAttr{ .writable = true, .enumerable = false, .configurable = true };
         _ = try array_ctor_obj.defineOwnData("fromAsync", try val_mod.makeNativeFunctionNamed(arena, nativeArrayFromAsync, "fromAsync", 1), from_async_attr);
-        _ = try array_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Array"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try array_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try array_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Array"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try array_proto.defineOwnData("constructor", try val_mod.makeObject(arena, array_ctor_obj), .{ .writable = true, .enumerable = false, .configurable = true });
         try env.define("Array", try val_mod.makeObject(arena, array_ctor_obj));
 
@@ -4528,15 +4597,15 @@ pub const Realm = struct {
         try string_ctor_obj.set("fromCodePoint", try val_mod.makeNativeFunctionNamed(arena, nativeStringFromCodePoint, "fromCodePoint", 1));
         try string_ctor_obj.set("raw", try val_mod.makeNativeFunctionNamed(arena, nativeStringRaw, "raw", 1));
         try string_proto.set("constructor", try val_mod.makeObject(arena, string_ctor_obj));
-        _ = try string_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "String"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try string_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try string_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "String"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("String", try val_mod.makeObject(arena, string_ctor_obj));
 
         const number_proto = try JsObject.create(arena, object_proto);
         // Number.prototype is itself a Number object with [[NumberData]] = +0.
         try number_proto.set("[[PrimitiveValue]]", try val_mod.makeNumber(arena, 0));
         try number_proto.set("valueOf", try val_mod.makeNativeFunctionNamed(arena, nativeNumberValueOf, "valueOf", 0));
-        try number_proto.set("toString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToString, "toString", 0));
+        try number_proto.set("toString", try val_mod.makeNativeFunctionNamedLen(arena, nativeNumberToString, "toString", 1));
         try number_proto.set("toLocaleString", try val_mod.makeNativeFunctionNamed(arena, nativeNumberProtoToLocaleString, "toLocaleString", 0));
         try number_proto.set("toFixed", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToFixed, "toFixed", 1));
         try number_proto.set("toExponential", try val_mod.makeNativeFunctionNamed(arena, nativeNumberToExponential, "toExponential", 1));
@@ -4563,12 +4632,12 @@ pub const Realm = struct {
         _ = try number_ctor_obj.defineOwnData("isNaN", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsNaN, "isNaN", 1), num_method_attr);
         _ = try number_ctor_obj.defineOwnData("isSafeInteger", try val_mod.makeNativeFunctionNamed(arena, nativeNumberIsSafeInteger, "isSafeInteger", 1), num_method_attr);
         try number_proto.set("constructor", try val_mod.makeObject(arena, number_ctor_obj));
-        _ = try number_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Number"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try number_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try number_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Number"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Number", try val_mod.makeObject(arena, number_ctor_obj));
 
         // ---- BigInt(value) global (conversion function; literals `1n` lex
-        // independently). ponytail: asIntN/asUintN/prototype not added yet.
+        // independently).
         const bigint_ctor_obj = try JsObject.create(arena, null);
         try bigint_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBigIntCtor));
         // BigInt.prototype: real object so `BigInt.prototype.toString = ...` and
@@ -4586,8 +4655,10 @@ pub const Realm = struct {
             try bigint_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, bigint_proto), .{ .writable = false, .enumerable = false, .configurable = false });
             active_bigint_proto = bigint_proto;
         }
-        _ = try bigint_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
+        try bigint_ctor_obj.set("asIntN", try val_mod.makeNativeFunctionNamedLen(arena, nativeBigIntAsIntN, "asIntN", 2));
+        try bigint_ctor_obj.set("asUintN", try val_mod.makeNativeFunctionNamedLen(arena, nativeBigIntAsUintN, "asUintN", 2));
         _ = try bigint_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try bigint_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "BigInt"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("BigInt", try val_mod.makeObject(arena, bigint_ctor_obj));
 
         // ---- Function constructor (minimal): callable object so `typeof Function`
@@ -4598,8 +4669,8 @@ pub const Realm = struct {
         try function_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, function_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try function_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeFunctionCtor));
         try function_proto.set("constructor", try val_mod.makeObject(arena, function_ctor_obj));
-        _ = try function_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Function"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try function_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try function_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Function"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Function", try val_mod.makeObject(arena, function_ctor_obj));
         active_function_ctor = function_ctor_obj;
 
@@ -4614,14 +4685,18 @@ pub const Realm = struct {
         try boolean_ctor_obj.defineOwnDataForced("prototype", try val_mod.makeObject(arena, boolean_proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try boolean_ctor_obj.set("__call__", try val_mod.makeNativeFunction(arena, nativeBooleanCtor));
         try boolean_proto.set("constructor", try val_mod.makeObject(arena, boolean_ctor_obj));
-        _ = try boolean_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Boolean"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try boolean_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try boolean_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "Boolean"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Boolean", try val_mod.makeObject(arena, boolean_ctor_obj));
         try env.define("isNaN", try val_mod.makeNativeFunctionNamed(arena, nativeIsNaN, "isNaN", 1));
         try env.define("eval", try val_mod.makeNativeFunctionNamed(arena, nativeEval, "eval", 1));
         try env.define("isFinite", try val_mod.makeNativeFunctionNamed(arena, nativeIsFinite, "isFinite", 1));
         try env.define("parseInt", try val_mod.makeNativeFunctionNamed(arena, nativeParseInt, "parseInt", 2));
         try env.define("parseFloat", try val_mod.makeNativeFunctionNamed(arena, nativeParseFloat, "parseFloat", 1));
+        // §21.1.2.12-13: Number.parseInt/parseFloat are the SAME function objects
+        // as the global parseInt/parseFloat, so `Number.parseInt === parseInt`.
+        _ = try number_ctor_obj.defineOwnData("parseInt", try env.lookup("parseInt"), num_method_attr);
+        _ = try number_ctor_obj.defineOwnData("parseFloat", try env.lookup("parseFloat"), num_method_attr);
         try env.define("encodeURI", try val_mod.makeNativeFunctionNamed(arena, nativeEncodeURI, "encodeURI", 1));
         try env.define("encodeURIComponent", try val_mod.makeNativeFunctionNamed(arena, nativeEncodeURIComponent, "encodeURIComponent", 1));
         try env.define("decodeURI", try val_mod.makeNativeFunctionNamed(arena, nativeDecodeURI, "decodeURI", 1));
@@ -4660,8 +4735,8 @@ pub const Realm = struct {
         // Symbol.prototype.constructor === Symbol, and the `description` accessor
         // (a getter holder `{ get: nativeFn }`, matching the live-reexport pattern).
         try symbol_proto.set("constructor", try val_mod.makeObject(arena, symbol_ctor));
-        _ = try symbol_ctor.defineOwnData("name", try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try symbol_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try symbol_ctor.defineOwnData("name", try val_mod.makeString(arena, "Symbol"), .{ .writable = false, .enumerable = false, .configurable = true });
         const sym_desc_holder = try JsObject.create(arena, null);
         try sym_desc_holder.set("get", try val_mod.makeNativeFunctionNamed(arena, symbol_mod.nativeSymbolDescriptionGet, "get", 0));
         _ = try symbol_proto.defineOwnAccessor("description", try val_mod.makeObject(arena, sym_desc_holder), .{
@@ -4672,7 +4747,11 @@ pub const Realm = struct {
         // Capture Symbol.iterator and register Array.prototype[Symbol.iterator].
         active_sym_iterator = symbol_ctor.getOwn("iterator");
         if (active_sym_iterator) |symv| {
-            try array_proto.setSym(symv, try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeArrayValues));
+            // §23.1.3.41: Array.prototype[@@iterator] is the SAME function object
+            // as Array.prototype.values, not a second copy of it.
+            const values_fn = array_proto.get("values") orelse
+                try val_mod.makeNativeFunction(arena, es2015_collections_mod.nativeArrayValues);
+            try array_proto.setSym(symv, values_fn);
             // String.prototype[@@iterator] — by-code-point iteration (overridable
             // and deletable, so it is a writable/configurable own property).
             try string_proto.setSymAttr(symv, try val_mod.makeNativeFunctionNamed(arena, es2015_collections_mod.nativeStringValues, "[Symbol.iterator]", 0), .{ .writable = true, .enumerable = false, .configurable = true });
@@ -4744,6 +4823,16 @@ pub const Realm = struct {
             } else |_| {}
         }
         active_sym_species = symbol_ctor.getOwn("species");
+        // `get C[@@species]` on the constructors whose prototype methods use
+        // SpeciesConstructor (§23.1.2.5 / §27.2.4.7 / §22.2.5.2). Registered here
+        // because the well-known symbols only exist after Symbol init.
+        if (active_sym_species) |spec_sym| {
+            for ([_][]const u8{ "Array", "Promise", "RegExp" }) |ctor_name| {
+                const cv = env.lookup(ctor_name) catch continue;
+                if (cv.bits == 0 or cv.unbox() != .object) continue;
+                try es2015_collections_mod.defineSymGetter(arena, cv.toPtr().object, spec_sym, es2015_collections_mod.nativeSpeciesReturnThis, "get [Symbol.species]");
+            }
+        }
         active_sym_is_concat_spreadable = symbol_ctor.getOwn("isConcatSpreadable");
         // Capture the RegExp-related well-known symbols and install the
         // RegExp.prototype[@@match/@@replace/@@search/@@split/@@matchAll] methods
@@ -4792,8 +4881,8 @@ pub const Realm = struct {
         const proxy_ctor = try JsObject.create(arena, null);
         try proxy_ctor.set("__call__", try val_mod.makeNativeFunction(arena, proxy_mod.nativeProxyCtor));
         _ = try proxy_ctor.defineOwnData("revocable", try val_mod.makeNativeFunctionNamed(arena, proxy_mod.nativeProxyRevocable, "revocable", 2), .{ .writable = true, .enumerable = false, .configurable = true });
-        _ = try proxy_ctor.defineOwnData("name", try val_mod.makeString(arena, "Proxy"), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try proxy_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 2), .{ .writable = false, .enumerable = false, .configurable = true });
+        _ = try proxy_ctor.defineOwnData("name", try val_mod.makeString(arena, "Proxy"), .{ .writable = false, .enumerable = false, .configurable = true });
         try env.define("Proxy", try val_mod.makeObject(arena, proxy_ctor));
 
         // ---- Intl (en-US, dependency-free) ----
@@ -4813,8 +4902,8 @@ pub const Realm = struct {
                     _ = try proto.defineOwnData("constructor", try val_mod.makeObject(a, ctor), .{ .writable = true, .enumerable = false, .configurable = true });
                     if (active_sym_to_string_tag) |tag_sym|
                         _ = try proto.defineOwnDataSym(tag_sym, try val_mod.makeString(a, tag), .{ .writable = false, .enumerable = false, .configurable = true });
-                    _ = try ctor.defineOwnData("name", try val_mod.makeString(a, cname), .{ .writable = false, .enumerable = false, .configurable = true });
                     _ = try ctor.defineOwnData("length", try val_mod.makeNumber(a, @floatFromInt(len)), .{ .writable = false, .enumerable = false, .configurable = true });
+                    _ = try ctor.defineOwnData("name", try val_mod.makeString(a, cname), .{ .writable = false, .enumerable = false, .configurable = true });
                     if (has_slo)
                         _ = try ctor.defineOwnData("supportedLocalesOf", try val_mod.makeNativeFunctionNamed(a, intl_mod.nativeDurationFormatSupportedLocalesOf, "supportedLocalesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
                 }
@@ -4931,8 +5020,8 @@ pub const Realm = struct {
             try df_ctor.set("__call__", try val_mod.makeNativeFunction(arena, intl_mod.nativeDurationFormatCtor));
             _ = try df_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, df_proto), .{ .writable = false, .enumerable = false, .configurable = false });
             _ = try df_proto.defineOwnData("constructor", try val_mod.makeObject(arena, df_ctor), .{ .writable = true, .enumerable = false, .configurable = true });
-            _ = try df_ctor.defineOwnData("name", try val_mod.makeString(arena, "DurationFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
             _ = try df_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
+            _ = try df_ctor.defineOwnData("name", try val_mod.makeString(arena, "DurationFormat"), .{ .writable = false, .enumerable = false, .configurable = true });
             _ = try df_ctor.defineOwnData("supportedLocalesOf", try val_mod.makeNativeFunctionNamed(arena, intl_mod.nativeDurationFormatSupportedLocalesOf, "supportedLocalesOf", 1), .{ .writable = true, .enumerable = false, .configurable = true });
             try intl_obj.set("DurationFormat", try val_mod.makeObject(arena, df_ctor));
             // Intl.Segmenter, plus the two prototypes `segment()` produces. Both
@@ -5210,6 +5299,10 @@ pub const Realm = struct {
         }
 
         const hp_array_proto = try heap.allocateObject(hp_proto);
+        // %Array.prototype% is itself an Array exotic object (§23.1.3); the
+        // heap-migrated copy must keep that brand and its length.
+        hp_array_proto.is_array = self.array_prototype.is_array;
+        hp_array_proto.array_length = self.array_prototype.array_length;
         for (self.array_prototype.ownKeys()) |k| {
             const a = self.array_prototype.ownAttr(k) orelse obj_mod.PropAttr{};
             if (a.is_accessor) {

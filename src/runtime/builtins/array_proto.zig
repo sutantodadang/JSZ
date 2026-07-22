@@ -363,9 +363,10 @@ pub fn nativeArrayToString(arena: std.mem.Allocator, this_val: Value, _: []const
             (cuni == .object and join_fn.toPtr().object.get("__call__") != null);
         if (callable) return fpm.invokeCallback(arena, this_val, join_fn, &[_]Value{});
     }
-    // Fallback: "[object Array]"-style tag via the array's own elements is not
-    // applicable here; emulate Object.prototype.toString minimal output.
-    return val_mod.makeString(arena, "[object Array]");
+    // §23.1.3.36 step 4: a non-callable `join` falls back to
+    // %Object.prototype.toString%, which brands by the RECEIVER — so
+    // `Array.prototype.toString.call(true)` is "[object Boolean]".
+    return realm_mod.nativeObjectProtoToString(arena, this_val, &[_]Value{});
 }
 
 /// ES Object.prototype.toLocaleString: return ? Invoke(this, "toString").
@@ -888,7 +889,10 @@ fn genSet(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
     };
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
     if (realm_mod.active_context) |ctx| {
-        try ctx.setProp(arena, this_val, key, v);
+        // Every element write in this file comes from a spec step of the form
+        // Set(O, ToString(i), v, true) — the THROWING form. A read-only or
+        // setter-less accessor target must raise TypeError, not fail silently.
+        try ctx.setPropThrow(arena, this_val, key, v);
         return;
     }
     if (this_val.isHeapPtr() and this_val.toPtr().* == .object)
@@ -900,7 +904,7 @@ fn genSet(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
 /// if [[DefineOwnProperty]] fails (non-configurable existing prop, non-extensible
 /// target, exotic rejection). Used by concat/map/filter/splice/… which the spec
 /// defines with CreateDataProperty, not [[Set]].
-fn genCreate(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
+pub fn genCreate(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
     if (realm_mod.nativeDeadlineExceeded()) return error.OutOfMemory;
     // Fast path: dense real array (elements are always configurable/writable and
     // the array is extensible, so CreateDataProperty always succeeds).
@@ -971,17 +975,11 @@ fn toObject(arena: std.mem.Allocator, v: Value) !Value {
         else
             try JsObject.create(arena, p);
         try w.set("[[PrimitiveValue]]", v);
-        // A String exotic object exposes each code unit as an own index property
-        // plus `length`, so array methods can read them (String is byte-indexed).
-        if (v.unbox() == .string) {
-            const s = v.toPtr().string;
-            var i: usize = 0;
-            while (i < s.len) : (i += 1) {
-                const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-                try w.set(key, try val_mod.makeString(arena, try arena.dupe(u8, s[i .. i + 1])));
-            }
-            try w.set("length", try val_mod.makeNumber(arena, @floatFromInt(s.len)));
-        }
+        // A String exotic object exposes each UTF-16 code unit as an own
+        // { enumerable, non-writable, non-configurable } index property plus a
+        // non-writable `length` — the attributes matter, because a mutating array
+        // method applied to a string receiver must fail with a TypeError.
+        if (v.unbox() == .string) try realm_mod.installStringExotic(arena, w, v.toPtr().string);
         return val_mod.makeObject(arena, w);
     }
     return v;

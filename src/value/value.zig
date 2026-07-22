@@ -45,6 +45,10 @@ pub const NativeFnEntry = struct {
     /// Cross-realm: which Realm created this native function (opaque *Realm).
     /// Null = primary realm / untagged. Used by GetFunctionRealm.
     realm: ?*anyopaque = null,
+    /// %ThrowTypeError% only (§10.2.4.1): the intrinsic is created
+    /// non-extensible and its `length`/`name` are non-configurable, unlike every
+    /// other built-in function. Reflection paths consult this flag.
+    frozen_intrinsic: bool = false,
 
     pub fn invoke(self: NativeFnEntry, arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
         g_active_native_data = self.data;
@@ -296,6 +300,45 @@ pub fn bigIntBitNot(arena: std.mem.Allocator, v: Value) !Value {
     try t.add(&m, &one);
     t.negate();
     return makeBigInt(arena, t.toConst());
+}
+
+/// BigInt.asIntN / BigInt.asUintN core: reduce `v` modulo 2**bits, then (when
+/// `signed`) reinterpret the top bit as a sign. `v` must be `.bigint`.
+/// Returns error.Overflow when the result would need an unreasonable number of
+/// limbs (a huge `bits` with a negative operand), which the caller reports as a
+/// RangeError — the same escape hatch V8 uses.
+pub fn bigIntAsIntN(arena: std.mem.Allocator, v: Value, bits: u64, signed: bool) !Value {
+    const c = v.toPtr().bigint.toConst();
+    if (bits == 0 or c.eqlZero()) return makeBigIntFromI64(arena, 0);
+    // Fast path: the value already fits in `bits` two's-complement bits, so the
+    // modulo is the identity. Also the only way a huge `bits` stays tractable.
+    const magnitude_bits = c.bitCountAbs();
+    const fits = if (c.positive)
+        (if (signed) magnitude_bits < bits else magnitude_bits <= bits)
+    else
+        (signed and c.bitCountTwosComp() <= bits);
+    if (fits) return v;
+    if (bits > 1 << 24) return error.Overflow; // ~2 MiB of limbs; refuse politely
+
+    const nbits: usize = @intCast(bits);
+    var one = try std.math.big.int.Managed.initSet(arena, 1);
+    var modulus = try std.math.big.int.Managed.init(arena);
+    try modulus.shiftLeft(&one, nbits);
+    var val = try c.toManaged(arena);
+    var q = try std.math.big.int.Managed.init(arena);
+    var r = try std.math.big.int.Managed.init(arena);
+    // Floored division: the remainder takes the divisor's (positive) sign, so
+    // `r` lands in [0, 2**bits) exactly like the spec's `modulo`.
+    try q.divFloor(&r, &val, &modulus);
+    if (!signed) return makeBigInt(arena, r.toConst());
+    var half = try std.math.big.int.Managed.init(arena);
+    try half.shiftLeft(&one, nbits - 1);
+    if (r.toConst().order(half.toConst()).compare(.gte)) {
+        var signed_r = try std.math.big.int.Managed.init(arena);
+        try signed_r.sub(&r, &modulus);
+        return makeBigInt(arena, signed_r.toConst());
+    }
+    return makeBigInt(arena, r.toConst());
 }
 
 /// BigInt negation (unary minus). `v` must be `.bigint`.
@@ -619,8 +662,52 @@ pub const Value = extern struct {
 /// a bare `parseFloat`, which maps "" to NaN and rejects radix prefixes. Shared by
 /// `Value.toF64` (Number(), Array index coercion) and the VM's arithmetic path so
 /// they agree (e.g. Number("0b1110") === +"0b1110" === 14).
+/// ES StrWhiteSpace: WhiteSpace ∪ LineTerminator. Beyond the ASCII set this
+/// covers NBSP, the Unicode space separators, U+2028/U+2029 and the BOM — all
+/// multi-byte in UTF-8, so a byte-wise `std.mem.trim` would leave them behind
+/// and turn `Number("\u00A012")` into NaN.
+fn strWhiteSpaceLenAt(s: []const u8, i: usize) ?usize {
+    const c = s[i];
+    if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0B or c == 0x0C) return 1;
+    if (c == 0xC2 and i + 1 < s.len and s[i + 1] == 0xA0) return 2; // U+00A0
+    if (c == 0xE1 and i + 2 < s.len and s[i + 1] == 0x9A and s[i + 2] == 0x80) return 3; // U+1680
+    if (c == 0xE2 and i + 2 < s.len and s[i + 1] == 0x80) {
+        const b2 = s[i + 2];
+        // U+2000..U+200A, U+2028, U+2029, U+202F
+        if ((b2 >= 0x80 and b2 <= 0x8A) or b2 == 0xA8 or b2 == 0xA9 or b2 == 0xAF) return 3;
+    }
+    if (c == 0xE2 and i + 2 < s.len and s[i + 1] == 0x81 and s[i + 2] == 0x9F) return 3; // U+205F
+    if (c == 0xE3 and i + 2 < s.len and s[i + 1] == 0x80 and s[i + 2] == 0x80) return 3; // U+3000
+    if (c == 0xEF and i + 2 < s.len and s[i + 1] == 0xBB and s[i + 2] == 0xBF) return 3; // U+FEFF
+    return null;
+}
+
+fn trimStrWhiteSpace(s: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < s.len) {
+        const n = strWhiteSpaceLenAt(s, start) orelse break;
+        start += n;
+    }
+    var end: usize = s.len;
+    outer: while (end > start) {
+        // Scan forward from `start` to find the last whitespace run's beginning:
+        // whitespace is 1..3 bytes, so probe the possible starts of the final run.
+        var back: usize = 1;
+        while (back <= 3 and end >= start + back) : (back += 1) {
+            if (strWhiteSpaceLenAt(s, end - back)) |n| {
+                if (end - back + n == end) {
+                    end -= back;
+                    continue :outer;
+                }
+            }
+        }
+        break;
+    }
+    return s[start..end];
+}
+
 pub fn jsStringToNumber(s: []const u8) f64 {
-    const t = std.mem.trim(u8, s, " \t\n\r\x0B\x0C");
+    const t = trimStrWhiteSpace(s);
     if (t.len == 0) return 0;
     // ES StringNumericLiteral forbids numeric separators ('_'); Zig's parseFloat/
     // parseInt accept them, so reject up front (ToNumber("1_0") is NaN).
@@ -635,7 +722,10 @@ pub fn jsStringToNumber(s: []const u8) f64 {
             else => null,
         };
         if (radix) |r| {
-            const v = std.fmt.parseInt(u64, t[2..], r) catch return std.math.nan(f64);
+            // The non-decimal grammar is digits ONLY: `std.fmt.parseInt` would
+            // happily accept a sign ("0x+1") that ES rejects.
+            for (t[2..]) |c| _ = std.fmt.charToDigit(c, r) catch return std.math.nan(f64);
+            const v = std.fmt.parseInt(u128, t[2..], r) catch return std.math.nan(f64);
             return @floatFromInt(v);
         }
     }
@@ -645,6 +735,13 @@ pub fn jsStringToNumber(s: []const u8) f64 {
     // "Infinity"/"+Infinity"/"-Infinity", handled above, are special).
     const c0 = t[0];
     if (!(std.ascii.isDigit(c0) or c0 == '.' or c0 == '+' or c0 == '-')) return std.math.nan(f64);
+    // StrDecimalLiteral uses ONLY digits, '.', an e-exponent and a sign. Zig's
+    // parseFloat additionally accepts hex-float syntax, so `Number("+0x10")` and
+    // `Number("0x10.01")` would come back as 16 instead of NaN.
+    for (t) |c| {
+        if (std.ascii.isDigit(c) or c == '.' or c == '+' or c == '-' or c == 'e' or c == 'E') continue;
+        return std.math.nan(f64);
+    }
     return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
 }
 

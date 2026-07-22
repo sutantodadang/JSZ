@@ -179,8 +179,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     // §22.2.1: %TypedArray%.name is "TypedArray", .length is 0 (both
     // non-writable, non-enumerable, configurable).
     const nlen_attr: PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
-    _ = try ta_ctor.defineOwnData("name", try val_mod.makeString(arena, "TypedArray"), nlen_attr);
     _ = try ta_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), nlen_attr);
+    _ = try ta_ctor.defineOwnData("name", try val_mod.makeString(arena, "TypedArray"), nlen_attr);
     // .prototype: non-writable, non-enumerable, non-configurable (ctor → proto link).
     _ = try ta_ctor.defineOwnData("prototype", try val_mod.makeObject(arena, ta_proto), .{ .writable = false, .enumerable = false, .configurable = false });
     try ta_ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeTaAbstractCtor));

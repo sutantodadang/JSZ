@@ -339,8 +339,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         active_disposable_proto = proto;
 
         const ctor = try JsObject.create(arena, ctx.function_proto);
-        _ = try ctor.defineOwnData("name", try val_mod.makeString(arena, "DisposableStack"), nn);
         _ = try ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), nn);
+        _ = try ctor.defineOwnData("name", try val_mod.makeString(arena, "DisposableStack"), nn);
         _ = try ctor.defineOwnData("prototype", try val_mod.makeObject(arena, proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeDisposableCtor));
         _ = try proto.defineOwnData("constructor", try val_mod.makeObject(arena, ctor), m);
@@ -360,8 +360,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
         active_async_disposable_proto = proto;
 
         const ctor = try JsObject.create(arena, ctx.function_proto);
-        _ = try ctor.defineOwnData("name", try val_mod.makeString(arena, "AsyncDisposableStack"), nn);
         _ = try ctor.defineOwnData("length", try val_mod.makeNumber(arena, 0), nn);
+        _ = try ctor.defineOwnData("name", try val_mod.makeString(arena, "AsyncDisposableStack"), nn);
         _ = try ctor.defineOwnData("prototype", try val_mod.makeObject(arena, proto), .{ .writable = false, .enumerable = false, .configurable = false });
         try ctor.set("__call__", try val_mod.makeNativeFunction(arena, nativeAsyncDisposableCtor));
         _ = try proto.defineOwnData("constructor", try val_mod.makeObject(arena, ctor), m);

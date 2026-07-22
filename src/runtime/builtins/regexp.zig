@@ -47,8 +47,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try regexp_ctor_obj.defineOwnDataForced("prototype", regexp_proto_val, .{ .writable = false, .enumerable = false, .configurable = false });
     const regexp_call_fn = try val_mod.makeNativeFunction(arena, nativeRegExpCtor);
     try regexp_ctor_obj.set("__call__", regexp_call_fn);
-    _ = try regexp_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "RegExp"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try regexp_ctor_obj.defineOwnData("length", try val_mod.makeNumber(arena, 2), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try regexp_ctor_obj.defineOwnData("name", try val_mod.makeString(arena, "RegExp"), .{ .writable = false, .enumerable = false, .configurable = true });
     const regexp_ctor_val = try val_mod.makeObject(arena, regexp_ctor_obj);
     _ = try regexp_proto.defineOwnData("constructor", regexp_ctor_val, .{ .writable = true, .enumerable = false, .configurable = true });
     try ctx.env.define("RegExp", regexp_ctor_val);
@@ -2885,7 +2885,7 @@ fn setLastIndexThrow(arena: std.mem.Allocator, v: Value, idx: usize) !void {
 /// IsRegExp (§7.2.8): an own/inherited `Symbol.match` wins over the
 /// [[RegExpMatcher]] slot, so `re[Symbol.match] = false` makes `re` stop
 /// counting as a RegExp for the constructor's short-circuit.
-fn isRegExpValue(arena: std.mem.Allocator, v: Value) anyerror!bool {
+pub fn isRegExpValue(arena: std.mem.Allocator, v: Value) anyerror!bool {
     if (v.bits == 0 or v.unbox() != .object) return false;
     if (realm_mod.active_sym_match) |match_sym| {
         if (realm_mod.active_context) |ctx| {

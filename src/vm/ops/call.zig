@@ -113,7 +113,7 @@ pub inline fn opTailCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 try val_mod.makeUndefined(self.arena);
             try call_env.define(pname, av);
         }
-        try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
+        try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)], closure);
         if (fn_ptr.name) |fname| {
             var is_param = false;
             for (fn_ptr.param_names) |p| {
@@ -265,7 +265,7 @@ pub inline fn opTailMethodCall(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 try val_mod.makeUndefined(self.arena);
             try call_env.define(pname, av);
         }
-        try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)]);
+        try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)], closure);
         if (fn_ptr.name) |fname| {
             var is_param = false;
             for (fn_ptr.param_names) |p| {

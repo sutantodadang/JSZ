@@ -49,6 +49,51 @@ fn sameValue(x: Value, y: Value) bool {
 }
 
 /// Object.keys(o): returns array of own enumerable string property names.
+/// EnumerableOwnProperties(O, kind) — §7.3.24 — for a Proxy receiver. Every step
+/// is observable: [[OwnPropertyKeys]], then [[GetOwnProperty]] per key to filter
+/// on [[Enumerable]], then [[Get]] for the value kinds. Returns null when `obj`
+/// is not a Proxy, so ordinary objects keep their direct property-table walk.
+fn proxyEnumerableOwnProperties(
+    arena: std.mem.Allocator,
+    target: Value,
+    obj: *JsObject,
+    kind: enum { key, value, key_value },
+) anyerror!?Value {
+    if (obj.internal_kind != .proxy) return null;
+    const realm_mod = @import("../realm.zig");
+    const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
+    const arr = try JsObject.createArray(arena, arr_proto);
+    const keys = (try proxy_mod.proxyOwnKeys(arena, obj)) orelse &[_]Value{};
+    var i: u32 = 0;
+    for (keys) |kv| {
+        // Symbol keys never appear in keys/values/entries.
+        if (!(kv.bits != 0 and kv.unbox() == .string)) continue;
+        const desc = try nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ target, kv });
+        if (desc.bits == 0 or desc.unbox() != .object) continue;
+        const enumerable = desc.toPtr().object.get("enumerable") orelse Value{};
+        if (!val_mod.toBoolean(enumerable)) continue;
+        const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+        i += 1;
+        if (kind == .key) {
+            try arr.set(idx_key, kv);
+            continue;
+        }
+        const ctx = realm_mod.active_context orelse return throwTypeError(arena, "no active context");
+        const v = try ctx.getProp(arena, target, try realm_mod.stringPrimitive(arena, kv));
+        if (kind == .value) {
+            try arr.set(idx_key, v);
+        } else {
+            const pair = try JsObject.createArray(arena, arr_proto);
+            try pair.set("0", kv);
+            try pair.set("1", v);
+            pair.array_length = 2;
+            try arr.set(idx_key, try val_mod.makeObject(arena, pair));
+        }
+    }
+    arr.array_length = i;
+    return @as(?Value, try val_mod.makeObject(arena, arr));
+}
+
 pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
     const arr_proto: ?*JsObject = if (realm_mod.active_array_proto) |p| p else null;
@@ -93,21 +138,7 @@ pub fn nativeObjectKeys(arena: std.mem.Allocator, _: Value, args: []const Value)
         return val_mod.makeObject(arena, arr);
     }
 
-    // Proxy: ownKeys trap (string keys only for Object.keys).
-    if (obj.internal_kind == .proxy) {
-        if (try proxy_mod.proxyOwnKeys(arena, obj)) |keys| {
-            var pi: u32 = 0;
-            for (keys) |kv| {
-                if (kv.bits != 0 and kv.unbox() == .string) {
-                    const idx_key = try std.fmt.allocPrint(arena, "{d}", .{pi});
-                    try arr.set(idx_key, kv);
-                    pi += 1;
-                }
-            }
-            arr.array_length = pi;
-        }
-        return val_mod.makeObject(arena, arr);
-    }
+    if (try proxyEnumerableOwnProperties(arena, input, obj, .key)) |r| return r;
 
     // M15: TypedArray integer indices (all enumerable per spec).
     var ta_key_count: u32 = 0;
@@ -190,6 +221,8 @@ pub fn nativeObjectValues(arena: std.mem.Allocator, _: Value, args: []const Valu
         arr.array_length = 0;
         return val_mod.makeObject(arena, arr);
     };
+
+    if (try proxyEnumerableOwnProperties(arena, input, obj, .value)) |r| return r;
 
     // M15: TypedArray integer-indexed element values come first (all enumerable).
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
@@ -353,6 +386,8 @@ pub fn nativeObjectEntries(arena: std.mem.Allocator, _: Value, args: []const Val
         return val_mod.makeObject(arena, arr);
     };
 
+    if (try proxyEnumerableOwnProperties(arena, input, obj, .key_value)) |r| return r;
+
     // M15: TypedArray integer-indexed [index, value] pairs come first.
     if (obj.internal_kind == .typed_array and obj.internal_slot != null) {
         const ta_mod = @import("typed_array.zig");
@@ -428,6 +463,13 @@ pub fn nativeObjectFromEntries(arena: std.mem.Allocator, _: Value, args: []const
             return e;
         };
         // ToPropertyKey(key): a Symbol stays a symbol key; else ToString it.
+        // `toPrimitive` returns null for an ALREADY-primitive input, so a bare
+        // Symbol key must be recognised before calling it or it falls through to
+        // the ToString branch and the property is dropped.
+        if (key.bits != 0 and key.unbox() == .symbol) {
+            try out.setSymAttr(key, value, .{ .writable = true, .enumerable = true, .configurable = true });
+            continue;
+        }
         const prim = coercion_mod.toPrimitive(arena, key, .string) catch |e| {
             try iteratorCloseIgnore(arena, ctx, iter);
             return e;
@@ -1507,6 +1549,9 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
         const entry = arg0_unboxed.native_function;
         const obj_proto: ?*JsObject = if (realm_mod.active_object_proto) |p| p else null;
         const desc = try JsObject.create(arena, obj_proto);
+        // Built-in `length`/`name` are configurable — except on %ThrowTypeError%,
+        // which the spec freezes (§10.2.4.1).
+        const cfg = !entry.frozen_intrinsic;
         if (std.mem.eql(u8, key, "name")) {
             if (entry.name_deleted) return val_mod.makeUndefined(arena);
             const name_val = if (entry.name) |n|
@@ -1516,14 +1561,14 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
             try desc.set("value", name_val);
             try desc.set("writable", try val_mod.makeBool(arena, false));
             try desc.set("enumerable", try val_mod.makeBool(arena, false));
-            try desc.set("configurable", try val_mod.makeBool(arena, true));
+            try desc.set("configurable", try val_mod.makeBool(arena, cfg));
             return val_mod.makeObject(arena, desc);
         } else if (std.mem.eql(u8, key, "length")) {
             if (entry.length_deleted) return val_mod.makeUndefined(arena);
             try desc.set("value", try val_mod.makeNumber(arena, @floatFromInt(entry.length)));
             try desc.set("writable", try val_mod.makeBool(arena, false));
             try desc.set("enumerable", try val_mod.makeBool(arena, false));
-            try desc.set("configurable", try val_mod.makeBool(arena, true));
+            try desc.set("configurable", try val_mod.makeBool(arena, cfg));
             return val_mod.makeObject(arena, desc);
         }
         return val_mod.makeUndefined(arena);
@@ -2193,8 +2238,10 @@ pub fn nativeObjectIsExtensible(arena: std.mem.Allocator, _: Value, args: []cons
             }
             break :blk val_mod.makeBool(arena, o.extensible);
         },
-        // Functions are ordinary (extensible) objects.
-        .native_function, .bc_function, .function => val_mod.makeBool(arena, true),
+        // Functions are ordinary (extensible) objects — except %ThrowTypeError%,
+        // which the spec creates non-extensible (§10.2.4.1).
+        .native_function => |e| val_mod.makeBool(arena, !e.frozen_intrinsic),
+        .bc_function, .function => val_mod.makeBool(arena, true),
         else => val_mod.makeBool(arena, false),
     };
 }

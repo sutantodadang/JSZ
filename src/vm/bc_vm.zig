@@ -380,7 +380,7 @@ pub const BcVm = struct {
                 // Arrows ignore the provided `this` and use their captured lexical one.
                 const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
                 if (fn_ptr.is_async and fn_ptr.is_generator) return try self.buildAsyncGenerator(fn_ptr, def_env, eff_this, args, closure);
-                if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, eff_this, args);
+                if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, eff_this, args, closure);
                 if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, eff_this, args, closure);
                 // Eval code shares the calling/global VariableEnvironment directly
                 // so its top-level declarations hoist there (not a discarded child).
@@ -390,7 +390,7 @@ pub const BcVm = struct {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
                 }
-                try self.defineArguments(call_env, fn_ptr, args);
+                try self.defineArguments(call_env, fn_ptr, args, closure);
                 try self.bindRestParam(call_env, fn_ptr, args);
                 const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
                 const new_regs = try self.arena.alloc(Value, num_regs);
@@ -1184,21 +1184,31 @@ pub const BcVm = struct {
         {
             const sym_binding = nr.global_env.bindings.get("Symbol");
             const sym_val = if (sym_binding) |b| b.value else Value{};
-            if (sym_val.bits != 0 and sym_val.unbox() == .object) {
+            // The primary realm's Symbol object supplies every well-known symbol
+            // (ES §6.1.5.1: they are shared by ALL realms of an agent, not just
+            // the four the species/iterator machinery needs internally).
+            const primary_sym_val = blk: {
+                const b = self.realm.global_env.bindings.get("Symbol") orelse break :blk Value{};
+                break :blk b.value;
+            };
+            const primary_sym_obj: ?*JsObject = if (primary_sym_val.bits != 0 and primary_sym_val.unbox() == .object)
+                primary_sym_val.toPtr().object
+            else
+                null;
+            if (sym_val.bits != 0 and sym_val.unbox() == .object and primary_sym_obj != null) {
                 const sym_obj = sym_val.toPtr().object;
                 // Direct-slot overwrite bypasses non-writable/non-configurable guard.
-                inline for (.{
-                    .{ "species", realm_mod.active_sym_species },
-                    .{ "iterator", realm_mod.active_sym_iterator },
-                    .{ "toStringTag", realm_mod.active_sym_to_string_tag },
-                    .{ "toPrimitive", realm_mod.active_sym_to_primitive },
-                }) |entry| {
-                    if (entry[1]) |primary_sym| {
-                        if (sym_obj.shape.key_to_slot.get(entry[0])) |slot| {
-                            if (slot < sym_obj.slots.items.len) {
-                                sym_obj.slots.items[slot] = primary_sym;
-                                sym_obj.gcWrite(primary_sym);
-                            }
+                for ([_][]const u8{
+                    "iterator",     "asyncIterator", "hasInstance", "isConcatSpreadable",
+                    "match",        "matchAll",      "replace",     "search",
+                    "split",        "species",       "toPrimitive", "toStringTag",
+                    "unscopables",  "dispose",       "asyncDispose",
+                }) |wk_name| {
+                    const primary_sym = primary_sym_obj.?.getOwn(wk_name) orelse continue;
+                    if (sym_obj.shape.key_to_slot.get(wk_name)) |slot| {
+                        if (slot < sym_obj.slots.items.len) {
+                            sym_obj.slots.items[slot] = primary_sym;
+                            sym_obj.gcWrite(primary_sym);
                         }
                     }
                 }
@@ -1384,7 +1394,7 @@ pub const BcVm = struct {
         const realm_mod = @import("../runtime/realm.zig");
         const promise_mod = @import("../runtime/builtins/promise.zig");
         const global_env: *Environment = @ptrCast(@alignCast(captured_env));
-        const result = self.buildAsyncFunction(main_func, global_env, Value{}, &[_]Value{}) catch |e| {
+        const result = self.buildAsyncFunction(main_func, global_env, Value{}, &[_]Value{}, null) catch |e| {
             if (e == error.JsException) {
                 return RunOutcome{ .exception_value = .{ .msg = "module evaluation failed", .value = realm_mod.pending_exception } };
             }
@@ -1796,7 +1806,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const p = try self.buildAsyncFunction(fn_ptr, def_env, eff_this, aargs);
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, eff_this, aargs, closure);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
                     return null;
                 }
@@ -1815,7 +1825,7 @@ pub const BcVm = struct {
                         try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
                 }
-                try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
+                try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)], closure);
                 try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
                 const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
                 const new_regs = try self.arena.alloc(Value, num_regs);
@@ -2050,15 +2060,21 @@ pub const BcVm = struct {
     /// Set a symbol-keyed own property. Functions are objects: a bc_function
     /// stores symbol props on its backing object (e.g. `fn[Symbol.iterator]=…`).
     pub fn setPropSym(self: *BcVm, obj_val: Value, sym_key: Value, value: Value) !void {
-        if (obj_val.bits == 0) return;
+        _ = try self.setPropSymChecked(obj_val, sym_key, value);
+    }
+
+    /// OrdinarySet with a symbol key, reporting success so a strict-mode store
+    /// can throw. False means the write was rejected (non-writable own property,
+    /// setter-less accessor, or a new property on a non-extensible object).
+    pub fn setPropSymChecked(self: *BcVm, obj_val: Value, sym_key: Value, value: Value) !bool {
+        if (obj_val.bits == 0) return true;
         const obj = switch (obj_val.unbox()) {
             .object => |o| o,
             .bc_function => |c| try self.closureBackingObj(c),
-            else => return,
+            else => return true,
         };
         if (obj.internal_kind == .proxy) {
-            _ = try self.proxySet(obj_val, obj, sym_key, value, obj_val);
-            return;
+            return try self.proxySet(obj_val, obj, sym_key, value, obj_val);
         }
         // M16: Module Namespace exotic [[Set]] always fails.
         if (obj.internal_kind == .module_namespace) {
@@ -2075,22 +2091,24 @@ pub const BcVm = struct {
             if (depth >= 64) break;
             depth += 1;
             if (o.internal_kind == .proxy and o != obj) {
-                _ = try self.proxySet(obj_val, o, sym_key, value, obj_val);
-                return;
+                return try self.proxySet(obj_val, o, sym_key, value, obj_val);
             }
             if (o.getOwnSymEntry(sym_key)) |sp| {
                 if (sp.attr.is_accessor) {
                     const setter = accessorMember(sp.value, "set");
-                    if (isCallable(setter)) _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
-                    return;
+                    if (!isCallable(setter)) return false; // accessor with no setter
+                    _ = try self.callAccessor(setter, obj_val, &[_]Value{value});
+                    return true;
                 }
+                // An inherited non-writable data property also blocks the write.
+                if (o != obj and !sp.attr.writable) return false;
                 // A data property found on `obj` itself is overwritten in place;
                 // one inherited from a prototype is shadowed by a new own property.
                 break;
             }
             cur = o.proto;
         }
-        try obj.setSym(sym_key, value);
+        return obj.setSymChecked(sym_key, value);
     }
 
     /// Proxy `get` trap dispatch: `handler.get(target, key, receiver)`, falling
@@ -2282,6 +2300,9 @@ pub const BcVm = struct {
             if (obj_val.isHeapPtr()) {
                 const key = try valueToStringArena(self.arena, key_v);
                 const entry: *val_mod.NativeFnEntry = &obj_val.toPtr().native_function;
+                // %ThrowTypeError%'s length/name are non-configurable: `delete`
+                // must fail rather than drop them.
+                if (entry.frozen_intrinsic and (std.mem.eql(u8, key, "length") or std.mem.eql(u8, key, "name"))) return false;
                 if (std.mem.eql(u8, key, "length")) { entry.length_deleted = true; return true; }
                 if (std.mem.eql(u8, key, "name"))   { entry.name_deleted   = true; return true; }
             }
@@ -3404,7 +3425,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
-                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val_eff, aargs);
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val_eff, aargs, closure);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
                     return null;
                 }
@@ -3444,7 +3465,7 @@ pub const BcVm = struct {
                         try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
                 }
-                try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
+                try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)], closure);
                 try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 1 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
@@ -3683,7 +3704,7 @@ pub const BcVm = struct {
                 if (fn_ptr.is_async) {
                     var aargs = try self.arena.alloc(Value, nargs);
                     for (0..nargs) |i| aargs[i] = frame.registers[base + 2 + @as(u8, @intCast(i))];
-                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val_eff, aargs);
+                    const p = try self.buildAsyncFunction(fn_ptr, def_env, this_val_eff, aargs, closure);
                     self.frames.items[self.frames.items.len - 1].registers[ret_dst] = p;
                     return null;
                 }
@@ -3705,7 +3726,7 @@ pub const BcVm = struct {
                         try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
                 }
-                try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)]);
+                try self.defineArguments(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)], closure);
                 try self.bindRestParam(call_env, fn_ptr, frame.registers[@as(usize, base) + 2 ..][0..@as(usize, nargs)]);
 
                 // NFE self-binding.
@@ -3880,7 +3901,7 @@ pub const BcVm = struct {
     /// object with indexed elements 0..n-1, a `length`, and an `@@iterator` so
     /// `for (x of arguments)` works. Skipped when a parameter is literally named
     /// `arguments` (that binding wins per spec). No-op for the common case.
-    pub fn defineArguments(self: *BcVm, env: *Environment, fn_ptr: *const BcFunction, args: []const Value) !void {
+    pub fn defineArguments(self: *BcVm, env: *Environment, fn_ptr: *const BcFunction, args: []const Value, callee: ?*BcClosure) !void {
         if (!fn_ptr.uses_arguments) return;
         // Only *function* code gets an arguments object. In eval code the name
         // resolves through the enclosing scope chain — to the calling function's
@@ -3914,10 +3935,12 @@ pub const BcVm = struct {
         // a reassigned param reflects in `arguments[0]`). Synthetic param names
         // (`__param_*` destructuring, `__arg_*` defaults) and a rest parameter make
         // the list non-simple → unmapped.
+        // An EMPTY parameter list is still "simple" — it just has nothing to map.
+        // The distinction matters for `callee` below, which a mapped arguments
+        // object carries even when there are no parameters to alias.
         const simple = blk: {
             if (fn_ptr.is_strict) break :blk false;
             if (fn_ptr.rest_param != null) break :blk false;
-            if (fn_ptr.param_names.len == 0) break :blk false;
             for (fn_ptr.param_names) |p| {
                 if (std.mem.startsWith(u8, p, "__param_") or std.mem.startsWith(u8, p, "__arg_")) break :blk false;
             }
@@ -3926,6 +3949,23 @@ pub const BcVm = struct {
         // Every arguments object (mapped or unmapped) carries the [[ParameterMap]]
         // internal slot so Object.prototype.toString tags it "[object Arguments]".
         // `count` = 0 for unmapped lists, which disables index aliasing.
+        // "callee" (§10.4.4.6/.7): a mapped (sloppy, simple-parameter-list)
+        // arguments object exposes the running function; an unmapped one has a
+        // NON-configurable accessor whose get AND set are %ThrowTypeError% — the
+        // only way user code can reach that intrinsic.
+        if (!simple) {
+            if (realm_mod.active_throw_type_error) |thrower| {
+                const holder = try JsObject.create(self.arena, null);
+                try holder.set("get", thrower);
+                try holder.set("set", thrower);
+                _ = try obj.defineOwnAccessor("callee", try val_mod.makeObject(self.arena, holder), .{
+                    .enumerable = false,
+                    .configurable = false,
+                });
+            }
+        } else if (callee) |c| {
+            _ = try obj.defineOwnData("callee", try val_mod.makeBcFunction(self.arena, c), .{ .writable = true, .enumerable = false, .configurable = true });
+        }
         const md = try self.arena.create(MappedArgsData);
         const map_count = if (simple) @min(args.len, fn_ptr.param_names.len) else 0;
         const mapped = try self.arena.alloc(bool, map_count);
@@ -3962,13 +4002,13 @@ pub const BcVm = struct {
     /// Build the suspended-frame state shared by generators and async functions:
     /// a fresh call env with params bound, register file with params seeded, and
     /// a BcGeneratorState registered for GC scanning. The frame starts at pc 0.
-    fn buildGenState(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value) !*BcGeneratorState {
+    fn buildGenState(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, callee: ?*BcClosure) !*BcGeneratorState {
         const call_env = try Environment.initVarScope(self.arena, def_env);
         for (fn_ptr.param_names, 0..) |pname, i| {
             const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
             try call_env.define(pname, av);
         }
-        try self.defineArguments(call_env, fn_ptr, args);
+        try self.defineArguments(call_env, fn_ptr, args, callee);
         const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
         const regs = try self.arena.alloc(Value, num_regs);
         for (regs) |*r| r.* = Value{};
@@ -4025,7 +4065,7 @@ pub const BcVm = struct {
     }
 
     fn buildGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, closure: *BcClosure) !Value {
-        const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
+        const state = try self.buildGenState(fn_ptr, def_env, this_val, args, closure);
         // Run parameter initialization before reading `.prototype`, so a default
         // that mutates it (`function* g(a = (g.prototype = null)) {}`) is observed
         // by GetPrototypeFromConstructor (FunctionDeclarationInstantiation precedes
@@ -4164,9 +4204,9 @@ pub const BcVm = struct {
     /// Start an `async function` call: build the coroutine, create its pending
     /// result promise, and drive it synchronously up to the first `await`.
     /// Returns the result promise immediately.
-    fn buildAsyncFunction(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value) !Value {
+    fn buildAsyncFunction(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, closure: ?*BcClosure) !Value {
         const promise_mod = @import("../runtime/builtins/promise.zig");
-        const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
+        const state = try self.buildGenState(fn_ptr, def_env, this_val, args, closure);
         const result = try promise_mod.newPendingPromise(self.arena);
         const actx = try self.arena.create(AsyncCtx);
         actx.* = .{ .vm = self, .state = state, .result = result };
@@ -4376,7 +4416,7 @@ pub const BcVm = struct {
     }
 
     fn buildAsyncGenerator(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, closure: *BcClosure) !Value {
-        const state = try self.buildGenState(fn_ptr, def_env, this_val, args);
+        const state = try self.buildGenState(fn_ptr, def_env, this_val, args, closure);
         const agc = try self.arena.create(AsyncGenCtx);
         agc.* = .{ .vm = self, .state = state };
 

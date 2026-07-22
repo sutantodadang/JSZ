@@ -88,8 +88,8 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
             _ = try pf.unbox().object.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         }
     }
-    _ = try date_ctor.defineOwnData("name", try val_mod.makeString(arena, "Date"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try date_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 7), .{ .writable = false, .enumerable = false, .configurable = true });
+    _ = try date_ctor.defineOwnData("name", try val_mod.makeString(arena, "Date"), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try date_proto.defineOwnData("constructor", try val_mod.makeObject(arena, date_ctor), .{ .writable = true, .enumerable = false, .configurable = true });
     try ctx.defineGlobal("Date", date_ctor);
 }

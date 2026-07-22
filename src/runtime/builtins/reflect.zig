@@ -1050,7 +1050,7 @@ pub fn nativeReflectApply(arena: std.mem.Allocator, _: Value, args: []const Valu
 /// Bare native_function values are built-in *methods* (Math.max, etc.) and are
 /// NOT constructors. Built-in constructors are JsObjects with a `__call__` slot;
 /// user functions (bc_function) construct; bound/proxy mirror their target.
-fn isConstructorVal(v: Value) bool {
+pub fn isConstructorVal(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .bc_function => true,

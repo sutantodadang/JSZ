@@ -10,6 +10,8 @@ const function_proto_mod = @import("./function_proto.zig");
 const realm_mod = @import("../realm.zig");
 const coercion_mod = @import("./coercion.zig");
 const unorm = @import("unicode_normalize.zig");
+const ucase = @import("unicode_case_tables.zig");
+const uprops = @import("unicode_prop_tables.zig");
 
 /// Throw a TypeError with `msg` and return error.JsException.
 /// Used by coerceThis for null/undefined/Symbol receivers.
@@ -102,28 +104,9 @@ fn argToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
 /// ES ToNumber that throws TypeError for Symbol / BigInt (unlike the VM's lenient
 /// toNumberValue which returns NaN). Used by string-method argument coercion.
 fn toNumberChecked(arena: std.mem.Allocator, v: Value) anyerror!f64 {
-    if (v.bits == 0) return std.math.nan(f64);
-    switch (v.unbox()) {
-        .number => |n| return n,
-        .boolean => |b| return if (b) 1 else 0,
-        .null_ => return 0,
-        .undefined_ => return std.math.nan(f64),
-        .string => |s| return val_mod.jsStringToNumber(s),
-        .symbol => {
-            _ = try throwTypeErrorStr(arena, "Cannot convert a Symbol value to a number");
-            unreachable;
-        },
-        .bigint => {
-            _ = try throwTypeErrorStr(arena, "Cannot convert a BigInt value to a number");
-            unreachable;
-        },
-        .object => {
-            const prim = (try coercion_mod.toPrimitive(arena, v, .number)) orelse return std.math.nan(f64);
-            if (prim.bits != 0 and prim.unbox() == .object) return std.math.nan(f64);
-            return toNumberChecked(arena, prim);
-        },
-        else => return std.math.nan(f64),
-    }
+    // Spec ToNumber: an object with no callable valueOf/toString is a TypeError,
+    // not a silent NaN, and a Symbol/BigInt argument throws.
+    return coercion_mod.toNumberThrowing(arena, v);
 }
 
 /// ES ToIntegerOrInfinity: ToNumber then NaN → 0, ±Infinity preserved, else trunc.
@@ -484,18 +467,112 @@ pub fn nativeSlice(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     return val_mod.makeString(arena, try cuSliceAlloc(arena, s, start, end_));
 }
 
+/// Decode one code point at byte offset `i`, joining a surrogate PAIR into the
+/// astral code point it represents. Strings reach this module either as 4-byte
+/// WTF-8 or as two 3-byte surrogate halves (from `\uD83D\uDE00`-style escapes);
+/// case conversion must see the same code point either way.
+fn decodeCpJoined(s: []const u8, i: usize) struct { cp: u21, len: usize, paired: bool } {
+    const d = decodeWtf8At(s, i);
+    if (d.cp >= 0xD800 and d.cp <= 0xDBFF and i + d.len < s.len) {
+        const lo = decodeWtf8At(s, i + d.len);
+        if (lo.cp >= 0xDC00 and lo.cp <= 0xDFFF) {
+            const cp: u21 = 0x10000 + ((d.cp - 0xD800) << 10) + (lo.cp - 0xDC00);
+            return .{ .cp = cp, .len = d.len + lo.len, .paired = true };
+        }
+    }
+    return .{ .cp = d.cp, .len = d.len, .paired = false };
+}
+
+/// Encode `cp`, reproducing the surrogate-PAIR spelling when the source code
+/// point used one. Both spellings denote the same JS string, but they are
+/// distinct byte sequences, and `===` compares bytes — so `"\uD801\uDC00"
+/// .toLowerCase()` must come back as a pair, not as 4-byte WTF-8.
+fn encodeCpAs(buf: *std.ArrayList(u8), arena: std.mem.Allocator, cp: u21, as_pair: bool) !void {
+    if (as_pair and cp > 0xFFFF) {
+        const v: u21 = cp - 0x10000;
+        try encodeWtf8Cp(buf, arena, 0xD800 + (v >> 10));
+        try encodeWtf8Cp(buf, arena, 0xDC00 + (v & 0x3FF));
+        return;
+    }
+    try encodeWtf8Cp(buf, arena, cp);
+}
+
+fn cpHasProp(table_name: []const u8, cp: u21) bool {
+    const ranges = uprops.lookup(table_name) orelse return false;
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const r = ranges[mid];
+        if (cp < r[0]) hi = mid else if (cp > r[1]) lo = mid + 1 else return true;
+    }
+    return false;
+}
+
+/// SpecialCasing.txt `Final_Sigma`: U+03A3 lowercases to ς rather than σ when it
+/// is preceded by a Cased code point and NOT followed by one, skipping
+/// Case_Ignorable code points on both sides.
+fn isFinalSigma(s: []const u8, sigma_start: usize, sigma_len: usize) bool {
+    var before = false;
+    var i: usize = 0;
+    while (i < sigma_start) {
+        const d = decodeCpJoined(s, i);
+        if (!cpHasProp("Case_Ignorable", d.cp)) before = cpHasProp("Cased", d.cp);
+        i += d.len;
+    }
+    if (!before) return false;
+    var j = sigma_start + sigma_len;
+    while (j < s.len) {
+        const d = decodeCpJoined(s, j);
+        if (!cpHasProp("Case_Ignorable", d.cp)) return !cpHasProp("Cased", d.cp);
+        j += d.len;
+    }
+    return true;
+}
+
+/// Unicode Default Case Conversion over a WTF-8 string. Uses the FULL mappings
+/// (a code point may expand: ß → SS, ﬀ → FF, U+0130 → i + combining dot) plus
+/// the Final_Sigma context rule.
+fn caseConvert(arena: std.mem.Allocator, s: []const u8, to_upper: bool) ![]const u8 {
+    // ASCII-only fast path — by far the common case, and it needs no tables.
+    var ascii = true;
+    for (s) |c| {
+        if (c >= 0x80) {
+            ascii = false;
+            break;
+        }
+    }
+    if (ascii) {
+        const out = try arena.alloc(u8, s.len);
+        for (s, 0..) |c, i| out[i] = if (to_upper) std.ascii.toUpper(c) else std.ascii.toLower(c);
+        return out;
+    }
+
+    const table = if (to_upper) ucase.to_upper else ucase.to_lower;
+    var buf = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < s.len) {
+        const d = decodeCpJoined(s, i);
+        if (!to_upper and d.cp == 0x03A3 and isFinalSigma(s, i, d.len)) {
+            try encodeWtf8Cp(&buf, arena, 0x03C2);
+        } else if (ucase.lookup(table, d.cp)) |mapped| {
+            for (mapped) |m| try encodeCpAs(&buf, arena, m, d.paired);
+        } else {
+            try buf.appendSlice(arena, s[i .. i + d.len]);
+        }
+        i += d.len;
+    }
+    return buf.items;
+}
+
 pub fn nativeToUpperCase(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const out = try arena.alloc(u8, s.len);
-    for (s, 0..) |c, i| out[i] = std.ascii.toUpper(c);
-    return val_mod.makeString(arena, out);
+    return val_mod.makeString(arena, try caseConvert(arena, s, true));
 }
 
 pub fn nativeToLowerCase(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const s = try coerceThis(arena, this_val);
-    const out = try arena.alloc(u8, s.len);
-    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
-    return val_mod.makeString(arena, out);
+    return val_mod.makeString(arena, try caseConvert(arena, s, false));
 }
 
 /// ES ToUint32 of a coerced Number.
@@ -831,7 +908,7 @@ pub fn nativeReplaceAll(arena: std.mem.Allocator, this_val: Value, args: []const
     if (!is_nullish) {
         // If searchValue is a RegExp it must carry the "g" flag (read the
         // `flags` property so overrides / abrupt getters are observed).
-        if (regexp_mod.getCompiledRegex(search) != null) {
+        if (try regexp_mod.isRegExpValue(arena, search)) {
             const flags_val = if (realm_mod.active_context) |ctx|
                 try ctx.getProp(arena, search, "flags")
             else
@@ -1090,16 +1167,17 @@ fn argToStr(arena: std.mem.Allocator, a: Value) ![]const u8 {
 }
 
 /// Throw a TypeError if `a` is a RegExp (per String.prototype.{startsWith,endsWith,
-/// includes}: a RegExp searchString is not allowed).
+/// includes}: a RegExp searchString is not allowed). Uses the spec IsRegExp, which
+/// reads `@@match` — so a plain object with a truthy `@@match` is rejected too, and
+/// an abrupt getter propagates.
 fn rejectRegExp(arena: std.mem.Allocator, a: Value) !void {
-    if (a.bits != 0 and a.unbox() == .object and a.toPtr().object.internal_kind == .regexp) {
-        const JsObject = @import("../../object/object.zig").JsObject;
-        const obj = try JsObject.create(arena, realm_mod.error_proto_TypeError);
-        try obj.set("message", try val_mod.makeString(arena, "First argument to String.prototype.startsWith/endsWith/includes must not be a regular expression"));
-        try obj.set("name", try val_mod.makeString(arena, "TypeError"));
-        realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
-        return error.JsException;
-    }
+    if (!(try regexp_mod.isRegExpValue(arena, a))) return;
+    const JsObject = @import("../../object/object.zig").JsObject;
+    const obj = try JsObject.create(arena, realm_mod.error_proto_TypeError);
+    try obj.set("message", try val_mod.makeString(arena, "First argument to String.prototype.startsWith/endsWith/includes must not be a regular expression"));
+    try obj.set("name", try val_mod.makeString(arena, "TypeError"));
+    realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
+    return error.JsException;
 }
 
 /// ES2015 String.prototype.startsWith(searchString [, position]).

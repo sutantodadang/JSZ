@@ -122,14 +122,6 @@ pub fn toPrimitive(arena: std.mem.Allocator, v: Value, hint: Hint) anyerror!?Val
         }
     }
 
-    // 1b. Wrapper objects (Number/String/Boolean/BigInt/Symbol) unbox via their
-    // stored [[PrimitiveValue]] — equivalent to the prototype valueOf result.
-    if (obj) |o| {
-        if (o.get("[[PrimitiveValue]]")) |p| {
-            if (isPrimitive(p)) return p;
-        }
-    }
-
     // 2. OrdinaryToPrimitive: method order depends on hint.
     return ordinaryToPrimitive(arena, v, hint == .string);
 }
