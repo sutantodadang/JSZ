@@ -717,9 +717,10 @@ pub fn nativeWithTimeZone(arena: std.mem.Allocator, this_val: Value, args: []con
 pub fn nativeWithCalendar(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
     const v = if (args.len > 0) args[0] else Value{};
-    if (v.bits == 0 or v.unbox() != .string) return realm_mod.throwTypeError(arena, "calendar must be a string");
+    if (v.bits == 0 or v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "withCalendar requires a calendar");
     // The instant and zone are unchanged; only the lens through which the
-    // wall-clock date is read.
+    // wall-clock date is read. A calendar-bearing Temporal object contributes
+    // its own [[Calendar]] (ToTemporalCalendarIdentifier fast path).
     var out = z.*;
     out.calendar = try shared.resolveCalendarArg(arena, v);
     return makeZoned(arena, out);

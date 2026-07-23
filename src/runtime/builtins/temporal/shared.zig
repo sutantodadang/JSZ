@@ -1268,11 +1268,19 @@ pub fn isIso8601(s: []const u8) bool {
 /// supplies it per ParseTemporalCalendarString.
 pub fn calendarFromString(s: []const u8) ?calendar_mod.CalendarId {
     if (calendar_mod.canonicalize(s)) |c| return c;
-    // A time-only form is intentionally not accepted here (PlainTime ignores its
-    // calendar, so its parser would let an unknown annotation pass).
     if (parseISODateTime(s)) |dt| return dt.date.calendar else |_| {}
     if (parseISOYearMonth(s)) |ym| return ym.calendar else |_| {}
     if (parseISOMonthDay(s)) |md| return md.calendar else |_| {}
+    // A bare time string (e.g. "15:23") is a valid ToTemporalCalendarIdentifier
+    // input; its `[u-ca=…]` annotation (default iso8601) supplies the calendar.
+    if (parseISOTime(s)) |_| {
+        if (std.mem.indexOf(u8, s, "[u-ca=")) |a| {
+            const rest = s[a + "[u-ca=".len ..];
+            const close = std.mem.indexOfScalar(u8, rest, ']') orelse return .iso8601;
+            return calendar_mod.canonicalize(rest[0..close]) orelse null;
+        }
+        return .iso8601;
+    } else |_| {}
     return null;
 }
 
