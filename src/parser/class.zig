@@ -651,7 +651,9 @@ fn namedFieldInitOf(p: *Parser, f: ClassField, val: *Node, check: *Node) ?*Node 
     if (f.computed_key != null or !isAnonFnDef(check)) return val;
     const s = p.current.start;
     const callee = nodeIdent(p, "__nameFn__") orelse return null;
-    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = f.name }) orelse return null;
+    // A private field's `f.name` has been mangled (e.g. "#field\x010"); the
+    // inferred function name must be the source-level private name ("#field").
+    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = privateDisplayName(f.name) }) orelse return null;
     var args = std.ArrayList(*Node){};
     args.append(p.arena, val) catch return null;
     args.append(p.arena, key) catch return null;
@@ -1259,6 +1261,32 @@ fn emitClassStatements(
         const id_st_r = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
         const helper_ret = p.makeNode(.return_stmt, start, start, .{ .return_stmt = id_st_r }) orelse return null;
         var helper_body = std.ArrayList(*Node){};
+        // Double super() is a ReferenceError: BindThisValue throws when
+        // [[ThisBindingStatus]] is already "initialized" (§9.1.1.3.1). Once the
+        // first super() ran, `__superthis` holds the (object) instance, so guard:
+        //   if (__superthis !== undefined)
+        //     throw new ReferenceError("Super constructor may only be called once");
+        {
+            const g_lhs = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+            const g_rhs = p.makeNode(.identifier, start, start, .{ .identifier = "undefined" }) orelse return null;
+            const g_test = p.makeNode(.binary_expr, start, start, .{
+                .binary_expr = .{ .op = .strict_neq, .left = g_lhs, .right = g_rhs },
+            }) orelse return null;
+            const g_re = p.makeNode(.identifier, start, start, .{ .identifier = "ReferenceError" }) orelse return null;
+            const g_msg = p.makeNode(.string_literal, start, start, .{
+                .string_literal = "Super constructor may only be called once",
+            }) orelse return null;
+            var g_args = std.ArrayList(*Node){};
+            g_args.append(p.arena, g_msg) catch return null;
+            const g_new = p.makeNode(.new_expr, start, start, .{
+                .new_expr = .{ .callee = g_re, .args = g_args.items },
+            }) orelse return null;
+            const g_throw = p.makeNode(.throw_stmt, start, start, .{ .throw_stmt = g_new }) orelse return null;
+            const g_if = p.makeNode(.if_stmt, start, start, .{
+                .if_stmt = .{ .test_ = g_test, .consequent = g_throw, .alternate = null },
+            }) orelse return null;
+            helper_body.append(p.arena, g_if) catch return null;
+        }
         helper_body.append(p.arena, assign_stmt) catch return null;
         // Install instance fields on `__superthis` right after the parent ctor
         // returns — the spec point where a derived class initializes its fields.
