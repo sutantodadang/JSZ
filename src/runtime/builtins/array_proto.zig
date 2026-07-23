@@ -1073,9 +1073,12 @@ pub fn nativeReverse(arena: std.mem.Allocator, this_val: Value, _: []const Value
     var lower: usize = 0;
     while (lower < len / 2) : (lower += 1) {
         const upper = len - 1 - lower;
+        // Spec §23.1.3.26 order: HasProperty(lower), Get(lower), HasProperty(upper),
+        // Get(upper) — strictly interleaved, since Get(lower) may run an accessor
+        // that mutates the array (e.g. truncating length so upper stops existing).
         const lower_exists = try genHas(arena, O, lower);
-        const upper_exists = try genHas(arena, O, upper);
         const lv = if (lower_exists) try genGet(arena, O, lower) else undefined;
+        const upper_exists = try genHas(arena, O, upper);
         const uv = if (upper_exists) try genGet(arena, O, upper) else undefined;
         if (lower_exists and upper_exists) {
             try genSet(arena, O, lower, uv);
