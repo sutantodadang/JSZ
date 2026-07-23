@@ -736,10 +736,28 @@ fn parseAnnotations(p: *Parser, ca_mode: CalendarAnnotation) ParseError!void {
         } else {
             // Time-zone annotation: single, and before any key/value annotation.
             if (tz_seen or kv_seen) return error.Invalid;
+            // A numeric-offset time-zone annotation may only carry minute
+            // precision (±HH, ±HH:MM, ±HHMM); a seconds or fractional component is
+            // a syntax error even though the datetime's own offset may have one.
+            if (content[0] == '+' or content[0] == '-') {
+                if (!isMinutePrecisionOffset(content)) return error.Invalid;
+            }
             tz_seen = true;
         }
     }
     if (ca_count > 1 and ca_critical) return error.Invalid;
+}
+
+/// A numeric UTC-offset time-zone annotation limited to minute precision:
+/// `±HH`, `±HH:MM`, or `±HHMM`. Seconds or a fractional component is rejected.
+fn isMinutePrecisionOffset(s: []const u8) bool {
+    if (s.len < 3) return false; // sign + two hour digits
+    if (!isDigit(s[1]) or !isDigit(s[2])) return false;
+    if (s.len == 3) return true; // ±HH
+    if (s[3] == ':') {
+        return s.len == 6 and isDigit(s[4]) and isDigit(s[5]); // ±HH:MM
+    }
+    return s.len == 5 and isDigit(s[3]) and isDigit(s[4]); // ±HHMM
 }
 
 /// A valid RFC 9557 `AnnotationValue`: one or more alphanumeric components of

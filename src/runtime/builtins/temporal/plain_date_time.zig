@@ -615,9 +615,10 @@ pub fn nativeToPlainTime(arena: std.mem.Allocator, this_val: Value, _: []const V
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
-    // Option read order is fixed by the spec: digits, then mode, then unit.
-    const digits = try shared.getFractionalDigits(arena, opts);
+    // Options are read in alphabetical order: calendarName, fractionalSecondDigits,
+    // roundingMode, then smallestUnit (via getSecondsStringPrecision).
     const show = try shared.getShowCalendar(arena, opts);
+    const digits = try shared.getFractionalDigits(arena, opts);
     const mode = try shared.getRoundingMode(arena, opts, .trunc);
     const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
     // Rounding up past midnight carries into the date.

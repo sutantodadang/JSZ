@@ -108,28 +108,31 @@ fn timeFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overf
     var ms: f64 = 0;
     var us: f64 = 0;
     var ns: f64 = 0;
+    // ToTemporalTimeRecord reads the time fields through [[Get]] in alphabetical
+    // order (hour, microsecond, millisecond, minute, nanosecond, second), which
+    // is observable through getters/Proxy traps.
     if (try readField(arena, o, "hour")) |x| {
         h = x;
-        got = true;
-    }
-    if (try readField(arena, o, "minute")) |x| {
-        min = x;
-        got = true;
-    }
-    if (try readField(arena, o, "second")) |x| {
-        s = x;
-        got = true;
-    }
-    if (try readField(arena, o, "millisecond")) |x| {
-        ms = x;
         got = true;
     }
     if (try readField(arena, o, "microsecond")) |x| {
         us = x;
         got = true;
     }
+    if (try readField(arena, o, "millisecond")) |x| {
+        ms = x;
+        got = true;
+    }
+    if (try readField(arena, o, "minute")) |x| {
+        min = x;
+        got = true;
+    }
     if (try readField(arena, o, "nanosecond")) |x| {
         ns = x;
+        got = true;
+    }
+    if (try readField(arena, o, "second")) |x| {
+        s = x;
         got = true;
     }
     if (!got) return realm_mod.throwTypeError(arena, "time-like object needs at least one field");

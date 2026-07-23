@@ -351,12 +351,8 @@ built-ins/Temporal/Duration/prototype/total/throws-if-date-time-invalid-with-zon
 built-ins/Temporal/Duration/prototype/total/throws-if-target-nanoseconds-outside-valid-limits.js
 built-ins/Temporal/Instant/basic.js
 built-ins/Temporal/Instant/from/argument-object-tostring.js
-built-ins/Temporal/Instant/from/instant-string-sub-minute-offset.js
 built-ins/Temporal/Instant/fromEpochMilliseconds/argument.js
-built-ins/Temporal/Instant/prototype/equals/instant-string-sub-minute-offset.js
-built-ins/Temporal/Instant/prototype/since/instant-string-sub-minute-offset.js
 built-ins/Temporal/Instant/prototype/toString/options-read-before-algorithmic-validation.js
-built-ins/Temporal/Instant/prototype/until/instant-string-sub-minute-offset.js
 built-ins/Temporal/PlainDate/calendar-wrong-type.js
 built-ins/Temporal/PlainDate/limits.js
 built-ins/Temporal/PlainDate/prototype/since/round-cross-unit-boundary.js
@@ -365,17 +361,12 @@ built-ins/Temporal/PlainDate/prototype/subtract/argument-duration-max.js
 built-ins/Temporal/PlainDate/prototype/subtract/argument-string-negative-fractional-units.js
 built-ins/Temporal/PlainDate/prototype/subtract/balance-smaller-units-basic.js
 built-ins/Temporal/PlainDate/prototype/subtract/balance-smaller-units.js
-built-ins/Temporal/PlainDate/prototype/toPlainDateTime/order-of-operations.js
-built-ins/Temporal/PlainDate/prototype/toZonedDateTime/order-of-operations.js
 built-ins/Temporal/PlainDate/prototype/until/round-cross-unit-boundary.js
 built-ins/Temporal/PlainDateTime/calendar-wrong-type.js
 built-ins/Temporal/PlainDateTime/limits.js
 built-ins/Temporal/PlainDateTime/prototype/since/roundingincrement-non-integer.js
-built-ins/Temporal/PlainDateTime/prototype/toString/options-read-before-algorithmic-validation.js
-built-ins/Temporal/PlainDateTime/prototype/toString/order-of-operations.js
 built-ins/Temporal/PlainDateTime/prototype/toString/rounding-edge-of-range.js
 built-ins/Temporal/PlainDateTime/prototype/until/roundingincrement-non-integer.js
-built-ins/Temporal/PlainDateTime/prototype/withPlainTime/order-of-operations.js
 built-ins/Temporal/PlainMonthDay/from/fields-string.js
 built-ins/Temporal/PlainMonthDay/from/iso-year-used-only-for-overflow.js
 built-ins/Temporal/PlainMonthDay/from/overflow.js
@@ -387,8 +378,6 @@ built-ins/Temporal/PlainMonthDay/refisoyear-out-of-range.js
 built-ins/Temporal/PlainTime/from/argument-string-invalid.js
 built-ins/Temporal/PlainTime/from/options-wrong-type.js
 built-ins/Temporal/PlainTime/from/order-of-operations.js
-built-ins/Temporal/PlainTime/prototype/since/order-of-operations.js
-built-ins/Temporal/PlainTime/prototype/until/order-of-operations.js
 built-ins/Temporal/PlainYearMonth/prototype/since/throws-if-rounded-date-outside-valid-iso-range.js
 built-ins/Temporal/PlainYearMonth/prototype/until/throws-if-rounded-date-outside-valid-iso-range.js
 built-ins/Temporal/ZonedDateTime/argument-convert.js
@@ -416,7 +405,6 @@ built-ins/Temporal/ZonedDateTime/prototype/until/argument-string-limits.js
 built-ins/Temporal/ZonedDateTime/prototype/until/order-of-operations.js
 built-ins/Temporal/ZonedDateTime/prototype/until/roundingincrement-addition-out-of-range.js
 built-ins/Temporal/ZonedDateTime/prototype/with/order-of-operations.js
-built-ins/Temporal/ZonedDateTime/prototype/withPlainTime/order-of-operations.js
 built-ins/Temporal/ZonedDateTime/timezone-iso-string.js
 built-ins/ThrowTypeError/distinct-cross-realm.js
 built-ins/TypedArray/prototype/copyWithin/coerced-values-end-detached-prototype.js
