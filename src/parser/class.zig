@@ -374,6 +374,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             return null;
         };
         p.in_generator_function = prev_gen;
+        if (!parser_file.checkStrictDirectiveSimpleParams(p, mparams.non_simple, mbody)) return null;
         const member_end = p.prev_end;
 
         if (!is_static and accessor == .none and computed_key == null and std.mem.eql(u8, name, "constructor")) {
@@ -651,7 +652,9 @@ fn namedFieldInitOf(p: *Parser, f: ClassField, val: *Node, check: *Node) ?*Node 
     if (f.computed_key != null or !isAnonFnDef(check)) return val;
     const s = p.current.start;
     const callee = nodeIdent(p, "__nameFn__") orelse return null;
-    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = f.name }) orelse return null;
+    // A private field's `f.name` has been mangled (e.g. "#field\x010"); the
+    // inferred function name must be the source-level private name ("#field").
+    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = privateDisplayName(f.name) }) orelse return null;
     var args = std.ArrayList(*Node){};
     args.append(p.arena, val) catch return null;
     args.append(p.arena, key) catch return null;
@@ -1259,6 +1262,32 @@ fn emitClassStatements(
         const id_st_r = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
         const helper_ret = p.makeNode(.return_stmt, start, start, .{ .return_stmt = id_st_r }) orelse return null;
         var helper_body = std.ArrayList(*Node){};
+        // Double super() is a ReferenceError: BindThisValue throws when
+        // [[ThisBindingStatus]] is already "initialized" (§9.1.1.3.1). Once the
+        // first super() ran, `__superthis` holds the (object) instance, so guard:
+        //   if (__superthis !== undefined)
+        //     throw new ReferenceError("Super constructor may only be called once");
+        {
+            const g_lhs = p.makeNode(.identifier, start, start, .{ .identifier = "__superthis" }) orelse return null;
+            const g_rhs = p.makeNode(.identifier, start, start, .{ .identifier = "undefined" }) orelse return null;
+            const g_test = p.makeNode(.binary_expr, start, start, .{
+                .binary_expr = .{ .op = .strict_neq, .left = g_lhs, .right = g_rhs },
+            }) orelse return null;
+            const g_re = p.makeNode(.identifier, start, start, .{ .identifier = "ReferenceError" }) orelse return null;
+            const g_msg = p.makeNode(.string_literal, start, start, .{
+                .string_literal = "Super constructor may only be called once",
+            }) orelse return null;
+            var g_args = std.ArrayList(*Node){};
+            g_args.append(p.arena, g_msg) catch return null;
+            const g_new = p.makeNode(.new_expr, start, start, .{
+                .new_expr = .{ .callee = g_re, .args = g_args.items },
+            }) orelse return null;
+            const g_throw = p.makeNode(.throw_stmt, start, start, .{ .throw_stmt = g_new }) orelse return null;
+            const g_if = p.makeNode(.if_stmt, start, start, .{
+                .if_stmt = .{ .test_ = g_test, .consequent = g_throw, .alternate = null },
+            }) orelse return null;
+            helper_body.append(p.arena, g_if) catch return null;
+        }
         helper_body.append(p.arena, assign_stmt) catch return null;
         // Install instance fields on `__superthis` right after the parent ctor
         // returns — the spec point where a derived class initializes its fields.
@@ -1504,6 +1533,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
     // functions/arrows (which reuse p.arrow_prelude) can't clobber them.
     var param_prelude = std.ArrayList(*Node){};
     var saw_rest = false;
+    var saw_destructuring = false;
     var rest_param: ?[]const u8 = null;
     while (!p.check(.right_paren) and !p.check(.eof) and !p.had_error) {
         var is_rest = false;
@@ -1512,6 +1542,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         // optional `= default`). Desugared to a synthetic `__param_N` name plus
         // `let` decls prepended to the body, mirroring the arrow-param path.
         if (!is_rest and (p.check(.left_bracket) or p.check(.left_brace))) {
+            saw_destructuring = true;
             const pat = p.parseAssignmentExpr() orelse return null;
             const tmp_name = std.fmt.allocPrint(p.arena, "__param_{d}", .{p.param_destruct_counter}) catch {
                 p.had_error = true;
@@ -1681,6 +1712,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         .param_defaults = defaults.items,
         .rest_param = rest_param,
         .expected_argc = expected_argc,
+        .non_simple = rest_param != null or any_default or saw_destructuring,
     };
 }
 
@@ -1731,6 +1763,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     const le_start = p.live_exports.items.len;
     const la_start = p.live_export_aliases.items.len;
     var in_prologue = true;
+    var body_use_strict = false;
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const s = p.parseStatement() orelse break;
         body.append(p.arena, s) catch {
@@ -1739,11 +1772,17 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
         };
         if (in_prologue) {
             if (parser_file.directiveOf(s)) |dir| {
-                if (std.mem.eql(u8, dir, "use strict")) p.strict = true;
+                if (std.mem.eql(u8, dir, "use strict")) {
+                    p.strict = true;
+                    body_use_strict = true;
+                }
             } else in_prologue = false;
         }
         p.drainExtraStmts(&body);
     }
+    // Surface this body's own "use strict" directive for the caller's §15.2.1
+    // non-simple-parameter early-error check (see pending_body_use_strict).
+    p.pending_body_use_strict = body_use_strict;
     p.applyLiveBindings(body.items, li_start, le_start, la_start);
     // §15.2.1: a "use strict" prologue makes the *whole* function strict, which
     // retroactively outlaws a duplicate parameter name; and a body-level

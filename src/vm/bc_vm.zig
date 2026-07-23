@@ -4116,6 +4116,24 @@ pub const BcVm = struct {
             try call_env.define(pname, av);
         }
         try self.defineArguments(call_env, fn_ptr, args, callee);
+        // NFE self-binding: `function* g(){ ... g ... }` binds its own name to an
+        // immutable binding of the generator function, shadowed by a same-named
+        // parameter (ES §15.5.4 / MakeConstructor + FunctionDeclarationInstantiation).
+        if (fn_ptr.nfe_name) |fname| {
+            var is_param = false;
+            for (fn_ptr.param_names) |p| {
+                if (std.mem.eql(u8, p, fname)) {
+                    is_param = true;
+                    break;
+                }
+            }
+            if (!is_param) {
+                if (callee) |cl| {
+                    const self_val = try val_mod.makeBcFunction(self.arena, cl);
+                    call_env.defineImmutable(fname, self_val, fn_ptr.is_strict) catch {};
+                }
+            }
+        }
         const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
         const regs = try self.arena.alloc(Value, num_regs);
         for (regs) |*r| r.* = Value{};

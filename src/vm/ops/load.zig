@@ -46,10 +46,18 @@ fn isReservedRuntimeGlobal(name: []const u8) bool {
 /// Only own data properties are consulted: inherited names (e.g. Object.prototype
 /// members) must not leak in as globals, and accessors are skipped to keep the
 /// failed-lookup path free of user code (and frame reallocation).
-fn globalObjectOwn(frame: *BcCallFrame, name: []const u8) ?Value {
+/// Identifier resolution against the global object Environment Record: when the
+/// global object carries `name` as an own property, resolve it via a full
+/// [[Get]] (so an accessor property's getter runs) rather than reading the raw
+/// slot. Returns null when the global object has no such own property, so the
+/// caller can fall through to a ReferenceError. `getProp` may run a getter
+/// (re-entrant → `self.frames` can realloc), so the caller must re-fetch the
+/// frame before writing the destination register.
+fn globalObjectGet(self: *BcVm, frame: *BcCallFrame, name: []const u8) !?Value {
     const gt = frame.env.lookup("globalThis") catch return null;
     if (gt.bits == 0 or gt.unbox() != .object) return null;
-    return gt.toPtr().object.getOwn(name);
+    if (!gt.toPtr().object.hasOwn(name)) return null;
+    return try self.getProp(gt, name);
 }
 
 /// ES §9.1.1.4 (global environment record): a `var`/function declaration (or a
@@ -178,12 +186,22 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name_val = frame.func.chunk.constants[kidx];
     const name = name_val.toPtr().string;
-    return getBindingByName(self, frame, rdst, name);
+    // getBindingByName can run a with-object @@unscopables getter, which may
+    // throw; route it through the try/catch handler search.
+    return getBindingByName(self, frame, rdst, name) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error resolving binding")) |oc| return oc;
+        return null;
+    };
 }
 
 /// GetValue for an identifier Reference resolved by name (GET_GLOBAL, and the
 /// fallback for a GET_REF whose token designates nothing reusable).
-fn getBindingByName(self: *BcVm, frame: *BcCallFrame, rdst: u8, name: []const u8) !?RunOutcome {
+fn getBindingByName(self: *BcVm, frame_in: *BcCallFrame, rdst: u8, name: []const u8) !?RunOutcome {
+    // `ownWith`/`inheritedWith` run user code (a @@unscopables / HasProperty
+    // getter or Proxy trap) that can realloc `self.frames`; re-fetch `frame`
+    // after each so later `frame.env`/`frame.registers` accesses aren't dangling.
+    var frame = frame_in;
     // `with` scopes (if any) shadow the lexical/global scope: an object whose
     // [[HasProperty]] is true provides the binding via [[Get]].
     if (frame.with_stack.items.len > 0) {
@@ -194,6 +212,7 @@ fn getBindingByName(self: *BcVm, frame: *BcCallFrame, rdst: u8, name: []const u8
             self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
             return null;
         }
+        frame = &self.frames.items[self.frames.items.len - 1];
     }
     // Look up in frame env (chains to global), then realm global.
     // An identifier that resolves nowhere is a ReferenceError
@@ -216,6 +235,7 @@ fn getBindingByName(self: *BcVm, frame: *BcCallFrame, rdst: u8, name: []const u8
                 self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
                 return null;
             }
+            frame = &self.frames.items[self.frames.items.len - 1];
             if (frame.inherited_env_floor != null) {
                 if (frame.env.lookup(name)) |v| {
                     frame.registers[rdst] = v;
@@ -224,8 +244,8 @@ fn getBindingByName(self: *BcVm, frame: *BcCallFrame, rdst: u8, name: []const u8
             }
             if (self.realm.global_env.lookup(name)) |v| {
                 frame.registers[rdst] = v;
-            } else |_| if (globalObjectOwn(frame, name)) |v| {
-                frame.registers[rdst] = v;
+            } else |_| if (try globalObjectGet(self, frame, name)) |v| {
+                self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
             } else {
                 const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{name});
                 const exc_val = try self.makeErrorObjectBc("ReferenceError", msg);
@@ -266,9 +286,13 @@ pub inline fn opGetGlobalOpt(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         },
         error.ConstAssignment => unreachable,
         error.NotDefined => {
-            frame.registers[rdst] = self.realm.global_env.lookup(name) catch
-                globalObjectOwn(frame, name) orelse
-                try val_mod.makeUndefined(self.arena);
+            if (self.realm.global_env.lookup(name)) |v| {
+                frame.registers[rdst] = v;
+            } else |_| if (try globalObjectGet(self, frame, name)) |v| {
+                self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
+            } else {
+                frame.registers[rdst] = try val_mod.makeUndefined(self.arena);
+            }
         },
         error.OutOfMemory => return error.OutOfMemory,
     }
@@ -411,10 +435,17 @@ pub fn withHasBinding(self: *BcVm, wobj: Value, key: Value, name: []const u8) !b
 fn withScan(self: *BcVm, frame: *BcCallFrame, name: []const u8, lo: usize, hi: usize) !?Value {
     if (lo >= hi) return null;
     const key = try val_mod.makeString(self.arena, name);
+    // Snapshot the with-object slice up front: withHasBinding runs user code
+    // (a @@unscopables / HasProperty getter or Proxy trap) that can realloc
+    // `self.frames`, leaving `frame` dangling — dereferencing `frame.with_stack`
+    // inside the loop would then read freed memory. The slice's backing buffer is
+    // separately arena-allocated and is not touched while another frame runs, so
+    // the copied slice stays valid across those calls.
+    const items = frame.with_stack.items;
     var i = hi;
     while (i > lo) {
         i -= 1;
-        const wobj = frame.with_stack.items[i];
+        const wobj = items[i];
         if (wobj.bits == 0 or wobj.unbox() != .object) continue;
         if (try withHasBinding(self, wobj, key, name)) return wobj;
     }
@@ -469,9 +500,12 @@ fn envAtDepth(env: *Environment, depth: usize) ?*Environment {
 /// Locate the binding for `name` and return it as a reference token. Mirrors the
 /// resolution order of `opGetGlobal`/`opSetGlobal`; anything those two reach by
 /// a path this cannot describe comes back as the fallback token.
-fn resolveRefToken(self: *BcVm, frame: *BcCallFrame, name: []const u8) !Value {
+fn resolveRefToken(self: *BcVm, frame_in: *BcCallFrame, name: []const u8) !Value {
+    var frame = frame_in;
     if (frame.with_stack.items.len > 0) {
         if (try ownWith(self, frame, name)) |wobj| return wobj;
+        // ownWith may have run a @@unscopables getter that reallocated frames.
+        frame = &self.frames.items[self.frames.items.len - 1];
     }
     var depth: usize = 0;
     var cur: ?*Environment = frame.env;
@@ -495,7 +529,13 @@ pub inline fn opResolveRef(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name = frame.func.chunk.constants[kidx].toPtr().string;
-    const token = try resolveRefToken(self, frame, name);
+    // resolveRefToken can run a with-object @@unscopables / HasProperty getter,
+    // which may throw; route it through the try/catch handler search.
+    const token = resolveRefToken(self, frame, name) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error resolving with binding")) |oc| return oc;
+        return null;
+    };
     // resolveRefToken can run a with-object [[HasProperty]] trap, which may have
     // reallocated self.frames — write through the re-fetched top frame.
     self.frames.items[self.frames.items.len - 1].registers[rref] = token;
@@ -517,13 +557,24 @@ pub inline fn opGetRef(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
     const name = frame.func.chunk.constants[kidx].toPtr().string;
-    const token = try resolveRefToken(self, frame, name);
+    // resolveRefToken can run a with-object @@unscopables / HasProperty getter,
+    // which may throw. Route that through the bytecode try/catch handler search
+    // rather than letting the raw error.JsException bubble past every JS `try`.
+    const token = resolveRefToken(self, frame, name) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error resolving with binding")) |oc| return oc;
+        return null;
+    };
     {
         const top = &self.frames.items[self.frames.items.len - 1];
         top.registers[rref] = token;
     }
     if (token.bits != 0 and token.unbox() == .object) {
-        const v = try self.getProp(token, name);
+        const v = self.getProp(token, name) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in with getter")) |oc| return oc;
+            return null;
+        };
         self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
         return null;
     }
@@ -548,7 +599,11 @@ pub inline fn opGetRef(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     }
     // Unresolvable through the token: replay the ordinary name-based read, which
     // owns the ReferenceError / global-object fallbacks.
-    return getBindingByName(self, frame, rdst, name);
+    return getBindingByName(self, frame, rdst, name) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error resolving binding")) |oc| return oc;
+        return null;
+    };
 }
 
 pub inline fn opPutRef(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
@@ -633,7 +688,8 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 
 /// PutValue for an identifier Reference resolved by name (SET_GLOBAL, and the
 /// fallback for a PUT_REF whose token no longer designates a binding).
-fn setBindingByName(self: *BcVm, frame: *BcCallFrame, name: []const u8, value: Value) !?RunOutcome {
+fn setBindingByName(self: *BcVm, frame_in: *BcCallFrame, name: []const u8, value: Value) !?RunOutcome {
+    var frame = frame_in;
     const cur_is_strict = frame.func.is_strict;
     // `with` scopes: assign through an object whose [[HasProperty]] is true.
     if (frame.with_stack.items.len > 0) {
@@ -641,6 +697,8 @@ fn setBindingByName(self: *BcVm, frame: *BcCallFrame, name: []const u8, value: V
             try self.setProp(wobj, name, value);
             return null;
         }
+        // ownWith may have run a @@unscopables getter that reallocated frames.
+        frame = &self.frames.items[self.frames.items.len - 1];
     }
     // Try to assign in env chain (covers locals and upvalues).
     // TemporalDeadZone and ConstAssignment are real errors that must propagate.
@@ -668,6 +726,7 @@ fn setBindingByName(self: *BcVm, frame: *BcCallFrame, name: []const u8, value: V
                 try self.setProp(wobj, name, value);
                 return null;
             }
+            frame = &self.frames.items[self.frames.items.len - 1];
             if (frame.inherited_env_floor != null) {
                 if (frame.env.assign(name, value)) |_| {
                     mirrorGlobalBinding(frame, name, value, true);
@@ -798,7 +857,8 @@ pub inline fn opSyncAnnexBFn(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 /// `delete <identifier>` (ES `delete` on an environment Reference). Resolves the
 /// name over the scope chain WITHOUT evaluating its value, and stores the boolean
 /// result in Rdst. See the DELETE_NAME opcode doc for the full precedence.
-pub inline fn opDeleteName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+pub inline fn opDeleteName(self: *BcVm, frame_in: *BcCallFrame) !?RunOutcome {
+    var frame = frame_in;
     const code = frame.func.chunk.code;
     const rdst = code[frame.pc];
     frame.pc += 1;
@@ -824,6 +884,8 @@ pub inline fn opDeleteName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             self.frames.items[frame_idx].registers[rdst] = try val_mod.makeBool(self.arena, res);
             return null;
         }
+        // ownWith may have run a @@unscopables getter that reallocated frames.
+        frame = &self.frames.items[frame_idx];
     }
 
     // 2) Environment record binding. A local/lexical declarative binding is
@@ -847,6 +909,7 @@ pub inline fn opDeleteName(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             self.frames.items[frame_idx].registers[rdst] = try val_mod.makeBool(self.arena, res);
             return null;
         }
+        frame = &self.frames.items[frame_idx];
     }
 
     // 3) Global object [[Delete]] — reached for `.global_object_ref` bindings and

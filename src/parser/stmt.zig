@@ -298,6 +298,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
                     return null;
                 };
                 p.in_generator_function = prev_gen;
+                if (!parser_file.checkStrictDirectiveSimpleParams(p, parsed_params.non_simple, body)) return null;
                 const is_strict = parser_file.hasUseStrict(body);
                 const fn_decl = p.makeNode(.function_decl, fn_start, p.current.start, .{
                     .function_decl = .{
@@ -333,6 +334,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
                     return null;
                 };
                 p.in_generator_function = prev_gen;
+                if (!parser_file.checkStrictDirectiveSimpleParams(p, parsed_params.non_simple, body)) return null;
                 const is_strict = parser_file.hasUseStrict(body);
                 const internal_name = if (is_gen) "__esm_dflt_gen__" else "__esm_dflt_fn__";
                 const fn_decl = p.makeNode(.function_decl, fn_start, p.current.start, .{
@@ -857,6 +859,7 @@ pub fn parseFunctionDecl(p: *Parser, is_async: bool) ?*Node {
         return null;
     };
     p.in_generator_function = prev_gen;
+    if (!parser_file.checkStrictDirectiveSimpleParams(p, parsed_params.non_simple, body)) return null;
     const is_strict = parser_file.hasUseStrict(body);
     return p.makeNode(.function_decl, start, p.current.start, .{
         .function_decl = .{
