@@ -438,7 +438,14 @@ pub fn nativeShift(arena: std.mem.Allocator, this_val: Value, _: []const Value) 
 
 /// ES IsConcatSpreadable(O): honors @@isConcatSpreadable, else IsArray(O).
 fn isConcatSpreadable(arena: std.mem.Allocator, v: Value) !bool {
-    if (v.bits == 0 or v.unbox() != .object) return false;
+    // IsConcatSpreadable step 1: "If Type(O) is not Object, return false." A
+    // callable (function/class) IS an object, so an explicit
+    // @@isConcatSpreadable on a function must still be honored.
+    if (v.bits == 0) return false;
+    switch (v.unbox()) {
+        .object, .bc_function, .native_function, .function => {},
+        else => return false,
+    }
     if (realm_mod.active_sym_is_concat_spreadable) |sym| {
         const spreadable = if (realm_mod.active_context) |ctx|
             try ctx.getPropSym(arena, v, sym)
