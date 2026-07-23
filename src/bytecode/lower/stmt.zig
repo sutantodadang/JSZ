@@ -278,7 +278,7 @@ pub fn lowerWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     const patch_exit = self.currentOffset();
     try self.emitI16(0);
 
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .with_depth = self.with_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
     try self.compileStmt(ws.body, last_expr_reg);
 
     // Jump back to loop start (continue lands here too: re-eval cond).
@@ -300,7 +300,7 @@ pub fn lowerDoWhileStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) err
     try self.resetCompletion(line);
     const loop_start = self.currentOffset();
 
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .with_depth = self.with_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
     try self.compileStmt(dw.body, last_expr_reg);
 
     // continue in a do-while jumps to the condition test.
@@ -358,7 +358,7 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         try self.emitI16(0);
     }
 
-    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
+    try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .with_depth = self.with_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
     try self.compileStmt(fs.body, last_expr_reg);
 
     // continue in a for-loop runs the update expression, then re-tests.
@@ -668,6 +668,7 @@ pub fn lowerBreakStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
                 if (std.mem.eql(u8, l, lname)) {
                     try runPendingFinally(self, null, self.loop_stack.items[li].finally_depth, line);
                     try self.emitExitScopesTo(self.loop_stack.items[li].scope_depth, line);
+                    try self.emitPopWithsTo(self.loop_stack.items[li].with_depth, line);
                     try self.emitOp(.JMP, line);
                     const patch = self.currentOffset();
                     try self.emitI16(0);
@@ -700,6 +701,7 @@ pub fn lowerBreakStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         const ti = self.loop_stack.items.len - 1;
         try runPendingFinally(self, null, self.loop_stack.items[ti].finally_depth, line);
         try self.emitExitScopesTo(self.loop_stack.items[ti].scope_depth, line);
+        try self.emitPopWithsTo(self.loop_stack.items[ti].with_depth, line);
         try self.emitOp(.JMP, line);
         const patch = self.currentOffset();
         try self.emitI16(0);
@@ -755,6 +757,7 @@ pub fn lowerContinueStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
         // still does, since those loops are being left).
         try runPendingFinally(self, null, self.loop_stack.items[ti].continue_finally_depth, line);
         try self.emitExitScopesTo(self.loop_stack.items[ti].scope_depth, line);
+        try self.emitPopWithsTo(self.loop_stack.items[ti].with_depth, line);
     }
     try self.emitOp(.JMP, line);
     const patch = self.currentOffset();
