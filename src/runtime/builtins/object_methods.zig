@@ -2336,6 +2336,21 @@ pub fn nativeObjectGetOwnPropertySymbols(arena: std.mem.Allocator, _: Value, arg
     // internal deferred-id symbol so it does not leak as an own symbol key.
     if (obj.internal_kind == .module_namespace) try namespace_mod.triggerAll(arena, obj);
     var i: u32 = 0;
+    // Proxy: run the [[OwnPropertyKeys]] trap (whose invariant check must see the
+    // full key list — including non-configurable string keys — before this filter
+    // to Symbols), then keep only the symbol keys.
+    if (obj.internal_kind == .proxy) {
+        const keys = (try proxy_mod.proxyOwnKeys(arena, obj)) orelse &[_]Value{};
+        for (keys) |k| {
+            if (k.bits != 0 and k.unbox() == .symbol) {
+                const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+                try arr.set(idx_key, k);
+                i += 1;
+            }
+        }
+        arr.array_length = i;
+        return val_mod.makeObject(arena, arr);
+    }
     for (obj.symKeys()) |sp| {
         const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
         try arr.set(idx_key, sp.key);
