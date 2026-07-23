@@ -2124,10 +2124,27 @@ fn setIntegrityLevelProxy(arena: std.mem.Allocator, target: Value, freeze: bool)
     }
 }
 
+/// Resolve an integrity-op argument (Object.freeze/seal/preventExtensions and
+/// their queries) to the *JsObject it operates on. A bc function is an ordinary
+/// object whose own properties live on a lazily-materialized backing object, so
+/// freezing/sealing it must target that. Returns null for primitives and native
+/// functions (whose own props are not a JsObject).
+fn integrityObj(arena: std.mem.Allocator, val: Value) anyerror!?*JsObject {
+    if (val.bits == 0) return null;
+    return switch (val.unbox()) {
+        .object => |o| o,
+        .bc_function => blk: {
+            const realm_mod = @import("../realm.zig");
+            const ctx = realm_mod.active_context orelse break :blk null;
+            break :blk try ctx.backingObject(arena, val);
+        },
+        else => null,
+    };
+}
+
 pub fn nativeObjectFreeze(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
-    if (args[0].unbox() != .object) return args[0];
-    const obj = args[0].toPtr().object;
+    const obj = (try integrityObj(arena, args[0])) orelse return args[0];
     if (obj.internal_kind == .proxy) {
         try setIntegrityLevelProxy(arena, args[0], true);
         return args[0];
@@ -2166,8 +2183,7 @@ pub fn nativeObjectFreeze(arena: std.mem.Allocator, _: Value, args: []const Valu
 /// Object.seal(o): seal the object (non-extensible, all props non-configurable).
 pub fn nativeObjectSeal(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
-    if (args[0].unbox() != .object) return args[0];
-    const obj = args[0].toPtr().object;
+    const obj = (try integrityObj(arena, args[0])) orelse return args[0];
     if (obj.internal_kind == .proxy) {
         try setIntegrityLevelProxy(arena, args[0], false);
         return args[0];
@@ -2197,8 +2213,7 @@ pub fn nativeObjectSeal(arena: std.mem.Allocator, _: Value, args: []const Value)
 /// Object.preventExtensions(o): prevent new own properties from being added.
 pub fn nativeObjectPreventExtensions(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeUndefined(arena);
-    if (args[0].unbox() != .object) return args[0];
-    const obj = args[0].toPtr().object;
+    const obj = (try integrityObj(arena, args[0])) orelse return args[0];
     if (obj.internal_kind == .proxy) {
         if (try proxy_mod.proxyPreventExtensions(arena, obj)) |ok| {
             if (!ok) return throwTypeError(arena, "proxy preventExtensions returned false");
@@ -2243,8 +2258,8 @@ fn truthy(v: ?Value) bool {
 
 pub fn nativeObjectIsFrozen(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeBool(arena, true);
-    if (args[0].unbox() != .object) return val_mod.makeBool(arena, true);
-    const obj = args[0].toPtr().object;
+    if (args[0].unbox() != .object and args[0].unbox() != .bc_function) return val_mod.makeBool(arena, true);
+    const obj = (try integrityObj(arena, args[0])) orelse return val_mod.makeBool(arena, true);
     if (obj.internal_kind == .proxy)
         return val_mod.makeBool(arena, try testIntegrityLevelProxy(arena, args[0], true));
     // Module Namespace exports always have writable:true → namespace is never frozen.
@@ -2266,8 +2281,8 @@ pub fn nativeObjectIsFrozen(arena: std.mem.Allocator, _: Value, args: []const Va
 /// Object.isSealed(o): primitives → true; objects → isSealedSelf().
 pub fn nativeObjectIsSealed(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or args[0].bits == 0) return val_mod.makeBool(arena, true);
-    if (args[0].unbox() != .object) return val_mod.makeBool(arena, true);
-    const obj = args[0].toPtr().object;
+    if (args[0].unbox() != .object and args[0].unbox() != .bc_function) return val_mod.makeBool(arena, true);
+    const obj = (try integrityObj(arena, args[0])) orelse return val_mod.makeBool(arena, true);
     if (obj.internal_kind == .proxy)
         return val_mod.makeBool(arena, try testIntegrityLevelProxy(arena, args[0], false));
     // A non-empty TypedArray is never sealed: its integer indices stay
@@ -2295,7 +2310,14 @@ pub fn nativeObjectIsExtensible(arena: std.mem.Allocator, _: Value, args: []cons
         // Functions are ordinary (extensible) objects — except %ThrowTypeError%,
         // which the spec creates non-extensible (§10.2.4.1).
         .native_function => |e| val_mod.makeBool(arena, !e.frozen_intrinsic),
-        .bc_function, .function => val_mod.makeBool(arena, true),
+        // A bc function's extensibility lives on its backing object once
+        // preventExtensions/seal/freeze has materialized one; absent a backing
+        // object it is still extensible.
+        .bc_function => blk: {
+            if (try integrityObj(arena, args[0])) |o| break :blk val_mod.makeBool(arena, o.extensible);
+            break :blk val_mod.makeBool(arena, true);
+        },
+        .function => val_mod.makeBool(arena, true),
         else => val_mod.makeBool(arena, false),
     };
 }
