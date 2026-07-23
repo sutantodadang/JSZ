@@ -160,6 +160,13 @@ pub const Parser = struct {
     /// M16 Phase 5: nesting depth inside function bodies. 0 = top-level module code;
     /// incremented by parseFunctionBody so import hoisting only applies at top level.
     fn_nesting_depth: u32,
+    /// Nesting depth of enclosing iteration statements (for/while/do-while) in
+    /// the *current* function/script level. An unlabeled `continue` outside any
+    /// iteration, or an unlabeled `break` outside any iteration or switch, is an
+    /// early SyntaxError (§13.8.1.1 / §13.9.1.1). Reset across function bodies.
+    iteration_depth: u32 = 0,
+    /// Nesting depth of enclosing `switch` statements (for unlabeled `break`).
+    switch_depth: u32 = 0,
     /// Inside a class static initialization block, `await` is reserved: it is
     /// neither an identifier nor an operator there (§15.7.1). Cleared when a
     /// nested function body is entered — that body re-establishes its own rules,

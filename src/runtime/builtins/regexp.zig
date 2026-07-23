@@ -714,6 +714,21 @@ const PatternParser = struct {
         return @as(u21, b);
     }
 
+    /// A literal node for code point `cp`. In byte-based (non-/u) mode a value
+    /// ≥ 0x80 is expanded to a sequence of byte-literals holding its WTF-8 bytes,
+    /// so it matches the same way a bare multi-byte character does. Under /u the
+    /// matcher decodes code points directly, so a single literal node is emitted.
+    fn cpLiteralNode(self: *PatternParser, cp: u21) ParseError!RegexNode {
+        if (self.unicode or cp < 0x80) return RegexNode{ .literal = cp };
+        var buf: [4]u8 = undefined;
+        const n = encodeUtf8Cp(cp, &buf);
+        var items = std.ArrayListUnmanaged(RegexNode){};
+        for (buf[0..n]) |b| {
+            items.append(self.alloc, .{ .literal = @as(u21, b) }) catch return ParseError.OutOfMemory;
+        }
+        return RegexNode{ .seq = items.items };
+    }
+
     // Top-level: parse alternation
     fn parseAlt(self: *PatternParser) ParseError!RegexNode {
         var arms = std.ArrayListUnmanaged(RegexNode){};
@@ -1046,6 +1061,78 @@ const PatternParser = struct {
     /// (`[\x41-\x5A]`, `[\u{10401}-\u{10404}]`), which the per-escape cases
     /// below cannot express on their own. A CharacterClassEscape stands for a
     /// whole set and may never end a range.
+    /// Read the remaining digits of a LegacyOctalEscapeSequence (Annex B), given
+    /// the value of the first octal digit (already consumed). A leading 0-3 allows
+    /// up to three octal digits total; 4-7 allows two. Returns the code unit value.
+    fn readLegacyOctalRest(self: *PatternParser, first: u21) u21 {
+        var val: u21 = first;
+        const max_digits: u8 = if (first <= 3) 3 else 2;
+        var digits: u8 = 1;
+        while (digits < max_digits and !self.eof() and self.cur() >= '0' and self.cur() <= '7') {
+            val = val * 8 + (self.cur() - '0');
+            self.advance();
+            digits += 1;
+        }
+        return val;
+    }
+
+    /// Add a predefined set escape (`\d \D \w \W \s \S`) to `cc`. Shared by the
+    /// class body and the Annex B CharacterRangeOrUnion path.
+    fn addSetEscapeToClass(_: *PatternParser, cc: *CharClass, esc: u8) void {
+        switch (esc) {
+            'd' => cc.addPredefined('d', false),
+            'D' => {
+                var i: u16 = 0;
+                while (i <= 255) : (i += 1) {
+                    if (i < '0' or i > '9') cc.bitmap[@intCast(i)] = true;
+                }
+            },
+            'w' => cc.addPredefined('w', false),
+            'W' => {
+                var i: u16 = 0;
+                while (i <= 255) : (i += 1) {
+                    const ci: u8 = @intCast(i);
+                    const is_w = (ci >= 'a' and ci <= 'z') or (ci >= 'A' and ci <= 'Z') or
+                        (ci >= '0' and ci <= '9') or ci == '_';
+                    if (!is_w) cc.bitmap[@intCast(i)] = true;
+                }
+            },
+            's' => cc.addPredefined('s', false),
+            'S' => {
+                var i: u16 = 0;
+                while (i <= 255) : (i += 1) {
+                    const ci: u8 = @intCast(i);
+                    const is_s = ci == ' ' or ci == '\t' or ci == '\n' or ci == '\r' or
+                        ci == 0x0B or ci == 0x0C or ci == 0xA0;
+                    if (!is_s) cc.bitmap[@intCast(i)] = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Annex B CharacterRangeOrUnion: after a range dash has been consumed at
+    /// `lo-<here>`, if the endpoint is a CharacterClassEscape (`\d` etc.) then the
+    /// range is not a range at all — the `-` is literal and the result is the
+    /// union of {lo}, {'-'}, and the escape's set. Consumes the escape and returns
+    /// true; otherwise consumes nothing and returns false.
+    fn tryClassRangeOrUnion(self: *PatternParser, cc: *CharClass, lo: u21) ParseError!bool {
+        if (self.unicode) return false;
+        if (self.eof() or self.cur() != '\\' or self.pos + 1 >= self.src.len) return false;
+        const e = self.src[self.pos + 1];
+        const is_set = switch (e) {
+            'd', 'D', 'w', 'W', 's', 'S' => true,
+            else => false,
+        };
+        if (!is_set) return false;
+        self.advance(); // backslash
+        self.advance(); // set letter
+        cc.addCpRange(self.alloc, lo, lo) catch return ParseError.OutOfMemory;
+        cc.addChar('-');
+        self.addSetEscapeToClass(cc, e);
+        return true;
+    }
+
     fn parseClassRangeEnd(self: *PatternParser) ParseError!u21 {
         if (self.eof()) return ParseError.InvalidPattern;
         if (self.cur() != '\\') {
@@ -1069,7 +1156,17 @@ const PatternParser = struct {
             'v' => 0x0B,
             'f' => 0x0C,
             'b' => 0x08,
-            '0' => 0,
+            '0' => blk: {
+                if (!self.unicode and !self.eof() and self.cur() >= '0' and self.cur() <= '7') {
+                    break :blk self.readLegacyOctalRest(0);
+                }
+                break :blk 0;
+            },
+            // Annex B legacy octal at a range endpoint (e.g. `[\12-\14]`).
+            '1', '2', '3', '4', '5', '6', '7' => blk: {
+                if (self.unicode) return ParseError.InvalidPattern;
+                break :blk self.readLegacyOctalRest(e - '0');
+            },
             'x' => blk: {
                 if (self.pos + 1 >= self.src.len or
                     hexVal(self.src[self.pos]) == null or
@@ -1187,10 +1284,24 @@ const PatternParser = struct {
                         if (self.unicode and !self.eof() and self.cur() >= '0' and self.cur() <= '9') {
                             return ParseError.InvalidPattern; // legacy octal
                         }
-                        single_cp = 0;
+                        if (!self.unicode and !self.eof() and self.cur() >= '0' and self.cur() <= '7') {
+                            single_cp = self.readLegacyOctalRest(0);
+                        } else {
+                            single_cp = 0;
+                        }
+                    },
+                    // Annex B: inside a class, \1-\7 are LegacyOctalEscapes (there
+                    // are no backreferences in a class); \8/\9 are IdentityEscapes.
+                    '1', '2', '3', '4', '5', '6', '7' => {
+                        if (self.unicode) return ParseError.InvalidPattern;
+                        single_cp = self.readLegacyOctalRest(esc - '0');
                     },
                     'c' => {
-                        if (!self.eof() and isAsciiAlpha(self.cur())) {
+                        // ClassControlLetter is a letter always; Annex B also admits
+                        // a DecimalDigit or `_` (character value mod 32).
+                        const is_ctrl = !self.eof() and (isAsciiAlpha(self.cur()) or
+                            (!self.unicode and (std.ascii.isDigit(self.cur()) or self.cur() == '_')));
+                        if (is_ctrl) {
                             single_cp = self.cur() & 0x1F;
                             self.advance();
                         } else if (self.unicode) {
@@ -1256,9 +1367,11 @@ const PatternParser = struct {
                         self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']')
                     {
                         self.advance(); // consume -
-                        const hi = try self.parseClassRangeEnd();
-                        if (hi < lo) return ParseError.InvalidPattern;
-                        cc.addCpRange(self.alloc, lo, hi) catch return ParseError.OutOfMemory;
+                        if (!try self.tryClassRangeOrUnion(cc, lo)) {
+                            const hi = try self.parseClassRangeEnd();
+                            if (hi < lo) return ParseError.InvalidPattern;
+                            cc.addCpRange(self.alloc, lo, hi) catch return ParseError.OutOfMemory;
+                        }
                     } else {
                         cc.addCpRange(self.alloc, lo, lo) catch return ParseError.OutOfMemory;
                     }
@@ -1294,11 +1407,13 @@ const PatternParser = struct {
                 self.advance();
                 if (!self.eof() and self.cur() == '-' and self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']') {
                     self.advance(); // consume -
-                    // The endpoint may be an escape denoting any code point
-                    // (`[a-\u{10404}]`), so it is not limited to a byte.
-                    const end_cp = try self.parseClassRangeEnd();
-                    if (end_cp < start_ch) return ParseError.InvalidPattern;
-                    cc.addCpRange(self.alloc, start_ch, end_cp) catch return ParseError.OutOfMemory;
+                    if (!try self.tryClassRangeOrUnion(cc, start_ch)) {
+                        // The endpoint may be an escape denoting any code point
+                        // (`[a-\u{10404}]`), so it is not limited to a byte.
+                        const end_cp = try self.parseClassRangeEnd();
+                        if (end_cp < start_ch) return ParseError.InvalidPattern;
+                        cc.addCpRange(self.alloc, start_ch, end_cp) catch return ParseError.OutOfMemory;
+                    }
                 } else {
                     cc.addChar(start_ch);
                 }
@@ -1362,11 +1477,17 @@ const PatternParser = struct {
         if (c >= '1' and c <= '9') {
             const idx: u8 = c - '0';
             // Under /u a DecimalEscape is always a backreference, so naming a
-            // group that does not exist is an early error. Without /u the same
-            // spelling falls back to a legacy octal escape (Annex B), which the
-            // matcher approximates as a never-matching backreference.
-            if (self.unicode and idx > self.total_caps) return ParseError.InvalidPattern;
-            return RegexNode{ .back_ref = idx };
+            // group that does not exist is an early error.
+            if (self.unicode) {
+                if (idx > self.total_caps) return ParseError.InvalidPattern;
+                return RegexNode{ .back_ref = idx };
+            }
+            // Annex B: a DecimalEscape referring to an existing capture group is a
+            // backreference; otherwise \1-\7 are LegacyOctalEscapeSequences and
+            // \8/\9 are IdentityEscapes (the literal digit).
+            if (idx <= self.total_caps) return RegexNode{ .back_ref = idx };
+            if (c == '8' or c == '9') return RegexNode{ .literal = @as(u21, c) };
+            return self.cpLiteralNode(self.readLegacyOctalRest(idx));
         }
         // Named backreference \k<name> (only meaningful when the pattern has
         // named groups; otherwise `\k` is a literal 'k' in non-unicode mode).
@@ -1444,6 +1565,10 @@ const PatternParser = struct {
                 if (self.unicode and !self.eof() and self.cur() >= '0' and self.cur() <= '9') {
                     return ParseError.InvalidPattern;
                 }
+                // Annex B: `\0` followed by octal digits is a LegacyOctalEscape.
+                if (!self.unicode and !self.eof() and self.cur() >= '0' and self.cur() <= '7') {
+                    return self.cpLiteralNode(self.readLegacyOctalRest(0));
+                }
                 return RegexNode{ .literal = 0 };
             },
             'c' => {
@@ -1471,11 +1596,19 @@ const PatternParser = struct {
                 const h1 = hexVal(self.src[self.pos]).?;
                 const h2 = hexVal(self.src[self.pos + 1]).?;
                 self.pos += 2;
-                return RegexNode{ .literal = @intCast(@as(u16, h1) * 16 + h2) };
+                return self.cpLiteralNode(@intCast(@as(u16, h1) * 16 + h2));
             },
             'u' => {
-                const cp = try self.parseUEscape();
-                return RegexNode{ .literal = cp };
+                const save = self.pos;
+                if (self.parseUEscape()) |cp| {
+                    return self.cpLiteralNode(cp);
+                } else |_| {
+                    // Incomplete `\u`: /u forbids it; Annex B rereads it as an
+                    // IdentityEscape, i.e. a literal `u`.
+                    if (self.unicode) return ParseError.InvalidPattern;
+                    self.pos = save;
+                    return RegexNode{ .literal = 'u' };
+                }
             },
             else => {
                 // IdentityEscape: /u admits only SyntaxCharacter and `/`; Annex B
@@ -2224,7 +2357,11 @@ fn consumeLiteral(input: []const u8, pos: usize, ch: u21, flags: *const Compiled
         }
         return pos + dc.len;
     } else {
-        if (ch > 255) return null; // BMP+ literal can't match in byte mode
+        // Byte-based (non-/u): a multi-byte code unit in the pattern is stored as
+        // one byte-literal per WTF-8 byte, matched byte-for-byte here. (Escapes
+        // that denote a value ≥ 0x80 are expanded to their WTF-8 bytes at parse
+        // time, so this path only ever sees single bytes.)
+        if (ch > 255) return null;
         const c = input[pos];
         const cb: u8 = @intCast(ch);
         if (flags.ignore_case) {
@@ -2260,6 +2397,10 @@ fn consumeClass(input: []const u8, pos: usize, cc: *const CharClass, flags: *con
         if (!(if (cc.negate) !raw else raw)) return null;
         return pos + dc.len;
     } else {
+        // Byte-based (non-/u): the Pike VM and backtracker both step one WTF-8
+        // byte at a time here, so class membership is tested per byte. (A
+        // multi-byte class member cannot be represented in this model — that is a
+        // known limitation of the byte-based non-/u engine.)
         var c = input[pos];
         if (flags.ignore_case) c = foldCase(c);
         var hit = cc.bitmap[c];

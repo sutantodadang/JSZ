@@ -1641,6 +1641,16 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     p.pending_params_duplicate = false;
     _ = p.expect(.left_brace) orelse return null;
     p.fn_nesting_depth += 1;
+    // A function body starts its own break/continue scope: an enclosing loop or
+    // switch does not extend into it.
+    const saved_iter_depth = p.iteration_depth;
+    const saved_switch_depth = p.switch_depth;
+    p.iteration_depth = 0;
+    p.switch_depth = 0;
+    defer {
+        p.iteration_depth = saved_iter_depth;
+        p.switch_depth = saved_switch_depth;
+    }
     // A nested function body establishes its own rules: a class static
     // initialization block's restrictions on `await`, `arguments` and `return`
     // stop at its boundary (`static { function f(await) {} }` is legal).
