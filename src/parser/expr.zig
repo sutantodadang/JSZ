@@ -238,9 +238,10 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         }
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
-        // NamedEvaluation: `x = class {}` names the anonymous class after the
-        // target (see parseAssignmentExprCore for the mirror case).
-        const set_class_hint = op == .assign and left.kind == .identifier and
+        // NamedEvaluation: `x = class {}` — and the logical assignments
+        // `x &&= class{}` / `x ||= class{}` / `x ??= class{}` (§13.15.2) — name the
+        // anonymous class after the target (see parseAssignmentExprCore mirror).
+        const set_class_hint = isNamedEvalAssignOp(op) and left.kind == .identifier and
             p.check(.kw_class) and p.export_default_name_hint == null;
         if (set_class_hint) p.export_default_name_hint = left.data.identifier;
         const right = p.parseAssignmentExpr() orelse return null;
@@ -403,9 +404,10 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
         // NamedEvaluation: `x = class {}` (simple `=` to an IdentifierReference)
-        // names the anonymous class after the target. Threaded to parseClassExpr
-        // via the parser hint since the class desugars to an IIFE.
-        const set_class_hint = op == .assign and left.kind == .identifier and
+        // and the logical assignments `x &&=/||=/??= class{}` (§13.15.2) name the
+        // anonymous class after the target. Threaded to parseClassExpr via the
+        // parser hint since the class desugars to an IIFE.
+        const set_class_hint = isNamedEvalAssignOp(op) and left.kind == .identifier and
             p.check(.kw_class) and p.export_default_name_hint == null;
         if (set_class_hint) p.export_default_name_hint = left.data.identifier;
         const right = p.parseAssignmentExpr() orelse return null; // right-assoc
@@ -2488,6 +2490,17 @@ fn parseRegexRaw(raw: []const u8) RegexRaw {
     }
     // Unterminated — return body sans opening slash
     return .{ .pattern = raw[1..], .flags = "" };
+}
+
+/// The assignment operators whose RHS is subject to NamedEvaluation when it is an
+/// anonymous function/class definition and the LHS is an IdentifierReference:
+/// simple `=` (§13.15.2) and the logical assignments `&&= ||= ??=`. The other
+/// compound assignments (`+=`, …) never trigger NamedEvaluation.
+fn isNamedEvalAssignOp(op: ast.AssignOp) bool {
+    return switch (op) {
+        .assign, .logical_and, .logical_or, .logical_nullish => true,
+        else => false,
+    };
 }
 
 fn tokenToAssignOp(kind: @import("../lexer/token.zig").TokenKind) ast.AssignOp {
