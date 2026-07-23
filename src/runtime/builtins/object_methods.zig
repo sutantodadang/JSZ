@@ -293,6 +293,11 @@ pub fn nativeObjectAssign(arena: std.mem.Allocator, _: Value, args: []const Valu
     const to_val = try realm_mod.toObjectForThis(arena, target);
     if (to_val.bits == 0 or to_val.unbox() != .object) return to_val;
     const target_obj = to_val.toPtr().object;
+    // toObjectForThis skips the String exotic index properties for speed, but
+    // Object.assign boxes the target once and must honor its read-only indices:
+    // Set(to, "0", …, true) has to raise a TypeError on a String target.
+    if (target.bits != 0 and target.unbox() == .string)
+        try realm_mod.installStringExotic(arena, target_obj, target.toPtr().string);
     const ctx = realm_mod.active_context;
 
     if (args.len <= 1) return to_val;
