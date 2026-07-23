@@ -1007,16 +1007,25 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     var smallest: ?shared.Unit = null;
     const arg0 = if (args.len > 0) args[0] else Value{};
     if (arg0.bits == 0 or arg0.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "round() requires an argument");
+    var inc: f64 = 1;
+    var mode: shared.RoundingMode = .half_expand;
     if (arg0.unbox() == .string) {
         smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
     } else {
+        // Read order: roundingIncrement, roundingMode, smallestUnit; then validate.
         opts = try shared.getOptionsObject(arena, arg0);
+        inc = try shared.getRoundingIncrement(arena, opts);
+        mode = try shared.getRoundingMode(arena, opts, .half_expand);
         smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     }
     if (smallest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
     if (unitRank(smallest.?) < unitRank(.day)) return realm_mod.throwRangeError(arena, "smallestUnit must be day..nanosecond");
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
+    // ValidateTemporalRoundingIncrement: day allows only 1 (inclusive); a time
+    // unit's increment must divide (non-inclusive) its next-coarser unit.
+    if (smallest.? == .day)
+        try shared.validateRoundingIncrement(arena, inc, 1, true)
+    else if (shared.maximumRoundingIncrement(smallest.?)) |maxv|
+        try shared.validateRoundingIncrement(arena, inc, maxv, false);
 
     const cur = localDT(z);
     const day_start_ns = wallNs(.{ .date = cur.date, .time = .{} }) - z.offset_ns;

@@ -599,11 +599,18 @@ fn roundRelative(
     switch (smallest) {
         .year => out.years = rounded_count,
         .month => {
-            // A rounded month count can reach a full year; re-difference the
-            // rounded end date so months bubble into years when `largest` is year
-            // (BubbleRelativeDuration). Weeks/days below the smallest unit are 0.
-            const rounded_date = try pd.addISODate(R, bal.years, rounded_count, 0, 0, .constrain, arena);
-            out = pd.differenceISODate(R, rounded_date, largest);
+            out.years = bal.years;
+            out.months = rounded_count;
+            // A rounded month count that reaches a full year (12, ISO) bubbles
+            // into the years field, but only when `largest` is year — otherwise
+            // months remain the top unit (BubbleRelativeDuration).
+            if (largest == .year) {
+                const extra = @divTrunc(rounded_count, 12);
+                if (extra != 0) {
+                    out.years += extra;
+                    out.months -= extra * 12;
+                }
+            }
         },
         .week => {
             out.years = bal.years;

@@ -415,7 +415,18 @@ pub fn roundRelative(
     const rounded = shared.roundNumberToIncrement(total, inc, mode);
     switch (smallest) {
         .year => out.years = rounded,
-        .month => out.months = rounded,
+        .month => {
+            out.months = rounded;
+            // A rounded month count reaching a full year (12, ISO) bubbles into
+            // years, but only when `largest` is year (BubbleRelativeDuration).
+            if (largest == .year) {
+                const extra = @divTrunc(rounded, 12);
+                if (extra != 0) {
+                    out.years += extra;
+                    out.months -= extra * 12;
+                }
+            }
+        },
         .week => out.weeks = rounded,
         .day => out.days = rounded,
         else => {},
