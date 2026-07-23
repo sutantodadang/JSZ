@@ -740,12 +740,35 @@ pub fn nativeObjectIsPrototypeOf(arena: std.mem.Allocator, this_val: Value, args
     if (this_val.bits == 0 or this_val.unbox() == .undefined_ or this_val.unbox() == .null_)
         return throwTypeError(arena, "Cannot convert undefined or null to object");
     const O = (try resolveObject(arena, this_val)) orelse return val_mod.makeBool(arena, false);
-    var cur: ?*JsObject = v_obj.proto;
+    // Walk V's prototype chain via [[GetPrototypeOf]], so a Proxy link consults
+    // its getPrototypeOf trap (§20.1.3.3 step 3.a) rather than its raw slot.
+    var cur: ?*JsObject = try isProtoStep(arena, v_obj);
+    var depth: usize = 0;
     while (cur) |c| {
         if (c == O) return val_mod.makeBool(arena, true);
-        cur = c.proto;
+        depth += 1;
+        if (depth > 100000) break; // cycle guard against a malicious proxy chain
+        cur = try isProtoStep(arena, c);
     }
     return val_mod.makeBool(arena, false);
+}
+
+/// One [[GetPrototypeOf]] step: a Proxy dispatches its getPrototypeOf trap
+/// (forwarding to the target's slot when absent); ordinary objects use .proto.
+fn isProtoStep(arena: std.mem.Allocator, o: *JsObject) anyerror!?*JsObject {
+    if (o.internal_kind == .proxy) {
+        if (try proxy_mod.proxyGetPrototypeOf(arena, o)) |res| {
+            if (res.bits == 0 or res.unbox() == .null_) return null;
+            if (res.unbox() == .object) return res.toPtr().object;
+            return null;
+        }
+        // No trap: forward to the target's prototype.
+        if (proxy_mod.proxyTarget(o)) |t| {
+            if (t.bits != 0 and t.unbox() == .object) return t.toPtr().object.proto;
+        }
+        return null;
+    }
+    return o.proto;
 }
 
 pub fn nativePropertyIsEnumerable(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
