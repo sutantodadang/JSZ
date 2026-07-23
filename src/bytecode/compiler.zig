@@ -2108,6 +2108,11 @@ pub const FnCompiler = struct {
             // set dynamically (handles symbol keys).
             if (prop.computed_key) |key_node| {
                 const rkey = try self.compileExpr(key_node);
+                // ES §13.2.5.5 PropertyDefinitionEvaluation: ToPropertyKey runs on
+                // the computed name (EvaluatePropertyKey) BEFORE the value — a key
+                // object's @@toPrimitive/toString is observed first, and exactly once.
+                try self.emitOp(.TO_PROPERTY_KEY, line);
+                try self.emitU8(rkey);
                 const rval = try self.compileExpr(prop.value);
                 // NamedEvaluation with a runtime key: `{[k]: () => {}}`,
                 // `{[k](){}}`, `{get [k](){}}` all name the function after the
