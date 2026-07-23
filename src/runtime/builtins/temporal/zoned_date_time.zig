@@ -952,9 +952,11 @@ pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, ar
         dir = arg.unbox().string;
     } else if (arg.bits != 0 and arg.unbox() == .object) {
         const o = arg.toPtr().object;
-        const dv = try shared.optionGet(arena, o, "direction") orelse return realm_mod.throwTypeError(arena, "missing direction");
-        if (dv.bits == 0 or dv.unbox() != .string) return realm_mod.throwTypeError(arena, "direction must be a string");
-        dir = dv.unbox().string;
+        // GetDirectionOption: the value is coerced with ToString (a Symbol is a
+        // TypeError) and must be "next"/"previous"; a missing/undefined direction
+        // is a RangeError (the option is required with no default).
+        const dv = try shared.optionGet(arena, o, "direction") orelse return realm_mod.throwRangeError(arena, "direction is required");
+        dir = try shared.valueToString(arena, dv);
     } else if (arg.bits == 0 or arg.unbox() == .undefined_) {
         return realm_mod.throwTypeError(arena, "direction is required");
     } else {
