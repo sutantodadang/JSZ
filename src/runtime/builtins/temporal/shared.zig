@@ -748,6 +748,25 @@ fn parseAnnotations(p: *Parser, ca_mode: CalendarAnnotation) ParseError!void {
     if (ca_count > 1 and ca_critical) return error.Invalid;
 }
 
+/// ToBigInt: BigInt is returned unchanged, boolean maps to 0n/1n, a string is
+/// parsed as a BigInt literal (SyntaxError if malformed), objects go through
+/// ToPrimitive(number); Number/Symbol/undefined/null are TypeErrors.
+pub fn toBigInt(arena: std.mem.Allocator, v: Value) anyerror!Value {
+    if (v.bits == 0) return realm_mod.throwTypeError(arena, "Cannot convert undefined to a BigInt");
+    switch (v.unbox()) {
+        .bigint => return v,
+        .boolean => |b| return val_mod.makeBigIntFromI64(arena, if (b) 1 else 0),
+        .string => |s| return val_mod.stringToBigInt(arena, s) catch
+            return realm_mod.throwSyntaxError(arena, "Cannot convert string to a BigInt"),
+        .object => {
+            const prim = (try coercion.toPrimitive(arena, v, .number)) orelse
+                return realm_mod.throwTypeError(arena, "Cannot convert object to a BigInt");
+            return toBigInt(arena, prim);
+        },
+        else => return realm_mod.throwTypeError(arena, "Cannot convert value to a BigInt"),
+    }
+}
+
 /// A numeric UTC-offset time-zone annotation limited to minute precision:
 /// `±HH`, `±HH:MM`, or `±HHMM`. Seconds or a fractional component is rejected.
 fn isMinutePrecisionOffset(s: []const u8) bool {
@@ -1637,7 +1656,15 @@ pub const SecondsPrecision = struct {
 /// smallestUnit, and callers must preserve that order. smallestUnit wins when
 /// both are present.
 pub fn getSecondsStringPrecision(arena: std.mem.Allocator, opts: ?*JsObject, digits: ?u8) !SecondsPrecision {
-    if (try getTemporalUnit(arena, opts, "smallestUnit")) |u| return switch (u) {
+    return secondsPrecisionFromUnit(arena, try getTemporalUnit(arena, opts, "smallestUnit"), digits);
+}
+
+/// Map an already-read smallestUnit (and fractionalSecondDigits) to a precision
+/// record. Split out so a caller can read a *later* option (e.g. Instant's
+/// "timeZone") between reading the unit and the algorithmic "hour is invalid"
+/// validation the mapping performs.
+pub fn secondsPrecisionFromUnit(arena: std.mem.Allocator, u: ?Unit, digits: ?u8) !SecondsPrecision {
+    if (u) |unit| return switch (unit) {
         .minute => .{ .minute = true, .increment = NS_PER_MINUTE },
         .second => .{ .digits = 0, .increment = NS_PER_SECOND },
         .millisecond => .{ .digits = 3, .increment = NS_PER_MILLI },

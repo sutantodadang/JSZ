@@ -349,10 +349,6 @@ built-ins/Temporal/Duration/prototype/total/rounding-window.js
 built-ins/Temporal/Duration/prototype/total/throws-if-date-time-invalid-with-plaindate-relative.js
 built-ins/Temporal/Duration/prototype/total/throws-if-date-time-invalid-with-zoneddatetime-relative.js
 built-ins/Temporal/Duration/prototype/total/throws-if-target-nanoseconds-outside-valid-limits.js
-built-ins/Temporal/Instant/basic.js
-built-ins/Temporal/Instant/from/argument-object-tostring.js
-built-ins/Temporal/Instant/fromEpochMilliseconds/argument.js
-built-ins/Temporal/Instant/prototype/toString/options-read-before-algorithmic-validation.js
 built-ins/Temporal/PlainDate/calendar-wrong-type.js
 built-ins/Temporal/PlainDate/limits.js
 built-ins/Temporal/PlainDate/prototype/since/round-cross-unit-boundary.js
@@ -372,9 +368,6 @@ built-ins/Temporal/PlainMonthDay/from/iso-year-used-only-for-overflow.js
 built-ins/Temporal/PlainMonthDay/from/overflow.js
 built-ins/Temporal/PlainMonthDay/prototype/equals/argument-string.js
 built-ins/Temporal/PlainMonthDay/prototype/with/iso-year-used-only-for-overflow.js
-built-ins/Temporal/PlainMonthDay/prototype/with/options-wrong-type.js
-built-ins/Temporal/PlainMonthDay/prototype/with/order-of-operations.js
-built-ins/Temporal/PlainMonthDay/refisoyear-out-of-range.js
 built-ins/Temporal/PlainTime/from/argument-string-invalid.js
 built-ins/Temporal/PlainTime/from/options-wrong-type.js
 built-ins/Temporal/PlainTime/from/order-of-operations.js
