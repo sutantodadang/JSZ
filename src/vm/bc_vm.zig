@@ -2761,6 +2761,16 @@ pub const BcVm = struct {
                         return val_mod.makeUndefined(self.arena);
                     }
                 }
+                // Legacy `caller`/`arguments`: an ordinary *sloppy* function has
+                // its own null-valued `caller`/`arguments` data properties (the
+                // web-reality behavior — see test262 15.3.5.4_2 series). Strict
+                // functions, arrows, methods, generators and async functions have
+                // no own copy and inherit the %ThrowTypeError% poison instead.
+                if ((std.mem.eql(u8, key, "caller") or std.mem.eql(u8, key, "arguments")) and
+                    !closure.func.is_strict and closure.isConstructor())
+                {
+                    return val_mod.makeNull(self.arena);
+                }
                 // Own `name`/`length` for user functions (spec: non-writable,
                 // configurable). `length` = declared arity; `name` = the bound
                 // function name ("" when anonymous and not named-evaluated).
