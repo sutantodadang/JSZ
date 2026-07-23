@@ -358,6 +358,10 @@ pub const IsoParseOpts = struct {
     /// Require an explicit time component; a date-only string is rejected. Used
     /// by PlainTime, which does not implicitly convert a date to midnight.
     require_time: bool = false,
+    /// Skip the representable-year range check. PlainMonthDay parses a full date
+    /// string only for its month/day and discards the year, so a grammatically
+    /// valid but unrepresentable year (e.g. "-999999-10-01") is still accepted.
+    ignore_year_range: bool = false,
 };
 
 pub fn parseISODateTimeOpts(s0: []const u8, opts: IsoParseOpts) ParseError!ISODateTime {
@@ -401,7 +405,12 @@ pub fn parseISODateTimeOpts(s0: []const u8, opts: IsoParseOpts) ParseError!ISODa
     try parseAnnotations(&p, if (opts.validate_calendar) .any_known else .ignore);
     if (!p.eof()) return error.Invalid;
 
-    if (year < -271821 or year > 275760) return error.Invalid;
+    // The representable-year range is skipped only when the caller discards the
+    // year (PlainMonthDay) AND the calendar is iso8601 — a non-ISO calendar
+    // annotation makes the year meaningful again, so it must be in range.
+    const skip_range = opts.ignore_year_range and p.calendar == .iso8601;
+    if (!skip_range and (year < -271821 or year > 275760)) return error.Invalid;
+    if (year < -999999 or year > 999999) return error.Invalid; // grammar bound
     if (!isValidISODate(@intCast(year), @intCast(month), @intCast(day))) return error.Invalid;
     if (!isValidISOTime(time)) return error.Invalid;
     return .{ .date = .{ .year = @intCast(year), .month = @intCast(month), .day = @intCast(day), .calendar = p.calendar }, .time = time };
@@ -457,7 +466,9 @@ pub fn parseISOMonthDay(s0: []const u8) ParseError!ISOMonthDay {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     // Full date/datetime form: has a 4+ digit leading year.
     if (looksLikeDate(s)) {
-        const dt = try parseISODateTime(s0);
+        // The year is only parsed for grammar validity, then discarded, so an
+        // unrepresentable year does not make a month-day string invalid.
+        const dt = try parseISODateTimeOpts(s0, .{ .ignore_year_range = true });
         return .{ .month = dt.date.month, .day = dt.date.day, .ref_year = 1972 };
     }
     var p = Parser{ .s = s };
