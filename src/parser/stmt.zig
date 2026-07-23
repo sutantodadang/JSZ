@@ -605,6 +605,18 @@ pub fn parseStatement(p: *Parser) ?*Node {
         _ = p.advance(); // consume `async`
         return p.parseFunctionDecl(true);
     }
+    // `yield` is a valid label in sloppy-mode code outside a generator (it is
+    // only a reserved word in strict/generator context). It lexes as `kw_yield`,
+    // so the identifier-label path below misses it.
+    if (p.check(.kw_yield) and !p.strict and !p.in_generator_function and p.peekNext().kind == .colon) {
+        const saved = p.current;
+        _ = p.advance(); // `yield`
+        _ = p.advance(); // `:`
+        const body = p.parseStatement() orelse return null;
+        return p.makeNode(.labeled_stmt, saved.start, p.current.start, .{
+            .labeled_stmt = .{ .name = "yield", .body = body },
+        });
+    }
     // Phase 4d: labeled statement — identifier followed by colon.
     if (p.current.kind == .identifier) {
         // Peek ahead: if next non-whitespace token is ':', this is a labeled stmt.

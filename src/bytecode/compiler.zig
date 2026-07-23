@@ -72,6 +72,11 @@ pub const LoopCtx = struct {
     /// `break`/`continue` emit EXIT_SCOPE for each block scope between the
     /// statement and this depth so the frame env is balanced on the jump.
     scope_depth: u32 = 0,
+    /// `with_depth` at loop entry. `break`/`continue` emit POP_WITH for each
+    /// `with` scope opened between the statement and this depth, so the frame's
+    /// with-stack is balanced on the jump (else a lingering with-object keeps
+    /// shadowing outer bindings after the loop).
+    with_depth: u32 = 0,
     /// `finally_stack` length at loop entry. `break`/`continue` run (and POP_TRY)
     /// each try-block opened inside the loop before jumping out of it.
     finally_depth: usize = 0,
@@ -399,7 +404,13 @@ pub const FnCompiler = struct {
         switch (node.kind) {
             .function_decl => {
                 if (!nested) return; // an ordinary declaration of this scope
-                const name = node.data.function_decl.name;
+                // Annex B B.3.3 block→function hoisting applies ONLY to a plain
+                // FunctionDeclaration. Generator / async / async-generator
+                // declarations are strictly block-scoped (lexical), so they are
+                // NOT visible outside their block.
+                const fd = node.data.function_decl;
+                if (fd.is_generator or fd.is_async) return;
+                const name = fd.name;
                 for (blocked.items) |b| if (std.mem.eql(u8, b, name)) return;
                 try self.addHoistName(out, name);
                 try self.annexb_fn_sites.append(self.arena, node);
@@ -667,6 +678,17 @@ pub const FnCompiler = struct {
         var d = self.block_scope_depth;
         while (d > target_depth) : (d -= 1) {
             try self.emitOp(.EXIT_SCOPE, line);
+        }
+    }
+
+    /// Emit a POP_WITH for each `with` scope opened between the current
+    /// `with_depth` and `target_depth`, so an abrupt completion
+    /// (`break`/`continue`) leaving those `with` statements balances the frame's
+    /// with-stack (a lingering with-object would keep shadowing outer bindings).
+    pub fn emitPopWithsTo(self: *Self, target_depth: u32, line: u32) !void {
+        var d = self.with_depth;
+        while (d > target_depth) : (d -= 1) {
+            try self.emitOp(.POP_WITH, line);
         }
     }
 
@@ -2935,6 +2957,7 @@ pub const FnCompiler = struct {
         // not constructors: propagate the flag so the VM omits the `prototype`
         // property for non-generator methods.
         child_fn.is_method = fe.is_method;
+        child_fn.is_class = fe.is_class;
         // `fn.length` counts only the parameters before the first defaulted one.
         // The parser recorded that before its TDZ desugar rewrote the defaults
         // into the body and cleared `param_defaults`.

@@ -296,6 +296,11 @@ pub const FuncExpr = struct {
     /// property) is NOT bound inside its own body — unlike a named function
     /// expression — so this suppresses the inner self-binding at compile time.
     is_method: bool = false,
+    /// True for the synthetic constructor of a `class` declaration/expression.
+    /// A class constructor's own `prototype` property is non-writable (spec
+    /// §15.7.14 — MakeConstructor with writablePrototype=false), unlike an
+    /// ordinary function whose `.prototype` is writable.
+    is_class: bool = false,
     /// Function.prototype.toString: exact original source text for this
     /// function literal (params+body, or the whole arrow), sliced from the
     /// parser's source buffer. Null when no meaningful span was captured
