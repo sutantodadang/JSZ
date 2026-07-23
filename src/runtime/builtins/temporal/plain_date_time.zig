@@ -372,7 +372,21 @@ pub fn roundRelative(
     mode: shared.RoundingMode,
     largest: shared.Unit,
 ) !shared.DurationFields {
-    if (unitRank(smallest) >= unitRank(.hour)) return roundTimeOnly(dur, smallest, inc, mode, largest);
+    if (unitRank(smallest) >= unitRank(.hour)) {
+        var res = roundTimeOnly(dur, smallest, inc, mode, largest);
+        // When the time rounding spilled into an extra day and `largest` is a
+        // calendar unit, that day can complete a month/year: re-anchor the date
+        // part from `from` so the overflow bubbles up (BubbleRelativeDuration).
+        if (unitRank(largest) < unitRank(.day)) {
+            const end = try plain_date.addISODate(from.date, res.years, res.months, res.weeks, res.days, .constrain, arena);
+            const rebal = plain_date.differenceISODate(from.date, end, largest);
+            res.years = rebal.years;
+            res.months = rebal.months;
+            res.weeks = rebal.weeks;
+            res.days = rebal.days;
+        }
+        return res;
+    }
     if (dur.sign() == 0) return dur;
     const sign: f64 = @floatFromInt(dur.sign());
 
@@ -408,14 +422,25 @@ pub fn roundRelative(
 
     var total = q;
     if (p2 != p1) {
-        const progress = @as(f64, @floatFromInt(dest_wall - p1)) / @as(f64, @floatFromInt(p2 - p1));
+        const progress = shared.divToF64(dest_wall - p1, p2 - p1);
         total = q + progress * inc * sign;
     }
     var out = base;
     const rounded = shared.roundNumberToIncrement(total, inc, mode);
     switch (smallest) {
         .year => out.years = rounded,
-        .month => out.months = rounded,
+        .month => {
+            out.months = rounded;
+            // A rounded month count reaching a full year (12, ISO) bubbles into
+            // years, but only when `largest` is year (BubbleRelativeDuration).
+            if (largest == .year) {
+                const extra = @divTrunc(rounded, 12);
+                if (extra != 0) {
+                    out.years += extra;
+                    out.months -= extra * 12;
+                }
+            }
+        },
         .week => out.weeks = rounded,
         .day => out.days = rounded,
         else => {},
@@ -469,8 +494,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const cur = try requireDT(arena, this_val);
     const arg = if (args.len > 0) args[0] else Value{};
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "with() requires an object");
-    if (getDateTime(arg) != null or plain_date.getDate(arg) != null or plain_time.getTime(arg) != null)
-        return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
+    if (shared.isTemporalObject(arg)) return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
     const o = arg.toPtr().object;
     if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
     if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
@@ -500,16 +524,25 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     var opts: ?*JsObject = null;
     var smallest: ?shared.Unit = null;
     const arg0 = if (args.len > 0) args[0] else Value{};
-    if (arg0.bits != 0 and arg0.unbox() == .string) {
+    if (arg0.bits == 0 or arg0.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "round() requires an options argument");
+    var inc: f64 = 1;
+    var mode: shared.RoundingMode = .half_expand;
+    if (arg0.unbox() == .string) {
         smallest = shared.unitFromString(arg0.unbox().string) orelse return realm_mod.throwRangeError(arena, "invalid smallestUnit");
     } else {
         opts = try shared.getOptionsObject(arena, arg0);
+        inc = try shared.getRoundingIncrement(arena, opts);
+        mode = try shared.getRoundingMode(arena, opts, .half_expand);
         smallest = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     }
     if (smallest == null) return realm_mod.throwRangeError(arena, "round() requires smallestUnit");
     if (unitRank(smallest.?) < unitRank(.day)) return realm_mod.throwRangeError(arena, "smallestUnit must be day..nanosecond");
-    const mode = try shared.getRoundingMode(arena, opts, .half_expand);
-    const inc = try shared.getRoundingIncrement(arena, opts);
+    // ValidateTemporalRoundingIncrement: day allows only 1 (inclusive maximum),
+    // time units divide their next-coarser unit (non-inclusive).
+    if (smallest.? == .day)
+        try shared.validateRoundingIncrement(arena, inc, 1, true)
+    else if (shared.maximumRoundingIncrement(smallest.?)) |maxv|
+        try shared.validateRoundingIncrement(arena, inc, maxv, false);
 
     if (smallest.? == .day) {
         // Round to nearest day.
