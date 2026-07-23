@@ -2913,7 +2913,10 @@ fn nativeAsyncFromSyncNext(arena: std.mem.Allocator, this_val: Value, args: []co
         // `syncIterator.next(value)`, §27.1.4.2.1). Re-reading `sync_it.next`
         // here would fire the accessor on every step.
         const sync_next = wrap_obj.get("__syncnext__") orelse Value{};
-        const fwd = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+        // Forward the received value only when one was actually passed: an absent
+        // value calls `syncIterator.next()` with NO arguments (§27.1.4.2.1 step 5),
+        // so `next.length`-observing sync iterators see `arguments.length === 0`.
+        const fwd_args: []const Value = if (args.len > 0) args[0..1] else &[_]Value{};
         const result = blk: {
             if (!isCallable(sync_next)) {
                 // No captured method (degenerate): fall back to a fresh step.
@@ -2922,7 +2925,7 @@ fn nativeAsyncFromSyncNext(arena: std.mem.Allocator, this_val: Value, args: []co
                     return p;
                 };
             }
-            const r = function_proto.invokeCallback(arena, sync_it, sync_next, &[_]Value{fwd}) catch {
+            const r = function_proto.invokeCallback(arena, sync_it, sync_next, fwd_args) catch {
                 promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
                 return p;
             };
