@@ -1572,6 +1572,7 @@ pub const BcVm = struct {
                 .ARRAY_APPEND_HOLE => if (try object_ops.opArrayAppendHole(self, frame)) |o| return o,
                 .GET_PROP => if (try property_ops.opGetProp(self, frame)) |o| return o,
                 .GET_PROP_DYN => if (try property_ops.opGetPropDyn(self, frame)) |o| return o,
+                .TO_PROPERTY_KEY => if (try property_ops.opToPropertyKey(self, frame)) |o| return o,
                 .SET_PROP => if (try property_ops.opSetProp(self, frame)) |o| return o,
                 .DEFINE_PRIVATE => if (try property_ops.opDefinePrivate(self, frame)) |o| return o,
                 .SET_PROP_DYN => if (try property_ops.opSetPropDyn(self, frame)) |o| return o,

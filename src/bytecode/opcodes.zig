@@ -357,8 +357,13 @@ pub const Op = enum(u8) {
     /// function that has an `arguments` binding. Such an eval may not declare
     /// `var arguments` — the parameter scope already binds the name, so
     /// EvalDeclarationInstantiation reports a SyntaxError.
-    /// Declared last (ordinal stability for the pinned JIT contract).
     MARK_PARAM_EVAL,
+    /// TO_PROPERTY_KEY | 2 | op, Rkey. In-place ToPropertyKey(R[Rkey]): coerce an
+    /// object key via ToPrimitive(string) — running user @@toPrimitive/toString/
+    /// valueOf exactly once — leaving a string or symbol in R[Rkey]. Used so a
+    /// compound/logical assignment `base[expr] op= rhs` evaluates its key ONCE,
+    /// shared by the read and the write. Declared last (JIT ordinal stability).
+    TO_PROPERTY_KEY,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -460,6 +465,7 @@ pub fn instrSize(op: Op) usize {
         .DEFINE_PRIVATE => 6,
         .MARK_DIRECT_EVAL => 1,
         .MARK_PARAM_EVAL => 1,
+        .TO_PROPERTY_KEY => 2,
         .DEFINE_LOCAL => 4,
         .DEFINE_DATA => 5,
         .DEFINE_DATA_DYN => 4,
