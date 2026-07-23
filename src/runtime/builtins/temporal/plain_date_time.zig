@@ -372,7 +372,21 @@ pub fn roundRelative(
     mode: shared.RoundingMode,
     largest: shared.Unit,
 ) !shared.DurationFields {
-    if (unitRank(smallest) >= unitRank(.hour)) return roundTimeOnly(dur, smallest, inc, mode, largest);
+    if (unitRank(smallest) >= unitRank(.hour)) {
+        var res = roundTimeOnly(dur, smallest, inc, mode, largest);
+        // When the time rounding spilled into an extra day and `largest` is a
+        // calendar unit, that day can complete a month/year: re-anchor the date
+        // part from `from` so the overflow bubbles up (BubbleRelativeDuration).
+        if (unitRank(largest) < unitRank(.day)) {
+            const end = try plain_date.addISODate(from.date, res.years, res.months, res.weeks, res.days, .constrain, arena);
+            const rebal = plain_date.differenceISODate(from.date, end, largest);
+            res.years = rebal.years;
+            res.months = rebal.months;
+            res.weeks = rebal.weeks;
+            res.days = rebal.days;
+        }
+        return res;
+    }
     if (dur.sign() == 0) return dur;
     const sign: f64 = @floatFromInt(dur.sign());
 
