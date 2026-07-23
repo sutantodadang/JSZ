@@ -775,6 +775,14 @@ pub fn parseStatement(p: *Parser) ?*Node {
     // Explicit resource management: `using x = ...` / `await using x = ...`
     // declarations. Only recognized when a binding identifier follows (see
     // atUsingDecl/atAwaitUsingDecl); otherwise `using`/`await` stay ordinary.
+    // §14.3.2: a `using`/`await using` declaration is a SyntaxError at the top
+    // level of a Script or eval code — it is only allowed inside a block or
+    // function, or at the top level of a Module.
+    if (atAwaitUsingDecl(p) or atUsingDecl(p)) {
+        if (!p.is_module and p.fn_nesting_depth == 0 and p.block_depth == 0) {
+            return p.fail("using declaration not allowed at the top level of a script");
+        }
+    }
     if (atAwaitUsingDecl(p)) return parseUsingDeclStmt(p, true);
     if (atUsingDecl(p)) return parseUsingDeclStmt(p, false);
     // Phase 8: a statement starting with `await` is an await-expression statement,
@@ -890,6 +898,8 @@ pub fn parseStatement(p: *Parser) ?*Node {
 pub fn parseBlock(p: *Parser) ?*Node {
     const start = p.current.start;
     _ = p.expect(.left_brace) orelse return null;
+    p.block_depth += 1;
+    defer p.block_depth -= 1;
     var body = std.ArrayList(*Node){};
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const s = p.parseStatement() orelse break;
@@ -1502,6 +1512,10 @@ pub fn parseSwitchStmt(p: *Parser) ?*Node {
     const discriminant = p.parseExpression() orelse return null;
     _ = p.expect(.right_paren) orelse return null;
     _ = p.expect(.left_brace) orelse return null;
+    // The CaseBlock is its own lexical scope, so `using` declarations in a case
+    // clause are permitted even at Script/eval top level.
+    p.block_depth += 1;
+    defer p.block_depth -= 1;
 
     var cases = std.ArrayList(ast.SwitchCase){};
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
