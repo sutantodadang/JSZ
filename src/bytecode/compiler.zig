@@ -1065,6 +1065,28 @@ pub const FnCompiler = struct {
     }
 
     pub fn compileBinary(self: *Self, b: ast.BinaryExpr, line: u32) error{OutOfMemory}!u8 {
+        // `#priv in obj` (ergonomic brand check): the LHS is a private-name
+        // identifier kept un-lowered so a genuine string literal `"#x"` is never
+        // conflated with the private name #x. Load the (already class-mangled)
+        // private key as a string constant, then HasProperty.
+        if (b.op == .in and b.left.kind == .identifier and
+            b.left.data.identifier.len > 0 and b.left.data.identifier[0] == '#')
+        {
+            const rlhs = self.allocReg();
+            const kidx = try self.addConstant(try val_mod.makeString(self.arena, b.left.data.identifier));
+            try self.emitOp(.LOAD_K, line);
+            try self.emitU8(rlhs);
+            try self.emitU16(kidx);
+            const rrhs = try self.compileExpr(b.right);
+            self.sp = rlhs;
+            self.sp += 1;
+            const rdst = rlhs;
+            try self.emitOp(.IN, line);
+            try self.emitU8(rdst);
+            try self.emitU8(rlhs);
+            try self.emitU8(rrhs);
+            return rdst;
+        }
         const rlhs = try self.compileExpr(b.left);
         const rrhs = try self.compileExpr(b.right);
         // Free both, then alloc result (we use rlhs as rdst to minimize register pressure).

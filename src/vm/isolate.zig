@@ -356,6 +356,7 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__objSpreadInto__", try val_mod.makeNativeFunction(arena, es2015.nativeObjSpreadInto));
         try realm.global_env.define("__defineNamedMethod__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/object_methods.zig").nativeDefineNamedMethod));
         try realm.global_env.define("__nameFn__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/object_methods.zig").nativeNameFn));
+        try realm.global_env.define("__toPropertyKey__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/object_methods.zig").nativeToPropertyKey));
         try realm.global_env.define("__makeNamespace__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeNamespace));
         // import-defer: `import defer * as ns` desugars to `__importDefer__(spec)`;
         // dynamic `import.defer(spec)` routes through `__importDeferDyn__`.
@@ -539,6 +540,11 @@ pub const IsolateImpl = struct {
         return self.runMainBc(arena, main_func);
     }
 };
+
+/// Monotonic id assigned to each textual tagged-template site during source
+/// rewriting; the realm's template cache is keyed by it so repeated evaluations
+/// of one source position share a single frozen template object.
+var g_template_site_id: u64 = 0;
 
 pub fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]const u8 {
     var out = std.ArrayList(u8){};
@@ -876,7 +882,15 @@ fn rewriteTaggedTemplate(arena: std.mem.Allocator, out: *std.ArrayList(u8), sour
     try cooked.append(arena, try arena.dupe(u8, literal_buf.items));
     try raw.append(arena, try arena.dupe(u8, literal_buf.items));
 
-    try out.appendSlice(arena, "(__jsztag([");
+    // Each textual template site gets a stable id so the realm's template cache
+    // (§13.2.8.4: the same source position yields the same frozen object across
+    // evaluations) returns one object for repeated calls of the enclosing
+    // function. Assigned once per source rewrite in source order.
+    const site_id = g_template_site_id;
+    g_template_site_id += 1;
+    try out.appendSlice(arena, "(__jsztag(");
+    try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{site_id}));
+    try out.appendSlice(arena, ",[");
     for (cooked.items, 0..) |seg, k| {
         if (k > 0) try out.appendSlice(arena, ",");
         try emitTemplateLiteralSegment(arena, out, seg, false);
