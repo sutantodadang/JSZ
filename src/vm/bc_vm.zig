@@ -2396,9 +2396,18 @@ pub const BcVm = struct {
         if (obj_val.bits != 0 and obj_val.unbox() == .bc_function) {
             if (key_v.bits != 0 and key_v.unbox() == .symbol) return true;
             const closure_d = obj_val.toPtr().bc_function;
-            if (closure_d.obj == null) return true; // nothing materialized yet — no own props
-            const bk: *JsObject = @ptrCast(@alignCast(closure_d.obj.?));
             const key_str_d = try valueToStringArena(self.arena, key_v);
+            if (closure_d.obj == null) {
+                // `length` and `name` are virtual own props resolved on demand;
+                // deleting one must actually remove it (not resurface via the
+                // recompute path), so materialize the backing object first — it
+                // installs real length/name descriptors. Any other key genuinely
+                // has no own property yet, so deleting it is a no-op.
+                if (!std.mem.eql(u8, key_str_d, "length") and !std.mem.eql(u8, key_str_d, "name"))
+                    return true;
+                _ = try self.closureBackingObj(closure_d);
+            }
+            const bk: *JsObject = @ptrCast(@alignCast(closure_d.obj.?));
             if (!bk.hasOwn(key_str_d)) return true; // not own
             return bk.deleteOwn(key_str_d);
         }
@@ -2748,15 +2757,20 @@ pub const BcVm = struct {
                 // Own `name`/`length` for user functions (spec: non-writable,
                 // configurable). `length` = declared arity; `name` = the bound
                 // function name ("" when anonymous and not named-evaluated).
-                if (std.mem.eql(u8, key, "name")) {
-                    const raw = closure.effectiveName();
-                    // Translate internal sentinels for anonymous default exports to "default".
-                    const display = if (std.mem.eql(u8, raw, "__esm_dflt_fn__") or
-                        std.mem.eql(u8, raw, "__esm_dflt_gen__")) "default" else raw;
-                    return val_mod.makeString(self.arena, display);
-                }
-                if (std.mem.eql(u8, key, "length")) {
-                    return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.expected_argc));
+                // Only compute virtually while the backing object does not exist:
+                // once materialized it holds real length/name descriptors, and a
+                // missing one there means it was deleted (must not resurface).
+                if (closure.obj == null) {
+                    if (std.mem.eql(u8, key, "name")) {
+                        const raw = closure.effectiveName();
+                        // Translate internal sentinels for anonymous default exports to "default".
+                        const display = if (std.mem.eql(u8, raw, "__esm_dflt_fn__") or
+                            std.mem.eql(u8, raw, "__esm_dflt_gen__")) "default" else raw;
+                        return val_mod.makeString(self.arena, display);
+                    }
+                    if (std.mem.eql(u8, key, "length")) {
+                        return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.expected_argc));
+                    }
                 }
                 // Walk the backing object's prototype chain. For a subclass
                 // constructor (`class C extends Base`), `bcSetProto` set the
