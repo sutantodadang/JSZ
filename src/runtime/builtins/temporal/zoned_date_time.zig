@@ -1061,8 +1061,9 @@ pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const V
     const mode = try shared.getRoundingMode(arena, opts, .trunc);
     const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
     const show_tz = try getShowTimeZoneName(arena, opts);
-    // Rounding the epoch nanoseconds carries into the date for free.
-    const z_ns = shared.roundI128ToIncrement(z.ns, prec.increment, mode);
+    // Rounding the epoch nanoseconds carries into the date for free. Modes apply
+    // as if the epoch were positive, so "trunc"/"floor" go towards the Big Bang.
+    const z_ns = shared.roundI128ToIncrementAsIfPositive(z.ns, prec.increment, mode);
     const s = try zonedToString(arena, z_ns, z.offset_ns, z.tz, z.calendar, prec, show_cal, show_off, show_tz);
     return val_mod.makeString(arena, s);
 }
