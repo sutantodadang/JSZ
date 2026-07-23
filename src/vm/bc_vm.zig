@@ -1809,7 +1809,7 @@ pub const BcVm = struct {
                 }
                 // Promise resolving functions are callable but not constructors —
                 // `new resolve()` must throw (they carry no [[Construct]]).
-                if (obj.internal_kind == .promise_resolver) {
+                if (obj.internal_kind == .promise_resolver or obj.internal_kind == .proxy_revoke) {
                     self.last_exception_value = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
                     return "__js_exception__";
                 }

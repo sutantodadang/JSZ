@@ -1074,8 +1074,9 @@ pub fn isConstructorVal(v: Value) bool {
                 }
                 break :blk false;
             }
-            // A Promise resolving function is callable but not a constructor.
-            if (o.internal_kind == .promise_resolver) break :blk false;
+            // A Promise resolving function and a Proxy revoke function are callable
+            // but not constructors.
+            if (o.internal_kind == .promise_resolver or o.internal_kind == .proxy_revoke) break :blk false;
             // A proxy is a constructor iff its (non-revoked) target is (§10.5.14):
             // ProxyCreate only installs [[Construct]] when the target has one.
             if (o.internal_kind == .proxy) {

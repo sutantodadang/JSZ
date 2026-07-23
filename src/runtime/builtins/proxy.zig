@@ -707,6 +707,20 @@ fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
 
 /// `new Proxy(target, handler)` — both must be objects.
 pub fn nativeProxyCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    // §28.2.1.1: Proxy is a constructor — calling it without `new` (NewTarget is
+    // undefined) throws a TypeError. `Proxy.revocable` uses `proxyCreate` directly.
+    const constructing = realm_mod.active_constructing;
+    realm_mod.active_constructing = false;
+    if (!constructing) {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "Constructor Proxy requires 'new'");
+        return error.JsException;
+    }
+    return proxyCreate(arena, args);
+}
+
+/// ProxyCreate(target, handler): the shared allocation used by both `new Proxy`
+/// and `Proxy.revocable` (which is not itself invoked with `new`).
+fn proxyCreate(arena: std.mem.Allocator, args: []const Value) anyerror!Value {
     if (args.len < 2 or !isObjectLike(args[0]) or !isObjectLike(args[1])) {
         realm_mod.pending_exception = try makeTypeErrorVal(arena, "Cannot create proxy with a non-object as target or handler");
         return error.JsException;
@@ -731,7 +745,7 @@ pub fn isRevoked(proxy_obj: *JsObject) bool {
 /// `Proxy.revocable(target, handler)` — returns `{ proxy, revoke }` where calling
 /// `revoke()` clears the proxy's target/handler so all further operations throw.
 pub fn nativeProxyRevocable(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const proxy_val = try nativeProxyCtor(arena, Value{}, args);
+    const proxy_val = try proxyCreate(arena, args);
     const proxy_obj = proxy_val.toPtr().object;
 
     // The revoke function: a callable object (no `prototype`, so the call paths
@@ -741,6 +755,9 @@ pub fn nativeProxyRevocable(arena: std.mem.Allocator, _: Value, args: []const Va
     else
         try JsObject.create(arena, realm_mod.active_function_proto);
     revoke.internal_slot = @ptrCast(proxy_obj);
+    // Mark as the Proxy revoke function: callable but not a constructor, so
+    // `isConstructor(revoke)` is false and `new revoke()` throws (§28.2.2.1.1).
+    revoke.internal_kind = .proxy_revoke;
     try revoke.set("__call__", try val_mod.makeNativeFunction(arena, nativeProxyRevoke));
     _ = try revoke.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
     _ = try revoke.defineOwnData("name", try val_mod.makeString(arena, ""), .{ .writable = false, .enumerable = false, .configurable = true });
