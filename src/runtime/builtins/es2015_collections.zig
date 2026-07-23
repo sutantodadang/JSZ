@@ -2095,6 +2095,19 @@ pub fn initArrayIteratorProto(arena: std.mem.Allocator, object_proto: *JsObject)
     active_array_iter_proto = aip;
     active_iterator_proto = iter_proto;
 
+    // %MapIteratorPrototype% / %SetIteratorPrototype% must inherit from the real
+    // %IteratorPrototype% (with its @@toStringTag getter + helper methods), not
+    // the throwaway intermediate that registerSymbols built before this proto
+    // existed. Re-point them now that iter_proto is available.
+    if (active_map_iter_proto) |p| {
+        p.proto = iter_proto;
+        p.setProtoBarrier(iter_proto);
+    }
+    if (active_set_iter_proto) |p| {
+        p.proto = iter_proto;
+        p.setProtoBarrier(iter_proto);
+    }
+
     // %StringIteratorPrototype% (ES §22.1.5): a sibling of %ArrayIteratorPrototype%,
     // not the same object — `Object.prototype.toString` on a string iterator must
     // report "[object String Iterator]". `next` is the shared sequence stepper,
