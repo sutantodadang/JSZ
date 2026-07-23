@@ -4004,9 +4004,83 @@ pub fn nativeRegExpSymbolSplit(arena: std.mem.Allocator, this_val: Value, args: 
     return val_mod.makeObject(arena, arr);
 }
 
-/// RegExp.prototype[@@matchAll] (ES §22.2.6.9): eagerly collect all matches and
-/// return an array iterator over them (the observable order/values match a lazy
-/// RegExpStringIterator for the common cases the tests exercise).
+/// %RegExpStringIteratorPrototype% (ES §22.2.9.1). Lazy iterator returned by
+/// RegExp.prototype[@@matchAll]; parent = %IteratorPrototype%.
+pub var active_regexp_string_iter_proto: ?*JsObject = null;
+
+/// [[IteratingRegExp]] / [[IteratedString]] / [[Global]] / [[Unicode]] / [[Done]]
+/// internal slots of a RegExp String Iterator (ES §22.2.9.1).
+pub const MatchAllIterData = struct {
+    regexp: Value,
+    string: Value,
+    string_bytes: []const u8,
+    global: bool,
+    unicode: bool,
+    done: bool,
+};
+
+/// GC hook: keep the iterating RegExp and iterated String alive.
+pub fn gcTraceStringIterator(heap: anytype, obj: *JsObject) void {
+    const d: *MatchAllIterData = @ptrCast(@alignCast(obj.internal_slot orelse return));
+    heap.markValueLive(d.regexp);
+    heap.markValueLive(d.string);
+}
+
+fn requireStringIterator(arena: std.mem.Allocator, this_val: Value) !*MatchAllIterData {
+    if (this_val.bits == 0 or this_val.unbox() != .object)
+        return realm_mod.throwTypeError(arena, "RegExp String Iterator.prototype.next called on a non-object");
+    const obj = this_val.toPtr().object;
+    if (obj.internal_kind != .regexp_string_iterator or obj.internal_slot == null)
+        return realm_mod.throwTypeError(arena, "RegExp String Iterator.prototype.next called on an incompatible receiver");
+    return @ptrCast(@alignCast(obj.internal_slot.?));
+}
+
+/// %RegExpStringIteratorPrototype%.next ( ) — ES §22.2.9.2.1.
+pub fn nativeRegExpStringIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    const d = try requireStringIterator(arena, this_val);
+    if (d.done) return makeMatchIterResult(arena, try val_mod.makeUndefined(arena), true);
+
+    const match = try regExpExec(arena, d.regexp, d.string);
+    if (match.bits == 0 or match.unbox() == .null_) {
+        d.done = true;
+        return makeMatchIterResult(arena, try val_mod.makeUndefined(arena), true);
+    }
+    if (!d.global) {
+        d.done = true;
+        return makeMatchIterResult(arena, match, false);
+    }
+    // Global: if the match is empty, bump lastIndex so we make progress.
+    const match_str = try getStrProp(arena, match, "0");
+    if (match_str.len == 0) {
+        const li = try realm_mod.toLengthValue(arena, try ctxGetProp(arena, d.regexp, "lastIndex"));
+        try ctxSetProp(arena, d.regexp, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(advanceStringIndex(d.string_bytes, li, d.unicode))));
+    }
+    return makeMatchIterResult(arena, match, false);
+}
+
+/// CreateIterResultObject (ES §7.4.14).
+fn makeMatchIterResult(arena: std.mem.Allocator, value: Value, done: bool) !Value {
+    const proto = realm_mod.active_object_proto;
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
+    try obj.set("value", value);
+    try obj.set("done", try val_mod.makeBool(arena, done));
+    return val_mod.makeObject(arena, obj);
+}
+
+/// Build %RegExpStringIteratorPrototype% (called at realm init, after
+/// %IteratorPrototype% exists).
+pub fn initStringIteratorProto(arena: std.mem.Allocator, iterator_proto: ?*JsObject) !void {
+    const cfg: @import("../../object/object.zig").PropAttr = .{ .writable = true, .enumerable = false, .configurable = true };
+    const tag_cfg: @import("../../object/object.zig").PropAttr = .{ .writable = false, .enumerable = false, .configurable = true };
+    const proto = try JsObject.create(arena, iterator_proto orelse realm_mod.active_object_proto);
+    _ = try proto.defineOwnData("next", try val_mod.makeNativeFunctionNamed(arena, nativeRegExpStringIterNext, "next", 0), cfg);
+    if (realm_mod.active_sym_to_string_tag) |tag|
+        try proto.setSymAttr(tag, try val_mod.makeString(arena, "RegExp String Iterator"), tag_cfg);
+    active_regexp_string_iter_proto = proto;
+}
+
+/// RegExp.prototype[@@matchAll] (ES §22.2.6.9): construct a matcher clone of R
+/// and return a lazy RegExp String Iterator over it.
 pub fn nativeRegExpSymbolMatchAll(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     try requireObject(arena, this_val, "RegExp.prototype[Symbol.matchAll]");
     const s_str = if (args.len > 0) try realm_mod.stringPrimitive(arena, args[0]) else "undefined";
@@ -4024,29 +4098,21 @@ pub fn nativeRegExpSymbolMatchAll(arena: std.mem.Allocator, this_val: Value, arg
     const start_li = try realm_mod.toLengthValue(arena, try ctxGetProp(arena, this_val, "lastIndex"));
     try ctxSetProp(arena, matcher, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(start_li)));
 
-    const matches = try JsObject.createArray(arena, realm_mod.active_array_proto);
-    var count: u32 = 0;
-    while (true) {
-        const result = try regExpExec(arena, matcher, s_val);
-        if (result.bits == 0 or result.unbox() == .null_) break;
-        const key = try std.fmt.allocPrint(arena, "{d}", .{count});
-        try matches.set(key, result);
-        count += 1;
-        if (!global) break;
-        const match_str = try getStrProp(arena, result, "0");
-        if (match_str.len == 0) {
-            const li = try realm_mod.toLengthValue(arena, try ctxGetProp(arena, matcher, "lastIndex"));
-            try ctxSetProp(arena, matcher, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(advanceStringIndex(s_str, li, unicode))));
-        }
-    }
-    matches.array_length = count;
-    // Return an array iterator over the collected match arrays.
-    const arr_val = try val_mod.makeObject(arena, matches);
-    if (realm_mod.active_context) |ctx| {
-        const values_fn = try ctx.getProp(arena, arr_val, "values");
-        return fp.invokeCallback(arena, arr_val, values_fn, &[_]Value{});
-    }
-    return arr_val;
+    // CreateRegExpStringIterator(matcher, S, global, fullUnicode).
+    const d = try arena.create(MatchAllIterData);
+    d.* = .{
+        .regexp = matcher,
+        .string = s_val,
+        .string_bytes = s_str,
+        .global = global,
+        .unicode = unicode,
+        .done = false,
+    };
+    const proto = active_regexp_string_iter_proto orelse realm_mod.active_object_proto;
+    const iter = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
+    iter.internal_slot = d;
+    iter.internal_kind = .regexp_string_iterator;
+    return val_mod.makeObject(arena, iter);
 }
 
 /// Install RegExp.prototype[@@match/@@replace/@@search/@@split/@@matchAll].

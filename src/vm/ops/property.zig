@@ -899,6 +899,29 @@ pub inline fn opGetKeys(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                     }
                 }
             }
+        } else if (iv == .bc_function or iv == .native_function or iv == .function) {
+            // A callable's own properties (e.g. a class's static fields) live on
+            // its backing object, which is not tagged `.object`. Resolve it and
+            // run the same EnumerateObjectProperties proto-chain walk.
+            const realm_mod = @import("../../runtime/realm.zig");
+            if (realm_mod.active_context) |ctx| {
+                if (try ctx.backingObject(self.arena, obj_val)) |bobj| {
+                    var visited = std.StringHashMap(void).init(self.arena);
+                    defer visited.deinit();
+                    var cur: ?*JsObject = bobj;
+                    while (cur) |o| : (cur = o.proto) {
+                        for (o.ownKeys()) |k| {
+                            if (JsObject.isInternalSlotKey(k)) continue;
+                            const gop = try visited.getOrPut(k);
+                            if (gop.found_existing) continue;
+                            if (!o.isEnumerable(k)) continue;
+                            const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
+                            arr_obj.set(idx_str, try val_mod.makeString(self.arena, k)) catch {};
+                            count += 1;
+                        }
+                    }
+                }
+            }
         } else if (iv == .string) {
             // for-in applies ToObject to its operand, so a primitive string
             // enumerates the index keys its String wrapper would expose.

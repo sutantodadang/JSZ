@@ -1225,6 +1225,10 @@ pub const BcVm = struct {
                 "__nameFn__",
                 try val_mod.makeNativeFunction(self.arena, obj_methods.nativeNameFn),
             );
+            try nr.global_env.define(
+                "__toPropertyKey__",
+                try val_mod.makeNativeFunction(self.arena, obj_methods.nativeToPropertyKey),
+            );
         }
         // Cross-realm: make the secondary realm's well-known symbols *shared* with
         // the primary realm by replacing the Symbol constructor's properties directly.

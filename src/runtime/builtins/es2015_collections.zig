@@ -928,6 +928,9 @@ pub fn gcStrongTrace(heap: *Heap, obj: *JsObject) void {
         .disposable_stack, .async_disposable_stack => {
             @import("disposable_stack.zig").gcTrace(heap, obj);
         },
+        .regexp_string_iterator => {
+            @import("regexp.zig").gcTraceStringIterator(heap, obj);
+        },
         else => {},
     }
 }

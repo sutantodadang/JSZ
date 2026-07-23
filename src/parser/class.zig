@@ -218,6 +218,12 @@ const ClassField = struct {
     is_static: bool = false,
     name: []const u8 = "",
     computed_key: ?*Node = null,
+    /// Name of the hidden `var` holding the pre-evaluated property key for a
+    /// computed field. Per spec the ClassElementName is evaluated once, at
+    /// ClassDefinitionEvaluation time (in source order), not per instance — so
+    /// the field initializers reference this binding instead of re-evaluating
+    /// `computed_key`. Null for non-computed fields.
+    key_var: ?[]const u8 = null,
     init: ?*Node = null,
     /// ES2022 static initialization block (`static { ... }`). Carries the block's
     /// statements instead of a key/initializer; kept in the same list as static
@@ -461,13 +467,11 @@ const PrivateRewriter = struct {
             .identifier => |name| node.data = .{ .identifier = self.map(name) },
             .unary_expr => |u| self.walk(u.operand),
             .binary_expr => |b| {
-                // `#x in obj` reaches here with the LHS already lowered to the
-                // string key "#x" (see parseBinaryRhs), so mangle it in place.
-                if (b.op == .in and b.left.kind == .string_literal and
-                    isPrivateName(b.left.data.string_literal))
-                {
-                    b.left.data = .{ .string_literal = self.map(b.left.data.string_literal) };
-                } else self.walk(b.left);
+                // `#x in obj` keeps `#x` as an identifier (see parseBinaryRhs), so
+                // the `.identifier` branch mangles it like `this.#x`. A genuine
+                // string literal `"#x"` is left untouched, so `"#x" in obj` is a
+                // plain string HasProperty (never matches a private element).
+                self.walk(b.left);
                 self.walk(b.right);
             },
             .logical_expr => |b| {
@@ -659,16 +663,55 @@ fn namedFieldInitOf(p: *Parser, f: ClassField, val: *Node, check: *Node) ?*Node 
 /// A private name (`#x`) is emitted as a non-computed member, so it resolves to
 /// the property key "#x" — matching how `obj.#x` reads are parsed.
 fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
+    const this_node = p.makeNode(.this_expr, p.current.start, p.current.start, .{ .this_expr = {} }) orelse return null;
+    return makeFieldDefineOn(p, f, this_node);
+}
+
+/// Emit an instance-field initializer that installs the field on `target` using
+/// CreateDataProperty semantics (`Object.defineProperty`) for a public field, or
+/// PrivateFieldAdd (`target.#name = init`) for a private one. `target` is `this`
+/// for a base class and `__superthis` for a derived class. A computed field's
+/// key is read from its pre-evaluated hidden binding (`f.key_var`) so the key
+/// object's @@toPrimitive is observed once, at class-definition time.
+fn makeFieldDefineOn(p: *Parser, f: ClassField, target: *Node) ?*Node {
     const s = p.current.start;
-    const this_node = p.makeNode(.this_expr, s, s, .{ .this_expr = {} }) orelse return null;
-    const lhs = if (f.computed_key) |k|
-        (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = this_node, .property = k, .computed = true } }) orelse return null)
-    else
-        markPrivateDefine(nodeMember(p, this_node, f.name) orelse return null, false);
     const raw = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
     const val = namedFieldInit(p, f, raw) orelse return null;
-    const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
-    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+
+    // Private fields: `target.#name = init` (member assignment → PrivateFieldAdd).
+    if (f.computed_key == null and f.name.len > 0 and f.name[0] == '#') {
+        const lhs = markPrivateDefine(nodeMember(p, target, f.name) orelse return null, false);
+        const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
+        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+    }
+
+    // Public fields: Object.defineProperty(target, key,
+    //   { value: init, writable: true, enumerable: true, configurable: true }).
+    const key_val = fieldKeyNode(p, f) orelse return null;
+    var props = std.ArrayList(ast.ObjectProp){};
+    props.append(p.arena, .{ .key = "value", .value = val }) catch return null;
+    props.append(p.arena, .{ .key = "writable", .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null }) catch return null;
+    props.append(p.arena, .{ .key = "enumerable", .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null }) catch return null;
+    props.append(p.arena, .{ .key = "configurable", .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null }) catch return null;
+    const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
+
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, target) catch return null;
+    args.append(p.arena, key_val) catch return null;
+    args.append(p.arena, desc) catch return null;
+    const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
+    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
+}
+
+/// The key expression for a field's install: the pre-evaluated hidden binding
+/// for a computed field, else a string literal of the field name.
+fn fieldKeyNode(p: *Parser, f: ClassField) ?*Node {
+    const s = p.current.start;
+    if (f.key_var) |kv| return nodeIdent(p, kv);
+    if (f.computed_key) |k| return k; // no hoisting slot assigned (fallback)
+    return p.makeNode(.string_literal, s, s, .{ .string_literal = f.name });
 }
 
 /// Build a derived-class instance-field initializer targeting `__superthis`
@@ -686,39 +729,8 @@ fn makeInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
 /// operation that triggers deferred evaluation). Private fields keep the
 /// member-assignment form (`__superthis.#name = init`), which is PrivateFieldAdd.
 fn makeDerivedInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
-    const s = p.current.start;
     const superthis = nodeIdent(p, "__superthis") orelse return null;
-    const raw = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
-    const val = namedFieldInit(p, f, raw) orelse return null;
-
-    // Private fields: `__superthis.#name = init` (member assignment → PrivateFieldAdd).
-    if (f.computed_key == null and f.name.len > 0 and f.name[0] == '#') {
-        const lhs = markPrivateDefine(nodeMember(p, superthis, f.name) orelse return null, false);
-        const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
-        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
-    }
-
-    // Public fields: Object.defineProperty(__superthis, key,
-    //   { value: init, writable: true, enumerable: true, configurable: true }).
-    const key_val = if (f.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = f.name }) orelse return null);
-    const t1 = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
-    const t2 = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
-    const t3 = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
-    var props = std.ArrayList(ast.ObjectProp){};
-    props.append(p.arena, .{ .key = "value", .value = val }) catch return null;
-    props.append(p.arena, .{ .key = "writable", .value = t1 }) catch return null;
-    props.append(p.arena, .{ .key = "enumerable", .value = t2 }) catch return null;
-    props.append(p.arena, .{ .key = "configurable", .value = t3 }) catch return null;
-    const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
-
-    const id_obj = nodeIdent(p, "Object") orelse return null;
-    const callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
-    var args = std.ArrayList(*Node){};
-    args.append(p.arena, superthis) catch return null;
-    args.append(p.arena, key_val) catch return null;
-    args.append(p.arena, desc) catch return null;
-    const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
-    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
+    return makeFieldDefineOn(p, f, superthis);
 }
 
 /// Append derived-class instance-field initializers (skipping static fields) to
@@ -760,11 +772,6 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
         }) orelse return null;
         return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = blk_call });
     }
-    const cls = nodeIdent(p, class_name) orelse return null;
-    const lhs = if (f.computed_key) |k|
-        (p.makeNode(.member_expr, s, s, .{ .member_expr = .{ .object = cls, .property = k, .computed = true } }) orelse return null)
-    else
-        markPrivateDefine(nodeMember(p, cls, f.name) orelse return null, false);
     const raw_init = f.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null);
 
     // Wrap: (function () { return <init>; }).call(ClassName)
@@ -784,8 +791,31 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
     const call_val = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = call_member, .args = call_args } }) orelse return null;
     const val = namedFieldInitOf(p, f, call_val, raw_init) orelse return null;
 
-    const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
-    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+    // Private static field: `ClassName.#name = init` (PrivateFieldAdd).
+    if (f.computed_key == null and f.name.len > 0 and f.name[0] == '#') {
+        const cls = nodeIdent(p, class_name) orelse return null;
+        const lhs = markPrivateDefine(nodeMember(p, cls, f.name) orelse return null, false);
+        const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = val } }) orelse return null;
+        return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
+    }
+
+    // Public static field: CreateDataProperty via Object.defineProperty(ClassName,
+    // key, { value, writable, enumerable, configurable }) with the pre-evaluated key.
+    const key_val = fieldKeyNode(p, f) orelse return null;
+    var props = std.ArrayList(ast.ObjectProp){};
+    props.append(p.arena, .{ .key = "value", .value = val }) catch return null;
+    props.append(p.arena, .{ .key = "writable", .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null }) catch return null;
+    props.append(p.arena, .{ .key = "enumerable", .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null }) catch return null;
+    props.append(p.arena, .{ .key = "configurable", .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null }) catch return null;
+    const desc = p.makeNode(.object_literal, s, s, .{ .object_literal = .{ .properties = props.items } }) orelse return null;
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    const dp_callee = nodeMember(p, id_obj, "defineProperty") orelse return null;
+    var dp_args = std.ArrayList(*Node){};
+    dp_args.append(p.arena, nodeIdent(p, class_name) orelse return null) catch return null;
+    dp_args.append(p.arena, key_val) catch return null;
+    dp_args.append(p.arena, desc) catch return null;
+    const dp_call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = dp_callee, .args = dp_args.items } }) orelse return null;
+    return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = dp_call });
 }
 
 /// Prepend instance-field initializers to a base-class constructor body. Returns
@@ -1093,6 +1123,27 @@ fn emitClassStatements(
     const members = parsed.members;
     const fields = parsed.fields;
 
+    // Pre-evaluate computed field NAMES once, at class-definition time, in source
+    // order (ClassElementName evaluation). Each computed field's key is stored in
+    // a hidden `var` the field initializers read, so a key object's @@toPrimitive
+    // is observed exactly once and any abrupt completion (ReferenceError, a
+    // throwing toString) surfaces at the class definition, not per instance.
+    // Collected now, before the field-install desugar below (which runs while
+    // building the constructor body) references `key_var`.
+    var key_evals = std.ArrayList(*Node){};
+    for (parsed.fields) |*f| {
+        const k = f.computed_key orelse continue;
+        const kv = std.fmt.allocPrint(p.arena, "__ck_{d}__", .{p.param_destruct_counter}) catch return null;
+        p.param_destruct_counter += 1;
+        f.key_var = kv;
+        const helper = nodeIdent(p, "__toPropertyKey__") orelse return null;
+        var ck_args = std.ArrayList(*Node){};
+        ck_args.append(p.arena, k) catch return null;
+        const call = p.makeNode(.call_expr, start, start, .{ .call_expr = .{ .callee = helper, .args = ck_args.items } }) orelse return null;
+        const decl = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = .var_, .name = kv, .init = call } }) orelse return null;
+        key_evals.append(p.arena, decl) catch return null;
+    }
+
     if (!parsed.has_ctor) {
         if (super_name) |sname| {
             // Derived default constructor: `return Reflect.construct(Super,
@@ -1289,6 +1340,12 @@ fn emitClassStatements(
         .var_decl = .{ .kind = .let, .name = class_name, .init = ctor_fn },
     }) orelse return null;
     out.append(p.arena, ctor_decl) catch return null;
+
+    // Emit the pre-evaluated computed-key bindings now: after the constructor is
+    // bound (so a key may reference the class name) but before static field value
+    // initializers and any `new ClassName()`, so every ClassElementName is
+    // evaluated exactly once, in source order, at class-definition time.
+    for (key_evals.items) |kd| out.append(p.arena, kd) catch return null;
 
     if (super_name) |sname| {
         // Object.setPrototypeOf(ClassName, Super) — static inheritance

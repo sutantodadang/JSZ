@@ -137,15 +137,12 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         }
         const start = left.start;
         // Private-in brand check: `#name in obj`. `#name` lexes as an identifier
-        // whose value includes the leading '#'; as a bare reference it would be an
-        // undefined-variable error. Private elements are own-only and JSZ stores
-        // them under the property key "#name", so rewrite the LHS to that string
-        // literal — `in` then performs the HasProperty(obj, "#name") brand check.
-        if (op_kind == .kw_in and left.kind == .identifier and
-            left.data.identifier.len > 0 and left.data.identifier[0] == '#')
-        {
-            left = p.makeNode(.string_literal, left.start, left.start, .{ .string_literal = left.data.identifier }) orelse return null;
-        }
+        // whose value includes the leading '#'. It is kept as an identifier (NOT
+        // lowered to a string literal here) so the class rewriter mangles it via
+        // the same path as `this.#name`, and so a genuine string literal `"#name"`
+        // in `"#name" in obj` is never conflated with the private name. The
+        // compiler's `.in` case loads a `#`-prefixed identifier LHS as the string
+        // key for the HasProperty brand check.
         left = switch (op_kind) {
             .amp_amp, .pipe_pipe, .question_question => p.makeNode(.logical_expr, start, p.current.start, .{
                 .logical_expr = .{
@@ -1046,15 +1043,12 @@ pub fn parseBinaryExpr(p: *Parser, min_prec: u8) ?*Node {
         }
         const start = left.start;
         // Private-in brand check: `#name in obj`. `#name` lexes as an identifier
-        // whose value includes the leading '#'; as a bare reference it would be an
-        // undefined-variable error. Private elements are own-only and JSZ stores
-        // them under the property key "#name", so rewrite the LHS to that string
-        // literal — `in` then performs the HasProperty(obj, "#name") brand check.
-        if (op_kind == .kw_in and left.kind == .identifier and
-            left.data.identifier.len > 0 and left.data.identifier[0] == '#')
-        {
-            left = p.makeNode(.string_literal, left.start, left.start, .{ .string_literal = left.data.identifier }) orelse return null;
-        }
+        // whose value includes the leading '#'. It is kept as an identifier (NOT
+        // lowered to a string literal here) so the class rewriter mangles it via
+        // the same path as `this.#name`, and so a genuine string literal `"#name"`
+        // in `"#name" in obj` is never conflated with the private name. The
+        // compiler's `.in` case loads a `#`-prefixed identifier LHS as the string
+        // key for the HasProperty brand check.
         left = switch (op_kind) {
             .amp_amp, .pipe_pipe, .question_question => p.makeNode(.logical_expr, start, p.current.start, .{
                 .logical_expr = .{

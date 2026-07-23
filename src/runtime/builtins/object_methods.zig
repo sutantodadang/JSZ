@@ -744,14 +744,20 @@ pub fn nativeObjectIsPrototypeOf(arena: std.mem.Allocator, this_val: Value, args
 }
 
 pub fn nativePropertyIsEnumerable(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    const realm_mod = @import("../realm.zig");
     // Step 1: P = ToPropertyKey(V) — coercion (may throw) precedes ToObject(this).
     const key_arg = try toPropertyKeyValue(arena, if (args.len > 0) args[0] else Value{});
     // Step 2: ToObject(this) throws for null/undefined.
     if (this_val.isNullish()) return throwTypeError(arena, "Object.prototype.propertyIsEnumerable called on null or undefined");
-    if (this_val.bits == 0 or this_val.unbox() != .object) {
+    // ToObject(this): a callable's own properties (e.g. a class's static fields)
+    // live on its backing object, which is not tagged `.object`.
+    const obj: *JsObject = blk: {
+        if (this_val.bits != 0 and this_val.unbox() == .object) break :blk this_val.toPtr().object;
+        if (realm_mod.active_context) |ctx| {
+            if (try ctx.backingObject(arena, this_val)) |bo| break :blk bo;
+        }
         return val_mod.makeBool(arena, false);
-    }
-    const obj = this_val.toPtr().object;
+    };
     // Proxy [[GetOwnProperty]]: enumerable iff the descriptor exists and its
     // [[Enumerable]] field is true.
     if (obj.internal_kind == .proxy) {
@@ -1730,6 +1736,16 @@ fn toPropertyKeyValue(arena: std.mem.Allocator, v: Value) !Value {
     if (prim.bits != 0 and prim.unbox() == .symbol) return prim;
     const s = try @import("../realm.zig").stringPrimitive(arena, prim);
     return val_mod.makeString(arena, s);
+}
+
+/// `__toPropertyKey__(v)` → ToPropertyKey(v). Used by the class desugar to
+/// evaluate a computed class-element name once, at ClassDefinitionEvaluation
+/// time (a key object's @@toPrimitive/toString must be observed exactly once,
+/// and any abrupt completion must surface where the class is defined — not per
+/// instance). The resulting string/symbol key is stored in a hidden binding the
+/// field initializers read.
+pub fn nativeToPropertyKey(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    return toPropertyKeyValue(arena, if (args.len >= 1) args[0] else Value{});
 }
 
 /// `__nameFn__(fn, key)` → fn, after SetFunctionName(fn, key). Wraps a class

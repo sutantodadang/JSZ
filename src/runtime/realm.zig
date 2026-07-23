@@ -3999,11 +3999,45 @@ fn registerArrayProto(arena: std.mem.Allocator, proto: *JsObject) !void {
 /// rewrite), attach `raw` to `cooked` as a non-writable/non-configurable
 /// property and return `cooked` as the template object. Exposed globally as
 /// `__jsztag`.
-fn nativeTemplateObject(_: std.mem.Allocator, _: val_mod.Value, args: []const val_mod.Value) anyerror!val_mod.Value {
-    const cooked = if (args.len > 0) args[0] else val_mod.Value{};
-    const raw = if (args.len > 1) args[1] else val_mod.Value{};
+/// Per-realm tagged-template cache object: own property "<site_id>" → the frozen
+/// template object for that source position. Rooted in the global environment
+/// (hidden `__jsztmplcache__` binding) so its entries survive GC. §13.2.8.4:
+/// GetTemplateObject returns the same object for one source position per realm.
+pub var active_template_cache: ?*JsObject = null;
+
+fn nativeTemplateObject(arena: std.mem.Allocator, _: val_mod.Value, args: []const val_mod.Value) anyerror!val_mod.Value {
+    // args: (site_id, cooked, raw). site_id keys the realm's template cache.
+    const site_id = if (args.len > 0) args[0] else val_mod.Value{};
+    const cooked = if (args.len > 1) args[1] else val_mod.Value{};
+    const raw = if (args.len > 2) args[2] else val_mod.Value{};
+
+    var key_buf: [24]u8 = undefined;
+    const key: ?[]const u8 = if (site_id.bits != 0 and site_id.unbox() == .number)
+        std.fmt.bufPrint(&key_buf, "{d}", .{@as(i64, @intFromFloat(site_id.unbox().number))}) catch null
+    else
+        null;
+    if (key) |k| {
+        if (active_template_cache) |cache| {
+            if (cache.getOwn(k)) |cached| {
+                if (cached.bits != 0) return cached;
+            }
+        }
+    }
+
+    // §13.2.8.4 GetTemplateObject: the raw array is frozen (SetIntegrityLevel
+    // "frozen"), attached to the cooked array as a non-writable/non-enumerable/
+    // non-configurable "raw", then the cooked array is itself frozen. The
+    // resulting object's indices are non-writable/non-configurable (still
+    // enumerable) and its `length` is non-writable.
+    if (raw.bits != 0 and raw.unbox() == .object) raw.toPtr().object.freezeSelf();
     if (cooked.bits != 0 and cooked.unbox() == .object) {
         _ = try cooked.toPtr().object.defineOwnData("raw", raw, .{ .writable = false, .enumerable = false, .configurable = false });
+        cooked.toPtr().object.freezeSelf();
+    }
+    if (key) |k| {
+        if (active_template_cache) |cache| {
+            _ = try cache.defineOwnData(try arena.dupe(u8, k), cooked, .{ .writable = true, .enumerable = false, .configurable = true });
+        }
     }
     return cooked;
 }
@@ -4921,6 +4955,8 @@ pub const Realm = struct {
         // now that @@iterator / @@toStringTag exist. Array + TypedArray iterators
         // all inherit from it.
         try es2015_collections_mod.initArrayIteratorProto(arena, object_proto);
+        // %RegExpStringIteratorPrototype% — inherits %IteratorPrototype%.
+        try regexp_mod.initStringIteratorProto(arena, es2015_collections_mod.active_iterator_proto);
 
         // ---- ES2024 Iterator global (map/filter/take/drop/… helpers) ----
         try es2015_collections_mod.registerIteratorGlobal(&reg_ctx);
@@ -5136,6 +5172,14 @@ pub const Realm = struct {
         // Tagged-template runtime helper (see rewriteTemplateLiterals): builds the
         // template strings object from its cooked + raw arrays.
         try env.define("__jsztag", try val_mod.makeNativeFunction(arena, nativeTemplateObject));
+        // Per-realm tagged-template cache, rooted in the global env (hidden `__`
+        // binding, so not mirrored onto globalThis) so its cached template
+        // objects survive GC across tag calls.
+        {
+            const cache_obj = try JsObject.create(arena, null);
+            active_template_cache = cache_obj;
+            try env.define("__jsztmplcache__", try val_mod.makeObject(arena, cache_obj));
+        }
 
         // ---- Post-pass: give built-in constructors and namespace objects their
         // [[Prototype]]. Most constructor objects above were created with a null
