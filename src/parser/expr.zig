@@ -1574,7 +1574,20 @@ fn superReadFollows(p: *Parser, obj: *Node) bool {
 /// Parse a member expression without call expressions (for `new` callee).
 /// Handles dot and bracket access but NOT `(` argument lists.
 pub fn parseNewCallee(p: *Parser) ?*Node {
-    var base = p.parsePrimaryExpr() orelse return null;
+    // A nested `new` is itself a valid MemberExpression callee (§13.3
+    // `MemberExpression : new MemberExpression Arguments`): `new new C()` has the
+    // outer `new` apply to the inner `new C()`. Parse the inner callee and its own
+    // optional Arguments recursively, then continue with member access below.
+    var base: *Node = if (p.check(.kw_new) and p.peekNext().kind != .dot) blk: {
+        const nstart = p.current.start;
+        _ = p.advance(); // consume inner `new`
+        const inner_callee = p.parseNewCallee() orelse return null;
+        var inner_args: []*Node = &[_]*Node{};
+        if (p.check(.left_paren)) inner_args = p.parseArgs() orelse return null;
+        break :blk p.makeNode(.new_expr, nstart, p.current.start, .{
+            .new_expr = .{ .callee = inner_callee, .args = inner_args },
+        }) orelse return null;
+    } else p.parsePrimaryExpr() orelse return null;
     while (true) {
         if (p.match(.dot)) {
             const prop_tok = p.expectIdentifierName() orelse return null;
