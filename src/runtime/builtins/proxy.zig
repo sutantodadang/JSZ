@@ -200,15 +200,18 @@ pub fn proxyOwnKeys(arena: std.mem.Allocator, proxy_obj: *JsObject) anyerror!?[]
     if (res.bits == 0 or res.unbox() != .object)
         return throwProxy(arena, "proxy ownKeys trap must return an array-like object");
     const arr = res.toPtr().object;
+    // CreateListFromArrayLike reads `length` and every index via [[Get]], firing
+    // accessor getters / proxy traps on the trap result — observable per spec.
+    const ctx = realm_mod.active_context;
     const len = if (arr.is_array) arr.getArrayLength() else blk: {
-        const lv = arr.get("length") orelse val_mod.Value{};
+        const lv = if (ctx) |c| try c.getProp(arena, res, "length") else (arr.get("length") orelse val_mod.Value{});
         break :blk @as(u32, @intCast(try realm_mod.toLengthValue(arena, lv)));
     };
     var list = std.ArrayListUnmanaged(Value){};
     var i: u32 = 0;
     while (i < len) : (i += 1) {
         const k = try std.fmt.allocPrint(arena, "{d}", .{i});
-        const ev = arr.get(k) orelse val_mod.Value{};
+        const ev = if (ctx) |c| try c.getProp(arena, res, k) else (arr.get(k) orelse val_mod.Value{});
         if (!isPropertyKey(ev))
             return throwProxy(arena, "proxy ownKeys trap result must contain only Strings and Symbols");
         // Duplicate entries are forbidden.
