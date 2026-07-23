@@ -48,6 +48,7 @@ pub fn makeDateTime(arena: std.mem.Allocator, dt: ISODateTime) !Value {
 
 fn installInto(arena: std.mem.Allocator, this_val: Value, dt: ISODateTime) !Value {
     if (!shared.isValidISODate(dt.date.year, dt.date.month, dt.date.day)) return realm_mod.throwRangeError(arena, "invalid PlainDateTime");
+    if (!shared.isoDateTimeWithinLimits(dt.date, dt.time)) return realm_mod.throwRangeError(arena, "PlainDateTime out of range");
     const slot = try arena.create(ISODateTime);
     slot.* = dt;
     this_val.toPtr().object.internal_kind = .temporal_plain_date_time;
@@ -72,8 +73,11 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     // constructor's year/month/day are always ISO, whatever the calendar.
     var cal: calendar.CalendarId = .iso8601;
     if (args.len > 9 and args[9].bits != 0 and args[9].unbox() != .undefined_) {
-        const name = try shared.valueToString(arena, args[9]);
-        cal = calendar.canonicalize(name) orelse return realm_mod.throwRangeError(arena, "unsupported calendar");
+        // The constructor's calendar argument must be a String primitive; any
+        // other type (null, number, object, …) is a TypeError before the
+        // identifier is canonicalized.
+        if (args[9].unbox() != .string) return realm_mod.throwTypeError(arena, "calendar must be a string");
+        cal = calendar.canonicalize(args[9].unbox().string) orelse return realm_mod.throwRangeError(arena, "unsupported calendar");
     }
     const yi = f2i(y);
     const mi = f2i(mo);
@@ -615,9 +619,10 @@ pub fn nativeToPlainTime(arena: std.mem.Allocator, this_val: Value, _: []const V
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
-    // Option read order is fixed by the spec: digits, then mode, then unit.
-    const digits = try shared.getFractionalDigits(arena, opts);
+    // Options are read in alphabetical order: calendarName, fractionalSecondDigits,
+    // roundingMode, then smallestUnit (via getSecondsStringPrecision).
     const show = try shared.getShowCalendar(arena, opts);
+    const digits = try shared.getFractionalDigits(arena, opts);
     const mode = try shared.getRoundingMode(arena, opts, .trunc);
     const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
     // Rounding up past midnight carries into the date.

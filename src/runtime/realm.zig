@@ -3243,7 +3243,7 @@ pub fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
 
 /// Raise a `SyntaxError` from a native. Spec StringToBigInt reports a malformed
 /// numeric string this way (`BigInt("abc")`), not as a TypeError.
-fn throwSyntaxError(arena: std.mem.Allocator, msg: []const u8) anyerror {
+pub fn throwSyntaxError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const eo = if (active_heap) |h| try JsObject.createOnHeap(h, error_proto_SyntaxError) else try JsObject.create(arena, error_proto_SyntaxError);
     try eo.set("message", try val_mod.makeString(arena, msg));
     try eo.set("name", try val_mod.makeString(arena, "SyntaxError"));

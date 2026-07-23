@@ -61,8 +61,9 @@ fn installInto(arena: std.mem.Allocator, this_val: Value, ns: i128) !Value {
 pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     if (!realm_mod.active_constructing) return realm_mod.throwTypeError(arena, "Temporal.Instant requires new");
     const arg = if (args.len > 0) args[0] else Value{};
-    if (arg.bits == 0 or arg.unbox() != .bigint) return realm_mod.throwTypeError(arena, "epochNanoseconds must be a BigInt");
-    const ns = shared.bigIntToI128(arg) orelse return realm_mod.throwRangeError(arena, "Instant out of range");
+    // The constructor's argument goes through ToBigInt (string/boolean accepted).
+    const big = try shared.toBigInt(arena, arg);
+    const ns = shared.bigIntToI128(big) orelse return realm_mod.throwRangeError(arena, "Instant out of range");
     if (!isValidEpochNs(ns)) return realm_mod.throwRangeError(arena, "Instant out of range");
     if (this_val.bits != 0 and this_val.unbox() == .object) return installInto(arena, this_val, ns);
     return makeInstant(arena, ns);
@@ -79,6 +80,14 @@ pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyer
     if (v.bits != 0 and v.unbox() == .string) {
         const ns = try parseInstantString(arena, v.unbox().string);
         return makeInstant(arena, ns);
+    }
+    // ToTemporalInstant: a non-Temporal object is coerced with ToPrimitive(string)
+    // and the result parsed as an ISO string (so an ordinary object becomes
+    // "[object Object]" → RangeError, but an Instant-like object with a useful
+    // toString parses). Any non-string value is a TypeError.
+    if (v.bits != 0 and v.unbox() == .object) {
+        const s = try shared.toPrimitiveRequireString(arena, v);
+        return makeInstant(arena, try parseInstantString(arena, s));
     }
     return realm_mod.throwTypeError(arena, "cannot convert to Temporal.Instant");
 }
@@ -174,6 +183,9 @@ pub fn nativeFromEpochMilliseconds(arena: std.mem.Allocator, _: Value, args: []c
 
 fn readEpochNumber(arena: std.mem.Allocator, args: []const Value, max_abs: f64) !f64 {
     const v = if (args.len > 0) args[0] else Value{};
+    // ToNumber throws a TypeError for BigInt and Symbol (before any range check).
+    if (v.bits != 0 and (v.unbox() == .bigint or v.unbox() == .symbol))
+        return realm_mod.throwTypeError(arena, "cannot convert to a Number");
     const n = try realm_mod.toNumberValue(arena, v);
     if (!std.math.isFinite(n) or n != @trunc(n)) return realm_mod.throwRangeError(arena, "epoch value must be an integer");
     if (@abs(n) > max_abs) return realm_mod.throwRangeError(arena, "Instant out of range");
@@ -364,11 +376,15 @@ fn getEpochNanoseconds(arena: std.mem.Allocator, this_val: Value, _: []const Val
 pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const ins = try requireInstant(arena, this_val);
     const opts = try shared.getOptionsObject(arena, if (args.len > 0) args[0] else null);
-    // Option read order is fixed by the spec: digits, then mode, then unit.
+    // All options are read before any algorithmic validation: fractionalSecond-
+    // Digits, roundingMode, smallestUnit, then timeZone. The "smallestUnit is
+    // hour" rejection happens only after timeZone has been read, so the unit is
+    // read raw here and validated afterwards.
     const digits = try shared.getFractionalDigits(arena, opts);
     const mode = try shared.getRoundingMode(arena, opts, .trunc);
-    const prec = try shared.getSecondsStringPrecision(arena, opts, digits);
+    const unit = try shared.getTemporalUnit(arena, opts, "smallestUnit");
     const tz_v: ?Value = if (opts) |o| try shared.optionGet(arena, o, "timeZone") else null;
+    const prec = try shared.secondsPrecisionFromUnit(arena, unit, digits);
     // Rounding is on the epoch nanoseconds, so a carry past midnight moves the
     // date for free. The modes read as if the instant were positive.
     const ns = shared.roundI128ToIncrementAsIfPositive(ins.*, prec.increment, mode);

@@ -100,40 +100,45 @@ pub fn toTemporalTime(arena: std.mem.Allocator, v: Value, overflow: shared.Overf
     return realm_mod.throwTypeError(arena, "cannot convert to Temporal.PlainTime");
 }
 
-fn timeFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISOTime {
-    var got = false;
-    var h: f64 = 0;
-    var min: f64 = 0;
-    var s: f64 = 0;
-    var ms: f64 = 0;
-    var us: f64 = 0;
-    var ns: f64 = 0;
+const TimeFieldsRaw = struct { h: f64 = 0, min: f64 = 0, s: f64 = 0, ms: f64 = 0, us: f64 = 0, ns: f64 = 0, got: bool = false };
+
+/// ToTemporalTimeRecord: read the time fields through [[Get]] in alphabetical
+/// order (hour, microsecond, millisecond, minute, nanosecond, second), which is
+/// observable through getters/Proxy traps. Regulation is separate so a caller
+/// can read the overflow option *after* the fields (as `from` does).
+fn readTimeFieldsRaw(arena: std.mem.Allocator, o: *JsObject) !TimeFieldsRaw {
+    var r = TimeFieldsRaw{};
     if (try readField(arena, o, "hour")) |x| {
-        h = x;
-        got = true;
-    }
-    if (try readField(arena, o, "minute")) |x| {
-        min = x;
-        got = true;
-    }
-    if (try readField(arena, o, "second")) |x| {
-        s = x;
-        got = true;
-    }
-    if (try readField(arena, o, "millisecond")) |x| {
-        ms = x;
-        got = true;
+        r.h = x;
+        r.got = true;
     }
     if (try readField(arena, o, "microsecond")) |x| {
-        us = x;
-        got = true;
+        r.us = x;
+        r.got = true;
+    }
+    if (try readField(arena, o, "millisecond")) |x| {
+        r.ms = x;
+        r.got = true;
+    }
+    if (try readField(arena, o, "minute")) |x| {
+        r.min = x;
+        r.got = true;
     }
     if (try readField(arena, o, "nanosecond")) |x| {
-        ns = x;
-        got = true;
+        r.ns = x;
+        r.got = true;
     }
-    if (!got) return realm_mod.throwTypeError(arena, "time-like object needs at least one field");
-    return regulateTime(arena, h, min, s, ms, us, ns, overflow);
+    if (try readField(arena, o, "second")) |x| {
+        r.s = x;
+        r.got = true;
+    }
+    if (!r.got) return realm_mod.throwTypeError(arena, "time-like object needs at least one field");
+    return r;
+}
+
+fn timeFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISOTime {
+    const r = try readTimeFieldsRaw(arena, o);
+    return regulateTime(arena, r.h, r.min, r.s, r.ms, r.us, r.ns, overflow);
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
@@ -162,13 +167,35 @@ fn regulateTime(arena: std.mem.Allocator, h: f64, min: f64, s: f64, ms: f64, us:
 
 pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else Value{};
-    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    // A string argument is parsed before the options bag is consulted.
-    const parse_first = shared.isStringArg(v);
-    const overflow = if (parse_first) .constrain else try shared.getOverflow(arena, opts);
-    const t = try toTemporalTime(arena, v, overflow);
-    if (parse_first) _ = try shared.getOverflow(arena, opts);
-    return makeTime(arena, t);
+    const opts_arg = if (args.len > 1) args[1] else null;
+    // ToTemporalTime reads the value (parsing a string, or reading an object's
+    // time fields) *before* it consults the options bag for overflow.
+    if (v.bits != 0 and v.unbox() == .object) {
+        if (getTime(v)) |t| {
+            _ = try shared.getOverflow(arena, try shared.getOptionsObject(arena, opts_arg));
+            return makeTime(arena, t.*);
+        }
+        const pdt = @import("plain_date_time.zig");
+        if (pdt.getDateTime(v)) |dt| {
+            _ = try shared.getOverflow(arena, try shared.getOptionsObject(arena, opts_arg));
+            return makeTime(arena, dt.time);
+        }
+        const zdt = @import("zoned_date_time.zig");
+        if (zdt.getZoned(v)) |z| {
+            _ = try shared.getOverflow(arena, try shared.getOptionsObject(arena, opts_arg));
+            return makeTime(arena, zdt.localISODateTime(z).time);
+        }
+        // A plain fields bag: read the fields, then overflow, then regulate.
+        const r = try readTimeFieldsRaw(arena, v.toPtr().object);
+        const overflow = try shared.getOverflow(arena, try shared.getOptionsObject(arena, opts_arg));
+        return makeTime(arena, try regulateTime(arena, r.h, r.min, r.s, r.ms, r.us, r.ns, overflow));
+    }
+    if (v.bits != 0 and v.unbox() == .string) {
+        const t = shared.parseISOTime(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid PlainTime string");
+        _ = try shared.getOverflow(arena, try shared.getOptionsObject(arena, opts_arg));
+        return makeTime(arena, t);
+    }
+    return realm_mod.throwTypeError(arena, "cannot convert to Temporal.PlainTime");
 }
 
 pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {

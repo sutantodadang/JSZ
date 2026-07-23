@@ -33,7 +33,10 @@ fn requireMD(arena: std.mem.Allocator, v: Value) !*ISOMonthDay {
 
 pub fn makeMonthDay(arena: std.mem.Allocator, md: ISOMonthDay) !Value {
     if (!shared.isValidISODate(md.ref_year, md.month, md.day)) return realm_mod.throwRangeError(arena, "invalid PlainMonthDay");
-    if (md.ref_year < -271821 or md.ref_year > 275760) return realm_mod.throwRangeError(arena, "PlainMonthDay reference year out of range");
+    // CreateTemporalMonthDay validates the reference ISO date against the full
+    // PlainDate range (the boundary reference year alone is not enough).
+    if (!shared.isoDateWithinLimits(.{ .year = md.ref_year, .month = md.month, .day = md.day }))
+        return realm_mod.throwRangeError(arena, "PlainMonthDay reference date out of range");
     const slot = try arena.create(ISOMonthDay);
     slot.* = md;
     const obj = if (realm_mod.active_heap) |h|
@@ -47,6 +50,8 @@ pub fn makeMonthDay(arena: std.mem.Allocator, md: ISOMonthDay) !Value {
 
 fn installInto(arena: std.mem.Allocator, this_val: Value, md: ISOMonthDay) !Value {
     if (!shared.isValidISODate(md.ref_year, md.month, md.day)) return realm_mod.throwRangeError(arena, "invalid PlainMonthDay");
+    if (!shared.isoDateWithinLimits(.{ .year = md.ref_year, .month = md.month, .day = md.day }))
+        return realm_mod.throwRangeError(arena, "PlainMonthDay reference date out of range");
     const slot = try arena.create(ISOMonthDay);
     slot.* = md;
     this_val.toPtr().object.internal_kind = .temporal_plain_month_day;
@@ -183,48 +188,34 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const o = arg.toPtr().object;
     if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
     if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
+    const cal = cur.calendar;
+    // PrepareCalendarFields reads the partial fields (day, month, monthCode, year)
+    // alphabetically, coerced and validated, *before* the options object is
+    // consulted — so an out-of-range partial field is a RangeError even when the
+    // options argument would itself be a TypeError.
+    const bag = try plain_date.readDateBag(arena, o, .{ .fixed_cal = cal });
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const overflow = try shared.getOverflow(arena, opts);
+    const any = bag.day != null or bag.month != null or bag.month_code != null or
+        bag.year != null or bag.era != null or bag.era_year != null;
+    if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
     // Merge over the receiver's own calendar fields, then recompute the ISO
     // reference date for the resulting month code + day.
-    const cal = cur.calendar;
     const base = calendar.fields(cal, .{ .year = cur.ref_year, .month = cur.month, .day = cur.day, .calendar = cal });
     var code = shared.MonthCode{ .num = base.code_num, .leap = base.code_leap };
-    var day: i32 = base.day;
-    var any = false;
-    var mc_month: ?i32 = null;
-    const mc_v = try shared.optionGet(arena, o, "monthCode");
-    if (mc_v != null and mc_v.?.bits != 0 and mc_v.?.unbox() != .undefined_) {
-        if (mc_v.?.unbox() != .string) return realm_mod.throwTypeError(arena, "monthCode must be a string");
-        code = try shared.parseMonthCode(arena, mc_v.?.unbox().string, calendar.hasLeapMonths(cal));
-        mc_month = code.num;
-        any = true;
-    }
-    if (try readField(arena, o, "month")) |x| {
-        // month and monthCode, when both present, must denote the same month.
-        if (mc_month) |mc| {
-            if (floatToI32(x) != mc) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
+    if (bag.month_code) |mc| code = try shared.parseMonthCode(arena, mc, calendar.hasLeapMonths(cal));
+    if (bag.month) |mv| {
+        const m = floatToI32(mv); // readDateBag already rejected month < 1
+        if (bag.month_code != null) {
+            if (m != code.num or code.leap) return realm_mod.throwRangeError(arena, "month and monthCode disagree");
         } else {
-            const m = floatToI32(x);
-            if (m < 1 or m > 255) return realm_mod.throwRangeError(arena, "month out of range");
             code = .{ .num = @intCast(m) };
         }
-        any = true;
     }
-    if (try readField(arena, o, "day")) |x| {
-        day = floatToI32(x);
-        any = true;
-    }
-    if (try shared.optionGet(arena, o, "year") != null) any = true;
-    if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
+    const day: i32 = if (bag.day) |dv| floatToI32(dv) else base.day;
     const iso = calendar.monthDayReference(cal, code.num, code.leap, day, overflow) catch
         return realm_mod.throwRangeError(arena, "month-day out of range");
     return makeMonthDay(arena, .{ .month = iso.month, .day = iso.day, .ref_year = iso.year, .calendar = cal });
-}
-
-fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
-    const v = (try shared.optionGet(arena, o, name)) orelse return null;
-    return try shared.toIntegerWithTruncation(arena, v);
 }
 
 pub fn nativeEquals(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {

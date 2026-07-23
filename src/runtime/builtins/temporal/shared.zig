@@ -358,6 +358,10 @@ pub const IsoParseOpts = struct {
     /// Require an explicit time component; a date-only string is rejected. Used
     /// by PlainTime, which does not implicitly convert a date to midnight.
     require_time: bool = false,
+    /// Skip the representable-year range check. PlainMonthDay parses a full date
+    /// string only for its month/day and discards the year, so a grammatically
+    /// valid but unrepresentable year (e.g. "-999999-10-01") is still accepted.
+    ignore_year_range: bool = false,
 };
 
 pub fn parseISODateTimeOpts(s0: []const u8, opts: IsoParseOpts) ParseError!ISODateTime {
@@ -401,7 +405,12 @@ pub fn parseISODateTimeOpts(s0: []const u8, opts: IsoParseOpts) ParseError!ISODa
     try parseAnnotations(&p, if (opts.validate_calendar) .any_known else .ignore);
     if (!p.eof()) return error.Invalid;
 
-    if (year < -271821 or year > 275760) return error.Invalid;
+    // The representable-year range is skipped only when the caller discards the
+    // year (PlainMonthDay) AND the calendar is iso8601 — a non-ISO calendar
+    // annotation makes the year meaningful again, so it must be in range.
+    const skip_range = opts.ignore_year_range and p.calendar == .iso8601;
+    if (!skip_range and (year < -271821 or year > 275760)) return error.Invalid;
+    if (year < -999999 or year > 999999) return error.Invalid; // grammar bound
     if (!isValidISODate(@intCast(year), @intCast(month), @intCast(day))) return error.Invalid;
     if (!isValidISOTime(time)) return error.Invalid;
     return .{ .date = .{ .year = @intCast(year), .month = @intCast(month), .day = @intCast(day), .calendar = p.calendar }, .time = time };
@@ -457,7 +466,9 @@ pub fn parseISOMonthDay(s0: []const u8) ParseError!ISOMonthDay {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     // Full date/datetime form: has a 4+ digit leading year.
     if (looksLikeDate(s)) {
-        const dt = try parseISODateTime(s0);
+        // The year is only parsed for grammar validity, then discarded, so an
+        // unrepresentable year does not make a month-day string invalid.
+        const dt = try parseISODateTimeOpts(s0, .{ .ignore_year_range = true });
         return .{ .month = dt.date.month, .day = dt.date.day, .ref_year = 1972 };
     }
     var p = Parser{ .s = s };
@@ -635,16 +646,18 @@ fn skipOffset(p: *Parser) ParseError!bool {
                 p.i = save;
                 return false;
             };
-            _ = h;
+            // A UTC offset's components share the clock's bounds: an out-of-range
+            // hour/minute/second (e.g. "-24:00") makes the whole string invalid.
+            if (h > 23) return error.Invalid;
             // Minutes: "±HH", "±HH:MM" and compact "±HHMM" are all valid, as is
             // a further "±HH:MM:SS(.fff)" / "±HHMMSS(.fff)". Consume greedily.
             const had_colon = p.eat(':');
             if (isDigit(p.peek())) {
-                _ = p.digitsN(2);
+                if ((p.digitsN(2) orelse 0) > 59) return error.Invalid;
                 // Seconds (with matching separator style).
                 const sep = if (had_colon) p.eat(':') else !had_colon;
                 if (sep and isDigit(p.peek())) {
-                    _ = p.digitsN(2);
+                    if ((p.digitsN(2) orelse 0) > 59) return error.Invalid;
                     var t = ISOTime{};
                     // The offset sub-second fraction obeys the same ≤9-digit rule.
                     try parseFraction(p, &t);
@@ -736,10 +749,47 @@ fn parseAnnotations(p: *Parser, ca_mode: CalendarAnnotation) ParseError!void {
         } else {
             // Time-zone annotation: single, and before any key/value annotation.
             if (tz_seen or kv_seen) return error.Invalid;
+            // A numeric-offset time-zone annotation may only carry minute
+            // precision (±HH, ±HH:MM, ±HHMM); a seconds or fractional component is
+            // a syntax error even though the datetime's own offset may have one.
+            if (content[0] == '+' or content[0] == '-') {
+                if (!isMinutePrecisionOffset(content)) return error.Invalid;
+            }
             tz_seen = true;
         }
     }
     if (ca_count > 1 and ca_critical) return error.Invalid;
+}
+
+/// ToBigInt: BigInt is returned unchanged, boolean maps to 0n/1n, a string is
+/// parsed as a BigInt literal (SyntaxError if malformed), objects go through
+/// ToPrimitive(number); Number/Symbol/undefined/null are TypeErrors.
+pub fn toBigInt(arena: std.mem.Allocator, v: Value) anyerror!Value {
+    if (v.bits == 0) return realm_mod.throwTypeError(arena, "Cannot convert undefined to a BigInt");
+    switch (v.unbox()) {
+        .bigint => return v,
+        .boolean => |b| return val_mod.makeBigIntFromI64(arena, if (b) 1 else 0),
+        .string => |s| return val_mod.stringToBigInt(arena, s) catch
+            return realm_mod.throwSyntaxError(arena, "Cannot convert string to a BigInt"),
+        .object => {
+            const prim = (try coercion.toPrimitive(arena, v, .number)) orelse
+                return realm_mod.throwTypeError(arena, "Cannot convert object to a BigInt");
+            return toBigInt(arena, prim);
+        },
+        else => return realm_mod.throwTypeError(arena, "Cannot convert value to a BigInt"),
+    }
+}
+
+/// A numeric UTC-offset time-zone annotation limited to minute precision:
+/// `±HH`, `±HH:MM`, or `±HHMM`. Seconds or a fractional component is rejected.
+fn isMinutePrecisionOffset(s: []const u8) bool {
+    if (s.len < 3) return false; // sign + two hour digits
+    if (!isDigit(s[1]) or !isDigit(s[2])) return false;
+    if (s.len == 3) return true; // ±HH
+    if (s[3] == ':') {
+        return s.len == 6 and isDigit(s[4]) and isDigit(s[5]); // ±HH:MM
+    }
+    return s.len == 5 and isDigit(s[3]) and isDigit(s[4]); // ±HHMM
 }
 
 /// A valid RFC 9557 `AnnotationValue`: one or more alphanumeric components of
@@ -804,7 +854,10 @@ pub fn parseISODuration(s0: []const u8) ParseError!DurationFields {
     // Time portion.
     if (p.eat('T') or p.eat('t')) {
         var saw_time = false;
+        // A fractional time unit must be the final component: no unit may follow.
+        var frac_seen = false;
         while (p.peek()) |c| {
+            if (frac_seen) return error.Invalid;
             if (!(c >= '0' and c <= '9')) return error.Invalid;
             const start = p.i;
             while (p.peek()) |d| {
@@ -821,6 +874,9 @@ pub fn parseISODuration(s0: []const u8) ParseError!DurationFields {
                     p.i += 1;
                 }
                 if (p.i == fstart) return error.Invalid;
+                // The grammar allows at most nine fractional digits.
+                if (p.i - fstart > 9) return error.Invalid;
+                frac_seen = true;
                 const fstr = p.s[fstart..p.i];
                 frac = std.fmt.parseFloat(f64, fstr) catch return error.Invalid;
                 frac = frac / std.math.pow(f64, 10, @floatFromInt(fstr.len));
@@ -1368,6 +1424,16 @@ pub fn formatMonthCode(arena: std.mem.Allocator, f: calendar_mod.CalFields) ![]c
     return arena.dupe(u8, s);
 }
 
+/// Validate only the *syntax* of a month code — "M" followed by two decimal
+/// digits and an optional "L" — as PrepareCalendarFields does when the field is
+/// first read. Whether that month is suitable for the calendar/year is a
+/// separate, later check (see parseMonthCode).
+pub fn checkMonthCodeSyntax(arena: std.mem.Allocator, code: []const u8) !void {
+    const ok = (code.len == 3 or (code.len == 4 and code[3] == 'L')) and
+        code[0] == 'M' and isDigit(code[1]) and isDigit(code[2]);
+    if (!ok) return realm_mod.throwRangeError(arena, "invalid monthCode syntax");
+}
+
 /// Parse a "MNN" / "MNNL" month code. `allow_leap` gates the "L" suffix, which
 /// only calendars with leap months accept.
 pub fn parseMonthCode(arena: std.mem.Allocator, code: []const u8, allow_leap: bool) !MonthCode {
@@ -1603,7 +1669,15 @@ pub const SecondsPrecision = struct {
 /// smallestUnit, and callers must preserve that order. smallestUnit wins when
 /// both are present.
 pub fn getSecondsStringPrecision(arena: std.mem.Allocator, opts: ?*JsObject, digits: ?u8) !SecondsPrecision {
-    if (try getTemporalUnit(arena, opts, "smallestUnit")) |u| return switch (u) {
+    return secondsPrecisionFromUnit(arena, try getTemporalUnit(arena, opts, "smallestUnit"), digits);
+}
+
+/// Map an already-read smallestUnit (and fractionalSecondDigits) to a precision
+/// record. Split out so a caller can read a *later* option (e.g. Instant's
+/// "timeZone") between reading the unit and the algorithmic "hour is invalid"
+/// validation the mapping performs.
+pub fn secondsPrecisionFromUnit(arena: std.mem.Allocator, u: ?Unit, digits: ?u8) !SecondsPrecision {
+    if (u) |unit| return switch (unit) {
         .minute => .{ .minute = true, .increment = NS_PER_MINUTE },
         .second => .{ .digits = 0, .increment = NS_PER_SECOND },
         .millisecond => .{ .digits = 3, .increment = NS_PER_MILLI },

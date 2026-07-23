@@ -97,13 +97,19 @@ fn floatToI32(f: f64) i32 {
 
 pub fn toTemporalYearMonth(arena: std.mem.Allocator, v: Value, overflow: shared.Overflow) !ISODate {
     if (getYearMonth(v)) |d| return d.*;
-    if (v.bits != 0 and v.unbox() == .object) {
-        return try yearMonthFromFields(arena, v.toPtr().object, overflow);
-    }
-    if (v.bits != 0 and v.unbox() == .string) {
-        return shared.parseISOYearMonth(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid PlainYearMonth string");
-    }
-    return realm_mod.throwTypeError(arena, "cannot convert to Temporal.PlainYearMonth");
+    const d: ISODate = blk: {
+        if (v.bits != 0 and v.unbox() == .object) {
+            break :blk try yearMonthFromFields(arena, v.toPtr().object, overflow);
+        }
+        if (v.bits != 0 and v.unbox() == .string) {
+            break :blk shared.parseISOYearMonth(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid PlainYearMonth string");
+        }
+        return realm_mod.throwTypeError(arena, "cannot convert to Temporal.PlainYearMonth");
+    };
+    // ToTemporalYearMonth ends in ISOYearMonthWithinLimits: an out-of-range
+    // year-month is a RangeError regardless of which source produced it.
+    try checkLimits(arena, d);
+    return d;
 }
 
 /// ToTemporalYearMonth with an options object: the field bag is read before the
@@ -162,10 +168,13 @@ pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) an
     return val_mod.makeNumber(arena, @floatFromInt(compareYM(a, b)));
 }
 
-/// Compare year-months ignoring reference day.
+/// Temporal.PlainYearMonth.compare is CompareISODate over the stored ISO date,
+/// so the reference day participates (two year-months that differ only in their
+/// reference day are not equal).
 fn compareYM(a: ISODate, b: ISODate) i8 {
     if (a.year != b.year) return if (a.year < b.year) -1 else 1;
     if (a.month != b.month) return if (a.month < b.month) -1 else 1;
+    if (a.day != b.day) return if (a.day < b.day) -1 else 1;
     return 0;
 }
 
@@ -188,35 +197,24 @@ fn nativeAddSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, 
         dur.microseconds = -dur.microseconds;
         dur.nanoseconds = -dur.nanoseconds;
     }
-    // Balance time units down into whole days.
-    const time_ns = @as(i128, @intFromFloat(dur.hours)) * shared.NS_PER_HOUR +
-        @as(i128, @intFromFloat(dur.minutes)) * shared.NS_PER_MINUTE +
-        @as(i128, @intFromFloat(dur.seconds)) * shared.NS_PER_SECOND +
-        @as(i128, @intFromFloat(dur.milliseconds)) * shared.NS_PER_MILLI +
-        @as(i128, @intFromFloat(dur.microseconds)) * shared.NS_PER_MICRO +
-        @as(i128, @intFromFloat(dur.nanoseconds));
-    const extra_days: f64 = @floatFromInt(@as(i128, (@divTrunc(time_ns, shared.NS_PER_DAY))));
-    const total_days = dur.days + extra_days;
-    // AddDurationToYearMonth: anchor to the first of the month for a
-    // non-negative duration, else the last day, so day-level overflow lands the
-    // result in the intended month.
-    const sign = shared.DurationFields.sign(.{
-        .years = dur.years,
-        .months = dur.months,
-        .weeks = dur.weeks,
-        .days = total_days,
-    });
+    // AddDurationToYearMonth step 7: a year-month can only move by whole years
+    // and months, so any non-zero week, day, or time component is a RangeError.
+    if (dur.weeks != 0 or dur.days != 0 or dur.hours != 0 or dur.minutes != 0 or
+        dur.seconds != 0 or dur.milliseconds != 0 or dur.microseconds != 0 or dur.nanoseconds != 0)
+    {
+        return realm_mod.throwRangeError(arena, "PlainYearMonth arithmetic does not accept units smaller than months");
+    }
     const cal = ym.calendar;
     const f = calendar.fields(cal, ym.*);
-    // The stored ISO date is already day 1 of the calendar month, which is the
-    // anchor a non-negative duration wants. A *calendar* month rarely starts on
-    // an ISO 1st, so the last-day anchor has to be built in calendar space too.
-    const anchor: ISODate = if (sign < 0)
-        calendar.toIso(cal, f.year, f.month, calendar.daysInMonth(cal, f.year, f.month), .constrain) catch ym.*
-    else
-        ym.*;
-    const result = try plain_date.addISODateDayOverflow(anchor, dur.years, dur.months, dur.weeks, total_days, overflow, .constrain, arena);
-    // Renormalize onto the first day of the resulting *calendar* month.
+    // Steps 8-11: the intermediate date is the first day of the calendar month,
+    // which CalendarDateFromFields validates as a full ISO date — a boundary
+    // year-month whose first day falls outside the PlainDate range throws here.
+    const intermediate = calendar.toIso(cal, f.year, f.month, 1, .constrain) catch
+        return realm_mod.throwRangeError(arena, "year-month out of range");
+    if (!shared.isoDateWithinLimits(intermediate)) return realm_mod.throwRangeError(arena, "year-month out of range");
+    // Step 12: add the year/month duration.
+    const result = try plain_date.addISODate(intermediate, dur.years, dur.months, 0, 0, overflow, arena);
+    // Steps 13-15: back to the first day of the resulting calendar month.
     const rf = calendar.fields(cal, result);
     const first = calendar.toIso(cal, rf.year, rf.month, 1, .constrain) catch
         return realm_mod.throwRangeError(arena, "year-month out of range");
@@ -243,6 +241,23 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     const largest: ?shared.Unit = st.largest;
     const mode = st.mode;
     const inc = st.increment;
+    // Equal year-months (including reference day) are a zero duration and skip
+    // the range validation below — even a boundary year-month equals itself.
+    if (compareYM(ym.*, other) == 0) return duration.makeDuration(arena, .{});
+    // DifferenceTemporalPlainYearMonth builds each operand's first-of-month date
+    // via CalendarDateFromFields, so a boundary year-month whose first day is
+    // outside the PlainDate range throws here.
+    {
+        const cal = ym.calendar;
+        const tf = calendar.fields(cal, ym.*);
+        const this_date = calendar.toIso(cal, tf.year, tf.month, 1, .constrain) catch
+            return realm_mod.throwRangeError(arena, "year-month out of range");
+        if (!shared.isoDateWithinLimits(this_date)) return realm_mod.throwRangeError(arena, "year-month out of range");
+        const of = calendar.fields(cal, other);
+        const other_date = calendar.toIso(cal, of.year, of.month, 1, .constrain) catch
+            return realm_mod.throwRangeError(arena, "year-month out of range");
+        if (!shared.isoDateWithinLimits(other_date)) return realm_mod.throwRangeError(arena, "year-month out of range");
+    }
     var result = plain_date.differenceISODate(ym.*, other, largest.?);
     result.weeks = 0;
     result.days = 0;
@@ -251,17 +266,28 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     // months-per-year, so only re-derive the split when rounding disturbs it.
     // The total-months form assumes 12 months per year and is reached only for
     // year-granularity or multi-month increments.
-    if (inc != 1 or smallest.? == .year) {
+    if (smallest.? == .year) {
+        // Rounding at year granularity collapses to a whole number of years.
         var total_months = result.years * 12.0 + result.months;
-        const round_increment: f64 = if (smallest.? == .year) inc * 12.0 else inc;
-        total_months = shared.roundNumberToIncrement(total_months, round_increment, mode);
-        result.years = 0;
-        result.months = 0;
-        if (largest.? == .year) {
-            result.years = @trunc(total_months / 12.0);
-            result.months = total_months - result.years * 12.0;
-        } else {
+        total_months = shared.roundNumberToIncrement(total_months, inc * 12.0, mode);
+        result.years = @trunc(total_months / 12.0);
+        result.months = total_months - result.years * 12.0;
+    } else if (inc != 1) {
+        // smallestUnit is month. When the largest unit is also month everything
+        // collapses to one months count; otherwise NudgeToCalendarUnit rounds the
+        // months field while holding the years (carrying a full year on overflow).
+        if (largest.? == .month) {
+            var total_months = result.years * 12.0 + result.months;
+            total_months = shared.roundNumberToIncrement(total_months, inc, mode);
+            result.years = 0;
             result.months = total_months;
+        } else {
+            result.months = shared.roundNumberToIncrement(result.months, inc, mode);
+            if (@abs(result.months) >= 12.0) {
+                const carry = @trunc(result.months / 12.0);
+                result.years += carry;
+                result.months -= carry * 12.0;
+            }
         }
     } else if (largest.? == .month) {
         result.months = result.years * 12.0 + result.months;

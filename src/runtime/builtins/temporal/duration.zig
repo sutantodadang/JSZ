@@ -189,6 +189,16 @@ pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) an
     const opts = try shared.getOptionsObject(arena, if (args.len > 2) args[2] else null);
     const rel = try readRelativeDate(arena, opts);
 
+    // Two durations with identical field values compare equal without needing a
+    // relativeTo, even when calendar units are present (spec step 5).
+    if (a.years == b.years and a.months == b.months and a.weeks == b.weeks and
+        a.days == b.days and a.hours == b.hours and a.minutes == b.minutes and
+        a.seconds == b.seconds and a.milliseconds == b.milliseconds and
+        a.microseconds == b.microseconds and a.nanoseconds == b.nanoseconds)
+    {
+        return val_mod.makeNumber(arena, 0);
+    }
+
     // Comparing durations with calendar units (years/months/weeks) needs a
     // relativeTo reference; with one, compare their exact endpoints from R.
     if (hasCalendarUnits(a) or hasCalendarUnits(b)) {
@@ -675,6 +685,11 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     // largestUnit must be the same or larger magnitude than smallestUnit.
     if (durUnitRank(large) > durUnitRank(small))
         return realm_mod.throwRangeError(arena, "largestUnit must be larger than or equal to smallestUnit");
+    // Rounding a date unit (year/month/week/day) to an increment > 1 cannot also
+    // balance up to a larger unit: the increment and the balancing target must be
+    // the same unit (e.g. rounding days to 30 while balancing to weeks is invalid).
+    if (inc > 1 and durUnitRank(small) <= durUnitRank(.day) and durUnitRank(large) != durUnitRank(small))
+        return realm_mod.throwRangeError(arena, "cannot round to an increment of date units greater than 1 while balancing to a larger unit");
 
     // Anything touching calendar units (in the receiver or as a rounding unit)
     // needs a reference date; resolve relativeTo and use the calendar algorithm.

@@ -44,6 +44,7 @@ pub fn makeDate(arena: std.mem.Allocator, d: ISODate) !Value {
 
 fn installInto(arena: std.mem.Allocator, this_val: Value, d: ISODate) !Value {
     if (!shared.isValidISODate(d.year, d.month, d.day)) return realm_mod.throwRangeError(arena, "invalid PlainDate");
+    if (!shared.isoDateWithinLimits(d)) return realm_mod.throwRangeError(arena, "PlainDate out of range");
     const slot = try arena.create(ISODate);
     slot.* = d;
     this_val.toPtr().object.internal_kind = .temporal_plain_date;
@@ -64,8 +65,10 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     // regardless of the calendar.
     var cal: calendar.CalendarId = .iso8601;
     if (args.len > 3 and args[3].bits != 0 and args[3].unbox() != .undefined_) {
-        const name = try shared.valueToString(arena, args[3]);
-        cal = calendar.canonicalize(name) orelse return realm_mod.throwRangeError(arena, "unsupported calendar");
+        // The calendar argument must be a String primitive; null/number/object
+        // is a TypeError before canonicalization.
+        if (args[3].unbox() != .string) return realm_mod.throwTypeError(arena, "calendar must be a string");
+        cal = calendar.canonicalize(args[3].unbox().string) orelse return realm_mod.throwRangeError(arena, "unsupported calendar");
     }
     if (y != @trunc(y) or m != @trunc(m) or d != @trunc(d)) return realm_mod.throwRangeError(arena, "non-integer date field");
     const yi: i32 = floatToI32(y);
@@ -194,6 +197,9 @@ pub const BagWant = struct {
     time: bool = false,
     /// offset + timeZone, which only ZonedDateTime accepts.
     zoned: bool = false,
+    /// ZonedDateTime.with reads the offset field but not timeZone (it already
+    /// rejected a timeZone property separately), so this suppresses that read.
+    skip_time_zone: bool = false,
     /// Set by the `with` methods, which already know the calendar and must not
     /// read one off the bag.
     fixed_cal: ?calendar.CalendarId = null,
@@ -212,7 +218,12 @@ pub fn readDateBag(arena: std.mem.Allocator, o: *JsObject, want: BagWant) !DateB
         bag.calendar = try shared.resolveCalendarArg(arena, v);
     }
     if (want.day) {
-        if (try shared.optionGet(arena, o, "day")) |v| bag.day = try shared.toIntegerWithTruncation(arena, v);
+        if (try shared.optionGet(arena, o, "day")) |v| {
+            bag.day = try shared.toIntegerWithTruncation(arena, v);
+            // PrepareCalendarFields rejects a non-positive day at read time,
+            // before any options object or calendar resolution is consulted.
+            if (bag.day.? < 1) return realm_mod.throwRangeError(arena, "day must be a positive integer");
+        }
     }
     // A calendar without eras has no era/eraYear in its field list at all.
     if (calendar.hasEras(bag.calendar)) {
@@ -226,8 +237,18 @@ pub fn readDateBag(arena: std.mem.Allocator, o: *JsObject, want: BagWant) !DateB
         if (try shared.optionGet(arena, o, "minute")) |v| bag.minute = try shared.toIntegerWithTruncation(arena, v);
     }
     if (want.month) {
-        if (try shared.optionGet(arena, o, "month")) |v| bag.month = try shared.toIntegerWithTruncation(arena, v);
-        if (try shared.optionGet(arena, o, "monthCode")) |v| bag.month_code = try shared.toPrimitiveRequireString(arena, v);
+        if (try shared.optionGet(arena, o, "month")) |v| {
+            bag.month = try shared.toIntegerWithTruncation(arena, v);
+            // PrepareCalendarFields rejects a non-positive month immediately.
+            if (bag.month.? < 1) return realm_mod.throwRangeError(arena, "month must be a positive integer");
+        }
+        if (try shared.optionGet(arena, o, "monthCode")) |v| {
+            bag.month_code = try shared.toPrimitiveRequireString(arena, v);
+            // The month-code *format* ("M" + two digits + optional "L") is
+            // validated as it is read; whether that month exists in the calendar
+            // (suitability) is checked later against the resolved year.
+            try shared.checkMonthCodeSyntax(arena, bag.month_code.?);
+        }
     }
     if (want.time) {
         if (try shared.optionGet(arena, o, "nanosecond")) |v| bag.nanosecond = try shared.toIntegerWithTruncation(arena, v);
@@ -238,7 +259,7 @@ pub fn readDateBag(arena: std.mem.Allocator, o: *JsObject, want: BagWant) !DateB
     if (want.time) {
         if (try shared.optionGet(arena, o, "second")) |v| bag.second = try shared.toIntegerWithTruncation(arena, v);
     }
-    if (want.zoned) {
+    if (want.zoned and !want.skip_time_zone) {
         if (try shared.optionGet(arena, o, "timeZone")) |v| bag.time_zone = v;
     }
     if (try shared.optionGet(arena, o, "year")) |v| bag.year = try shared.toIntegerWithTruncation(arena, v);
@@ -370,6 +391,15 @@ fn nativeAddSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, 
         dur.months = -dur.months;
         dur.weeks = -dur.weeks;
         dur.days = -dur.days;
+        // The time units are balanced into days below, so they must be negated
+        // for subtraction too — otherwise a duration like "1 day + 24 hours"
+        // subtracts the day but adds the hours.
+        dur.hours = -dur.hours;
+        dur.minutes = -dur.minutes;
+        dur.seconds = -dur.seconds;
+        dur.milliseconds = -dur.milliseconds;
+        dur.microseconds = -dur.microseconds;
+        dur.nanoseconds = -dur.nanoseconds;
     }
     // Time units in the duration are balanced down into whole days.
     const time_ns = @as(i128, @intFromFloat(dur.hours)) * shared.NS_PER_HOUR +
