@@ -389,6 +389,14 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                // A class constructor may only be [[Construct]]ed. When invoked as
+                // a plain callback (Function.prototype.call/apply, Reflect.apply,
+                // Array.prototype.map, …) new.target is absent → throw TypeError.
+                if (fn_ptr.is_class and captured_nt.bits == 0) {
+                    const realm_m = @import("../runtime/realm.zig");
+                    realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", try std.fmt.allocPrint(self.arena, "Class constructor {s} cannot be invoked without 'new'", .{fn_ptr.name orelse ""}));
+                    return error.JsException;
+                }
                 // Arrows ignore the provided `this` and use their captured lexical one.
                 const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
                 if (fn_ptr.is_async and fn_ptr.is_generator) return try self.buildAsyncGenerator(fn_ptr, def_env, eff_this, args, closure);
@@ -1882,6 +1890,11 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                // A class constructor's [[Call]] always throws — only `new` is
+                // allowed (construct routes through constructImpl, not here).
+                if (fn_ptr.is_class) {
+                    return try std.fmt.allocPrint(self.arena, "TypeError: Class constructor {s} cannot be invoked without 'new'", .{fn_ptr.name orelse ""});
+                }
                 // An arrow ignores the caller-provided `this` and uses the `this`
                 // captured at its definition site.
                 const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
@@ -2963,8 +2976,10 @@ pub const BcVm = struct {
         // wrongly show up in for-in / Object.keys of the prototype.
         _ = try proto_obj.defineOwnData("constructor", fn_val, .{ .writable = true, .enumerable = false, .configurable = true });
         // §20.2.4.2: a function's own `prototype` is {writable:true,
-        // enumerable:false, configurable:false}.
-        _ = try o.defineOwnData("prototype", pv, .{ .writable = true, .enumerable = false, .configurable = false });
+        // enumerable:false, configurable:false}. A class constructor
+        // (MakeConstructor, writablePrototype=false) instead gets a
+        // non-writable `.prototype` (§15.7.14).
+        _ = try o.defineOwnData("prototype", pv, .{ .writable = !closure.func.is_class, .enumerable = false, .configurable = false });
         return pv;
     }
 
@@ -3517,6 +3532,12 @@ pub const BcVm = struct {
             .bc_function => |closure| {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
+                // A class constructor's [[Call]] always throws — it may only be
+                // invoked via `new` / [[Construct]] (which routes through
+                // constructImpl, not here).
+                if (fn_ptr.is_class) {
+                    return try std.fmt.allocPrint(self.arena, "TypeError: Class constructor {s} cannot be invoked without 'new'", .{fn_ptr.name orelse ""});
+                }
                 // An arrow ignores the caller-provided `this`, using its captured one.
                 const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else this_val;
 

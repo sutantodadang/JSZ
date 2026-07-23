@@ -61,6 +61,10 @@ pub const BcFunction = struct {
     /// or setter). Concise methods are not constructors: a non-generator method
     /// has no own `prototype` property (spec MethodDefinitionEvaluation).
     is_method: bool = false,
+    /// True for a `class` constructor. Its own `prototype` property is
+    /// non-writable (MakeConstructor with writablePrototype=false), unlike an
+    /// ordinary function.
+    is_class: bool = false,
     /// M16: this top-level function compiles ES-module code. Used so the VM binds
     /// the module's top-level `this` to undefined (a Script binds it to the global
     /// object). Only meaningful on a program/module top-level function.

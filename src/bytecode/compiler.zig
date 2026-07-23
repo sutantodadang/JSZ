@@ -2935,6 +2935,7 @@ pub const FnCompiler = struct {
         // not constructors: propagate the flag so the VM omits the `prototype`
         // property for non-generator methods.
         child_fn.is_method = fe.is_method;
+        child_fn.is_class = fe.is_class;
         // `fn.length` counts only the parameters before the first defaulted one.
         // The parser recorded that before its TDZ desugar rewrote the defaults
         // into the body and cleared `param_defaults`.

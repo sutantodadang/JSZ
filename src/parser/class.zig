@@ -187,6 +187,17 @@ fn makeNewTargetNode(p: *Parser, start: u32, class_name: []const u8) ?*Node {
     });
 }
 
+/// Like `makeNewTargetNode`, but reads the `__supernt__` capture (the enclosing
+/// constructor's NewTarget, saved into a local before the `super()` helper) so a
+/// nested helper function does not shadow it with its own `__new_target__`.
+fn makeCapturedNtNode(p: *Parser, start: u32, class_name: []const u8) ?*Node {
+    const id_var = p.makeNode(.identifier, start, start, .{ .identifier = "__supernt__" }) orelse return null;
+    const id_cls = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+    return p.makeNode(.logical_expr, start, start, .{
+        .logical_expr = .{ .op = .or_, .left = id_var, .right = id_cls },
+    });
+}
+
 const AccessorKind = enum { none, get, set };
 
 /// A parsed non-constructor class member. `computed_key` (when non-null) holds a
@@ -1219,6 +1230,19 @@ fn emitClassStatements(
             .var_decl = .{ .kind = .var_, .name = "__superthis", .init = null },
         }) orelse return null;
         ctor_stmts.append(p.arena, st_decl) catch return null;
+        // `var __supernt__ = __new_target__;` — capture the constructor's own
+        // NewTarget into a distinctly-named local. The `super()` helper below is
+        // a real function whose own call binds a fresh `__new_target__` (undefined
+        // for a plain call), which would shadow the constructor's via closure. A
+        // uniquely-named capture is read unshadowed through the closure chain, so
+        // NewTarget forwards correctly down a multi-level super chain.
+        {
+            const cap_init = p.makeNode(.identifier, start, start, .{ .identifier = "__new_target__" }) orelse return null;
+            const cap_decl = p.makeNode(.var_decl, start, start, .{
+                .var_decl = .{ .kind = .var_, .name = "__supernt__", .init = cap_init },
+            }) orelse return null;
+            ctor_stmts.append(p.arena, cap_decl) catch return null;
+        }
         // `var __sproto__ = Super.prototype;` — the Set base for `super.PROP = V`
         // inside the constructor (rewriteSuperPropAssign). The Receiver is
         // `__superthis`, the object returned by the super() call above.
@@ -1242,7 +1266,9 @@ fn emitClassStatements(
         }) orelse return null;
         const id_super_p = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
         const id_args = p.makeNode(.identifier, start, start, .{ .identifier = "arguments" }) orelse return null;
-        const id_nt = makeNewTargetNode(p, start, class_name) orelse return null;
+        // `__supernt__ || ClassName` — the captured NewTarget (see above), read
+        // through the helper's closure without shadowing.
+        const id_nt = makeCapturedNtNode(p, start, class_name) orelse return null;
         var rc_args = std.ArrayList(*Node){};
         rc_args.append(p.arena, id_super_p) catch return null;
         rc_args.append(p.arena, id_args) catch return null;
@@ -1331,7 +1357,10 @@ fn emitClassStatements(
             .rest_param = ctor_rest,
             .body = ctor_body_effective,
             .is_arrow = false,
-            .is_strict = parser_file.hasUseStrict(ctor_body_effective),
+            // Class bodies are always strict mode code (§11.2.2), regardless of
+            // a "use strict" directive.
+            .is_strict = true,
+            .is_class = true,
             .requires_super = super_name != null,
             .source_text = p.sourceSlice(start, p.prev_end),
         },
@@ -1373,7 +1402,14 @@ fn emitClassStatements(
             const sp_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = sp_call }) orelse return null;
             out.append(p.arena, sp_stmt) catch return null;
         }
-        // ClassName.prototype = Object.create(Super.prototype)
+        // Object.setPrototypeOf(ClassName.prototype, Super.prototype)
+        //
+        // A class constructor's own `.prototype` is non-writable
+        // (MakeConstructor, writablePrototype=false), so we reparent the
+        // existing auto-created prototype object rather than replacing it via
+        // `ClassName.prototype = Object.create(...)` (a plain assignment that
+        // would now silently fail). The auto prototype already carries the
+        // non-enumerable `constructor` back-link.
         const id_class = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
         const id_proto = p.makeNode(.identifier, start, start, .{ .identifier = "prototype" }) orelse return null;
         const lhs_proto = p.makeNode(.member_expr, start, start, .{
@@ -1381,9 +1417,9 @@ fn emitClassStatements(
         }) orelse return null;
 
         const id_obj = p.makeNode(.identifier, start, start, .{ .identifier = "Object" }) orelse return null;
-        const id_create = p.makeNode(.identifier, start, start, .{ .identifier = "create" }) orelse return null;
-        const callee_create = p.makeNode(.member_expr, start, start, .{
-            .member_expr = .{ .object = id_obj, .property = id_create, .computed = false },
+        const id_setp = p.makeNode(.identifier, start, start, .{ .identifier = "setPrototypeOf" }) orelse return null;
+        const callee_setp = p.makeNode(.member_expr, start, start, .{
+            .member_expr = .{ .object = id_obj, .property = id_setp, .computed = false },
         }) orelse return null;
 
         const id_super = p.makeNode(.identifier, start, start, .{ .identifier = sname }) orelse return null;
@@ -1392,18 +1428,16 @@ fn emitClassStatements(
             .member_expr = .{ .object = id_super, .property = id_super_proto, .computed = false },
         }) orelse return null;
 
+        // `extends null` → the prototype's parent is null.
         const null_proto = p.makeNode(.null_literal, start, start, .{ .null_literal = {} }) orelse return null;
-        const create_arg = nullHeritageGuard(p, sname, super_proto, null_proto, start) orelse return null;
-        var args_create = std.ArrayList(*Node){};
-        args_create.append(p.arena, create_arg) catch return null;
-        const rhs_create = p.makeNode(.call_expr, start, start, .{
-            .call_expr = .{ .callee = callee_create, .args = args_create.items },
+        const parent_arg = nullHeritageGuard(p, sname, super_proto, null_proto, start) orelse return null;
+        var sp2_args = std.ArrayList(*Node){};
+        sp2_args.append(p.arena, lhs_proto) catch return null;
+        sp2_args.append(p.arena, parent_arg) catch return null;
+        const sp2_call = p.makeNode(.call_expr, start, start, .{
+            .call_expr = .{ .callee = callee_setp, .args = sp2_args.items },
         }) orelse return null;
-
-        const assign_proto = p.makeNode(.assignment_expr, start, start, .{
-            .assignment_expr = .{ .op = .assign, .target = lhs_proto, .value = rhs_create },
-        }) orelse return null;
-        const stmt_proto = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign_proto }) orelse return null;
+        const stmt_proto = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = sp2_call }) orelse return null;
         out.append(p.arena, stmt_proto) catch return null;
     }
 
