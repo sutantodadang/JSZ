@@ -55,6 +55,128 @@ fn moduleSourceParses(gpa: std.mem.Allocator, src: []const u8) bool {
     };
 }
 
+/// True when `name` is a compiler-synthesised binding (the class/destructuring/
+/// import desugars mint `__…__` helpers). Such names are not user-visible
+/// declarations, so the module-goal early-error scan must ignore them.
+fn isSyntheticBinding(name: []const u8) bool {
+    return name.len >= 2 and name[0] == '_' and name[1] == '_';
+}
+
+/// VarDeclaredNames of a statement (§8.2.6): every `var` binding reachable
+/// through *statement* nesting. Deliberately does not descend into function or
+/// class bodies — those open a new variable scope.
+fn collectVarDeclaredNames(node: *ast.Node, out: *std.StringHashMap(void)) void {
+    switch (node.kind) {
+        .var_decl => if (node.data.var_decl.kind == .var_) {
+            out.put(node.data.var_decl.name, {}) catch {};
+        },
+        .block_stmt => for (node.data.block_stmt.body) |c| collectVarDeclaredNames(c, out),
+        .if_stmt => {
+            collectVarDeclaredNames(node.data.if_stmt.consequent, out);
+            if (node.data.if_stmt.alternate) |a| collectVarDeclaredNames(a, out);
+        },
+        .while_stmt => collectVarDeclaredNames(node.data.while_stmt.body, out),
+        .do_while_stmt => collectVarDeclaredNames(node.data.do_while_stmt.body, out),
+        .with_stmt => collectVarDeclaredNames(node.data.with_stmt.body, out),
+        .for_stmt => {
+            if (node.data.for_stmt.init) |i| collectVarDeclaredNames(i, out);
+            collectVarDeclaredNames(node.data.for_stmt.body, out);
+        },
+        .for_in_stmt => {
+            collectVarDeclaredNames(node.data.for_in_stmt.left, out);
+            collectVarDeclaredNames(node.data.for_in_stmt.body, out);
+        },
+        .try_stmt => {
+            collectVarDeclaredNames(node.data.try_stmt.block, out);
+            if (node.data.try_stmt.handler) |h| collectVarDeclaredNames(h.body, out);
+            if (node.data.try_stmt.finalizer) |f| collectVarDeclaredNames(f, out);
+        },
+        .switch_stmt => for (node.data.switch_stmt.cases) |c| {
+            for (c.body) |s| collectVarDeclaredNames(s, out);
+        },
+        .labeled_stmt => collectVarDeclaredNames(node.data.labeled_stmt.body, out),
+        else => {},
+    }
+}
+
+/// LexicallyDeclaredNames of a *module* top-level item: `let`/`const`/`class`
+/// plus — unlike a Script — `function`/`function*`/`async function`, which is
+/// exactly what makes `var x; function x(){}` legal script code but illegal
+/// module code.
+///
+/// A `block_stmt` with `lexical_scope == false` is a synthetic container the
+/// desugars emit (class declarations, multi-declarator lowering) whose bindings
+/// belong to the enclosing scope, so it is transparent here; a real block is not.
+fn collectTopLexicalNames(
+    node: *ast.Node,
+    out: *std.ArrayList([]const u8),
+    allocator: std.mem.Allocator,
+) void {
+    switch (node.kind) {
+        .var_decl => if (node.data.var_decl.kind != .var_) {
+            out.append(allocator, node.data.var_decl.name) catch {};
+        },
+        .function_decl => out.append(allocator, node.data.function_decl.name) catch {},
+        .block_stmt => if (!node.data.block_stmt.lexical_scope) {
+            for (node.data.block_stmt.body) |c| collectTopLexicalNames(c, out, allocator);
+        },
+        else => {},
+    }
+}
+
+/// ModuleBody early errors that a *Script*-goal parse cannot see (§16.2.1.5):
+///
+///   - LexicallyDeclaredNames of ModuleItemList contains duplicate entries;
+///   - any LexicallyDeclaredName also occurs in VarDeclaredNames.
+///
+/// Top-level `function` declarations are lexical in a Module but var-scoped in a
+/// Script, so `var smoosh; function smoosh() {}` is legal Script code and a
+/// SyntaxError as module code — and `moduleSourceParses` cannot tell, because it
+/// wraps the source in a function (i.e. re-parses it under the Script goal).
+///
+/// Conservative by construction: a source that does not parse at all returns
+/// false (that is `moduleSourceParses`'s job), synthetic `__…__` desugar bindings
+/// are ignored, and the duplicate check only looks at directly-declared top-level
+/// names. A false negative costs a test; a false positive breaks a valid module.
+fn moduleGoalEarlyError(gpa: std.mem.Allocator, src: []const u8) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const isolate_mod = @import("../vm/isolate.zig");
+    const rewritten = isolate_mod.rewriteTemplateLiterals(arena, src) catch return false;
+    var p = parser_mod.Parser.init(rewritten, arena);
+    const stmts = switch (p.parseModule()) {
+        .ok => |s| s,
+        .err => return false,
+    };
+
+    var vars = std.StringHashMap(void).init(arena);
+    var lex = std.ArrayList([]const u8){};
+    var direct = std.ArrayList([]const u8){};
+    for (stmts) |s| {
+        collectVarDeclaredNames(s, &vars);
+        collectTopLexicalNames(s, &lex, arena);
+        switch (s.kind) {
+            .var_decl => if (s.data.var_decl.kind != .var_) {
+                direct.append(arena, s.data.var_decl.name) catch {};
+            },
+            .function_decl => direct.append(arena, s.data.function_decl.name) catch {},
+            else => {},
+        }
+    }
+    for (lex.items) |n| {
+        if (isSyntheticBinding(n)) continue;
+        if (vars.contains(n)) return true;
+    }
+    var seen = std.StringHashMap(void).init(arena);
+    for (direct.items) |n| {
+        if (isSyntheticBinding(n)) continue;
+        if (seen.contains(n)) return true;
+        seen.put(n, {}) catch {};
+    }
+    return false;
+}
+
 /// Lifecycle of a module record, mirroring the spec [[Status]] field. Phase 1
 /// uses these to dedup work and to expose a partially-initialised record to a
 /// cyclic importer (a record that is `.evaluating` when re-entered).
@@ -1510,6 +1632,27 @@ pub fn buildScriptBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id:
     return buildBundleImpl(gpa, base_dir, entry_id, entry_src, true);
 }
 
+/// Emit a `__modules__[id]` factory that throws a `SyntaxError` the first time
+/// the module is required. This is how a module that must fail at *link* time
+/// (parse error, module-goal early error, unresolvable indirect export) reports
+/// itself: `require` propagates the throw, and `import()` rejects with the error
+/// object — so `error.name === "SyntaxError"`, unlike the `__moduleUnresolved__`
+/// path which rejects with a bare string.
+fn emitSyntaxErrorFactory(
+    gpa: std.mem.Allocator,
+    sb: *std.ArrayList(u8),
+    mod_id: []const u8,
+    message: []const u8,
+) !void {
+    try sb.appendSlice(gpa, "__modules__[");
+    try appendJsString(gpa, sb, mod_id);
+    try sb.appendSlice(gpa, "] = function(require, module, exports){\nthrow new SyntaxError(");
+    try appendJsString(gpa, sb, message);
+    try sb.appendSlice(gpa, "+");
+    try appendJsString(gpa, sb, mod_id);
+    try sb.appendSlice(gpa, ");\n};\n");
+}
+
 fn buildBundleImpl(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]const u8, entry_src: []const u8, entry_is_script: bool) ![]const u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1749,11 +1892,13 @@ fn buildBundleImpl(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         // surfaces lazily at evaluation — `import()` rejects and
         // `ShadowRealm.prototype.importValue` rejects with a TypeError.
         if (!moduleSourceParses(gpa, e.value_ptr.*)) {
-            try sb.appendSlice(gpa, "__modules__[");
-            try appendJsString(gpa, &sb, mod_id);
-            try sb.appendSlice(gpa, "] = function(require, module, exports){\nthrow new SyntaxError(\"Unexpected end of input in module \"+");
-            try appendJsString(gpa, &sb, mod_id);
-            try sb.appendSlice(gpa, ");\n};\n");
+            try emitSyntaxErrorFactory(gpa, &sb, mod_id, "Unexpected end of input in module ");
+            continue;
+        }
+        // Module-goal early errors (§16.2.1.5) that the Script-goal parse above
+        // cannot see — e.g. a top-level `function` colliding with a `var`.
+        if (moduleGoalEarlyError(gpa, e.value_ptr.*)) {
+            try emitSyntaxErrorFactory(gpa, &sb, mod_id, "Invalid module code in ");
             continue;
         }
         const mod_is_async = async_set.contains(mod_id);

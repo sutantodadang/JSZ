@@ -279,6 +279,8 @@ fn lowerFunctionDeclInto(self: *FnCompiler, node: *Node, last_expr_reg: *?u8, lo
     // See compileFuncExpr: `fn.length` is the parser-recorded
     // ExpectedArgumentCount, not the raw parameter count.
     if (fd.expected_argc) |n| child_fn.expected_argc = n;
+    // PrivateEnvironment carrier for direct eval inside a class body.
+    child_fn.priv_names = fd.priv_names;
     const child_idx: u16 = @intCast(self.child_functions.items.len);
     try self.child_functions.append(self.arena, child_fn);
 

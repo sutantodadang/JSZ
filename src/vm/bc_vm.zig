@@ -942,6 +942,22 @@ pub const BcVm = struct {
                 return error.JsException;
             },
         };
+        // PrivateNameResolution (§13.2.5.1) for eval code: `#x` parsed here is
+        // still raw, so rewrite it to the mangled key of whichever enclosing
+        // class declares it. The calling context's PrivateEnvironment travels on
+        // its BcFunction (see BcFunction.priv_names); an indirect eval has none,
+        // so any `#x` in it is unbound. An unbound name is an early SyntaxError,
+        // raised before the eval body runs.
+        const class_mod = @import("../parser/class.zig");
+        const eval_priv_names: []const @import("../parser/ast.zig").PrivName = if (direct)
+            self.frames.items[self.frames.items.len - 1].func.priv_names
+        else
+            &.{};
+        if (class_mod.resolveEvalPrivateNames(self.arena, stmts, eval_priv_names)) |bad| {
+            const msg = try std.fmt.allocPrint(self.arena, "Private field '{s}' must be declared in an enclosing class", .{bad});
+            realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", msg);
+            return error.JsException;
+        }
         const eval_is_strict = parser_mod.hasUseStrict(stmts) or p.strict;
         // EvalDeclarationInstantiation (§19.2.1.3) validates the whole declaration
         // set BEFORE creating any binding, so a rejected declaration leaves no
@@ -1012,6 +1028,8 @@ pub const BcVm = struct {
         // VariableEnvironment, so run the body with the environment built below
         // directly rather than a fresh child — see BcFunction.is_eval.
         main_func.is_eval = true;
+        // A nested direct eval inside this one inherits the same PrivateEnvironment.
+        main_func.priv_names = eval_priv_names;
         // An undefined `break`/`continue` label is an early SyntaxError; the
         // compiler records it (it can't unwind), and eval surfaces it as a throw.
         if (compiler_mod.last_label_error) |msg| {

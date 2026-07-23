@@ -278,6 +278,15 @@ pub const MemberExpr = struct {
     define_data: bool = false,
 };
 
+/// One `#name` -> mangled-key entry of a PrivateEnvironment. Functions nested
+/// inside a class body carry the list of private names lexically in scope for
+/// them, so a direct `eval` can resolve `this.#x` the same way the enclosing
+/// class body's own code does. See `class.manglePrivateNames`.
+pub const PrivName = struct {
+    raw: []const u8,
+    mangled: []const u8,
+};
+
 pub const FuncExpr = struct {
     name: ?[]const u8,
     params: [][]const u8,
@@ -307,6 +316,8 @@ pub const FuncExpr = struct {
     /// (synthetic/desugared function nodes) — callers fall back to the
     /// native "[native code]" format in that case.
     source_text: ?[]const u8 = null,
+    /// See `FuncDecl.priv_names`.
+    priv_names: []const PrivName = &.{},
 };
 
 /// Phase 3a: a single property in an object literal.
@@ -400,6 +411,9 @@ pub const FuncDecl = struct {
     is_async: bool = false,
     is_strict: bool = false,
     source_text: ?[]const u8 = null,
+    /// PrivateEnvironment in scope for this function's body, innermost class
+    /// first. Non-empty only for functions nested inside a class body.
+    priv_names: []const PrivName = &.{},
 };
 
 pub const IfStmt = struct {

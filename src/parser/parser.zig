@@ -314,6 +314,13 @@ pub const Parser = struct {
     /// chain. Only then is SuperProperty (`super.x`) legal inside the eval'd
     /// code; SuperCall never is, and an indirect eval permits neither.
     eval_allow_super_prop: bool = false,
+    /// Bumped every time a SuperProperty (`super.x`, `super[x]`, `super.m()`) is
+    /// desugared to its `__sproto__`/`__superthis` form. The class emitter
+    /// snapshots it around each member so it can bind those two names only in the
+    /// bodies that actually read them — a base class has a home object too, so
+    /// `super.x` is legal there, but paying for the binding in every method would
+    /// cost an `Object.getPrototypeOf` per call.
+    super_prop_count: u32 = 0,
     /// Set with `eval_code` for a direct eval whose calling context is a function
     /// invocation, which is the only place `new.target` is legal (§13.3.12.1: it
     /// is a SyntaxError unless the code is contained in function code). The VM

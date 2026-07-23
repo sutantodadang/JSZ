@@ -384,6 +384,10 @@ const ClassBodyParse = struct {
     has_ctor: bool = false,
     members: []ClassMember = &[_]ClassMember{},
     fields: []ClassField = &[_]ClassField{},
+    /// This class body's PrivateEnvironment, filled in by `manglePrivateNames`.
+    /// The desugared statements get it stamped onto every function they contain
+    /// (`attachPrivScope`) so a direct `eval` inside a method can resolve `#x`.
+    priv_names: []const ast.PrivName = &.{},
 };
 
 /// True when the token after `current` means `current` (a contextual keyword like
@@ -588,12 +592,24 @@ fn markPrivateDefine(n: *Node, is_method: bool) *Node {
 /// therefore already mangled) before the enclosing body's pass runs, so its own
 /// `#x` reads no longer match and shadowing resolves innermost-first.
 const PrivateRewriter = struct {
-    raw: [][]const u8,
-    mangled: [][]const u8,
+    pairs: []const ast.PrivName,
+    /// Direct-eval mode: records the first `#x` that no enclosing class declares,
+    /// so the caller can raise the early SyntaxError the spec requires
+    /// (PrivateNameResolution has no binding for it). Null in the ordinary
+    /// class-body pass, where an unmatched `#x` belongs to an enclosing class
+    /// whose own pass has not run yet.
+    unresolved: ?*?[]const u8 = null,
 
     fn map(self: PrivateRewriter, name: []const u8) []const u8 {
-        for (self.raw, self.mangled) |r, m| {
-            if (std.mem.eql(u8, r, name)) return m;
+        for (self.pairs) |e| {
+            if (std.mem.eql(u8, e.raw, name)) return e.mangled;
+        }
+        if (self.unresolved) |slot| {
+            // Already-mangled names come from a class defined *inside* the eval
+            // and are resolved; only a still-raw `#x` is unbound.
+            if (slot.* == null and isPrivateName(name) and
+                std.mem.indexOfScalar(u8, name, mangled_priv_sep) == null)
+                slot.* = name;
         }
         return name;
     }
@@ -714,6 +730,151 @@ const PrivateRewriter = struct {
     }
 };
 
+/// Resolve the private names a direct `eval`'s code refers to against the
+/// PrivateEnvironment its calling context carries (`BcFunction.priv_names`).
+///
+/// The eval parser has no lexical view of the enclosing class body, so `#x`
+/// survives parsing as a raw identifier; this rewrites it to the same mangled
+/// key the class body's own code uses, and stamps the environment onto every
+/// function in the eval'd source so a *nested* eval resolves it too.
+///
+/// Returns the first `#x` no enclosing class declares — the caller turns that
+/// into the early SyntaxError §13.2.5.1 requires — or null when all resolved.
+pub fn resolveEvalPrivateNames(
+    arena: std.mem.Allocator,
+    stmts: []const *Node,
+    pairs: []const ast.PrivName,
+) ?[]const u8 {
+    var unresolved: ?[]const u8 = null;
+    const rw = PrivateRewriter{ .pairs = pairs, .unresolved = &unresolved };
+    for (stmts) |s| rw.walk(s);
+    if (unresolved != null) return unresolved;
+    attachPrivScope(arena, stmts, pairs);
+    return null;
+}
+
+/// Stamp `pairs` onto every function nested in the desugared class statements,
+/// so a direct `eval` running inside one of them can resolve the class's private
+/// names (the eval parser has no lexical view of the class body). Appending —
+/// rather than prepending — keeps innermost-first order: a nested class is fully
+/// desugared before the enclosing body's pass runs, so its own pairs are already
+/// at the front and win the first-match lookup.
+pub fn attachPrivScope(p: std.mem.Allocator, nodes: []const *Node, pairs: []const ast.PrivName) void {
+    if (pairs.len == 0) return;
+    for (nodes) |n| attachPrivScopeNode(p, n, pairs);
+}
+
+fn attachPrivScopeOpt(p: std.mem.Allocator, node: ?*Node, pairs: []const ast.PrivName) void {
+    if (node) |n| attachPrivScopeNode(p, n, pairs);
+}
+
+fn extendPrivNames(p: std.mem.Allocator, existing: []const ast.PrivName, pairs: []const ast.PrivName) []const ast.PrivName {
+    const out = p.alloc(ast.PrivName, existing.len + pairs.len) catch return existing;
+    @memcpy(out[0..existing.len], existing);
+    @memcpy(out[existing.len..], pairs);
+    return out;
+}
+
+fn attachPrivScopeNode(p: std.mem.Allocator, node: *Node, pairs: []const ast.PrivName) void {
+    switch (node.data) {
+        .function_expr => |f| {
+            node.data.function_expr.priv_names = extendPrivNames(p, f.priv_names, pairs);
+            for (f.param_defaults) |d| attachPrivScopeOpt(p, d, pairs);
+            attachPrivScope(p, f.body, pairs);
+        },
+        .function_decl => |f| {
+            node.data.function_decl.priv_names = extendPrivNames(p, f.priv_names, pairs);
+            for (f.param_defaults) |d| attachPrivScopeOpt(p, d, pairs);
+            attachPrivScope(p, f.body, pairs);
+        },
+        .unary_expr => |u| attachPrivScopeNode(p, u.operand, pairs),
+        .binary_expr => |b| {
+            attachPrivScopeNode(p, b.left, pairs);
+            attachPrivScopeNode(p, b.right, pairs);
+        },
+        .logical_expr => |b| {
+            attachPrivScopeNode(p, b.left, pairs);
+            attachPrivScopeNode(p, b.right, pairs);
+        },
+        .assignment_expr => |a| {
+            attachPrivScopeNode(p, a.target, pairs);
+            attachPrivScopeNode(p, a.value, pairs);
+        },
+        .update_expr => |u| attachPrivScopeNode(p, u.operand, pairs),
+        .conditional_expr => |c| {
+            attachPrivScopeNode(p, c.test_, pairs);
+            attachPrivScopeNode(p, c.consequent, pairs);
+            attachPrivScopeNode(p, c.alternate, pairs);
+        },
+        .sequence_expr => |s| attachPrivScope(p, s.exprs, pairs),
+        .spread_expr => |e| attachPrivScopeNode(p, e, pairs),
+        .yield_expr => |e| attachPrivScopeOpt(p, e, pairs),
+        .call_expr => |c| {
+            attachPrivScopeNode(p, c.callee, pairs);
+            attachPrivScope(p, c.args, pairs);
+        },
+        .new_expr => |n| {
+            attachPrivScopeNode(p, n.callee, pairs);
+            attachPrivScope(p, n.args, pairs);
+        },
+        .member_expr => |m| attachPrivScopeNode(p, m.object, pairs),
+        .optional_chain => |e| attachPrivScopeNode(p, e, pairs),
+        .object_literal => |o| for (o.properties) |pr| {
+            attachPrivScopeNode(p, pr.value, pairs);
+            attachPrivScopeOpt(p, pr.computed_key, pairs);
+        },
+        .array_literal => |a| attachPrivScope(p, a.elements, pairs),
+        .program => |pr| attachPrivScope(p, pr.body, pairs),
+        .expr_stmt => |e| attachPrivScopeNode(p, e, pairs),
+        .block_stmt => |b| attachPrivScope(p, b.body, pairs),
+        .var_decl => |v| attachPrivScopeOpt(p, v.init, pairs),
+        .if_stmt => |i| {
+            attachPrivScopeNode(p, i.test_, pairs);
+            attachPrivScopeNode(p, i.consequent, pairs);
+            attachPrivScopeOpt(p, i.alternate, pairs);
+        },
+        .while_stmt => |w| {
+            attachPrivScopeNode(p, w.test_, pairs);
+            attachPrivScopeNode(p, w.body, pairs);
+        },
+        .do_while_stmt => |w| {
+            attachPrivScopeNode(p, w.body, pairs);
+            attachPrivScopeNode(p, w.test_, pairs);
+        },
+        .with_stmt => |w| {
+            attachPrivScopeNode(p, w.object, pairs);
+            attachPrivScopeNode(p, w.body, pairs);
+        },
+        .for_stmt => |f| {
+            attachPrivScopeOpt(p, f.init, pairs);
+            attachPrivScopeOpt(p, f.test_, pairs);
+            attachPrivScopeOpt(p, f.update, pairs);
+            attachPrivScopeNode(p, f.body, pairs);
+        },
+        .return_stmt => |e| attachPrivScopeOpt(p, e, pairs),
+        .throw_stmt => |e| attachPrivScopeNode(p, e, pairs),
+        .try_stmt => |t| {
+            attachPrivScopeNode(p, t.block, pairs);
+            if (t.handler) |h| attachPrivScopeNode(p, h.body, pairs);
+            attachPrivScopeOpt(p, t.finalizer, pairs);
+        },
+        .for_in_stmt => |f| {
+            attachPrivScopeNode(p, f.left, pairs);
+            attachPrivScopeNode(p, f.right, pairs);
+            attachPrivScopeNode(p, f.body, pairs);
+        },
+        .switch_stmt => |s| {
+            attachPrivScopeNode(p, s.discriminant, pairs);
+            for (s.cases) |c| {
+                attachPrivScopeOpt(p, c.test_, pairs);
+                attachPrivScope(p, c.body, pairs);
+            }
+        },
+        .labeled_stmt => |l| attachPrivScopeNode(p, l.body, pairs),
+        else => {},
+    }
+}
+
 /// Give this class body's private elements a PrivateEnvironment-unique key, so
 /// `o.#x` only resolves on instances branded by *this* class (spec
 /// PrivateEnvironment / PrivateNameResolution). Without it two classes that both
@@ -750,7 +911,12 @@ fn manglePrivateNames(p: *Parser, parsed: *ClassBodyParse) bool {
         const m = std.fmt.allocPrint(p.arena, "{s}{c}{d}", .{ r, mangled_priv_sep, id }) catch return false;
         mangled.append(p.arena, m) catch return false;
     }
-    const rw = PrivateRewriter{ .raw = raw.items, .mangled = mangled.items };
+    var pairs = std.ArrayList(ast.PrivName){};
+    for (raw.items, mangled.items) |r, m| {
+        pairs.append(p.arena, .{ .raw = r, .mangled = m }) catch return false;
+    }
+    parsed.priv_names = pairs.items;
+    const rw = PrivateRewriter{ .pairs = pairs.items };
 
     for (parsed.fields) |*f| {
         if (f.computed_key == null) f.name = rw.map(f.name);
@@ -794,7 +960,9 @@ fn namedFieldInitOf(p: *Parser, f: ClassField, val: *Node, check: *Node) ?*Node 
     if (f.computed_key != null or !isAnonFnDef(check)) return val;
     const s = p.current.start;
     const callee = nodeIdent(p, "__nameFn__") orelse return null;
-    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = f.name }) orelse return null;
+    // A private field names its function after the *source* spelling ("#x"), not
+    // the PrivateEnvironment-mangled key the property table uses.
+    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = privateDisplayName(f.name) }) orelse return null;
     var args = std.ArrayList(*Node){};
     args.append(p.arena, val) catch return null;
     args.append(p.arena, key) catch return null;
@@ -1190,6 +1358,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         .class_name = class_name,
         .ctor_fn_name = class_name,
     }, heritage, parsed, start) orelse return null;
+    attachPrivScope(p.arena, out.items, parsed.priv_names);
 
     if (out.items.len == 1) return out.items[0];
     // Transparent container: the `let <ClassName>` binding (and helpers) belong
@@ -1709,6 +1878,7 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
         .class_name = class_name,
         .ctor_fn_name = if (has_name) class_name else (anon_name_hint orelse ""),
     }, heritage, parsed, start) orelse return null;
+    attachPrivScope(p.arena, out.items, parsed.priv_names);
 
     // The IIFE evaluates to the constructor.
     const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
