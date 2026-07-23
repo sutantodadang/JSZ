@@ -363,14 +363,11 @@ built-ins/Temporal/PlainYearMonth/prototype/since/throws-if-rounded-date-outside
 built-ins/Temporal/PlainYearMonth/prototype/until/throws-if-rounded-date-outside-valid-iso-range.js
 built-ins/Temporal/ZonedDateTime/argument-convert.js
 built-ins/Temporal/ZonedDateTime/compare/argument-string-limits.js
-built-ins/Temporal/ZonedDateTime/compare/order-of-operations.js
 built-ins/Temporal/ZonedDateTime/from/argument-string-limits.js
 built-ins/Temporal/ZonedDateTime/from/offset-string-invalid.js
-built-ins/Temporal/ZonedDateTime/from/options-read-before-algorithmic-validation.js
 built-ins/Temporal/ZonedDateTime/from/options-wrong-type.js
 built-ins/Temporal/ZonedDateTime/from/order-of-operations.js
 built-ins/Temporal/ZonedDateTime/prototype/equals/argument-string-limits.js
-built-ins/Temporal/ZonedDateTime/prototype/equals/order-of-operations.js
 built-ins/Temporal/ZonedDateTime/prototype/getTimeZoneTransition/direction-undefined.js
 built-ins/Temporal/ZonedDateTime/prototype/getTimeZoneTransition/direction-wrong-type.js
 built-ins/Temporal/ZonedDateTime/prototype/getTimeZoneTransition/order-of-operations.js
@@ -379,11 +376,9 @@ built-ins/Temporal/ZonedDateTime/prototype/hoursInDay/next-day-out-of-range.js
 built-ins/Temporal/ZonedDateTime/prototype/round/day-rounding-out-of-range.js
 built-ins/Temporal/ZonedDateTime/prototype/round/get-start-of-day-throws.js
 built-ins/Temporal/ZonedDateTime/prototype/since/argument-string-limits.js
-built-ins/Temporal/ZonedDateTime/prototype/since/order-of-operations.js
 built-ins/Temporal/ZonedDateTime/prototype/since/roundingincrement-addition-out-of-range.js
 built-ins/Temporal/ZonedDateTime/prototype/toString/options-read-before-algorithmic-validation.js
 built-ins/Temporal/ZonedDateTime/prototype/until/argument-string-limits.js
-built-ins/Temporal/ZonedDateTime/prototype/until/order-of-operations.js
 built-ins/Temporal/ZonedDateTime/prototype/until/roundingincrement-addition-out-of-range.js
 built-ins/Temporal/ZonedDateTime/prototype/with/order-of-operations.js
 built-ins/Temporal/ZonedDateTime/timezone-iso-string.js
