@@ -457,8 +457,8 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
     // Reached only for a direct write (Receiver is the target); a foreign
     // Receiver was handled above.
     if (target_obj.is_array and std.mem.eql(u8, k, "length")) {
-        try @import("object_methods.zig").arraySetLengthThrowing(arena, target_obj, value);
-        return val_mod.makeBool(arena, true);
+        const ok = try @import("object_methods.zig").arraySetLengthThrowing(arena, target_obj, value);
+        return val_mod.makeBool(arena, ok);
     }
     try target_obj.set(k, value);
     return val_mod.makeBool(arena, true);
@@ -857,14 +857,11 @@ pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []c
     }
 
     // Array exotic [[DefineOwnProperty]] on "length" (ES §10.4.2.1 → ArraySetLength):
-    // a {value} validates ToUint32 (RangeError) and truncates; converting length
-    // to an accessor, or making it configurable/enumerable, is rejected (false).
+    // full ArraySetLength semantics. A genuine RangeError (invalid length) or a
+    // BigInt/Symbol coercion still throws; every other rejection returns false.
     if (target_obj.is_array and std.mem.eql(u8, k, "length")) {
-        if (desc.hasOwn("get") or desc.hasOwn("set")) return val_mod.makeBool(arena, false);
-        if (desc.hasOwn("configurable") and descTruthy(desc.getOwn("configurable"))) return val_mod.makeBool(arena, false);
-        if (desc.hasOwn("enumerable") and descTruthy(desc.getOwn("enumerable"))) return val_mod.makeBool(arena, false);
-        if (desc.hasOwn("value")) try @import("object_methods.zig").arraySetLengthThrowing(arena, target_obj, desc.getOwn("value").?);
-        return val_mod.makeBool(arena, true);
+        const ok = try @import("object_methods.zig").arrayDefineLength(arena, target_obj, try val_mod.makeObject(arena, desc), desc);
+        return val_mod.makeBool(arena, ok);
     }
 
     if (desc.hasOwn("get") or desc.hasOwn("set")) {

@@ -3114,10 +3114,14 @@ pub const BcVm = struct {
                 // write (Receiver is the array) takes this path; a foreign
                 // Receiver falls through to ordinary handling.
                 if (obj.is_array and receiver.bits == obj_val.bits and std.mem.eql(u8, key, "length")) {
-                    const numv = try self.toNumberValueChecked(value);
-                    const num = numv.unbox().number;
-                    const u = toUint32FromNumber(num);
-                    if (@as(f64, @floatFromInt(u)) != num)
+                    // §10.4.2.4 steps 3-5: newLen = ToUint32(V), numberLen = ToNumber(V)
+                    // — the value is coerced *twice* (both observable via user
+                    // valueOf/@@toPrimitive), and a mismatch is a RangeError.
+                    const numv1 = try self.toNumberValueChecked(value);
+                    const u = toUint32FromNumber(numv1.unbox().number);
+                    const numv2 = try self.toNumberValueChecked(value);
+                    const num2 = numv2.unbox().number;
+                    if (@as(f64, @floatFromInt(u)) != num2)
                         return self.throwRangeErr("Invalid array length");
                     // [[Set]] of a non-writable data property always fails (§10.1.9.2),
                     // even to the same value; the strict/throwing caller then throws.
