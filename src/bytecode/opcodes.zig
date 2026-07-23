@@ -364,6 +364,30 @@ pub const Op = enum(u8) {
     /// compound/logical assignment `base[expr] op= rhs` evaluates its key ONCE,
     /// shared by the read and the write. Declared last (JIT ordinal stability).
     TO_PROPERTY_KEY,
+    /// USING_ENTER | 3 | op, Rdst u8, kind u8. Explicit resource management:
+    /// create a fresh dispose capability (kind 0 = sync, 1 = async) and store the
+    /// backing object in R[Rdst]. `using`/`await using` block desugaring pushes
+    /// one at scope entry; resources are appended by USING_ADD and released by
+    /// USING_DISPOSE on scope exit. Declared last (JIT ordinal stability).
+    USING_ENTER,
+    /// USING_ADD | 4 | op, Rstack u8, Rval u8, hint u8. AddDisposableResource:
+    /// register R[Rval] on the capability R[Rstack]. hint 0 = sync (@@dispose),
+    /// 1 = async (@@asyncDispose, falling back to @@dispose). null/undefined is a
+    /// no-op; a non-object or a value with no callable dispose method throws a
+    /// TypeError. Declared last (JIT ordinal stability).
+    USING_ADD,
+    /// USING_DISPOSE | 2 | op, Rstack u8. DisposeResources on the capability
+    /// R[Rstack] with a NORMAL incoming completion (block fell through, or a
+    /// `break`/`continue`/`return` is leaving it): run each resource's dispose
+    /// method LIFO, and if any throws, propagate it (SuppressedError-chained).
+    /// Declared last (JIT ordinal stability).
+    USING_DISPOSE,
+    /// USING_DISPOSE_THROW | 3 | op, Rstack u8, Rexc u8. DisposeResources on
+    /// R[Rstack] with a THROW incoming completion whose value is R[Rexc]: run the
+    /// dispose methods LIFO, chaining any dispose error over R[Rexc] via
+    /// SuppressedError, then re-raise the resulting completion. Always throws.
+    /// Declared last (JIT ordinal stability).
+    USING_DISPOSE_THROW,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -477,6 +501,10 @@ pub fn instrSize(op: Op) usize {
         .IN => 4,
         .DELETE_PROP => 4,
         .CALL_SPREAD => 5,
+        .USING_ENTER => 3,
+        .USING_ADD => 4,
+        .USING_DISPOSE => 2,
+        .USING_DISPOSE_THROW => 3,
     };
 }
 

@@ -122,6 +122,82 @@ fn getMethodSym(arena: std.mem.Allocator, v: Value, sym: Value) !?Value {
     return m;
 }
 
+// ---- `using` / `await using` block desugaring -----------------------------
+// These back the USING_ENTER / USING_ADD / USING_DISPOSE(_THROW) opcodes, which
+// implement §14.2 (Block) explicit resource management. A dispose capability is
+// an ordinary DisposableStackData held in a bytecode register (a wrapper object
+// created by createUsingScope), not exposed to user code.
+
+/// Create a fresh dispose-capability object (kind 0 = sync, 1 = async).
+pub fn createUsingScope(arena: std.mem.Allocator, kind: u8) !Value {
+    const proto = if (kind == 1) active_async_disposable_proto else active_disposable_proto;
+    const ikind: @TypeOf((@as(JsObject, undefined)).internal_kind) =
+        if (kind == 1) .async_disposable_stack else .disposable_stack;
+    const v = try makeObj(arena, proto, ikind);
+    const d = try arena.create(DisposableStackData);
+    d.* = .{};
+    v.toPtr().object.internal_slot = d;
+    return v;
+}
+
+fn scopeData(stack: Value) *DisposableStackData {
+    return @ptrCast(@alignCast(stack.toPtr().object.internal_slot.?));
+}
+
+/// AddDisposableResource(capability, value, hint) for `using x = value`
+/// (hint 0 = sync-dispose, 1 = async-dispose). null/undefined adds nothing.
+pub fn usingAdd(arena: std.mem.Allocator, stack: Value, value: Value, hint: u8) !void {
+    if (isNullOrUndefined(value)) return;
+    // "Object" for spec purposes includes callable values (functions), whose
+    // Value tags are distinct from plain `.object`.
+    const is_object = switch (value.unbox()) {
+        .object, .bc_function, .native_function, .function => true,
+        else => false,
+    };
+    if (!is_object) return throwType(arena, "using declaration value is not an object");
+    var method: ?Value = null;
+    if (hint == 1) {
+        if (realm_mod.active_sym_async_dispose) |s| method = try getMethodSym(arena, value, s);
+        if (method == null) {
+            if (realm_mod.active_sym_dispose) |s| method = try getMethodSym(arena, value, s);
+        }
+        if (method == null) return throwType(arena, "value is not async-disposable (no [Symbol.asyncDispose])");
+    } else {
+        const s = realm_mod.active_sym_dispose orelse return throwType(arena, "Symbol.dispose unavailable");
+        method = (try getMethodSym(arena, value, s)) orelse
+            return throwType(arena, "value is not disposable (no [Symbol.dispose])");
+    }
+    try scopeData(stack).records.append(arena, .{ .this_val = value, .method = method.? });
+}
+
+/// DisposeResources(capability, completion) — synchronous. `incoming` is the
+/// pending thrown value for a THROW completion, or null for a NORMAL one. Runs
+/// every resource's dispose method LIFO, chaining thrown errors into a
+/// SuppressedError over `incoming`. Returns the final completion's value to
+/// throw (null = normal completion, nothing to raise).
+pub fn usingDisposeSync(arena: std.mem.Allocator, stack: Value, incoming: ?Value) !?Value {
+    const d = scopeData(stack);
+    d.disposed = true;
+    var completion: ?Value = incoming;
+    var i: usize = d.records.items.len;
+    while (i > 0) {
+        i -= 1;
+        const r = d.records.items[i];
+        const res = function_proto.invokeCallback(arena, r.this_val, r.method, &[_]Value{});
+        if (res) |_| {} else |e| {
+            if (e != error.JsException) return e;
+            const thrown = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
+            realm_mod.pending_exception = Value{};
+            if (completion) |prev| {
+                completion = try suppressedError(arena, thrown, prev);
+            } else {
+                completion = thrown;
+            }
+        }
+    }
+    return completion;
+}
+
 // ---- DisposableStack ------------------------------------------------------
 
 fn nativeDisposableCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
