@@ -357,8 +357,13 @@ fn resolveDtfTimeZone(arena: std.mem.Allocator, s: []const u8) !DtfZone {
     for (iana_links) |link| {
         if (std.mem.eql(u8, s, link[0])) target = link[1];
     }
-    if (t_tzdata.lookupDef(target)) |def|
-        return .{ .id = s, .zone = target, .offset_ms = @as(i64, def.std_offset_sec) * 1000 };
+    if (t_tzdata.lookupDef(target)) |def| {
+        // `resolvedOptions().timeZone` echoes the requested identifier with its
+        // canonical IANA casing (Zone names are matched case-insensitively).
+        // Look up the requested spelling itself, so a link keeps its own name.
+        const id = if (t_tzdata.lookupDef(s)) |own| own.name else s;
+        return .{ .id = id, .zone = target, .offset_ms = @as(i64, def.std_offset_sec) * 1000 };
+    }
     if (isPlausibleIanaName(s)) return .{ .id = s, .zone = target, .offset_ms = 0 };
     return throwRangeError(arena, "invalid time zone");
 }
@@ -551,10 +556,17 @@ pub fn nativeDateTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
     for (dtf_components, comps) |c, v| {
         if (v.len > 0 and !std.mem.eql(u8, c.key, "era")) needs_defaults = false;
     }
-    const has_comp = !needs_defaults or tz_name.len > 0;
+    // `hasExplicitFormatComponents` (§11.1.2 step 43.a) is set by ANY explicit
+    // component — including `era`, `timeZoneName` and `fractionalSecondDigits` —
+    // and is distinct from `needs_defaults`, which excludes `era` when deciding
+    // whether to apply the numeric year/month/day defaults.
+    var has_explicit = frac_sec > 0 or tz_name.len > 0;
+    for (comps) |v| {
+        if (v.len > 0) has_explicit = true;
+    }
     // dateStyle/timeStyle are shorthands for a whole pattern and cannot be mixed
-    // with individual components (§11.1.2 step 39).
-    if ((date_style.len > 0 or time_style.len > 0) and has_comp)
+    // with individual components (§11.1.2 step 43).
+    if ((date_style.len > 0 or time_style.len > 0) and has_explicit)
         return realm_mod.throwTypeError(arena, "dateStyle/timeStyle may not be used with other date-time component options");
 
     // ResolveLocale over the `ca` / `nu` / `hc` keys: an options value that this
