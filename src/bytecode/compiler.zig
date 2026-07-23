@@ -404,7 +404,13 @@ pub const FnCompiler = struct {
         switch (node.kind) {
             .function_decl => {
                 if (!nested) return; // an ordinary declaration of this scope
-                const name = node.data.function_decl.name;
+                // Annex B B.3.3 block→function hoisting applies ONLY to a plain
+                // FunctionDeclaration. Generator / async / async-generator
+                // declarations are strictly block-scoped (lexical), so they are
+                // NOT visible outside their block.
+                const fd = node.data.function_decl;
+                if (fd.is_generator or fd.is_async) return;
+                const name = fd.name;
                 for (blocked.items) |b| if (std.mem.eql(u8, b, name)) return;
                 try self.addHoistName(out, name);
                 try self.annexb_fn_sites.append(self.arena, node);
