@@ -1186,7 +1186,20 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
     }
     // Prefix unary
     switch (p.current.kind) {
-        .bang, .tilde, .minus, .plus, .kw_typeof, .kw_void, .kw_delete => {
+        .kw_delete => {
+            _ = p.advance();
+            // Keep an immediate `super.x`/`super[e]` a raw super reference so the
+            // compiler throws the spec ReferenceError; a chained `delete super.x.y`
+            // still rewrites the inner super read normally.
+            const saved_del = p.in_delete_operand;
+            p.in_delete_operand = true;
+            const operand = p.parseUnaryExpr() orelse return null;
+            p.in_delete_operand = saved_del;
+            return p.makeNode(.unary_expr, start, p.current.start, .{
+                .unary_expr = .{ .op = .delete_, .operand = operand },
+            });
+        },
+        .bang, .tilde, .minus, .plus, .kw_typeof, .kw_void => {
             const op_kind = p.current.kind;
             _ = p.advance();
             const operand = p.parseUnaryExpr() orelse return null;
@@ -1547,6 +1560,11 @@ fn rewriteSuperPropRead(p: *Parser, me_node: *Node) ?*Node {
 /// (member-based) handling we leave untouched.
 fn superReadFollows(p: *Parser, obj: *Node) bool {
     if (!(obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "super"))) return false;
+    // `delete super.x` / `delete super[e]`: this super member is the delete target
+    // and must stay a raw super reference (the compiler throws ReferenceError). A
+    // chained `delete super.x.y` has a `.`/`[` next, so the inner read still
+    // rewrites — only the whole-operand form is a Super Reference.
+    if (p.in_delete_operand and p.current.kind != .dot and p.current.kind != .left_bracket) return false;
     return switch (p.current.kind) {
         .left_paren, .plus_plus, .minus_minus => false,
         else => !isAssignOp(p.current.kind),
