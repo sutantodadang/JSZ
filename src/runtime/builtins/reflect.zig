@@ -192,12 +192,14 @@ fn makeAccessorHolder(arena: std.mem.Allocator, getter: ?Value, setter: ?Value) 
 
 pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
-    if (args.len == 0 or !isObj(args[0])) return val_mod.makeUndefined(arena);
     const target = args[0];
     const key = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
     const receiver = if (args.len > 2) args[2] else target;
 
-    const target_obj = target.toPtr().object;
+    // A callable target (class constructor / function) is an object; resolve its
+    // lazily-materialized backing object so `Reflect.get(Ctor, "staticMethod")`
+    // and super-property reads in static methods work.
+    const target_obj = (try reflectTargetObj(arena, target)) orelse return val_mod.makeUndefined(arena);
 
     // Proxy [[Get]](P, Receiver): dispatch the `get` trap (with the get
     // invariant), else forward to the proxy target's [[Get]] preserving Receiver.

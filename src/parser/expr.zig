@@ -1446,19 +1446,50 @@ pub fn rewriteSuperCall(p: *Parser, call_node: *Node) ?*Node {
         });
     }
 
-    // Case 2: super.method(...)
+    // Case 2: super.method(...) / super[expr](...)
+    //
+    // Desugar to `Reflect.get(__sproto__, key, this).call(this, ...args)` — the
+    // spec's SuperProperty evaluation `Call(Get(homeProto, key, thisValue),
+    // thisValue, args)`. A plain `super.method.call(this, …)` would read the
+    // method off the `super` *binding*, which is the super-call helper function
+    // (not the parent prototype) inside a derived constructor, yielding
+    // undefined. Routing through `__sproto__`/`this` fixes derived constructors
+    // and passes the correct Receiver to inherited accessor methods everywhere.
+    // The `this` receiver becomes the TDZ-guarded `__checkthis__()` inside a
+    // derived constructor (rewriteThisToSuperThis), so `super.m()` before
+    // `super()` is a ReferenceError.
     if (call.callee.kind == .member_expr) {
         const me = call.callee.data.member_expr;
         const is_super_obj = me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super");
         const is_explicit_call = (!me.computed and me.property.kind == .identifier and std.mem.eql(u8, me.property.data.identifier, "call"));
         if (is_super_obj and !is_explicit_call) {
+            const key = if (me.computed)
+                me.property
+            else if (me.property.kind == .identifier)
+                (p.makeNode(.string_literal, start, end, .{ .string_literal = me.property.data.identifier }) orelse return null)
+            else
+                return call_node;
+            const id_reflect = p.makeNode(.identifier, start, end, .{ .identifier = "Reflect" }) orelse return null;
+            const id_get = p.makeNode(.identifier, start, end, .{ .identifier = "get" }) orelse return null;
+            const rg_callee = p.makeNode(.member_expr, start, end, .{
+                .member_expr = .{ .object = id_reflect, .property = id_get, .computed = false },
+            }) orelse return null;
+            const id_proto = p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
+            const this_recv = p.makeNode(.this_expr, start, end, .{ .this_expr = {} }) orelse return null;
+            var rg_args = std.ArrayList(*Node){};
+            rg_args.append(p.arena, id_proto) catch return null;
+            rg_args.append(p.arena, key) catch return null;
+            rg_args.append(p.arena, this_recv) catch return null;
+            const rg_call = p.makeNode(.call_expr, start, end, .{
+                .call_expr = .{ .callee = rg_callee, .args = rg_args.items },
+            }) orelse return null;
             const id_call = p.makeNode(.identifier, start, end, .{ .identifier = "call" }) orelse return null;
             const method_call = p.makeNode(.member_expr, start, end, .{
-                .member_expr = .{ .object = call.callee, .property = id_call, .computed = false },
+                .member_expr = .{ .object = rg_call, .property = id_call, .computed = false },
             }) orelse return null;
-            const this_expr = p.makeNode(.this_expr, start, end, .{ .this_expr = {} }) orelse return null;
+            const this_arg = p.makeNode(.this_expr, start, end, .{ .this_expr = {} }) orelse return null;
             var new_args = std.ArrayList(*Node){};
-            new_args.append(p.arena, this_expr) catch return null;
+            new_args.append(p.arena, this_arg) catch return null;
             for (call.args) |a| new_args.append(p.arena, a) catch return null;
             return p.makeNode(.call_expr, start, end, .{
                 .call_expr = .{ .callee = method_call, .args = new_args.items },
