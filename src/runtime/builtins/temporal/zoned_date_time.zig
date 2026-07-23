@@ -413,6 +413,8 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
     const zone = try timezone.toZone(arena, bracket);
     // ZonedDateTime accepts a `Z` UTC designator (unlike the plain types).
     const dt = shared.parseISODateTimeOpts(s, .{ .validate_calendar = true, .reject_utc = false }) catch return realm_mod.throwRangeError(arena, "invalid ZonedDateTime string");
+    // The parsed wall-clock datetime must itself be representable.
+    if (!shared.isoDateTimeWithinLimits(dt.date, dt.time)) return realm_mod.throwRangeError(arena, "ZonedDateTime wall-clock time out of range");
     const str_off = extractStringOffset(arena, s) catch |e| return e;
     // Options are read after the string is parsed, in observable order:
     // disambiguation, offset, overflow.
@@ -420,6 +422,8 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
     const offset_opt = try getOffsetOption(arena, opts, .reject);
     _ = try shared.getOverflow(arena, opts);
     const ns = try interpretOffset(arena, zone.id, dt, zone.offset_ns, str_off, offset_opt, dis);
+    // The resulting instant must be a valid epoch nanoseconds value.
+    if (ns < -shared.NS_LIMIT or ns > shared.NS_LIMIT) return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
     return .{ .ns = ns, .tz = zone.id, .offset_ns = zoneOffsetAt(zone.id, zone.offset_ns, ns), .calendar = dt.date.calendar };
 }
 
