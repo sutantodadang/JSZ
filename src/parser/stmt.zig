@@ -644,16 +644,32 @@ pub fn parseStatement(p: *Parser) ?*Node {
         .kw_export => p.parseExportDecl(),
         .kw_function => p.parseFunctionDecl(false),
         .kw_if => p.parseIfStmt(),
-        .kw_while => p.parseWhileStmt(),
-        .kw_do => p.parseDoWhileStmt(),
+        .kw_while => blk: {
+            p.iteration_depth += 1;
+            defer p.iteration_depth -= 1;
+            break :blk p.parseWhileStmt();
+        },
+        .kw_do => blk: {
+            p.iteration_depth += 1;
+            defer p.iteration_depth -= 1;
+            break :blk p.parseDoWhileStmt();
+        },
         .kw_with => p.parseWithStmt(),
-        .kw_for => p.parseForStmt(),
+        .kw_for => blk: {
+            p.iteration_depth += 1;
+            defer p.iteration_depth -= 1;
+            break :blk p.parseForStmt();
+        },
         .kw_return => p.parseReturnStmt(),
         .kw_break => p.parseBreakStmt(),
         .kw_continue => p.parseContinueStmt(),
         .kw_throw => p.parseThrowStmt(),
         .kw_try => p.parseTryStmt(),
-        .kw_switch => p.parseSwitchStmt(),
+        .kw_switch => blk: {
+            p.switch_depth += 1;
+            defer p.switch_depth -= 1;
+            break :blk p.parseSwitchStmt();
+        },
         .semicolon => {
             const start = p.current.start;
             _ = p.advance();
@@ -1311,6 +1327,11 @@ pub fn parseBreakStmt(p: *Parser) ?*Node {
         label = p.current.value_str;
         _ = p.advance();
     }
+    // §13.9.1.1: an unlabeled `break` is an early error unless it is nested in an
+    // iteration or switch statement. (A labeled break targets a labeled
+    // statement, which need not be a loop, so it is not checked here.)
+    if (label == null and p.iteration_depth == 0 and p.switch_depth == 0)
+        return p.fail("Illegal break statement");
     p.consumeSemicolon();
     return p.makeNode(.break_stmt, start, p.current.start, .{ .break_stmt = label });
 }
@@ -1323,6 +1344,11 @@ pub fn parseContinueStmt(p: *Parser) ?*Node {
         label = p.current.value_str;
         _ = p.advance();
     }
+    // §13.8.1.1: a `continue` is an early error unless it is nested in an
+    // iteration statement (a labeled continue must target an iteration label,
+    // which likewise requires an enclosing loop).
+    if (p.iteration_depth == 0)
+        return p.fail("Illegal continue statement");
     p.consumeSemicolon();
     return p.makeNode(.continue_stmt, start, p.current.start, .{ .continue_stmt = label });
 }

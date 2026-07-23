@@ -272,6 +272,7 @@ fn applyLanguageIdAliases(arena: std.mem.Allocator, p: *Parsed) !void {
     for (complex_language_aliases) |row| {
         if (std.mem.eql(u8, row[0], p.language) and std.mem.eql(u8, row[1], p.region)) {
             p.language = row[2];
+            p.region = "";
             break;
         }
     }
@@ -407,6 +408,8 @@ const grandfathered = [_][2][]const u8{
 const language_aliases = [_][2][]const u8{
     // Deprecated / renamed languages.
     .{ "in", "id" },      .{ "iw", "he" },     .{ "ji", "yi" },
+    // Macrolanguage members CLDR collapses to their enclosing language.
+    .{ "cmn", "zh" },
     .{ "jw", "jv" },      .{ "mo", "ro" },     .{ "tl", "fil" },
     .{ "sh", "sr-Latn" }, .{ "cnr", "sr-ME" }, .{ "swc", "sw-CD" },
     .{ "aam", "aas" },    .{ "adp", "dz" },    .{ "aue", "ktz" },
@@ -507,8 +510,18 @@ const language_id_aliases = [_][2][]const u8{
     .{ "ja-latn-hepburn-heploc", "ja-Latn-alalc97" },
 };
 
-/// `languageAlias` entries keyed on a language+region pair.
-const complex_language_aliases = [_][3][]const u8{};
+/// `languageAlias` entries keyed on a language+region pair. The replacement is
+/// a single language subtag that also drops the matched region (CLDR collapses
+/// e.g. `sgn-GR` — "sign language of Greece" — to the specific language `gss`).
+// Regions are compared in the lowercased form the parser stores.
+const complex_language_aliases = [_][3][]const u8{
+    .{ "sgn", "gr", "gss" },   .{ "sgn", "br", "bzs" },   .{ "sgn", "co", "csn" },
+    .{ "sgn", "de", "gsg" },   .{ "sgn", "dk", "dsl" },   .{ "sgn", "es", "ssp" },
+    .{ "sgn", "fr", "fsl" },   .{ "sgn", "gb", "bfi" },   .{ "sgn", "ie", "isg" },
+    .{ "sgn", "it", "ise" },   .{ "sgn", "jp", "jsl" },   .{ "sgn", "mx", "mfs" },
+    .{ "sgn", "ni", "ncs" },   .{ "sgn", "nl", "dse" },   .{ "sgn", "pt", "psr" },
+    .{ "sgn", "se", "swl" },   .{ "sgn", "us", "ase" },   .{ "sgn", "za", "sfs" },
+};
 
 /// `territoryAlias` entries with a single replacement.
 const region_aliases = [_][2][]const u8{

@@ -251,10 +251,12 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "with() requires an object");
     var d = cur.*;
     const o = arg.toPtr().object;
-    const names = [_][]const u8{ "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds", "nanoseconds" };
+    // ToTemporalPartialDurationRecord reads every field through [[Get]] (so
+    // getters/Proxy traps run) in alphabetical order, and requires at least one.
+    const names = [_][]const u8{ "days", "hours", "microseconds", "milliseconds", "minutes", "months", "nanoseconds", "seconds", "weeks", "years" };
     var any = false;
     for (names) |name| {
-        if (o.get(name)) |fv| {
+        if (try shared.optionGet(arena, o, name)) |fv| {
             if (fv.bits != 0 and fv.unbox() != .undefined_) {
                 const n = try shared.toIntegerIfIntegral(arena, fv);
                 assignField(&d, name, n);
@@ -314,44 +316,19 @@ fn addSubtract(arena: std.mem.Allocator, this_val: Value, args: []const Value, s
     const a = try requireDuration(arena, this_val);
     var b = try toTemporalDuration(arena, if (args.len > 0) args[0] else Value{});
     if (subtract) b = negate(b);
-    // relativeTo present? If calendar units involved, we cannot balance precisely.
-    if (hasCalendarUnits(a.*) or hasCalendarUnits(b)) {
-        // Only exact when the calendar-unit fields are identical structure; fall
-        // back to field-wise addition (works for pure y/m/w sums).
-        if ((a.years != 0 or b.years != 0 or a.months != 0 or b.months != 0 or a.weeks != 0 or b.weeks != 0) and
-            (a.days != 0 or b.days != 0 or hasTimeUnits(a.*) or hasTimeUnits(b)))
-        {
-            return realm_mod.throwRangeError(arena, "Duration add/subtract with calendar units requires relativeTo");
-        }
-        var r = DurationFields{
-            .years = a.years + b.years,
-            .months = a.months + b.months,
-            .weeks = a.weeks + b.weeks,
-            .days = a.days + b.days,
-            .hours = a.hours + b.hours,
-            .minutes = a.minutes + b.minutes,
-            .seconds = a.seconds + b.seconds,
-            .milliseconds = a.milliseconds + b.milliseconds,
-            .microseconds = a.microseconds + b.microseconds,
-            .nanoseconds = a.nanoseconds + b.nanoseconds,
-        };
-        return makeDuration(arena, r) catch {
-            r = normalizeSigns(r);
-            return makeDuration(arena, r);
-        };
-    }
-    // Pure time (+days) durations: sum nanoseconds and balance to largest unit day.
+    // add/subtract take no relativeTo, so any nonzero calendar unit (years,
+    // months, weeks) in either operand is unbalanceable and throws (spec
+    // AddDurations: DefaultTemporalLargestUnit of a calendar unit with an
+    // undefined relativeTo is a RangeError).
+    if (hasCalendarUnits(a.*) or hasCalendarUnits(b))
+        return realm_mod.throwRangeError(arena, "Duration add/subtract with calendar units requires relativeTo");
+    // Pure time (+days) durations: sum nanoseconds and balance up to the larger
+    // of the two operands' default largest units (LargerOfTwoTemporalUnits), so
+    // e.g. blank + "-PT24H" stays 24 hours rather than collapsing to 1 day.
     const total = timeDurationNanos(a.*) + timeDurationNanos(b);
-    const balanced = balanceTimeDuration(total, .day);
+    const largest = largerUnit(defaultLargestUnit(a.*), defaultLargestUnit(b));
+    const balanced = balanceTimeDuration(total, largest);
     return makeDuration(arena, balanced);
-}
-
-fn hasTimeUnits(d: DurationFields) bool {
-    return d.hours != 0 or d.minutes != 0 or d.seconds != 0 or d.milliseconds != 0 or d.microseconds != 0 or d.nanoseconds != 0;
-}
-
-fn normalizeSigns(d: DurationFields) DurationFields {
-    return d;
 }
 
 /// BalanceTimeDuration: distribute a nanosecond total across time units up to
@@ -362,42 +339,36 @@ fn balanceTimeDuration(total_ns: i128, largest: shared.Unit) DurationFields {
     if (neg) ns = -ns;
     var d = DurationFields{};
     var rem = ns;
-    switch (largest) {
-        .year, .month, .week, .day => {
-            d.days = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_DAY))));
-            rem = @mod(rem, shared.NS_PER_DAY);
-            d.hours = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_HOUR))));
-            rem = @mod(rem, shared.NS_PER_HOUR);
-            d.minutes = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_MINUTE))));
-            rem = @mod(rem, shared.NS_PER_MINUTE);
-            d.seconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_SECOND))));
-            rem = @mod(rem, shared.NS_PER_SECOND);
-        },
-        .hour => {
-            d.hours = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_HOUR))));
-            rem = @mod(rem, shared.NS_PER_HOUR);
-            d.minutes = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_MINUTE))));
-            rem = @mod(rem, shared.NS_PER_MINUTE);
-            d.seconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_SECOND))));
-            rem = @mod(rem, shared.NS_PER_SECOND);
-        },
-        .minute => {
-            d.minutes = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_MINUTE))));
-            rem = @mod(rem, shared.NS_PER_MINUTE);
-            d.seconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_SECOND))));
-            rem = @mod(rem, shared.NS_PER_SECOND);
-        },
-        .second => {
-            d.seconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_SECOND))));
-            rem = @mod(rem, shared.NS_PER_SECOND);
-        },
-        else => {},
+    // Open each unit only when `largest` is that unit or coarser (rank ≤ its
+    // rank), so e.g. largestUnit "microseconds" keeps the whole amount in
+    // microseconds instead of rolling up into milliseconds. A calendar largest
+    // unit (year/month/week) still caps time balancing at days.
+    const r = durUnitRank(largest);
+    if (r <= durUnitRank(.day)) {
+        d.days = @floatFromInt(@as(i128, @divTrunc(rem, shared.NS_PER_DAY)));
+        rem = @mod(rem, shared.NS_PER_DAY);
     }
-    d.milliseconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_MILLI))));
-    rem = @mod(rem, shared.NS_PER_MILLI);
-    d.microseconds = @floatFromInt(@as(i128, (@divTrunc(rem, shared.NS_PER_MICRO))));
-    rem = @mod(rem, shared.NS_PER_MICRO);
-    d.nanoseconds = @floatFromInt(@as(i128, (rem)));
+    if (r <= durUnitRank(.hour)) {
+        d.hours = @floatFromInt(@as(i128, @divTrunc(rem, shared.NS_PER_HOUR)));
+        rem = @mod(rem, shared.NS_PER_HOUR);
+    }
+    if (r <= durUnitRank(.minute)) {
+        d.minutes = @floatFromInt(@as(i128, @divTrunc(rem, shared.NS_PER_MINUTE)));
+        rem = @mod(rem, shared.NS_PER_MINUTE);
+    }
+    if (r <= durUnitRank(.second)) {
+        d.seconds = @floatFromInt(@as(i128, @divTrunc(rem, shared.NS_PER_SECOND)));
+        rem = @mod(rem, shared.NS_PER_SECOND);
+    }
+    if (r <= durUnitRank(.millisecond)) {
+        d.milliseconds = @floatFromInt(@as(i128, @divTrunc(rem, shared.NS_PER_MILLI)));
+        rem = @mod(rem, shared.NS_PER_MILLI);
+    }
+    if (r <= durUnitRank(.microsecond)) {
+        d.microseconds = @floatFromInt(@as(i128, @divTrunc(rem, shared.NS_PER_MICRO)));
+        rem = @mod(rem, shared.NS_PER_MICRO);
+    }
+    d.nanoseconds = @floatFromInt(@as(i128, rem));
     if (neg) return negate(d);
     return d;
 }
@@ -436,7 +407,14 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
     const o = opts orelse return null;
     // Read relativeTo through [[Get]] so observers/getters run (option-read order).
     const rv = (try shared.optionGet(arena, o, "relativeTo")) orelse Value{};
-    if (rv.bits == 0 or rv.isUndefined() or rv.isNull()) return null;
+    // ToRelativeTemporalObject: undefined (or absent) means "no relativeTo";
+    // any other primitive that is not a String is a TypeError (only strings and
+    // objects convert), so null/boolean/number/bigint/symbol throw here.
+    if (rv.bits == 0 or rv.isUndefined()) return null;
+    switch (rv.unbox()) {
+        .null_, .boolean, .number, .bigint, .symbol => return realm_mod.throwTypeError(arena, "relativeTo must be a string or object"),
+        else => {},
+    }
     // A ZonedDateTime relativeTo is reduced to its local calendar date (we do not
     // model per-day time-zone offset changes; correct for fixed-offset zones).
     const zdt = @import("zoned_date_time.zig");
@@ -451,17 +429,21 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
         const before_brackets = if (bracket_start) |b| str[0..b] else str;
         const has_utc = std.mem.indexOfScalar(u8, before_brackets, 'Z') != null or
             std.mem.indexOfScalar(u8, before_brackets, 'z') != null;
-        if (has_utc) {
-            if (!hasTimeZoneAnnotation(str))
-                return realm_mod.throwRangeError(arena, "UTC designator without a time zone is not a valid relativeTo");
-            // Zoned relativeTo string: `Z` is permitted; take the local date.
-            const dt = shared.parseISODateTimeOpts(str, .{ .validate_calendar = true, .reject_utc = false }) catch
-                return realm_mod.throwRangeError(arena, "invalid relativeTo string");
-            if (!shared.isValidISODate(dt.date.year, dt.date.month, dt.date.day) or dt.date.year < -271821 or dt.date.year > 275760)
-                return realm_mod.throwRangeError(arena, "relativeTo date out of range");
-            return dt.date;
+        // A string with a time-zone annotation (or a bare `Z`) is a *zoned*
+        // relativeTo: route it through ToTemporalZonedDateTime so the offset is
+        // validated against the zone and the instant is range-checked. A bare
+        // `Z` with no `[tz]` annotation is not a valid relativeTo.
+        if (hasTimeZoneAnnotation(str)) {
+            const z = try zdt.toTemporalZoned(arena, rv, null);
+            return zdt.localISODate(&z);
         }
+        if (has_utc)
+            return realm_mod.throwRangeError(arena, "UTC designator without a time zone is not a valid relativeTo");
     }
+    // A Temporal.PlainDate / PlainDateTime relativeTo uses its internal ISO date
+    // directly — its property-bag fields must NOT be observed.
+    if (pd.getDate(rv)) |dd| return dd.*;
+    if (@import("plain_date_time.zig").getDateTime(rv)) |dt| return dt.date;
     // A property bag is read as a full ZonedDateTime-shaped bag (time, offset
     // and timeZone included) even though only the date is kept: which fields are
     // touched is observable.
@@ -548,12 +530,12 @@ fn roundRelative(
             out.years = bal.years;
             out.months = bal.months;
             out.weeks = bal.weeks;
-            return .{ .d = out, .total = @as(f64, @floatFromInt(low_ns)) / @as(f64, @floatFromInt(unit_ns)) };
+            return .{ .d = out, .total = shared.divToF64(low_ns, unit_ns) };
         }
         const full_ns: i128 = @as(i128, epochDaysOf(dest_date) - epochDaysOf(R)) * DAY + time_rem;
         const rounded = shared.roundI128ToIncrement(full_ns, inc_ns, mode);
         const out = balanceTimeDuration(rounded, largest);
-        return .{ .d = out, .total = @as(f64, @floatFromInt(full_ns)) / @as(f64, @floatFromInt(unit_ns)) };
+        return .{ .d = out, .total = shared.divToF64(full_ns, unit_ns) };
     }
 
     // ---- Calendar/day smallestUnit: nudge between two candidate dates. ----
@@ -608,6 +590,7 @@ fn roundRelative(
     const dest_ns: i128 = @as(i128, epochDaysOf(dest_date)) * DAY + time_rem;
     const num = dest_ns - start_ns;
     const denom = end_ns - start_ns;
+    // total = r1 + progress × increment × sign, where progress = num/denom.
     const p: f64 = if (denom == 0) 0 else @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(denom));
     const value = r1_count + p * inc * sgn;
     const rounded_count = shared.roundNumberToIncrement(value, inc, mode);
@@ -618,6 +601,16 @@ fn roundRelative(
         .month => {
             out.years = bal.years;
             out.months = rounded_count;
+            // A rounded month count that reaches a full year (12, ISO) bubbles
+            // into the years field, but only when `largest` is year — otherwise
+            // months remain the top unit (BubbleRelativeDuration).
+            if (largest == .year) {
+                const extra = @divTrunc(rounded_count, 12);
+                if (extra != 0) {
+                    out.years += extra;
+                    out.months -= extra * 12;
+                }
+            }
         },
         .week => {
             out.years = bal.years;
@@ -805,7 +798,7 @@ pub fn nativeTotal(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     }
     const per = shared.unitLengthNanos(u) orelse return realm_mod.throwRangeError(arena, "calendar unit needs relativeTo");
     const total = timeDurationNanos(d.*);
-    const result = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(per));
+    const result = shared.divToF64(total, per);
     return val_mod.makeNumber(arena, result);
 }
 
@@ -848,44 +841,67 @@ fn durationToString(arena: std.mem.Allocator, d: DurationFields, digits: ?u8) ![
 
 fn durationToStringPrec(arena: std.mem.Allocator, d: DurationFields, prec: shared.SecondsPrecision, mode: shared.RoundingMode) ![]const u8 {
     const digits = prec.digits;
-    var buf = shared.Buf{};
     const sign = d.sign();
+
+    // Fields print verbatim; only the sub-second units (ms/µs/ns) fold up into a
+    // fractional seconds value, and the seconds field itself may be arbitrarily
+    // large (it is NOT balanced into minutes for display).
+    var out = d;
+    var sec_ns: i128 = @as(i128, @intFromFloat(@abs(d.seconds))) * shared.NS_PER_SECOND +
+        @as(i128, @intFromFloat(@abs(d.milliseconds))) * shared.NS_PER_MILLI +
+        @as(i128, @intFromFloat(@abs(d.microseconds))) * shared.NS_PER_MICRO +
+        @as(i128, @intFromFloat(@abs(d.nanoseconds)));
+
+    // When a rounding increment is in force, the whole time part is rounded to it
+    // and the carry may cross unit boundaries up through days (but never into
+    // weeks/months/years). Otherwise the values are emitted as stored.
+    if (prec.increment > 1) {
+        const time_ns: i128 = @as(i128, @intFromFloat(@abs(d.hours))) * shared.NS_PER_HOUR +
+            @as(i128, @intFromFloat(@abs(d.minutes))) * shared.NS_PER_MINUTE + sec_ns;
+        const rounded = shared.roundI128ToIncrement(if (sign < 0) -time_ns else time_ns, prec.increment, mode);
+        const mag_ns: i128 = if (rounded < 0) -rounded else rounded;
+        // Balance up to the duration's own largest unit (a calendar unit caps the
+        // time balance at days), so 59.9s→60s stays "60S" while 1h59m59.9s→"2H".
+        const bt = balanceTimeDuration(mag_ns, defaultLargestUnit(d));
+        out.days = d.days + (if (sign < 0) -bt.days else bt.days);
+        out.hours = if (sign < 0) -bt.hours else bt.hours;
+        out.minutes = if (sign < 0) -bt.minutes else bt.minutes;
+        out.seconds = if (sign < 0) -bt.seconds else bt.seconds;
+        out.milliseconds = 0;
+        out.microseconds = 0;
+        out.nanoseconds = 0;
+        if (!isValidDuration(out)) return realm_mod.throwRangeError(arena, "rounded Duration is out of range");
+        sec_ns = mag_ns - @as(i128, @intFromFloat(@abs(bt.days))) * shared.NS_PER_DAY -
+            @as(i128, @intFromFloat(@abs(bt.hours))) * shared.NS_PER_HOUR -
+            @as(i128, @intFromFloat(@abs(bt.minutes))) * shared.NS_PER_MINUTE;
+    }
+
+    var buf = shared.Buf{};
     if (sign < 0) try buf.append(arena, '-');
     try buf.append(arena, 'P');
-    try appendUnit(arena, &buf, @abs(d.years), 'Y');
-    try appendUnit(arena, &buf, @abs(d.months), 'M');
-    try appendUnit(arena, &buf, @abs(d.weeks), 'W');
-    try appendUnit(arena, &buf, @abs(d.days), 'D');
+    try appendUnit(arena, &buf, @abs(out.years), 'Y');
+    try appendUnit(arena, &buf, @abs(out.months), 'M');
+    try appendUnit(arena, &buf, @abs(out.weeks), 'W');
+    try appendUnit(arena, &buf, @abs(out.days), 'D');
 
-    // Time part. Hours and minutes print as-is; seconds combine with the
-    // millisecond/microsecond/nanosecond fields (which carry up into whole
-    // seconds) into one decimal.
-    const has_h = d.hours != 0;
-    const has_m = d.minutes != 0;
-    var total_sec_ns: i128 = @as(i128, @intFromFloat(@abs(d.seconds))) * 1_000_000_000 +
-        @as(i128, @intFromFloat(@abs(d.milliseconds))) * 1_000_000 +
-        @as(i128, @intFromFloat(@abs(d.microseconds))) * 1000 +
-        @as(i128, @intFromFloat(@abs(d.nanoseconds)));
-    if (prec.increment > 1) {
-        // Round the signed value: the mode's direction is about the duration,
-        // not about the magnitude we happen to be accumulating here.
-        const r = shared.roundI128ToIncrement(if (sign < 0) -total_sec_ns else total_sec_ns, prec.increment, mode);
-        total_sec_ns = if (r < 0) -r else r;
-    }
-    const sec_whole: i64 = @intCast(@divTrunc(total_sec_ns, 1_000_000_000));
-    const frac_ns: u32 = @intCast(@mod(total_sec_ns, 1_000_000_000));
-    const has_s = total_sec_ns != 0 or (digits != null and digits.? > 0);
+    const has_h = out.hours != 0;
+    const has_m = out.minutes != 0;
+    const sec_whole: i64 = @intCast(@divTrunc(sec_ns, 1_000_000_000));
+    const frac_ns: u32 = @intCast(@mod(sec_ns, 1_000_000_000));
+    // The seconds component is emitted when it is nonzero or when the precision
+    // was explicitly requested (any fractionalSecondDigits, including 0).
+    const has_s = !prec.minute and (sec_ns != 0 or digits != null);
 
     if (has_h or has_m or has_s) {
         try buf.append(arena, 'T');
-        try appendUnit(arena, &buf, @abs(d.hours), 'H');
-        try appendUnit(arena, &buf, @abs(d.minutes), 'M');
+        try appendUnit(arena, &buf, @abs(out.hours), 'H');
+        try appendUnit(arena, &buf, @abs(out.minutes), 'M');
         if (has_s) {
             try shared.appendPadded(arena, &buf, sec_whole, 1);
             try appendSecondsFraction(arena, &buf, frac_ns, digits);
             try buf.append(arena, 'S');
         }
-    } else if (sign == 0 and d.years == 0 and d.months == 0 and d.weeks == 0 and d.days == 0) {
+    } else if (sign == 0 and out.years == 0 and out.months == 0 and out.weeks == 0 and out.days == 0) {
         // Zero duration -> "PT0S".
         try buf.appendSlice(arena, "T0S");
     }

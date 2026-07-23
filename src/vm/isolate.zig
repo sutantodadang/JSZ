@@ -594,6 +594,42 @@ pub fn rewriteTemplateLiterals(arena: std.mem.Allocator, source: []const u8) ![]
             }
             continue;
         }
+        // Pass regex literals through verbatim. A backtick, quote, or `//`-looking
+        // sequence inside a regex body (`/a`b/`, `/'/`, `/[/]/`) must not be
+        // mistaken for a template, string, or comment. Only enter this when the
+        // `/` is unambiguously in expression position (regex, not division) — a
+        // division slash is harmless to copy through as an ordinary character.
+        if (c0 == '/' and slashStartsRegex(source, i)) {
+            try out.append(arena, '/');
+            i += 1;
+            var in_class = false;
+            while (i < source.len) {
+                const d = source[i];
+                if (d == '\n' or d == '\r') break; // unterminated; the lexer errors
+                try out.append(arena, d);
+                i += 1;
+                if (d == '\\') {
+                    if (i < source.len and source[i] != '\n' and source[i] != '\r') {
+                        try out.append(arena, source[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                if (d == '[') {
+                    in_class = true;
+                } else if (d == ']') {
+                    in_class = false;
+                } else if (d == '/' and !in_class) {
+                    break; // closing slash consumed
+                }
+            }
+            // Flags.
+            while (i < source.len and isIdentChar(source[i])) {
+                try out.append(arena, source[i]);
+                i += 1;
+            }
+            continue;
+        }
         if (c0 != '`') {
             try out.append(arena, source[i]);
             i += 1;
@@ -735,6 +771,44 @@ fn isTaggedTemplate(source: []const u8, btick: usize) bool {
     for (non_tag_words) |w| {
         if (std.mem.eql(u8, word, w)) return false;
     }
+    return true;
+}
+
+/// Decide whether a `/` at `slash_idx` begins a regex literal (vs. division),
+/// using the same previous-significant-token heuristic as the lexer. Only clear
+/// expression-position contexts return true; anything value-like (identifier,
+/// number, `)`, `]`, `}`, string/template close) returns false so a division
+/// slash is left to copy through as an ordinary character. Comment skip-back is
+/// not attempted (a `/` right after a comment is vanishingly rare in eval text).
+fn slashStartsRegex(source: []const u8, slash_idx: usize) bool {
+    if (slash_idx == 0) return true;
+    var j: isize = @as(isize, @intCast(slash_idx)) - 1;
+    while (j >= 0) : (j -= 1) {
+        const ch = source[@intCast(j)];
+        if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n') continue;
+        break;
+    }
+    if (j < 0) return true;
+    const ch = source[@intCast(j)];
+    // A value-producing close → division.
+    if (ch == ')' or ch == ']' or ch == '}' or ch == '"' or ch == '\'' or ch == '`') return false;
+    if (isIdentChar(ch)) {
+        // A number or plain identifier is a value → division. Only the operator-
+        // position keywords admit a following regex.
+        var start: isize = j;
+        while (start >= 0 and isIdentChar(source[@intCast(start)])) : (start -= 1) {}
+        const word = source[@intCast(start + 1) .. @intCast(j + 1)];
+        const regex_words = [_][]const u8{
+            "return",  "typeof", "void",  "delete", "instanceof", "in",
+            "of",      "new",    "do",    "else",   "yield",      "await",
+            "case",    "throw",  "default", "extends", "void",
+        };
+        for (regex_words) |w| {
+            if (std.mem.eql(u8, word, w)) return true;
+        }
+        return false;
+    }
+    // An operator, `(`, `,`, `{`, `;`, `:`, `=`, etc. → regex.
     return true;
 }
 
