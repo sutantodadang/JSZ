@@ -804,7 +804,10 @@ pub fn parseISODuration(s0: []const u8) ParseError!DurationFields {
     // Time portion.
     if (p.eat('T') or p.eat('t')) {
         var saw_time = false;
+        // A fractional time unit must be the final component: no unit may follow.
+        var frac_seen = false;
         while (p.peek()) |c| {
+            if (frac_seen) return error.Invalid;
             if (!(c >= '0' and c <= '9')) return error.Invalid;
             const start = p.i;
             while (p.peek()) |d| {
@@ -821,6 +824,9 @@ pub fn parseISODuration(s0: []const u8) ParseError!DurationFields {
                     p.i += 1;
                 }
                 if (p.i == fstart) return error.Invalid;
+                // The grammar allows at most nine fractional digits.
+                if (p.i - fstart > 9) return error.Invalid;
+                frac_seen = true;
                 const fstr = p.s[fstart..p.i];
                 frac = std.fmt.parseFloat(f64, fstr) catch return error.Invalid;
                 frac = frac / std.math.pow(f64, 10, @floatFromInt(fstr.len));
