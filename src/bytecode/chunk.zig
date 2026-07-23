@@ -751,6 +751,27 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             const target: i64 = @intCast(new_pc);
             try writer.print(" R{d} -> {d}", .{ rcond, target + offset });
         },
+        .USING_ENTER, .USING_DISPOSE_THROW => {
+            const a = code[new_pc];
+            new_pc += 1;
+            const b = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} {d}", .{ a, b });
+        },
+        .USING_ADD => {
+            const rstack = code[new_pc];
+            new_pc += 1;
+            const rval = code[new_pc];
+            new_pc += 1;
+            const hint = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d} R{d} hint{d}", .{ rstack, rval, hint });
+        },
+        .USING_DISPOSE => {
+            const rstack = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d}", .{rstack});
+        },
     }
     try writer.print("\n", .{});
     return new_pc;

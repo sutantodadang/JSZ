@@ -650,8 +650,12 @@ pub const Lexer = struct {
             self.pos += 1;
             self.column += 1;
         }
-        // Consume flags
+        // Consume flags. isIdentChar accepts any byte >= 0x80, but Unicode
+        // WhiteSpace (NBSP, U+2000-block, BOM, …) and line terminators
+        // (U+2028/U+2029) are NOT identifier parts — stop so `/x/g<NBSP>;`
+        // treats the space as trivia rather than a bogus flag byte.
         while (self.pos < self.source.len and isIdentChar(self.source[self.pos])) {
+            if (self.source[self.pos] >= 0x80 and (self.unicodeWsLen() > 0 or self.isUnicodeLineTerm())) break;
             self.pos += 1;
             self.column += 1;
         }

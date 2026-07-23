@@ -56,6 +56,10 @@ pub const Cleanup = union(enum) {
     /// `for-of`/`for-await-of`: IteratorClose the iterator held in this
     /// register, so leaving the loop early runs the iterator's `return()`.
     close_iter: u8,
+    /// A `using`/`await using` block: DisposeResources on the capability held in
+    /// this register when an abrupt completion (`break`/`continue`/`return`)
+    /// leaves the block. Owns a PUSH_TRY like the other entries, popped on exit.
+    dispose_scope: u8,
 };
 
 /// Per-loop compilation context for unlabeled (and labeled) `break`/`continue`.
@@ -192,6 +196,11 @@ pub const FnCompiler = struct {
     /// They are all patched to the chain's short-circuit landing pad. null when
     /// not inside an optional chain.
     optional_jumps: ?*std.ArrayListUnmanaged(usize) = null,
+    /// Explicit resource management: while compiling the body of a block that has
+    /// `using` declarations, holds the register carrying that block's dispose
+    /// capability. lowerVarDecl emits USING_ADD against it for each `using x = e`.
+    /// null outside such a block (declarations then behave as plain `let`).
+    using_stack_reg: ?u8 = null,
 
     const Self = @This();
 
@@ -3082,9 +3091,45 @@ pub const FnCompiler = struct {
             self.completion_reg = cr;
         }
 
+        // Explicit resource management at function/script/module body scope: a
+        // body with `using` / `await using` declarations gets a dispose
+        // capability, disposed on fallthrough (before the implicit RETURN), on a
+        // throw (PUSH_TRY handler), and on an explicit `return` (finally_stack).
+        // Mirrors the block-level desugar in lowerBlockStmt. `await using` uses
+        // the synchronous-drain await approximation. Generators are excluded: they
+        // run this prelude eagerly in a frame whose registers do not survive the
+        // initial suspend, so a body-scope capability would read back undefined.
+        const lower_using = @import("./lower/stmt.zig");
+        const body_uscan = lower_using.scanBlockUsing(body);
+        // Generators run the code before their PARAMS_DONE marker eagerly at
+        // creation time, in a frame whose registers do not survive the initial
+        // suspend — so a body-scope capability set up here would read back as
+        // `undefined` on first resume. Body-level `using` in a generator is rare;
+        // leave it on the plain-`let` path (a `using` BLOCK inside the generator
+        // still disposes, since that setup runs after PARAMS_DONE).
+        const body_do_dispose = (body_uscan.has_sync or body_uscan.has_async) and
+            !self.is_generator and !self.is_async_generator;
+        var body_d_rstack: u8 = 0;
+        var body_d_rexc: u8 = 0;
+        var body_d_try_patch: usize = 0;
+        if (body_do_dispose) {
+            body_d_rstack = self.allocReg();
+            try self.emitOp(.USING_ENTER, 0);
+            try self.emitU8(body_d_rstack);
+            try self.emitU8(0);
+            body_d_rexc = self.allocReg();
+            self.freeReg();
+            try self.emitOp(.PUSH_TRY, 0);
+            try self.emitU8(body_d_rexc);
+            body_d_try_patch = self.currentOffset();
+            try self.emitI16(0);
+            try self.finally_stack.append(self.arena, .{ .dispose_scope = body_d_rstack });
+            self.using_stack_reg = body_d_rstack;
+        }
+
         var last_expr_stmt_reg: ?u8 = null;
         var last_other_reg: ?u8 = null;
-        const reclaim_floor: u8 = if (self.completion_reg) |cr| cr + 1 else 0;
+        const reclaim_floor: u8 = if (body_do_dispose) body_d_rstack + 1 else if (self.completion_reg) |cr| cr + 1 else 0;
 
         for (body, 0..) |stmt, stmt_idx| {
             // Parameter-initializer code reaches the body two ways: the parser's
@@ -3112,6 +3157,25 @@ pub const FnCompiler = struct {
             } else {
                 last_other_reg = last_expr_reg;
             }
+        }
+
+        // Body-scope `using` disposal on fallthrough completion (before the
+        // implicit return): pop the handler, dispose (normal completion), and
+        // jump past the throw-path handler which disposes then re-raises.
+        if (body_do_dispose) {
+            _ = self.finally_stack.pop();
+            self.using_stack_reg = null;
+            try self.emitOp(.POP_TRY, 0);
+            try self.emitOp(.USING_DISPOSE, 0);
+            try self.emitU8(body_d_rstack);
+            try self.emitOp(.JMP, 0);
+            const jmp_end = self.currentOffset();
+            try self.emitI16(0);
+            self.patchJump(body_d_try_patch, self.currentOffset());
+            try self.emitOp(.USING_DISPOSE_THROW, 0);
+            try self.emitU8(body_d_rstack);
+            try self.emitU8(body_d_rexc);
+            self.patchJump(jmp_end, self.currentOffset());
         }
 
         // Top-level program returns its accumulated completion value (eval / REPL

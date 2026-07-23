@@ -40,6 +40,19 @@ pub fn lowerVarDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
             const r = try self.compileExpr(init_node);
             self.name_hint = null; // defensive clear (no-op if consumed inside)
             try self.emitInitLexical(vd.name, r, line, is_const);
+            // Explicit resource management: a `using x = e` also registers the
+            // value on the enclosing block's dispose capability (AddDisposableResource).
+            // Done AFTER InitializeBinding, per §14.2 evaluation order. Only wired
+            // when the block set up a capability (self.using_stack_reg); the sync
+            // `using` uses hint 0, `await using` hint 1.
+            if (vd.using_kind != .none) {
+                if (self.using_stack_reg) |rstack| {
+                    try self.emitOp(.USING_ADD, line);
+                    try self.emitU8(rstack);
+                    try self.emitU8(r);
+                    try self.emitU8(if (vd.using_kind == .await_using_) 1 else 0);
+                }
+            }
             self.freeReg();
         } else {
             // No initializer: initialize with undefined.
@@ -83,6 +96,30 @@ pub fn lowerVarDecl(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     }
 }
 
+/// Whether a block's statement list contains `using` / `await using`
+/// declarations, recursing through transparent (non-lexical) container blocks
+/// produced by multi-declarator lowering — their bindings belong to this block.
+pub const UsingScan = struct { has_sync: bool = false, has_async: bool = false };
+pub fn scanBlockUsing(body: []const *Node) UsingScan {
+    var out = UsingScan{};
+    for (body) |child| {
+        switch (child.kind) {
+            .var_decl => switch (child.data.var_decl.using_kind) {
+                .using_ => out.has_sync = true,
+                .await_using_ => out.has_async = true,
+                .none => {},
+            },
+            .block_stmt => if (!child.data.block_stmt.lexical_scope) {
+                const inner = scanBlockUsing(child.data.block_stmt.body);
+                if (inner.has_sync) out.has_sync = true;
+                if (inner.has_async) out.has_async = true;
+            },
+            else => {},
+        }
+    }
+    return out;
+}
+
 pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
     const line: u32 = node.start;
     // A real `{ ... }` block forms its own lexical scope. Synthetic
@@ -111,6 +148,39 @@ pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         var fd_reg: ?u8 = null;
         for (fn_decls.items) |fd| try lowerBlockFunctionDecl(self, fd, &fd_reg);
     }
+    // Explicit resource management (§14.2): a real block with `using` /
+    // `await using` declarations gets a dispose capability. The body runs under a
+    // PUSH_TRY so a throw disposes and re-raises (SuppressedError-chained); normal
+    // fallthrough disposes after the body; an early `break`/`continue`/`return`
+    // disposes via the finally_stack entry. `await using` uses the sync-drain
+    // await approximation (see below); per-declaration hint set in lowerVarDecl.
+    const uscan = if (node.data.block_stmt.lexical_scope) scanBlockUsing(node.data.block_stmt.body) else UsingScan{};
+    // `await using` disposal is approximated by the engine's synchronous-drain
+    // await model (same as AsyncDisposableStack.disposeAsync): the async-dispose
+    // method is invoked at scope exit but its result is not truly awaited. Good
+    // enough for the observable-side-effect tests; a real microtask boundary is
+    // not introduced. Per-declaration hint (sync vs async) is set in lowerVarDecl.
+    const do_dispose = uscan.has_sync or uscan.has_async;
+    const saved_using = self.using_stack_reg;
+    var d_rstack: u8 = 0;
+    var d_rexc: u8 = 0;
+    var d_try_patch: usize = 0;
+    if (do_dispose) {
+        d_rstack = self.allocReg();
+        try self.emitOp(.USING_ENTER, line);
+        try self.emitU8(d_rstack);
+        try self.emitU8(0);
+        // Exception register for the body handler (scratch: the body may reuse
+        // the slot; a throw overwrites it with the thrown value).
+        d_rexc = self.allocReg();
+        self.freeReg();
+        try self.emitOp(.PUSH_TRY, line);
+        try self.emitU8(d_rexc);
+        d_try_patch = self.currentOffset();
+        try self.emitI16(0);
+        try self.finally_stack.append(self.arena, .{ .dispose_scope = d_rstack });
+        self.using_stack_reg = d_rstack;
+    }
     // Reclaim registers between statements — same discipline as compileBody so
     // that deeply-nested or repeated blocks do not exhaust the u8 register space.
     // We only free slots allocated *inside* this block (>= entry_sp) to avoid
@@ -134,6 +204,25 @@ pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         prev_reg = child_reg;
     }
     last_expr_reg.* = prev_reg;
+    if (do_dispose) {
+        // Body fell through: pop the handler, dispose (normal completion), and
+        // jump past the throw-path handler. The finally_stack entry is popped
+        // before POP_TRY, mirroring the try/finally lowering.
+        _ = self.finally_stack.pop();
+        self.using_stack_reg = saved_using;
+        try self.emitOp(.POP_TRY, line);
+        try self.emitOp(.USING_DISPOSE, line);
+        try self.emitU8(d_rstack);
+        try self.emitOp(.JMP, line);
+        const jmp_end = self.currentOffset();
+        try self.emitI16(0);
+        // Throw path: PUSH_TRY landed here with the exception in d_rexc.
+        self.patchJump(d_try_patch, self.currentOffset());
+        try self.emitOp(.USING_DISPOSE_THROW, line);
+        try self.emitU8(d_rstack);
+        try self.emitU8(d_rexc);
+        self.patchJump(jmp_end, self.currentOffset());
+    }
     if (has_scope) {
         try self.emitOp(.EXIT_SCOPE, line);
         self.block_scope_depth -= 1;
@@ -649,6 +738,13 @@ pub fn runPendingFinally(self: *FnCompiler, rv_reg: ?u8, floor: usize, line: u32
                 const scratch = self.allocReg();
                 try self.emitDestrCall("__destrIterClose__", riter, null, scratch, line);
                 self.sp = saved_sp;
+            },
+            // A `break`/`continue`/`return` leaving a `using` block runs
+            // DisposeResources with a normal completion; a throwing dispose then
+            // propagates (USING_DISPOSE handles the raise).
+            .dispose_scope => |rstack| {
+                try self.emitOp(.USING_DISPOSE, line);
+                try self.emitU8(rstack);
             },
         }
     }

@@ -11,6 +11,7 @@ const TryEntry = bcv.TryEntry;
 const val_mod = @import("../../value/value.zig");
 const Value = val_mod.Value;
 const JsObject = @import("../../object/object.zig").JsObject;
+const disposable_stack = @import("../../runtime/builtins/disposable_stack.zig");
 
 pub inline fn opThrow(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
@@ -118,6 +119,83 @@ pub inline fn opEndFinally(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             const msg = try bcv.formatExceptionMessage(self.arena, thrown);
             return RunOutcome{ .exception_value = .{ .msg = msg, .value = thrown } };
         }
+    }
+    return null;
+}
+
+/// USING_ENTER Rdst, kind — create a dispose capability for a `using` block.
+pub inline fn opUsingEnter(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rdst = code[frame.pc];
+    frame.pc += 1;
+    const kind = code[frame.pc];
+    frame.pc += 1;
+    const scope = disposable_stack.createUsingScope(self.arena, kind) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("using scope allocation")) |oc| return oc;
+        return null;
+    };
+    frame.registers[rdst] = scope;
+    return null;
+}
+
+/// USING_ADD Rstack, Rval, hint — AddDisposableResource for `using x = value`.
+pub inline fn opUsingAdd(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rstack = code[frame.pc];
+    frame.pc += 1;
+    const rval = code[frame.pc];
+    frame.pc += 1;
+    const hint = code[frame.pc];
+    frame.pc += 1;
+    disposable_stack.usingAdd(self.arena, frame.registers[rstack], frame.registers[rval], hint) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("using resource registration")) |oc| return oc;
+        return null;
+    };
+    return null;
+}
+
+/// USING_DISPOSE Rstack — DisposeResources with a NORMAL incoming completion.
+pub inline fn opUsingDispose(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rstack = code[frame.pc];
+    frame.pc += 1;
+    const throw_val = disposable_stack.usingDisposeSync(self.arena, frame.registers[rstack], null) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("using disposal")) |oc| return oc;
+        return null;
+    };
+    if (throw_val) |tv| {
+        self.last_exception_value = tv;
+        if (!try self.throwException(tv)) {
+            const msg = try bcv.formatExceptionMessage(self.arena, tv);
+            return RunOutcome{ .exception_value = .{ .msg = msg, .value = tv } };
+        }
+    }
+    return null;
+}
+
+/// USING_DISPOSE_THROW Rstack, Rexc — DisposeResources threading R[Rexc] as a
+/// THROW completion; always re-raises the resulting (possibly SuppressedError)
+/// completion.
+pub inline fn opUsingDisposeThrow(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rstack = code[frame.pc];
+    frame.pc += 1;
+    const rexc = code[frame.pc];
+    frame.pc += 1;
+    const incoming = frame.registers[rexc];
+    const throw_val = disposable_stack.usingDisposeSync(self.arena, frame.registers[rstack], incoming) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("using disposal")) |oc| return oc;
+        return null;
+    };
+    const tv = throw_val orelse incoming;
+    self.last_exception_value = tv;
+    if (!try self.throwException(tv)) {
+        const msg = try bcv.formatExceptionMessage(self.arena, tv);
+        return RunOutcome{ .exception_value = .{ .msg = msg, .value = tv } };
     }
     return null;
 }
