@@ -900,11 +900,18 @@ fn genGet(arena: std.mem.Allocator, this_val: Value, i: usize) !Value {
 /// ? Set(O, ToString(i), v, true) firing exotic/accessor writes.
 fn genSet(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) !void {
     if (realm_mod.nativeDeadlineExceeded()) return error.OutOfMemory;
-    // Dense array write: store by integer index, no decimal-key allocation. For a
-    // real Array, ctx.setProp bottoms out in the same ordinary [[Set]] anyway.
+    // Dense array write: store by integer index, no decimal-key allocation. This
+    // fast path is only valid when the index already holds an own element — an own
+    // data property shadows any inherited accessor, so a direct write matches the
+    // ordinary [[Set]]. A fresh or hole index may hit an inherited setter
+    // (Array.prototype[i]) or a non-writable length, so it must take the full
+    // throwing [[Set]] below (spec: Set(O, ToString(i), v, true)).
     if (i <= std.math.maxInt(u32)) if (denseArrayOf(this_val)) |o| {
-        try o.setIndex(@intCast(i), v);
-        return;
+        const idx: u32 = @intCast(i);
+        if (o.getIndexOwn(idx) != null) {
+            try o.setIndex(idx, v);
+            return;
+        }
     };
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
     if (realm_mod.active_context) |ctx| {
@@ -1385,12 +1392,9 @@ pub fn nativeSplice(arena: std.mem.Allocator, this_val: Value, args: []const Val
     for (items, 0..) |it, j| {
         try genSet(arena, O, start + j, it);
     }
-    // Set length last (real arrays update [[ArrayLength]]; array-likes get a prop).
-    if (realm_mod.active_context) |ctx| {
-        try ctx.setProp(arena, O, "length", try val_mod.makeNumber(arena, @floatFromInt(new_len)));
-    } else if (O.isHeapPtr() and O.toPtr().* == .object) {
-        O.toPtr().object.array_length = @intCast(new_len);
-    }
+    // Set length last: spec Set(A, "length", len, true) — a non-writable length
+    // (real array or array-like) raises a TypeError.
+    try setLength(arena, O, new_len);
     return removed;
 }
 
