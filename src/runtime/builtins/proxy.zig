@@ -121,6 +121,9 @@ fn targetOwnKeyList(arena: std.mem.Allocator, target: Value) anyerror![]Value {
     // Arrays expose a synthetic "length" own key not present in `ownKeys()`.
     var length_emitted = false;
     for (t.ownKeys()) |k| {
+        // Internal slots ([[PrimitiveValue]], [[OriginalSource]], …) are hidden
+        // from [[OwnPropertyKeys]] and must not leak through proxy forwarding.
+        if (JsObject.isInternalSlotKey(k)) continue;
         if (t.is_array and !length_emitted and !isArrayIndexKey(k)) {
             try list.append(arena, try val_mod.makeString(arena, "length"));
             length_emitted = true;

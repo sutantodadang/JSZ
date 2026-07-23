@@ -2311,16 +2311,22 @@ pub const BcVm = struct {
         if (root_obj.internal_kind == .proxy) {
             const handler = proxy_mod.proxyHandler(root_obj) orelse return proxy_mod.throwRevoked(self.arena);
             const target = proxy_mod.proxyTarget(root_obj) orelse return proxy_mod.throwRevoked(self.arena);
+            // [[HasProperty]] always receives a property key (String or Symbol);
+            // a numeric index operand (`1 in proxy`) must reach the trap as "1".
+            const key_pk: Value = if (key_v.bits != 0 and key_v.unbox() == .symbol)
+                key_v
+            else
+                try val_mod.makeString(self.arena, try valueToStringArena(self.arena, key_v));
             if (try proxy_mod.getTrap(self.arena, handler, "has")) |trap_fn| {
-                const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v });
+                const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_pk });
                 const b = isTruthy(res);
                 // Invariant: has may not report false for a non-configurable own
                 // property of the target, nor for any own property of a
                 // non-extensible target.
-                if (!b) try self.proxyReportAbsentInvariant(target, key_v);
+                if (!b) try self.proxyReportAbsentInvariant(target, key_pk);
                 return b;
             }
-            return try self.hasProperty(target, key_v);
+            return try self.hasProperty(target, key_pk);
         }
         // M15: TypedArray [[HasProperty]] — integer-indexed exotic.
         if (root_obj.internal_kind == .typed_array) {
@@ -2555,6 +2561,13 @@ pub const BcVm = struct {
     fn proxyConstruct(self: *BcVm, proxy_obj: *JsObject, args: []const Value, new_target: Value) anyerror!Value {
         const handler = proxy_mod.proxyHandler(proxy_obj) orelse return self.throwRevokedProxy();
         const target = proxy_mod.proxyTarget(proxy_obj) orelse return self.throwRevokedProxy();
+        // A proxy has a [[Construct]] method only when its target does; otherwise
+        // `new proxy()` is a TypeError (§10.5.14 / ProxyCreate).
+        if (!@import("../runtime/builtins/reflect.zig").isConstructorVal(target)) {
+            const realm_m = @import("../runtime/realm.zig");
+            realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "proxy target is not a constructor");
+            return error.JsException;
+        }
         if (try proxy_mod.getTrap(self.arena, handler, "construct")) |trap_fn| {
             const args_arr = try self.arrayFromSlice(args);
             const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, args_arr, new_target });

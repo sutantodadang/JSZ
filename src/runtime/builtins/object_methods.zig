@@ -1617,7 +1617,9 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
         break :blk (try ctx.backingObject(arena, args[0])) orelse return val_mod.makeUndefined(arena);
     };
 
-    if (args.len < 2) return val_mod.makeUndefined(arena);
+    // A proxy still runs its [[GetOwnProperty]] even when P is absent (P becomes
+    // "undefined"); a revoked proxy throws there, so it must not short-circuit.
+    if (args.len < 2 and obj.internal_kind != .proxy) return val_mod.makeUndefined(arena);
 
     // Proxy: getOwnPropertyDescriptor trap (or forward to target).
     if (obj.internal_kind == .proxy) {
