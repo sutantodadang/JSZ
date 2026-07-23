@@ -635,16 +635,18 @@ fn skipOffset(p: *Parser) ParseError!bool {
                 p.i = save;
                 return false;
             };
-            _ = h;
+            // A UTC offset's components share the clock's bounds: an out-of-range
+            // hour/minute/second (e.g. "-24:00") makes the whole string invalid.
+            if (h > 23) return error.Invalid;
             // Minutes: "±HH", "±HH:MM" and compact "±HHMM" are all valid, as is
             // a further "±HH:MM:SS(.fff)" / "±HHMMSS(.fff)". Consume greedily.
             const had_colon = p.eat(':');
             if (isDigit(p.peek())) {
-                _ = p.digitsN(2);
+                if ((p.digitsN(2) orelse 0) > 59) return error.Invalid;
                 // Seconds (with matching separator style).
                 const sep = if (had_colon) p.eat(':') else !had_colon;
                 if (sep and isDigit(p.peek())) {
-                    _ = p.digitsN(2);
+                    if ((p.digitsN(2) orelse 0) > 59) return error.Invalid;
                     var t = ISOTime{};
                     // The offset sub-second fraction obeys the same ≤9-digit rule.
                     try parseFraction(p, &t);

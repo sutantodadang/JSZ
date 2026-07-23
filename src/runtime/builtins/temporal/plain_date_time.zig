@@ -72,8 +72,11 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     // constructor's year/month/day are always ISO, whatever the calendar.
     var cal: calendar.CalendarId = .iso8601;
     if (args.len > 9 and args[9].bits != 0 and args[9].unbox() != .undefined_) {
-        const name = try shared.valueToString(arena, args[9]);
-        cal = calendar.canonicalize(name) orelse return realm_mod.throwRangeError(arena, "unsupported calendar");
+        // The constructor's calendar argument must be a String primitive; any
+        // other type (null, number, object, …) is a TypeError before the
+        // identifier is canonicalized.
+        if (args[9].unbox() != .string) return realm_mod.throwTypeError(arena, "calendar must be a string");
+        cal = calendar.canonicalize(args[9].unbox().string) orelse return realm_mod.throwRangeError(arena, "unsupported calendar");
     }
     const yi = f2i(y);
     const mi = f2i(mo);

@@ -358,7 +358,6 @@ built-ins/Temporal/PlainDate/prototype/subtract/argument-string-negative-fractio
 built-ins/Temporal/PlainDate/prototype/subtract/balance-smaller-units-basic.js
 built-ins/Temporal/PlainDate/prototype/subtract/balance-smaller-units.js
 built-ins/Temporal/PlainDate/prototype/until/round-cross-unit-boundary.js
-built-ins/Temporal/PlainDateTime/calendar-wrong-type.js
 built-ins/Temporal/PlainDateTime/limits.js
 built-ins/Temporal/PlainDateTime/prototype/since/roundingincrement-non-integer.js
 built-ins/Temporal/PlainDateTime/prototype/toString/rounding-edge-of-range.js
@@ -368,9 +367,6 @@ built-ins/Temporal/PlainMonthDay/from/iso-year-used-only-for-overflow.js
 built-ins/Temporal/PlainMonthDay/from/overflow.js
 built-ins/Temporal/PlainMonthDay/prototype/equals/argument-string.js
 built-ins/Temporal/PlainMonthDay/prototype/with/iso-year-used-only-for-overflow.js
-built-ins/Temporal/PlainTime/from/argument-string-invalid.js
-built-ins/Temporal/PlainTime/from/options-wrong-type.js
-built-ins/Temporal/PlainTime/from/order-of-operations.js
 built-ins/Temporal/PlainYearMonth/prototype/since/throws-if-rounded-date-outside-valid-iso-range.js
 built-ins/Temporal/PlainYearMonth/prototype/until/throws-if-rounded-date-outside-valid-iso-range.js
 built-ins/Temporal/ZonedDateTime/argument-convert.js
