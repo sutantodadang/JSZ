@@ -148,14 +148,19 @@ pub fn lowerBlockStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         var fd_reg: ?u8 = null;
         for (fn_decls.items) |fd| try lowerBlockFunctionDecl(self, fd, &fd_reg);
     }
-    // Explicit resource management (§14.2): a real block with sync `using`
-    // declarations gets a dispose capability. The body runs under a PUSH_TRY so a
-    // throw disposes and re-raises (SuppressedError-chained); normal fallthrough
-    // disposes after the body; an early `break`/`continue`/`return` disposes via
-    // the finally_stack entry. `await using` blocks are left to the plain `let`
-    // path for now (no async disposal), so only all-sync blocks opt in.
+    // Explicit resource management (§14.2): a real block with `using` /
+    // `await using` declarations gets a dispose capability. The body runs under a
+    // PUSH_TRY so a throw disposes and re-raises (SuppressedError-chained); normal
+    // fallthrough disposes after the body; an early `break`/`continue`/`return`
+    // disposes via the finally_stack entry. `await using` uses the sync-drain
+    // await approximation (see below); per-declaration hint set in lowerVarDecl.
     const uscan = if (node.data.block_stmt.lexical_scope) scanBlockUsing(node.data.block_stmt.body) else UsingScan{};
-    const do_dispose = uscan.has_sync and !uscan.has_async;
+    // `await using` disposal is approximated by the engine's synchronous-drain
+    // await model (same as AsyncDisposableStack.disposeAsync): the async-dispose
+    // method is invoked at scope exit but its result is not truly awaited. Good
+    // enough for the observable-side-effect tests; a real microtask boundary is
+    // not introduced. Per-declaration hint (sync vs async) is set in lowerVarDecl.
+    const do_dispose = uscan.has_sync or uscan.has_async;
     const saved_using = self.using_stack_reg;
     var d_rstack: u8 = 0;
     var d_rexc: u8 = 0;

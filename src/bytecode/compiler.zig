@@ -3092,11 +3092,13 @@ pub const FnCompiler = struct {
         }
 
         // Explicit resource management at function/script/module body scope: a
-        // body with sync `using` declarations gets a dispose capability, disposed
-        // on fallthrough (before the implicit RETURN), on a throw (PUSH_TRY
-        // handler), and on an explicit `return` (finally_stack). Mirrors the
-        // block-level desugar in lowerBlockStmt. `await using` bodies stay on the
-        // plain-`let` path (no async disposal) — only all-sync bodies opt in.
+        // body with `using` / `await using` declarations gets a dispose
+        // capability, disposed on fallthrough (before the implicit RETURN), on a
+        // throw (PUSH_TRY handler), and on an explicit `return` (finally_stack).
+        // Mirrors the block-level desugar in lowerBlockStmt. `await using` uses
+        // the synchronous-drain await approximation. Generators are excluded: they
+        // run this prelude eagerly in a frame whose registers do not survive the
+        // initial suspend, so a body-scope capability would read back undefined.
         const lower_using = @import("./lower/stmt.zig");
         const body_uscan = lower_using.scanBlockUsing(body);
         // Generators run the code before their PARAMS_DONE marker eagerly at
@@ -3105,7 +3107,7 @@ pub const FnCompiler = struct {
         // `undefined` on first resume. Body-level `using` in a generator is rare;
         // leave it on the plain-`let` path (a `using` BLOCK inside the generator
         // still disposes, since that setup runs after PARAMS_DONE).
-        const body_do_dispose = body_uscan.has_sync and !body_uscan.has_async and
+        const body_do_dispose = (body_uscan.has_sync or body_uscan.has_async) and
             !self.is_generator and !self.is_async_generator;
         var body_d_rstack: u8 = 0;
         var body_d_rexc: u8 = 0;
