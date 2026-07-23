@@ -261,68 +261,44 @@ pub fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts: ?*JsObject) !Zo
 }
 
 fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !ZonedDT {
-    // ToTemporalZonedDateTime validates the calendar (ToTemporalCalendarIdentifier;
-    // ISO strings ok) BEFORE requiring the timeZone field, so an invalid calendar
-    // throws RangeError even when timeZone is absent.
+    // ToTemporalZonedDateTime reads the calendar first (ToTemporalCalendarIdentifier;
+    // ISO strings ok), then does a single PrepareCalendarFields sweep over the
+    // remaining fields — day, hour, microsecond, millisecond, minute, month,
+    // monthCode, nanosecond, offset, second, timeZone, year — in that
+    // alphabetical, observable order.
     const cal = if (try shared.optionGet(arena, o, "calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
-    // timeZone is required.
-    const tz_v = try shared.optionGet(arena, o, "timeZone") orelse return realm_mod.throwTypeError(arena, "missing timeZone");
-    if (tz_v.bits != 0 and tz_v.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "missing timeZone");
+    const bag = try plain_date.readDateBag(arena, o, .{ .time = true, .zoned = true, .fixed_cal = cal });
+
+    // timeZone is required (a present-but-undefined value reads as absent).
+    const tz_v = bag.time_zone orelse return realm_mod.throwTypeError(arena, "missing timeZone");
     const zone = try toTimeZone(arena, tz_v, null);
 
-    // The property-bag fields (wall-clock datetime + offset) are read first,
-    // then the options in observable order (disambiguation, offset, overflow).
-    // Overflow governs field regulation, so it is applied after the raw read.
-    const dt_raw = try readDateTimeFields(arena, o, .constrain, cal);
-
-    // offset property (a string like "+01:00"; sub-minute allowed here). An
-    // offset given as a field is an "option"-behaviour offset; absent is "wall".
+    // An offset given as a field is an "option"-behaviour offset; absent is "wall".
     var so = StringOffset{ .behaviour = .wall };
-    if (try shared.optionGet(arena, o, "offset")) |ov| {
-        if (ov.bits != 0 and ov.unbox() != .undefined_) {
-            // The offset field is a String (ToPrimitiveAndRequireString): an
-            // object with toString is coerced, but a bare number/bigint/null
-            // is a TypeError before any format validation.
-            const os = try shared.toPrimitiveRequireString(arena, ov);
-            so = .{ .behaviour = .option, .ns = try parseOffsetValue(arena, os) };
-        }
-    }
+    if (bag.offset) |os| so = .{ .behaviour = .option, .ns = try parseOffsetValue(arena, os) };
 
+    // Options are read after every field, in observable order, and the overflow
+    // they carry governs regulation of the already-read wall-clock fields.
     const dis = try getDisambiguationOption(arena, opts);
     const offset_opt = try getOffsetOption(arena, opts, .reject);
     const overflow = try shared.getOverflow(arena, opts);
 
-    // Re-read with the real overflow so a `reject` bag with an out-of-range
-    // field throws now that the option is known.
-    const dt = if (overflow == .reject) try readDateTimeFields(arena, o, overflow, cal) else dt_raw;
+    var date = try plain_date.dateFromBag(arena, bag, overflow);
+    date.calendar = cal;
+    const time = try timeFromBag(arena, bag, overflow);
+    const dt = ISODateTime{ .date = date, .time = time };
     const ns = try interpretOffset(arena, zone.id, dt, zone.offset_ns, so, offset_opt, dis);
     return .{ .ns = ns, .tz = zone.id, .offset_ns = zoneOffsetAt(zone.id, zone.offset_ns, ns), .calendar = cal };
 }
 
-/// Read the required/optional date+time fields from a property bag into an
-/// ISODateTime (mirrors PlainDateTime's field reading, inlined so ZonedDateTime
-/// can require timeZone separately).
-fn readDateTimeFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow, cal: calendar.CalendarId) !ISODateTime {
-    // The date half is exactly PlainDate's field set, read in `cal`'s space.
-    var date = try plain_date.dateFromFields(arena, o, overflow);
-    date.calendar = cal;
-    const time = try readTimeFields(arena, o, overflow);
-    return .{ .date = date, .time = time };
-}
-
-fn readTimeFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overflow) !ISOTime {
-    var h: f64 = 0;
-    var min: f64 = 0;
-    var s: f64 = 0;
-    var ms: f64 = 0;
-    var us: f64 = 0;
-    var ns: f64 = 0;
-    if (try readField(arena, o, "hour")) |x| h = x;
-    if (try readField(arena, o, "minute")) |x| min = x;
-    if (try readField(arena, o, "second")) |x| s = x;
-    if (try readField(arena, o, "millisecond")) |x| ms = x;
-    if (try readField(arena, o, "microsecond")) |x| us = x;
-    if (try readField(arena, o, "nanosecond")) |x| ns = x;
+/// Regulate the time fields already read into a property bag into an ISOTime.
+fn timeFromBag(arena: std.mem.Allocator, bag: plain_date.DateBag, overflow: shared.Overflow) !ISOTime {
+    const h = bag.hour orelse 0;
+    const min = bag.minute orelse 0;
+    const s = bag.second orelse 0;
+    const ms = bag.millisecond orelse 0;
+    const us = bag.microsecond orelse 0;
+    const ns = bag.nanosecond orelse 0;
     if (overflow == .reject) {
         if (h > 23 or min > 59 or s > 59 or ms > 999 or us > 999 or ns > 999 or
             h < 0 or min < 0 or s < 0 or ms < 0 or us < 0 or ns < 0)
@@ -338,17 +314,6 @@ fn readTimeFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overf
     };
 }
 
-fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
-    const v = o.get(name) orelse return null;
-    if (v.bits == 0 or v.unbox() == .undefined_) return null;
-    return try shared.toIntegerWithTruncation(arena, v);
-}
-
-fn f2i(f: f64) i32 {
-    if (f > 2147483647) return 2147483647;
-    if (f < -2147483648) return -2147483648;
-    return @intFromFloat(f);
-}
 
 /// The zone's UTC offset at an exact instant. A fixed-offset identifier has no
 /// tzdata entry and never varies, so `fixed` stands in for it.
