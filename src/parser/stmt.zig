@@ -885,6 +885,30 @@ pub fn wrapForUsing(p: *Parser, for_stmt: *Node, using_decls: []*Node, start: u3
     return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = wrapped, .lexical_scope = true } }) orelse for_stmt;
 }
 
+/// Build the per-iteration body of a `for (using x of it)` loop: a disposal scope
+/// that registers the current binding `x` (`__ds.use(x)`) then runs the original
+/// body, disposing `x` when the iteration exits. `is_async` selects the async
+/// disposal path for `for (await using x of it)`. Returns a `block_stmt`, or null
+/// on failure.
+fn wrapForOfUsing(p: *Parser, name: []const u8, body: *Node, is_async: bool, start: u32) ?*Node {
+    const ds_name = std.fmt.allocPrint(p.arena, "__ds_{d}__", .{p.param_destruct_counter}) catch return null;
+    p.param_destruct_counter += 1;
+    // __ds.use(x);
+    const ds_id = p.makeNode(.identifier, start, start, .{ .identifier = ds_name }) orelse return null;
+    const use_id = p.makeNode(.identifier, start, start, .{ .identifier = "use" }) orelse return null;
+    const use_member = p.makeNode(.member_expr, start, start, .{ .member_expr = .{ .object = ds_id, .property = use_id, .computed = false } }) orelse return null;
+    const x_id = p.makeNode(.identifier, start, start, .{ .identifier = name }) orelse return null;
+    var uargs = std.ArrayList(*Node){};
+    uargs.append(p.arena, x_id) catch return null;
+    const use_call = p.makeNode(.call_expr, start, start, .{ .call_expr = .{ .callee = use_member, .args = uargs.items } }) orelse return null;
+    const use_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = use_call }) orelse return null;
+    var inner = std.ArrayList(*Node){};
+    inner.append(p.arena, use_stmt) catch return null;
+    inner.append(p.arena, body) catch return null;
+    const wrapped = wrapItemsInDisposal(p, inner.items, ds_name, is_async, start) orelse return null;
+    return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = wrapped, .lexical_scope = true } });
+}
+
 pub fn parseVarDeclStmt(p: *Parser) ?*Node {
     const start = p.current.start;
     _ = p.advance(); // consume 'var'
@@ -1141,6 +1165,8 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         const name_tok = if (p.check(.kw_of)) p.advance() else (p.expect(.identifier) orelse return null);
         const name: []const u8 = if (name_tok.kind == .kw_of) "of" else name_tok.value_str;
         // `for (using x of it)`: per-iteration for-of binding (lowered to `let`).
+        // Each iteration's resource is disposed at the END of that iteration, so
+        // the body is wrapped in its own disposal scope that registers `x`.
         if (p.check(.kw_of)) {
             _ = p.advance(); // consume `of`
             const right = p.parseAssignmentExpr() orelse return null;
@@ -1149,8 +1175,9 @@ pub fn parseForStmt(p: *Parser) ?*Node {
             const left = p.makeNode(.var_decl, name_tok.start, name_tok.end, .{
                 .var_decl = .{ .kind = .let, .name = name, .init = null },
             }) orelse return null;
+            const wrapped_body = wrapForOfUsing(p, name, body, is_await, start) orelse body;
             return p.makeNode(.for_in_stmt, start, p.current.start, .{
-                .for_in_stmt = .{ .left = left, .right = right, .body = body, .iterate_values = true, .is_await = for_await },
+                .for_in_stmt = .{ .left = left, .right = right, .body = wrapped_body, .iterate_values = true, .is_await = for_await },
             });
         }
         // `for (using x = e; cond; incr)`: C-style head with a required
