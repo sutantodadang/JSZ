@@ -195,11 +195,23 @@ fn nativeMove(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyer
 /// aggregating thrown errors into a SuppressedError chain. Shared by both the
 /// sync `dispose()` and the async drain.
 fn disposeResources(arena: std.mem.Allocator, d: *DisposableStackData) anyerror!void {
-    var completion: ?Value = null; // pending thrown value, if any
+    return disposeResourcesSeeded(arena, d, null);
+}
+
+/// As `disposeResources`, but the completion may be seeded with a pending thrown
+/// value (`seed`). This models the DisposeResources(cap, completion) form used
+/// by the `using` scope desugar: when the scope body already threw, a further
+/// disposal error nests the body's error as the `suppressed` of a SuppressedError.
+fn disposeResourcesSeeded(arena: std.mem.Allocator, d: *DisposableStackData, seed: ?Value) anyerror!void {
+    var completion: ?Value = seed; // pending thrown value, if any
     var i: usize = d.records.items.len;
     while (i > 0) {
         i -= 1;
         const r = d.records.items[i];
+        // Dispose(V, hint, method): "If method is undefined, let result be
+        // undefined" — a null/undefined resource carries no dispose method, so it
+        // is a no-op (used by the `using x = null` / `await using x = null` path).
+        if (isNullOrUndefined(r.method)) continue;
         const call_args: []const Value = if (r.has_arg) &[_]Value{r.arg} else &[_]Value{};
         const res = function_proto.invokeCallback(arena, r.this_val, r.method, call_args);
         if (res) |_| {
@@ -317,6 +329,88 @@ fn nativeDisposeAsync(arena: std.mem.Allocator, this_val: Value, _: []const Valu
         realm_mod.pending_exception = Value{};
         return promise_mod.makeRejectedPromise(arena, err);
     }
+}
+
+// ---- `using` / `await using` desugar support ------------------------------
+//
+// A `using x = V` (or `await using x = V`) declaration lowers, in the parser,
+// to a try/finally over the enclosing scope plus calls to the three hidden
+// intrinsics below. They are bound as environment names (not globalThis
+// properties), so user code and reflection never observe them:
+//
+//   let __using_stack__ = __usingStackInit__();
+//   let __using_threw__ = false, __using_err__ = undefined;
+//   try {
+//     try { let x = __usingAdd__(__using_stack__, V, /*isAsync*/ false); ...body... }
+//     catch (e) { __using_threw__ = true; __using_err__ = e; }
+//   } finally { __usingDispose__(__using_stack__, __using_threw__, __using_err__); }
+
+/// A fresh per-scope DisposeCapability. Backed by DisposableStackData but with a
+/// null prototype so it can never be confused with a real DisposableStack.
+pub fn nativeUsingStackInit(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
+    obj.internal_kind = .disposable_stack;
+    const d = try arena.create(DisposableStackData);
+    d.* = .{};
+    obj.internal_slot = d;
+    return val_mod.makeObject(arena, obj);
+}
+
+fn usingData(v: Value) ?*DisposableStackData {
+    if (v.bits == 0 or v.unbox() != .object) return null;
+    const obj = v.toPtr().object;
+    if (obj.internal_kind != .disposable_stack or obj.internal_slot == null) return null;
+    return @ptrCast(@alignCast(obj.internal_slot.?));
+}
+
+/// AddDisposableResource for a `using`/`await using` binding.
+/// args: [stack, value, isAsync]. Validates and registers `value` (§14.3.5),
+/// then returns it so the caller binds `let x = __usingAdd__(stack, V, false)`.
+pub fn nativeUsingAdd(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const stack = if (args.len > 0) args[0] else Value{};
+    const value = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    const is_async = args.len > 2 and val_mod.toBoolean(args[2]);
+    const d = usingData(stack) orelse return throwType(arena, "internal: invalid using capability");
+    if (isNullOrUndefined(value)) {
+        // sync-dispose: null/undefined is skipped entirely; async-dispose adds a
+        // no-op record (dispose method undefined) — AddDisposableResource step 1.
+        if (!is_async) return value;
+        try d.records.append(arena, .{ .this_val = value, .method = try val_mod.makeUndefined(arena) });
+        return value;
+    }
+    // §CreateDisposableResource: "If V is not an Object, throw". Functions and
+    // classes are Objects, so accept any callable too (not just plain objects).
+    switch (value.unbox()) {
+        .object, .function, .bc_function, .native_function => {},
+        else => return throwType(arena, "using value is not an object"),
+    }
+    var method: ?Value = null;
+    if (is_async) {
+        if (realm_mod.active_sym_async_dispose) |s| method = try getMethodSym(arena, value, s);
+        if (method == null) {
+            if (realm_mod.active_sym_dispose) |s| method = try getMethodSym(arena, value, s);
+        }
+    } else {
+        const s = realm_mod.active_sym_dispose orelse return throwType(arena, "Symbol.dispose unavailable");
+        method = try getMethodSym(arena, value, s);
+    }
+    const m = method orelse return throwType(arena, "using value is not disposable");
+    try d.records.append(arena, .{ .this_val = value, .method = m });
+    return value;
+}
+
+/// DisposeResources at scope exit. args: [stack, threw, errValue]. When the
+/// scope body completed abruptly with a throw, `threw` seeds the completion so a
+/// disposal error nests the body error in a SuppressedError; otherwise disposal
+/// errors surface directly (and a clean body re-surfaces any disposal error).
+pub fn nativeUsingDispose(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const stack = if (args.len > 0) args[0] else Value{};
+    const threw = args.len > 1 and val_mod.toBoolean(args[1]);
+    const seed: ?Value = if (threw) (if (args.len > 2) args[2] else try val_mod.makeUndefined(arena)) else null;
+    const d = usingData(stack) orelse return throwType(arena, "internal: invalid using capability");
+    d.disposed = true;
+    try disposeResourcesSeeded(arena, d, seed);
+    return try val_mod.makeUndefined(arena);
 }
 
 // ---- registration ---------------------------------------------------------

@@ -185,6 +185,11 @@ pub const Parser = struct {
     /// M16 Phase 5: nesting depth inside function bodies. 0 = top-level module code;
     /// incremented by parseFunctionBody so import hoisting only applies at top level.
     fn_nesting_depth: u32,
+    /// Nesting depth inside `{ }` blocks (and switch bodies). A `using`/`await
+    /// using` declaration is a SyntaxError at the top level of a Script or eval
+    /// code, but allowed inside any block/function and at Module top level — so
+    /// this distinguishes those positions when `fn_nesting_depth == 0`.
+    block_depth: u32 = 0,
     /// Nesting depth of enclosing iteration statements (for/while/do-while) in
     /// the *current* function/script level. An unlabeled `continue` outside any
     /// iteration, or an unlabeled `break` outside any iteration or switch, is an
