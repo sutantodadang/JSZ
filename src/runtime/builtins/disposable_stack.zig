@@ -208,6 +208,10 @@ fn disposeResourcesSeeded(arena: std.mem.Allocator, d: *DisposableStackData, see
     while (i > 0) {
         i -= 1;
         const r = d.records.items[i];
+        // Dispose(V, hint, method): "If method is undefined, let result be
+        // undefined" — a null/undefined resource carries no dispose method, so it
+        // is a no-op (used by the `using x = null` / `await using x = null` path).
+        if (isNullOrUndefined(r.method)) continue;
         const call_args: []const Value = if (r.has_arg) &[_]Value{r.arg} else &[_]Value{};
         const res = function_proto.invokeCallback(arena, r.this_val, r.method, call_args);
         if (res) |_| {

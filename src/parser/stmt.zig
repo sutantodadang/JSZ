@@ -609,25 +609,41 @@ fn scopeHasUsing(body: []const *Node) bool {
     return false;
 }
 
-/// Rewrite a single `using x = V` declaration into `let x = __usingAdd__(stack, V, isAsync)`.
-fn rewriteUsingDecl(p: *Parser, node: *Node, stack_name: []const u8) ?*Node {
+/// Emit the two statements a single `using x = V` declaration lowers to, into
+/// `out`: a plain `let x = V` (so NamedEvaluation / TDZ / evaluation order match
+/// an ordinary `let` exactly) followed by `__usingAdd__(stack, x, isAsync)`,
+/// which validates the resource and registers it for disposal. Keeping the
+/// initializer on a real `let` — rather than wrapping it in the call — preserves
+/// anonymous-function name inference (`using f = function(){}` names `f`).
+fn emitUsingDecl(p: *Parser, node: *Node, stack_name: []const u8, out: *std.ArrayList(*Node)) bool {
     const vd = node.data.var_decl;
     const s = node.start;
-    const callee = uIdent(p, "__usingAdd__", s) orelse return null;
+    const let_decl = p.makeNode(.var_decl, s, node.end, .{ .var_decl = .{ .kind = .let, .name = vd.name, .init = vd.init } }) orelse return false;
+    out.append(p.arena, let_decl) catch return false;
     var argv = std.ArrayList(*Node){};
-    argv.append(p.arena, uIdent(p, stack_name, s) orelse return null) catch return null;
-    argv.append(p.arena, vd.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null)) catch return null;
-    argv.append(p.arena, p.makeNode(.bool_literal, s, s, .{ .bool_literal = vd.using_kind == .await_using_ }) orelse return null) catch return null;
-    const call = p.makeNode(.call_expr, s, node.end, .{ .call_expr = .{ .callee = callee, .args = argv.items } }) orelse return null;
-    return p.makeNode(.var_decl, s, node.end, .{ .var_decl = .{ .kind = .let, .name = vd.name, .init = call } });
+    argv.append(p.arena, uIdent(p, stack_name, s) orelse return false) catch return false;
+    argv.append(p.arena, uIdent(p, vd.name, s) orelse return false) catch return false;
+    argv.append(p.arena, p.makeNode(.bool_literal, s, s, .{ .bool_literal = vd.using_kind == .await_using_ }) orelse return false) catch return false;
+    const call = p.makeNode(.call_expr, s, node.end, .{ .call_expr = .{
+        .callee = uIdent(p, "__usingAdd__", s) orelse return false,
+        .args = argv.items,
+    } }) orelse return false;
+    // Bind the registration into a throwaway `let` rather than an expression
+    // statement: a Declaration has an empty completion, so a using-only block
+    // still yields the running value (`eval('4; {using x = null;}')` === 4)
+    // rather than the resource value. The name is unique because using bindings
+    // in a scope are themselves unique.
+    const reg_name = std.fmt.allocPrint(p.arena, "__using_reg_{s}__", .{vd.name}) catch return false;
+    out.append(p.arena, p.makeNode(.var_decl, s, node.end, .{ .var_decl = .{ .kind = .let, .name = reg_name, .init = call } }) orelse return false) catch return false;
+    return true;
 }
 
-/// Rewrite one statement of a using scope: `using` declarations (including the
-/// multi-declarator transparent container) become plain `let` bindings that
-/// register the resource; everything else passes through unchanged.
-fn rewriteUsingStmt(p: *Parser, node: *Node, stack_name: []const u8) ?*Node {
+/// Expand one statement of a using scope into `out`: `using` declarations
+/// (including the multi-declarator transparent container) expand to a `let` plus
+/// an `__usingAdd__` registration; everything else passes through unchanged.
+fn expandUsingStmt(p: *Parser, node: *Node, stack_name: []const u8, out: *std.ArrayList(*Node)) bool {
     if (node.kind == .var_decl and node.data.var_decl.using_kind != .none) {
-        return rewriteUsingDecl(p, node, stack_name);
+        return emitUsingDecl(p, node, stack_name, out);
     }
     if (node.kind == .block_stmt and !node.data.block_stmt.lexical_scope) {
         var any = false;
@@ -635,18 +651,18 @@ fn rewriteUsingStmt(p: *Parser, node: *Node, stack_name: []const u8) ?*Node {
             if (c.kind == .var_decl and c.data.var_decl.using_kind != .none) any = true;
         }
         if (any) {
-            var out = std.ArrayList(*Node){};
             for (node.data.block_stmt.body) |c| {
-                const nc = if (c.kind == .var_decl and c.data.var_decl.using_kind != .none)
-                    (rewriteUsingDecl(p, c, stack_name) orelse return null)
-                else
-                    c;
-                out.append(p.arena, nc) catch return null;
+                if (c.kind == .var_decl and c.data.var_decl.using_kind != .none) {
+                    if (!emitUsingDecl(p, c, stack_name, out)) return false;
+                } else {
+                    out.append(p.arena, c) catch return false;
+                }
             }
-            return p.makeNode(.block_stmt, node.start, node.end, .{ .block_stmt = .{ .body = out.items, .lexical_scope = false } });
+            return true;
         }
     }
-    return node;
+    out.append(p.arena, node) catch return false;
+    return true;
 }
 
 /// Wrap a statement list that contains `using`/`await using` declarations so its
@@ -666,7 +682,7 @@ pub fn desugarUsingScope(p: *Parser, body: []const *Node, start: u32) ?[]*Node {
     // Rewrite the original statements into the inner try body.
     var inner_body = std.ArrayList(*Node){};
     for (body) |c| {
-        inner_body.append(p.arena, rewriteUsingStmt(p, c, stack_name) orelse return null) catch return null;
+        if (!expandUsingStmt(p, c, stack_name, &inner_body)) return null;
     }
     const inner_block = p.makeNode(.block_stmt, s, s, .{ .block_stmt = .{ .body = inner_body.items, .lexical_scope = true } }) orelse return null;
 
