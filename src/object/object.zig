@@ -766,11 +766,14 @@ pub const JsObject = struct {
         if (self.extensible) return false;
         // A frozen array must have a non-writable "length".
         if (self.is_array and self.array_length_writable) return false;
+        // A frozen object's DATA properties must be non-writable; an accessor
+        // property has no [[Writable]] attribute, so only its configurability
+        // matters (a stray writable=true on an accessor slot must be ignored).
         for (self.attrs.items) |a| {
-            if (a.configurable or a.writable) return false;
+            if (a.configurable or (!a.is_accessor and a.writable)) return false;
         }
         for (self.sym_props.items) |sp| {
-            if (sp.attr.configurable or sp.attr.writable) return false;
+            if (sp.attr.configurable or (!sp.attr.is_accessor and sp.attr.writable)) return false;
         }
         return true;
     }
