@@ -216,7 +216,9 @@ fn flattenInto(
         if (!try genHas(arena, source, i)) continue;
         var elem = try genGet(arena, source, i);
         if (mapper) |m| elem = try callCb(arena, m, mapper_this, elem, @floatFromInt(i), source);
-        const is_arr = elem.bits != 0 and elem.unbox() == .object and elem.toPtr().object.is_array;
+        // §23.1.3.13.1 step 8.c uses IsArray, which unwraps Proxies (and throws on
+        // a revoked one) — a Proxy for an array must still be flattened.
+        const is_arr = try isArraySpec(arena, elem);
         if (depth > 0 and is_arr) {
             const el_len = try genLength(arena, elem);
             try flattenInto(arena, target, elem, el_len, depth - 1, ni, null, mapper_this);

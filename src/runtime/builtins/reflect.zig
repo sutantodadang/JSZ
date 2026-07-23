@@ -165,7 +165,7 @@ fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .bc_function, .native_function => true,
-        .object => |o| switch (o.internal_kind) {
+        .object => |o| if (o.is_callable_intrinsic) true else switch (o.internal_kind) {
             .bound_function => true,
             // A Proxy is callable iff its (possibly nested) target is callable.
             // A revoked proxy has no target → not callable.
@@ -480,6 +480,17 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
         while (cur) |o| {
             if (depth >= 64) break;
             depth += 1;
+            // A Proxy anywhere in the chain has its own [[HasProperty]] — symbol
+            // keys go through the `has` trap exactly like string keys do.
+            if (o.internal_kind == .proxy) {
+                const handler = proxy_mod.proxyHandler(o) orelse return proxy_mod.throwRevoked(arena);
+                const target = proxy_mod.proxyTarget(o) orelse return proxy_mod.throwRevoked(arena);
+                if (try proxy_mod.getTrap(arena, handler, "has")) |trap_fn| {
+                    const res = try fp.invokeCallback(arena, handler, trap_fn, &[_]Value{ target, key });
+                    return val_mod.makeBool(arena, descTruthy(res));
+                }
+                return nativeReflectHas(arena, .{}, &[_]Value{ target, key });
+            }
             if (o.getOwnSym(key) != null) return val_mod.makeBool(arena, true);
             cur = o.proto;
         }
@@ -525,7 +536,11 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
             }
             return nativeReflectHas(arena, .{}, &[_]Value{ target, key });
         }
-        if (o.resolveOwnSlot(k) != null) return val_mod.makeBool(arena, true);
+        // `hasOwn` (not `resolveOwnSlot`) so dense array elements — which live
+        // outside the shape's key_to_slot map — are found; `length` on an Array
+        // exotic is likewise not a shape key.
+        if (o.hasOwn(k) or (o.is_array and std.mem.eql(u8, k, "length")))
+            return val_mod.makeBool(arena, true);
         cur = o.proto;
     }
     return val_mod.makeBool(arena, false);

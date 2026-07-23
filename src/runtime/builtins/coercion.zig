@@ -34,7 +34,7 @@ pub fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
-        .object => |obj| obj.internal_kind == .bound_function,
+        .object => |obj| obj.is_callable_intrinsic or obj.internal_kind == .bound_function,
         else => false,
     };
 }

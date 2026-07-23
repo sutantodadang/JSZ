@@ -208,6 +208,7 @@ pub fn isCallableFn(v: Value) bool {
     return switch (v.unbox()) {
         .native_function, .bc_function, .function => true,
         .object => |o| {
+            if (o.is_callable_intrinsic) return true;
             if (o.internal_kind == .bound_function) return true;
             if (o.internal_kind == .proxy) {
                 if (realm_mod.active_sym_proxy_target) |sym| {

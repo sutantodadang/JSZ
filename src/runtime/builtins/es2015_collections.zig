@@ -1863,7 +1863,7 @@ fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .native_function, .bc_function, .function => true,
-        .object => |o| o.get("__call__") != null or o.internal_kind == .bound_function,
+        .object => |o| o.is_callable_intrinsic or o.get("__call__") != null or o.internal_kind == .bound_function,
         else => false,
     };
 }

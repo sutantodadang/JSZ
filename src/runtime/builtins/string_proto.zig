@@ -854,7 +854,7 @@ fn isCallable(v: Value) bool {
         // A built-in constructor object (and the Annex B `document.all` stand-in)
         // keeps its [[Call]] behind the `__call__` slot; `invokeCallback` routes
         // both through the VM, so IsCallable has to agree.
-        .object => |obj| obj.internal_kind == .bound_function or obj.get("__call__") != null,
+        .object => |obj| obj.is_callable_intrinsic or obj.internal_kind == .bound_function or obj.get("__call__") != null,
         else => false,
     };
 }

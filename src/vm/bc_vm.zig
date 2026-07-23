@@ -505,6 +505,9 @@ pub const BcVm = struct {
                 // parent reaches here; returning a blank exception (the old
                 // behaviour) silently dropped a genuine throw (e.g. a RangeError
                 // from a TypedArray ctor when a resizable buffer shrank mid-call).
+                // %Function.prototype% is callable and returns undefined for any
+                // arguments (§20.2.3).
+                if (obj.is_callable_intrinsic) return try val_mod.makeUndefined(self.arena);
                 if (obj.get("__call__")) |cv| {
                     if (cv.bits != 0 and cv.unbox() == .native_function) {
                         // A non-constructor callable object (no `prototype`, e.g. a
@@ -668,6 +671,11 @@ pub const BcVm = struct {
                     var nt = new_target;
                     if (nt.bits != 0 and nt.unbox() == .object and nt.toPtr().object == o) nt = bd.target;
                     return try self.constructImpl(bd.target, combined, nt);
+                }
+                // %Function.prototype% has [[Call]] but no [[Construct]].
+                if (o.is_callable_intrinsic) {
+                    realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                    return error.JsException;
                 }
                 if (o.get("__call__")) |cv| {
                     if (cv.bits != 0 and cv.unbox() == .native_function) {
@@ -1828,6 +1836,11 @@ pub const BcVm = struct {
                     self.last_exception_value = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
                     return "__js_exception__";
                 }
+                // %Function.prototype% is callable but has no [[Construct]].
+                if (obj.is_callable_intrinsic) {
+                    self.last_exception_value = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
+                    return "__js_exception__";
+                }
                 // Error constructor object: has __call__ and prototype.
                 if (obj.get("__call__")) |call_val| {
                     if (call_val.bits != 0 and call_val.unbox() == .native_function) {
@@ -2021,7 +2034,7 @@ pub const BcVm = struct {
         if (v.bits == 0) return false;
         return switch (v.unbox()) {
             .function, .native_function, .bc_function => true,
-            .object => |obj| obj.internal_kind == .bound_function,
+            .object => |obj| obj.is_callable_intrinsic or obj.internal_kind == .bound_function,
             else => false,
         };
     }
@@ -3164,14 +3177,26 @@ pub const BcVm = struct {
                         _ = try self.callAccessor(setter, receiver, &[_]Value{value});
                         return true;
                     }
+                    // Data property. A non-writable ownDesc fails the assignment
+                    // outright (§10.1.9.2 step 2.a) — including when it is inherited,
+                    // which must NOT be shadowed by a new own property.
+                    if (!a.writable) return false;
+                    // Steps 2.c-e: when Receiver is not O the write lands on the
+                    // Receiver, through *its* [[GetOwnProperty]]/[[DefineOwnProperty]].
+                    // For a Proxy Receiver that means its traps run.
+                    if (!sameObject(receiver, obj))
+                        return try self.ordinarySetReceiverWrite(receiver, key, value);
                     if (loc.holder == obj) {
-                        if (loc.slot < obj.attrs.items.len and !obj.attrs.items[loc.slot].writable) return false;
                         _ = obj.setOwnBySlot(obj.shapePtr(), loc.slot, value);
                         mirrorGlobalObjectWrite(obj, key, value);
                         return true;
                     }
                     // inherited data property: fall through to create an own (shadow).
                 }
+                // No property found anywhere: ownDesc is the default writable data
+                // descriptor, so this is still CreateDataProperty(Receiver, …).
+                if (!sameObject(receiver, obj))
+                    return try self.ordinarySetReceiverWrite(receiver, key, value);
                 // Creating a new own property (no own data/accessor reached above)
                 // requires the receiver to be extensible; otherwise the assignment
                 // fails (sloppy: silent no-op; strict: caller throws TypeError).
@@ -3244,18 +3269,62 @@ pub const BcVm = struct {
         return true;
     }
 
-    /// CreateDataProperty on a Proxy Receiver: dispatch the `defineProperty` trap
-    /// with a full data descriptor, or forward to the target when no trap exists.
+    /// OrdinarySetWithOwnDescriptor steps 2.c-e with a Proxy as the Receiver: read
+    /// the Receiver's own descriptor (`getOwnPropertyDescriptor` trap), then write
+    /// through its `defineProperty` trap — with a value-only descriptor when the
+    /// property already exists, a full data descriptor (CreateDataProperty) when
+    /// it does not.
     fn proxyDefineDataProperty(self: *BcVm, proxy_obj: *JsObject, key: []const u8, value: Value) anyerror!bool {
         const handler = proxy_mod.proxyHandler(proxy_obj) orelse return false;
         const target = proxy_mod.proxyTarget(proxy_obj) orelse return false;
+        const key_v = try val_mod.makeString(self.arena, key);
+
+        // Step 2.c: existingDescriptor = ? Receiver.[[GetOwnProperty]](P).
+        var has_existing = false;
+        var existing_accessor = false;
+        var existing_writable = true;
+        if (try proxy_mod.proxyGetOwnPropertyDescriptor(self.arena, proxy_obj, key_v)) |d| {
+            if (d.bits != 0 and d.unbox() == .object) {
+                has_existing = true;
+                const eo = d.toPtr().object;
+                existing_accessor = eo.getOwn("get") != null or eo.getOwn("set") != null;
+                if (eo.getOwn("writable")) |w| existing_writable = val_mod.toBoolean(w);
+            }
+        } else if (target.bits != 0 and target.unbox() == .object) {
+            // No trap → the target's ordinary [[GetOwnProperty]].
+            const to = target.toPtr().object;
+            if (to.resolveOwnSlot(key)) |slot| {
+                has_existing = true;
+                const a = to.attrAt(slot);
+                existing_accessor = a.is_accessor;
+                existing_writable = a.writable;
+            } else if (to.hasOwn(key)) {
+                has_existing = true;
+            }
+        }
+        // Steps 2.d.i/ii: an accessor, or a non-writable data property, fails.
+        if (has_existing and (existing_accessor or !existing_writable)) return false;
+
         if (try proxy_mod.getTrap(self.arena, handler, "defineProperty")) |trap_fn| {
-            const key_v = try val_mod.makeString(self.arena, key);
-            const desc = try self.makeDataDescriptor(value);
+            const desc = if (has_existing)
+                try self.makeValueOnlyDescriptor(value)
+            else
+                try self.makeDataDescriptor(value);
             const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v, desc });
             return isTruthy(res);
         }
         return try self.ordinarySetReceiverWrite(target, key, value);
+    }
+
+    /// Build `{ value }` — the descriptor OrdinarySetWithOwnDescriptor step 2.d.iii
+    /// hands to [[DefineOwnProperty]] when the property already exists.
+    fn makeValueOnlyDescriptor(self: *BcVm, value: Value) !Value {
+        const o = if (self.heap) |heap|
+            try JsObject.createOnHeap(heap, self.realm.object_prototype)
+        else
+            try JsObject.create(self.arena, self.realm.object_prototype);
+        try o.set("value", value);
+        return val_mod.makeObject(self.arena, o);
     }
 
     /// Build `{ value, writable: true, enumerable: true, configurable: true }`.
@@ -3775,6 +3844,16 @@ pub const BcVm = struct {
                         return null;
                     }
                 }
+                // %Function.prototype%(...) → undefined, whatever the arguments.
+                if (obj.is_callable_intrinsic) {
+                    const undef = try val_mod.makeUndefined(self.arena);
+                    if (self.frames.items.len > 0) {
+                        self.frames.items[self.frames.items.len - 1].registers[ret_dst] = undef;
+                    } else {
+                        self.result = undef;
+                    }
+                    return null;
+                }
                 if (obj.get("__call__")) |call_val| {
                     if (call_val.bits != 0 and call_val.unbox() == .native_function) {
                         const fn_ptr = call_val.toPtr().native_function;
@@ -4012,6 +4091,16 @@ pub const BcVm = struct {
                 // resolve/reject function) reached via a member call
                 // `obj.method(...)`. Mirror `doCall`: the native receives the
                 // callable object itself as `this` so it can read its internal slot.
+                // `obj.fnProto(...)` where the method is %Function.prototype%.
+                if (obj.is_callable_intrinsic) {
+                    const undef = try val_mod.makeUndefined(self.arena);
+                    if (self.frames.items.len > 0) {
+                        self.frames.items[self.frames.items.len - 1].registers[ret_dst] = undef;
+                    } else {
+                        self.result = undef;
+                    }
+                    return null;
+                }
                 if (obj.get("__call__")) |call_val| {
                     if (call_val.bits != 0 and call_val.unbox() == .native_function) {
                         const fn_ptr = call_val.toPtr().native_function;
@@ -5177,6 +5266,7 @@ fn isCallableValue(v: Value) bool {
     return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
         .object => |obj| {
+            if (obj.is_callable_intrinsic) return true;
             if (obj.internal_kind == .bound_function or obj.get("__call__") != null) return true;
             if (obj.internal_kind == .proxy) {
                 if (proxy_mod.proxyTarget(obj)) |t| return isCallableValue(t);

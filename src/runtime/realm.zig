@@ -1257,7 +1257,7 @@ fn isCallableValue(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
-        .object => |o| o.get("__call__") != null,
+        .object => |o| o.is_callable_intrinsic or o.get("__call__") != null,
         else => false,
     };
 }
@@ -1846,7 +1846,7 @@ fn isCallableVal(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .native_function, .bc_function, .function => true,
-        .object => |o| o.get("__call__") != null,
+        .object => |o| o.is_callable_intrinsic or o.get("__call__") != null,
         else => false,
     };
 }
@@ -1895,7 +1895,7 @@ fn faIsConstructor(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .bc_function => true,
-        .object => |o| o.get("__call__") != null or
+        .object => |o| o.is_callable_intrinsic or o.get("__call__") != null or
             o.internal_kind == .bound_function or
             o.internal_kind == .proxy,
         else => false,
@@ -3582,9 +3582,10 @@ pub fn nativeObjectProtoToString(arena: std.mem.Allocator, this_val: Value, _: [
             "Array"
         else if (obj.internal_kind == .mapped_arguments)
             "Arguments"
-        else if (obj.get("__call__") != null or obj.internal_kind == .bound_function)
-            // A bound function is callable but carries no `__call__` slot, so it
-            // needs its own check to get the reserved "Function" tag.
+        else if (obj.is_callable_intrinsic or obj.get("__call__") != null or obj.internal_kind == .bound_function)
+            // A bound function (and %Function.prototype%) is callable but carries
+            // no `__call__` slot, so each needs its own check to get the reserved
+            // "Function" tag.
             "Function"
         else if (obj.is_error)
             "Error"
@@ -4644,12 +4645,13 @@ pub const Realm = struct {
         // ("") are non-writable, non-enumerable, configurable data properties.
         _ = try function_proto.defineOwnData("length", try val_mod.makeNumber(arena, 0), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try function_proto.defineOwnData("name", try val_mod.makeString(arena, ""), .{ .writable = false, .enumerable = false, .configurable = true });
-        // NOTE: §20.2.3 makes %Function.prototype% a callable built-in function
-        // object. jsz still models it as a plain object, because the only
-        // available [[Call]] hook (a `__call__` slot) is found by a prototype
-        // chain walk -- which would make %GeneratorFunction.prototype% and every
-        // other object inheriting from it report `typeof === "function"` too.
-        // Marking it callable needs a brand checked at each IsCallable site.
+        // §20.2.3: %Function.prototype% is a callable built-in function object
+        // that accepts any arguments and returns undefined. It cannot advertise
+        // that with a `__call__` slot -- that slot is found by a prototype-chain
+        // walk, so %GeneratorFunction.prototype% and every other inheritor would
+        // report `typeof === "function"` too. `is_callable_intrinsic` is the
+        // own-object brand each IsCallable site checks instead.
+        function_proto.is_callable_intrinsic = true;
         active_function_proto = function_proto;
 
         // R1: shared registration context for self-registering builtins (each
