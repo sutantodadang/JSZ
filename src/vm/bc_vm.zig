@@ -353,12 +353,18 @@ pub const BcVm = struct {
         if (fn_ptr.is_strict) return this_val;
         const realm_m = @import("../runtime/realm.zig");
         if (this_val.bits == 0 or this_val.isUndefined() or this_val.isNull()) {
+            // A sloppy function's undefined/null `this` becomes its OWN realm's
+            // global object. Prefer the closure's realm; fall back to the running
+            // VM's realm (reliable even when `closure.realm`/`active_global_env`
+            // are unset, e.g. the top-level CommonJS module wrapper).
             if (closure.realm) |r_opaque| {
                 const fr = @as(*Realm, @ptrCast(@alignCast(r_opaque)));
-                return fr.global_env.lookup("globalThis") catch this_val;
+                if (fr.global_env.lookup("globalThis")) |g| return g else |_| {}
             }
-            if (realm_m.active_global_env) |genv| return genv.lookup("globalThis") catch this_val;
-            return this_val;
+            if (realm_m.active_global_env) |genv| {
+                if (genv.lookup("globalThis")) |g| return g else |_| {}
+            }
+            return self.realm.global_env.lookup("globalThis") catch this_val;
         }
         return realm_m.toObjectForThis(self.arena, this_val);
     }
@@ -1596,6 +1602,7 @@ pub const BcVm = struct {
                 .ARRAY_APPEND_HOLE => if (try object_ops.opArrayAppendHole(self, frame)) |o| return o,
                 .GET_PROP => if (try property_ops.opGetProp(self, frame)) |o| return o,
                 .GET_PROP_DYN => if (try property_ops.opGetPropDyn(self, frame)) |o| return o,
+                .TO_PROPERTY_KEY => if (try property_ops.opToPropertyKey(self, frame)) |o| return o,
                 .SET_PROP => if (try property_ops.opSetProp(self, frame)) |o| return o,
                 .DEFINE_PRIVATE => if (try property_ops.opDefinePrivate(self, frame)) |o| return o,
                 .SET_PROP_DYN => if (try property_ops.opSetPropDyn(self, frame)) |o| return o,

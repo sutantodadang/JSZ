@@ -196,6 +196,11 @@ pub const Parser = struct {
     /// M16 Phase 5: name hint set by parseExportDecl for `export default class/function`
     /// anonymous expressions, consumed by parseClassExpr / parseFunctionExpr.
     export_default_name_hint: ?[]const u8,
+    /// True while parsing the operand of a `delete`. Keeps an immediate
+    /// `super.x` / `super[e]` a raw super member (instead of desugaring the read to
+    /// `Reflect.get`) so the compiler emits the spec ReferenceError for
+    /// `delete super.x` (§13.5.1.2 IsSuperReference).
+    in_delete_operand: bool = false,
     /// M16 TLA: set when an `await` is parsed at module top level (function
     /// nesting depth 0). The module then has top-level await and its top-level
     /// program is compiled/driven as an async body (real per-await suspension).

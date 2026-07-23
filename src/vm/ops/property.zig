@@ -30,6 +30,18 @@ inline fn canonicalIndexFromValue(v: Value) ?u32 {
     return @intFromFloat(n);
 }
 
+/// ToPropertyKey for a dynamic member access whose key is an OBJECT: run
+/// ToPrimitive(key, string) — invoking the user's @@toPrimitive / toString /
+/// valueOf, which may throw — and return the resulting primitive (string or
+/// symbol). Non-object keys are returned unchanged. This must run BEFORE the
+/// [[Get]]/[[Set]] so a throwing key coercion is observed at the right point in
+/// evaluation order (§13.3.3 EvaluatePropertyAccessWithExpressionKey). The
+/// caller is responsible for re-fetching a possibly-stale `frame` afterward.
+fn coerceObjectKey(self: *BcVm, key_val: Value) anyerror!Value {
+    if (key_val.bits == 0 or key_val.unbox() != .object) return key_val;
+    return (try @import("../../runtime/builtins/coercion.zig").toPrimitive(self.arena, key_val, .string)) orelse key_val;
+}
+
 /// Raise the strict-mode TypeError for a failed property assignment ([[Set]]
 /// returned false). Returns a non-null RunOutcome only when the throw escapes
 /// the current frame uncaught; null means a handler caught it.
@@ -204,6 +216,34 @@ pub inline fn opGetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             "";
         return nullishReadThrow(self, obj_val, key_desc);
     }
+    // ToPropertyKey: an object key is coerced via ToPrimitive(string) — running
+    // user @@toPrimitive/toString/valueOf (may throw) — BEFORE the [[Get]].
+    // Handled in its own return path since coercion may reallocate frames.
+    if (key_val.bits != 0 and key_val.unbox() == .object) {
+        const fidx_k = self.frames.items.len - 1;
+        const prim = coerceObjectKey(self, key_val) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in toPrimitive")) |oc| return oc;
+            return null;
+        };
+        if (prim.bits != 0 and prim.unbox() == .symbol) {
+            const sym_res = self.getPropSym(obj_val, prim) catch |e| {
+                if (e != error.JsException) return e;
+                if (try self.raisePendingException("error in getter")) |oc| return oc;
+                return null;
+            };
+            self.frames.items[fidx_k].registers[rdst] = sym_res;
+            return null;
+        }
+        const key_s = try bcv.valueToStringArena(self.arena, prim);
+        const res_k = self.getProp(obj_val, key_s) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in getter")) |oc| return oc;
+            return null;
+        };
+        self.frames.items[fidx_k].registers[rdst] = res_k;
+        return null;
+    }
     if (key_val.bits != 0 and key_val.unbox() == .string) {
         const key = key_val.toPtr().string;
         const site_cache = &@constCast(frame.func.ic_table)[site_pc];
@@ -305,6 +345,35 @@ pub inline fn opGetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             return null;
         };
         self.frames.items[frame_idx_dyn2].registers[rdst] = result_dyn2;
+    }
+    return null;
+}
+
+/// TO_PROPERTY_KEY Rkey: coerce R[Rkey] to a property key in place. An object
+/// key runs ToPrimitive(string) — user @@toPrimitive/toString/valueOf, exactly
+/// once — and the string/symbol result replaces the register. Non-object keys
+/// pass through untouched. Lets a compound/logical assignment share one key
+/// evaluation between its read and write.
+pub inline fn opToPropertyKey(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const rkey = code[frame.pc];
+    frame.pc += 1;
+    const key_val = frame.registers[rkey];
+    if (key_val.bits == 0 or key_val.unbox() != .object) return null;
+    const fidx = self.frames.items.len - 1;
+    const prim = coerceObjectKey(self, key_val) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error in toPrimitive")) |oc| return oc;
+        return null;
+    };
+    // A symbol key stays a symbol; any other primitive is stringified so the
+    // downstream GET_PROP_DYN/SET_PROP_DYN string path handles it directly.
+    const fr = &self.frames.items[fidx];
+    if (prim.bits != 0 and prim.unbox() == .symbol) {
+        fr.registers[rkey] = prim;
+    } else {
+        const s = try bcv.valueToStringArena(self.arena, prim);
+        fr.registers[rkey] = try val_mod.makeString(self.arena, s);
     }
     return null;
 }
@@ -538,6 +607,38 @@ pub inline fn opSetPropDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         else
             "";
         return nullishWriteThrow(self, obj_val, key_desc);
+    }
+    // ToPropertyKey: an object key runs ToPrimitive(string) — user
+    // @@toPrimitive/toString/valueOf (may throw) — BEFORE the [[Set]]. Its own
+    // return path; coercion may reallocate frames, so capture strictness first.
+    if (key_val.bits != 0 and key_val.unbox() == .object) {
+        const set_key_strict = frame.func.is_strict;
+        const prim = coerceObjectKey(self, key_val) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in toPrimitive")) |oc| return oc;
+            return null;
+        };
+        if (prim.bits != 0 and prim.unbox() == .symbol) {
+            const sym_ok = self.setPropSymChecked(obj_val, prim, val) catch |e| {
+                if (e != error.JsException) return e;
+                if (try self.raisePendingException("error in setter")) |oc| return oc;
+                return null;
+            };
+            if (!sym_ok and set_key_strict) {
+                if (try strictAssignThrow(self)) |oc| return oc;
+            }
+            return null;
+        }
+        const key_s = try bcv.valueToStringArena(self.arena, prim);
+        const set_key_ok = self.setPropR(obj_val, key_s, val, obj_val) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in setter")) |oc| return oc;
+            return null;
+        };
+        if (!set_key_ok and set_key_strict) {
+            if (try strictAssignThrow(self)) |oc| return oc;
+        }
+        return null;
     }
     if (key_val.bits != 0 and key_val.unbox() == .string) {
         const key = key_val.toPtr().string;

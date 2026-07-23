@@ -238,9 +238,10 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         }
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
-        // NamedEvaluation: `x = class {}` names the anonymous class after the
-        // target (see parseAssignmentExprCore for the mirror case).
-        const set_class_hint = op == .assign and left.kind == .identifier and
+        // NamedEvaluation: `x = class {}` — and the logical assignments
+        // `x &&= class{}` / `x ||= class{}` / `x ??= class{}` (§13.15.2) — name the
+        // anonymous class after the target (see parseAssignmentExprCore mirror).
+        const set_class_hint = isNamedEvalAssignOp(op) and left.kind == .identifier and
             p.check(.kw_class) and p.export_default_name_hint == null;
         if (set_class_hint) p.export_default_name_hint = left.data.identifier;
         const right = p.parseAssignmentExpr() orelse return null;
@@ -403,9 +404,10 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         const op = tokenToAssignOp(p.current.kind);
         _ = p.advance();
         // NamedEvaluation: `x = class {}` (simple `=` to an IdentifierReference)
-        // names the anonymous class after the target. Threaded to parseClassExpr
-        // via the parser hint since the class desugars to an IIFE.
-        const set_class_hint = op == .assign and left.kind == .identifier and
+        // and the logical assignments `x &&=/||=/??= class{}` (§13.15.2) name the
+        // anonymous class after the target. Threaded to parseClassExpr via the
+        // parser hint since the class desugars to an IIFE.
+        const set_class_hint = isNamedEvalAssignOp(op) and left.kind == .identifier and
             p.check(.kw_class) and p.export_default_name_hint == null;
         if (set_class_hint) p.export_default_name_hint = left.data.identifier;
         const right = p.parseAssignmentExpr() orelse return null; // right-assoc
@@ -1184,7 +1186,20 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
     }
     // Prefix unary
     switch (p.current.kind) {
-        .bang, .tilde, .minus, .plus, .kw_typeof, .kw_void, .kw_delete => {
+        .kw_delete => {
+            _ = p.advance();
+            // Keep an immediate `super.x`/`super[e]` a raw super reference so the
+            // compiler throws the spec ReferenceError; a chained `delete super.x.y`
+            // still rewrites the inner super read normally.
+            const saved_del = p.in_delete_operand;
+            p.in_delete_operand = true;
+            const operand = p.parseUnaryExpr() orelse return null;
+            p.in_delete_operand = saved_del;
+            return p.makeNode(.unary_expr, start, p.current.start, .{
+                .unary_expr = .{ .op = .delete_, .operand = operand },
+            });
+        },
+        .bang, .tilde, .minus, .plus, .kw_typeof, .kw_void => {
             const op_kind = p.current.kind;
             _ = p.advance();
             const operand = p.parseUnaryExpr() orelse return null;
@@ -1545,6 +1560,11 @@ fn rewriteSuperPropRead(p: *Parser, me_node: *Node) ?*Node {
 /// (member-based) handling we leave untouched.
 fn superReadFollows(p: *Parser, obj: *Node) bool {
     if (!(obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "super"))) return false;
+    // `delete super.x` / `delete super[e]`: this super member is the delete target
+    // and must stay a raw super reference (the compiler throws ReferenceError). A
+    // chained `delete super.x.y` has a `.`/`[` next, so the inner read still
+    // rewrites — only the whole-operand form is a Super Reference.
+    if (p.in_delete_operand and p.current.kind != .dot and p.current.kind != .left_bracket) return false;
     return switch (p.current.kind) {
         .left_paren, .plus_plus, .minus_minus => false,
         else => !isAssignOp(p.current.kind),
@@ -1554,7 +1574,20 @@ fn superReadFollows(p: *Parser, obj: *Node) bool {
 /// Parse a member expression without call expressions (for `new` callee).
 /// Handles dot and bracket access but NOT `(` argument lists.
 pub fn parseNewCallee(p: *Parser) ?*Node {
-    var base = p.parsePrimaryExpr() orelse return null;
+    // A nested `new` is itself a valid MemberExpression callee (§13.3
+    // `MemberExpression : new MemberExpression Arguments`): `new new C()` has the
+    // outer `new` apply to the inner `new C()`. Parse the inner callee and its own
+    // optional Arguments recursively, then continue with member access below.
+    var base: *Node = if (p.check(.kw_new) and p.peekNext().kind != .dot) blk: {
+        const nstart = p.current.start;
+        _ = p.advance(); // consume inner `new`
+        const inner_callee = p.parseNewCallee() orelse return null;
+        var inner_args: []*Node = &[_]*Node{};
+        if (p.check(.left_paren)) inner_args = p.parseArgs() orelse return null;
+        break :blk p.makeNode(.new_expr, nstart, p.current.start, .{
+            .new_expr = .{ .callee = inner_callee, .args = inner_args },
+        }) orelse return null;
+    } else p.parsePrimaryExpr() orelse return null;
     while (true) {
         if (p.match(.dot)) {
             const prop_tok = p.expectIdentifierName() orelse return null;
@@ -2488,6 +2521,17 @@ fn parseRegexRaw(raw: []const u8) RegexRaw {
     }
     // Unterminated — return body sans opening slash
     return .{ .pattern = raw[1..], .flags = "" };
+}
+
+/// The assignment operators whose RHS is subject to NamedEvaluation when it is an
+/// anonymous function/class definition and the LHS is an IdentifierReference:
+/// simple `=` (§13.15.2) and the logical assignments `&&= ||= ??=`. The other
+/// compound assignments (`+=`, …) never trigger NamedEvaluation.
+fn isNamedEvalAssignOp(op: ast.AssignOp) bool {
+    return switch (op) {
+        .assign, .logical_and, .logical_or, .logical_nullish => true,
+        else => false,
+    };
 }
 
 fn tokenToAssignOp(kind: @import("../lexer/token.zig").TokenKind) ast.AssignOp {

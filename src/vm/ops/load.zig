@@ -15,6 +15,28 @@ const Value = val_mod.Value;
 const Environment = @import("../../runtime/execution_context.zig").Environment;
 const realm_mod = @import("../../runtime/realm.zig");
 
+/// True for the runtime/ESM-desugar helper globals that the CommonJS/module
+/// prelude installs via DEFINE_GLOBAL in *script* context. These must stay
+/// invisible on `globalThis` (they are engine internals, not user declarations).
+/// A USER top-level `var`/function whose name merely starts with `__` (e.g. the
+/// legacy test262 `__func`/`__MONSTER` idiom) is NOT reserved and mirrors to the
+/// global object normally — so `delete __func` correctly returns false.
+fn isReservedRuntimeGlobal(name: []const u8) bool {
+    if (name.len < 3 or name[0] != '_' or name[1] != '_') return false;
+    const reserved = [_][]const u8{
+        "__modules__",       "__module_id__",      "__moduleStatus__",   "__moduleGraph__",
+        "__moduleUnresolved__", "__exportStar__",  "__exportStarGetter__", "__starRoot__",
+        "__ambMap__",        "__deferGather__",    "__liveReexport__",   "__liveLocalExport__",
+        "__readyForSync__",  "__esm_hoist_point__", "__esm_hoist_point_no_se__", "__awaitDeps__",
+        "__entry__",         "__initExports__",    "__initModuleExports__", "__evalError__",
+        "__jszModuleReject__", "__import_meta__",  "__backing__",
+    };
+    for (reserved) |r| {
+        if (std.mem.eql(u8, name, r)) return true;
+    }
+    return false;
+}
+
 /// Resolve `name` as an own property of the running scope's global object
 /// (`globalThis`). This backs the global-environment-record semantics: a binding
 /// installed via `globalThis.x = v` (or otherwise added to the global object) is
@@ -68,7 +90,7 @@ fn mirrorGlobalBindingOptsIn(frame: *BcCallFrame, target: *Environment, name: []
     // ES module top-level declarations live in the Module Environment Record
     // and must NOT become own-properties of the global object (spec §16.2.1.6).
     if (frame.func.is_module) return;
-    if (name.len >= 2 and name[0] == '_' and name[1] == '_') return;
+    if (isReservedRuntimeGlobal(name)) return;
     const gt = frame.env.lookup("globalThis") catch return;
     if (gt.bits == 0 or gt.unbox() != .object) return;
     const obj = gt.toPtr().object;
@@ -276,7 +298,7 @@ pub inline fn opHoistVar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const undef = try val_mod.makeUndefined(self.arena);
     const target = varTargetEnv(frame);
     const shadows_global = target.parent == null and !frame.func.is_module and
-        !(name.len >= 2 and name[0] == '_' and name[1] == '_') and
+        !isReservedRuntimeGlobal(name) and
         !target.bindings.contains(name) and globalObjectHasOwn(frame, name);
     if (!shadows_global) target.hoistVar(name, undef) catch return error.OutOfMemory;
     // ES §9.1.1.4.17 CreateGlobalVarBinding: a top-level `var`/function name in
@@ -725,7 +747,7 @@ pub inline fn opDefineGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 fn mirrorGlobalBindingIn(frame: *BcCallFrame, target: *Environment, name: []const u8, value: Value, configurable: bool) void {
     if (target.parent != null) return;
     if (frame.func.is_module) return;
-    if (name.len >= 2 and name[0] == '_' and name[1] == '_') return;
+    if (isReservedRuntimeGlobal(name)) return;
     const gt = frame.env.lookup("globalThis") catch return;
     if (gt.bits == 0 or gt.unbox() != .object) return;
     const obj = gt.toPtr().object;

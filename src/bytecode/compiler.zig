@@ -1308,6 +1308,18 @@ pub const FnCompiler = struct {
             .logical_and, .logical_or, .logical_nullish => return self.compileLogicalAssign(a, line),
             else => {},
         }
+        // Compound assignment on a plain member target: evaluate base + key
+        // exactly ONCE (one Reference, §13.15.2), read through it, apply the
+        // operator, write through the same reference. compileExpr(target) +
+        // compileMemberWrite would evaluate the base and ToPropertyKey(key)
+        // twice. Super/private/define-data forms keep the older double-eval path.
+        if (a.target.kind == .member_expr) {
+            const me = a.target.data.member_expr;
+            const is_super = me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super");
+            if (!me.private_define and !me.define_data and !is_super) {
+                return try self.compileCompoundMember(a, me, line);
+            }
+        }
         // Compound assignment. Like simple assignment, the target's Reference is
         // resolved once up front; `rref` sits below `rcur` so resetting sp to
         // rcur+1 after the RHS keeps it live for the PUT_REF.
@@ -1351,6 +1363,53 @@ pub const FnCompiler = struct {
             try self.compileMemberWrite(a.target.data.member_expr, rdst, line);
         }
         return rdst;
+    }
+
+    /// Map a compound-assignment operator to its arithmetic/bitwise opcode.
+    fn compoundBinOp(op: ast.AssignOp) Op {
+        return switch (op) {
+            .add => .ADD,
+            .sub => .SUB,
+            .mul => .MUL,
+            .div => .DIV,
+            .mod => .MOD,
+            .exp => .EXP,
+            .bit_and => .BIT_AND,
+            .bit_or => .BIT_OR,
+            .bit_xor => .BIT_XOR,
+            .lshift => .SHL,
+            .rshift => .SHR,
+            .urshift => .USHR,
+            .assign, .logical_and, .logical_or, .logical_nullish => unreachable,
+        };
+    }
+
+    /// `base[key] op= rhs` on a plain (non-super/private) member target. Evaluates
+    /// base and — for a computed key — ToPropertyKey(key) exactly ONCE via a
+    /// PreparedRef, then reads, applies the operator, and writes back through that
+    /// same reference. `rres` is allocated first so the result lands in the lowest
+    /// register (an assignment in argument position must).
+    fn compileCompoundMember(self: *Self, a: ast.AssignExpr, me: ast.MemberExpr, line: u32) error{OutOfMemory}!u8 {
+        const rres = self.allocReg();
+        const pr = (try self.prepareMemberRef(me)) orelse unreachable; // not private
+        // ToPropertyKey once: a computed object key's @@toPrimitive/toString runs
+        // here, not again at the write. Per §13.3.2 GetValue, RequireObjectCoercible
+        // on the base precedes ToPropertyKey — so `null[obj] += x` throws a
+        // TypeError WITHOUT invoking the key's toString.
+        if (pr.rkey) |rk| {
+            try self.emitRequireCoercible(pr.robj, line);
+            try self.emitOp(.TO_PROPERTY_KEY, line);
+            try self.emitU8(rk);
+        }
+        try self.emitPreparedRead(pr, rres, line); // rres = GetValue(ref)
+        const rrhs = try self.compileExpr(a.value);
+        try self.emitOp(compoundBinOp(a.op), line);
+        try self.emitU8(rres);
+        try self.emitU8(rres);
+        try self.emitU8(rrhs);
+        try self.emitPreparedWrite(pr, rres, line); // PutValue(ref, rres)
+        self.sp = rres + 1; // free base/key/rhs; keep the result
+        return rres;
     }
 
     /// Assign the value held in register `rsrc` to a destructuring pattern
@@ -1485,6 +1544,23 @@ pub const FnCompiler = struct {
             return .{ .robj = robj, .kidx = try self.addConstant(sv) };
         }
         return .{ .robj = robj, .rkey = try self.compileExpr(me.property) };
+    }
+
+    /// Read the current value of a prepared member reference into `rdst`,
+    /// mirroring `emitPreparedWrite`. Used by compound/logical assignment so the
+    /// GetValue and PutValue share one base/key evaluation.
+    fn emitPreparedRead(self: *Self, pr: PreparedRef, rdst: u8, line: u32) error{OutOfMemory}!void {
+        if (pr.rkey) |rk| {
+            try self.emitOp(.GET_PROP_DYN, line);
+            try self.emitU8(rdst);
+            try self.emitU8(pr.robj);
+            try self.emitU8(rk);
+        } else {
+            try self.emitOp(.GET_PROP, line);
+            try self.emitU8(rdst);
+            try self.emitU8(pr.robj);
+            try self.emitU16(pr.kidx);
+        }
     }
 
     fn emitPreparedWrite(self: *Self, pr: PreparedRef, rval: u8, line: u32) error{OutOfMemory}!void {
@@ -2032,6 +2108,11 @@ pub const FnCompiler = struct {
             // set dynamically (handles symbol keys).
             if (prop.computed_key) |key_node| {
                 const rkey = try self.compileExpr(key_node);
+                // ES §13.2.5.5 PropertyDefinitionEvaluation: ToPropertyKey runs on
+                // the computed name (EvaluatePropertyKey) BEFORE the value — a key
+                // object's @@toPrimitive/toString is observed first, and exactly once.
+                try self.emitOp(.TO_PROPERTY_KEY, line);
+                try self.emitU8(rkey);
                 const rval = try self.compileExpr(prop.value);
                 // NamedEvaluation with a runtime key: `{[k]: () => {}}`,
                 // `{[k](){}}`, `{get [k](){}}` all name the function after the
