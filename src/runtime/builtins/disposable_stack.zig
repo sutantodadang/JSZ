@@ -95,6 +95,16 @@ fn isCallable(v: Value) bool {
     };
 }
 
+/// True for the values that carry properties / can expose a @@dispose method:
+/// ordinary objects and every function representation (functions are objects).
+fn isObjectLike(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .object, .bc_function, .native_function, .function => true,
+        else => false,
+    };
+}
+
 fn isNullOrUndefined(v: Value) bool {
     if (v.bits == 0) return true;
     return switch (v.unbox()) {
@@ -148,7 +158,7 @@ fn nativeUse(arena: std.mem.Allocator, this_val: Value, args: []const Value) any
     // AddDisposableResource(capability, value, sync-dispose): null/undefined is a
     // no-op; otherwise value must be an Object exposing a callable @@dispose.
     if (!isNullOrUndefined(value)) {
-        if (value.unbox() != .object) return throwType(arena, "value is not disposable (not an object)");
+        if (!isObjectLike(value)) return throwType(arena, "value is not disposable (not an object)");
         const disp_sym = realm_mod.active_sym_dispose orelse return throwType(arena, "Symbol.dispose unavailable");
         const method = (try getMethodSym(arena, value, disp_sym)) orelse
             return throwType(arena, "value is not disposable (no [Symbol.dispose])");
@@ -253,7 +263,7 @@ fn nativeAsyncUse(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (d.disposed) return throwRef(arena, "AsyncDisposableStack already disposed");
     const value = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     if (!isNullOrUndefined(value)) {
-        if (value.unbox() != .object) return throwType(arena, "value is not disposable (not an object)");
+        if (!isObjectLike(value)) return throwType(arena, "value is not disposable (not an object)");
         // async-dispose: prefer @@asyncDispose, fall back to @@dispose.
         var method: ?Value = null;
         if (realm_mod.active_sym_async_dispose) |s| method = try getMethodSym(arena, value, s);

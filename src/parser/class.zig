@@ -5,6 +5,7 @@ const std = @import("std");
 const parser_file = @import("./parser.zig");
 const Parser = parser_file.Parser;
 const expr_mod = @import("./expr.zig");
+const stmt_mod = @import("./stmt.zig");
 const ast = @import("./ast.zig");
 const Node = ast.Node;
 
@@ -2009,6 +2010,10 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     // the marker (gated on in_generator_function) so a regular function's body
     // structure — and tail-call analysis — is unchanged. A destructuring prelude
     // outside a generator is still prepended (it just runs as ordinary body code).
+    // Explicit Resource Management: a `using`/`await using` at the top level of a
+    // function body disposes at function return. Wrap the body (not the parameter
+    // prelude, which runs first) in the disposal try/finally.
+    const body_items = stmt_mod.desugarUsingScope(p, body.items, 0);
     if (p.in_generator_function) {
         var combined = std.ArrayList(*Node){};
         combined.appendSlice(p.arena, param_prelude) catch {
@@ -2020,7 +2025,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
             p.had_error = true;
             return null;
         };
-        combined.appendSlice(p.arena, body.items) catch {
+        combined.appendSlice(p.arena, body_items) catch {
             p.had_error = true;
             return null;
         };
@@ -2032,11 +2037,11 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
             p.had_error = true;
             return null;
         };
-        combined.appendSlice(p.arena, body.items) catch {
+        combined.appendSlice(p.arena, body_items) catch {
             p.had_error = true;
             return null;
         };
         return combined.items;
     }
-    return body.items;
+    return body_items;
 }

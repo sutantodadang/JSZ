@@ -712,8 +712,121 @@ pub fn parseBlock(p: *Parser) ?*Node {
     }
     _ = p.expect(.right_brace) orelse return null;
     const end = p.current.start;
-    const items = body.items;
+    const items = desugarUsingScope(p, body.items, start);
     return p.makeNode(.block_stmt, start, end, .{ .block_stmt = .{ .body = items } });
+}
+
+/// Note whether `it` (a top-level statement of some lexical scope) is a `using`
+/// or `await using` declaration. Multi-declarator forms lower to a *transparent*
+/// container block (`lexical_scope == false`), so recurse into those.
+fn collectUsing(it: *Node, has_sync: *bool, has_async: *bool) void {
+    if (it.kind == .var_decl) {
+        switch (it.data.var_decl.using_kind) {
+            .using_ => has_sync.* = true,
+            .await_using_ => has_async.* = true,
+            .none => {},
+        }
+    } else if (it.kind == .block_stmt and !it.data.block_stmt.lexical_scope) {
+        for (it.data.block_stmt.body) |b| collectUsing(b, has_sync, has_async);
+    }
+}
+
+/// Rewrite each `using x = e` / `await using x = e` in place to a plain
+/// `let x = __ds.use(e)`: the disposable-stack `use` performs AddDisposableResource
+/// (validating @@dispose / @@asyncDispose, no-op for null/undefined) and returns
+/// the resource, so the binding keeps its value while registering for disposal.
+fn rewriteUsingDecls(p: *Parser, it: *Node, ds_name: []const u8, start: u32) void {
+    if (it.kind == .var_decl and it.data.var_decl.using_kind != .none) {
+        var init = it.data.var_decl.init orelse return;
+        // NamedEvaluation: `using x = () => {}` names the function "x". Wrapping the
+        // initializer in `use(...)` would otherwise leave an anonymous-function
+        // argument unnamed, so apply the name before the wrap.
+        const is_anon = switch (init.kind) {
+            .function_expr => init.data.function_expr.name == null,
+            .call_expr => init.data.call_expr.anon_class_iife,
+            else => false,
+        };
+        if (is_anon) {
+            const namer = p.makeNode(.identifier, start, start, .{ .identifier = "__nameFn__" }) orelse return;
+            const key = p.makeNode(.string_literal, start, start, .{ .string_literal = it.data.var_decl.name }) orelse return;
+            var nargs = std.ArrayList(*Node){};
+            nargs.append(p.arena, init) catch return;
+            nargs.append(p.arena, key) catch return;
+            init = p.makeNode(.call_expr, start, start, .{ .call_expr = .{ .callee = namer, .args = nargs.items } }) orelse return;
+        }
+        const ds_id = p.makeNode(.identifier, start, start, .{ .identifier = ds_name }) orelse return;
+        const use_id = p.makeNode(.identifier, start, start, .{ .identifier = "use" }) orelse return;
+        const use_member = p.makeNode(.member_expr, start, start, .{
+            .member_expr = .{ .object = ds_id, .property = use_id, .computed = false },
+        }) orelse return;
+        var args = std.ArrayList(*Node){};
+        args.append(p.arena, init) catch return;
+        const use_call = p.makeNode(.call_expr, start, start, .{
+            .call_expr = .{ .callee = use_member, .args = args.items },
+        }) orelse return;
+        it.data.var_decl.init = use_call;
+        it.data.var_decl.using_kind = .none;
+    } else if (it.kind == .block_stmt and !it.data.block_stmt.lexical_scope) {
+        for (it.data.block_stmt.body) |b| rewriteUsingDecls(p, b, ds_name, start);
+    }
+}
+
+/// Explicit Resource Management (§13.16): if `items` (a lexical scope's statement
+/// list) declares any `using` / `await using` resources, wrap the scope so those
+/// resources are disposed when it exits — normally or abruptly — in reverse
+/// order, aggregating disposal errors into a SuppressedError:
+///
+///   let __ds_N = new DisposableStack();          // AsyncDisposableStack if async
+///   try { <stmts; each `using x = e` -> `let x = __ds_N.use(e)`> }
+///   finally { __ds_N.dispose(); }                // await __ds_N.disposeAsync()
+///
+/// Returns `items` unchanged when the scope declares no resources.
+pub fn desugarUsingScope(p: *Parser, items: []*Node, start: u32) []*Node {
+    var has_sync = false;
+    var has_async = false;
+    for (items) |it| collectUsing(it, &has_sync, &has_async);
+    if (!has_sync and !has_async) return items;
+    const is_async = has_async;
+
+    const ds_name = std.fmt.allocPrint(p.arena, "__ds_{d}__", .{p.param_destruct_counter}) catch return items;
+    p.param_destruct_counter += 1;
+
+    for (items) |it| rewriteUsingDecls(p, it, ds_name, start);
+
+    // let __ds = new (Async)DisposableStack();
+    const ctor_name = if (is_async) "AsyncDisposableStack" else "DisposableStack";
+    const ctor_id = p.makeNode(.identifier, start, start, .{ .identifier = ctor_name }) orelse return items;
+    const new_expr = p.makeNode(.new_expr, start, start, .{ .new_expr = .{ .callee = ctor_id, .args = &[_]*Node{} } }) orelse return items;
+    const ds_decl = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = .let, .name = ds_name, .init = new_expr } }) orelse return items;
+
+    const try_block = p.makeNode(.block_stmt, start, start, .{ .block_stmt = .{ .body = items, .lexical_scope = true } }) orelse return items;
+
+    // finalizer: `__ds.dispose();` or `__await__(__ds.disposeAsync());`
+    const ds_id2 = p.makeNode(.identifier, start, start, .{ .identifier = ds_name }) orelse return items;
+    const disp_name = if (is_async) "disposeAsync" else "dispose";
+    const disp_id = p.makeNode(.identifier, start, start, .{ .identifier = disp_name }) orelse return items;
+    const disp_member = p.makeNode(.member_expr, start, start, .{
+        .member_expr = .{ .object = ds_id2, .property = disp_id, .computed = false },
+    }) orelse return items;
+    var disp_expr = p.makeNode(.call_expr, start, start, .{
+        .call_expr = .{ .callee = disp_member, .args = &[_]*Node{} },
+    }) orelse return items;
+    if (is_async) {
+        const aw = p.makeNode(.identifier, start, start, .{ .identifier = "__await__" }) orelse return items;
+        var aargs = std.ArrayList(*Node){};
+        aargs.append(p.arena, disp_expr) catch return items;
+        disp_expr = p.makeNode(.call_expr, start, start, .{ .call_expr = .{ .callee = aw, .args = aargs.items } }) orelse return items;
+    }
+    const disp_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = disp_expr }) orelse return items;
+    var fin_body = std.ArrayList(*Node){};
+    fin_body.append(p.arena, disp_stmt) catch return items;
+    const finalizer = p.makeNode(.block_stmt, start, start, .{ .block_stmt = .{ .body = fin_body.items, .lexical_scope = true } }) orelse return items;
+    const try_stmt = p.makeNode(.try_stmt, start, start, .{ .try_stmt = .{ .block = try_block, .handler = null, .finalizer = finalizer } }) orelse return items;
+
+    var out = std.ArrayList(*Node){};
+    out.append(p.arena, ds_decl) catch return items;
+    out.append(p.arena, try_stmt) catch return items;
+    return out.items;
 }
 
 pub fn parseVarDeclStmt(p: *Parser) ?*Node {
