@@ -358,12 +358,10 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__nameFn__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/object_methods.zig").nativeNameFn));
         try realm.global_env.define("__toPropertyKey__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/object_methods.zig").nativeToPropertyKey));
         try realm.global_env.define("__makeNamespace__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeNamespace));
-        // Explicit resource management: `using`/`await using` scope desugar.
-        try realm.global_env.define("__usingStackInit__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingStackInit));
-        try realm.global_env.define("__usingAdd__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingAdd));
+        // Explicit resource management: the disposal step of a `using` scope's
+        // try/finally desugar (seeds a body error into the SuppressedError chain).
         try realm.global_env.define("__usingDispose__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingDispose));
-        // import-defer: `import defer * as ns` desugars to `__importDefer__(spec)`;
-        // dynamic `import.defer(spec)` routes through `__importDeferDyn__`.
+        try realm.global_env.define("__usingDisposeAsync__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingDisposeAsync));
         try realm.global_env.define("__importDefer__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImportDefer));
         try realm.global_env.define("__importDeferDyn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImportDeferDynamic));
         // source-phase imports: `import.source(spec)` → a promise that rejects
@@ -382,10 +380,6 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__asyncDelegCall__", try val_mod.makeNativeFunction(arena, es2015.nativeAsyncDelegCall));
         try realm.global_env.define("__asyncDelegStep__", try val_mod.makeNativeFunction(arena, es2015.nativeAsyncDelegStep));
         try realm.global_env.define("__retComplVal__", try val_mod.makeNativeFunction(arena, es2015.nativeRetComplVal));
-        // Explicit Resource Management: the disposal step of a `using` scope's
-        // try/finally desugar (seeds a body error into the SuppressedError chain).
-        try realm.global_env.define("__usingDispose__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingDispose));
-        try realm.global_env.define("__usingDisposeAsync__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingDisposeAsync));
         // Class desugar: the return-override rule for a derived constructor.
         try realm.global_env.define("__derivedReturn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeDerivedReturn));
         // M16 Phase 3: dynamic import() native + the import.meta object binding.

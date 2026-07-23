@@ -1267,9 +1267,8 @@ pub const BcVm = struct {
                 try val_mod.makeNativeFunction(self.arena, obj_methods.nativeToPropertyKey),
             );
             const dstack = @import("../runtime/builtins/disposable_stack.zig");
-            try nr.global_env.define("__usingStackInit__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingStackInit));
-            try nr.global_env.define("__usingAdd__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingAdd));
             try nr.global_env.define("__usingDispose__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingDispose));
+            try nr.global_env.define("__usingDisposeAsync__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingDisposeAsync));
         }
         // Cross-realm: make the secondary realm's well-known symbols *shared* with
         // the primary realm by replacing the Symbol constructor's properties directly.
@@ -1631,10 +1630,10 @@ pub const BcVm = struct {
                 .PUSH_TRY => if (try exception_ops.opPushTry(self, frame)) |o| return o,
                 .POP_TRY => if (try exception_ops.opPopTry(self, frame)) |o| return o,
                 .END_FINALLY => if (try exception_ops.opEndFinally(self, frame)) |o| return o,
-                .USING_ENTER => if (try exception_ops.opUsingEnter(self, frame)) |o| return o,
-                .USING_ADD => if (try exception_ops.opUsingAdd(self, frame)) |o| return o,
-                .USING_DISPOSE => if (try exception_ops.opUsingDispose(self, frame)) |o| return o,
-                .USING_DISPOSE_THROW => if (try exception_ops.opUsingDisposeThrow(self, frame)) |o| return o,
+                // USING_* opcodes exist only for JIT ordinal stability — the
+                // parser-desugar approach handles `using`/`await using` at the
+                // AST level and never emits these. Reaching one is a bug.
+                .USING_ENTER, .USING_ADD, .USING_DISPOSE, .USING_DISPOSE_THROW => unreachable,
                 .INSTANCEOF => if (try exception_ops.opInstanceof(self, frame)) |o| return o,
                 .NEW_INSTANCE => if (try exception_ops.opNewInstance(self, frame)) |o| return o,
                 .NEW_INSTANCE_SPREAD => if (try exception_ops.opNewInstanceSpread(self, frame)) |o| return o,
