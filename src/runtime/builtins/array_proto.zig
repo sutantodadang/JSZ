@@ -150,7 +150,7 @@ pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Va
     // fromIndex = ToIntegerOrInfinity(args[1]); +∞ → no match, -∞ → 0.
     var from: usize = 0;
     if (args.len > 1) {
-        const n = try realm_mod.toNumberValue(arena, args[1]);
+        const n = try realm_mod.toNumberCheckedRealm(arena, args[1]);
         if (std.math.isInf(n) and n > 0) return val_mod.makeNumber(arena, -1.0);
         const ni: i64 = if (std.math.isNan(n)) 0 else val_mod.f64ToI64Sat(std.math.trunc(n));
         if (ni >= 0) {
@@ -179,7 +179,7 @@ pub fn nativeIncludes(arena: std.mem.Allocator, this_val: Value, args: []const V
     // fromIndex = ToIntegerOrInfinity; +∞ → false, -∞ → 0.
     var from: usize = 0;
     if (args.len > 1) {
-        const n = try realm_mod.toNumberValue(arena, args[1]);
+        const n = try realm_mod.toNumberCheckedRealm(arena, args[1]);
         if (std.math.isInf(n) and n > 0) return val_mod.makeBool(arena, false);
         const ni: i64 = if (std.math.isNan(n)) 0 else val_mod.f64ToI64Sat(std.math.trunc(n));
         if (ni >= 0) {
@@ -945,11 +945,19 @@ pub fn genCreate(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) 
     _ = try obj_methods.nativeObjectDefineProperty(arena, this_val, &[_]Value{ this_val, key_val, val_mod.makeObject(arena, d) catch this_val });
 }
 
-/// DeletePropertyOrThrow(O, ToString(i)) — best-effort own-property delete.
+/// DeletePropertyOrThrow(O, ToString(i)): [[Delete]] (Proxy trap aware) and a
+/// TypeError when it reports false (e.g. a non-configurable property).
 fn genDelete(arena: std.mem.Allocator, this_val: Value, i: usize) !void {
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-    if (this_val.isHeapPtr() and this_val.toPtr().* == .object)
-        _ = try this_val.toPtr().object.deleteOwn(key);
+    if (realm_mod.active_context) |ctx| {
+        if (!try ctx.deleteProp(arena, this_val, key))
+            return throwTypeError(arena, "Cannot delete property");
+        return;
+    }
+    if (this_val.isHeapPtr() and this_val.toPtr().* == .object) {
+        if (!try this_val.toPtr().object.deleteOwn(key))
+            return throwTypeError(arena, "Cannot delete property");
+    }
 }
 
 /// ToIntegerOrInfinity with full ToNumber coercion (objects via valueOf/toString).
@@ -1093,7 +1101,7 @@ pub fn nativeLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []cons
     // fromIndex = ToIntegerOrInfinity; default len-1. -∞ → no match.
     var from: i64 = @as(i64, @intCast(len)) - 1;
     if (args.len > 1) {
-        const nnum = try realm_mod.toNumberValue(arena, args[1]);
+        const nnum = try realm_mod.toNumberCheckedRealm(arena, args[1]);
         if (std.math.isInf(nnum) and nnum < 0) return val_mod.makeNumber(arena, -1);
         const n: i64 = if (std.math.isNan(nnum)) 0 else val_mod.f64ToI64Sat(std.math.trunc(nnum));
         if (n >= 0) {

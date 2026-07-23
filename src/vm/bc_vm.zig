@@ -743,6 +743,14 @@ pub const BcVm = struct {
         return self.setProp(obj_val, key, value);
     }
 
+    /// [[Delete]] returning the boolean result; routes through the Proxy
+    /// deleteProperty trap and honors non-configurable properties.
+    fn bcDeleteProp(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool {
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        const key_v = try val_mod.makeString(arena, key);
+        return self.deleteProperty(obj_val, key_v);
+    }
+
     /// [[Set]] with Throw=true: a failed assignment (setPropR returns false)
     /// becomes a TypeError, matching a strict-mode store.
     fn bcSetPropThrow(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8, value: Value) anyerror!void {
@@ -1374,6 +1382,7 @@ pub const BcVm = struct {
             .set_fn = bcSetProp,
             .set_throw_fn = bcSetPropThrow,
             .has_fn = bcHasProp,
+            .delete_fn = bcDeleteProp,
             .set_proto_fn = bcSetProto,
             .backing_obj_fn = bcBackingObj,
             .shadow_eval_fn = bcEvalInEnv,

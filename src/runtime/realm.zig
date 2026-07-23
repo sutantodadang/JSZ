@@ -85,6 +85,9 @@ pub const Context = struct {
     /// HasProperty(O, key): own-or-inherited existence check firing Proxy `has`
     /// traps. Used by array methods to skip holes (absent indices).
     has_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool,
+
+    /// [[Delete]] returning the boolean result (Proxy trap aware).
+    delete_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool,
     /// Set [[Prototype]] of an object OR bc_function (materializing the closure's
     /// backing object). Used by Object.setPrototypeOf for class static inheritance.
     set_proto_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void,
@@ -158,6 +161,10 @@ pub const Context = struct {
 
     pub fn hasProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool {
         return self.has_fn(self.ptr, arena, obj_val, key);
+    }
+
+    pub fn deleteProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool {
+        return self.delete_fn(self.ptr, arena, obj_val, key);
     }
 
     pub fn setProto(self: *Context, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void {
