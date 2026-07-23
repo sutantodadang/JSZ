@@ -2749,7 +2749,11 @@ pub fn nativeGetAsyncIterator(arena: std.mem.Allocator, _: Value, args: []const 
     if (x.bits != 0 and x.unbox() == .object) {
         if (realm_mod.active_context) |ctx| {
             if (realm_mod.active_sym_async_iterator) |sym| {
-                const m = ctx.getPropSym(arena, x, sym) catch Value{};
+                // GetIterator(obj, async): `method = ? GetMethod(obj, @@asyncIterator)`.
+                // A throwing @@asyncIterator getter is an abrupt completion that
+                // propagates — it must NOT be swallowed into a sync fallback (which
+                // would wrongly access @@iterator).
+                const m = try ctx.getPropSym(arena, x, sym);
                 if (!(m.bits == 0 or m.unbox() == .undefined_ or m.unbox() == .null_)) {
                     if (!isCallable(m)) {
                         realm_mod.pending_exception = try makeTypeErrorVal(arena, "Symbol.asyncIterator is not a function");
@@ -2767,11 +2771,22 @@ pub fn nativeGetAsyncIterator(arena: std.mem.Allocator, _: Value, args: []const 
     }
     // No @@asyncIterator: wrap the sync iterator (AsyncFromSyncIterator).
     const sync_it = try nativeGetIterator(arena, Value{}, args);
+    // CreateAsyncFromSyncIterator captures the sync iterator's `next` method ONCE
+    // (§27.1.4.1 builds an Iterator Record: `nextMethod = ? GetV(it, "next")`).
+    // Every AsyncFromSyncIteratorContinuation reuses that captured method, so a
+    // `next` accessor fires exactly one time no matter how many steps run.
+    const sync_next: Value = if (realm_mod.active_context) |ctx|
+        (ctx.getProp(arena, sync_it, "next") catch Value{})
+    else if (sync_it.bits != 0 and sync_it.unbox() == .object)
+        (sync_it.toPtr().object.get("next") orelse Value{})
+    else
+        Value{};
     const wrap = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, null)
     else
         try JsObject.create(arena, null);
     try wrap.set("__syncit__", sync_it);
+    try wrap.set("__syncnext__", sync_next);
     try wrap.set("next", try val_mod.makeNativeFunctionNamed(arena, nativeAsyncFromSyncNext, "next", 0));
     // %AsyncFromSyncIteratorPrototype%.return forwards to the wrapped sync
     // iterator, so `break`/`throw` out of a `for await` over a sync iterable
@@ -2887,21 +2902,53 @@ fn nativeAsyncFromSyncReturn(arena: std.mem.Allocator, this_val: Value, args: []
 
 /// next() of an AsyncFromSyncIterator: step the underlying sync iterator and
 /// hand back a settled promise of the {value,done} result.
-fn nativeAsyncFromSyncNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+fn nativeAsyncFromSyncNext(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const promise_mod = @import("promise.zig");
     const p = try promise_mod.newPendingPromise(arena);
     if (this_val.bits != 0 and this_val.unbox() == .object) {
-        const sync_it = this_val.toPtr().object.get("__syncit__") orelse Value{};
-        const result = nativeIterStep(arena, Value{}, &.{sync_it}) catch {
-            promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
-            return p;
+        const wrap_obj = this_val.toPtr().object;
+        const sync_it = wrap_obj.get("__syncit__") orelse Value{};
+        // Call the `next` method captured at CreateAsyncFromSyncIterator time,
+        // forwarding the received value (`AsyncFromSyncIterator.next(value)` →
+        // `syncIterator.next(value)`, §27.1.4.2.1). Re-reading `sync_it.next`
+        // here would fire the accessor on every step.
+        const sync_next = wrap_obj.get("__syncnext__") orelse Value{};
+        // Forward the received value only when one was actually passed: an absent
+        // value calls `syncIterator.next()` with NO arguments (§27.1.4.2.1 step 5),
+        // so `next.length`-observing sync iterators see `arguments.length === 0`.
+        const fwd_args: []const Value = if (args.len > 0) args[0..1] else &[_]Value{};
+        const result = blk: {
+            if (!isCallable(sync_next)) {
+                // No captured method (degenerate): fall back to a fresh step.
+                break :blk nativeIterStep(arena, Value{}, &.{sync_it}) catch {
+                    promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+                    return p;
+                };
+            }
+            const r = function_proto.invokeCallback(arena, sync_it, sync_next, fwd_args) catch {
+                promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+                return p;
+            };
+            // IteratorNext: a non-Object iterator result is a TypeError.
+            if (r.bits == 0 or r.unbox() != .object) {
+                promise_mod.settleResult(arena, p, try makeTypeErrorVal(arena, "iterator result is not an object"), false);
+                return p;
+            }
+            break :blk r;
         };
         // AsyncFromSyncIteratorContinuation: await the produced value so a sync
         // iterable of promises yields resolved values (`for await (x of [p])`).
         if (result.bits != 0 and result.unbox() == .object) {
             const robj = result.toPtr().object;
             if (robj.get("value")) |val| {
-                const awaited = promise_mod.awaitValue(arena, val) catch val;
+                // AsyncFromSyncIteratorContinuation awaits the value; if that await
+                // rejects (e.g. the sync iterator yielded a rejected promise), the
+                // continuation's promise rejects with that reason — it must not be
+                // swallowed back into a fulfilled result.
+                const awaited = promise_mod.awaitValue(arena, val) catch {
+                    promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+                    return p;
+                };
                 try robj.set("value", awaited);
             }
         }

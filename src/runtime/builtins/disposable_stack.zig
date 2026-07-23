@@ -95,6 +95,16 @@ fn isCallable(v: Value) bool {
     };
 }
 
+/// True for the values that carry properties / can expose a @@dispose method:
+/// ordinary objects and every function representation (functions are objects).
+fn isObjectLike(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .object, .bc_function, .native_function, .function => true,
+        else => false,
+    };
+}
+
 fn isNullOrUndefined(v: Value) bool {
     if (v.bits == 0) return true;
     return switch (v.unbox()) {
@@ -120,82 +130,6 @@ fn getMethodSym(arena: std.mem.Allocator, v: Value, sym: Value) !?Value {
     if (isNullOrUndefined(m)) return null;
     if (!isCallable(m)) return throwType(arena, "@@dispose is not callable");
     return m;
-}
-
-// ---- `using` / `await using` block desugaring -----------------------------
-// These back the USING_ENTER / USING_ADD / USING_DISPOSE(_THROW) opcodes, which
-// implement §14.2 (Block) explicit resource management. A dispose capability is
-// an ordinary DisposableStackData held in a bytecode register (a wrapper object
-// created by createUsingScope), not exposed to user code.
-
-/// Create a fresh dispose-capability object (kind 0 = sync, 1 = async).
-pub fn createUsingScope(arena: std.mem.Allocator, kind: u8) !Value {
-    const proto = if (kind == 1) active_async_disposable_proto else active_disposable_proto;
-    const ikind: @TypeOf((@as(JsObject, undefined)).internal_kind) =
-        if (kind == 1) .async_disposable_stack else .disposable_stack;
-    const v = try makeObj(arena, proto, ikind);
-    const d = try arena.create(DisposableStackData);
-    d.* = .{};
-    v.toPtr().object.internal_slot = d;
-    return v;
-}
-
-fn scopeData(stack: Value) *DisposableStackData {
-    return @ptrCast(@alignCast(stack.toPtr().object.internal_slot.?));
-}
-
-/// AddDisposableResource(capability, value, hint) for `using x = value`
-/// (hint 0 = sync-dispose, 1 = async-dispose). null/undefined adds nothing.
-pub fn usingAdd(arena: std.mem.Allocator, stack: Value, value: Value, hint: u8) !void {
-    if (isNullOrUndefined(value)) return;
-    // "Object" for spec purposes includes callable values (functions), whose
-    // Value tags are distinct from plain `.object`.
-    const is_object = switch (value.unbox()) {
-        .object, .bc_function, .native_function, .function => true,
-        else => false,
-    };
-    if (!is_object) return throwType(arena, "using declaration value is not an object");
-    var method: ?Value = null;
-    if (hint == 1) {
-        if (realm_mod.active_sym_async_dispose) |s| method = try getMethodSym(arena, value, s);
-        if (method == null) {
-            if (realm_mod.active_sym_dispose) |s| method = try getMethodSym(arena, value, s);
-        }
-        if (method == null) return throwType(arena, "value is not async-disposable (no [Symbol.asyncDispose])");
-    } else {
-        const s = realm_mod.active_sym_dispose orelse return throwType(arena, "Symbol.dispose unavailable");
-        method = (try getMethodSym(arena, value, s)) orelse
-            return throwType(arena, "value is not disposable (no [Symbol.dispose])");
-    }
-    try scopeData(stack).records.append(arena, .{ .this_val = value, .method = method.? });
-}
-
-/// DisposeResources(capability, completion) — synchronous. `incoming` is the
-/// pending thrown value for a THROW completion, or null for a NORMAL one. Runs
-/// every resource's dispose method LIFO, chaining thrown errors into a
-/// SuppressedError over `incoming`. Returns the final completion's value to
-/// throw (null = normal completion, nothing to raise).
-pub fn usingDisposeSync(arena: std.mem.Allocator, stack: Value, incoming: ?Value) !?Value {
-    const d = scopeData(stack);
-    d.disposed = true;
-    var completion: ?Value = incoming;
-    var i: usize = d.records.items.len;
-    while (i > 0) {
-        i -= 1;
-        const r = d.records.items[i];
-        const res = function_proto.invokeCallback(arena, r.this_val, r.method, &[_]Value{});
-        if (res) |_| {} else |e| {
-            if (e != error.JsException) return e;
-            const thrown = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
-            realm_mod.pending_exception = Value{};
-            if (completion) |prev| {
-                completion = try suppressedError(arena, thrown, prev);
-            } else {
-                completion = thrown;
-            }
-        }
-    }
-    return completion;
 }
 
 // ---- DisposableStack ------------------------------------------------------
@@ -224,7 +158,7 @@ fn nativeUse(arena: std.mem.Allocator, this_val: Value, args: []const Value) any
     // AddDisposableResource(capability, value, sync-dispose): null/undefined is a
     // no-op; otherwise value must be an Object exposing a callable @@dispose.
     if (!isNullOrUndefined(value)) {
-        if (value.unbox() != .object) return throwType(arena, "value is not disposable (not an object)");
+        if (!isObjectLike(value)) return throwType(arena, "value is not disposable (not an object)");
         const disp_sym = realm_mod.active_sym_dispose orelse return throwType(arena, "Symbol.dispose unavailable");
         const method = (try getMethodSym(arena, value, disp_sym)) orelse
             return throwType(arena, "value is not disposable (no [Symbol.dispose])");
@@ -271,35 +205,44 @@ fn nativeMove(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyer
 /// aggregating thrown errors into a SuppressedError chain. Shared by both the
 /// sync `dispose()` and the async drain.
 fn disposeResources(arena: std.mem.Allocator, d: *DisposableStackData) anyerror!void {
-    return disposeResourcesSeeded(arena, d, null);
+    return disposeResourcesSeeded(arena, d, null, false);
 }
 
-/// As `disposeResources`, but the completion may be seeded with a pending thrown
-/// value (`seed`). This models the DisposeResources(cap, completion) form used
-/// by the `using` scope desugar: when the scope body already threw, a further
-/// disposal error nests the body's error as the `suppressed` of a SuppressedError.
-fn disposeResourcesSeeded(arena: std.mem.Allocator, d: *DisposableStackData, seed: ?Value) anyerror!void {
+/// DisposeResources seeded with an existing abrupt completion `seed` (the value
+/// thrown by the guarded body). Each disposer that throws suppresses the current
+/// completion: the result is `SuppressedError(disposerError, priorCompletion)`,
+/// so a body error threads to the innermost `suppressed` of the chain. When
+/// `is_async` is set (AsyncDisposeResources), each disposer's returned value is
+/// awaited, so an async disposer that *rejects* is captured just like a throw.
+fn disposeResourcesSeeded(arena: std.mem.Allocator, d: *DisposableStackData, seed: ?Value, is_async: bool) anyerror!void {
     var completion: ?Value = seed; // pending thrown value, if any
     var i: usize = d.records.items.len;
     while (i > 0) {
         i -= 1;
         const r = d.records.items[i];
-        // Dispose(V, hint, method): "If method is undefined, let result be
-        // undefined" — a null/undefined resource carries no dispose method, so it
-        // is a no-op (used by the `using x = null` / `await using x = null` path).
-        if (isNullOrUndefined(r.method)) continue;
         const call_args: []const Value = if (r.has_arg) &[_]Value{r.arg} else &[_]Value{};
-        const res = function_proto.invokeCallback(arena, r.this_val, r.method, call_args);
-        if (res) |_| {
-            // normal completion — nothing to do
+        var thrown: ?Value = null;
+        if (function_proto.invokeCallback(arena, r.this_val, r.method, call_args)) |rv| {
+            // Await the disposer's result so an async @@asyncDispose that returns
+            // a rejected promise surfaces as a disposal error (the await is a
+            // synchronous microtask drain).
+            if (is_async) {
+                if (promise_mod.awaitValue(arena, rv)) |_| {} else |e| {
+                    if (e != error.JsException) return e;
+                    thrown = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
+                    realm_mod.pending_exception = Value{};
+                }
+            }
         } else |e| {
             if (e != error.JsException) return e;
-            const thrown = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
+            thrown = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
             realm_mod.pending_exception = Value{};
+        }
+        if (thrown) |t| {
             if (completion) |prev| {
-                completion = try suppressedError(arena, thrown, prev);
+                completion = try suppressedError(arena, t, prev);
             } else {
-                completion = thrown;
+                completion = t;
             }
         }
     }
@@ -341,7 +284,7 @@ fn nativeAsyncUse(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (d.disposed) return throwRef(arena, "AsyncDisposableStack already disposed");
     const value = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     if (!isNullOrUndefined(value)) {
-        if (value.unbox() != .object) return throwType(arena, "value is not disposable (not an object)");
+        if (!isObjectLike(value)) return throwType(arena, "value is not disposable (not an object)");
         // async-dispose: prefer @@asyncDispose, fall back to @@dispose.
         var method: ?Value = null;
         if (realm_mod.active_sym_async_dispose) |s| method = try getMethodSym(arena, value, s);
@@ -397,7 +340,7 @@ fn nativeDisposeAsync(arena: std.mem.Allocator, this_val: Value, _: []const Valu
     };
     if (d.disposed) return promise_mod.makeResolvedPromise(arena, try val_mod.makeUndefined(arena));
     d.disposed = true;
-    if (disposeResources(arena, d)) |_| {
+    if (disposeResourcesSeeded(arena, d, null, true)) |_| {
         return promise_mod.makeResolvedPromise(arena, try val_mod.makeUndefined(arena));
     } else |e| {
         if (e != error.JsException) return e;
@@ -407,86 +350,57 @@ fn nativeDisposeAsync(arena: std.mem.Allocator, this_val: Value, _: []const Valu
     }
 }
 
-// ---- `using` / `await using` desugar support ------------------------------
-//
-// A `using x = V` (or `await using x = V`) declaration lowers, in the parser,
-// to a try/finally over the enclosing scope plus calls to the three hidden
-// intrinsics below. They are bound as environment names (not globalThis
-// properties), so user code and reflection never observe them:
-//
-//   let __using_stack__ = __usingStackInit__();
-//   let __using_threw__ = false, __using_err__ = undefined;
-//   try {
-//     try { let x = __usingAdd__(__using_stack__, V, /*isAsync*/ false); ...body... }
-//     catch (e) { __using_threw__ = true; __using_err__ = e; }
-//   } finally { __usingDispose__(__using_stack__, __using_threw__, __using_err__); }
-
-/// A fresh per-scope DisposeCapability. Backed by DisposableStackData but with a
-/// null prototype so it can never be confused with a real DisposableStack.
-pub fn nativeUsingStackInit(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
-    const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
-    obj.internal_kind = .disposable_stack;
-    const d = try arena.create(DisposableStackData);
-    d.* = .{};
-    obj.internal_slot = d;
-    return val_mod.makeObject(arena, obj);
-}
-
-fn usingData(v: Value) ?*DisposableStackData {
-    if (v.bits == 0 or v.unbox() != .object) return null;
-    const obj = v.toPtr().object;
-    if (obj.internal_kind != .disposable_stack or obj.internal_slot == null) return null;
-    return @ptrCast(@alignCast(obj.internal_slot.?));
-}
-
-/// AddDisposableResource for a `using`/`await using` binding.
-/// args: [stack, value, isAsync]. Validates and registers `value` (§14.3.5),
-/// then returns it so the caller binds `let x = __usingAdd__(stack, V, false)`.
-pub fn nativeUsingAdd(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const stack = if (args.len > 0) args[0] else Value{};
-    const value = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
-    const is_async = args.len > 2 and val_mod.toBoolean(args[2]);
-    const d = usingData(stack) orelse return throwType(arena, "internal: invalid using capability");
-    if (isNullOrUndefined(value)) {
-        // sync-dispose: null/undefined is skipped entirely; async-dispose adds a
-        // no-op record (dispose method undefined) — AddDisposableResource step 1.
-        if (!is_async) return value;
-        try d.records.append(arena, .{ .this_val = value, .method = try val_mod.makeUndefined(arena) });
-        return value;
-    }
-    // §CreateDisposableResource: "If V is not an Object, throw". Functions and
-    // classes are Objects, so accept any callable too (not just plain objects).
-    switch (value.unbox()) {
-        .object, .function, .bc_function, .native_function => {},
-        else => return throwType(arena, "using value is not an object"),
-    }
-    var method: ?Value = null;
-    if (is_async) {
-        if (realm_mod.active_sym_async_dispose) |s| method = try getMethodSym(arena, value, s);
-        if (method == null) {
-            if (realm_mod.active_sym_dispose) |s| method = try getMethodSym(arena, value, s);
-        }
-    } else {
-        const s = realm_mod.active_sym_dispose orelse return throwType(arena, "Symbol.dispose unavailable");
-        method = try getMethodSym(arena, value, s);
-    }
-    const m = method orelse return throwType(arena, "using value is not disposable");
-    try d.records.append(arena, .{ .this_val = value, .method = m });
-    return value;
-}
-
-/// DisposeResources at scope exit. args: [stack, threw, errValue]. When the
-/// scope body completed abruptly with a throw, `threw` seeds the completion so a
-/// disposal error nests the body error in a SuppressedError; otherwise disposal
-/// errors surface directly (and a clean body re-surfaces any disposal error).
+/// `__usingDispose__(stack, hasError, error)` — the disposal step of a `using`
+/// scope's try/finally desugar. Runs DisposeResources over `stack`, seeded with
+/// the scope body's thrown `error` when `hasError` is true, so a body error
+/// becomes the innermost `suppressed` of any SuppressedError chain. When the
+/// body threw but no disposer does, the original error is re-thrown as-is.
 pub fn nativeUsingDispose(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const stack = if (args.len > 0) args[0] else Value{};
-    const threw = args.len > 1 and val_mod.toBoolean(args[1]);
-    const seed: ?Value = if (threw) (if (args.len > 2) args[2] else try val_mod.makeUndefined(arena)) else null;
-    const d = usingData(stack) orelse return throwType(arena, "internal: invalid using capability");
+    const has_err = args.len > 1 and isTrue(args[1]);
+    const err: ?Value = if (has_err) (if (args.len > 2) args[2] else try val_mod.makeUndefined(arena)) else null;
+    const d = try requireData(arena, stack, .disposable_stack, "using dispose on incompatible receiver");
+    if (d.disposed) {
+        if (err) |e| {
+            realm_mod.pending_exception = e;
+            return error.JsException;
+        }
+        return val_mod.makeUndefined(arena);
+    }
     d.disposed = true;
-    try disposeResourcesSeeded(arena, d, seed);
-    return try val_mod.makeUndefined(arena);
+    try disposeResourcesSeeded(arena, d, err, false);
+    return val_mod.makeUndefined(arena);
+}
+
+/// Async counterpart of `__usingDispose__`: returns a promise that settles once
+/// the (approximated-synchronous) disposal drains — rejected with the aggregated
+/// completion, resolved with undefined otherwise.
+pub fn nativeUsingDisposeAsync(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const stack = if (args.len > 0) args[0] else Value{};
+    const has_err = args.len > 1 and isTrue(args[1]);
+    const err: ?Value = if (has_err) (if (args.len > 2) args[2] else try val_mod.makeUndefined(arena)) else null;
+    const d = requireData(arena, stack, .async_disposable_stack, "using dispose on incompatible receiver") catch {
+        const e = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
+        realm_mod.pending_exception = Value{};
+        return promise_mod.makeRejectedPromise(arena, e);
+    };
+    if (!d.disposed) {
+        d.disposed = true;
+        if (disposeResourcesSeeded(arena, d, err, true)) |_| {
+            return promise_mod.makeResolvedPromise(arena, try val_mod.makeUndefined(arena));
+        } else |e| {
+            if (e != error.JsException) return e;
+            const ev = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
+            realm_mod.pending_exception = Value{};
+            return promise_mod.makeRejectedPromise(arena, ev);
+        }
+    }
+    if (err) |e| return promise_mod.makeRejectedPromise(arena, e);
+    return promise_mod.makeResolvedPromise(arena, try val_mod.makeUndefined(arena));
+}
+
+fn isTrue(v: Value) bool {
+    return v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean;
 }
 
 // ---- registration ---------------------------------------------------------
