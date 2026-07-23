@@ -2295,6 +2295,11 @@ pub fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8
         .null_ => "null",
         .undefined_ => "undefined",
         .bigint => |b| try val_mod.bigIntToString(arena, b),
+        // ToString(Symbol) throws a TypeError (§7.1.17). The one non-throwing
+        // Symbol→String path — `String(sym)` as a plain call — is special-cased by
+        // the caller before it reaches here, so any Symbol arriving must throw
+        // (e.g. `new String(sym)`, template/`+` coercion).
+        .symbol => return throwTypeError(arena, "Cannot convert a Symbol value to a string"),
         // Functions are objects too: `String(function f(){})` is the source
         // text produced by Function.prototype.toString, not "[object Object]".
         .object, .function, .bc_function, .native_function => blk: {
@@ -2303,7 +2308,6 @@ pub fn stringPrimitive(arena: std.mem.Allocator, arg: Value) anyerror![]const u8
                 break :blk try stringPrimitive(arena, prim);
             break :blk "[object Object]";
         },
-        else => "[object Object]",
     };
 }
 

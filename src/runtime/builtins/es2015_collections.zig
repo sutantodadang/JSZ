@@ -2230,9 +2230,17 @@ fn newArrayPair(arena: std.mem.Allocator) !*JsObject {
 }
 
 fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    if (this_val.bits == 0 or this_val.unbox() != .object) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    // Brand check (%ArrayIteratorPrototype%/%StringIteratorPrototype% next): the
+    // receiver must be a genuine iterator object carrying the internal slot, not
+    // e.g. `Object.create(iterator)` which inherits the proto but lacks the slot.
+    if (this_val.bits == 0 or this_val.unbox() != .object or
+        this_val.toPtr().object.internal_kind != .array_iterator or
+        this_val.toPtr().object.internal_slot == null)
+    {
+        realm_mod.pending_exception = try makeTypeErrorVal(arena, "next called on a non-iterator object");
+        return error.JsException;
+    }
     const obj = this_val.toPtr().object;
-    if (obj.internal_slot == null) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     const d: *SeqIterData = @ptrCast(@alignCast(obj.internal_slot.?));
     if (d.done) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     if (d.is_string) {

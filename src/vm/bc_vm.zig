@@ -1817,7 +1817,7 @@ pub const BcVm = struct {
                 }
                 // Promise resolving functions are callable but not constructors —
                 // `new resolve()` must throw (they carry no [[Construct]]).
-                if (obj.internal_kind == .promise_resolver) {
+                if (obj.internal_kind == .promise_resolver or obj.internal_kind == .proxy_revoke) {
                     self.last_exception_value = try self.makeErrorObjectBc("TypeError", "value is not a constructor");
                     return "__js_exception__";
                 }
@@ -2324,16 +2324,22 @@ pub const BcVm = struct {
         if (root_obj.internal_kind == .proxy) {
             const handler = proxy_mod.proxyHandler(root_obj) orelse return proxy_mod.throwRevoked(self.arena);
             const target = proxy_mod.proxyTarget(root_obj) orelse return proxy_mod.throwRevoked(self.arena);
+            // [[HasProperty]] always receives a property key (String or Symbol);
+            // a numeric index operand (`1 in proxy`) must reach the trap as "1".
+            const key_pk: Value = if (key_v.bits != 0 and key_v.unbox() == .symbol)
+                key_v
+            else
+                try val_mod.makeString(self.arena, try valueToStringArena(self.arena, key_v));
             if (try proxy_mod.getTrap(self.arena, handler, "has")) |trap_fn| {
-                const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_v });
+                const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, key_pk });
                 const b = isTruthy(res);
                 // Invariant: has may not report false for a non-configurable own
                 // property of the target, nor for any own property of a
                 // non-extensible target.
-                if (!b) try self.proxyReportAbsentInvariant(target, key_v);
+                if (!b) try self.proxyReportAbsentInvariant(target, key_pk);
                 return b;
             }
-            return try self.hasProperty(target, key_v);
+            return try self.hasProperty(target, key_pk);
         }
         // M15: TypedArray [[HasProperty]] — integer-indexed exotic.
         if (root_obj.internal_kind == .typed_array) {
@@ -2568,6 +2574,13 @@ pub const BcVm = struct {
     fn proxyConstruct(self: *BcVm, proxy_obj: *JsObject, args: []const Value, new_target: Value) anyerror!Value {
         const handler = proxy_mod.proxyHandler(proxy_obj) orelse return self.throwRevokedProxy();
         const target = proxy_mod.proxyTarget(proxy_obj) orelse return self.throwRevokedProxy();
+        // A proxy has a [[Construct]] method only when its target does; otherwise
+        // `new proxy()` is a TypeError (§10.5.14 / ProxyCreate).
+        if (!@import("../runtime/builtins/reflect.zig").isConstructorVal(target)) {
+            const realm_m = @import("../runtime/realm.zig");
+            realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "proxy target is not a constructor");
+            return error.JsException;
+        }
         if (try proxy_mod.getTrap(self.arena, handler, "construct")) |trap_fn| {
             const args_arr = try self.arrayFromSlice(args);
             const res = try self.callAccessor(trap_fn, handler, &[_]Value{ target, args_arr, new_target });
@@ -2773,6 +2786,16 @@ pub const BcVm = struct {
                         if (raw.bits != 0) return raw;
                         return val_mod.makeUndefined(self.arena);
                     }
+                }
+                // Legacy `caller`/`arguments`: an ordinary *sloppy* function has
+                // its own null-valued `caller`/`arguments` data properties (the
+                // web-reality behavior — see test262 15.3.5.4_2 series). Strict
+                // functions, arrows, methods, generators and async functions have
+                // no own copy and inherit the %ThrowTypeError% poison instead.
+                if ((std.mem.eql(u8, key, "caller") or std.mem.eql(u8, key, "arguments")) and
+                    !closure.func.is_strict and closure.isConstructor())
+                {
+                    return val_mod.makeNull(self.arena);
                 }
                 // Own `name`/`length` for user functions (spec: non-writable,
                 // configurable). `length` = declared arity; `name` = the bound
@@ -3106,10 +3129,14 @@ pub const BcVm = struct {
                 // write (Receiver is the array) takes this path; a foreign
                 // Receiver falls through to ordinary handling.
                 if (obj.is_array and receiver.bits == obj_val.bits and std.mem.eql(u8, key, "length")) {
-                    const numv = try self.toNumberValueChecked(value);
-                    const num = numv.unbox().number;
-                    const u = toUint32FromNumber(num);
-                    if (@as(f64, @floatFromInt(u)) != num)
+                    // §10.4.2.4 steps 3-5: newLen = ToUint32(V), numberLen = ToNumber(V)
+                    // — the value is coerced *twice* (both observable via user
+                    // valueOf/@@toPrimitive), and a mismatch is a RangeError.
+                    const numv1 = try self.toNumberValueChecked(value);
+                    const u = toUint32FromNumber(numv1.unbox().number);
+                    const numv2 = try self.toNumberValueChecked(value);
+                    const num2 = numv2.unbox().number;
+                    if (@as(f64, @floatFromInt(u)) != num2)
                         return self.throwRangeErr("Invalid array length");
                     // [[Set]] of a non-writable data property always fails (§10.1.9.2),
                     // even to the same value; the strict/throwing caller then throws.
