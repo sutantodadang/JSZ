@@ -489,7 +489,31 @@ fn applyNumberingSystem(arena: std.mem.Allocator, parts: []DTPart, ns: []const u
 
 /// The locale's default hour cycle. Only Japanese differs among the locales the
 /// suite exercises (`resolvedOptions/hourCycle-default.js` asserts exactly this).
+/// Languages whose CLDR `timeData` preferred hour cycle is the 24-hour `H`
+/// (`h23`) — most of Europe and a good part of Asia. Everything else defaults to
+/// the 12-hour clock.
+const h23_languages = [_][]const u8{
+    "af", "az", "be", "bg", "bs",  "ca", "cs", "da", "de", "el", "es", "et", "eu",
+    "fa", "fi", "fr", "ga", "gl",  "he", "hr", "hu", "hy", "id", "is", "it", "ka",
+    "kk", "ky", "lt", "lv", "mk",  "mn", "ms", "mt", "nb", "nl", "nn", "no", "pl",
+    "pt", "ro", "ru", "sk", "sl",  "sq", "sr", "sv", "th", "tr", "uk", "uz", "vi",
+    "cy", "lb", "gd", "br", "kok", "si", "km", "lo", "my", "ne", "hi_x",
+};
+
+/// The locale's default hour cycle when neither `hour12` nor `hourCycle` (nor a
+/// `-u-hc-` extension) was requested. Japanese is the one language whose 12-hour
+/// clock counts from zero.
 fn defaultHourCycle(locale: []const u8) []const u8 {
+    const lang = primaryLanguage(locale);
+    if (std.mem.eql(u8, lang, "ja")) return "h11";
+    for (h23_languages) |l| {
+        if (std.mem.eql(u8, lang, l)) return "h23";
+    }
+    return "h12";
+}
+
+/// `[[hourCycle12]]`: which 12-hour cycle `hour12: true` selects.
+fn hourCycle12(locale: []const u8) []const u8 {
     return if (std.mem.eql(u8, primaryLanguage(locale), "ja")) "h11" else "h12";
 }
 
@@ -637,12 +661,7 @@ pub fn nativeDateTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
     if (hour12) |h12| {
         // A normative 2023 change dropped "h24" from this selection: the 24-hour
         // clock always resolves to h23.
-        hour_cycle = if (!h12)
-            "h23"
-        else if (std.mem.eql(u8, hc_default, "h11") or std.mem.eql(u8, hc_default, "h23"))
-            "h11"
-        else
-            "h12";
+        hour_cycle = if (!h12) "h23" else hourCycle12(req.base);
         // hour12 overrides the extension, so `-u-hc-` never survives with it.
         var w: usize = 0;
         for (kept[0..kept_n]) |k| {
@@ -721,9 +740,15 @@ const DTFPattern = struct {
     second: []const u8 = "",
     frac_sec: u32 = 0,
     tz_name: []const u8 = "",
-    hour12: bool = true,
+    /// The resolved hour cycle: "h11" | "h12" | "h23" | "h24".
+    hour_cycle: []const u8 = "h12",
     /// The resolved time zone identifier, for the `timeZoneName` part.
     tz_id: []const u8 = "UTC",
+
+    /// True for the two 12-hour cycles, which carry an AM/PM marker.
+    fn isHour12(self: DTFPattern) bool {
+        return std.mem.eql(u8, self.hour_cycle, "h11") or std.mem.eql(u8, self.hour_cycle, "h12");
+    }
 
     fn hasDate(self: DTFPattern) bool {
         return self.weekday.len + self.era.len + self.year.len + self.month.len + self.day.len > 0;
@@ -815,7 +840,10 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
             .second = readOpt(o, "__dtf_second"),
             .frac_sec = @intFromFloat(readNum(o, "__dtf_fracSec")),
             .tz_name = readOpt(o, "__dtf_tzName"),
-            .hour12 = if (o.get("__dtf_hour12")) |v| (v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean) else true,
+            .hour_cycle = blk: {
+                const hc = readOpt(o, "__dtf_hourCycle");
+                break :blk if (hc.len > 0) hc else "h12";
+            },
             .tz_id = blk: {
                 const id = readOpt(o, "__dtf_tzZone");
                 break :blk if (id.len > 0) id else "UTC";
@@ -841,14 +869,14 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
         if (bare and args.len > 0) {
             if (temporalKindOf(args[0])) |tk| switch (tk) {
                 .date => {},
-                .time => p = .{ .hour = "numeric", .minute = "numeric", .second = "numeric", .hour12 = p.hour12 },
+                .time => p = .{ .hour = "numeric", .minute = "numeric", .second = "numeric", .hour_cycle = p.hour_cycle },
                 .datetime, .instant, .zoned => {
                     p.hour = "numeric";
                     p.minute = "numeric";
                     p.second = "numeric";
                 },
-                .year_month => p = .{ .era = p.era, .year = "numeric", .month = "numeric", .hour12 = p.hour12 },
-                .month_day => p = .{ .month = "numeric", .day = "numeric", .hour12 = p.hour12 },
+                .year_month => p = .{ .era = p.era, .year = "numeric", .month = "numeric", .hour_cycle = p.hour_cycle },
+                .month_day => p = .{ .month = "numeric", .day = "numeric", .hour_cycle = p.hour_cycle },
             };
         }
         // A Temporal *plain* value carries no time zone of its own, so the
@@ -866,7 +894,7 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
         // formatter do not overlap at all and formatting is a TypeError. Only a
         // real Intl.DateTimeFormat goes through this — the synthetic formatters
         // `toLocaleString` builds already match their receiver by construction.
-        if (args.len > 0 and o.getOwn("__dtf_hourCycle") != null) {
+        if (args.len > 0 and o.getOwn("__dtf_hourCycle") != null and o.getOwn("__dtf_tls") == null) {
             if (temporalKindOf(args[0])) |tk| {
                 if (tk == .zoned)
                     return realm_mod.throwTypeError(arena, "Intl.DateTimeFormat.prototype.format does not support Temporal.ZonedDateTime");
@@ -888,7 +916,7 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
     var parts = std.ArrayListUnmanaged(DTPart){};
     try renderDateTimeParts(arena, f, p, &parts);
     if (parts.items.len == 0) {
-        try renderDateTimeParts(arena, f, .{ .year = "numeric", .month = "numeric", .day = "numeric", .hour12 = p.hour12 }, &parts);
+        try renderDateTimeParts(arena, f, .{ .year = "numeric", .month = "numeric", .day = "numeric", .hour_cycle = p.hour_cycle }, &parts);
     }
     if (this_val.bits != 0 and this_val.unbox() == .object)
         try applyNumberingSystem(arena, parts.items, readOpt(this_val.toPtr().object, "__dtf_numbering"));
@@ -1094,11 +1122,16 @@ fn renderDateTimeParts(
         if (has_date) try parts.append(arena, .{ .type = "literal", .value = ", " });
         if (p.hour.len > 0) {
             var h: i64 = f.hour;
-            // en-US 24-hour clock (h23) always renders a 2-digit hour.
-            const hstyle = if (p.hour12) p.hour else "2-digit";
-            if (p.hour12) {
+            // en-US 24-hour clocks (h23/h24) always render a 2-digit hour.
+            const is12 = p.isHour12();
+            const hstyle = if (is12) p.hour else "2-digit";
+            if (is12) {
                 h = @mod(f.hour, 12);
-                if (h == 0) h = 12;
+                // h11 counts 0..11 (midnight is 0); h12 counts 1..12.
+                if (h == 0 and std.mem.eql(u8, p.hour_cycle, "h12")) h = 12;
+            } else if (std.mem.eql(u8, p.hour_cycle, "h24") and h == 0) {
+                // h24 counts 1..24, so midnight is the 24th hour.
+                h = 24;
             }
             try parts.append(arena, .{ .type = "hour", .value = try fieldStr(arena, h, hstyle) });
         }
@@ -1123,7 +1156,7 @@ fn renderDateTimeParts(
         if (p.day_period.len > 0) {
             if (has_clock) try parts.append(arena, .{ .type = "literal", .value = " " });
             try parts.append(arena, .{ .type = "dayPeriod", .value = dayPeriodName(f.hour, f.min, f.sec, p.day_period) });
-        } else if (p.hour12 and p.hour.len > 0) {
+        } else if (p.isHour12() and p.hour.len > 0) {
             try parts.append(arena, .{ .type = "literal", .value = " " });
             try parts.append(arena, .{ .type = "dayPeriod", .value = if (f.hour < 12) "AM" else "PM" });
         }
@@ -1263,13 +1296,13 @@ pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: [
     // A ZonedDateTime carries its own zone; a `timeZone` option is disallowed.
     if (kind == .zoned and optStr(opts_v, "timeZone") != null)
         return realm_mod.throwTypeError(arena, "Temporal.ZonedDateTime.toLocaleString does not accept a timeZone option");
-    const dtf = try buildLocaleDTF(arena, if (args.len > 0) args[0] else Value{}, opts_v, required, defaults, restrict);
-    // A ZonedDateTime names its zone by default (Temporal §ZonedDateTime.toLocaleString).
-    if (kind == .zoned and dtfWantsDefaults(opts_v)) {
-        const o = dtf.toPtr().object;
-        try o.set("__dtf_tzName", try val_mod.makeString(arena, "short"));
-        if (t_zdt.getZoned(receiver)) |z| try o.set("__dtf_tzZone", try val_mod.makeString(arena, z.tz));
-    }
+    // …and it names that zone by default (Temporal §ZonedDateTime.toLocaleString).
+    const tls_tz: ?[]const u8 = if (kind == .zoned)
+        (if (t_zdt.getZoned(receiver)) |z| z.tz else null)
+    else
+        null;
+    const tls_tz_name: ?[]const u8 = if (kind == .zoned and dtfWantsDefaults(opts_v)) "short" else null;
+    const dtf = try buildLocaleDTF(arena, if (args.len > 0) args[0] else Value{}, opts_v, required, defaults, restrict, tls_tz, tls_tz_name);
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
 }
 
@@ -1301,7 +1334,18 @@ pub const Restrict = enum { none, date_only, time_only, year_month_only, month_d
 /// `Date.prototype.toLocale*String`: parse options, validate conflicts, resolve
 /// the effective component styles, and return a DateTimeFormat-like object ready
 /// for `nativeDateTimeFormatFormat`.
-fn buildLocaleDTF(arena: std.mem.Allocator, locales: Value, opts_v: ?Value, required: Required, defaults: LocaleDefaults, restrict: Restrict) anyerror!Value {
+fn buildLocaleDTF(
+    arena: std.mem.Allocator,
+    locales: Value,
+    opts_v: ?Value,
+    required: Required,
+    defaults: LocaleDefaults,
+    restrict: Restrict,
+    /// A ZonedDateTime supplies its own zone (§Temporal `toLocaleStringTimeZone`).
+    tls_time_zone: ?[]const u8,
+    /// …and names it by default when the caller asked for no components.
+    tls_tz_name: ?[]const u8,
+) anyerror!Value {
     const weekday = optStr(opts_v, "weekday");
     const era = optStr(opts_v, "era");
     const year = optStr(opts_v, "year");
@@ -1344,19 +1388,6 @@ fn buildLocaleDTF(arena: std.mem.Allocator, locales: Value, opts_v: ?Value, requ
         .none => {},
     }
 
-    // ISO calendar: era (used above only for conflict detection) is not rendered.
-    var p = DTFPattern{
-        .weekday = weekday orelse "",
-        .year = year orelse "",
-        .month = month orelse "",
-        .day = day orelse "",
-        .hour = hour orelse "",
-        .minute = minute orelse "",
-        .second = second orelse "",
-    };
-    if (date_style) |ds| applyDateStyle(ds, &p);
-    if (time_style) |ts| applyTimeStyle(ts, &p);
-
     // ToDateTimeOptions: `needDefaults` is driven by the REQUIRED family only —
     // e.g. toLocaleDateString (required "date") still fills in year/month/day
     // even when the caller passed only time components. When set, the `defaults`
@@ -1374,53 +1405,51 @@ fn buildLocaleDTF(arena: std.mem.Allocator, locales: Value, opts_v: ?Value, requ
             need_defaults = false;
         },
     };
+
+    // ToDateTimeOptions builds a *derived* options object whose prototype is the
+    // caller's bag, so the defaults it adds shadow rather than mutate. Everything
+    // else — locale/calendar/numberingSystem/hourCycle/timeZone resolution — is
+    // then the real `Intl.DateTimeFormat` constructor's job, which keeps
+    // `x.toLocaleString(l, o)` and `new Intl.DateTimeFormat(l, o).format(x)` in
+    // agreement by construction.
+    const base = try coerceOptionsToObject(arena, opts_v);
+    const base_obj: ?*JsObject = if (base.bits != 0 and base.unbox() == .object) base.toPtr().object else null;
+    const derived = if (realm_mod.active_heap) |hp|
+        try JsObject.createOnHeap(hp, base_obj)
+    else
+        try JsObject.create(arena, base_obj);
     if (need_defaults) {
+        const numeric = try val_mod.makeString(arena, "numeric");
         if (defaults == .date or defaults == .datetime or defaults == .year_month) {
-            if (p.year.len == 0) p.year = "numeric";
-            if (p.month.len == 0) p.month = "numeric";
+            if (year == null) try derived.set("year", numeric);
+            if (month == null) try derived.set("month", numeric);
         }
         if (defaults == .date or defaults == .datetime or defaults == .month_day) {
-            if (p.day.len == 0) p.day = "numeric";
+            if (day == null) try derived.set("day", numeric);
         }
-        if (defaults == .month_day and p.month.len == 0) p.month = "numeric";
+        if (defaults == .month_day and month == null) try derived.set("month", numeric);
         if (defaults == .time or defaults == .datetime) {
-            if (p.hour.len == 0) p.hour = "numeric";
-            if (p.minute.len == 0) p.minute = "numeric";
-            if (p.second.len == 0) p.second = "numeric";
+            if (hour == null) try derived.set("hour", numeric);
+            if (minute == null) try derived.set("minute", numeric);
+            if (second == null) try derived.set("second", numeric);
         }
     }
+    if (tls_time_zone) |tz| try derived.set("timeZone", try val_mod.makeString(arena, tz));
+    if (tls_tz_name) |tn| try derived.set("timeZoneName", try val_mod.makeString(arena, tn));
 
-    p.hour12 = optBool(opts_v, "hour12") orelse true;
-    if (optStr(opts_v, "hourCycle")) |hc| {
-        if (std.mem.eql(u8, hc, "h23") or std.mem.eql(u8, hc, "h24")) p.hour12 = false;
-        if (std.mem.eql(u8, hc, "h11") or std.mem.eql(u8, hc, "h12")) p.hour12 = true;
-    }
-
-    const dtf = if (realm_mod.active_heap) |hp|
-        try JsObject.createOnHeap(hp, realm_mod.active_object_proto)
-    else
-        try JsObject.create(arena, realm_mod.active_object_proto);
-    try dtf.set("__dtf_weekday", try val_mod.makeString(arena, p.weekday));
-    try dtf.set("__dtf_year", try val_mod.makeString(arena, p.year));
-    try dtf.set("__dtf_month", try val_mod.makeString(arena, p.month));
-    try dtf.set("__dtf_day", try val_mod.makeString(arena, p.day));
-    try dtf.set("__dtf_hour", try val_mod.makeString(arena, p.hour));
-    try dtf.set("__dtf_minute", try val_mod.makeString(arena, p.minute));
-    try dtf.set("__dtf_second", try val_mod.makeString(arena, p.second));
-    try dtf.set("__dtf_hour12", try val_mod.makeBool(arena, p.hour12));
-    try dtf.set("__dtf_dayPeriod", try val_mod.makeString(arena, p.day_period));
-    try dtf.set("__dtf_era", try val_mod.makeString(arena, p.era));
-    try dtf.set("__dtf_tzName", try val_mod.makeString(arena, p.tz_name));
-    // The numbering system comes from the requested locale exactly as it does
-    // for a real formatter, so `date.toLocaleString("th-u-nu-thai")` and
-    // `new Intl.DateTimeFormat("th-u-nu-thai").format(date)` agree.
-    const req = try resolveLocaleRequest(arena, locales);
-    const nu = blk: {
-        const ext = (try req.keyword(arena, "nu")) orelse break :blk "latn";
-        break :blk if (numberingSystemDigits(ext) != null) ext else "latn";
-    };
-    try dtf.set("__dtf_numbering", try val_mod.makeString(arena, nu));
-    return val_mod.makeObject(arena, dtf);
+    const inst = try legacyServiceObj(arena, active_date_time_format_proto);
+    const saved_constructing = realm_mod.active_constructing;
+    realm_mod.active_constructing = true;
+    const built = nativeDateTimeFormatCtor(arena, try val_mod.makeObject(arena, inst), &[_]Value{
+        locales, try val_mod.makeObject(arena, derived),
+    });
+    realm_mod.active_constructing = saved_constructing;
+    const dtf = try built;
+    // Mark the formatter as `toLocaleString`-built: its pattern already matches
+    // its receiver, so `buildDTFParts` must not re-run the §11.5.2 Temporal
+    // component-overlap check (which rejects a ZonedDateTime outright).
+    try dtf.toPtr().object.set("__dtf_tls", try val_mod.makeBool(arena, true));
+    return dtf;
 }
 
 /// `Date.prototype.{toLocaleString,toLocaleDateString,toLocaleTimeString}`:
@@ -1428,7 +1457,7 @@ fn buildLocaleDTF(arena: std.mem.Allocator, locales: Value, opts_v: ?Value, requ
 /// component set and format the Date through the shared en-US machinery.
 pub fn dateToLocaleString(arena: std.mem.Allocator, receiver: Value, args: []const Value, required: Required, defaults: LocaleDefaults) anyerror!Value {
     const opts_v: ?Value = if (args.len > 1) args[1] else null;
-    const dtf = try buildLocaleDTF(arena, if (args.len > 0) args[0] else Value{}, opts_v, required, defaults, .none);
+    const dtf = try buildLocaleDTF(arena, if (args.len > 0) args[0] else Value{}, opts_v, required, defaults, .none, null, null);
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
 }
 
