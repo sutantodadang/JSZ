@@ -251,10 +251,12 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "with() requires an object");
     var d = cur.*;
     const o = arg.toPtr().object;
-    const names = [_][]const u8{ "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds", "nanoseconds" };
+    // ToTemporalPartialDurationRecord reads every field through [[Get]] (so
+    // getters/Proxy traps run) in alphabetical order, and requires at least one.
+    const names = [_][]const u8{ "days", "hours", "microseconds", "milliseconds", "minutes", "months", "nanoseconds", "seconds", "weeks", "years" };
     var any = false;
     for (names) |name| {
-        if (o.get(name)) |fv| {
+        if (try shared.optionGet(arena, o, name)) |fv| {
             if (fv.bits != 0 and fv.unbox() != .undefined_) {
                 const n = try shared.toIntegerIfIntegral(arena, fv);
                 assignField(&d, name, n);
@@ -438,6 +440,10 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
         if (has_utc)
             return realm_mod.throwRangeError(arena, "UTC designator without a time zone is not a valid relativeTo");
     }
+    // A Temporal.PlainDate / PlainDateTime relativeTo uses its internal ISO date
+    // directly — its property-bag fields must NOT be observed.
+    if (pd.getDate(rv)) |dd| return dd.*;
+    if (@import("plain_date_time.zig").getDateTime(rv)) |dt| return dt.date;
     // A property bag is read as a full ZonedDateTime-shaped bag (time, offset
     // and timeZone included) even though only the date is kept: which fields are
     // touched is observable.
@@ -593,8 +599,11 @@ fn roundRelative(
     switch (smallest) {
         .year => out.years = rounded_count,
         .month => {
-            out.years = bal.years;
-            out.months = rounded_count;
+            // A rounded month count can reach a full year; re-difference the
+            // rounded end date so months bubble into years when `largest` is year
+            // (BubbleRelativeDuration). Weeks/days below the smallest unit are 0.
+            const rounded_date = try pd.addISODate(R, bal.years, rounded_count, 0, 0, .constrain, arena);
+            out = pd.differenceISODate(R, rounded_date, largest);
         },
         .week => {
             out.years = bal.years;
