@@ -729,8 +729,9 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
     if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
     // The bag is read in full before any option is consulted; the "offset"
-    // field lands in its alphabetical slot among the rest.
-    const bag = try plain_date.readDateBag(arena, o, .{ .time = true, .zoned = true, .fixed_cal = z.calendar });
+    // field lands in its alphabetical slot among the rest. timeZone is NOT read
+    // here — it was already rejected above (RejectObjectWithCalendarOrTimeZone).
+    const bag = try plain_date.readDateBag(arena, o, .{ .time = true, .zoned = true, .skip_time_zone = true, .fixed_cal = z.calendar });
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
     const dis = try getDisambiguationOption(arena, opts);
     const offset_opt = try getOffsetOption(arena, opts, .prefer);

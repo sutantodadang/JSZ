@@ -197,6 +197,9 @@ pub const BagWant = struct {
     time: bool = false,
     /// offset + timeZone, which only ZonedDateTime accepts.
     zoned: bool = false,
+    /// ZonedDateTime.with reads the offset field but not timeZone (it already
+    /// rejected a timeZone property separately), so this suppresses that read.
+    skip_time_zone: bool = false,
     /// Set by the `with` methods, which already know the calendar and must not
     /// read one off the bag.
     fixed_cal: ?calendar.CalendarId = null,
@@ -256,7 +259,7 @@ pub fn readDateBag(arena: std.mem.Allocator, o: *JsObject, want: BagWant) !DateB
     if (want.time) {
         if (try shared.optionGet(arena, o, "second")) |v| bag.second = try shared.toIntegerWithTruncation(arena, v);
     }
-    if (want.zoned) {
+    if (want.zoned and !want.skip_time_zone) {
         if (try shared.optionGet(arena, o, "timeZone")) |v| bag.time_zone = v;
     }
     if (try shared.optionGet(arena, o, "year")) |v| bag.year = try shared.toIntegerWithTruncation(arena, v);

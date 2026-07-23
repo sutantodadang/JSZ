@@ -378,7 +378,6 @@ built-ins/Temporal/ZonedDateTime/prototype/since/roundingincrement-addition-out-
 built-ins/Temporal/ZonedDateTime/prototype/toString/options-read-before-algorithmic-validation.js
 built-ins/Temporal/ZonedDateTime/prototype/until/argument-string-limits.js
 built-ins/Temporal/ZonedDateTime/prototype/until/roundingincrement-addition-out-of-range.js
-built-ins/Temporal/ZonedDateTime/prototype/with/order-of-operations.js
 built-ins/Temporal/ZonedDateTime/timezone-iso-string.js
 built-ins/ThrowTypeError/distinct-cross-realm.js
 built-ins/TypedArray/prototype/copyWithin/coerced-values-end-detached-prototype.js
