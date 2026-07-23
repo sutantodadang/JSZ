@@ -48,6 +48,7 @@ pub fn makeDateTime(arena: std.mem.Allocator, dt: ISODateTime) !Value {
 
 fn installInto(arena: std.mem.Allocator, this_val: Value, dt: ISODateTime) !Value {
     if (!shared.isValidISODate(dt.date.year, dt.date.month, dt.date.day)) return realm_mod.throwRangeError(arena, "invalid PlainDateTime");
+    if (!shared.isoDateTimeWithinLimits(dt.date, dt.time)) return realm_mod.throwRangeError(arena, "PlainDateTime out of range");
     const slot = try arena.create(ISODateTime);
     slot.* = dt;
     this_val.toPtr().object.internal_kind = .temporal_plain_date_time;

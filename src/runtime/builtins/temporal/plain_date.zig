@@ -44,6 +44,7 @@ pub fn makeDate(arena: std.mem.Allocator, d: ISODate) !Value {
 
 fn installInto(arena: std.mem.Allocator, this_val: Value, d: ISODate) !Value {
     if (!shared.isValidISODate(d.year, d.month, d.day)) return realm_mod.throwRangeError(arena, "invalid PlainDate");
+    if (!shared.isoDateWithinLimits(d)) return realm_mod.throwRangeError(arena, "PlainDate out of range");
     const slot = try arena.create(ISODate);
     slot.* = d;
     this_val.toPtr().object.internal_kind = .temporal_plain_date;
@@ -64,8 +65,10 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     // regardless of the calendar.
     var cal: calendar.CalendarId = .iso8601;
     if (args.len > 3 and args[3].bits != 0 and args[3].unbox() != .undefined_) {
-        const name = try shared.valueToString(arena, args[3]);
-        cal = calendar.canonicalize(name) orelse return realm_mod.throwRangeError(arena, "unsupported calendar");
+        // The calendar argument must be a String primitive; null/number/object
+        // is a TypeError before canonicalization.
+        if (args[3].unbox() != .string) return realm_mod.throwTypeError(arena, "calendar must be a string");
+        cal = calendar.canonicalize(args[3].unbox().string) orelse return realm_mod.throwRangeError(arena, "unsupported calendar");
     }
     if (y != @trunc(y) or m != @trunc(m) or d != @trunc(d)) return realm_mod.throwRangeError(arena, "non-integer date field");
     const yi: i32 = floatToI32(y);
@@ -385,6 +388,15 @@ fn nativeAddSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, 
         dur.months = -dur.months;
         dur.weeks = -dur.weeks;
         dur.days = -dur.days;
+        // The time units are balanced into days below, so they must be negated
+        // for subtraction too — otherwise a duration like "1 day + 24 hours"
+        // subtracts the day but adds the hours.
+        dur.hours = -dur.hours;
+        dur.minutes = -dur.minutes;
+        dur.seconds = -dur.seconds;
+        dur.milliseconds = -dur.milliseconds;
+        dur.microseconds = -dur.microseconds;
+        dur.nanoseconds = -dur.nanoseconds;
     }
     // Time units in the duration are balanced down into whole days.
     const time_ns = @as(i128, @intFromFloat(dur.hours)) * shared.NS_PER_HOUR +
