@@ -1637,7 +1637,14 @@ pub fn installStringExotic(arena: std.mem.Allocator, obj: *JsObject, s: []const 
 }
 
 fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
+    // The Array constructor ALWAYS builds a fresh array (OrdinaryCreateFrom-
+    // Constructor); it never installs into the `this` binding. Only reuse the
+    // caller-supplied object when it is the construct target the VM synthesized
+    // for `new Array(...)` (active_constructing) — a plain call such as
+    // `Array.apply(obj, args)` must not mutate `obj`.
+    const is_construct = active_constructing;
+    active_constructing = false;
+    const obj = if (is_construct and this_val.bits != 0 and this_val.unbox() == .object)
         this_val.toPtr().object
     else if (active_heap) |heap|
         try JsObject.createOnHeap(heap, active_array_proto)
