@@ -85,6 +85,9 @@ pub const Context = struct {
     /// HasProperty(O, key): own-or-inherited existence check firing Proxy `has`
     /// traps. Used by array methods to skip holes (absent indices).
     has_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool,
+
+    /// [[Delete]] returning the boolean result (Proxy trap aware).
+    delete_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool,
     /// Set [[Prototype]] of an object OR bc_function (materializing the closure's
     /// backing object). Used by Object.setPrototypeOf for class static inheritance.
     set_proto_fn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void,
@@ -158,6 +161,10 @@ pub const Context = struct {
 
     pub fn hasProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool {
         return self.has_fn(self.ptr, arena, obj_val, key);
+    }
+
+    pub fn deleteProp(self: *Context, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool {
+        return self.delete_fn(self.ptr, arena, obj_val, key);
     }
 
     pub fn setProto(self: *Context, arena: std.mem.Allocator, obj_val: Value, proto: ?*JsObject) anyerror!void {
@@ -1294,6 +1301,7 @@ pub var active_array_proto: ?*JsObject = null;
 /// %Array% of the running realm — ArraySpeciesCreate compares a cross-realm
 /// species constructor against its OWN realm's %Array% (ES 23.1.3.4 step 3.b).
 pub var active_array_ctor: ?*JsObject = null;
+pub var active_object_ctor: ?*JsObject = null;
 pub var active_object_proto: ?*JsObject = null;
 /// Phase 4b: thread-local for String.prototype (autoboxing lookup).
 pub var active_string_proto: ?*JsObject = null;
@@ -1552,6 +1560,20 @@ fn nativeSuppressedErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []
 // ---- Phase 4: Array/String/Number constructors ----
 
 fn nativeObjectCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    // §20.1.1.1 step 1: if NewTarget is neither undefined nor the active function
+    // (Object itself) — i.e. a subclass is being constructed — ignore `value` and
+    // build a fresh object from NewTarget's prototype. The VM synthesized
+    // `this_val` with that prototype and applies GetPrototypeFromConstructor
+    // post-return, so returning it here yields OrdinaryCreateFromConstructor.
+    if (active_constructing) {
+        const nt = pending_new_target;
+        const is_subclass = nt.bits != 0 and !(nt.bits != 0 and active_object_ctor != null and
+            nt.isHeapPtr() and nt.unbox() == .object and nt.toPtr().object == active_object_ctor.?);
+        if (is_subclass and this_val.bits != 0 and this_val.unbox() == .object) {
+            active_constructing = false;
+            return this_val;
+        }
+    }
     // new Object() / Object(): if arg is an object return it, else create new.
     // Functions are objects too — `Object(f) === f` must hold, and testing only
     // for `.object` boxed them into a fresh plain object instead.
@@ -1637,7 +1659,14 @@ pub fn installStringExotic(arena: std.mem.Allocator, obj: *JsObject, s: []const 
 }
 
 fn nativeArrayCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    const obj = if (this_val.bits != 0 and this_val.unbox() == .object)
+    // The Array constructor ALWAYS builds a fresh array (OrdinaryCreateFrom-
+    // Constructor); it never installs into the `this` binding. Only reuse the
+    // caller-supplied object when it is the construct target the VM synthesized
+    // for `new Array(...)` (active_constructing) — a plain call such as
+    // `Array.apply(obj, args)` must not mutate `obj`.
+    const is_construct = active_constructing;
+    active_constructing = false;
+    const obj = if (is_construct and this_val.bits != 0 and this_val.unbox() == .object)
         this_val.toPtr().object
     else if (active_heap) |heap|
         try JsObject.createOnHeap(heap, active_array_proto)
@@ -4358,6 +4387,7 @@ pub const Realm = struct {
         _ = try object_ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });
         _ = try object_ctor.defineOwnData("name", try val_mod.makeString(arena, "Object"), .{ .writable = false, .enumerable = false, .configurable = true });
         const ctor_val = try val_mod.makeObject(arena, object_ctor);
+        active_object_ctor = object_ctor;
         try env.define("Object", ctor_val);
 
         // Object.prototype.constructor === Object (spec §20.1.2.1). Was absent →

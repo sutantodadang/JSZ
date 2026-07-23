@@ -524,13 +524,28 @@ pub const BcVm = struct {
         return self.constructImpl(ctor, args, ctor);
     }
 
+    /// The *JsObject to use as a new instance's [[Prototype]] when `pv` is a
+    /// constructor's `.prototype` value. Per ES [[Construct]] / OrdinaryCreate-
+    /// FromConstructor, ANY object (including a callable — plain function, class,
+    /// bound function) is a valid prototype, not just plain objects. Returns null
+    /// when `pv` is not object-like (primitive), so the caller falls back to the
+    /// intrinsic default. Materializes a bc function's backing object on demand.
+    fn protoObjOf(self: *BcVm, pv: Value) anyerror!?*JsObject {
+        if (pv.bits == 0) return null;
+        return switch (pv.unbox()) {
+            .object => |o| o,
+            .bc_function => |c| try self.closureBackingObj(c),
+            else => null,
+        };
+    }
+
     /// GetPrototypeFromConstructor(newTarget, default): `? Get(newTarget,"prototype")`
     /// (fires accessor getters / proxy traps, abrupt throws propagate); falls back
     /// to `default` when the result is not an object.
     fn protoFromNewTarget(self: *BcVm, new_target: Value, ctor: Value, default_proto: ?*JsObject) anyerror!?*JsObject {
         if (new_target.bits == 0) return default_proto;
         const pv = try self.getProp(new_target, "prototype");
-        if (pv.bits != 0 and pv.unbox() == .object) return pv.toPtr().object;
+        if (try self.protoObjOf(pv)) |po| return po;
         // GetPrototypeFromConstructor fallback (ES 9.1.14 step 4): NewTarget.prototype
         // is not an object, so use the intrinsic default prototype from NewTarget's
         // [[Realm]]. That intrinsic is the SAME-named constructor's `.prototype` in
@@ -649,7 +664,7 @@ pub const BcVm = struct {
                         // so e.g. ToIndex on a primitive arg can throw FIRST) or post-hoc here.
                         var default_proto: ?*JsObject = self.realm.object_prototype;
                         if (o.get("prototype")) |pv| {
-                            if (pv.bits != 0 and pv.unbox() == .object) default_proto = pv.toPtr().object;
+                            if (try self.protoObjOf(pv)) |po| default_proto = po;
                         }
                         const new_obj = if (self.heap) |heap|
                             try JsObject.createOnHeap(heap, default_proto)
@@ -726,6 +741,14 @@ pub const BcVm = struct {
         _ = arena;
         const self: *BcVm = @ptrCast(@alignCast(ptr));
         return self.setProp(obj_val, key, value);
+    }
+
+    /// [[Delete]] returning the boolean result; routes through the Proxy
+    /// deleteProperty trap and honors non-configurable properties.
+    fn bcDeleteProp(ptr: *anyopaque, arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!bool {
+        const self: *BcVm = @ptrCast(@alignCast(ptr));
+        const key_v = try val_mod.makeString(arena, key);
+        return self.deleteProperty(obj_val, key_v);
     }
 
     /// [[Set]] with Throw=true: a failed assignment (setPropR returns false)
@@ -1359,6 +1382,7 @@ pub const BcVm = struct {
             .set_fn = bcSetProp,
             .set_throw_fn = bcSetPropThrow,
             .has_fn = bcHasProp,
+            .delete_fn = bcDeleteProp,
             .set_proto_fn = bcSetProto,
             .backing_obj_fn = bcBackingObj,
             .shadow_eval_fn = bcEvalInEnv,
@@ -1686,10 +1710,7 @@ pub const BcVm = struct {
                     args[i] = frame.registers[base + 1 + @as(u8, @intCast(i))];
                 }
                 const proto_v = try self.getProp(callee_val, "prototype");
-                const proto: ?*JsObject = if (proto_v.bits != 0 and proto_v.unbox() == .object)
-                    proto_v.toPtr().object
-                else
-                    self.realm.object_prototype;
+                const proto: ?*JsObject = (try self.protoObjOf(proto_v)) orelse self.realm.object_prototype;
                 const new_obj = if (self.heap) |heap|
                     try JsObject.createOnHeap(heap, proto)
                 else
@@ -1791,8 +1812,8 @@ pub const BcVm = struct {
                         const fn_ptr = call_val.toPtr().native_function;
                         var proto: ?*JsObject = self.realm.object_prototype;
                         if (obj.get("prototype")) |pv| {
-                            if (pv.bits != 0 and pv.unbox() == .object) {
-                                proto = pv.toPtr().object;
+                            if (try self.protoObjOf(pv)) |po| {
+                                proto = po;
                             }
                         }
                         var args = try self.arena.alloc(Value, nargs);
@@ -2375,9 +2396,18 @@ pub const BcVm = struct {
         if (obj_val.bits != 0 and obj_val.unbox() == .bc_function) {
             if (key_v.bits != 0 and key_v.unbox() == .symbol) return true;
             const closure_d = obj_val.toPtr().bc_function;
-            if (closure_d.obj == null) return true; // nothing materialized yet — no own props
-            const bk: *JsObject = @ptrCast(@alignCast(closure_d.obj.?));
             const key_str_d = try valueToStringArena(self.arena, key_v);
+            if (closure_d.obj == null) {
+                // `length` and `name` are virtual own props resolved on demand;
+                // deleting one must actually remove it (not resurface via the
+                // recompute path), so materialize the backing object first — it
+                // installs real length/name descriptors. Any other key genuinely
+                // has no own property yet, so deleting it is a no-op.
+                if (!std.mem.eql(u8, key_str_d, "length") and !std.mem.eql(u8, key_str_d, "name"))
+                    return true;
+                _ = try self.closureBackingObj(closure_d);
+            }
+            const bk: *JsObject = @ptrCast(@alignCast(closure_d.obj.?));
             if (!bk.hasOwn(key_str_d)) return true; // not own
             return bk.deleteOwn(key_str_d);
         }
@@ -2727,15 +2757,20 @@ pub const BcVm = struct {
                 // Own `name`/`length` for user functions (spec: non-writable,
                 // configurable). `length` = declared arity; `name` = the bound
                 // function name ("" when anonymous and not named-evaluated).
-                if (std.mem.eql(u8, key, "name")) {
-                    const raw = closure.effectiveName();
-                    // Translate internal sentinels for anonymous default exports to "default".
-                    const display = if (std.mem.eql(u8, raw, "__esm_dflt_fn__") or
-                        std.mem.eql(u8, raw, "__esm_dflt_gen__")) "default" else raw;
-                    return val_mod.makeString(self.arena, display);
-                }
-                if (std.mem.eql(u8, key, "length")) {
-                    return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.expected_argc));
+                // Only compute virtually while the backing object does not exist:
+                // once materialized it holds real length/name descriptors, and a
+                // missing one there means it was deleted (must not resurface).
+                if (closure.obj == null) {
+                    if (std.mem.eql(u8, key, "name")) {
+                        const raw = closure.effectiveName();
+                        // Translate internal sentinels for anonymous default exports to "default".
+                        const display = if (std.mem.eql(u8, raw, "__esm_dflt_fn__") or
+                            std.mem.eql(u8, raw, "__esm_dflt_gen__")) "default" else raw;
+                        return val_mod.makeString(self.arena, display);
+                    }
+                    if (std.mem.eql(u8, key, "length")) {
+                        return val_mod.makeNumber(self.arena, @floatFromInt(closure.func.expected_argc));
+                    }
                 }
                 // Walk the backing object's prototype chain. For a subclass
                 // constructor (`class C extends Base`), `bcSetProto` set the
@@ -3690,7 +3725,7 @@ pub const BcVm = struct {
                             // Preserve legacy behavior for Error-like constructor objects.
                             var proto: ?*JsObject = self.realm.object_prototype;
                             if (obj.get("prototype")) |pv| {
-                                if (pv.bits != 0 and pv.unbox() == .object) proto = pv.toPtr().object;
+                                if (try self.protoObjOf(pv)) |po| proto = po;
                             }
                             const new_obj = if (self.heap) |heap|
                                 try JsObject.createOnHeap(heap, proto)

@@ -667,12 +667,16 @@ pub const JsObject = struct {
         }
         if (self.shape.key_to_slot.get(key)) |slot| {
             const cur = if (slot < self.attrs.items.len) self.attrs.items[slot] else PropAttr{};
-            // Converting accessor → data: delete the accessor slot first so a
-            // shape transition happens and stale ICs miss.
+            // Converting accessor → data: update the EXISTING slot in place.
+            // Deleting and re-adding would move the key to the end of the
+            // creation order, but [[DefineOwnProperty]] must not reorder
+            // (Object.keys/values order). Mirrors the data → accessor path.
             if (cur.is_accessor) {
                 if (!cur.configurable) return false;
-                _ = try self.deleteOwn(key);
-                // Fall through to the add-new-key path below.
+                if (slot < self.slots.items.len) self.slots.items[slot] = value;
+                if (slot < self.attrs.items.len) self.attrs.items[slot] = attr;
+                self.gcWrite(value);
+                return true;
             } else {
                 if (!cur.configurable) {
                     if (attr.configurable) return false;
@@ -762,11 +766,14 @@ pub const JsObject = struct {
         if (self.extensible) return false;
         // A frozen array must have a non-writable "length".
         if (self.is_array and self.array_length_writable) return false;
+        // A frozen object's DATA properties must be non-writable; an accessor
+        // property has no [[Writable]] attribute, so only its configurability
+        // matters (a stray writable=true on an accessor slot must be ignored).
         for (self.attrs.items) |a| {
-            if (a.configurable or a.writable) return false;
+            if (a.configurable or (!a.is_accessor and a.writable)) return false;
         }
         for (self.sym_props.items) |sp| {
-            if (sp.attr.configurable or sp.attr.writable) return false;
+            if (sp.attr.configurable or (!sp.attr.is_accessor and sp.attr.writable)) return false;
         }
         return true;
     }

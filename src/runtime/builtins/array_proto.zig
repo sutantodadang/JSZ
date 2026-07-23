@@ -150,7 +150,7 @@ pub fn nativeIndexOf(arena: std.mem.Allocator, this_val: Value, args: []const Va
     // fromIndex = ToIntegerOrInfinity(args[1]); +∞ → no match, -∞ → 0.
     var from: usize = 0;
     if (args.len > 1) {
-        const n = try realm_mod.toNumberValue(arena, args[1]);
+        const n = try realm_mod.toNumberCheckedRealm(arena, args[1]);
         if (std.math.isInf(n) and n > 0) return val_mod.makeNumber(arena, -1.0);
         const ni: i64 = if (std.math.isNan(n)) 0 else val_mod.f64ToI64Sat(std.math.trunc(n));
         if (ni >= 0) {
@@ -179,7 +179,7 @@ pub fn nativeIncludes(arena: std.mem.Allocator, this_val: Value, args: []const V
     // fromIndex = ToIntegerOrInfinity; +∞ → false, -∞ → 0.
     var from: usize = 0;
     if (args.len > 1) {
-        const n = try realm_mod.toNumberValue(arena, args[1]);
+        const n = try realm_mod.toNumberCheckedRealm(arena, args[1]);
         if (std.math.isInf(n) and n > 0) return val_mod.makeBool(arena, false);
         const ni: i64 = if (std.math.isNan(n)) 0 else val_mod.f64ToI64Sat(std.math.trunc(n));
         if (ni >= 0) {
@@ -438,7 +438,14 @@ pub fn nativeShift(arena: std.mem.Allocator, this_val: Value, _: []const Value) 
 
 /// ES IsConcatSpreadable(O): honors @@isConcatSpreadable, else IsArray(O).
 fn isConcatSpreadable(arena: std.mem.Allocator, v: Value) !bool {
-    if (v.bits == 0 or v.unbox() != .object) return false;
+    // IsConcatSpreadable step 1: "If Type(O) is not Object, return false." A
+    // callable (function/class) IS an object, so an explicit
+    // @@isConcatSpreadable on a function must still be honored.
+    if (v.bits == 0) return false;
+    switch (v.unbox()) {
+        .object, .bc_function, .native_function, .function => {},
+        else => return false,
+    }
     if (realm_mod.active_sym_is_concat_spreadable) |sym| {
         const spreadable = if (realm_mod.active_context) |ctx|
             try ctx.getPropSym(arena, v, sym)
@@ -938,11 +945,19 @@ pub fn genCreate(arena: std.mem.Allocator, this_val: Value, i: usize, v: Value) 
     _ = try obj_methods.nativeObjectDefineProperty(arena, this_val, &[_]Value{ this_val, key_val, val_mod.makeObject(arena, d) catch this_val });
 }
 
-/// DeletePropertyOrThrow(O, ToString(i)) — best-effort own-property delete.
+/// DeletePropertyOrThrow(O, ToString(i)): [[Delete]] (Proxy trap aware) and a
+/// TypeError when it reports false (e.g. a non-configurable property).
 fn genDelete(arena: std.mem.Allocator, this_val: Value, i: usize) !void {
     const key = try std.fmt.allocPrint(arena, "{d}", .{i});
-    if (this_val.isHeapPtr() and this_val.toPtr().* == .object)
-        _ = try this_val.toPtr().object.deleteOwn(key);
+    if (realm_mod.active_context) |ctx| {
+        if (!try ctx.deleteProp(arena, this_val, key))
+            return throwTypeError(arena, "Cannot delete property");
+        return;
+    }
+    if (this_val.isHeapPtr() and this_val.toPtr().* == .object) {
+        if (!try this_val.toPtr().object.deleteOwn(key))
+            return throwTypeError(arena, "Cannot delete property");
+    }
 }
 
 /// ToIntegerOrInfinity with full ToNumber coercion (objects via valueOf/toString).
@@ -1058,9 +1073,12 @@ pub fn nativeReverse(arena: std.mem.Allocator, this_val: Value, _: []const Value
     var lower: usize = 0;
     while (lower < len / 2) : (lower += 1) {
         const upper = len - 1 - lower;
+        // Spec §23.1.3.26 order: HasProperty(lower), Get(lower), HasProperty(upper),
+        // Get(upper) — strictly interleaved, since Get(lower) may run an accessor
+        // that mutates the array (e.g. truncating length so upper stops existing).
         const lower_exists = try genHas(arena, O, lower);
-        const upper_exists = try genHas(arena, O, upper);
         const lv = if (lower_exists) try genGet(arena, O, lower) else undefined;
+        const upper_exists = try genHas(arena, O, upper);
         const uv = if (upper_exists) try genGet(arena, O, upper) else undefined;
         if (lower_exists and upper_exists) {
             try genSet(arena, O, lower, uv);
@@ -1086,7 +1104,7 @@ pub fn nativeLastIndexOf(arena: std.mem.Allocator, this_val: Value, args: []cons
     // fromIndex = ToIntegerOrInfinity; default len-1. -∞ → no match.
     var from: i64 = @as(i64, @intCast(len)) - 1;
     if (args.len > 1) {
-        const nnum = try realm_mod.toNumberValue(arena, args[1]);
+        const nnum = try realm_mod.toNumberCheckedRealm(arena, args[1]);
         if (std.math.isInf(nnum) and nnum < 0) return val_mod.makeNumber(arena, -1);
         const n: i64 = if (std.math.isNan(nnum)) 0 else val_mod.f64ToI64Sat(std.math.trunc(nnum));
         if (n >= 0) {
