@@ -48,6 +48,20 @@ fn isObj(v: Value) bool {
     return v.toPtr().* == .object;
 }
 
+/// The *JsObject a Reflect target denotes, including a function's lazily
+/// materialized backing object (a callable IS an object). Null for primitives.
+fn reflectTargetObj(arena: std.mem.Allocator, v: Value) anyerror!?*JsObject {
+    if (v.bits == 0) return null;
+    return switch (v.unbox()) {
+        .object => v.toPtr().object,
+        .bc_function, .function => if (@import("../realm.zig").active_context) |ctx|
+            (try ctx.backingObject(arena, v))
+        else
+            null,
+        else => null,
+    };
+}
+
 fn isSym(v: Value) bool {
     if (v.bits == 0) return false;
     if (!v.isHeapPtr()) return false;
@@ -746,9 +760,8 @@ pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
 // ---------------------------------------------------------------- Reflect.defineProperty ---
 
 pub fn nativeReflectDefineProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len < 1 or !isObj(args[0]))
+    const target_obj = (try reflectTargetObj(arena, if (args.len > 0) args[0] else Value{})) orelse
         return throwTypeErrorReflect(arena, "Reflect.defineProperty called on non-object");
-    const target_obj = args[0].toPtr().object;
     // Spec order: ToPropertyKey (step 2) runs before ToPropertyDescriptor (step 3),
     // so a throwing property-key coercion must propagate before the descriptor check.
     const key_arg = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
