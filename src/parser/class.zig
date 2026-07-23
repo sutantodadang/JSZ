@@ -374,6 +374,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             return null;
         };
         p.in_generator_function = prev_gen;
+        if (!parser_file.checkStrictDirectiveSimpleParams(p, mparams.non_simple, mbody)) return null;
         const member_end = p.prev_end;
 
         if (!is_static and accessor == .none and computed_key == null and std.mem.eql(u8, name, "constructor")) {
@@ -1532,6 +1533,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
     // functions/arrows (which reuse p.arrow_prelude) can't clobber them.
     var param_prelude = std.ArrayList(*Node){};
     var saw_rest = false;
+    var saw_destructuring = false;
     var rest_param: ?[]const u8 = null;
     while (!p.check(.right_paren) and !p.check(.eof) and !p.had_error) {
         var is_rest = false;
@@ -1540,6 +1542,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         // optional `= default`). Desugared to a synthetic `__param_N` name plus
         // `let` decls prepended to the body, mirroring the arrow-param path.
         if (!is_rest and (p.check(.left_bracket) or p.check(.left_brace))) {
+            saw_destructuring = true;
             const pat = p.parseAssignmentExpr() orelse return null;
             const tmp_name = std.fmt.allocPrint(p.arena, "__param_{d}", .{p.param_destruct_counter}) catch {
                 p.had_error = true;
@@ -1709,6 +1712,7 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         .param_defaults = defaults.items,
         .rest_param = rest_param,
         .expected_argc = expected_argc,
+        .non_simple = rest_param != null or any_default or saw_destructuring,
     };
 }
 
@@ -1759,6 +1763,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     const le_start = p.live_exports.items.len;
     const la_start = p.live_export_aliases.items.len;
     var in_prologue = true;
+    var body_use_strict = false;
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const s = p.parseStatement() orelse break;
         body.append(p.arena, s) catch {
@@ -1767,11 +1772,17 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
         };
         if (in_prologue) {
             if (parser_file.directiveOf(s)) |dir| {
-                if (std.mem.eql(u8, dir, "use strict")) p.strict = true;
+                if (std.mem.eql(u8, dir, "use strict")) {
+                    p.strict = true;
+                    body_use_strict = true;
+                }
             } else in_prologue = false;
         }
         p.drainExtraStmts(&body);
     }
+    // Surface this body's own "use strict" directive for the caller's §15.2.1
+    // non-simple-parameter early-error check (see pending_body_use_strict).
+    p.pending_body_use_strict = body_use_strict;
     p.applyLiveBindings(body.items, li_start, le_start, la_start);
     // §15.2.1: a "use strict" prologue makes the *whole* function strict, which
     // retroactively outlaws a duplicate parameter name; and a body-level

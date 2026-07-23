@@ -30,6 +30,11 @@ pub const ParamParse = struct {
     /// because the default-parameter TDZ desugar in `parseFunctionParams`
     /// rewrites the initializers into the body and clears `param_defaults`.
     expected_argc: u16 = 0,
+    /// True when the formal parameter list is *not* a simple one — i.e. it has a
+    /// default value, a rest element, or a destructuring pattern (§15.1.3
+    /// IsSimpleParameterList). Captured before the TDZ desugar clears the
+    /// initializers so callers can enforce the "use strict" directive early error.
+    non_simple: bool = false,
 };
 
 /// Check if first statement of body is "use strict" directive.
@@ -42,6 +47,26 @@ pub fn hasUseStrict(body: []*Node) bool {
     const inner = first.data.expr_stmt;
     if (inner.kind != .string_literal) return false;
     return std.mem.eql(u8, inner.data.string_literal, "use strict");
+}
+
+/// §15.2.1 early error: a function whose FunctionBody opens with a "use strict"
+/// directive may not have a non-simple parameter list (defaults, rest, or a
+/// destructuring pattern). Returns false and records the SyntaxError when that
+/// combination is present, so the caller aborts the parse.
+pub fn checkStrictDirectiveSimpleParams(p: *Parser, non_simple: bool, body: []*Node) bool {
+    _ = body; // directive is read from pending_body_use_strict (prelude-safe)
+    if (non_simple and p.pending_body_use_strict) {
+        if (!p.had_error) {
+            p.had_error = true;
+            p.error_info = ParseError{
+                .message = "Illegal 'use strict' directive in function with non-simple parameter list",
+                .line = p.current.line,
+                .column = p.current.column,
+            };
+        }
+        return false;
+    }
+    return true;
 }
 
 /// If `node` is a string-literal expression statement (a member of a directive
@@ -257,6 +282,12 @@ pub const Parser = struct {
     /// early SyntaxError everywhere else — including when the body turns out to
     /// carry a "use strict" prologue, which only `parseFunctionBody` can see.
     pending_params_duplicate: bool = false,
+    /// True when the FunctionBody just parsed by `parseFunctionBody` opened with a
+    /// "use strict" directive of its own. Read once, right after that call, by the
+    /// §15.2.1 non-simple-parameter early-error check — `hasUseStrict` on the
+    /// returned body is unreliable once a default/destructuring prelude has been
+    /// prepended in front of the directive.
+    pending_body_use_strict: bool = false,
     /// Set by callers that parse UniqueFormalParameters (method definitions,
     /// accessors, class constructors), where duplicate BoundNames are an early
     /// SyntaxError regardless of strictness. Consumed by `parseFunctionParams`.
