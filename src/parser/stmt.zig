@@ -799,18 +799,36 @@ pub fn desugarUsingScope(p: *Parser, items: []*Node, start: u32) []*Node {
     const new_expr = p.makeNode(.new_expr, start, start, .{ .new_expr = .{ .callee = ctor_id, .args = &[_]*Node{} } }) orelse return items;
     const ds_decl = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = .let, .name = ds_name, .init = new_expr } }) orelse return items;
 
+    // Names for the caught-error flag/value threaded into disposal, so a body
+    // throw becomes the innermost `suppressed` of the SuppressedError chain.
+    const err_name = std.fmt.allocPrint(p.arena, "__uerr_{s}", .{ds_name}) catch return items;
+    const has_name = std.fmt.allocPrint(p.arena, "__uhas_{s}", .{ds_name}) catch return items;
+    const cvar_name = std.fmt.allocPrint(p.arena, "__uc_{s}", .{ds_name}) catch return items;
+
     const try_block = p.makeNode(.block_stmt, start, start, .{ .block_stmt = .{ .body = items, .lexical_scope = true } }) orelse return items;
 
-    // finalizer: `__ds.dispose();` or `__await__(__ds.disposeAsync());`
-    const ds_id2 = p.makeNode(.identifier, start, start, .{ .identifier = ds_name }) orelse return items;
-    const disp_name = if (is_async) "disposeAsync" else "dispose";
-    const disp_id = p.makeNode(.identifier, start, start, .{ .identifier = disp_name }) orelse return items;
-    const disp_member = p.makeNode(.member_expr, start, start, .{
-        .member_expr = .{ .object = ds_id2, .property = disp_id, .computed = false },
-    }) orelse return items;
-    var disp_expr = p.makeNode(.call_expr, start, start, .{
-        .call_expr = .{ .callee = disp_member, .args = &[_]*Node{} },
-    }) orelse return items;
+    // catch (__uc) { __uerr = __uc; __uhas = true; }
+    const catch_body = blk: {
+        const uc_id = p.makeNode(.identifier, start, start, .{ .identifier = cvar_name }) orelse return items;
+        const err_id = p.makeNode(.identifier, start, start, .{ .identifier = err_name }) orelse return items;
+        const a1 = p.makeNode(.assignment_expr, start, start, .{ .assignment_expr = .{ .op = .assign, .target = err_id, .value = uc_id } }) orelse return items;
+        const has_id = p.makeNode(.identifier, start, start, .{ .identifier = has_name }) orelse return items;
+        const true_lit = p.makeNode(.bool_literal, start, start, .{ .bool_literal = true }) orelse return items;
+        const a2 = p.makeNode(.assignment_expr, start, start, .{ .assignment_expr = .{ .op = .assign, .target = has_id, .value = true_lit } }) orelse return items;
+        var cb = std.ArrayList(*Node){};
+        cb.append(p.arena, p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = a1 }) orelse return items) catch return items;
+        cb.append(p.arena, p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = a2 }) orelse return items) catch return items;
+        break :blk p.makeNode(.block_stmt, start, start, .{ .block_stmt = .{ .body = cb.items, .lexical_scope = true } }) orelse return items;
+    };
+
+    // finalizer: `__usingDispose__(__ds, __uhas, __uerr);` (await for async).
+    const helper_name = if (is_async) "__usingDisposeAsync__" else "__usingDispose__";
+    const helper_id = p.makeNode(.identifier, start, start, .{ .identifier = helper_name }) orelse return items;
+    var dargs = std.ArrayList(*Node){};
+    dargs.append(p.arena, p.makeNode(.identifier, start, start, .{ .identifier = ds_name }) orelse return items) catch return items;
+    dargs.append(p.arena, p.makeNode(.identifier, start, start, .{ .identifier = has_name }) orelse return items) catch return items;
+    dargs.append(p.arena, p.makeNode(.identifier, start, start, .{ .identifier = err_name }) orelse return items) catch return items;
+    var disp_expr = p.makeNode(.call_expr, start, start, .{ .call_expr = .{ .callee = helper_id, .args = dargs.items } }) orelse return items;
     if (is_async) {
         const aw = p.makeNode(.identifier, start, start, .{ .identifier = "__await__" }) orelse return items;
         var aargs = std.ArrayList(*Node){};
@@ -821,10 +839,21 @@ pub fn desugarUsingScope(p: *Parser, items: []*Node, start: u32) []*Node {
     var fin_body = std.ArrayList(*Node){};
     fin_body.append(p.arena, disp_stmt) catch return items;
     const finalizer = p.makeNode(.block_stmt, start, start, .{ .block_stmt = .{ .body = fin_body.items, .lexical_scope = true } }) orelse return items;
-    const try_stmt = p.makeNode(.try_stmt, start, start, .{ .try_stmt = .{ .block = try_block, .handler = null, .finalizer = finalizer } }) orelse return items;
+    const try_stmt = p.makeNode(.try_stmt, start, start, .{ .try_stmt = .{
+        .block = try_block,
+        .handler = .{ .param_name = cvar_name, .body = catch_body },
+        .finalizer = finalizer,
+    } }) orelse return items;
+
+    // let __uerr = undefined; let __uhas = false;
+    const err_decl = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = .let, .name = err_name, .init = null } }) orelse return items;
+    const false_lit = p.makeNode(.bool_literal, start, start, .{ .bool_literal = false }) orelse return items;
+    const has_decl = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = .let, .name = has_name, .init = false_lit } }) orelse return items;
 
     var out = std.ArrayList(*Node){};
     out.append(p.arena, ds_decl) catch return items;
+    out.append(p.arena, err_decl) catch return items;
+    out.append(p.arena, has_decl) catch return items;
     out.append(p.arena, try_stmt) catch return items;
     return out.items;
 }

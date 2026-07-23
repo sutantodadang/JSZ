@@ -378,6 +378,10 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__asyncDelegCall__", try val_mod.makeNativeFunction(arena, es2015.nativeAsyncDelegCall));
         try realm.global_env.define("__asyncDelegStep__", try val_mod.makeNativeFunction(arena, es2015.nativeAsyncDelegStep));
         try realm.global_env.define("__retComplVal__", try val_mod.makeNativeFunction(arena, es2015.nativeRetComplVal));
+        // Explicit Resource Management: the disposal step of a `using` scope's
+        // try/finally desugar (seeds a body error into the SuppressedError chain).
+        try realm.global_env.define("__usingDispose__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingDispose));
+        try realm.global_env.define("__usingDisposeAsync__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingDisposeAsync));
         // Class desugar: the return-override rule for a derived constructor.
         try realm.global_env.define("__derivedReturn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeDerivedReturn));
         // M16 Phase 3: dynamic import() native + the import.meta object binding.

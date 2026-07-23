@@ -205,23 +205,44 @@ fn nativeMove(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyer
 /// aggregating thrown errors into a SuppressedError chain. Shared by both the
 /// sync `dispose()` and the async drain.
 fn disposeResources(arena: std.mem.Allocator, d: *DisposableStackData) anyerror!void {
-    var completion: ?Value = null; // pending thrown value, if any
+    return disposeResourcesSeeded(arena, d, null, false);
+}
+
+/// DisposeResources seeded with an existing abrupt completion `seed` (the value
+/// thrown by the guarded body). Each disposer that throws suppresses the current
+/// completion: the result is `SuppressedError(disposerError, priorCompletion)`,
+/// so a body error threads to the innermost `suppressed` of the chain. When
+/// `is_async` is set (AsyncDisposeResources), each disposer's returned value is
+/// awaited, so an async disposer that *rejects* is captured just like a throw.
+fn disposeResourcesSeeded(arena: std.mem.Allocator, d: *DisposableStackData, seed: ?Value, is_async: bool) anyerror!void {
+    var completion: ?Value = seed; // pending thrown value, if any
     var i: usize = d.records.items.len;
     while (i > 0) {
         i -= 1;
         const r = d.records.items[i];
         const call_args: []const Value = if (r.has_arg) &[_]Value{r.arg} else &[_]Value{};
-        const res = function_proto.invokeCallback(arena, r.this_val, r.method, call_args);
-        if (res) |_| {
-            // normal completion — nothing to do
+        var thrown: ?Value = null;
+        if (function_proto.invokeCallback(arena, r.this_val, r.method, call_args)) |rv| {
+            // Await the disposer's result so an async @@asyncDispose that returns
+            // a rejected promise surfaces as a disposal error (the await is a
+            // synchronous microtask drain).
+            if (is_async) {
+                if (promise_mod.awaitValue(arena, rv)) |_| {} else |e| {
+                    if (e != error.JsException) return e;
+                    thrown = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
+                    realm_mod.pending_exception = Value{};
+                }
+            }
         } else |e| {
             if (e != error.JsException) return e;
-            const thrown = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
+            thrown = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
             realm_mod.pending_exception = Value{};
+        }
+        if (thrown) |t| {
             if (completion) |prev| {
-                completion = try suppressedError(arena, thrown, prev);
+                completion = try suppressedError(arena, t, prev);
             } else {
-                completion = thrown;
+                completion = t;
             }
         }
     }
@@ -319,7 +340,7 @@ fn nativeDisposeAsync(arena: std.mem.Allocator, this_val: Value, _: []const Valu
     };
     if (d.disposed) return promise_mod.makeResolvedPromise(arena, try val_mod.makeUndefined(arena));
     d.disposed = true;
-    if (disposeResources(arena, d)) |_| {
+    if (disposeResourcesSeeded(arena, d, null, true)) |_| {
         return promise_mod.makeResolvedPromise(arena, try val_mod.makeUndefined(arena));
     } else |e| {
         if (e != error.JsException) return e;
@@ -327,6 +348,59 @@ fn nativeDisposeAsync(arena: std.mem.Allocator, this_val: Value, _: []const Valu
         realm_mod.pending_exception = Value{};
         return promise_mod.makeRejectedPromise(arena, err);
     }
+}
+
+/// `__usingDispose__(stack, hasError, error)` — the disposal step of a `using`
+/// scope's try/finally desugar. Runs DisposeResources over `stack`, seeded with
+/// the scope body's thrown `error` when `hasError` is true, so a body error
+/// becomes the innermost `suppressed` of any SuppressedError chain. When the
+/// body threw but no disposer does, the original error is re-thrown as-is.
+pub fn nativeUsingDispose(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const stack = if (args.len > 0) args[0] else Value{};
+    const has_err = args.len > 1 and isTrue(args[1]);
+    const err: ?Value = if (has_err) (if (args.len > 2) args[2] else try val_mod.makeUndefined(arena)) else null;
+    const d = try requireData(arena, stack, .disposable_stack, "using dispose on incompatible receiver");
+    if (d.disposed) {
+        if (err) |e| {
+            realm_mod.pending_exception = e;
+            return error.JsException;
+        }
+        return val_mod.makeUndefined(arena);
+    }
+    d.disposed = true;
+    try disposeResourcesSeeded(arena, d, err, false);
+    return val_mod.makeUndefined(arena);
+}
+
+/// Async counterpart of `__usingDispose__`: returns a promise that settles once
+/// the (approximated-synchronous) disposal drains — rejected with the aggregated
+/// completion, resolved with undefined otherwise.
+pub fn nativeUsingDisposeAsync(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const stack = if (args.len > 0) args[0] else Value{};
+    const has_err = args.len > 1 and isTrue(args[1]);
+    const err: ?Value = if (has_err) (if (args.len > 2) args[2] else try val_mod.makeUndefined(arena)) else null;
+    const d = requireData(arena, stack, .async_disposable_stack, "using dispose on incompatible receiver") catch {
+        const e = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
+        realm_mod.pending_exception = Value{};
+        return promise_mod.makeRejectedPromise(arena, e);
+    };
+    if (!d.disposed) {
+        d.disposed = true;
+        if (disposeResourcesSeeded(arena, d, err, true)) |_| {
+            return promise_mod.makeResolvedPromise(arena, try val_mod.makeUndefined(arena));
+        } else |e| {
+            if (e != error.JsException) return e;
+            const ev = if (realm_mod.pending_exception.bits != 0) realm_mod.pending_exception else try val_mod.makeUndefined(arena);
+            realm_mod.pending_exception = Value{};
+            return promise_mod.makeRejectedPromise(arena, ev);
+        }
+    }
+    if (err) |e| return promise_mod.makeRejectedPromise(arena, e);
+    return promise_mod.makeResolvedPromise(arena, try val_mod.makeUndefined(arena));
+}
+
+fn isTrue(v: Value) bool {
+    return v.bits != 0 and v.unbox() == .boolean and v.unbox().boolean;
 }
 
 // ---- registration ---------------------------------------------------------
