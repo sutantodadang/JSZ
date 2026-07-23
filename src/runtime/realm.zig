@@ -2876,6 +2876,19 @@ fn isObjectLike(v: Value) bool {
     };
 }
 
+/// `__checkHeritage__(value)` — ClassDefinitionEvaluation step 8.d: a non-null
+/// ClassHeritage value must be a constructor. The check happens *before* the
+/// `superclass.prototype` read, so `class C extends (() => {})` throws a
+/// TypeError without ever invoking a `prototype` getter on the heritage value.
+/// Returns the value unchanged so the desugar can use it as an expression.
+pub fn nativeCheckHeritage(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const v = if (args.len > 0) args[0] else Value{};
+    if (v.bits != 0 and v.unbox() == .null_) return v;
+    if (!@import("builtins/reflect.zig").isConstructorVal(v))
+        return throwTypeError(arena, "Class extends value is not a constructor or null");
+    return v;
+}
+
 /// `__derivedReturn__(value, instance)` — the return-override rule a *derived*
 /// constructor applies to an explicit `return` (§10.2.2 [[Construct]] step 13).
 /// An Object result replaces the instance; `undefined` keeps it; anything else

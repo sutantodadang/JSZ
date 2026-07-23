@@ -1226,7 +1226,20 @@ const Heritage = struct {
 
 fn parseHeritage(p: *Parser) ?Heritage {
     if (!p.match(.kw_extends)) return Heritage{};
-    const h = p.parseCallMemberExpr() orelse return null;
+    const h_raw = p.parseCallMemberExpr() orelse return null;
+    // `__checkHeritage__(<expr>)` — ClassDefinitionEvaluation rejects a heritage
+    // value that is neither `null` nor a constructor, and does so *before* the
+    // `.prototype` read below, so `class C extends (() => {})` throws a TypeError
+    // rather than tripping a `prototype` getter on the arrow.
+    const h = blk: {
+        const s = p.current.start;
+        const callee = nodeIdent(p, "__checkHeritage__") orelse return null;
+        var cargs = std.ArrayList(*Node){};
+        cargs.append(p.arena, h_raw) catch return null;
+        break :blk p.makeNode(.call_expr, s, s, .{
+            .call_expr = .{ .callee = callee, .args = cargs.items },
+        }) orelse return null;
+    };
     // Always snapshot into a fresh binding, even for a bare identifier: the
     // ClassHeritage is evaluated once at class-definition time, but `super()`
     // and the prototype wiring below read the name later. `chain = class
