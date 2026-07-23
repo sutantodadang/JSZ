@@ -212,7 +212,12 @@ pub fn readDateBag(arena: std.mem.Allocator, o: *JsObject, want: BagWant) !DateB
         bag.calendar = try shared.resolveCalendarArg(arena, v);
     }
     if (want.day) {
-        if (try shared.optionGet(arena, o, "day")) |v| bag.day = try shared.toIntegerWithTruncation(arena, v);
+        if (try shared.optionGet(arena, o, "day")) |v| {
+            bag.day = try shared.toIntegerWithTruncation(arena, v);
+            // PrepareCalendarFields rejects a non-positive day at read time,
+            // before any options object or calendar resolution is consulted.
+            if (bag.day.? < 1) return realm_mod.throwRangeError(arena, "day must be a positive integer");
+        }
     }
     // A calendar without eras has no era/eraYear in its field list at all.
     if (calendar.hasEras(bag.calendar)) {
@@ -226,8 +231,18 @@ pub fn readDateBag(arena: std.mem.Allocator, o: *JsObject, want: BagWant) !DateB
         if (try shared.optionGet(arena, o, "minute")) |v| bag.minute = try shared.toIntegerWithTruncation(arena, v);
     }
     if (want.month) {
-        if (try shared.optionGet(arena, o, "month")) |v| bag.month = try shared.toIntegerWithTruncation(arena, v);
-        if (try shared.optionGet(arena, o, "monthCode")) |v| bag.month_code = try shared.toPrimitiveRequireString(arena, v);
+        if (try shared.optionGet(arena, o, "month")) |v| {
+            bag.month = try shared.toIntegerWithTruncation(arena, v);
+            // PrepareCalendarFields rejects a non-positive month immediately.
+            if (bag.month.? < 1) return realm_mod.throwRangeError(arena, "month must be a positive integer");
+        }
+        if (try shared.optionGet(arena, o, "monthCode")) |v| {
+            bag.month_code = try shared.toPrimitiveRequireString(arena, v);
+            // The month-code *format* ("M" + two digits + optional "L") is
+            // validated as it is read; whether that month exists in the calendar
+            // (suitability) is checked later against the resolved year.
+            try shared.checkMonthCodeSyntax(arena, bag.month_code.?);
+        }
     }
     if (want.time) {
         if (try shared.optionGet(arena, o, "nanosecond")) |v| bag.nanosecond = try shared.toIntegerWithTruncation(arena, v);

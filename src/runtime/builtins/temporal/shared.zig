@@ -1368,6 +1368,16 @@ pub fn formatMonthCode(arena: std.mem.Allocator, f: calendar_mod.CalFields) ![]c
     return arena.dupe(u8, s);
 }
 
+/// Validate only the *syntax* of a month code — "M" followed by two decimal
+/// digits and an optional "L" — as PrepareCalendarFields does when the field is
+/// first read. Whether that month is suitable for the calendar/year is a
+/// separate, later check (see parseMonthCode).
+pub fn checkMonthCodeSyntax(arena: std.mem.Allocator, code: []const u8) !void {
+    const ok = (code.len == 3 or (code.len == 4 and code[3] == 'L')) and
+        code[0] == 'M' and isDigit(code[1]) and isDigit(code[2]);
+    if (!ok) return realm_mod.throwRangeError(arena, "invalid monthCode syntax");
+}
+
 /// Parse a "MNN" / "MNNL" month code. `allow_leap` gates the "L" suffix, which
 /// only calendars with leap months accept.
 pub fn parseMonthCode(arena: std.mem.Allocator, code: []const u8, allow_leap: bool) !MonthCode {
