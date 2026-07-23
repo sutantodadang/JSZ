@@ -123,9 +123,9 @@ fn optBool(opts: ?Value, key: []const u8) ?bool {
 
 pub fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const obj = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.error_proto_RangeError)
+        try JsObject.createOnHeap(h, realm_mod.rangeErrorProto())
     else
-        try JsObject.create(arena, realm_mod.error_proto_RangeError);
+        try JsObject.create(arena, realm_mod.rangeErrorProto());
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "RangeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
@@ -134,9 +134,9 @@ pub fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
 
 pub fn throwTypeErrorIntl(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const obj = if (realm_mod.active_heap) |h|
-        try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)
+        try JsObject.createOnHeap(h, realm_mod.typeErrorProto())
     else
-        try JsObject.create(arena, realm_mod.error_proto_TypeError);
+        try JsObject.create(arena, realm_mod.typeErrorProto());
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);

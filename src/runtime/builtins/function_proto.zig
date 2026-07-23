@@ -90,7 +90,7 @@ pub fn invokeCallback(arena: std.mem.Allocator, this_val: Value, fn_val: Value, 
 }
 
 fn makeTypeError(arena: std.mem.Allocator, msg: []const u8) !Value {
-    const proto = realm_mod.error_proto_TypeError;
+    const proto = realm_mod.typeErrorProto();
     const obj = if (realm_mod.active_heap) |heap|
         try JsObject.createOnHeap(heap, proto)
     else
@@ -103,7 +103,7 @@ fn makeTypeError(arena: std.mem.Allocator, msg: []const u8) !Value {
 }
 
 fn makeRangeError(arena: std.mem.Allocator, msg: []const u8) !Value {
-    const proto = realm_mod.error_proto_RangeError;
+    const proto = realm_mod.rangeErrorProto();
     const obj = if (realm_mod.active_heap) |heap|
         try JsObject.createOnHeap(heap, proto)
     else
@@ -329,7 +329,13 @@ pub fn nativeFunctionBind(arena: std.mem.Allocator, this_val: Value, args: []con
     // SetFunctionLength (ES §20.2.3.2): read the target's "length" via [[Get]],
     // apply ToIntegerOrInfinity, then L = max(targetLen - boundArgs, 0) with
     // +∞ preserved and -∞ mapped to 0. Non-writable, non-enumerable, configurable.
-    const target_len = try getFnProp(arena, fn_val, "length");
+    // Step 6 gates on HasOwnProperty(Target, "length"), not a plain [[Get]]: a
+    // `length` inherited from the target's prototype does not count, so a target
+    // whose own `length` was deleted binds to 0.
+    const target_len = if (try hasOwnFnProp(arena, fn_val, "length"))
+        try getFnProp(arena, fn_val, "length")
+    else
+        Value{};
     var blen: f64 = 0;
     if (target_len.bits != 0 and target_len.unbox() == .number) {
         const tl = target_len.unbox().number;
@@ -354,6 +360,28 @@ pub fn nativeFunctionBind(arena: std.mem.Allocator, this_val: Value, args: []con
     _ = try bound_obj.defineOwnData("name", try val_mod.makeString(arena, bname), .{ .writable = false, .enumerable = false, .configurable = true });
 
     return val_mod.makeObject(arena, bound_obj);
+}
+
+/// HasOwnProperty for a function-valued target's `length` / `name`. Both are
+/// implicit on the four callable representations until deleted, so the check is
+/// per-representation rather than a lookup in one property table.
+fn hasOwnFnProp(arena: std.mem.Allocator, v: Value, key: []const u8) !bool {
+    _ = arena;
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .native_function => |e| if (std.mem.eql(u8, key, "length")) !e.length_deleted else !e.name_deleted,
+        .function => true,
+        // Materializing a bc function's backing object always installs real
+        // `length`/`name` descriptors, so once it exists the object is
+        // authoritative — a `delete f.length` shows up as a missing key. Before
+        // materialization both are still virtual own properties.
+        .bc_function => |cl| if (cl.obj) |op| blk: {
+            const o: *JsObject = @ptrCast(@alignCast(op));
+            break :blk o.hasOwn(key);
+        } else true,
+        .object => |o| o.hasOwn(key),
+        else => false,
+    };
 }
 
 /// [[Get]] a property of a function-valued target, honouring redefined own

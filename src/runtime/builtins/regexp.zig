@@ -3316,7 +3316,7 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     const cr = arena.create(CompiledRegex) catch return error.OutOfMemory;
     cr.* = compileRegex(arena, pattern_str, flags_str) catch {
         const msg_s = std.fmt.allocPrint(arena, "Invalid regular expression: /{s}/{s}", .{ pattern_str, flags_str }) catch "Invalid regular expression";
-        const proto_opt = realm_mod.error_proto_SyntaxError;
+        const proto_opt = realm_mod.syntaxErrorProto();
         const proto: ?*JsObject = proto_opt;
         const obj = if (realm_mod.active_heap) |heap|
             JsObject.createOnHeap(heap, proto) catch null
@@ -3351,9 +3351,9 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
 fn throwRegExpSyntaxError(arena: std.mem.Allocator, pattern: []const u8, flags: []const u8) anyerror {
     const msg_s = std.fmt.allocPrint(arena, "Invalid regular expression: /{s}/{s}", .{ pattern, flags }) catch "Invalid regular expression";
     const obj = if (realm_mod.active_heap) |heap|
-        JsObject.createOnHeap(heap, realm_mod.error_proto_SyntaxError) catch null
+        JsObject.createOnHeap(heap, realm_mod.syntaxErrorProto()) catch null
     else
-        JsObject.create(arena, realm_mod.error_proto_SyntaxError) catch null;
+        JsObject.create(arena, realm_mod.syntaxErrorProto()) catch null;
     if (obj) |err_obj| {
         err_obj.set("message", val_mod.makeString(arena, msg_s) catch Value{}) catch {};
         err_obj.set("name", val_mod.makeString(arena, "SyntaxError") catch Value{}) catch {};
@@ -3630,7 +3630,10 @@ fn updateLegacyState(s: []const u8, start: usize, end: usize, captures: []const 
 /// The legacy accessors are brand-checked to the %RegExp% constructor itself:
 /// any other receiver (instance, subclass, cross-realm ctor) is a TypeError.
 fn legacyBrandCheck(arena: std.mem.Allocator, this_val: Value) anyerror!void {
-    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object != active_regexp_ctor)
+    // Cross-realm: the receiver must be the %RegExp% of the realm this getter was
+    // created in, not whichever realm's constructor happens to be active.
+    const expected = if (realm_mod.activeNativeRealm()) |r| r.regexp_ctor else active_regexp_ctor;
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object != expected)
         return realm_mod.throwTypeError(arena, "RegExp legacy accessor called on an incompatible receiver");
 }
 
@@ -4369,7 +4372,7 @@ fn regexpFlagBrand(arena: std.mem.Allocator, this_val: Value) anyerror!?*Compile
     if (this_val.bits == 0 or this_val.unbox() != .object)
         return realm_mod.throwTypeError(arena, "RegExp flag getter called on incompatible receiver");
     if (getCompiledRegex(this_val)) |cr| return cr;
-    if (realm_mod.active_regexp_proto) |proto| {
+    if (realm_mod.regexpProtoForActiveNative()) |proto| {
         if (this_val.toPtr().object == proto) return null;
     }
     return realm_mod.throwTypeError(arena, "RegExp flag getter called on incompatible receiver");
@@ -4416,7 +4419,7 @@ pub fn nativeRegExpGetUnicodeSets(arena: std.mem.Allocator, this_val: Value, _: 
     if (getCompiledRegex(this_val) == null) {
         // No [[OriginalFlags]]: only %RegExpPrototype% itself yields undefined;
         // any other object is an incompatible receiver (ES §22.2.6.18 step 3).
-        if (realm_mod.active_regexp_proto) |proto| {
+        if (realm_mod.regexpProtoForActiveNative()) |proto| {
             if (this_val.toPtr().object == proto) return val_mod.makeUndefined(arena);
         }
         return realm_mod.throwTypeError(arena, "RegExp.prototype.unicodeSets called on incompatible receiver");

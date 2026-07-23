@@ -695,7 +695,7 @@ pub fn proxyPreventExtensions(arena: std.mem.Allocator, proxy_obj: *JsObject) an
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
     // Use the real %TypeError.prototype% so `e instanceof TypeError` and the
     // `e.constructor === TypeError` checks in test harnesses hold.
-    const proto = realm_mod.error_proto_TypeError;
+    const proto = realm_mod.typeErrorProto();
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, proto)
     else

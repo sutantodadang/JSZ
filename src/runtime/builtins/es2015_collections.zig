@@ -3227,7 +3227,7 @@ pub fn nativeRetComplVal(arena: std.mem.Allocator, _: Value, args: []const Value
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
     // Use the realm's TypeError.prototype so `err instanceof TypeError` and
     // `err.constructor === TypeError` hold (assert.throws relies on both).
-    const proto: ?*JsObject = realm_mod.error_proto_TypeError;
+    const proto: ?*JsObject = realm_mod.typeErrorProto();
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     try obj.set("message", try val_mod.makeString(arena, msg));

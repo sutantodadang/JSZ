@@ -47,7 +47,7 @@ fn makeError(arena: std.mem.Allocator, proto: ?*JsObject, name: []const u8, msg:
 }
 
 fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
-    realm_mod.pending_exception = try makeError(arena, realm_mod.error_proto_TypeError, "TypeError", msg);
+    realm_mod.pending_exception = try makeError(arena, realm_mod.typeErrorProto(), "TypeError", msg);
     return error.JsException;
 }
 
@@ -196,19 +196,19 @@ fn nativeImportValue(arena: std.mem.Allocator, this_val: Value, args: []const Va
 /// TypeError (from the caller's realm).
 fn realmImportValue(arena: std.mem.Allocator, env: *Environment, specifier: []const u8, export_name: []const u8, promise: Value) void {
     const ns = importNamespace(arena, env, specifier) catch {
-        promise_mod.settleResult(arena, promise, makeError(arena, realm_mod.error_proto_TypeError, "TypeError", "ShadowRealm.importValue: module failed to load") catch Value{}, false);
+        promise_mod.settleResult(arena, promise, makeError(arena, realm_mod.typeErrorProto(), "TypeError", "ShadowRealm.importValue: module failed to load") catch Value{}, false);
         return;
     };
     if (ns.bits == 0 or ns.unbox() != .object) {
-        promise_mod.settleResult(arena, promise, makeError(arena, realm_mod.error_proto_TypeError, "TypeError", "ShadowRealm.importValue: module has no namespace") catch Value{}, false);
+        promise_mod.settleResult(arena, promise, makeError(arena, realm_mod.typeErrorProto(), "TypeError", "ShadowRealm.importValue: module has no namespace") catch Value{}, false);
         return;
     }
     const value = ns.toPtr().object.get(export_name) orelse {
-        promise_mod.settleResult(arena, promise, makeError(arena, realm_mod.error_proto_TypeError, "TypeError", "ShadowRealm.importValue: export not found") catch Value{}, false);
+        promise_mod.settleResult(arena, promise, makeError(arena, realm_mod.typeErrorProto(), "TypeError", "ShadowRealm.importValue: export not found") catch Value{}, false);
         return;
     };
     const wrapped = getWrappedValue(arena, value) catch {
-        promise_mod.settleResult(arena, promise, makeError(arena, realm_mod.error_proto_TypeError, "TypeError", "ShadowRealm.importValue: value not wrappable") catch Value{}, false);
+        promise_mod.settleResult(arena, promise, makeError(arena, realm_mod.typeErrorProto(), "TypeError", "ShadowRealm.importValue: value not wrappable") catch Value{}, false);
         return;
     };
     promise_mod.settleResult(arena, promise, wrapped, true);

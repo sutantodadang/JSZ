@@ -3043,6 +3043,17 @@ pub const BcVm = struct {
     }
 
     /// SameValue between a Value and a raw JsObject pointer (object identity).
+    /// Does `o` have an own `key` for OrdinarySet's "stop delegating to the
+    /// prototype" test? `resolveOwnSlot` alone misses the two exotic own
+    /// properties that live outside the shape: an Array's `length` and a dense
+    /// element. Missing them let a Proxy in the prototype chain swallow
+    /// `arr.length = 0`.
+    fn ownForSet(o: *JsObject, key: []const u8) bool {
+        if (o.is_array and std.mem.eql(u8, key, "length")) return true;
+        if (o.resolveOwnSlot(key) != null) return true;
+        return o.hasOwn(key);
+    }
+
     fn sameObject(v: Value, ptr: *JsObject) bool {
         return v.bits != 0 and v.unbox() == .object and v.toPtr().object == ptr;
     }
@@ -3118,7 +3129,7 @@ pub const BcVm = struct {
                         }
                         // Ordinary own property at this level: let the existing
                         // findProperty logic below handle accessors/data/shadowing.
-                        if (c.resolveOwnSlot(key) != null) break;
+                        if (ownForSet(c, key)) break;
                         cur = c.proto;
                     }
                 }
@@ -3136,7 +3147,7 @@ pub const BcVm = struct {
                             const key_v = try val_mod.makeString(self.arena, key);
                             return try self.proxySet(try val_mod.makeObject(self.arena, c), c, key_v, value, receiver);
                         }
-                        if (c.resolveOwnSlot(key) != null) break; // own property → ordinary handling
+                        if (ownForSet(c, key)) break; // own property → ordinary handling
                         cur = c.proto;
                     }
                 }
@@ -4914,9 +4925,9 @@ pub const BcVm = struct {
     pub fn throwTypeErr(self: *BcVm, msg: []const u8) anyerror {
         const realm_mod = @import("../runtime/realm.zig");
         const obj = if (realm_mod.active_heap) |h|
-            try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)
+            try JsObject.createOnHeap(h, realm_mod.typeErrorProto())
         else
-            try JsObject.create(self.arena, realm_mod.error_proto_TypeError);
+            try JsObject.create(self.arena, realm_mod.typeErrorProto());
         try obj.set("name", try val_mod.makeString(self.arena, "TypeError"));
         try obj.set("message", try val_mod.makeString(self.arena, msg));
         realm_mod.pending_exception = try val_mod.makeObject(self.arena, obj);
@@ -4927,9 +4938,9 @@ pub const BcVm = struct {
     fn throwRangeErr(self: *BcVm, msg: []const u8) anyerror {
         const realm_mod = @import("../runtime/realm.zig");
         const obj = if (realm_mod.active_heap) |h|
-            try JsObject.createOnHeap(h, realm_mod.error_proto_RangeError)
+            try JsObject.createOnHeap(h, realm_mod.rangeErrorProto())
         else
-            try JsObject.create(self.arena, realm_mod.error_proto_RangeError);
+            try JsObject.create(self.arena, realm_mod.rangeErrorProto());
         try obj.set("name", try val_mod.makeString(self.arena, "RangeError"));
         try obj.set("message", try val_mod.makeString(self.arena, msg));
         realm_mod.pending_exception = try val_mod.makeObject(self.arena, obj);

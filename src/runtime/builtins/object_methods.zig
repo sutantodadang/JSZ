@@ -986,7 +986,7 @@ fn descTruthy(v: ?Value) bool {
 
 fn makeTypeErrorObj(arena: std.mem.Allocator, msg: []const u8) !Value {
     const realm_mod = @import("../realm.zig");
-    const proto = realm_mod.error_proto_TypeError;
+    const proto = realm_mod.typeErrorProto();
     const obj = if (realm_mod.active_heap) |heap|
         try JsObject.createOnHeap(heap, proto)
     else
@@ -1000,9 +1000,9 @@ fn makeReferenceErrorObj(arena: std.mem.Allocator, name: []const u8) !Value {
     const realm_mod = @import("../realm.zig");
     const msg = try std.fmt.allocPrint(arena, "{s} is not defined", .{name});
     const obj = if (realm_mod.active_heap) |heap|
-        try JsObject.createOnHeap(heap, realm_mod.error_proto_ReferenceError)
+        try JsObject.createOnHeap(heap, realm_mod.referenceErrorProto())
     else
-        try JsObject.create(arena, realm_mod.error_proto_ReferenceError);
+        try JsObject.create(arena, realm_mod.referenceErrorProto());
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "ReferenceError"));
     return val_mod.makeObject(arena, obj);
@@ -1016,7 +1016,7 @@ fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
 
 fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const realm_mod = @import("../realm.zig");
-    const proto = realm_mod.error_proto_RangeError;
+    const proto = realm_mod.rangeErrorProto();
     const obj = if (realm_mod.active_heap) |heap|
         try JsObject.createOnHeap(heap, proto)
     else

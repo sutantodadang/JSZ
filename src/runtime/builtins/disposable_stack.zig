@@ -56,11 +56,11 @@ fn makeErr(arena: std.mem.Allocator, proto: ?*JsObject, name: []const u8, msg: [
 }
 
 fn typeError(arena: std.mem.Allocator, msg: []const u8) !Value {
-    return makeErr(arena, realm_mod.error_proto_TypeError, "TypeError", msg);
+    return makeErr(arena, realm_mod.typeErrorProto(), "TypeError", msg);
 }
 
 fn refError(arena: std.mem.Allocator, msg: []const u8) !Value {
-    return makeErr(arena, realm_mod.error_proto_ReferenceError, "ReferenceError", msg);
+    return makeErr(arena, realm_mod.referenceErrorProto(), "ReferenceError", msg);
 }
 
 fn throwType(arena: std.mem.Allocator, msg: []const u8) anyerror {

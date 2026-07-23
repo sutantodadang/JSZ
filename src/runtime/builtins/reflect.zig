@@ -1109,9 +1109,9 @@ pub fn isConstructorVal(v: Value) bool {
 fn throwTypeErrorReflect(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const realm_mod = @import("../realm.zig");
     const obj = if (realm_mod.active_heap) |heap|
-        try JsObject.createOnHeap(heap, realm_mod.error_proto_TypeError)
+        try JsObject.createOnHeap(heap, realm_mod.typeErrorProto())
     else
-        try JsObject.create(arena, realm_mod.error_proto_TypeError);
+        try JsObject.create(arena, realm_mod.typeErrorProto());
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
@@ -1123,9 +1123,9 @@ fn throwReferenceErrorReflect(arena: std.mem.Allocator, name: []const u8) anyerr
     const realm_mod = @import("../realm.zig");
     const msg = try std.fmt.allocPrint(arena, "{s} is not defined", .{name});
     const obj = if (realm_mod.active_heap) |heap|
-        try JsObject.createOnHeap(heap, realm_mod.error_proto_ReferenceError)
+        try JsObject.createOnHeap(heap, realm_mod.referenceErrorProto())
     else
-        try JsObject.create(arena, realm_mod.error_proto_ReferenceError);
+        try JsObject.create(arena, realm_mod.referenceErrorProto());
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "ReferenceError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);

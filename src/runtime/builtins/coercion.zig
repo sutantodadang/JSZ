@@ -54,7 +54,7 @@ fn getSymMethod(obj: *JsObject, sym: Value) ?Value {
 
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
     // Proto = TypeError.prototype so `caught instanceof TypeError` holds.
-    const proto = realm_mod.error_proto_TypeError;
+    const proto = realm_mod.typeErrorProto();
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, proto)
     else

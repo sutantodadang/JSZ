@@ -263,9 +263,9 @@ pub fn stackExhausted() bool {
 
 fn throwStackOverflow(arena: std.mem.Allocator) anyerror {
     const obj = if (active_heap) |heap|
-        JsObject.createOnHeap(heap, error_proto_RangeError) catch null
+        JsObject.createOnHeap(heap, rangeErrorProto()) catch null
     else
-        JsObject.create(arena, error_proto_RangeError) catch null;
+        JsObject.create(arena, rangeErrorProto()) catch null;
     if (obj) |err_obj| {
         err_obj.set("message", val_mod.makeString(arena, "Maximum call stack size exceeded") catch Value{}) catch {};
         err_obj.set("name", val_mod.makeString(arena, "RangeError") catch Value{}) catch {};
@@ -571,9 +571,9 @@ pub fn nativeImportSourceDynamic(arena: std.mem.Allocator, _: Value, args: []con
         return rejectWithPending(arena);
     };
     const err_obj = if (active_heap) |h|
-        try JsObject.createOnHeap(h, error_proto_SyntaxError)
+        try JsObject.createOnHeap(h, syntaxErrorProto())
     else
-        try JsObject.create(arena, error_proto_SyntaxError);
+        try JsObject.create(arena, syntaxErrorProto());
     try err_obj.set("message", try val_mod.makeString(arena, "source phase imports are not available for source text modules"));
     const err = try val_mod.makeObject(arena, err_obj);
     return promise_mod.nativePromiseReject(arena, Value{}, &[_]Value{err});
@@ -1212,9 +1212,9 @@ pub fn makeImportMeta(arena: std.mem.Allocator, url: []const u8) !Value {
 fn throwModuleNotFound(arena: std.mem.Allocator, name: []const u8) !Value {
     const msg = try std.fmt.allocPrint(arena, "Cannot find module '{s}'", .{name});
     const err_obj = if (active_heap) |h|
-        try JsObject.createOnHeap(h, error_proto_Error)
+        try JsObject.createOnHeap(h, plainErrorProto())
     else
-        try JsObject.create(arena, error_proto_Error);
+        try JsObject.create(arena, plainErrorProto());
     try err_obj.set("message", try val_mod.makeString(arena, msg));
     try err_obj.set("name", try val_mod.makeString(arena, "Error"));
     pending_exception = try val_mod.makeObject(arena, err_obj);
@@ -1428,6 +1428,55 @@ pub var error_proto_URIError: ?*JsObject = null;
 pub var error_proto_EvalError: ?*JsObject = null;
 pub var error_proto_SuppressedError: ?*JsObject = null;
 
+/// The error prototypes an error thrown *right now* should use. A built-in
+/// function throws with its own realm's intrinsics (GetFunctionRealm, §10.2.5),
+/// not the caller's, so `otherRealm.RegExp.prototype.global` called on a
+/// primary-realm receiver must produce an `otherRealm.TypeError`. The thread-local
+/// `error_proto_*` still track the *running* realm; these accessors override them
+/// while a native tagged with a secondary realm is on the stack.
+pub fn activeNativeRealm() ?*Realm {
+    const rp = val_mod.g_active_native_realm orelse return null;
+    return @ptrCast(@alignCast(rp));
+}
+
+pub fn typeErrorProto() ?*JsObject {
+    if (activeNativeRealm()) |r| return r.type_error_prototype;
+    return error_proto_TypeError;
+}
+
+pub fn rangeErrorProto() ?*JsObject {
+    if (activeNativeRealm()) |r| return r.range_error_prototype;
+    return error_proto_RangeError;
+}
+
+pub fn referenceErrorProto() ?*JsObject {
+    if (activeNativeRealm()) |r| return r.reference_error_prototype;
+    return error_proto_ReferenceError;
+}
+
+pub fn plainErrorProto() ?*JsObject {
+    if (activeNativeRealm()) |r| return r.error_prototype;
+    return error_proto_Error;
+}
+
+/// %RegExp.prototype% as seen by the built-in currently running. The flag getters
+/// tolerate exactly one non-RegExp receiver — *their own* realm's
+/// %RegExp.prototype% (§22.2.6 step 3) — so another realm's prototype must throw.
+pub fn regexpProtoForActiveNative() ?*JsObject {
+    if (activeNativeRealm()) |r| return r.regexp_prototype;
+    return active_regexp_proto;
+}
+
+pub fn syntaxErrorProto() ?*JsObject {
+    if (activeNativeRealm()) |r| return r.syntax_error_prototype;
+    return error_proto_SyntaxError;
+}
+
+pub fn aggregateErrorProto() ?*JsObject {
+    if (activeNativeRealm()) |r| return r.aggregate_error_prototype;
+    return error_proto_AggregateError;
+}
+
 /// Attributes shared by the own data properties an Error constructor installs on
 /// its instance (message / cause / errors / error / suppressed): every one is
 /// { [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }.
@@ -1487,23 +1536,23 @@ fn errorCtorWithCause(arena: std.mem.Allocator, this_val: Value, proto: ?*JsObje
 }
 
 fn nativeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, error_proto_Error, args);
+    return errorCtorWithCause(arena, this_val, plainErrorProto(), args);
 }
 
 fn nativeTypeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, error_proto_TypeError, args);
+    return errorCtorWithCause(arena, this_val, typeErrorProto(), args);
 }
 
 fn nativeSyntaxErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, error_proto_SyntaxError, args);
+    return errorCtorWithCause(arena, this_val, syntaxErrorProto(), args);
 }
 
 fn nativeRangeErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, error_proto_RangeError, args);
+    return errorCtorWithCause(arena, this_val, rangeErrorProto(), args);
 }
 
 fn nativeReferenceErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    return errorCtorWithCause(arena, this_val, error_proto_ReferenceError, args);
+    return errorCtorWithCause(arena, this_val, referenceErrorProto(), args);
 }
 
 fn nativeEvalErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1537,7 +1586,7 @@ fn errorsListToArray(arena: std.mem.Allocator, errs_arg: Value) anyerror!Value {
 fn nativeAggregateErrorCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     // AggregateError(errors, message, options). Step order: define "message"
     // (if provided), InstallErrorCause, then IteratorToList(errors) → "errors".
-    const result = try populateErrorThis(arena, this_val, error_proto_AggregateError);
+    const result = try populateErrorThis(arena, this_val, aggregateErrorProto());
     try defineErrorMessage(arena, result, if (args.len > 1) args[1] else Value{});
     try installErrorCause(arena, result, if (args.len > 2) args[2] else Value{});
     const errors_arr = try errorsListToArray(arena, if (args.len > 0) args[0] else Value{});
@@ -2842,9 +2891,9 @@ pub fn nativeDerivedReturn(arena: std.mem.Allocator, _: Value, args: []const Val
     const instance = if (args.len > 1) args[1] else Value{};
     if (instance.bits == 0 or instance.unbox() == .undefined_) {
         const err_obj = if (active_heap) |h|
-            try JsObject.createOnHeap(h, error_proto_ReferenceError)
+            try JsObject.createOnHeap(h, referenceErrorProto())
         else
-            try JsObject.create(arena, error_proto_ReferenceError);
+            try JsObject.create(arena, referenceErrorProto());
         try err_obj.set("message", try val_mod.makeString(arena, "must call super constructor before returning from derived constructor"));
         pending_exception = try val_mod.makeObject(arena, err_obj);
         return error.JsException;
@@ -2880,7 +2929,7 @@ fn nativeErrorStackSet(arena: std.mem.Allocator, this_val: Value, args: []const 
 
     // Home-object check: assigning to this realm's %Error.prototype% itself throws
     // (emulates a non-writable data property in strict code).
-    if (error_proto_Error) |ep| {
+    if (plainErrorProto()) |ep| {
         if (obj == ep) return throwTypeError(arena, "Cannot assign to read only property 'stack' of Error.prototype");
     }
     if (obj.ownAttr("stack")) |attr| {
@@ -3123,7 +3172,7 @@ fn nativeBigIntCtor(arena: std.mem.Allocator, _: Value, args: []const Value) any
         },
         .number => |x| {
             if (std.math.isNan(x) or std.math.isInf(x) or std.math.floor(x) != x) {
-                const eo = if (active_heap) |h| try JsObject.createOnHeap(h, error_proto_RangeError) else try JsObject.create(arena, error_proto_RangeError);
+                const eo = if (active_heap) |h| try JsObject.createOnHeap(h, rangeErrorProto()) else try JsObject.create(arena, rangeErrorProto());
                 try eo.set("message", try val_mod.makeString(arena, "The number is not a safe integer"));
                 try eo.set("name", try val_mod.makeString(arena, "RangeError"));
                 pending_exception = try val_mod.makeObject(arena, eo);
@@ -3238,7 +3287,7 @@ fn nativeBigIntProtoValueOf(arena: std.mem.Allocator, this_val: Value, _: []cons
 }
 
 pub fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
-    const eo = if (active_heap) |h| try JsObject.createOnHeap(h, error_proto_RangeError) else try JsObject.create(arena, error_proto_RangeError);
+    const eo = if (active_heap) |h| try JsObject.createOnHeap(h, rangeErrorProto()) else try JsObject.create(arena, rangeErrorProto());
     try eo.set("message", try val_mod.makeString(arena, msg));
     try eo.set("name", try val_mod.makeString(arena, "RangeError"));
     pending_exception = try val_mod.makeObject(arena, eo);
@@ -3248,7 +3297,7 @@ pub fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
 /// Raise a `SyntaxError` from a native. Spec StringToBigInt reports a malformed
 /// numeric string this way (`BigInt("abc")`), not as a TypeError.
 pub fn throwSyntaxError(arena: std.mem.Allocator, msg: []const u8) anyerror {
-    const eo = if (active_heap) |h| try JsObject.createOnHeap(h, error_proto_SyntaxError) else try JsObject.create(arena, error_proto_SyntaxError);
+    const eo = if (active_heap) |h| try JsObject.createOnHeap(h, syntaxErrorProto()) else try JsObject.create(arena, syntaxErrorProto());
     try eo.set("message", try val_mod.makeString(arena, msg));
     try eo.set("name", try val_mod.makeString(arena, "SyntaxError"));
     pending_exception = try val_mod.makeObject(arena, eo);
@@ -3267,9 +3316,9 @@ fn wrapperPrimitive(this_val: Value) ?Value {
 /// `error.JsException` for the VM to surface as a catchable throw.
 pub fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const err_obj = if (active_heap) |h|
-        try JsObject.createOnHeap(h, error_proto_TypeError)
+        try JsObject.createOnHeap(h, typeErrorProto())
     else
-        try JsObject.create(arena, error_proto_TypeError);
+        try JsObject.create(arena, typeErrorProto());
     try err_obj.set("message", try val_mod.makeString(arena, msg));
     try err_obj.set("name", try val_mod.makeString(arena, "TypeError"));
     pending_exception = try val_mod.makeObject(arena, err_obj);
@@ -4155,6 +4204,7 @@ pub const ThreadLocalSnapshot = struct {
     boolean_proto: ?*JsObject,
     bigint_proto: ?*JsObject,
     regexp_proto: ?*JsObject,
+    regexp_ctor: ?*JsObject,
     function_proto: ?*JsObject,
     promise_proto: ?*JsObject,
     symbol_proto: ?*JsObject,
@@ -4204,6 +4254,7 @@ pub const ThreadLocalSnapshot = struct {
             .boolean_proto = active_boolean_proto,
             .bigint_proto = active_bigint_proto,
             .regexp_proto = active_regexp_proto,
+            .regexp_ctor = @import("builtins/regexp.zig").active_regexp_ctor,
             .function_proto = active_function_proto,
             .promise_proto = active_promise_proto,
             .symbol_proto = active_symbol_proto,
@@ -4255,6 +4306,7 @@ pub const ThreadLocalSnapshot = struct {
         active_boolean_proto = self.boolean_proto;
         active_bigint_proto = self.bigint_proto;
         active_regexp_proto = self.regexp_proto;
+        @import("builtins/regexp.zig").active_regexp_ctor = self.regexp_ctor;
         active_function_proto = self.function_proto;
         active_promise_proto = self.promise_proto;
         active_symbol_proto = self.symbol_proto;
@@ -4311,6 +4363,10 @@ pub const Realm = struct {
     string_prototype: *JsObject = undefined,
     /// Phase 4c: RegExp.prototype.
     regexp_prototype: *JsObject = undefined,
+    /// The %RegExp% constructor object -- the sole valid receiver for the Annex B
+    /// legacy statics (RegExp.$1, RegExp.input, ...), which are brand-checked
+    /// against the *getter's own* realm's constructor.
+    regexp_ctor: ?*JsObject = null,
     /// Phase 4d: Function.prototype.
     function_prototype: *JsObject = undefined,
     /// Phase 3b: GC heap. Null in tree-walker mode (which uses the eval arena).
@@ -5332,6 +5388,7 @@ pub const Realm = struct {
         const es2015_mod = @import("builtins/es2015_collections.zig");
         self.gen_iterator_proto = es2015_mod.active_iterator_proto;
         self.gen_function_ctor = active_function_ctor;
+        self.regexp_ctor = @import("builtins/regexp.zig").active_regexp_ctor;
     }
 
     /// Cross-realm: tag every top-level builtin function in this realm's global
@@ -5341,17 +5398,46 @@ pub const Realm = struct {
     /// thread-locals, so it may run after they have been restored.
     pub fn tagNativeFunctions(self: *Realm) void {
         const r_opaque: *anyopaque = @ptrCast(self);
+        var seen = std.AutoHashMap(*JsObject, void).init(self.arena);
+        defer seen.deinit();
         var it = self.global_env.bindings.iterator();
         while (it.next()) |entry| {
             const v = entry.value_ptr.value;
             if (v.bits == 0 or !v.isHeapPtr()) continue;
             switch (v.toPtr().*) {
                 .native_function, .bc_function => val_mod.setValueRealm(v, r_opaque),
-                .object => |o| {
-                    if (o.getOwn("__call__")) |cv| {
-                        if (cv.bits != 0) val_mod.setValueRealm(cv, r_opaque);
-                    }
-                },
+                .object => |o| tagObjectTree(o, r_opaque, &seen, 0),
+                else => {},
+            }
+        }
+    }
+
+    /// Reach the built-ins that are NOT global bindings — prototype methods and
+    /// accessor getters such as `RegExp.prototype.global` — so each also knows the
+    /// realm that created it. Bounded by `seen` (the graph is cyclic:
+    /// `String.prototype.constructor.prototype` …) and by depth.
+    fn tagObjectTree(obj: *JsObject, r_opaque: *anyopaque, seen: *std.AutoHashMap(*JsObject, void), depth: u8) void {
+        if (depth > 4) return;
+        const gop = seen.getOrPut(obj) catch return;
+        if (gop.found_existing) return;
+        for (obj.ownKeys()) |k| {
+            const slot = obj.resolveOwnSlot(k) orelse continue;
+            if (slot >= obj.slots.items.len) continue;
+            const raw = obj.slots.items[slot];
+            if (raw.bits == 0 or !raw.isHeapPtr()) continue;
+            if (obj.attrAt(slot).is_accessor) {
+                // Accessor slots hold a `{get, set}` holder object, not a callable.
+                if (raw.unbox() != .object) continue;
+                const holder = raw.toPtr().object;
+                for ([_][]const u8{ "get", "set" }) |side| {
+                    const f = holder.getOwn(side) orelse continue;
+                    if (f.bits != 0 and f.isHeapPtr()) val_mod.setValueRealm(f, r_opaque);
+                }
+                continue;
+            }
+            switch (raw.toPtr().*) {
+                .native_function, .bc_function => val_mod.setValueRealm(raw, r_opaque),
+                .object => |child| tagObjectTree(child, r_opaque, seen, depth + 1),
                 else => {},
             }
         }

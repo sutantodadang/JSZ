@@ -93,9 +93,9 @@ pub fn nativeJsonIsRawJSON(arena: std.mem.Allocator, _: Value, args: []const Val
 fn throwTypeErrorMsg(arena: std.mem.Allocator, msg: []const u8) anyerror!Value {
     const realm_mod = @import("../realm.zig");
     const obj = if (realm_mod.active_heap) |heap|
-        try JsObject.createOnHeap(heap, realm_mod.error_proto_TypeError)
+        try JsObject.createOnHeap(heap, realm_mod.typeErrorProto())
     else
-        try JsObject.create(arena, realm_mod.error_proto_TypeError);
+        try JsObject.create(arena, realm_mod.typeErrorProto());
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
@@ -486,9 +486,9 @@ pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Val
 fn throwStringifyTypeErrorMsg(arena: std.mem.Allocator, msg: []const u8) anyerror!void {
     const realm_mod = @import("../realm.zig");
     const obj = if (realm_mod.active_heap) |heap|
-        try JsObject.createOnHeap(heap, realm_mod.error_proto_TypeError)
+        try JsObject.createOnHeap(heap, realm_mod.typeErrorProto())
     else
-        try JsObject.create(arena, realm_mod.error_proto_TypeError);
+        try JsObject.create(arena, realm_mod.typeErrorProto());
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
@@ -715,7 +715,7 @@ fn jsonSynErr(arena: std.mem.Allocator, msg: []const u8) anyerror {
 fn throwSyntaxError(arena: std.mem.Allocator, msg: []const u8) anyerror!Value {
     // Build a SyntaxError object via the Phase 4a prototype.
     const realm_mod = @import("../realm.zig");
-    const proto: ?*JsObject = realm_mod.error_proto_SyntaxError;
+    const proto: ?*JsObject = realm_mod.syntaxErrorProto();
     const obj = if (realm_mod.active_heap) |heap|
         try JsObject.createOnHeap(heap, proto)
     else

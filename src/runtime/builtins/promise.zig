@@ -421,9 +421,9 @@ fn isConstructorVal(v: Value) bool {
 pub fn nativePromiseWithResolvers(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     if (!isConstructorVal(this_val)) {
         const err = if (realm_mod.active_heap) |h|
-            try JsObject.createOnHeap(h, realm_mod.error_proto_TypeError)
+            try JsObject.createOnHeap(h, realm_mod.typeErrorProto())
         else
-            try JsObject.create(arena, realm_mod.error_proto_TypeError);
+            try JsObject.create(arena, realm_mod.typeErrorProto());
         try err.set("name", try val_mod.makeString(arena, "TypeError"));
         try err.set("message", try val_mod.makeString(arena, "Promise.withResolvers called on a non-constructor"));
         realm_mod.pending_exception = try val_mod.makeObject(arena, err);
@@ -532,7 +532,7 @@ pub fn nativeAsyncIteratorAsyncDispose(arena: std.mem.Allocator, this_val: Value
     if (ret.bits == 0 or ret.isUndefined() or ret.isNull()) {
         result = try val_mod.makeUndefined(arena);
     } else if (!isCallable(ret)) {
-        const proto: ?*JsObject = realm_mod.error_proto_TypeError;
+        const proto: ?*JsObject = realm_mod.typeErrorProto();
         const eobj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
         try eobj.set("name", try val_mod.makeString(arena, "TypeError"));
         try eobj.set("message", try val_mod.makeString(arena, "return is not a function"));
@@ -958,7 +958,7 @@ const AnyElem = struct { parent: *AnyCtx, index: usize, already: bool = false };
 
 /// Build an AggregateError object wrapping the given `errors` array object.
 fn makeAggregateErrorFrom(arena: std.mem.Allocator, errors_val: Value, msg: []const u8) !Value {
-    const proto: ?*JsObject = realm_mod.error_proto_AggregateError orelse realm_mod.error_proto_Error;
+    const proto: ?*JsObject = realm_mod.aggregateErrorProto() orelse realm_mod.plainErrorProto();
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, proto)
     else
