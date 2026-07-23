@@ -1707,6 +1707,15 @@ pub fn nativeObjectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value, 
     // Internal slots ([[PrimitiveValue]], …) are not own properties.
     if (JsObject.isInternalSlotKey(key)) return val_mod.makeUndefined(arena);
 
+    // A function's `.prototype` is materialized lazily on first access; force it
+    // (via [[Get]]) so getOwnPropertyDescriptor observes the own data property.
+    // Non-constructors (arrows/methods/async) leave nothing behind, as required.
+    if ((arg0_unboxed == .bc_function or arg0_unboxed == .function) and
+        std.mem.eql(u8, key, "prototype") and !obj.hasOwn("prototype"))
+    {
+        if (realm_mod.active_context) |ctx| _ = try ctx.getProp(arena, args[0], "prototype");
+    }
+
     // Array exotic "length": a synthetic own data property that is writable
     // (unless the array is non-extensible), non-enumerable, non-configurable.
     if (obj.is_array and std.mem.eql(u8, key, "length")) {
