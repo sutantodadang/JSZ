@@ -36,6 +36,55 @@ fn isSuperDotCall(callee: *Node) bool {
     return obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "super");
 }
 
+/// True when `node` is the desugared super-property *read* or *write* form,
+/// i.e. `Reflect.get(__sproto__, KEY, __superthis)` or
+/// `Reflect.set(__sproto__, KEY, VALUE, __superthis)` (produced by
+/// rewriteSuperPropRead / rewriteSuperPropAssign). Identified by a `Reflect.get`
+/// / `Reflect.set` callee, a `__sproto__` first argument, and an `__superthis`
+/// receiver as the last argument. Super *method* calls are excluded: their
+/// Reflect.get receiver is a `this` expression (which this pass turns into a
+/// `__checkthis__()` call), never the bare `__superthis` identifier.
+fn isSuperPropReflect(node: *Node) bool {
+    if (node.kind != .call_expr) return false;
+    const c = node.data.call_expr;
+    if (c.callee.kind != .member_expr) return false;
+    const m = c.callee.data.member_expr;
+    if (m.computed) return false;
+    if (!(m.object.kind == .identifier and std.mem.eql(u8, m.object.data.identifier, "Reflect"))) return false;
+    if (!(m.property.kind == .identifier and
+        (std.mem.eql(u8, m.property.data.identifier, "get") or std.mem.eql(u8, m.property.data.identifier, "set")))) return false;
+    if (c.args.len < 3) return false;
+    if (!(c.args[0].kind == .identifier and std.mem.eql(u8, c.args[0].data.identifier, "__sproto__"))) return false;
+    const last = c.args[c.args.len - 1];
+    return last.kind == .identifier and std.mem.eql(u8, last.data.identifier, "__superthis");
+}
+
+/// True when `node` is a `super.x` / `super[e]` member access (object is the
+/// literal `super` identifier). Compound assignments (`super[e] += v`) and
+/// updates (`super[e]++`) keep this member form — they are not rewritten to a
+/// Reflect call — so a derived-constructor TDZ guard must be attached here too.
+fn isSuperMember(node: *Node) bool {
+    if (node.kind != .member_expr) return false;
+    const m = node.data.member_expr;
+    return m.object.kind == .identifier and std.mem.eql(u8, m.object.data.identifier, "super");
+}
+
+/// Wrap `node` (already rewritten in place) as `(__checkthis__(), <node>)` so
+/// that in a derived constructor the this-binding is fetched — throwing a
+/// ReferenceError while `this` is still in its TDZ — before the rest of the
+/// expression (e.g. the property key) is evaluated.
+fn guardWithCheckThis(p: *Parser, node: *Node) void {
+    const s = node.start;
+    const guard_callee = p.makeNode(.identifier, s, s, .{ .identifier = "__checkthis__" }) orelse return;
+    const guard = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = guard_callee, .args = &[_]*Node{} } }) orelse return;
+    const orig = p.makeNode(node.kind, node.start, node.end, node.data) orelse return;
+    var seq = std.ArrayList(*Node){};
+    seq.append(p.arena, guard) catch return;
+    seq.append(p.arena, orig) catch return;
+    node.kind = .sequence_expr;
+    node.data = .{ .sequence_expr = .{ .exprs = seq.items } };
+}
+
 fn rewriteThisToSuperThis(p: *Parser, node: *Node) void {
     switch (node.data) {
         .this_expr => {
@@ -58,10 +107,19 @@ fn rewriteThisToSuperThis(p: *Parser, node: *Node) void {
             rewriteThisToSuperThis(p, b.right);
         },
         .assignment_expr => |a| {
+            const super_target = isSuperMember(a.target);
             rewriteThisToSuperThis(p, a.target);
             rewriteThisToSuperThis(p, a.value);
+            // A compound assignment to a super property (`super[e] += v`) keeps
+            // the member form (only `=` is Reflect-desugared), so guard the TDZ
+            // here: the this-binding is read before the key `e` is evaluated.
+            if (super_target) guardWithCheckThis(p, node);
         },
-        .update_expr => |u| rewriteThisToSuperThis(p, u.operand),
+        .update_expr => |u| {
+            const super_target = isSuperMember(u.operand);
+            rewriteThisToSuperThis(p, u.operand);
+            if (super_target) guardWithCheckThis(p, node);
+        },
         .conditional_expr => |c| {
             rewriteThisToSuperThis(p, c.test_);
             rewriteThisToSuperThis(p, c.consequent);
@@ -86,6 +144,16 @@ fn rewriteThisToSuperThis(p: *Parser, node: *Node) void {
                 start_i = 1;
             }
             for (c.args[start_i..]) |a| rewriteThisToSuperThis(p, a);
+            // A super-property read/write (`super.x` / `super[e]` / `super.x = v`)
+            // desugars to `Reflect.get/set(__sproto__, KEY, …, __superthis)`. Per
+            // spec (SuperProperty evaluation) the this-binding is fetched — and a
+            // ReferenceError thrown if `this` is still in its TDZ (before super())
+            // — BEFORE the property key/value is evaluated. Reflect.get/set would
+            // instead evaluate KEY first. Force the check ahead of everything by
+            // rewriting the call to `(__checkthis__(), <call>)`: the comma
+            // evaluates the guard first, then the reflect call (which reads the
+            // now-safe `__superthis` receiver).
+            if (isSuperPropReflect(node)) guardWithCheckThis(p, node);
         },
         .new_expr => |n| {
             rewriteThisToSuperThis(p, n.callee);
