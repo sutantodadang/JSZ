@@ -1284,6 +1284,22 @@ pub fn calendarFromString(s: []const u8) ?calendar_mod.CalendarId {
     return null;
 }
 
+/// True when `v` is any Temporal date/time exotic object. The `with` methods
+/// reject such an argument (RejectTemporalLikeObject) — they take a plain bag.
+pub fn isTemporalObject(v: Value) bool {
+    if (v.bits == 0 or v.unbox() != .object) return false;
+    return switch (v.toPtr().object.internal_kind) {
+        .temporal_zoned_date_time,
+        .temporal_plain_date,
+        .temporal_plain_time,
+        .temporal_plain_date_time,
+        .temporal_plain_year_month,
+        .temporal_plain_month_day,
+        => true,
+        else => false,
+    };
+}
+
 /// Read the [[Calendar]] slot of a calendar-bearing Temporal object.
 pub fn calendarOfObject(o: *JsObject) ?calendar_mod.CalendarId {
     const slot = o.internal_slot orelse return null;

@@ -137,7 +137,7 @@ fn timeFromFields(arena: std.mem.Allocator, o: *JsObject, overflow: shared.Overf
 }
 
 fn readField(arena: std.mem.Allocator, o: *JsObject, name: []const u8) !?f64 {
-    const v = o.get(name) orelse return null;
+    const v = (try shared.optionGet(arena, o, name)) orelse return null;
     if (v.bits == 0 or v.unbox() == .undefined_) return null;
     return try shared.toIntegerWithTruncation(arena, v);
 }
@@ -188,23 +188,30 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "with() requires an object");
     const o = arg.toPtr().object;
     // Reject calendar/date fields per spec (with a Temporal type is a TypeError).
-    if (getTime(arg) != null) return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
-    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    const overflow = try shared.getOverflow(arena, opts);
+    if (shared.isTemporalObject(arg)) return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
+    // A time-fields bag may not carry a calendar or timeZone
+    // (RejectObjectWithCalendarOrTimeZone), read before the time fields.
+    if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
+    if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
     var h: f64 = @floatFromInt(cur.hour);
     var min: f64 = @floatFromInt(cur.minute);
     var s: f64 = @floatFromInt(cur.second);
     var ms: f64 = @floatFromInt(cur.millisecond);
     var us: f64 = @floatFromInt(cur.microsecond);
     var ns: f64 = @floatFromInt(cur.nanosecond);
+    // ToTemporalTimeRecord reads the time fields through [[Get]] (getters
+    // observed) in alphabetical order, requiring at least one.
     var any = false;
     if (try readField(arena, o, "hour")) |x| { h = x; any = true; }
-    if (try readField(arena, o, "minute")) |x| { min = x; any = true; }
-    if (try readField(arena, o, "second")) |x| { s = x; any = true; }
-    if (try readField(arena, o, "millisecond")) |x| { ms = x; any = true; }
     if (try readField(arena, o, "microsecond")) |x| { us = x; any = true; }
+    if (try readField(arena, o, "millisecond")) |x| { ms = x; any = true; }
+    if (try readField(arena, o, "minute")) |x| { min = x; any = true; }
     if (try readField(arena, o, "nanosecond")) |x| { ns = x; any = true; }
+    if (try readField(arena, o, "second")) |x| { s = x; any = true; }
     if (!any) return realm_mod.throwTypeError(arena, "with() needs at least one field");
+    // The overflow option is read after the fields (observable ordering).
+    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
+    const overflow = try shared.getOverflow(arena, opts);
     const t = try regulateTime(arena, h, min, s, ms, us, ns, overflow);
     return makeTime(arena, t);
 }

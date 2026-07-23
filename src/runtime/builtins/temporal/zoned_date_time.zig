@@ -750,8 +750,12 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const z = try requireZoned(arena, this_val);
     const arg = if (args.len > 0) args[0] else Value{};
     if (arg.bits == 0 or arg.unbox() != .object) return realm_mod.throwTypeError(arena, "with() requires an object");
-    if (getZoned(arg) != null or plain_date.getDate(arg) != null or plain_time.getTime(arg) != null or plain_date_time.getDateTime(arg) != null)
-        return realm_mod.throwTypeError(arena, "with() argument must be a plain object");
+    // Any Temporal date/time object (including PlainYearMonth/PlainMonthDay) is
+    // rejected — with() takes a plain fields bag (RejectTemporalLikeObject).
+    switch (arg.toPtr().object.internal_kind) {
+        .temporal_zoned_date_time, .temporal_plain_date, .temporal_plain_time, .temporal_plain_date_time, .temporal_plain_year_month, .temporal_plain_month_day => return realm_mod.throwTypeError(arena, "with() argument must be a plain object"),
+        else => {},
+    }
     const o = arg.toPtr().object;
     if (try shared.optionGet(arena, o, "calendar") != null) return realm_mod.throwTypeError(arena, "with() may not set calendar");
     if (try shared.optionGet(arena, o, "timeZone") != null) return realm_mod.throwTypeError(arena, "with() may not set timeZone");
