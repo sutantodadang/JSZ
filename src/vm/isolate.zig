@@ -358,6 +358,10 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__nameFn__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/object_methods.zig").nativeNameFn));
         try realm.global_env.define("__toPropertyKey__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/object_methods.zig").nativeToPropertyKey));
         try realm.global_env.define("__makeNamespace__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeNamespace));
+        // Explicit resource management: `using`/`await using` scope desugar.
+        try realm.global_env.define("__usingStackInit__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingStackInit));
+        try realm.global_env.define("__usingAdd__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingAdd));
+        try realm.global_env.define("__usingDispose__", try val_mod.makeNativeFunction(arena, @import("../runtime/builtins/disposable_stack.zig").nativeUsingDispose));
         // import-defer: `import defer * as ns` desugars to `__importDefer__(spec)`;
         // dynamic `import.defer(spec)` routes through `__importDeferDyn__`.
         try realm.global_env.define("__importDefer__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeImportDefer));

@@ -582,6 +582,154 @@ pub fn parseUsingDeclStmt(p: *Parser, is_await: bool) ?*Node {
     return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = decls.items, .lexical_scope = false } });
 }
 
+// ------------------------------------------- `using` scope desugar helpers ---
+
+fn uIdent(p: *Parser, name: []const u8, s: u32) ?*Node {
+    return p.makeNode(.identifier, s, s, .{ .identifier = name });
+}
+
+/// True if `node` (or, for the multi-declarator transparent container, one of
+/// its children) is a `using`/`await using` declaration still carrying its hint.
+fn stmtHasUsing(node: *Node) bool {
+    switch (node.kind) {
+        .var_decl => return node.data.var_decl.using_kind != .none,
+        .block_stmt => {
+            if (node.data.block_stmt.lexical_scope) return false;
+            for (node.data.block_stmt.body) |c| {
+                if (c.kind == .var_decl and c.data.var_decl.using_kind != .none) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn scopeHasUsing(body: []const *Node) bool {
+    for (body) |c| if (stmtHasUsing(c)) return true;
+    return false;
+}
+
+/// Rewrite a single `using x = V` declaration into `let x = __usingAdd__(stack, V, isAsync)`.
+fn rewriteUsingDecl(p: *Parser, node: *Node, stack_name: []const u8) ?*Node {
+    const vd = node.data.var_decl;
+    const s = node.start;
+    const callee = uIdent(p, "__usingAdd__", s) orelse return null;
+    var argv = std.ArrayList(*Node){};
+    argv.append(p.arena, uIdent(p, stack_name, s) orelse return null) catch return null;
+    argv.append(p.arena, vd.init orelse (p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null)) catch return null;
+    argv.append(p.arena, p.makeNode(.bool_literal, s, s, .{ .bool_literal = vd.using_kind == .await_using_ }) orelse return null) catch return null;
+    const call = p.makeNode(.call_expr, s, node.end, .{ .call_expr = .{ .callee = callee, .args = argv.items } }) orelse return null;
+    return p.makeNode(.var_decl, s, node.end, .{ .var_decl = .{ .kind = .let, .name = vd.name, .init = call } });
+}
+
+/// Rewrite one statement of a using scope: `using` declarations (including the
+/// multi-declarator transparent container) become plain `let` bindings that
+/// register the resource; everything else passes through unchanged.
+fn rewriteUsingStmt(p: *Parser, node: *Node, stack_name: []const u8) ?*Node {
+    if (node.kind == .var_decl and node.data.var_decl.using_kind != .none) {
+        return rewriteUsingDecl(p, node, stack_name);
+    }
+    if (node.kind == .block_stmt and !node.data.block_stmt.lexical_scope) {
+        var any = false;
+        for (node.data.block_stmt.body) |c| {
+            if (c.kind == .var_decl and c.data.var_decl.using_kind != .none) any = true;
+        }
+        if (any) {
+            var out = std.ArrayList(*Node){};
+            for (node.data.block_stmt.body) |c| {
+                const nc = if (c.kind == .var_decl and c.data.var_decl.using_kind != .none)
+                    (rewriteUsingDecl(p, c, stack_name) orelse return null)
+                else
+                    c;
+                out.append(p.arena, nc) catch return null;
+            }
+            return p.makeNode(.block_stmt, node.start, node.end, .{ .block_stmt = .{ .body = out.items, .lexical_scope = false } });
+        }
+    }
+    return node;
+}
+
+/// Wrap a statement list that contains `using`/`await using` declarations so its
+/// resources are disposed (LIFO, aggregating SuppressedError) when the scope
+/// completes — normally, via return/break/continue, or by a throw. Reuses the
+/// existing try/catch/finally lowering (which already runs finalizers on every
+/// abrupt completion) rather than new control-flow machinery. Returns the
+/// rewritten body, or the original slice when there is nothing to dispose.
+pub fn desugarUsingScope(p: *Parser, body: []const *Node, start: u32) ?[]*Node {
+    if (!scopeHasUsing(body)) return @constCast(body);
+    const s = start;
+    const stack_name = "__using_stack__";
+    const threw_name = "__using_threw__";
+    const err_name = "__using_err__";
+    const exc_name = "__using_exc__";
+
+    // Rewrite the original statements into the inner try body.
+    var inner_body = std.ArrayList(*Node){};
+    for (body) |c| {
+        inner_body.append(p.arena, rewriteUsingStmt(p, c, stack_name) orelse return null) catch return null;
+    }
+    const inner_block = p.makeNode(.block_stmt, s, s, .{ .block_stmt = .{ .body = inner_body.items, .lexical_scope = true } }) orelse return null;
+
+    // catch (e) { __using_threw__ = true; __using_err__ = e; }
+    var catch_body = std.ArrayList(*Node){};
+    {
+        const set_threw = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{
+            .op = .assign,
+            .target = uIdent(p, threw_name, s) orelse return null,
+            .value = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null,
+        } }) orelse return null;
+        catch_body.append(p.arena, p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = set_threw }) orelse return null) catch return null;
+        const set_err = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{
+            .op = .assign,
+            .target = uIdent(p, err_name, s) orelse return null,
+            .value = uIdent(p, exc_name, s) orelse return null,
+        } }) orelse return null;
+        catch_body.append(p.arena, p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = set_err }) orelse return null) catch return null;
+    }
+    const catch_block = p.makeNode(.block_stmt, s, s, .{ .block_stmt = .{ .body = catch_body.items, .lexical_scope = true } }) orelse return null;
+    const inner_try = p.makeNode(.try_stmt, s, s, .{ .try_stmt = .{
+        .block = inner_block,
+        .handler = .{ .param_name = exc_name, .body = catch_block },
+        .finalizer = null,
+    } }) orelse return null;
+
+    // finally { __usingDispose__(__using_stack__, __using_threw__, __using_err__); }
+    var disp_args = std.ArrayList(*Node){};
+    disp_args.append(p.arena, uIdent(p, stack_name, s) orelse return null) catch return null;
+    disp_args.append(p.arena, uIdent(p, threw_name, s) orelse return null) catch return null;
+    disp_args.append(p.arena, uIdent(p, err_name, s) orelse return null) catch return null;
+    const disp_call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{
+        .callee = uIdent(p, "__usingDispose__", s) orelse return null,
+        .args = disp_args.items,
+    } }) orelse return null;
+    var fin_body = std.ArrayList(*Node){};
+    fin_body.append(p.arena, p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = disp_call }) orelse return null) catch return null;
+    const fin_block = p.makeNode(.block_stmt, s, s, .{ .block_stmt = .{ .body = fin_body.items, .lexical_scope = true } }) orelse return null;
+
+    const inner_try_block = p.makeNode(.block_stmt, s, s, .{ .block_stmt = .{ .body = blk: {
+        var b = std.ArrayList(*Node){};
+        b.append(p.arena, inner_try) catch return null;
+        break :blk b.items;
+    }, .lexical_scope = true } }) orelse return null;
+    const outer_try = p.makeNode(.try_stmt, s, s, .{ .try_stmt = .{
+        .block = inner_try_block,
+        .handler = null,
+        .finalizer = fin_block,
+    } }) orelse return null;
+
+    // Prologue lexical decls: stack, threw flag, captured error.
+    var out = std.ArrayList(*Node){};
+    const init_call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{
+        .callee = uIdent(p, "__usingStackInit__", s) orelse return null,
+        .args = &[_]*Node{},
+    } }) orelse return null;
+    out.append(p.arena, p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .let, .name = stack_name, .init = init_call } }) orelse return null) catch return null;
+    out.append(p.arena, p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .let, .name = threw_name, .init = p.makeNode(.bool_literal, s, s, .{ .bool_literal = false }) orelse return null } }) orelse return null) catch return null;
+    out.append(p.arena, p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .let, .name = err_name, .init = p.makeNode(.undefined_literal, s, s, .{ .undefined_literal = {} }) orelse return null } }) orelse return null) catch return null;
+    out.append(p.arena, outer_try) catch return null;
+    return out.items;
+}
+
 pub fn parseStatement(p: *Parser) ?*Node {
     if (p.had_error) return null;
     // Explicit resource management: `using x = ...` / `await using x = ...`
@@ -712,7 +860,7 @@ pub fn parseBlock(p: *Parser) ?*Node {
     }
     _ = p.expect(.right_brace) orelse return null;
     const end = p.current.start;
-    const items = body.items;
+    const items = desugarUsingScope(p, body.items, start) orelse return null;
     return p.makeNode(.block_stmt, start, end, .{ .block_stmt = .{ .body = items } });
 }
 

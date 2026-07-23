@@ -1266,6 +1266,10 @@ pub const BcVm = struct {
                 "__toPropertyKey__",
                 try val_mod.makeNativeFunction(self.arena, obj_methods.nativeToPropertyKey),
             );
+            const dstack = @import("../runtime/builtins/disposable_stack.zig");
+            try nr.global_env.define("__usingStackInit__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingStackInit));
+            try nr.global_env.define("__usingAdd__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingAdd));
+            try nr.global_env.define("__usingDispose__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingDispose));
         }
         // Cross-realm: make the secondary realm's well-known symbols *shared* with
         // the primary realm by replacing the Symbol constructor's properties directly.

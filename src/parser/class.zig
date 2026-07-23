@@ -5,6 +5,7 @@ const std = @import("std");
 const parser_file = @import("./parser.zig");
 const Parser = parser_file.Parser;
 const expr_mod = @import("./expr.zig");
+const stmt_mod = @import("./stmt.zig");
 const ast = @import("./ast.zig");
 const Node = ast.Node;
 
@@ -1930,6 +1931,11 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     p.strict = saved_strict;
     p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
+    // Explicit resource management: wrap the user body in the `using` disposal
+    // desugar (a no-op unless it contains `using`/`await using` declarations)
+    // before the parameter prelude / generator marker is prepended, so disposal
+    // covers exactly the FunctionBody StatementList.
+    const body_items = stmt_mod.desugarUsingScope(p, body.items, p.current.start) orelse return null;
     // Prepend destructuring-param decls (binding the synthetic `__param_N`
     // names) so they run before the function body proper. A `params_done` marker
     // always separates parameter initialization from the body: for generators the
@@ -1952,7 +1958,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
             p.had_error = true;
             return null;
         };
-        combined.appendSlice(p.arena, body.items) catch {
+        combined.appendSlice(p.arena, body_items) catch {
             p.had_error = true;
             return null;
         };
@@ -1964,11 +1970,11 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
             p.had_error = true;
             return null;
         };
-        combined.appendSlice(p.arena, body.items) catch {
+        combined.appendSlice(p.arena, body_items) catch {
             p.had_error = true;
             return null;
         };
         return combined.items;
     }
-    return body.items;
+    return body_items;
 }
