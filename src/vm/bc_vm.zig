@@ -5325,6 +5325,9 @@ fn isCallableValue(v: Value) bool {
             if (obj.internal_kind == .bound_function or obj.get("__call__") != null) return true;
             if (obj.internal_kind == .proxy) {
                 if (proxy_mod.proxyTarget(obj)) |t| return isCallableValue(t);
+                // Revoked: the target symbol is gone, but [[Call]] was fixed at
+                // creation — honor the recorded callability.
+                return obj.proxy_callable;
             }
             return false;
         },

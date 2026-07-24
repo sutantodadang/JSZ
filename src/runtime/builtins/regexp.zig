@@ -30,6 +30,7 @@ const JsObject = @import("../../object/object.zig").JsObject;
 const realm_mod = @import("../realm.zig");
 const intrinsics = @import("intrinsics.zig");
 const fp = @import("function_proto.zig");
+const string_proto = @import("string_proto.zig");
 
 /// R1: install RegExp.prototype + constructor and bind the `RegExp` global.
 pub fn register(ctx: *const intrinsics.Ctx) !void {
@@ -2422,9 +2423,16 @@ fn consumeDot(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) 
         if (!flags.dotall and isUnicodeLineTerminator(dc.cp)) return null;
         return pos + dc.len;
     } else {
-        const c = input[pos];
-        if (!flags.dotall and isLineTerminator(c)) return null;
-        return pos + 1;
+        // Non-/u mode iterates UTF-16 code units, not raw bytes: a BMP code point
+        // is one unit spanning 1–3 WTF-8 bytes, so `.` must consume the whole
+        // sequence (else `/^.$/` fails on "π"). A WTF-8-encoded lone surrogate
+        // (astral escape / fromCodePoint) is also 3 bytes = one code unit. A
+        // 4-byte UTF-8 astral is TWO code units, which the byte model cannot
+        // split, so advance a single byte there (one unit's worth).
+        const dc = decodeUtf8At(input, pos);
+        if (!flags.dotall and isUnicodeLineTerminator(dc.cp)) return null;
+        const len: usize = if (dc.len >= 1 and dc.len <= 3) dc.len else 1;
+        return pos + len;
     }
 }
 
@@ -3544,7 +3552,9 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
     }
     arr.array_length = cr.num_captures + 1;
 
-    const idx_val = try val_mod.makeNumber(arena, @floatFromInt(result.start));
+    // `index` is a UTF-16 code-unit offset (JS strings are UTF-16); the matcher
+    // works in WTF-8 byte space, so convert the byte start to a code-unit index.
+    const idx_val = try val_mod.makeNumber(arena, @floatFromInt(string_proto.cuIndexOfByte(s, result.start)));
     try arr.set("index", idx_val);
 
     const input_val = try val_mod.makeString(arena, s);
@@ -3588,8 +3598,8 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
                 continue;
             }
             const pair = try JsObject.createArray(arena, arr_proto);
-            try pair.set("0", try val_mod.makeNumber(arena, @floatFromInt(span.start)));
-            try pair.set("1", try val_mod.makeNumber(arena, @floatFromInt(span.end)));
+            try pair.set("0", try val_mod.makeNumber(arena, @floatFromInt(string_proto.cuIndexOfByte(s, span.start))));
+            try pair.set("1", try val_mod.makeNumber(arena, @floatFromInt(string_proto.cuIndexOfByte(s, span.end))));
             pair.array_length = 2;
             try ind.set(key, try val_mod.makeObject(arena, pair));
         }
@@ -3606,8 +3616,8 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
                 const cap = if (ni.idx < MAX_CAPTURES) result.state.captures[ni.idx] else INVALID_CAP;
                 if (cap.unset()) continue;
                 const pair = try JsObject.createArray(arena, arr_proto);
-                try pair.set("0", try val_mod.makeNumber(arena, @floatFromInt(cap.start)));
-                try pair.set("1", try val_mod.makeNumber(arena, @floatFromInt(cap.end)));
+                try pair.set("0", try val_mod.makeNumber(arena, @floatFromInt(string_proto.cuIndexOfByte(s, cap.start))));
+                try pair.set("1", try val_mod.makeNumber(arena, @floatFromInt(string_proto.cuIndexOfByte(s, cap.end))));
                 pair.array_length = 2;
                 try gobj.set(ni.name, try val_mod.makeObject(arena, pair));
             }
@@ -4003,8 +4013,13 @@ pub fn nativeRegExpSymbolReplace(arena: std.mem.Allocator, this_val: Value, args
         const matched = try getStrProp(arena, result, "0");
         var position_f = try realm_mod.toNumberValue(arena, try ctxGetProp(arena, result, "index"));
         if (std.math.isNan(position_f) or position_f < 0) position_f = 0;
+        // `index` is a code-unit offset (spec, and RegExpBuiltinExec now reports
+        // it as such); the replacer callback receives that code-unit value, while
+        // all slicing of the WTF-8 `s_str` needs the corresponding byte offset.
         var position: usize = @intFromFloat(std.math.trunc(position_f));
-        if (position > s_str.len) position = s_str.len;
+        const s_cu_len = string_proto.cuLen(s_str);
+        if (position > s_cu_len) position = s_cu_len;
+        const position_byte = string_proto.cuByteOf(s_str, position);
 
         // Gather capture strings 1..n_caps.
         var captures = std.ArrayList(?[]const u8){};
@@ -4049,13 +4064,13 @@ pub fn nativeRegExpSymbolReplace(arena: std.mem.Allocator, this_val: Value, args
                 return realm_mod.throwTypeError(arena, "Cannot convert null groups to object");
             // `$<name>` looks up the (defined) `groups`; ctxGetProp autoboxes a
             // primitive receiver, so no explicit ToObject step is needed here.
-            replacement = try getSubstitution(arena, matched, s_str, position, captures.items, repl_str, named_captures);
+            replacement = try getSubstitution(arena, matched, s_str, position_byte, captures.items, repl_str, named_captures);
         }
 
-        if (position >= next_source_pos) {
-            try accumulated.appendSlice(arena, s_str[next_source_pos..position]);
+        if (position_byte >= next_source_pos) {
+            try accumulated.appendSlice(arena, s_str[next_source_pos..position_byte]);
             try accumulated.appendSlice(arena, replacement);
-            next_source_pos = position + matched.len;
+            next_source_pos = position_byte + matched.len;
         }
     }
     if (next_source_pos < s_str.len) try accumulated.appendSlice(arena, s_str[next_source_pos..]);

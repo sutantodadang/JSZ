@@ -214,7 +214,8 @@ pub fn isCallableFn(v: Value) bool {
                 if (realm_mod.active_sym_proxy_target) |sym| {
                     if (o.getOwnSym(sym)) |t| return isCallableFn(t);
                 }
-                return false;
+                // Revoked proxy: [[Call]] presence was fixed at creation.
+                return o.proxy_callable;
             }
             return o.get("__call__") != null;
         },
