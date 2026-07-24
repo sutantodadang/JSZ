@@ -882,10 +882,14 @@ fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, si
     } else {
         result = balanceTime(to.ns - from.ns, st.largest);
     }
-    const lto = localDT(&to);
-    const dest_wall = @as(i128, shared.isoDateToEpochDays(lto.date.year, lto.date.month, lto.date.day)) *
-        shared.NS_PER_DAY + shared.timeToNanos(lto.time);
-    result = try plain_date_time.roundRelative(arena, localDT(&from), dest_wall, result, st.smallest, st.increment, st.mode, st.largest);
+    if (unitRank(st.largest) <= unitRank(.day) and unitRank(st.smallest) >= unitRank(.hour)) {
+        result = try roundZonedTime(arena, from, to, result, st.smallest, st.increment, st.mode, st.largest);
+    } else {
+        const lto = localDT(&to);
+        const dest_wall = @as(i128, shared.isoDateToEpochDays(lto.date.year, lto.date.month, lto.date.day)) *
+            shared.NS_PER_DAY + shared.timeToNanos(lto.time);
+        result = try plain_date_time.roundRelative(arena, localDT(&from), dest_wall, result, st.smallest, st.increment, st.mode, st.largest);
+    }
     if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
 }
@@ -927,6 +931,63 @@ fn differenceZoned(arena: std.mem.Allocator, a: ZonedDT, b: ZonedDT, largest: sh
         return date_dur;
     }
     return .{};
+}
+
+/// NudgeToZonedTime: round the leftover time part of a zoned difference. Time
+/// only spills into an extra day once it reaches the *local* day's length, which
+/// a DST shift makes 23 or 25 hours — 24 hours is not a day on 2000-10-29 in
+/// America/Vancouver.
+fn roundZonedTime(
+    arena: std.mem.Allocator,
+    from: ZonedDT,
+    to: ZonedDT,
+    dur: shared.DurationFields,
+    smallest: shared.Unit,
+    inc: f64,
+    mode: shared.RoundingMode,
+    largest: shared.Unit,
+) !shared.DurationFields {
+    const per = shared.unitLengthNanos(smallest) orelse return dur;
+    const inc_ns = per * @as(i128, @intFromFloat(inc));
+    const time_ns = durTimeNanos(dur);
+    // The instant the date part alone reaches; its local day is the one whose
+    // length the leftover time is measured against.
+    const anchor_ns = to.ns - time_ns;
+    const anchor = ZonedDT{
+        .ns = anchor_ns,
+        .tz = from.tz,
+        .offset_ns = zoneOffsetAt(from.tz, from.offset_ns, anchor_ns),
+        .calendar = from.calendar,
+    };
+    const day_len = (try daySpan(arena, &anchor)).len;
+    var rounded = shared.roundI128ToIncrement(time_ns, inc_ns, mode);
+    var extra_days: f64 = 0;
+    if (day_len > 0) {
+        if (rounded >= day_len) {
+            extra_days = 1;
+            rounded -= day_len;
+        } else if (rounded <= -day_len) {
+            extra_days = -1;
+            rounded += day_len;
+        }
+    }
+    var out = balanceTime(rounded, .hour);
+    out.years = dur.years;
+    out.months = dur.months;
+    out.weeks = dur.weeks;
+    out.days = dur.days + extra_days;
+    // BubbleRelativeDuration: a day the rounding added can complete a month or
+    // year, so re-derive the date part from the origin.
+    if (unitRank(largest) < unitRank(.day) and extra_days != 0) {
+        const origin = localDT(&from).date;
+        const end = try plain_date.addISODate(origin, out.years, out.months, out.weeks, out.days, .constrain, arena);
+        const rebal = plain_date.differenceISODate(origin, end, largest);
+        out.years = rebal.years;
+        out.months = rebal.months;
+        out.weeks = rebal.weeks;
+        out.days = rebal.days;
+    }
+    return out;
 }
 
 fn balanceTime(total_ns: i128, largest: shared.Unit) shared.DurationFields {
