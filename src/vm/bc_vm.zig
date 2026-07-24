@@ -269,6 +269,12 @@ pub const BcVm = struct {
     /// True while dispatching such a call: `bcEval` then rejects a top-level
     /// `var arguments` in the eval'd source.
     param_eval_call: bool = false,
+    /// One-shot companion to `direct_eval_mark`, raised by MARK_FIELD_EVAL when
+    /// the direct eval sits in a class field initializer.
+    field_eval_mark: bool = false,
+    /// True while dispatching such a call: `bcEval` then rejects an eval body that
+    /// ContainsArguments (the "eval inside initializer" early error).
+    field_eval_call: bool = false,
     /// Phase 4d: context for re-entry from native callbacks.
     context: @import("../runtime/realm.zig").Context = undefined,
     /// Phase 9: optional JIT profiler. Null = no profiling (zero hot-path cost).
@@ -949,6 +955,13 @@ pub const BcVm = struct {
         // so any `#x` in it is unbound. An unbound name is an early SyntaxError,
         // raised before the eval body runs.
         const class_mod = @import("../parser/class.zig");
+        // "Eval inside initializer" early error (§sec-performeval-rules-in
+        // -initializer): a direct eval in a class field initializer whose body
+        // ContainsArguments is a SyntaxError, raised before the body runs.
+        if (self.field_eval_call and class_mod.evalBodyContainsArguments(stmts)) {
+            realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", "'arguments' is not allowed in a class field initializer eval");
+            return error.JsException;
+        }
         const eval_priv_names: []const @import("../parser/ast.zig").PrivName = if (direct)
             self.frames.items[self.frames.items.len - 1].func.priv_names
         else
@@ -1577,6 +1590,7 @@ pub const BcVm = struct {
                 .DEFINE_GLOBAL => if (try load_ops.opDefineGlobal(self, frame)) |o| return o,
                 .MARK_DIRECT_EVAL => self.direct_eval_mark = true,
                 .MARK_PARAM_EVAL => self.param_eval_mark = true,
+                .MARK_FIELD_EVAL => self.field_eval_mark = true,
                 .DEFINE_LOCAL => if (try load_ops.opDefineLocal(self, frame)) |o| return o,
                 .SYNC_ANNEXB_FN => if (try load_ops.opSyncAnnexBFn(self, frame)) |o| return o,
                 .GET_LOCAL => if (try load_ops.opGetLocal(self, frame)) |o| return o,
@@ -2107,6 +2121,12 @@ pub const BcVm = struct {
     pub fn privateGet(self: *BcVm, obj_val: Value, key: []const u8) anyerror!Value {
         const root = (try self.privateHolder(obj_val)) orelse return self.throwPrivateBrand(key);
         if (root.findProperty(key)) |loc| {
+            // A private brand check is OWN only — private elements are never
+            // inherited. A static private method reached on a *subclass* receiver
+            // (`class D extends C {}; D.f()` where C.f reads `this.#g`) finds #g on
+            // C via the constructor prototype chain, but D is not branded, so it
+            // must throw rather than resolve the inherited element.
+            if (loc.holder != root) return self.throwPrivateBrand(key);
             const a = loc.holder.attrAt(loc.slot);
             const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
             if (a.is_accessor) {
@@ -2130,6 +2150,8 @@ pub const BcVm = struct {
     pub fn privateSet(self: *BcVm, obj_val: Value, key: []const u8, val: Value) anyerror!bool {
         const root = (try self.privateHolder(obj_val)) orelse return self.throwPrivateBrandBool(key);
         const loc = root.findProperty(key) orelse return self.throwPrivateBrandBool(key);
+        // OWN-only brand check (private elements are never inherited).
+        if (loc.holder != root) return self.throwPrivateBrandBool(key);
         const a = loc.holder.attrAt(loc.slot);
         if (a.is_accessor) {
             const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
@@ -2795,6 +2817,25 @@ pub const BcVm = struct {
                 // materialized lazily; other own props live on the backing
                 // object; everything else delegates to Function.prototype.
                 if (std.mem.eql(u8, key, "prototype")) {
+                    // An own "prototype" (re)defined via Object.defineProperty —
+                    // e.g. an accessor on a method that has no natural prototype —
+                    // takes precedence and must fire its getter. closurePrototype
+                    // only handles the lazily-synthesized data property.
+                    if (closure.obj) |op| {
+                        const o: *JsObject = @ptrCast(@alignCast(op));
+                        if (o.hasOwn("prototype")) {
+                            const slot = o.shape.key_to_slot.get("prototype").?;
+                            const a = o.attrAt(slot);
+                            const raw = if (slot < o.slots.items.len) o.slots.items[slot] else Value{};
+                            if (a.is_accessor) {
+                                const getter = accessorMember(raw, "get");
+                                if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                                return try self.callAccessor(getter, obj_val, &[_]Value{});
+                            }
+                            if (raw.bits != 0) return raw;
+                            return val_mod.makeUndefined(self.arena);
+                        }
+                    }
                     return try self.closurePrototype(obj_val, closure);
                 }
                 // Generators inherit caller/arguments %ThrowTypeError% accessors via
@@ -3648,13 +3689,17 @@ pub const BcVm = struct {
         // ordinary call to f — and the flag must not survive into it, or f's own
         // call to the real eval would inherit the caller's scope.
         const prev_param_eval = self.param_eval_call;
+        const prev_field_eval = self.field_eval_call;
         self.direct_eval_call = self.direct_eval_mark and
             @import("../runtime/realm.zig").isEvalIntrinsic(callee_val);
         self.param_eval_call = self.direct_eval_call and self.param_eval_mark;
+        self.field_eval_call = self.direct_eval_call and self.field_eval_mark;
         self.direct_eval_mark = false;
         self.param_eval_mark = false;
+        self.field_eval_mark = false;
         defer self.direct_eval_call = prev_direct_eval;
         defer self.param_eval_call = prev_param_eval;
+        defer self.field_eval_call = prev_field_eval;
         const frame = &self.frames.items[self.frames.items.len - 1];
         if (callee_val.bits == 0) {
             return try std.fmt.allocPrint(self.arena, "TypeError: undefined is not a function", .{});
@@ -5299,6 +5344,9 @@ fn isCallableValue(v: Value) bool {
             if (obj.internal_kind == .bound_function or obj.get("__call__") != null) return true;
             if (obj.internal_kind == .proxy) {
                 if (proxy_mod.proxyTarget(obj)) |t| return isCallableValue(t);
+                // Revoked: the target symbol is gone, but [[Call]] was fixed at
+                // creation — honor the recorded callability.
+                return obj.proxy_callable;
             }
             return false;
         },

@@ -961,13 +961,22 @@ pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) any
         if (e != error.JsException) return e;
         return rejectWithPending(arena);
     };
-    // A second argument `{ with: { type: '...' } }` selects a typed (JSON/text)
-    // module: fold the type into the specifier so it keys the same synthetic
-    // module record the static-import desugar registers (`spec\x00type`).
-    var coerced = try arena.dupe(Value, args);
-    if (coerced.len == 0) coerced = try arena.alloc(Value, 1);
-    coerced[0] = try val_mod.makeString(arena, spec_str);
-    const args2 = importApplyTypeAttr(arena, coerced) catch coerced;
+    // EvaluateImportCall steps 9-10: validate the second argument and read its
+    // `with` import attributes. An abrupt options-object / `with` getter / non
+    // -string attribute value rejects the promise. A `with: { type: '...' }`
+    // attribute selects a typed (JSON/text) module: fold the type into the
+    // specifier so it keys the same synthetic module record the static-import
+    // desugar registers (`spec\x00type`).
+    const type_attr = importReadTypeAttr(arena, if (args.len > 1) args[1] else Value{}) catch |e| {
+        if (e != error.JsException) return e;
+        return rejectWithPending(arena);
+    };
+    const folded_spec = if (type_attr) |ty|
+        try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ spec_str, ty })
+    else
+        spec_str;
+    const args2 = try arena.alloc(Value, 1);
+    args2[0] = try val_mod.makeString(arena, folded_spec);
     const raw_name = args2[0].toPtr().string;
     // Resolve the specifier to the canonical id used in __modules__.
     const env = active_global_env orelse {
@@ -1019,23 +1028,57 @@ pub fn nativeImport(arena: std.mem.Allocator, _: Value, args: []const Value) any
     return nativeImportSync(arena, args2);
 }
 
-/// If `import(spec, options)` carries an import-attributes `with: { type: '...' }`
-/// (or legacy `assert: { ... }`) second argument, return a new args slice whose
-/// specifier is `spec\x00type`; otherwise return `args` unchanged. The folded
-/// specifier matches the typed-module key the static-import desugar registers.
-fn importApplyTypeAttr(arena: std.mem.Allocator, args: []const Value) anyerror![]const Value {
-    if (args.len < 2 or args[1].bits == 0 or args[1].unbox() != .object) return args;
-    const opts = args[1].toPtr().object;
-    const attrs_val = opts.get("with") orelse opts.get("assert") orelse return args;
-    if (attrs_val.bits == 0 or attrs_val.unbox() != .object) return args;
-    const type_val = attrs_val.toPtr().object.get("type") orelse return args;
-    if (type_val.bits == 0 or type_val.unbox() != .string) return args;
-    const ty = type_val.toPtr().string;
-    if (ty.len == 0) return args;
-    const typed = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ args[0].toPtr().string, ty });
-    const out = try arena.alloc(Value, 1);
-    out[0] = try val_mod.makeString(arena, typed);
-    return out;
+/// True when `v` is an Object (ordinary object, callable, or Proxy) — the
+/// spec's `Type(v) is Object` for a value box.
+fn valueIsObjectLike(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .object, .function, .native_function, .bc_function => true,
+        else => false,
+    };
+}
+
+/// Process `import(spec, options)`'s second argument per EvaluateImportCall
+/// steps 9-10 (import-attributes). Returns the `type` attribute string (or null
+/// when `options`/`with`/`type` is absent). Abrupt cases — a non-object
+/// `options`, a `with` value that is not an Object, or an attribute value that
+/// is not a String — raise a TypeError; an observable `with` getter,
+/// [[OwnPropertyKeys]] trap, or attribute [[Get]] propagates its own exception.
+/// The caller turns any `error.JsException` into a promise rejection.
+fn importReadTypeAttr(arena: std.mem.Allocator, options: Value) anyerror!?[]const u8 {
+    // step 9: options undefined ⇒ no attributes.
+    if (options.bits == 0 or options.unbox() == .undefined_) return null;
+    // step 9.a: Type(options) must be Object.
+    if (!valueIsObjectLike(options)) return throwTypeError(arena, "import() options argument must be an object");
+    const ctx = active_context orelse return null;
+    // step 9.b: attributesObj = ? Get(options, "with") — an accessor may throw.
+    const with_val = try ctx.getProp(arena, options, "with");
+    if (with_val.bits == 0 or with_val.unbox() == .undefined_) return null;
+    // step 9.d.i: the `with` value must itself be an Object.
+    if (!valueIsObjectLike(with_val)) return throwTypeError(arena, "import() 'with' option must be an object");
+    // step 9.d.ii: EnumerableOwnProperties(attributesObj, key) — observable
+    // [[OwnPropertyKeys]] + per-key [[GetOwnProperty]] enumerable filter (routed
+    // through Object.keys, so a Proxy's traps run and their throws propagate).
+    const keys_val = try obj_methods_mod.nativeObjectKeys(arena, Value{}, &[_]Value{with_val});
+    var type_attr: ?[]const u8 = null;
+    if (keys_val.bits != 0 and keys_val.unbox() == .object) {
+        const keys_obj = keys_val.toPtr().object;
+        const n = keys_obj.array_length;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const idx_key = try std.fmt.allocPrint(arena, "{d}", .{i});
+            const k = keys_obj.get(idx_key) orelse continue;
+            if (k.bits == 0 or k.unbox() != .string) continue;
+            const key_str = k.toPtr().string;
+            // step 9.d.iv: value = ? Get(attributesObj, key); must be a String.
+            const v = try ctx.getProp(arena, with_val, key_str);
+            if (v.bits == 0 or v.unbox() != .string)
+                return throwTypeError(arena, "import attribute value must be a string");
+            if (std.mem.eql(u8, key_str, "type") and v.toPtr().string.len != 0)
+                type_attr = v.toPtr().string;
+        }
+    }
+    return type_attr;
 }
 
 /// Synchronous path for `nativeImport`: evaluate the module immediately and
@@ -2893,6 +2936,14 @@ pub fn nativePrivInstallAcc(arena: std.mem.Allocator, _: Value, args: []const Va
     if (obj.resolveOwnSlot(key) != null) {
         const class_mod = @import("../parser/class.zig");
         const msg = try std.fmt.allocPrint(arena, "Cannot install private member {s} twice on the same object", .{class_mod.privateDisplayName(key)});
+        return throwTypeError(arena, msg);
+    }
+    // Installing a private accessor on a non-extensible object is a TypeError
+    // (matches DEFINE_PRIVATE for fields/methods) — see private-class-field-on
+    // -nonextensible-objects.
+    if (!obj.extensible) {
+        const class_mod = @import("../parser/class.zig");
+        const msg = try std.fmt.allocPrint(arena, "Cannot install private member {s} on a non-extensible object", .{class_mod.privateDisplayName(key)});
         return throwTypeError(arena, msg);
     }
     // The accessor holder is the same `{ get, set }` shape the ordinary accessor

@@ -650,6 +650,13 @@ pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []c
         else
             (try coerceKey(arena, key_v)) orelse return val_mod.makeBool(arena, false);
         if (bobj.isPrivate(key2)) return val_mod.makeBool(arena, false);
+        // A constructor-capable function's own "prototype" is materialized lazily
+        // on first [[Get]]. Force that read so hasOwnProperty agrees with
+        // getOwnPropertyDescriptor. For arrows/methods/async (no prototype) the
+        // read returns undefined without defining anything, so hasOwn stays false.
+        if (!bobj.hasOwn(key2) and std.mem.eql(u8, key2, "prototype")) {
+            _ = try ctx2.getProp(arena, this_val, "prototype");
+        }
         return val_mod.makeBool(arena, bobj.hasOwn(key2));
     }
     if (this_val.bits == 0 or this_val.unbox() != .object) {

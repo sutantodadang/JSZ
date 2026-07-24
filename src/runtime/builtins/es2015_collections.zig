@@ -2626,6 +2626,28 @@ pub fn nativeObjSpreadInto(arena: std.mem.Allocator, _: Value, args: []const Val
 
     const src_obj = src.toPtr().object;
     const ctx = realm_mod.active_context;
+    // A Proxy source drives CopyDataProperties through its traps: [[OwnPropertyKeys]]
+    // (strings and symbols interleaved in trap order), then per key [[GetOwnProperty]]
+    // to filter on [[Enumerable]] before the [[Get]] — a raw own-key scan would copy
+    // the proxy's internal slots instead.
+    if (src_obj.internal_kind == .proxy) {
+        const proxy_mod = @import("proxy.zig");
+        const keys = (try proxy_mod.proxyOwnKeys(arena, src_obj)) orelse return val_mod.makeUndefined(arena);
+        for (keys) |kv| {
+            const desc = (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, src_obj, kv)) orelse continue;
+            if (desc.bits == 0 or desc.unbox() != .object) continue;
+            const en = desc.toPtr().object.getOwn("enumerable") orelse Value{};
+            if (!(en.bits != 0 and isTruthy(en))) continue;
+            const c = ctx orelse continue;
+            if (kv.bits != 0 and kv.unbox() == .symbol) {
+                try target_obj.setSym(kv, try c.getPropSym(arena, src, kv));
+            } else {
+                const ks = try toPropertyKeyString(arena, kv);
+                try target_obj.set(ks, try c.getProp(arena, src, ks));
+            }
+        }
+        return val_mod.makeUndefined(arena);
+    }
     for (src_obj.ownKeys()) |k| {
         if (!src_obj.isEnumerable(k)) continue;
         const v = if (ctx) |c| try c.getProp(arena, src, k) else (src_obj.getOwn(k) orelse continue);

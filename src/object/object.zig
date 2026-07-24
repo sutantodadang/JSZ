@@ -120,6 +120,11 @@ pub const JsObject = struct {
     /// would make every object inheriting from it look callable too. This flag is
     /// the brand IsCallable consults instead; only %Function.prototype% sets it.
     is_callable_intrinsic: bool = false,
+    /// For a Proxy exotic object: whether its [[ProxyTarget]] was callable at
+    /// creation time. A Proxy's [[Call]] presence is fixed when it is made, so
+    /// `typeof`/IsCallable must keep reporting "function" even after the proxy is
+    /// revoked (which clears the target symbol). Only set on `.proxy` objects.
+    proxy_callable: bool = false,
     /// Allocator for property storage (the eval arena).
     arena: std.mem.Allocator,
     /// Phase 6 hidden class manager (shared globally).

@@ -730,6 +730,9 @@ fn proxyCreate(arena: std.mem.Allocator, args: []const Value) anyerror!Value {
     else
         try JsObject.create(arena, null);
     obj.internal_kind = .proxy;
+    // A Proxy over a callable target has a [[Call]] method; record this now so
+    // typeof/IsCallable still answer "function" after the proxy is revoked.
+    obj.proxy_callable = function_proto.isCallableFn(args[0]);
     if (realm_mod.active_sym_proxy_target) |s| try obj.setSym(s, args[0]);
     if (realm_mod.active_sym_proxy_handler) |s| try obj.setSym(s, args[1]);
     return val_mod.makeObject(arena, obj);
