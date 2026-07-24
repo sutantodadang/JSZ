@@ -49,6 +49,7 @@ const nfmt = @import("intl_number.zig");
 const locale_id = @import("intl_locale_id.zig");
 const likely = @import("intl_likely_subtags.zig");
 const plural = @import("intl_plural.zig");
+const cal_names = @import("intl_calendar_names.zig");
 
 // Intl.NumberFormat lives in `intl_number.zig`; re-export the pieces the realm
 // registration and the sibling services (ListFormat / RelativeTimeFormat) use.
@@ -744,6 +745,11 @@ const DTFPattern = struct {
     hour_cycle: []const u8 = "h12",
     /// The resolved time zone identifier, for the `timeZoneName` part.
     tz_id: []const u8 = "UTC",
+    /// The resolved calendar: date fields are projected into it before being
+    /// rendered, so `en-u-ca-buddhist` really does say 2593.
+    cal: t_calendar.CalendarId = .gregory,
+    /// Whether the locale writes a lunisolar year name in CJK rather than pinyin.
+    cjk_year_name: bool = false,
 
     /// True for the two 12-hour cycles, which carry an AM/PM marker.
     fn isHour12(self: DTFPattern) bool {
@@ -847,6 +853,14 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
             .tz_id = blk: {
                 const id = readOpt(o, "__dtf_tzZone");
                 break :blk if (id.len > 0) id else "UTC";
+            },
+            .cal = blk: {
+                const id = readOpt(o, "__dtf_calendar");
+                break :blk if (id.len > 0) (t_calendar.canonicalize(id) orelse .gregory) else .gregory;
+            },
+            .cjk_year_name = blk: {
+                const lang = primaryLanguage(resolvedLocaleOf(this_val));
+                break :blk std.mem.eql(u8, lang, "zh") or std.mem.eql(u8, lang, "ja") or std.mem.eql(u8, lang, "ko");
             },
         };
         offset_ms = @intFromFloat(readNum(o, "__dtf_tzOffsetMs"));
@@ -1053,6 +1067,32 @@ fn fieldStr(arena: std.mem.Allocator, val: i64, style: []const u8) ![]const u8 {
     return tmp.items;
 }
 
+/// Emit the `year` part — or, for a lunisolar calendar, the `relatedYear` /
+/// `yearName` pair CLDR uses in its place ("2019(ji-hai)", "2019己亥年").
+fn appendYearParts(
+    arena: std.mem.Allocator,
+    p: DTFPattern,
+    cal_year: i64,
+    arith_year: i32,
+    lunisolar: bool,
+    parts: *std.ArrayListUnmanaged(DTPart),
+) !void {
+    if (!lunisolar) {
+        try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, cal_year, p.year) });
+        return;
+    }
+    const name = try cal_names.sexagenaryYearName(arena, arith_year, p.cjk_year_name);
+    try parts.append(arena, .{ .type = "relatedYear", .value = try yearStr(arena, arith_year, p.year) });
+    if (p.cjk_year_name) {
+        try parts.append(arena, .{ .type = "yearName", .value = name });
+        try parts.append(arena, .{ .type = "literal", .value = "年" });
+    } else {
+        try parts.append(arena, .{ .type = "literal", .value = "(" });
+        try parts.append(arena, .{ .type = "yearName", .value = name });
+        try parts.append(arena, .{ .type = "literal", .value = ")" });
+    }
+}
+
 fn yearStr(arena: std.mem.Allocator, year: i64, style: []const u8) ![]const u8 {
     var tmp = std.ArrayListUnmanaged(u8){};
     try appendYear(arena, &tmp, year, style);
@@ -1097,6 +1137,23 @@ fn renderDateTimeParts(
     const named_month = month.len > 0 and !std.mem.eql(u8, month, "numeric") and !std.mem.eql(u8, month, "2-digit");
     var has_date = false;
 
+    // Project the ISO fields into the resolved calendar: `year` reports the era
+    // year where the calendar has eras, `month` its ordinal position, and named
+    // months come from that calendar's own list.
+    const cf = t_calendar.fields(p.cal, .{
+        .year = f.year,
+        .month = @intCast(f.month + 1),
+        .day = @intCast(f.day),
+    });
+    const cal_year: i64 = cf.era_year orelse cf.year;
+    const cal_month: i64 = cf.month;
+    const cal_day: i64 = cf.day;
+    const cal_month_name: ?[]const u8 = try cal_names.monthName(arena, p.cal, cf.code_num, cf.code_leap, cf.month);
+    // The lunisolar calendars number their years by the Gregorian year they
+    // begin in and name them from the sexagenary cycle, so a `year` request
+    // yields `relatedYear` + `yearName` rather than a plain `year` part.
+    const lunisolar = p.cal == .chinese or p.cal == .dangi;
+
     if (p.weekday.len > 0) {
         const idx: usize = @intCast(@mod(f.weekday, 7));
         const name = if (std.mem.eql(u8, p.weekday, "short")) weekday_short[idx] else if (std.mem.eql(u8, p.weekday, "narrow")) weekday_narrow[idx] else weekday_long[idx];
@@ -1106,46 +1163,44 @@ fn renderDateTimeParts(
 
     if (named_month) {
         if (has_date) try parts.append(arena, .{ .type = "literal", .value = ", " });
-        const midx: usize = @intCast(@mod(f.month, 12));
-        const mname = if (std.mem.eql(u8, month, "short")) month_short[midx] else if (std.mem.eql(u8, month, "narrow")) month_narrow[midx] else month_long[midx];
+        const mname = cal_month_name orelse blk: {
+            const midx: usize = @intCast(@mod(f.month, 12));
+            break :blk if (std.mem.eql(u8, month, "short")) month_short[midx] else if (std.mem.eql(u8, month, "narrow")) month_narrow[midx] else month_long[midx];
+        };
         try parts.append(arena, .{ .type = "month", .value = mname });
         if (p.day.len > 0) {
             try parts.append(arena, .{ .type = "literal", .value = " " });
-            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, p.day) });
+            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, cal_day, p.day) });
         }
         if (p.year.len > 0) {
             try parts.append(arena, .{ .type = "literal", .value = ", " });
-            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, p.year) });
+            try appendYearParts(arena, p, cal_year, cf.year, lunisolar, parts);
         }
         has_date = true;
     } else if (month.len > 0 or p.day.len > 0 or p.year.len > 0) {
         if (p.weekday.len > 0) try parts.append(arena, .{ .type = "literal", .value = ", " });
         var first = true;
         if (month.len > 0) {
-            try parts.append(arena, .{ .type = "month", .value = try fieldStr(arena, f.month + 1, month) });
+            try parts.append(arena, .{ .type = "month", .value = try fieldStr(arena, cal_month, month) });
             first = false;
         }
         if (p.day.len > 0) {
             if (!first) try parts.append(arena, .{ .type = "literal", .value = "/" });
-            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, f.day, p.day) });
+            try parts.append(arena, .{ .type = "day", .value = try fieldStr(arena, cal_day, p.day) });
             first = false;
         }
         if (p.year.len > 0) {
             if (!first) try parts.append(arena, .{ .type = "literal", .value = "/" });
-            try parts.append(arena, .{ .type = "year", .value = try yearStr(arena, f.year, p.year) });
+            try appendYearParts(arena, p, cal_year, cf.year, lunisolar, parts);
         }
         has_date = true;
     }
-    // The ISO calendar has no eras, so `era` renders the proleptic Gregorian one.
+    // The ISO calendar has no eras of its own, so `era` falls back to the
+    // proleptic Gregorian ones.
     if (p.era.len > 0) {
         if (has_date) try parts.append(arena, .{ .type = "literal", .value = " " });
-        const bc = f.year <= 0;
-        try parts.append(arena, .{ .type = "era", .value = if (std.mem.eql(u8, p.era, "long"))
-            (if (bc) "Before Christ" else "Anno Domini")
-        else if (std.mem.eql(u8, p.era, "narrow"))
-            (if (bc) "B" else "A")
-        else
-            (if (bc) "BC" else "AD") });
+        const code = cf.era orelse (if (f.year <= 0) "bce" else "ce");
+        try parts.append(arena, .{ .type = "era", .value = cal_names.eraName(code, p.era) });
         has_date = true;
     }
 
