@@ -1194,8 +1194,22 @@ fn namedFieldInit(p: *Parser, f: ClassField, val: *Node) ?*Node {
 /// anonymity test looks at the original `check` node while the wrapper `val` is
 /// what gets named.
 fn namedFieldInitOf(p: *Parser, f: ClassField, val: *Node, check: *Node) ?*Node {
-    if (f.computed_key != null or !isAnonFnDef(check)) return val;
+    if (!isAnonFnDef(check)) return val;
     const s = p.current.start;
+    // A computed field is still named — after its *pre-evaluated* key binding, so
+    // the key object's @@toPrimitive is not observed a second time. Without this
+    // wrap the desugared descriptor `{ value: init }` would name the anonymous
+    // function "value" (NamedEvaluation of the object-literal data property).
+    // Fields with no hidden key binding (fallback path) are left unnamed.
+    if (f.computed_key != null) {
+        const kv = f.key_var orelse return val;
+        const callee = nodeIdent(p, "__nameFn__") orelse return null;
+        const key_ident = nodeIdent(p, kv) orelse return null;
+        var cargs = std.ArrayList(*Node){};
+        cargs.append(p.arena, val) catch return null;
+        cargs.append(p.arena, key_ident) catch return null;
+        return p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = cargs.items } });
+    }
     const callee = nodeIdent(p, "__nameFn__") orelse return null;
     // A private field names its function after the *source* spelling ("#x"), not
     // the PrivateEnvironment-mangled key the property table uses.
@@ -2523,7 +2537,20 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
                 return null;
             };
             var init_node: *Node = undefined;
-            if (defaults.items[i]) |dexpr| {
+            if (defaults.items[i]) |dexpr_raw| {
+                // SingleNameBinding with an anonymous-function Initializer names the
+                // function after the parameter (`function(p = () => {})` → "p").
+                // The default expr sits in the conditional's `alternate`, so wrap
+                // it in `__nameFn__(fn, "p")` to preserve that name.
+                const dexpr = blk: {
+                    if (!isAnonFnDef(dexpr_raw)) break :blk dexpr_raw;
+                    const namer = nodeIdent(p, "__nameFn__") orelse return null;
+                    const key = p.makeNode(.string_literal, 0, 0, .{ .string_literal = orig }) orelse return null;
+                    var cargs = std.ArrayList(*Node){};
+                    cargs.append(p.arena, dexpr_raw) catch return null;
+                    cargs.append(p.arena, key) catch return null;
+                    break :blk p.makeNode(.call_expr, 0, 0, .{ .call_expr = .{ .callee = namer, .args = cargs.items } }) orelse return null;
+                };
                 const ar1 = p.makeNode(.identifier, 0, 0, .{ .identifier = synth }) orelse return null;
                 const undef = p.makeNode(.undefined_literal, 0, 0, .{ .undefined_literal = {} }) orelse return null;
                 const test_ = p.makeNode(.binary_expr, 0, 0, .{ .binary_expr = .{ .op = .strict_neq, .left = ar1, .right = undef } }) orelse return null;

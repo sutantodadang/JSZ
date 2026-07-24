@@ -4325,12 +4325,18 @@ pub fn registerSymbols(arena: std.mem.Allocator) !void {
 // ============================================================= Prototype Getters
 
 pub fn nativeRegExpToString(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    // §22.2.6.13: a *generic* function. It reads `source` and `flags` through
+    // ordinary [[Get]] (following the prototype chain and firing any getter or
+    // Proxy trap) and ToString's each — there is NO [[RegExpMatcher]] brand check
+    // on `this`, so it works on any object with those properties.
     if (this_val.bits == 0 or this_val.unbox() != .object)
-        return realm_mod.throwTypeError(arena, "RegExp.prototype.toString called on incompatible receiver");
-    const src = try nativeRegExpGetSource(arena, this_val, &.{});
-    const flags = try nativeRegExpGetFlags(arena, this_val, &.{});
-    const src_s: []const u8 = if (src.bits != 0 and src.unbox() == .string) src.toPtr().string else "(?:)";
-    const flags_s: []const u8 = if (flags.bits != 0 and flags.unbox() == .string) flags.toPtr().string else "";
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.toString called on non-object");
+    const ctx = realm_mod.active_context orelse
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.toString requires a runtime context");
+    const src = try ctx.getProp(arena, this_val, "source");
+    const src_s = try realm_mod.stringPrimitive(arena, src);
+    const flags = try ctx.getProp(arena, this_val, "flags");
+    const flags_s = try realm_mod.stringPrimitive(arena, flags);
     return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "/{s}/{s}", .{ src_s, flags_s }));
 }
 
