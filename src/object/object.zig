@@ -17,7 +17,10 @@ const ShapeManager = shape_mod.ShapeManager;
 const heap_mod = @import("../gc/heap.zig");
 
 /// Maximum prototype chain depth before we give up (cycle guard, Phase 3a).
-const MAX_PROTO_DEPTH: usize = 64;
+/// Upper bound on prototype-chain walk length. The spec imposes no limit;
+/// setPrototypeOf enforces acyclicity, so this only guards against a corrupted
+/// cyclic chain. Kept well above any real chain (SM's tests build 100+ levels).
+pub const MAX_PROTO_DEPTH: usize = 100_000;
 
 /// Largest hole-gap a dense-array write past the end will pad in place (with hole
 /// sentinels) before deciding the array is genuinely sparse and deopting to the

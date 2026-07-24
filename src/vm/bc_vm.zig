@@ -10,6 +10,7 @@ const val_mod = @import("../value/value.zig");
 const Value = val_mod.Value;
 const JsValue = val_mod.JsValue;
 const JsObject = @import("../object/object.zig").JsObject;
+const MAX_PROTO_DEPTH = @import("../object/object.zig").MAX_PROTO_DEPTH;
 const Op = @import("../bytecode/opcodes.zig").Op;
 const BcFunction = @import("../bytecode/function.zig").BcFunction;
 const build_options = @import("build_options");
@@ -2200,7 +2201,7 @@ pub const BcVm = struct {
         var cur: ?*JsObject = root_obj;
         var depth: usize = 0;
         while (cur) |o| {
-            if (depth >= 64) break;
+            if (depth >= MAX_PROTO_DEPTH) break;
             depth += 1;
             // A Proxy in the prototype chain dispatches its own [[Get]] with the
             // original receiver preserved (the root proxy is handled above).
@@ -2250,7 +2251,7 @@ pub const BcVm = struct {
         var cur: ?*JsObject = obj;
         var depth: usize = 0;
         while (cur) |o| {
-            if (depth >= 64) break;
+            if (depth >= MAX_PROTO_DEPTH) break;
             depth += 1;
             if (o.internal_kind == .proxy and o != obj) {
                 return try self.proxySet(obj_val, o, sym_key, value, obj_val);
@@ -2335,7 +2336,7 @@ pub const BcVm = struct {
             var cur: ?*JsObject = if (realm_mod.active_function_proto) |p| p else null;
             var depth: usize = 0;
             while (cur) |o| {
-                if (depth >= 64) break;
+                if (depth >= MAX_PROTO_DEPTH) break;
                 depth += 1;
                 if (o.hasOwn(key)) return true;
                 cur = o.proto;
@@ -2370,7 +2371,7 @@ pub const BcVm = struct {
             var cur: ?*JsObject = if (realm_mod.active_function_proto) |p| p else null;
             var depth: usize = 0;
             while (cur) |o| {
-                if (depth >= 64) break;
+                if (depth >= MAX_PROTO_DEPTH) break;
                 depth += 1;
                 if (key_v.bits != 0 and key_v.unbox() == .symbol) {
                     if (o.getOwnSym(key_v) != null) return true;
@@ -2415,7 +2416,7 @@ pub const BcVm = struct {
             var cur: ?*JsObject = root_obj;
             var depth: usize = 0;
             while (cur) |o| {
-                if (depth >= 64) break;
+                if (depth >= MAX_PROTO_DEPTH) break;
                 depth += 1;
                 // A Proxy in the prototype chain has its own [[HasProperty]];
                 // recurse so the `has` trap (or target walk) is dispatched.
@@ -2439,7 +2440,7 @@ pub const BcVm = struct {
         var cur: ?*JsObject = root_obj;
         var depth: usize = 0;
         while (cur) |o| {
-            if (depth >= 64) break;
+            if (depth >= MAX_PROTO_DEPTH) break;
             depth += 1;
             // A Proxy in the prototype chain has its own [[HasProperty]];
             // recurse so the `has` trap (or target walk) is dispatched.
@@ -2768,7 +2769,7 @@ pub const BcVm = struct {
                     var p: ?*JsObject = obj.proto;
                     var pd: usize = 0;
                     while (p) |pp| : (pd += 1) {
-                        if (pd >= 64) break;
+                        if (pd >= MAX_PROTO_DEPTH) break;
                         if (pp.internal_kind == .module_namespace)
                             return try self.getProp(try val_mod.makeObject(self.arena, pp), key);
                         // A Proxy in the prototype chain dispatches its own [[Get]]
@@ -3175,7 +3176,7 @@ pub const BcVm = struct {
                     var cur: ?*JsObject = obj;
                     var depth: usize = 0;
                     while (cur) |c| {
-                        if (depth >= 64) break;
+                        if (depth >= MAX_PROTO_DEPTH) break;
                         depth += 1;
                         if (c.internal_kind == .typed_array) {
                             const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(c.internal_slot.?));
@@ -3200,7 +3201,7 @@ pub const BcVm = struct {
                     var cur: ?*JsObject = obj;
                     var depth: usize = 0;
                     while (cur) |c| {
-                        if (depth >= 64) break;
+                        if (depth >= MAX_PROTO_DEPTH) break;
                         depth += 1;
                         if (c != obj and c.internal_kind == .proxy) {
                             const key_v = try val_mod.makeString(self.arena, key);
@@ -5330,6 +5331,13 @@ pub fn isObjectOperand(v: Value) bool {
         .object, .bc_function => true,
         else => false,
     };
+}
+
+/// True when `v` is a Symbol primitive. Symbols must divert a numeric binary
+/// operator off its plain-number fast path so ToNumeric throws a TypeError
+/// (`sym - 1`, `sym | 0`, …) rather than silently coercing to NaN/0.
+pub fn isSymbolOperand(v: Value) bool {
+    return v.bits != 0 and v.unbox() == .symbol;
 }
 
 /// True when `v` is callable (function-like): a native/bc/legacy function, a

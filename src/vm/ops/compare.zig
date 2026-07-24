@@ -88,6 +88,20 @@ pub inline fn opSneq(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+/// Coerce both relational operands via ToPrimitive(number) and reject a Symbol
+/// result: IsLessThan applies ToNumeric to a non-string primitive, and
+/// ToNumeric(Symbol) is a TypeError (`sym < 1`, `Symbol.iterator >= "x"`, …).
+/// A Symbol is never a String, so "either primitive is a Symbol" is exactly the
+/// case the spec throws on. BigInt is left alone (it compares fine).
+const RelPair = struct { lp: val_mod.Value, rp: val_mod.Value };
+inline fn relationalPrims(self: *BcVm, lv: val_mod.Value, rv: val_mod.Value) !RelPair {
+    const lp = try self.coerceForRelational(lv);
+    const rp = try self.coerceForRelational(rv);
+    if (bcv.isSymbolOperand(lp) or bcv.isSymbolOperand(rp))
+        return self.throwTypeErr("Cannot convert a Symbol value to a number");
+    return .{ .lp = lp, .rp = rp };
+}
+
 pub inline fn opLt(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const rdst = code[frame.pc];
@@ -98,10 +112,13 @@ pub inline fn opLt(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const lp = try self.coerceForRelational(lv);
-        const rp = try self.coerceForRelational(rv);
-        const r = bcv.jsLessThan(lp, rp) orelse false;
+    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv)) {
+        const pr = relationalPrims(self, lv, rv) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in comparison")) |oc| return oc;
+            return null;
+        };
+        const r = bcv.jsLessThan(pr.lp, pr.rp) orelse false;
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
     } else {
         const r = bcv.jsLessThan(lv, rv) orelse false;
@@ -121,10 +138,13 @@ pub inline fn opLe(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // a <= b == !(b < a)
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const lp = try self.coerceForRelational(lv);
-        const rp = try self.coerceForRelational(rv);
-        const r2 = bcv.jsLessThan(rp, lp);
+    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv)) {
+        const pr = relationalPrims(self, lv, rv) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in comparison")) |oc| return oc;
+            return null;
+        };
+        const r2 = bcv.jsLessThan(pr.rp, pr.lp);
         const r = if (r2) |v| !v else false;
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
     } else {
@@ -145,10 +165,13 @@ pub inline fn opGt(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const lp = try self.coerceForRelational(lv);
-        const rp = try self.coerceForRelational(rv);
-        const r = bcv.jsLessThan(rp, lp) orelse false;
+    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv)) {
+        const pr = relationalPrims(self, lv, rv) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in comparison")) |oc| return oc;
+            return null;
+        };
+        const r = bcv.jsLessThan(pr.rp, pr.lp) orelse false;
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
     } else {
         const r = bcv.jsLessThan(rv, lv) orelse false;
@@ -168,10 +191,13 @@ pub inline fn opGe(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // a >= b == !(a < b)
     const lv = frame.registers[rlhs];
     const rv = frame.registers[rrhs];
-    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv)) {
-        const lp = try self.coerceForRelational(lv);
-        const rp = try self.coerceForRelational(rv);
-        const r2 = bcv.jsLessThan(lp, rp);
+    if (bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv)) {
+        const pr = relationalPrims(self, lv, rv) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in comparison")) |oc| return oc;
+            return null;
+        };
+        const r2 = bcv.jsLessThan(pr.lp, pr.rp);
         const r = if (r2) |v| !v else false;
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
     } else {

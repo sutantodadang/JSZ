@@ -61,7 +61,8 @@ pub inline fn opSub(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .sub) catch |e| {
             if (e != error.JsException) return e;
@@ -103,7 +104,8 @@ pub inline fn opMul(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .mul) catch |e| {
             if (e != error.JsException) return e;
@@ -145,7 +147,8 @@ pub inline fn opDiv(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .div) catch |e| {
             if (e != error.JsException) return e;
@@ -184,7 +187,8 @@ pub inline fn opMod(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .mod) catch |e| {
             if (e != error.JsException) return e;
@@ -317,7 +321,8 @@ pub inline fn opBitAnd(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .band) catch |e| {
             if (e != error.JsException) return e;
@@ -361,7 +366,8 @@ pub inline fn opBitOr(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .bor) catch |e| {
             if (e != error.JsException) return e;
@@ -405,7 +411,8 @@ pub inline fn opBitXor(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .bxor) catch |e| {
             if (e != error.JsException) return e;
@@ -449,7 +456,8 @@ pub inline fn opShl(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .shl) catch |e| {
             if (e != error.JsException) return e;
@@ -493,7 +501,8 @@ pub inline fn opShr(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .shr) catch |e| {
             if (e != error.JsException) return e;
@@ -537,7 +546,8 @@ pub inline fn opUshr(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // (`Object(1n)` on either side) unwraps instead of reporting a
     // mixed-type TypeError. See BcVm.numericBinaryOp.
     if (bcv.BcVm.isBigOperand(lv) or bcv.BcVm.isBigOperand(rv) or
-        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv))
+        bcv.isObjectOperand(lv) or bcv.isObjectOperand(rv) or
+        bcv.isSymbolOperand(lv) or bcv.isSymbolOperand(rv))
     {
         const res = self.numericBinaryOp(lv, rv, .ushr) catch |e| {
             if (e != error.JsException) return e;
