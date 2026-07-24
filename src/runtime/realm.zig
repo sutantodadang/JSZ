@@ -4307,6 +4307,9 @@ pub const ThreadLocalSnapshot = struct {
     ta_iter_proto: ?*JsObject,
     ta_protos: [typed_array_mod.all_kinds.len]?*JsObject,
     ta_ctors: [typed_array_mod.all_kinds.len]?*JsObject,
+    /// %RegExp% itself — the sole legal receiver of the Annex B legacy static
+    /// accessors, so a secondary realm's constructor must not stand in for it.
+    regexp_ctor: ?*JsObject,
 
     pub fn capture() ThreadLocalSnapshot {
         return .{
@@ -4357,6 +4360,7 @@ pub const ThreadLocalSnapshot = struct {
             .ta_iter_proto = typed_array_mod.active_ta_iter_proto,
             .ta_protos = typed_array_mod.active_ta_protos,
             .ta_ctors = typed_array_mod.active_ta_ctors,
+            .regexp_ctor = @import("builtins/regexp.zig").active_regexp_ctor,
         };
     }
 
@@ -4408,6 +4412,7 @@ pub const ThreadLocalSnapshot = struct {
         typed_array_mod.active_ta_iter_proto = self.ta_iter_proto;
         typed_array_mod.active_ta_protos = self.ta_protos;
         typed_array_mod.active_ta_ctors = self.ta_ctors;
+        @import("builtins/regexp.zig").active_regexp_ctor = self.regexp_ctor;
     }
 };
 
