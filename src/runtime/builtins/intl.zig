@@ -962,13 +962,31 @@ pub fn nativeDateTimeFormatFormatGetter(arena: std.mem.Allocator, this_val: Valu
 /// §11.3.6/§11.3.7 formatRange / formatRangeToParts. en-US renders a range as
 /// "<start> – <end>", collapsing to the single formatted value when both ends
 /// produce identical text.
+/// ToDateTimeFormattable: a Temporal object passes through untouched, anything
+/// else is ToNumber-coerced. The coercion of *both* ends happens before the
+/// same-type check, so a poisoned valueOf still runs (§ToDateTimeFormattable).
+fn toDateTimeFormattable(arena: std.mem.Allocator, v: Value) !Value {
+    if (temporalKindOf(v) != null) return v;
+    if (v.bits != 0 and v.unbox() == .symbol)
+        return realm_mod.throwTypeError(arena, "cannot convert a Symbol to a number");
+    return val_mod.makeNumber(arena, try realm_mod.toNumberValue(arena, v));
+}
+
 fn dtfRangeParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) !std.ArrayListUnmanaged(DTPart) {
     _ = try requireDateTimeFormat(arena, this_val);
     if (args.len < 2 or args[0].bits == 0 or args[0].unbox() == .undefined_ or
         args[1].bits == 0 or args[1].unbox() == .undefined_)
         return throwTypeErrorIntl(arena, "Intl.DateTimeFormat.prototype.formatRange: both ends are required");
-    const start = try buildDTFParts(arena, this_val, args[0..1]);
-    const end = try buildDTFParts(arena, this_val, args[1..2]);
+    const x = try toDateTimeFormattable(arena, args[0]);
+    const y = try toDateTimeFormattable(arena, args[1]);
+    // SameTemporalType: a range whose ends are different Temporal types (or one
+    // Temporal and one plain number) has no common pattern at all.
+    const kx = temporalKindOf(x);
+    const ky = temporalKindOf(y);
+    if ((kx != null or ky != null) and kx != ky)
+        return throwTypeErrorIntl(arena, "formatRange arguments must be the same Temporal type");
+    const start = try buildDTFParts(arena, this_val, &[_]Value{x});
+    const end = try buildDTFParts(arena, this_val, &[_]Value{y});
     var same = start.items.len == end.items.len;
     if (same) for (start.items, end.items) |a, b| {
         if (!std.mem.eql(u8, a.value, b.value)) {
@@ -976,11 +994,13 @@ fn dtfRangeParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
             break;
         }
     };
+    // Identical ends collapse to one set of "shared" parts; otherwise each side
+    // is attributed to its own end of the range and only the separator is shared.
     if (same) return start;
     var out = std.ArrayListUnmanaged(DTPart){};
-    for (start.items) |p| try out.append(arena, p);
+    for (start.items) |p| try out.append(arena, .{ .type = p.type, .value = p.value, .source = "startRange" });
     try out.append(arena, .{ .type = "literal", .value = " " ++ range_separator ++ " " });
-    for (end.items) |p| try out.append(arena, p);
+    for (end.items) |p| try out.append(arena, .{ .type = p.type, .value = p.value, .source = "endRange" });
     return out;
 }
 
@@ -998,6 +1018,7 @@ pub fn nativeDateTimeFormatFormatRangeToParts(arena: std.mem.Allocator, this_val
         const o = try dnEmptyObj(arena);
         try defineData(o, "type", try val_mod.makeString(arena, p.type));
         try defineData(o, "value", try val_mod.makeString(arena, p.value));
+        try defineData(o, "source", try val_mod.makeString(arena, p.source));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
     return val_mod.makeObject(arena, arr);
@@ -1024,7 +1045,7 @@ pub fn nativeDateTimeFormatFormatToParts(arena: std.mem.Allocator, this_val: Val
 }
 
 /// One segment of a formatted date-time, as produced by `formatToParts`.
-const DTPart = struct { type: []const u8, value: []const u8 };
+const DTPart = struct { type: []const u8, value: []const u8, source: []const u8 = "shared" };
 
 fn fieldStr(arena: std.mem.Allocator, val: i64, style: []const u8) ![]const u8 {
     var tmp = std.ArrayListUnmanaged(u8){};
