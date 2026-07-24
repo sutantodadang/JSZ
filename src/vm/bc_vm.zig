@@ -2806,10 +2806,23 @@ pub const BcVm = struct {
                     const unit = string_proto.cuUnitAt(s, i) orelse return val_mod.makeUndefined(self.arena);
                     return val_mod.makeString(self.arena, try string_proto.cuToString(self.arena, unit));
                 }
-                // Delegate to String.prototype
+                // Delegate to String.prototype (and its own prototype chain up to
+                // Object.prototype). Must honour accessor properties — a getter
+                // defined on String.prototype fires with the primitive string as its
+                // receiver — so walk via findProperty rather than a raw `.get`.
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_string_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    if (proto.findProperty(key)) |loc| {
+                        const a = loc.holder.attrAt(loc.slot);
+                        const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+                        if (a.is_accessor) {
+                            const getter = accessorMember(raw, "get");
+                            if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                            return try self.callAccessor(getter, obj_val, &[_]Value{});
+                        }
+                        if (raw.bits != 0) return raw;
+                        return val_mod.makeUndefined(self.arena);
+                    }
                 }
                 return val_mod.makeUndefined(self.arena);
             },
