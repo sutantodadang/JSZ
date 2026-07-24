@@ -29,11 +29,32 @@ pub const Lexer = struct {
     /// of the Script grammar only. Cleared by `Parser.parseModule`, where the
     /// same character sequences must stay punctuators (and so a SyntaxError).
     allow_html_comments: bool = true,
+    /// One-shot override for `slashIsRegex`. `/` after `}` is lexed as division
+    /// because a `}` far more often closes an object literal used as an operand,
+    /// but the parser knows when it is at statement position (`{}/re/`,
+    /// `class A{}/re/`) and re-lexes the token with this set. Cleared by the
+    /// next `next()` call.
+    force_regex_once: bool = false,
+
+    /// Rewind to `pos` and pull one token, forcing a leading `/` to lex as a
+    /// RegularExpressionLiteral. `line`/`column` are restored by the caller's
+    /// saved token, so only the scan position matters here.
+    pub fn relexAsRegexAt(self: *Lexer, pos: usize, line: u32, column: u32) LexError!Token {
+        self.pos = pos;
+        self.line = line;
+        self.column = column;
+        self.force_regex_once = true;
+        defer self.force_regex_once = false;
+        return self.next();
+    }
 
     pub fn init(source: []const u8, allocator: std.mem.Allocator) Lexer {
         return Lexer{
             .source = source,
-            .pos = 0,
+            // HashbangComment (§12.5): `#!` is a comment only at the very start
+            // of the source text — for a Script, a Module, and eval code alike.
+            // One byte in and it is a SyntaxError, so match position 0 exactly.
+            .pos = hashbangLen(source),
             .line = 1,
             .column = 1,
             .prev_kind = null,
@@ -82,6 +103,20 @@ pub const Lexer = struct {
 
     fn isLineTerminator(c: u8) bool {
         return c == '\n' or c == '\r';
+    }
+
+    /// Byte length of a leading HashbangComment (`#!` through, but not
+    /// including, the first LineTerminator), or 0 when the source has none.
+    /// U+2028/U+2029 end the comment too, so they are matched explicitly.
+    fn hashbangLen(source: []const u8) usize {
+        if (source.len < 2 or source[0] != '#' or source[1] != '!') return 0;
+        var i: usize = 2;
+        while (i < source.len) : (i += 1) {
+            if (isLineTerminator(source[i])) break;
+            if (i + 2 < source.len and source[i] == 0xE2 and source[i + 1] == 0x80 and
+                (source[i + 2] == 0xA8 or source[i + 2] == 0xA9)) break;
+        }
+        return i;
     }
 
     /// Returns true if the next 3 bytes are the UTF-8 encoding of U+2028 or U+2029.
@@ -222,6 +257,7 @@ pub const Lexer = struct {
     /// ES5 spec: regex is allowed when the previous token is one of the listed kinds
     /// or there is no previous token.
     fn slashIsRegex(self: *const Lexer) bool {
+        if (self.force_regex_once) return true;
         const p = self.prev_kind orelse return true;
         return switch (p) {
             .left_paren,
@@ -478,6 +514,15 @@ pub const Lexer = struct {
             self.pos += 1;
             self.column += 1;
             if (self.pos >= self.source.len) return LexError.UnterminatedString;
+            // LineContinuation :: \ LineTerminatorSequence, where the sequence
+            // may be U+2028/U+2029. Those are three UTF-8 bytes, so the u8
+            // switch below cannot match them; drop the whole sequence here.
+            if (self.isUnicodeLineTerm()) {
+                self.pos += 3;
+                self.line += 1;
+                self.column = 1;
+                continue;
+            }
             const esc = self.source[self.pos];
             self.pos += 1;
             self.column += 1;
@@ -598,6 +643,15 @@ pub const Lexer = struct {
             self.pos += 1;
             self.column += 1;
             if (self.pos >= self.source.len) return LexError.UnterminatedString;
+            // LineContinuation :: \ LineTerminatorSequence, where the sequence
+            // may be U+2028/U+2029. Those are three UTF-8 bytes, so the u8
+            // switch below cannot match them; drop the whole sequence here.
+            if (self.isUnicodeLineTerm()) {
+                self.pos += 3;
+                self.line += 1;
+                self.column = 1;
+                continue;
+            }
             const esc = self.source[self.pos];
             self.pos += 1;
             self.column += 1;
@@ -620,7 +674,9 @@ pub const Lexer = struct {
         var in_class = false;
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
-            if (isLineTerminator(c)) return LexError.UnterminatedString;
+            // A RegularExpressionLiteral may not span a LineTerminator — U+2028
+            // and U+2029 included (§12.9.5), which the u8 test above misses.
+            if (isLineTerminator(c) or self.isUnicodeLineTerm()) return LexError.UnterminatedString;
             if (c == '[') {
                 in_class = true;
                 self.pos += 1;
@@ -637,6 +693,8 @@ pub const Lexer = struct {
                 self.pos += 1;
                 self.column += 1;
                 if (self.pos < self.source.len and !isLineTerminator(self.source[self.pos])) {
+                    // `\` + U+2028/U+2029 is not a valid RegularExpressionBackslashSequence.
+                    if (self.isUnicodeLineTerm()) return LexError.UnterminatedString;
                     self.pos += 1;
                     self.column += 1;
                 }

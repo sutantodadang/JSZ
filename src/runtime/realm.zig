@@ -2876,6 +2876,72 @@ fn isObjectLike(v: Value) bool {
     };
 }
 
+/// `__privInstallAcc__(target, key, getter, setter)` — PrivateMethodOrAccessorAdd
+/// for a private accessor. Unlike a private method (which DEFINE_PRIVATE
+/// installs), a `get #x`/`set #x` pair is a SINGLE private element carrying both
+/// halves, so the desugar emits one call per private name. Installing twice on
+/// the same object is a TypeError, which is observable when a base constructor
+/// returns an object that already went through this class's initialization.
+pub fn nativePrivInstallAcc(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const target = if (args.len > 0) args[0] else Value{};
+    const obj = (try @import("builtins/reflect.zig").reflectTargetObjPub(arena, target)) orelse
+        return throwTypeError(arena, "Cannot install a private accessor on a non-object");
+    const key_v = if (args.len > 1) args[1] else Value{};
+    if (key_v.bits == 0 or key_v.unbox() != .string)
+        return throwTypeError(arena, "private accessor key must be a string");
+    const key = key_v.toPtr().string;
+    if (obj.resolveOwnSlot(key) != null) {
+        const class_mod = @import("../parser/class.zig");
+        const msg = try std.fmt.allocPrint(arena, "Cannot install private member {s} twice on the same object", .{class_mod.privateDisplayName(key)});
+        return throwTypeError(arena, msg);
+    }
+    // The accessor holder is the same `{ get, set }` shape the ordinary accessor
+    // path stores, so privateGet/privateSet read it unchanged.
+    const holder = if (active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    if (args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_)
+        try holder.set("get", args[2]);
+    if (args.len > 3 and args[3].bits != 0 and args[3].unbox() != .undefined_)
+        try holder.set("set", args[3]);
+    _ = try obj.defineOwnAccessor(key, try val_mod.makeObject(arena, holder), .{
+        .writable = false,
+        .enumerable = false,
+        .configurable = false,
+        .is_private = true,
+    });
+    obj.markPrivate(key);
+    return Value{};
+}
+
+/// `__superSet__(base, key, value, receiver, strict)` — PutValue on a Super
+/// Reference. `Reflect.set` alone is not enough on two counts: an assignment
+/// evaluates to the assigned *value*, not to the set's boolean result, and in
+/// strict code a failed [[Set]] is a TypeError rather than a silent no-op
+/// (§6.2.5.6 PutValue step 6.d).
+pub fn nativeSuperSet(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const value = if (args.len > 2) args[2] else Value{};
+    const ok = try @import("builtins/reflect.zig").nativeReflectSet(arena, .{}, args[0..@min(args.len, 4)]);
+    const strict = args.len > 4 and val_mod.toBoolean(args[4]);
+    if (strict and !val_mod.toBoolean(ok))
+        return throwTypeError(arena, "Cannot assign to read only property of super");
+    return value;
+}
+
+/// `__checkHeritage__(value)` — ClassDefinitionEvaluation step 8.d: a non-null
+/// ClassHeritage value must be a constructor. The check happens *before* the
+/// `superclass.prototype` read, so `class C extends (() => {})` throws a
+/// TypeError without ever invoking a `prototype` getter on the heritage value.
+/// Returns the value unchanged so the desugar can use it as an expression.
+pub fn nativeCheckHeritage(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const v = if (args.len > 0) args[0] else Value{};
+    if (v.bits != 0 and v.unbox() == .null_) return v;
+    if (!@import("builtins/reflect.zig").isConstructorVal(v))
+        return throwTypeError(arena, "Class extends value is not a constructor or null");
+    return v;
+}
+
 /// `__derivedReturn__(value, instance)` — the return-override rule a *derived*
 /// constructor applies to an explicit `return` (§10.2.2 [[Construct]] step 13).
 /// An Object result replaces the instance; `undefined` keeps it; anything else

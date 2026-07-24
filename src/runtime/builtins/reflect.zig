@@ -50,6 +50,10 @@ fn isObj(v: Value) bool {
 
 /// The *JsObject a Reflect target denotes, including a function's lazily
 /// materialized backing object (a callable IS an object). Null for primitives.
+pub fn reflectTargetObjPub(arena: std.mem.Allocator, v: Value) anyerror!?*JsObject {
+    return reflectTargetObj(arena, v);
+}
+
 fn reflectTargetObj(arena: std.mem.Allocator, v: Value) anyerror!?*JsObject {
     if (v.bits == 0) return null;
     return switch (v.unbox()) {
@@ -105,8 +109,7 @@ fn createListFromArrayLike(arena: std.mem.Allocator, obj: Value) anyerror![]Valu
 /// the Receiver, or fail if it is a non-object / non-writable / accessor / a new
 /// property on a non-extensible Receiver.
 fn ordinarySetSymToReceiver(arena: std.mem.Allocator, receiver: Value, key: Value, value: Value) anyerror!Value {
-    if (!isObj(receiver)) return val_mod.makeBool(arena, false);
-    const robj = receiver.toPtr().object;
+    const robj = (try reflectTargetObj(arena, receiver)) orelse return val_mod.makeBool(arena, false);
     if (robj.getOwnSymEntry(key)) |sp| {
         if (sp.attr.is_accessor) return val_mod.makeBool(arena, false);
         if (!sp.attr.writable) return val_mod.makeBool(arena, false);
@@ -291,13 +294,14 @@ pub fn nativeReflectGet(arena: std.mem.Allocator, _: Value, args: []const Value)
 
 pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
-    if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
     const target = args[0];
     const key = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
     const value = if (args.len > 2) args[2] else Value{};
     const set_recv = if (args.len > 3) args[3] else target;
 
-    const target_obj = target.toPtr().object;
+    // A callable target resolves to its backing object (`super.x = v` in a static
+    // member has the superclass *constructor* as its property base).
+    const target_obj = (try reflectTargetObj(arena, target)) orelse return val_mod.makeBool(arena, false);
 
     // Proxy [[Set]](P, V, Receiver): dispatch the `set` trap, else forward to the
     // proxy target's [[Set]] preserving Receiver (defaults to the proxy itself).
@@ -416,9 +420,10 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
     // descriptor. A Module Namespace receiver runs its exotic [[GetOwnProperty]],
     // which throws ReferenceError for an uninitialized (TDZ) export.
     if (receiver.bits != target.bits) {
-        // CreateDataProperty(Receiver, …) requires an Object Receiver.
-        if (!isObj(receiver)) return val_mod.makeBool(arena, false);
-        const robj = receiver.toPtr().object;
+        // CreateDataProperty(Receiver, …) requires an Object Receiver — which a
+        // callable is, via its backing object (`super.x = v` inside a static
+        // member has the class constructor as Receiver).
+        const robj = (try reflectTargetObj(arena, receiver)) orelse return val_mod.makeBool(arena, false);
         // A TypedArray receiver routes a canonical numeric index through its
         // exotic [[Set]] (TypedArraySetElement): ToNumber/ToBigInt(V) runs its
         // valueOf side effects BEFORE the bounds check, and an out-of-bounds

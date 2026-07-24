@@ -474,7 +474,13 @@ pub fn main() !void {
 /// completion value is the entry module's exports.
 fn buildWrappedScript(gpa: std.mem.Allocator, script_path: []const u8, entry_src: []const u8) ![]const u8 {
     const base_dir = std.fs.path.dirname(script_path) orelse ".";
-    const wrapped_src = try std.fmt.allocPrint(gpa, "{s}\nmodule.exports;", .{entry_src});
+    // A HashbangComment is only a comment at offset 0, and the entry source is
+    // about to be embedded in a CJS wrapper — so drop the `#!` line here (the
+    // lexer's own handling never sees it at position 0). Replaced by a line
+    // comment rather than deleted, to keep line numbers aligned.
+    const src = if (std.mem.startsWith(u8, entry_src, "#!")) entry_src[2..] else entry_src;
+    const lead = if (std.mem.startsWith(u8, entry_src, "#!")) "//" else "";
+    const wrapped_src = try std.fmt.allocPrint(gpa, "{s}{s}\nmodule.exports;", .{ lead, src });
     defer gpa.free(wrapped_src);
     const entry_id = std.fs.path.basename(script_path);
     const __b = try jsz.module_loader.buildBundle(gpa, base_dir, entry_id, wrapped_src);

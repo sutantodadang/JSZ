@@ -188,7 +188,10 @@ pub fn lookupKeyword(s: []const u8) ?TokenKind {
         .{ "import", .kw_import },
         .{ "super", .kw_super },
         .{ "yield", .kw_yield },
-        .{ "let", .kw_let },
+        // `let` is NOT listed: it is a *contextual* keyword. Sloppy code may use
+        // it as an identifier (`for (let in obj)`), so the parser decides from
+        // the following token whether it starts a LexicalDeclaration, and
+        // `checkStrictBindingName` rejects it as a binding name in strict code.
         .{ "of", .kw_of },
         .{ "true", .kw_true },
         .{ "false", .kw_false },

@@ -17,6 +17,11 @@ pub const BcFunction = struct {
     /// normal mutable binding, so `function f(){ f = 2 }` reassigns the outer
     /// binding rather than shadowing it.
     nfe_name: ?[]const u8 = null,
+    /// PrivateEnvironment in scope for this function's body (innermost class
+    /// first), stamped on by the class desugar. A direct `eval` in this function
+    /// resolves `#x` through it; empty means no private name is in scope, so any
+    /// `#x` in eval code is an early SyntaxError. See ast.PrivName.
+    priv_names: []const @import("../parser/ast.zig").PrivName = &.{},
     /// Number of declared formal parameters (excluding a rest parameter). Used
     /// for call setup and the JIT's local-slot layout, NOT for `.length`.
     arity: u16,

@@ -314,6 +314,13 @@ pub const Parser = struct {
     /// chain. Only then is SuperProperty (`super.x`) legal inside the eval'd
     /// code; SuperCall never is, and an indirect eval permits neither.
     eval_allow_super_prop: bool = false,
+    /// Bumped every time a SuperProperty (`super.x`, `super[x]`, `super.m()`) is
+    /// desugared to its `__sproto__`/`__superthis` form. The class emitter
+    /// snapshots it around each member so it can bind those two names only in the
+    /// bodies that actually read them — a base class has a home object too, so
+    /// `super.x` is legal there, but paying for the binding in every method would
+    /// cost an `Object.getPrototypeOf` per call.
+    super_prop_count: u32 = 0,
     /// Set with `eval_code` for a direct eval whose calling context is a function
     /// invocation, which is the only place `new.target` is legal (§13.3.12.1: it
     /// is a SyntaxError unless the code is contained in function code). The VM
@@ -389,6 +396,18 @@ pub const Parser = struct {
         self.prev_end = prev.end;
         self.current = self.lexNext();
         return prev;
+    }
+
+    /// Re-lex `current` as a RegularExpressionLiteral. The lexer decides
+    /// regex-vs-division from the previous token alone, and treats `/` after `}`
+    /// as division — right for `{valueOf(){}} / 1`, wrong for a *statement*
+    /// `{}/re/` or `class A{}/re/`. Only the parser knows which position it is
+    /// in, so it calls this when a statement turns out to begin with `/`.
+    pub fn relexCurrentAsRegex(self: *Parser) void {
+        if (self.current.kind != .slash and self.current.kind != .slash_eq) return;
+        const t = self.current;
+        self.current = self.lexer.relexAsRegexAt(t.start, t.line, t.column) catch return;
+        self.current.line_terminator_before = t.line_terminator_before;
     }
 
     pub fn check(self: *const Parser, kind: TokenKind) bool {
@@ -635,6 +654,11 @@ pub const Parser = struct {
             stmts = final_stmts;
         }
         self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
+        // Explicit resource management is handled by an AST desugar, not by
+        // opcodes; the top level of a Script/Module is a `using` scope too, and
+        // without this a top-level `await using` reached the (dead) USING_*
+        // opcode path in the VM. No-op when the source declares no resources.
+        stmts.items = stmt_mod.desugarUsingScope(self, stmts.items, 0);
         if (self.had_error) {
             return ParseResult{ .err = self.error_info orelse ParseError{
                 .message = "parse error",
@@ -707,6 +731,11 @@ pub const Parser = struct {
             stmts = final_stmts;
         }
         self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
+        // Explicit resource management is handled by an AST desugar, not by
+        // opcodes; the top level of a Script/Module is a `using` scope too, and
+        // without this a top-level `await using` reached the (dead) USING_*
+        // opcode path in the VM. No-op when the source declares no resources.
+        stmts.items = stmt_mod.desugarUsingScope(self, stmts.items, 0);
         if (self.had_error) {
             return ParseResult{ .err = self.error_info orelse ParseError{
                 .message = "parse error",
@@ -1663,6 +1692,11 @@ pub const Parser = struct {
             self.drainExtraStmts(&stmts);
         }
         self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
+        // Explicit resource management is handled by an AST desugar, not by
+        // opcodes; the top level of a Script/Module is a `using` scope too, and
+        // without this a top-level `await using` reached the (dead) USING_*
+        // opcode path in the VM. No-op when the source declares no resources.
+        stmts.items = stmt_mod.desugarUsingScope(self, stmts.items, 0);
         const is_strict = hasUseStrict(stmts.items);
         return .{ .stmts = stmts.items, .is_strict = is_strict };
     }

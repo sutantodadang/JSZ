@@ -353,6 +353,11 @@ const ClassMember = struct {
     /// (default) means "no real span" → toString falls back to native format.
     src_start: u32 = 0,
     src_end: u32 = 0,
+    /// This member's body contains a SuperProperty. A base class has a home
+    /// object too, so `super.x` is legal in it, but binding `__sproto__` in
+    /// every method would cost an `Object.getPrototypeOf` per call — emit it
+    /// only where it is read. See Parser.super_prop_count.
+    uses_super_prop: bool = false,
 };
 
 /// A parsed class field (`name = init;`, `#name = init;`, `[expr] = init;`,
@@ -372,6 +377,8 @@ const ClassField = struct {
     /// statements instead of a key/initializer; kept in the same list as static
     /// fields because the two run interleaved, in source order.
     static_block: ?[]*Node = null,
+    /// See ClassMember.uses_super_prop.
+    uses_super_prop: bool = false,
 };
 
 const ClassBodyParse = struct {
@@ -384,6 +391,10 @@ const ClassBodyParse = struct {
     has_ctor: bool = false,
     members: []ClassMember = &[_]ClassMember{},
     fields: []ClassField = &[_]ClassField{},
+    /// This class body's PrivateEnvironment, filled in by `manglePrivateNames`.
+    /// The desugared statements get it stamped onto every function they contain
+    /// (`attachPrivScope`) so a direct `eval` inside a method can resolve `#x`.
+    priv_names: []const ast.PrivName = &.{},
 };
 
 /// True when the token after `current` means `current` (a contextual keyword like
@@ -414,6 +425,9 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         if (p.match(.semicolon)) continue;
 
+        // Snapshot: any SuperProperty desugared while parsing this member's
+        // initializer/body belongs to it, so `__sproto__` gets bound there.
+        const super_mark = p.super_prop_count;
         var is_static = false;
         if (p.check(.identifier) and std.mem.eql(u8, p.current.value_str, "static") and !nextTokenEndsName(p)) {
             is_static = true;
@@ -451,7 +465,11 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
         if (p.match(.star)) is_generator = true;
 
         var accessor: AccessorKind = .none;
-        if (p.check(.identifier) and !nextTokenEndsName(p)) {
+        // `get`/`set` is a modifier only when a ClassElementName follows. A `*`
+        // does not start one, so `get \n *a() {}` is a field named "get"
+        // (terminated by ASI) followed by a generator method — not a malformed
+        // accessor.
+        if (p.check(.identifier) and !nextTokenEndsName(p) and p.peekNext().kind != .star) {
             if (std.mem.eql(u8, p.current.value_str, "get")) {
                 accessor = .get;
                 _ = p.advance();
@@ -503,6 +521,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
                 .name = name,
                 .computed_key = computed_key,
                 .init = init_expr,
+                .uses_super_prop = p.super_prop_count != super_mark,
             }) catch return null;
             continue;
         }
@@ -539,6 +558,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
                 .body = mbody,
                 .src_start = member_start,
                 .src_end = member_end,
+                .uses_super_prop = p.super_prop_count != super_mark,
             }) catch return null;
         }
     }
@@ -588,12 +608,24 @@ fn markPrivateDefine(n: *Node, is_method: bool) *Node {
 /// therefore already mangled) before the enclosing body's pass runs, so its own
 /// `#x` reads no longer match and shadowing resolves innermost-first.
 const PrivateRewriter = struct {
-    raw: [][]const u8,
-    mangled: [][]const u8,
+    pairs: []const ast.PrivName,
+    /// Direct-eval mode: records the first `#x` that no enclosing class declares,
+    /// so the caller can raise the early SyntaxError the spec requires
+    /// (PrivateNameResolution has no binding for it). Null in the ordinary
+    /// class-body pass, where an unmatched `#x` belongs to an enclosing class
+    /// whose own pass has not run yet.
+    unresolved: ?*?[]const u8 = null,
 
     fn map(self: PrivateRewriter, name: []const u8) []const u8 {
-        for (self.raw, self.mangled) |r, m| {
-            if (std.mem.eql(u8, r, name)) return m;
+        for (self.pairs) |e| {
+            if (std.mem.eql(u8, e.raw, name)) return e.mangled;
+        }
+        if (self.unresolved) |slot| {
+            // Already-mangled names come from a class defined *inside* the eval
+            // and are resolved; only a still-raw `#x` is unbound.
+            if (slot.* == null and isPrivateName(name) and
+                std.mem.indexOfScalar(u8, name, mangled_priv_sep) == null)
+                slot.* = name;
         }
         return name;
     }
@@ -714,6 +746,151 @@ const PrivateRewriter = struct {
     }
 };
 
+/// Resolve the private names a direct `eval`'s code refers to against the
+/// PrivateEnvironment its calling context carries (`BcFunction.priv_names`).
+///
+/// The eval parser has no lexical view of the enclosing class body, so `#x`
+/// survives parsing as a raw identifier; this rewrites it to the same mangled
+/// key the class body's own code uses, and stamps the environment onto every
+/// function in the eval'd source so a *nested* eval resolves it too.
+///
+/// Returns the first `#x` no enclosing class declares — the caller turns that
+/// into the early SyntaxError §13.2.5.1 requires — or null when all resolved.
+pub fn resolveEvalPrivateNames(
+    arena: std.mem.Allocator,
+    stmts: []const *Node,
+    pairs: []const ast.PrivName,
+) ?[]const u8 {
+    var unresolved: ?[]const u8 = null;
+    const rw = PrivateRewriter{ .pairs = pairs, .unresolved = &unresolved };
+    for (stmts) |s| rw.walk(s);
+    if (unresolved != null) return unresolved;
+    attachPrivScope(arena, stmts, pairs);
+    return null;
+}
+
+/// Stamp `pairs` onto every function nested in the desugared class statements,
+/// so a direct `eval` running inside one of them can resolve the class's private
+/// names (the eval parser has no lexical view of the class body). Appending —
+/// rather than prepending — keeps innermost-first order: a nested class is fully
+/// desugared before the enclosing body's pass runs, so its own pairs are already
+/// at the front and win the first-match lookup.
+pub fn attachPrivScope(p: std.mem.Allocator, nodes: []const *Node, pairs: []const ast.PrivName) void {
+    if (pairs.len == 0) return;
+    for (nodes) |n| attachPrivScopeNode(p, n, pairs);
+}
+
+fn attachPrivScopeOpt(p: std.mem.Allocator, node: ?*Node, pairs: []const ast.PrivName) void {
+    if (node) |n| attachPrivScopeNode(p, n, pairs);
+}
+
+fn extendPrivNames(p: std.mem.Allocator, existing: []const ast.PrivName, pairs: []const ast.PrivName) []const ast.PrivName {
+    const out = p.alloc(ast.PrivName, existing.len + pairs.len) catch return existing;
+    @memcpy(out[0..existing.len], existing);
+    @memcpy(out[existing.len..], pairs);
+    return out;
+}
+
+fn attachPrivScopeNode(p: std.mem.Allocator, node: *Node, pairs: []const ast.PrivName) void {
+    switch (node.data) {
+        .function_expr => |f| {
+            node.data.function_expr.priv_names = extendPrivNames(p, f.priv_names, pairs);
+            for (f.param_defaults) |d| attachPrivScopeOpt(p, d, pairs);
+            attachPrivScope(p, f.body, pairs);
+        },
+        .function_decl => |f| {
+            node.data.function_decl.priv_names = extendPrivNames(p, f.priv_names, pairs);
+            for (f.param_defaults) |d| attachPrivScopeOpt(p, d, pairs);
+            attachPrivScope(p, f.body, pairs);
+        },
+        .unary_expr => |u| attachPrivScopeNode(p, u.operand, pairs),
+        .binary_expr => |b| {
+            attachPrivScopeNode(p, b.left, pairs);
+            attachPrivScopeNode(p, b.right, pairs);
+        },
+        .logical_expr => |b| {
+            attachPrivScopeNode(p, b.left, pairs);
+            attachPrivScopeNode(p, b.right, pairs);
+        },
+        .assignment_expr => |a| {
+            attachPrivScopeNode(p, a.target, pairs);
+            attachPrivScopeNode(p, a.value, pairs);
+        },
+        .update_expr => |u| attachPrivScopeNode(p, u.operand, pairs),
+        .conditional_expr => |c| {
+            attachPrivScopeNode(p, c.test_, pairs);
+            attachPrivScopeNode(p, c.consequent, pairs);
+            attachPrivScopeNode(p, c.alternate, pairs);
+        },
+        .sequence_expr => |s| attachPrivScope(p, s.exprs, pairs),
+        .spread_expr => |e| attachPrivScopeNode(p, e, pairs),
+        .yield_expr => |e| attachPrivScopeOpt(p, e, pairs),
+        .call_expr => |c| {
+            attachPrivScopeNode(p, c.callee, pairs);
+            attachPrivScope(p, c.args, pairs);
+        },
+        .new_expr => |n| {
+            attachPrivScopeNode(p, n.callee, pairs);
+            attachPrivScope(p, n.args, pairs);
+        },
+        .member_expr => |m| attachPrivScopeNode(p, m.object, pairs),
+        .optional_chain => |e| attachPrivScopeNode(p, e, pairs),
+        .object_literal => |o| for (o.properties) |pr| {
+            attachPrivScopeNode(p, pr.value, pairs);
+            attachPrivScopeOpt(p, pr.computed_key, pairs);
+        },
+        .array_literal => |a| attachPrivScope(p, a.elements, pairs),
+        .program => |pr| attachPrivScope(p, pr.body, pairs),
+        .expr_stmt => |e| attachPrivScopeNode(p, e, pairs),
+        .block_stmt => |b| attachPrivScope(p, b.body, pairs),
+        .var_decl => |v| attachPrivScopeOpt(p, v.init, pairs),
+        .if_stmt => |i| {
+            attachPrivScopeNode(p, i.test_, pairs);
+            attachPrivScopeNode(p, i.consequent, pairs);
+            attachPrivScopeOpt(p, i.alternate, pairs);
+        },
+        .while_stmt => |w| {
+            attachPrivScopeNode(p, w.test_, pairs);
+            attachPrivScopeNode(p, w.body, pairs);
+        },
+        .do_while_stmt => |w| {
+            attachPrivScopeNode(p, w.body, pairs);
+            attachPrivScopeNode(p, w.test_, pairs);
+        },
+        .with_stmt => |w| {
+            attachPrivScopeNode(p, w.object, pairs);
+            attachPrivScopeNode(p, w.body, pairs);
+        },
+        .for_stmt => |f| {
+            attachPrivScopeOpt(p, f.init, pairs);
+            attachPrivScopeOpt(p, f.test_, pairs);
+            attachPrivScopeOpt(p, f.update, pairs);
+            attachPrivScopeNode(p, f.body, pairs);
+        },
+        .return_stmt => |e| attachPrivScopeOpt(p, e, pairs),
+        .throw_stmt => |e| attachPrivScopeNode(p, e, pairs),
+        .try_stmt => |t| {
+            attachPrivScopeNode(p, t.block, pairs);
+            if (t.handler) |h| attachPrivScopeNode(p, h.body, pairs);
+            attachPrivScopeOpt(p, t.finalizer, pairs);
+        },
+        .for_in_stmt => |f| {
+            attachPrivScopeNode(p, f.left, pairs);
+            attachPrivScopeNode(p, f.right, pairs);
+            attachPrivScopeNode(p, f.body, pairs);
+        },
+        .switch_stmt => |s| {
+            attachPrivScopeNode(p, s.discriminant, pairs);
+            for (s.cases) |c| {
+                attachPrivScopeOpt(p, c.test_, pairs);
+                attachPrivScope(p, c.body, pairs);
+            }
+        },
+        .labeled_stmt => |l| attachPrivScopeNode(p, l.body, pairs),
+        else => {},
+    }
+}
+
 /// Give this class body's private elements a PrivateEnvironment-unique key, so
 /// `o.#x` only resolves on instances branded by *this* class (spec
 /// PrivateEnvironment / PrivateNameResolution). Without it two classes that both
@@ -750,7 +927,12 @@ fn manglePrivateNames(p: *Parser, parsed: *ClassBodyParse) bool {
         const m = std.fmt.allocPrint(p.arena, "{s}{c}{d}", .{ r, mangled_priv_sep, id }) catch return false;
         mangled.append(p.arena, m) catch return false;
     }
-    const rw = PrivateRewriter{ .raw = raw.items, .mangled = mangled.items };
+    var pairs = std.ArrayList(ast.PrivName){};
+    for (raw.items, mangled.items) |r, m| {
+        pairs.append(p.arena, .{ .raw = r, .mangled = m }) catch return false;
+    }
+    parsed.priv_names = pairs.items;
+    const rw = PrivateRewriter{ .pairs = pairs.items };
 
     for (parsed.fields) |*f| {
         if (f.computed_key == null) f.name = rw.map(f.name);
@@ -794,7 +976,9 @@ fn namedFieldInitOf(p: *Parser, f: ClassField, val: *Node, check: *Node) ?*Node 
     if (f.computed_key != null or !isAnonFnDef(check)) return val;
     const s = p.current.start;
     const callee = nodeIdent(p, "__nameFn__") orelse return null;
-    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = f.name }) orelse return null;
+    // A private field names its function after the *source* spelling ("#x"), not
+    // the PrivateEnvironment-mangled key the property table uses.
+    const key = p.makeNode(.string_literal, s, s, .{ .string_literal = privateDisplayName(f.name) }) orelse return null;
     var args = std.ArrayList(*Node){};
     args.append(p.arena, val) catch return null;
     args.append(p.arena, key) catch return null;
@@ -878,7 +1062,15 @@ fn makeDerivedInstanceFieldInit(p: *Parser, f: ClassField) ?*Node {
 
 /// Append derived-class instance-field initializers (skipping static fields) to
 /// `list`. Returns false on allocation failure.
-fn appendDerivedInstanceFields(p: *Parser, list: *std.ArrayList(*Node), fields: []const ClassField) bool {
+fn appendDerivedInstanceFields(
+    p: *Parser,
+    list: *std.ArrayList(*Node),
+    fields: []const ClassField,
+    priv_plan: []const PrivInstance,
+) bool {
+    // InitializeInstanceElements adds the private methods/accessors BEFORE
+    // running any field initializer, so a field's initializer may call `this.#m`.
+    if (!appendPrivInstanceInstalls(p, list, priv_plan, "__superthis")) return false;
     for (fields) |f| {
         if (f.is_static) continue;
         const st = makeDerivedInstanceFieldInit(p, f) orelse return false;
@@ -895,7 +1087,7 @@ fn appendDerivedInstanceFields(p: *Parser, list: *std.ArrayList(*Node), fields: 
 /// initializer is therefore wrapped in `(function(){ return <init>; }).call(C)`
 /// rather than assigned directly. A bare `static f = 1` (no `this`) gets the
 /// same wrapper; the result is identical.
-fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node {
+fn makeStaticFieldInit(p: *Parser, class_name: []const u8, super_name: ?[]const u8, f: ClassField) ?*Node {
     const s = p.current.start;
     // ES2022 static initialization block: same `this`-is-the-class wrapper as a
     // static field, but the block's whole statement list is the body and there
@@ -919,8 +1111,21 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
 
     // Wrap: (function () { return <init>; }).call(ClassName)
     const ret_stmt = p.makeNode(.return_stmt, s, s, .{ .return_stmt = raw_init }) orelse return null;
-    const body = p.arena.alloc(*Node, 1) catch return null;
-    body[0] = ret_stmt;
+    const body = blk_body: {
+        if (!f.uses_super_prop) {
+            const b = p.arena.alloc(*Node, 1) catch return null;
+            b[0] = ret_stmt;
+            break :blk_body b;
+        }
+        // The initializer's home object is the constructor, so `super.x` reads
+        // through its [[Prototype]] — the superclass for a derived class, and
+        // %Function.prototype% (via getPrototypeOf) for a base one.
+        const b = p.arena.alloc(*Node, 3) catch return null;
+        b[0] = superProtoDecl(p, class_name, super_name, true) orelse return null;
+        b[1] = superThisDecl(p) orelse return null;
+        b[2] = ret_stmt;
+        break :blk_body b;
+    };
     const init_fn = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
         .name = null,
         .params = &[_][]const u8{},
@@ -964,13 +1169,31 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
 /// Prepend instance-field initializers to a base-class constructor body. Returns
 /// the new body. Only used for base classes (no `extends`); for derived classes
 /// `this` is not available until after `super()` so field init is skipped.
-fn prependInstanceFields(p: *Parser, ctor_body: []*Node, fields: []const ClassField) ?[]*Node {
+fn prependInstanceFields(
+    p: *Parser,
+    class_name: []const u8,
+    ctor_body: []*Node,
+    fields: []const ClassField,
+    priv_plan: []const PrivInstance,
+) ?[]*Node {
     var any = false;
+    var any_super = false;
     for (fields) |f| {
-        if (!f.is_static) any = true;
+        if (f.is_static) continue;
+        any = true;
+        if (f.uses_super_prop) any_super = true;
     }
-    if (!any) return ctor_body;
+    if (!any and priv_plan.len == 0) return ctor_body;
     var stmts = std.ArrayList(*Node){};
+    // Private methods/accessors are added before any field initializer runs.
+    if (!appendPrivInstanceInstalls(p, &stmts, priv_plan, null)) return null;
+    // An instance field of a base class has `C.prototype` as its home object, so
+    // `super.x` in an initializer reads through that object's [[Prototype]].
+    // Bound once at the head of the constructor, ahead of every field install.
+    if (any_super) {
+        stmts.append(p.arena, superProtoDecl(p, class_name, null, false) orelse return null) catch return null;
+        stmts.append(p.arena, superThisDecl(p) orelse return null) catch return null;
+    }
     for (fields) |f| {
         if (f.is_static) continue;
         const st = makeInstanceFieldInit(p, f) orelse return null;
@@ -1036,11 +1259,47 @@ fn makeCtorBackLink(p: *Parser, class_name: []const u8) ?*Node {
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
 }
 
+/// `var __sproto__ = <property base for super.x>` — the superclass prototype (or
+/// the superclass itself, for a static element) when there is a heritage clause,
+/// otherwise the home object's own [[Prototype]]. See `homeObjectNode`.
+fn superProtoDecl(p: *Parser, class_name: []const u8, super_name: ?[]const u8, is_static: bool) ?*Node {
+    const s = p.current.start;
+    const base: *Node = if (super_name) |sname| blk: {
+        const sup = nodeIdent(p, sname) orelse return null;
+        const raw = if (is_static) sup else (nodeMember(p, sup, "prototype") orelse return null);
+        const sup_null = p.makeNode(.null_literal, s, s, .{ .null_literal = {} }) orelse return null;
+        break :blk nullHeritageGuard(p, sname, raw, sup_null, s) orelse return null;
+    } else homeObjectNode(p, class_name, is_static) orelse return null;
+    return p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__sproto__", .init = base } });
+}
+
+/// `var __superthis = this` — the Receiver a `super.x` read/write uses.
+fn superThisDecl(p: *Parser) ?*Node {
+    const s = p.current.start;
+    const this_node = p.makeNode(.this_expr, s, s, .{ .this_expr = {} }) orelse return null;
+    return p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__superthis", .init = this_node } });
+}
+
+/// `Object.getPrototypeOf(<Cls>.prototype)` — or `Object.getPrototypeOf(<Cls>)`
+/// for a static element. This is the property base `super.x` reads in a BASE
+/// class: its home object is the class prototype (resp. the constructor), and
+/// SuperProperty resolves against that object's [[Prototype]].
+fn homeObjectNode(p: *Parser, class_name: []const u8, is_static: bool) ?*Node {
+    const s = p.current.start;
+    const cls = nodeIdent(p, class_name) orelse return null;
+    const home = if (is_static) cls else (nodeMember(p, cls, "prototype") orelse return null);
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    const callee = nodeMember(p, id_obj, "getPrototypeOf") orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, home) catch return null;
+    return p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+}
+
 /// Desugar one class member into a single statement (a property assignment for
 /// methods, or `Object.defineProperty(target, key, { get|set, configurable,
 /// enumerable })` for accessors). `target` is the constructor for static members
 /// and `ClassName.prototype` otherwise.
-fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, m: ClassMember) ?*Node {
+fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, m: ClassMember, hidden: ?[]const u8) ?*Node {
     const s = p.current.start;
 
     // Instance methods of a derived class may use `super.foo()`; bind
@@ -1077,6 +1336,20 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         const sthis_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__superthis", .init = this_node } }) orelse return null;
         var wb = std.ArrayList(*Node){};
         wb.append(p.arena, sup_decl) catch return null;
+        wb.append(p.arena, sproto_decl) catch return null;
+        wb.append(p.arena, sthis_decl) catch return null;
+        for (m.body) |st| wb.append(p.arena, st) catch return null;
+        body = wb.items;
+    } else if (m.uses_super_prop) {
+        // A BASE class has a home object too (`C.prototype`, or `C` for a static
+        // member), so `super.x` is legal in its methods — it just reads through
+        // the home object's own [[Prototype]] rather than a named superclass.
+        // Only emitted where the body actually mentions `super`.
+        const home = homeObjectNode(p, class_name, m.is_static) orelse return null;
+        const sproto_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__sproto__", .init = home } }) orelse return null;
+        const this_node = p.makeNode(.this_expr, s, s, .{ .this_expr = {} }) orelse return null;
+        const sthis_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__superthis", .init = this_node } }) orelse return null;
+        var wb = std.ArrayList(*Node){};
         wb.append(p.arena, sproto_decl) catch return null;
         wb.append(p.arena, sthis_decl) catch return null;
         for (m.body) |st| wb.append(p.arena, st) catch return null;
@@ -1124,6 +1397,13 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         // check. Private names (`#x`) keep the member-assignment form
         // (PrivateMethodAdd — not a real enumerable-checkable property).
         if (m.computed_key == null and m.name.len > 0 and m.name[0] == '#') {
+            // A private *instance* method is created once here but installed on
+            // each instance by the constructor (see PrivInstance), so bind the
+            // function rather than adding it to the prototype. Static private
+            // methods still live on the constructor object.
+            if (hidden) |hv| {
+                return p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = hv, .init = fn_expr } });
+            }
             const lhs = markPrivateDefine(nodeMember(p, target, m.name) orelse return null, true);
             const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = fn_expr } }) orelse return null;
             return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
@@ -1144,6 +1424,12 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         args.append(p.arena, desc) catch return null;
         const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return null;
         return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
+    }
+
+    // A private instance accessor half is bound here and merged into a single
+    // private element per instance by `__privInstallAcc__`.
+    if (hidden) |hv| {
+        return p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = hv, .init = fn_expr } });
     }
 
     // Accessor: Object.defineProperty(target, key, { get|set: fn, configurable: true, enumerable: false })
@@ -1190,6 +1476,7 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
         .class_name = class_name,
         .ctor_fn_name = class_name,
     }, heritage, parsed, start) orelse return null;
+    attachPrivScope(p.arena, out.items, parsed.priv_names);
 
     if (out.items.len == 1) return out.items[0];
     // Transparent container: the `let <ClassName>` binding (and helpers) belong
@@ -1226,7 +1513,20 @@ const Heritage = struct {
 
 fn parseHeritage(p: *Parser) ?Heritage {
     if (!p.match(.kw_extends)) return Heritage{};
-    const h = p.parseCallMemberExpr() orelse return null;
+    const h_raw = p.parseCallMemberExpr() orelse return null;
+    // `__checkHeritage__(<expr>)` — ClassDefinitionEvaluation rejects a heritage
+    // value that is neither `null` nor a constructor, and does so *before* the
+    // `.prototype` read below, so `class C extends (() => {})` throws a TypeError
+    // rather than tripping a `prototype` getter on the arrow.
+    const h = blk: {
+        const s = p.current.start;
+        const callee = nodeIdent(p, "__checkHeritage__") orelse return null;
+        var cargs = std.ArrayList(*Node){};
+        cargs.append(p.arena, h_raw) catch return null;
+        break :blk p.makeNode(.call_expr, s, s, .{
+            .call_expr = .{ .callee = callee, .args = cargs.items },
+        }) orelse return null;
+    };
     // Always snapshot into a fresh binding, even for a bare identifier: the
     // ClassHeritage is evaluated once at class-definition time, but `super()`
     // and the prototype wiring below read the name later. `chain = class
@@ -1239,6 +1539,112 @@ fn parseHeritage(p: *Parser) ?Heritage {
     };
     p.param_destruct_counter += 1;
     return Heritage{ .super_name = name, .expr = h };
+}
+
+/// One private instance method/accessor group, hoisted out of the class body.
+///
+/// A private method is NOT a prototype property: InitializeInstanceElements
+/// adds it to each *instance* (PrivateMethodOrAccessorAdd), which is what makes
+/// `this.#m()` throw when the instance has not been branded yet — notably
+/// inside a base constructor that runs before the derived `super()` returns.
+/// The function object is still created once per class evaluation, so it is
+/// hoisted into a hidden binding here and only *installed* per instance.
+///
+/// `get #x` and `set #x` form a SINGLE private element, so the two halves share
+/// one entry and one install call.
+const PrivInstance = struct {
+    /// Mangled PrivateEnvironment key ("#x\x01N").
+    key: []const u8,
+    /// Hidden binding holding the method function, or null for an accessor.
+    method_var: ?[]const u8 = null,
+    getter_var: ?[]const u8 = null,
+    setter_var: ?[]const u8 = null,
+};
+
+/// Assign a hidden binding name to every private instance method/accessor in
+/// `members`, grouping `get #x`/`set #x` under one entry. Returns the entries in
+/// source order; `hidden_of[i]` is the binding name for `members[i]` (null when
+/// that member is not a private instance element and so installs normally).
+fn planPrivInstance(
+    p: *Parser,
+    members: []const ClassMember,
+    hidden_of: [][]const u8,
+) ?[]PrivInstance {
+    var out = std.ArrayList(PrivInstance){};
+    for (members, 0..) |m, i| {
+        hidden_of[i] = "";
+        if (m.is_static or m.computed_key != null) continue;
+        if (!isPrivateName(m.name)) continue;
+        const hidden = std.fmt.allocPrint(p.arena, "__pm{d}__", .{p.param_destruct_counter}) catch return null;
+        p.param_destruct_counter += 1;
+        hidden_of[i] = hidden;
+        // Reuse the existing entry for the other half of a get/set pair.
+        var found = false;
+        for (out.items) |*e| {
+            if (!std.mem.eql(u8, e.key, m.name)) continue;
+            found = true;
+            switch (m.accessor) {
+                .none => e.method_var = hidden,
+                .get => e.getter_var = hidden,
+                .set => e.setter_var = hidden,
+            }
+        }
+        if (found) continue;
+        var e = PrivInstance{ .key = m.name };
+        switch (m.accessor) {
+            .none => e.method_var = hidden,
+            .get => e.getter_var = hidden,
+            .set => e.setter_var = hidden,
+        }
+        out.append(p.arena, e) catch return null;
+    }
+    return out.items;
+}
+
+/// The per-instance install statements for `plan`, targeting `target` (`this`
+/// for a base class, `__superthis` for a derived one). Methods go through
+/// DEFINE_PRIVATE (`target.#m = __pmN`); accessors need the merged-pair helper.
+fn appendPrivInstanceInstalls(
+    p: *Parser,
+    list: *std.ArrayList(*Node),
+    plan: []const PrivInstance,
+    target_name: ?[]const u8,
+) bool {
+    const s = p.current.start;
+    for (plan) |e| {
+        const target: *Node = if (target_name) |n|
+            (nodeIdent(p, n) orelse return false)
+        else
+            (p.makeNode(.this_expr, s, s, .{ .this_expr = {} }) orelse return false);
+        if (e.method_var) |mv| {
+            const lhs = markPrivateDefine(nodeMember(p, target, e.key) orelse return false, true);
+            const rhs = nodeIdent(p, mv) orelse return false;
+            const assign = p.makeNode(.assignment_expr, s, s, .{
+                .assignment_expr = .{ .op = .assign, .target = lhs, .value = rhs },
+            }) orelse return false;
+            const st = p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign }) orelse return false;
+            list.append(p.arena, st) catch return false;
+            continue;
+        }
+        const callee = nodeIdent(p, "__privInstallAcc__") orelse return false;
+        const key_node = p.makeNode(.string_literal, s, s, .{ .string_literal = e.key }) orelse return false;
+        const undef = struct {
+            fn go(pp: *Parser, at: u32) ?*Node {
+                return pp.makeNode(.undefined_literal, at, at, .{ .undefined_literal = {} });
+            }
+        }.go;
+        const g: *Node = if (e.getter_var) |gv| (nodeIdent(p, gv) orelse return false) else (undef(p, s) orelse return false);
+        const st_fn: *Node = if (e.setter_var) |sv| (nodeIdent(p, sv) orelse return false) else (undef(p, s) orelse return false);
+        var args = std.ArrayList(*Node){};
+        args.append(p.arena, target) catch return false;
+        args.append(p.arena, key_node) catch return false;
+        args.append(p.arena, g) catch return false;
+        args.append(p.arena, st_fn) catch return false;
+        const call = p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } }) orelse return false;
+        const st = p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call }) orelse return false;
+        list.append(p.arena, st) catch return false;
+    }
+    return true;
 }
 
 /// How a class's constructor is named and bound. The declaration form
@@ -1276,6 +1682,12 @@ fn emitClassStatements(
     var ctor_body: []*Node = parsed.ctor_body;
     const members = parsed.members;
     const fields = parsed.fields;
+
+    // Private instance methods/accessors are installed per instance, not on the
+    // prototype (see PrivInstance). Plan the hidden bindings now: the member
+    // loop below defines them, and the constructor installs them.
+    const hidden_of = p.arena.alloc([]const u8, members.len) catch return null;
+    const priv_plan = planPrivInstance(p, members, hidden_of) orelse return null;
 
     // Pre-evaluate computed field NAMES once, at class-definition time, in source
     // order (ClassElementName evaluation). Each computed field's key is stored in
@@ -1325,7 +1737,9 @@ fn emitClassStatements(
                 if (!f.is_static) has_instance_field = true;
             }
             var body = std.ArrayList(*Node){};
-            if (has_instance_field) {
+            // Private instance methods need the same `__superthis` capture as
+            // fields: they are installed on the object the parent ctor returned.
+            if (has_instance_field or priv_plan.len > 0) {
                 // Derived class with instance fields: capture the parent result in
                 // `__superthis`, install the fields on it (DefineOwnProperty), and
                 // let the constructor wrapper below emit `return __superthis;`.
@@ -1335,7 +1749,7 @@ fn emitClassStatements(
                 }) orelse return null;
                 const assign_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign }) orelse return null;
                 body.append(p.arena, assign_stmt) catch return null;
-                if (!appendDerivedInstanceFields(p, &body, fields)) return null;
+                if (!appendDerivedInstanceFields(p, &body, fields, priv_plan)) return null;
             } else {
                 const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = rc_call }) orelse return null;
                 body.append(p.arena, ret_stmt) catch return null;
@@ -1478,7 +1892,7 @@ fn emitClassStatements(
         helper_body.append(p.arena, assign_stmt) catch return null;
         // Install instance fields on `__superthis` right after the parent ctor
         // returns — the spec point where a derived class initializes its fields.
-        if (!appendDerivedInstanceFields(p, &helper_body, fields)) return null;
+        if (!appendDerivedInstanceFields(p, &helper_body, fields, priv_plan)) return null;
         helper_body.append(p.arena, helper_ret) catch return null;
         const helper_fn = p.makeNode(.function_expr, start, start, .{
             .function_expr = .{
@@ -1535,7 +1949,7 @@ fn emitClassStatements(
         ctor_body_effective = ctor_stmts.items;
     } else {
         // Base class: instance fields initialize at the start of the constructor.
-        ctor_body_effective = prependInstanceFields(p, ctor_body_effective, fields) orelse return null;
+        ctor_body_effective = prependInstanceFields(p, class_name, ctor_body_effective, fields, priv_plan) orelse return null;
     }
 
     // var ClassName = function ClassName(...) { ... }
@@ -1636,15 +2050,16 @@ fn emitClassStatements(
     out.append(p.arena, stmt_ctor) catch return null;
 
     // prototype + static methods/accessors
-    for (members) |m| {
-        const stmt = emitClassMember(p, class_name, super_name, m) orelse return null;
+    for (members, 0..) |m, mi| {
+        const hidden: ?[]const u8 = if (hidden_of[mi].len > 0) hidden_of[mi] else null;
+        const stmt = emitClassMember(p, class_name, super_name, m, hidden) orelse return null;
         out.append(p.arena, stmt) catch return null;
     }
 
     // static fields: `ClassName.<name> = <init>` after the class is defined.
     for (fields) |f| {
         if (!f.is_static) continue;
-        const stmt = makeStaticFieldInit(p, class_name, f) orelse return null;
+        const stmt = makeStaticFieldInit(p, class_name, super_name, f) orelse return null;
         out.append(p.arena, stmt) catch return null;
     }
 
@@ -1696,6 +2111,7 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
         .class_name = class_name,
         .ctor_fn_name = if (has_name) class_name else (anon_name_hint orelse ""),
     }, heritage, parsed, start) orelse return null;
+    attachPrivScope(p.arena, out.items, parsed.priv_names);
 
     // The IIFE evaluates to the constructor.
     const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;

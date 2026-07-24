@@ -485,6 +485,19 @@ pub inline fn opDefinePrivate(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         else => null,
     };
     const obj = holder orelse return null;
+    // PrivateFieldAdd / PrivateMethodOrAccessorAdd both begin with
+    // PrivateElementFind and throw when the element already exists. Normally the
+    // receiver is freshly created so it cannot, but a base constructor that
+    // *returns an existing object* re-runs the whole install on it:
+    // `class C extends Base { #x }` with `Base` returning `obj` must reject the
+    // second `new C(obj)`.
+    if (obj.resolveOwnSlot(key) != null) {
+        const realm_mod = @import("../../runtime/realm.zig");
+        const class_mod = @import("../../parser/class.zig");
+        const msg = try std.fmt.allocPrint(self.arena, "Cannot install private member {s} twice on the same object", .{class_mod.privateDisplayName(key)});
+        realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", msg);
+        return error.JsException;
+    }
     // A private method is not writable: `obj.#m = v` must be a TypeError, which
     // `privateSet` derives from the stored attribute.
     _ = try obj.defineOwnData(key, val, .{ .writable = !is_method, .enumerable = false, .configurable = false, .is_private = true });

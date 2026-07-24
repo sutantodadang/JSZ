@@ -55,6 +55,128 @@ fn moduleSourceParses(gpa: std.mem.Allocator, src: []const u8) bool {
     };
 }
 
+/// True when `name` is a compiler-synthesised binding (the class/destructuring/
+/// import desugars mint `__…__` helpers). Such names are not user-visible
+/// declarations, so the module-goal early-error scan must ignore them.
+fn isSyntheticBinding(name: []const u8) bool {
+    return name.len >= 2 and name[0] == '_' and name[1] == '_';
+}
+
+/// VarDeclaredNames of a statement (§8.2.6): every `var` binding reachable
+/// through *statement* nesting. Deliberately does not descend into function or
+/// class bodies — those open a new variable scope.
+fn collectVarDeclaredNames(node: *ast.Node, out: *std.StringHashMap(void)) void {
+    switch (node.kind) {
+        .var_decl => if (node.data.var_decl.kind == .var_) {
+            out.put(node.data.var_decl.name, {}) catch {};
+        },
+        .block_stmt => for (node.data.block_stmt.body) |c| collectVarDeclaredNames(c, out),
+        .if_stmt => {
+            collectVarDeclaredNames(node.data.if_stmt.consequent, out);
+            if (node.data.if_stmt.alternate) |a| collectVarDeclaredNames(a, out);
+        },
+        .while_stmt => collectVarDeclaredNames(node.data.while_stmt.body, out),
+        .do_while_stmt => collectVarDeclaredNames(node.data.do_while_stmt.body, out),
+        .with_stmt => collectVarDeclaredNames(node.data.with_stmt.body, out),
+        .for_stmt => {
+            if (node.data.for_stmt.init) |i| collectVarDeclaredNames(i, out);
+            collectVarDeclaredNames(node.data.for_stmt.body, out);
+        },
+        .for_in_stmt => {
+            collectVarDeclaredNames(node.data.for_in_stmt.left, out);
+            collectVarDeclaredNames(node.data.for_in_stmt.body, out);
+        },
+        .try_stmt => {
+            collectVarDeclaredNames(node.data.try_stmt.block, out);
+            if (node.data.try_stmt.handler) |h| collectVarDeclaredNames(h.body, out);
+            if (node.data.try_stmt.finalizer) |f| collectVarDeclaredNames(f, out);
+        },
+        .switch_stmt => for (node.data.switch_stmt.cases) |c| {
+            for (c.body) |s| collectVarDeclaredNames(s, out);
+        },
+        .labeled_stmt => collectVarDeclaredNames(node.data.labeled_stmt.body, out),
+        else => {},
+    }
+}
+
+/// LexicallyDeclaredNames of a *module* top-level item: `let`/`const`/`class`
+/// plus — unlike a Script — `function`/`function*`/`async function`, which is
+/// exactly what makes `var x; function x(){}` legal script code but illegal
+/// module code.
+///
+/// A `block_stmt` with `lexical_scope == false` is a synthetic container the
+/// desugars emit (class declarations, multi-declarator lowering) whose bindings
+/// belong to the enclosing scope, so it is transparent here; a real block is not.
+fn collectTopLexicalNames(
+    node: *ast.Node,
+    out: *std.ArrayList([]const u8),
+    allocator: std.mem.Allocator,
+) void {
+    switch (node.kind) {
+        .var_decl => if (node.data.var_decl.kind != .var_) {
+            out.append(allocator, node.data.var_decl.name) catch {};
+        },
+        .function_decl => out.append(allocator, node.data.function_decl.name) catch {},
+        .block_stmt => if (!node.data.block_stmt.lexical_scope) {
+            for (node.data.block_stmt.body) |c| collectTopLexicalNames(c, out, allocator);
+        },
+        else => {},
+    }
+}
+
+/// ModuleBody early errors that a *Script*-goal parse cannot see (§16.2.1.5):
+///
+///   - LexicallyDeclaredNames of ModuleItemList contains duplicate entries;
+///   - any LexicallyDeclaredName also occurs in VarDeclaredNames.
+///
+/// Top-level `function` declarations are lexical in a Module but var-scoped in a
+/// Script, so `var smoosh; function smoosh() {}` is legal Script code and a
+/// SyntaxError as module code — and `moduleSourceParses` cannot tell, because it
+/// wraps the source in a function (i.e. re-parses it under the Script goal).
+///
+/// Conservative by construction: a source that does not parse at all returns
+/// false (that is `moduleSourceParses`'s job), synthetic `__…__` desugar bindings
+/// are ignored, and the duplicate check only looks at directly-declared top-level
+/// names. A false negative costs a test; a false positive breaks a valid module.
+fn moduleGoalEarlyError(gpa: std.mem.Allocator, src: []const u8) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const isolate_mod = @import("../vm/isolate.zig");
+    const rewritten = isolate_mod.rewriteTemplateLiterals(arena, src) catch return false;
+    var p = parser_mod.Parser.init(rewritten, arena);
+    const stmts = switch (p.parseModule()) {
+        .ok => |s| s,
+        .err => return false,
+    };
+
+    var vars = std.StringHashMap(void).init(arena);
+    var lex = std.ArrayList([]const u8){};
+    var direct = std.ArrayList([]const u8){};
+    for (stmts) |s| {
+        collectVarDeclaredNames(s, &vars);
+        collectTopLexicalNames(s, &lex, arena);
+        switch (s.kind) {
+            .var_decl => if (s.data.var_decl.kind != .var_) {
+                direct.append(arena, s.data.var_decl.name) catch {};
+            },
+            .function_decl => direct.append(arena, s.data.function_decl.name) catch {},
+            else => {},
+        }
+    }
+    for (lex.items) |n| {
+        if (isSyntheticBinding(n)) continue;
+        if (vars.contains(n)) return true;
+    }
+    var seen = std.StringHashMap(void).init(arena);
+    for (direct.items) |n| {
+        if (isSyntheticBinding(n)) continue;
+        if (seen.contains(n)) return true;
+        seen.put(n, {}) catch {};
+    }
+    return false;
+}
+
 /// Lifecycle of a module record, mirroring the spec [[Status]] field. Phase 1
 /// uses these to dedup work and to expose a partially-initialised record to a
 /// cyclic importer (a record that is `.evaluating` when re-entered).
@@ -967,6 +1089,516 @@ fn emitAwaitDeps(gpa: std.mem.Allocator, sb: *std.ArrayList(u8), deps: []const [
 /// against `base_dir`, i.e. as if it lived directly in that directory).
 pub const ENTRY_ID = "__entry__";
 
+// ------------------------------------------------ static export resolution ---
+//
+// The CJS desugar links names lazily at *runtime* (`__exportStar__` copies the
+// keys it can see, dropping the ones two star paths disagree about), which is
+// the right shape for the legal cases but cannot report the two *link-time*
+// failures the spec demands: §16.2.1.6.4 InitializeEnvironment step 3 says every
+// IndirectExportEntry must resolve, and §16.2.1.6.3 ResolveExport returns null
+// for a circular re-export chain and "ambiguous" when two `export *` paths reach
+// different bindings of the same name. Both are SyntaxErrors raised before the
+// module ever evaluates.
+//
+// So run ResolveExport statically over the graph the disk DFS already
+// discovered, and give any module with an unresolvable indirect export a
+// throwing factory. Note this keys strictly off IndirectExportEntries: star
+// ambiguity on its own is legal (the name is simply excluded from the
+// namespace), which is exactly what `__exportStar__`/`__ambMap__` keep doing.
+//
+// The scanners below are the same hand-rolled character scanners as the rest of
+// this file, so every verdict is opt-in: anything the scanner cannot model
+// exactly sets `unsure`, and resolution through an unsure module returns
+// `.unknown`, which suppresses the error. A false negative costs a test; a false
+// positive turns a working module into a hard SyntaxError.
+
+/// The spec's IndirectExportEntry — `export { importName as exportName } from
+/// moduleRequest` — with the provenance `findExportNames` flattens away.
+const IndirectExportEntry = struct {
+    export_name: []const u8,
+    /// Canonical id of the requested module.
+    module_id: []const u8,
+    import_name: []const u8,
+};
+
+/// The export entries of one module, split as in §16.2.1.6.1.
+const ExportEntries = struct {
+    /// ExportName of every LocalExportEntry, plus `export * as ns from` and
+    /// re-exports of a namespace import — those resolve to a namespace object,
+    /// which always exists, so they behave like a local binding here.
+    locals: []const []const u8 = &.{},
+    indirects: []const IndirectExportEntry = &.{},
+    /// ModuleRequest ids of the StarExportEntries.
+    stars: []const []const u8 = &.{},
+    /// The scanner met something it cannot model exactly (string-literal or
+    /// escaped export names, a bare/absolute/typed specifier, an unrecognised
+    /// `import`/`export` form). Never report a failure for — or through — such
+    /// a module.
+    unsure: bool = false,
+};
+
+/// Where an imported local name comes from. `import_name.len == 0` marks a
+/// namespace import (`import * as ns`), whose re-export never fails to resolve.
+const ImportBinding = struct {
+    module_id: []const u8,
+    import_name: []const u8,
+};
+
+/// Read an identifier at (or after whitespace/comments following) `i.*`,
+/// advancing `i.*` past it. Returns null for a string literal, a `\uXXXX`
+/// escaped name, or anything that is not an identifier — all callers treat
+/// that as "cannot model".
+fn readIdentAt(src: []const u8, i: *usize) ?[]const u8 {
+    const s = skipWsComments(src, i.*);
+    if (s >= src.len) return null;
+    const c = src[s];
+    if (!(std.ascii.isAlphabetic(c) or c == '_' or c == '$' or c >= 0x80)) return null;
+    var j = s;
+    while (j < src.len and (isIdentChar(src[j]) or src[j] >= 0x80)) : (j += 1) {}
+    i.* = j;
+    return src[s..j];
+}
+
+/// Read a module-request string literal at `i.*` and resolve it against
+/// `importer_id`. Returns null (and still advances past the literal when there
+/// was one) for a non-relative specifier or one carrying a `with { type: … }`
+/// attribute — a typed module is opaque data, not a source text module.
+fn readSpecifierAt(
+    src: []const u8,
+    i: *usize,
+    importer_id: []const u8,
+    allocator: std.mem.Allocator,
+) ?[]const u8 {
+    const s = skipWsComments(src, i.*);
+    if (s >= src.len) return null;
+    const q = src[s];
+    if (q != '"' and q != '\'') return null;
+    var j = s + 1;
+    while (j < src.len and src[j] != q) : (j += 1) {
+        if (src[j] == '\\') j += 1;
+    }
+    if (j >= src.len) return null;
+    const lit = src[s + 1 .. j];
+    i.* = j + 1;
+    if (attrTypeAfter(src, j + 1) != null) return null;
+    if (std.mem.indexOfScalar(u8, lit, '\\') != null) return null;
+    if (!std.mem.startsWith(u8, lit, "./") and !std.mem.startsWith(u8, lit, "../")) return null;
+    return resolveSpec(allocator, importer_id, lit) catch null;
+}
+
+/// Forward token walk shared by the export-entry scanners: skips comments,
+/// strings and template literals, and yields each identifier-like word together
+/// with the previous significant character — so `obj.export` can be told apart
+/// from a real `export` declaration without scanning backwards over comment text
+/// (a license header ending in "file." would otherwise look like a member access).
+const WordScan = struct {
+    src: []const u8,
+    i: usize = 0,
+    /// Last significant (non-whitespace, non-comment) byte before `word`.
+    prev: u8 = 0,
+
+    const Word = struct { text: []const u8, prev: u8, end: usize };
+
+    fn next(self: *WordScan) ?Word {
+        const src = self.src;
+        while (self.i < src.len) {
+            const c = src[self.i];
+            if (c == '/' and self.i + 1 < src.len and (src[self.i + 1] == '/' or src[self.i + 1] == '*')) {
+                const nxt = skipWsComments(src, self.i);
+                self.i = if (nxt > self.i) nxt else self.i + 1;
+                continue;
+            }
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                self.i += 1;
+                continue;
+            }
+            if (c == '`' or c == '"' or c == '\'') {
+                self.i = skipQuoted(src, self.i);
+                self.prev = c;
+                continue;
+            }
+            if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
+                const start = self.i;
+                while (self.i < src.len and isIdentChar(src[self.i])) : (self.i += 1) {}
+                const was = self.prev;
+                self.prev = src[self.i - 1];
+                return .{ .text = src[start..self.i], .prev = was, .end = self.i };
+            }
+            self.prev = c;
+            self.i += 1;
+        }
+        return null;
+    }
+};
+
+/// Collect the local-name → (module, import name) bindings introduced by the
+/// `import` declarations in `src`. Sets `unsure` on any form it cannot model.
+fn scanImportBindings(
+    src: []const u8,
+    importer_id: []const u8,
+    out: *std.StringHashMap(ImportBinding),
+    unsure: *bool,
+    allocator: std.mem.Allocator,
+) void {
+    var scan = WordScan{ .src = src };
+    while (scan.next()) |w| {
+        if (!std.mem.eql(u8, w.text, "import")) continue;
+        if (w.prev == '.') continue;
+        var j = skipWsComments(src, w.end);
+        if (j >= src.len) continue;
+        // `import(...)` (dynamic) and `import.meta` are not declarations.
+        if (src[j] == '(' or src[j] == '.') continue;
+        // `import 'spec'` — side effect only, no bindings.
+        if (src[j] == '"' or src[j] == '\'') {
+            scan.i = skipQuoted(src, j);
+            continue;
+        }
+        // `import defer * as ns from 'spec'` / `import source x from 'spec'`.
+        _ = matchKeyword(src, &j, "defer");
+        var pending = std.ArrayList([2][]const u8){};
+        var namespaces = std.ArrayList([]const u8){};
+        var ok = true;
+        var clause_done = false;
+        while (!clause_done) {
+            j = skipWsComments(src, j);
+            if (j >= src.len) {
+                ok = false;
+                break;
+            }
+            if (src[j] == '*') {
+                j += 1;
+                if (!matchKeyword(src, &j, "as")) {
+                    ok = false;
+                    break;
+                }
+                const ns = readIdentAt(src, &j) orelse {
+                    ok = false;
+                    break;
+                };
+                namespaces.append(allocator, ns) catch {};
+            } else if (src[j] == '{') {
+                j += 1;
+                while (true) {
+                    j = skipWsComments(src, j);
+                    if (j >= src.len) {
+                        ok = false;
+                        break;
+                    }
+                    if (src[j] == '}') {
+                        j += 1;
+                        break;
+                    }
+                    if (src[j] == ',') {
+                        j += 1;
+                        continue;
+                    }
+                    const imported = readIdentAt(src, &j) orelse {
+                        ok = false;
+                        break;
+                    };
+                    var local = imported;
+                    var k = j;
+                    if (matchKeyword(src, &k, "as")) {
+                        local = readIdentAt(src, &k) orelse {
+                            ok = false;
+                            break;
+                        };
+                        j = k;
+                    }
+                    pending.append(allocator, .{ local, imported }) catch {};
+                }
+                if (!ok) break;
+            } else {
+                // Default import binding (possibly after `source`/`defer`).
+                const local = readIdentAt(src, &j) orelse {
+                    ok = false;
+                    break;
+                };
+                if (std.mem.eql(u8, local, "from")) {
+                    ok = false;
+                    break;
+                }
+                pending.append(allocator, .{ local, "default" }) catch {};
+            }
+            const after = skipWsComments(src, j);
+            if (after < src.len and src[after] == ',') {
+                j = after + 1;
+                continue;
+            }
+            clause_done = true;
+        }
+        if (!ok) {
+            unsure.* = true;
+            scan.i = j;
+            continue;
+        }
+        if (!matchKeyword(src, &j, "from")) {
+            unsure.* = true;
+            scan.i = j;
+            continue;
+        }
+        const mod_id = readSpecifierAt(src, &j, importer_id, allocator) orelse {
+            unsure.* = true;
+            scan.i = j;
+            continue;
+        };
+        for (pending.items) |pr| {
+            out.put(pr[0], .{ .module_id = mod_id, .import_name = pr[1] }) catch {};
+        }
+        for (namespaces.items) |ns| {
+            out.put(ns, .{ .module_id = mod_id, .import_name = "" }) catch {};
+        }
+        scan.i = j;
+    }
+}
+
+/// Skip the string/template literal starting at `src[i]`, returning the index
+/// just past its closing delimiter.
+fn skipQuoted(src: []const u8, i: usize) usize {
+    const q = src[i];
+    var j = i + 1;
+    while (j < src.len and src[j] != q) : (j += 1) {
+        if (src[j] == '\\') j += 1;
+    }
+    return j + 1;
+}
+
+/// Split `src`'s `export` declarations into the spec's Local/Indirect/Star
+/// export entries, resolving each ModuleRequest against `importer_id`.
+fn scanExportEntries(src: []const u8, importer_id: []const u8, allocator: std.mem.Allocator) ExportEntries {
+    var locals = std.ArrayList([]const u8){};
+    var indirects = std.ArrayList(IndirectExportEntry){};
+    var stars = std.ArrayList([]const u8){};
+    var unsure = false;
+
+    // `export { x }` where `x` is an imported binding is an IndirectExportEntry,
+    // not a local one, so the import clauses have to be known up front.
+    var imports = std.StringHashMap(ImportBinding).init(allocator);
+    scanImportBindings(src, importer_id, &imports, &unsure, allocator);
+
+    var scan = WordScan{ .src = src };
+    while (scan.next()) |w| {
+        if (!std.mem.eql(u8, w.text, "export")) continue;
+        if (w.prev == '.') continue;
+        scan.i = scanOneExport(src, w.end, importer_id, &imports, &locals, &indirects, &stars, &unsure, allocator);
+    }
+    return .{
+        .locals = locals.items,
+        .indirects = indirects.items,
+        .stars = stars.items,
+        .unsure = unsure,
+    };
+}
+
+/// Parse the single `export` declaration whose keyword ends at `start`,
+/// appending its entries. Returns the index to resume scanning from; sets
+/// `unsure` on any unrecognised form.
+fn scanOneExport(
+    src: []const u8,
+    start: usize,
+    importer_id: []const u8,
+    imports: *const std.StringHashMap(ImportBinding),
+    locals: *std.ArrayList([]const u8),
+    indirects: *std.ArrayList(IndirectExportEntry),
+    stars: *std.ArrayList([]const u8),
+    unsure: *bool,
+    allocator: std.mem.Allocator,
+) usize {
+    var j = skipWsComments(src, start);
+    if (j >= src.len) {
+        unsure.* = true;
+        return j;
+    }
+    // `export * from 'spec'` / `export * as ns from 'spec'`
+    if (src[j] == '*') {
+        j += 1;
+        if (matchKeyword(src, &j, "as")) {
+            const ns = readIdentAt(src, &j) orelse {
+                unsure.* = true;
+                return j;
+            };
+            locals.append(allocator, ns) catch {};
+            if (!matchKeyword(src, &j, "from")) unsure.* = true;
+            _ = readSpecifierAt(src, &j, importer_id, allocator);
+            return j;
+        }
+        if (!matchKeyword(src, &j, "from")) {
+            unsure.* = true;
+            return j;
+        }
+        const mod_id = readSpecifierAt(src, &j, importer_id, allocator) orelse {
+            unsure.* = true;
+            return j;
+        };
+        stars.append(allocator, mod_id) catch {};
+        return j;
+    }
+    // `export { a, b as c } [from 'spec']`
+    if (src[j] == '{') {
+        j += 1;
+        var names = std.ArrayList([2][]const u8){};
+        while (true) {
+            j = skipWsComments(src, j);
+            if (j >= src.len) {
+                unsure.* = true;
+                return j;
+            }
+            if (src[j] == '}') {
+                j += 1;
+                break;
+            }
+            if (src[j] == ',') {
+                j += 1;
+                continue;
+            }
+            const local = readIdentAt(src, &j) orelse {
+                unsure.* = true;
+                return j + 1;
+            };
+            var exported = local;
+            var k = j;
+            if (matchKeyword(src, &k, "as")) {
+                exported = readIdentAt(src, &k) orelse {
+                    unsure.* = true;
+                    return k + 1;
+                };
+                j = k;
+            }
+            names.append(allocator, .{ local, exported }) catch {};
+        }
+        var k = j;
+        if (matchKeyword(src, &k, "from")) {
+            const mod_id = readSpecifierAt(src, &k, importer_id, allocator) orelse {
+                unsure.* = true;
+                return k;
+            };
+            for (names.items) |nm| {
+                indirects.append(allocator, .{
+                    .export_name = nm[1],
+                    .module_id = mod_id,
+                    .import_name = nm[0],
+                }) catch {};
+            }
+            return k;
+        }
+        for (names.items) |nm| {
+            if (imports.get(nm[0])) |ib| {
+                if (ib.import_name.len > 0) {
+                    indirects.append(allocator, .{
+                        .export_name = nm[1],
+                        .module_id = ib.module_id,
+                        .import_name = ib.import_name,
+                    }) catch {};
+                    continue;
+                }
+            }
+            locals.append(allocator, nm[1]) catch {};
+        }
+        return j;
+    }
+    if (matchKeyword(src, &j, "default")) {
+        locals.append(allocator, "default") catch {};
+        return j;
+    }
+    var dummy_tdz = std.ArrayList([]const u8){};
+    if (matchKeyword(src, &j, "var") or matchKeyword(src, &j, "let") or
+        matchKeyword(src, &j, "const") or matchKeyword(src, &j, "using"))
+    {
+        scanDeclaratorNames(src[j..], locals, &dummy_tdz, false, allocator);
+        return j;
+    }
+    _ = matchKeyword(src, &j, "async");
+    if (matchKeyword(src, &j, "function")) {
+        j = skipWsComments(src, j);
+        if (j < src.len and src[j] == '*') j += 1;
+        const nm = readIdentAt(src, &j) orelse {
+            unsure.* = true;
+            return j;
+        };
+        locals.append(allocator, nm) catch {};
+        return j;
+    }
+    if (matchKeyword(src, &j, "class")) {
+        const nm = readIdentAt(src, &j) orelse {
+            unsure.* = true;
+            return j;
+        };
+        locals.append(allocator, nm) catch {};
+        return j;
+    }
+    unsure.* = true;
+    return j;
+}
+
+/// Outcome of §16.2.1.6.3 ResolveExport. `unknown` is this implementation's
+/// extra state: the scanners could not model some module on the path, so no
+/// verdict may be drawn.
+const ResolutionKind = enum { resolved, none, ambiguous, unknown };
+
+const Resolution = struct {
+    kind: ResolutionKind,
+    module_id: []const u8 = "",
+    binding: []const u8 = "",
+};
+
+const ResolveCtx = struct {
+    entries: *const std.StringHashMap(ExportEntries),
+    /// The (module, exportName) pairs on the current resolution path — the
+    /// spec's resolveSet, used to detect a circular re-export chain.
+    path: *std.ArrayList([2][]const u8),
+    allocator: std.mem.Allocator,
+    depth: u32 = 0,
+};
+
+/// §16.2.1.6.3 ResolveExport, evaluated statically over the discovered graph.
+fn resolveExport(ctx: *ResolveCtx, module_id: []const u8, export_name: []const u8) Resolution {
+    if (ctx.depth > 64) return .{ .kind = .unknown };
+    const ents = ctx.entries.get(module_id) orelse return .{ .kind = .unknown };
+    if (ents.unsure) return .{ .kind = .unknown };
+    for (ctx.path.items) |r| {
+        if (std.mem.eql(u8, r[0], module_id) and std.mem.eql(u8, r[1], export_name)) {
+            // Circular import request: this path provides no binding.
+            return .{ .kind = .none };
+        }
+    }
+    ctx.path.append(ctx.allocator, .{ module_id, export_name }) catch return .{ .kind = .unknown };
+    defer _ = ctx.path.pop();
+    ctx.depth += 1;
+    defer ctx.depth -= 1;
+
+    for (ents.locals) |l| {
+        if (std.mem.eql(u8, l, export_name)) {
+            return .{ .kind = .resolved, .module_id = module_id, .binding = export_name };
+        }
+    }
+    for (ents.indirects) |ind| {
+        if (std.mem.eql(u8, ind.export_name, export_name)) {
+            return resolveExport(ctx, ind.module_id, ind.import_name);
+        }
+    }
+    // `export *` never provides `default`.
+    if (std.mem.eql(u8, export_name, "default")) return .{ .kind = .none };
+    var star: Resolution = .{ .kind = .none };
+    for (ents.stars) |s| {
+        const r = resolveExport(ctx, s, export_name);
+        switch (r.kind) {
+            .unknown => return .{ .kind = .unknown },
+            .ambiguous => return .{ .kind = .ambiguous },
+            .none => {},
+            .resolved => {
+                if (star.kind == .none) {
+                    star = r;
+                } else if (!std.mem.eql(u8, star.module_id, r.module_id) or
+                    !std.mem.eql(u8, star.binding, r.binding))
+                {
+                    return .{ .kind = .ambiguous };
+                }
+            },
+        }
+    }
+    return star;
+}
+
 /// Scan `src` for every exported name and append them to `out`. Handles
 /// comment/string/template skipping (reuses the same skip logic as
 /// `scanSpecifiers`). This is a syntactic scan, not a full parse — sufficient
@@ -1510,6 +2142,27 @@ pub fn buildScriptBundle(gpa: std.mem.Allocator, base_dir: []const u8, entry_id:
     return buildBundleImpl(gpa, base_dir, entry_id, entry_src, true);
 }
 
+/// Emit a `__modules__[id]` factory that throws a `SyntaxError` the first time
+/// the module is required. This is how a module that must fail at *link* time
+/// (parse error, module-goal early error, unresolvable indirect export) reports
+/// itself: `require` propagates the throw, and `import()` rejects with the error
+/// object — so `error.name === "SyntaxError"`, unlike the `__moduleUnresolved__`
+/// path which rejects with a bare string.
+fn emitSyntaxErrorFactory(
+    gpa: std.mem.Allocator,
+    sb: *std.ArrayList(u8),
+    mod_id: []const u8,
+    message: []const u8,
+) !void {
+    try sb.appendSlice(gpa, "__modules__[");
+    try appendJsString(gpa, sb, mod_id);
+    try sb.appendSlice(gpa, "] = function(require, module, exports){\nthrow new SyntaxError(");
+    try appendJsString(gpa, sb, message);
+    try sb.appendSlice(gpa, "+");
+    try appendJsString(gpa, sb, mod_id);
+    try sb.appendSlice(gpa, ");\n};\n");
+}
+
 fn buildBundleImpl(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]const u8, entry_src: []const u8, entry_is_script: bool) ![]const u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1581,6 +2234,49 @@ fn buildBundleImpl(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
                         changed = true;
                         break;
                     }
+                }
+            }
+        }
+    }
+
+    // §16.2.1.6.4 InitializeEnvironment step 3: for each IndirectExportEntry of
+    // a module, ResolveExport must yield a resolution — null (circular re-export
+    // chain) or "ambiguous" (two `export *` paths reaching different bindings)
+    // is a SyntaxError raised at link time, before the module evaluates. The CJS
+    // desugar links lazily at runtime and cannot see either, so decide it here
+    // over the graph the DFS just discovered and hand the offending module a
+    // throwing factory below.
+    var link_errors = std.StringHashMap(void).init(arena);
+    {
+        var entries = std.StringHashMap(ExportEntries).init(arena);
+        var rit = registry.iterator();
+        while (rit.next()) |e| {
+            const id = e.key_ptr.*;
+            // Typed (JSON/text/bytes) modules are opaque data — not modelled.
+            const ents: ExportEntries = if (idType(id) != null)
+                .{ .unsure = true }
+            else
+                scanExportEntries(e.value_ptr.*, id, arena);
+            try entries.put(id, ents);
+        }
+        if (!entries.contains(self_id)) {
+            try entries.put(self_id, if (entry_is_script)
+                ExportEntries{ .unsure = true }
+            else
+                scanExportEntries(entry_src, self_id, arena));
+        }
+        var vit = registry.iterator();
+        while (vit.next()) |e| {
+            const id = e.key_ptr.*;
+            const ents = entries.get(id) orelse continue;
+            if (ents.unsure) continue;
+            for (ents.indirects) |ind| {
+                var path = std.ArrayList([2][]const u8){};
+                var ctx = ResolveCtx{ .entries = &entries, .path = &path, .allocator = arena };
+                const r = resolveExport(&ctx, id, ind.export_name);
+                if (r.kind == .none or r.kind == .ambiguous) {
+                    try link_errors.put(id, {});
+                    break;
                 }
             }
         }
@@ -1749,11 +2445,19 @@ fn buildBundleImpl(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
         // surfaces lazily at evaluation — `import()` rejects and
         // `ShadowRealm.prototype.importValue` rejects with a TypeError.
         if (!moduleSourceParses(gpa, e.value_ptr.*)) {
-            try sb.appendSlice(gpa, "__modules__[");
-            try appendJsString(gpa, &sb, mod_id);
-            try sb.appendSlice(gpa, "] = function(require, module, exports){\nthrow new SyntaxError(\"Unexpected end of input in module \"+");
-            try appendJsString(gpa, &sb, mod_id);
-            try sb.appendSlice(gpa, ");\n};\n");
+            try emitSyntaxErrorFactory(gpa, &sb, mod_id, "Unexpected end of input in module ");
+            continue;
+        }
+        // Module-goal early errors (§16.2.1.5) that the Script-goal parse above
+        // cannot see — e.g. a top-level `function` colliding with a `var`.
+        if (moduleGoalEarlyError(gpa, e.value_ptr.*)) {
+            try emitSyntaxErrorFactory(gpa, &sb, mod_id, "Invalid module code in ");
+            continue;
+        }
+        // An IndirectExportEntry that ResolveExport reports as null or
+        // "ambiguous" (see the link_errors pass above).
+        if (link_errors.contains(mod_id)) {
+            try emitSyntaxErrorFactory(gpa, &sb, mod_id, "Unresolvable indirect export in module ");
             continue;
         }
         const mod_is_async = async_set.contains(mod_id);

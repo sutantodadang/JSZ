@@ -582,13 +582,35 @@ pub fn parseUsingDeclStmt(p: *Parser, is_await: bool) ?*Node {
     return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = decls.items, .lexical_scope = false } });
 }
 
+/// `let` starts a LexicalDeclaration here. `let` is a *contextual* keyword: it
+/// is only a declaration keyword when a BindingIdentifier / `[` / `{` follows,
+/// so sloppy code may still use it as a plain identifier (`let = 1`,
+/// `for (let in obj)`). Strict code rejects it as a binding *name* separately,
+/// via `checkStrictBindingName`.
+pub fn atLetDecl(p: *Parser) bool {
+    if (p.current.kind != .identifier or !std.mem.eql(u8, p.current.value_str, "let")) return false;
+    return switch (p.peekNext().kind) {
+        .identifier, .left_bracket, .left_brace => true,
+        else => false,
+    };
+}
+
 pub fn parseStatement(p: *Parser) ?*Node {
     if (p.had_error) return null;
+    // A statement can begin with a RegularExpressionLiteral, but the lexer read
+    // `/` as division because the token before it was a `}` (see
+    // Parser.relexCurrentAsRegex). Statement position settles it: `{}/re/`,
+    // `class A{}/re/` and `function f(){}/re/` are a declaration then a regex.
+    p.relexCurrentAsRegex();
     // Explicit resource management: `using x = ...` / `await using x = ...`
     // declarations. Only recognized when a binding identifier follows (see
     // atUsingDecl/atAwaitUsingDecl); otherwise `using`/`await` stay ordinary.
     if (atAwaitUsingDecl(p)) return parseUsingDeclStmt(p, true);
     if (atUsingDecl(p)) return parseUsingDeclStmt(p, false);
+    // `let` is a contextual keyword: it begins a LexicalDeclaration only when a
+    // BindingIdentifier / `[` / `{` follows. Otherwise sloppy code may use it as
+    // a plain identifier (`let = 1`, `let instanceof x`, `for (let in obj)`).
+    if (atLetDecl(p)) return p.parseLexicalDeclStmt(.let);
     // Phase 8: a statement starting with `await` is an await-expression statement,
     // not a label/identifier — route to expression parsing (which desugars await).
     // In module mode, `await` is always a keyword. In script mode, `await` is an
@@ -651,7 +673,6 @@ pub fn parseStatement(p: *Parser) ?*Node {
     return switch (p.current.kind) {
         .left_brace => p.parseBlock(),
         .kw_var => p.parseVarDeclStmt(),
-        .kw_let => p.parseLexicalDeclStmt(.let),
         .kw_const => p.parseLexicalDeclStmt(.const_),
         .kw_class => p.parseClassDeclStmt(),
         .kw_import => p.parseImportDecl(),
@@ -1212,9 +1233,13 @@ pub fn parseForStmt(p: *Parser) ?*Node {
     }
 
     // Detect for-in: for (var/let/const x in obj) or for (x in obj)
-    if (p.check(.kw_var) or p.check(.kw_let) or p.check(.kw_const)) {
+    // `let` only begins a LexicalDeclaration when a BindingIdentifier / `[` /
+    // `{` follows. In sloppy code `for (let in obj)` is a for-in whose target is
+    // the *identifier* `let`, so leave it to the expression path below.
+    const at_let = atLetDecl(p);
+    if (at_let or p.check(.kw_var) or p.check(.kw_const)) {
         // save position: for (var/let/const NAME in ...) is for-in
-        const decl_kind: ast.VarKind = if (p.check(.kw_var)) .var_ else if (p.check(.kw_let)) .let else .const_;
+        const decl_kind: ast.VarKind = if (p.check(.kw_var)) .var_ else if (at_let) .let else .const_;
         _ = p.advance(); // consume declaration keyword
         if (p.check(.left_bracket) or p.check(.left_brace)) {
             return p.parseForDestructuring(start, decl_kind, for_await);
@@ -1325,14 +1350,29 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         // binary operator. Detect this and split it back into a for-in.
         if (expr.kind == .binary_expr and
             expr.data.binary_expr.op == .in and
-            p.check(.right_paren))
+            (p.check(.right_paren) or p.check(.comma)))
         {
+            // The head's right-hand side is an `Expression`, so a comma sequence
+            // may continue past what the binary `in` swallowed:
+            // `for (x in null, {key: 0})` enumerates the object, not `null`.
+            var right = expr.data.binary_expr.right;
+            if (p.check(.comma)) {
+                var seq = std.ArrayList(*Node){};
+                seq.append(p.arena, right) catch return null;
+                while (p.match(.comma)) {
+                    const nxt = p.parseAssignmentExpr() orelse return null;
+                    seq.append(p.arena, nxt) catch return null;
+                }
+                right = p.makeNode(.sequence_expr, start, p.current.start, .{
+                    .sequence_expr = .{ .exprs = seq.items },
+                }) orelse return null;
+            }
             _ = p.expect(.right_paren) orelse return null;
             const body = p.parseStatement() orelse return null;
             return p.makeNode(.for_in_stmt, start, p.current.start, .{
                 .for_in_stmt = .{
                     .left = expr.data.binary_expr.left,
-                    .right = expr.data.binary_expr.right,
+                    .right = right,
                     .body = body,
                     .iterate_values = false,
                 },
