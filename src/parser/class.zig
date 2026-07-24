@@ -465,7 +465,11 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
         if (p.match(.star)) is_generator = true;
 
         var accessor: AccessorKind = .none;
-        if (p.check(.identifier) and !nextTokenEndsName(p)) {
+        // `get`/`set` is a modifier only when a ClassElementName follows. A `*`
+        // does not start one, so `get \n *a() {}` is a field named "get"
+        // (terminated by ASI) followed by a generator method — not a malformed
+        // accessor.
+        if (p.check(.identifier) and !nextTokenEndsName(p) and p.peekNext().kind != .star) {
             if (std.mem.eql(u8, p.current.value_str, "get")) {
                 accessor = .get;
                 _ = p.advance();

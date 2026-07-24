@@ -2876,6 +2876,45 @@ fn isObjectLike(v: Value) bool {
     };
 }
 
+/// `__privInstallAcc__(target, key, getter, setter)` — PrivateMethodOrAccessorAdd
+/// for a private accessor. Unlike a private method (which DEFINE_PRIVATE
+/// installs), a `get #x`/`set #x` pair is a SINGLE private element carrying both
+/// halves, so the desugar emits one call per private name. Installing twice on
+/// the same object is a TypeError, which is observable when a base constructor
+/// returns an object that already went through this class's initialization.
+pub fn nativePrivInstallAcc(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const target = if (args.len > 0) args[0] else Value{};
+    const obj = (try @import("builtins/reflect.zig").reflectTargetObjPub(arena, target)) orelse
+        return throwTypeError(arena, "Cannot install a private accessor on a non-object");
+    const key_v = if (args.len > 1) args[1] else Value{};
+    if (key_v.bits == 0 or key_v.unbox() != .string)
+        return throwTypeError(arena, "private accessor key must be a string");
+    const key = key_v.toPtr().string;
+    if (obj.resolveOwnSlot(key) != null) {
+        const class_mod = @import("../parser/class.zig");
+        const msg = try std.fmt.allocPrint(arena, "Cannot install private member {s} twice on the same object", .{class_mod.privateDisplayName(key)});
+        return throwTypeError(arena, msg);
+    }
+    // The accessor holder is the same `{ get, set }` shape the ordinary accessor
+    // path stores, so privateGet/privateSet read it unchanged.
+    const holder = if (active_heap) |h|
+        try JsObject.createOnHeap(h, null)
+    else
+        try JsObject.create(arena, null);
+    if (args.len > 2 and args[2].bits != 0 and args[2].unbox() != .undefined_)
+        try holder.set("get", args[2]);
+    if (args.len > 3 and args[3].bits != 0 and args[3].unbox() != .undefined_)
+        try holder.set("set", args[3]);
+    _ = try obj.defineOwnAccessor(key, try val_mod.makeObject(arena, holder), .{
+        .writable = false,
+        .enumerable = false,
+        .configurable = false,
+        .is_private = true,
+    });
+    obj.markPrivate(key);
+    return Value{};
+}
+
 /// `__superSet__(base, key, value, receiver, strict)` — PutValue on a Super
 /// Reference. `Reflect.set` alone is not enough on two counts: an assignment
 /// evaluates to the assigned *value*, not to the set's boolean result, and in

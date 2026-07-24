@@ -50,6 +50,10 @@ fn isObj(v: Value) bool {
 
 /// The *JsObject a Reflect target denotes, including a function's lazily
 /// materialized backing object (a callable IS an object). Null for primitives.
+pub fn reflectTargetObjPub(arena: std.mem.Allocator, v: Value) anyerror!?*JsObject {
+    return reflectTargetObj(arena, v);
+}
+
 fn reflectTargetObj(arena: std.mem.Allocator, v: Value) anyerror!?*JsObject {
     if (v.bits == 0) return null;
     return switch (v.unbox()) {
