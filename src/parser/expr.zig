@@ -1555,21 +1555,22 @@ pub fn rewriteSuperPropAssign(p: *Parser, op: ast.AssignOp, target: *Node, value
         (p.makeNode(.string_literal, start, end, .{ .string_literal = me.property.data.identifier }) orelse return null)
     else
         return null;
-    const id_reflect = p.makeNode(.identifier, start, end, .{ .identifier = "Reflect" }) orelse return null;
-    const id_set = p.makeNode(.identifier, start, end, .{ .identifier = "set" }) orelse return null;
-    const callee = p.makeNode(.member_expr, start, end, .{
-        .member_expr = .{ .object = id_reflect, .property = id_set, .computed = false },
-    }) orelse return null;
+    // `__superSet__` rather than a bare `Reflect.set`: the assignment must
+    // evaluate to the assigned value, and a failed [[Set]] in strict code is a
+    // TypeError (PutValue on a Super Reference).
+    const callee = p.makeNode(.identifier, start, end, .{ .identifier = "__superSet__" }) orelse return null;
     const id_proto = blk_sp: {
         p.super_prop_count += 1;
         break :blk_sp p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
     };
     const id_recv = p.makeNode(.identifier, start, end, .{ .identifier = "__superthis" }) orelse return null;
+    const strict_lit = p.makeNode(.bool_literal, start, end, .{ .bool_literal = p.strict }) orelse return null;
     var args = std.ArrayList(*Node){};
     args.append(p.arena, id_proto) catch return null;
     args.append(p.arena, key) catch return null;
     args.append(p.arena, value) catch return null;
     args.append(p.arena, id_recv) catch return null;
+    args.append(p.arena, strict_lit) catch return null;
     return p.makeNode(.call_expr, start, end, .{
         .call_expr = .{ .callee = callee, .args = args.items },
     });

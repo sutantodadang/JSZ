@@ -2876,6 +2876,20 @@ fn isObjectLike(v: Value) bool {
     };
 }
 
+/// `__superSet__(base, key, value, receiver, strict)` — PutValue on a Super
+/// Reference. `Reflect.set` alone is not enough on two counts: an assignment
+/// evaluates to the assigned *value*, not to the set's boolean result, and in
+/// strict code a failed [[Set]] is a TypeError rather than a silent no-op
+/// (§6.2.5.6 PutValue step 6.d).
+pub fn nativeSuperSet(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const value = if (args.len > 2) args[2] else Value{};
+    const ok = try @import("builtins/reflect.zig").nativeReflectSet(arena, .{}, args[0..@min(args.len, 4)]);
+    const strict = args.len > 4 and val_mod.toBoolean(args[4]);
+    if (strict and !val_mod.toBoolean(ok))
+        return throwTypeError(arena, "Cannot assign to read only property of super");
+    return value;
+}
+
 /// `__checkHeritage__(value)` — ClassDefinitionEvaluation step 8.d: a non-null
 /// ClassHeritage value must be a constructor. The check happens *before* the
 /// `superclass.prototype` read, so `class C extends (() => {})` throws a

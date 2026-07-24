@@ -382,6 +382,8 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__retComplVal__", try val_mod.makeNativeFunction(arena, es2015.nativeRetComplVal));
         // Class desugar: the return-override rule for a derived constructor.
         try realm.global_env.define("__derivedReturn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeDerivedReturn));
+        // PutValue on a Super Reference (`super.x = v`).
+        try realm.global_env.define("__superSet__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeSuperSet));
         // Class desugar: IsConstructor gate on the evaluated ClassHeritage.
         try realm.global_env.define("__checkHeritage__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeCheckHeritage));
         // M16 Phase 3: dynamic import() native + the import.meta object binding.
