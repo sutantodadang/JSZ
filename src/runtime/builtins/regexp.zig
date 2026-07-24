@@ -2449,6 +2449,19 @@ fn atWordBoundary(input: []const u8, pos: usize) bool {
     return before != after;
 }
 
+/// Set while a lookbehind body is being matched: the body may not consume input
+/// beyond the position the lookbehind sits at. The assertion matcher below does
+/// not backtrack, so without this bound a greedy quantifier in `(?<=^\w+)def`
+/// runs to end-of-input and the "must finish exactly here" test never holds.
+/// Cleared while a nested lookahead runs -- that one legitimately reads ahead.
+var lookbehind_limit: ?usize = null;
+
+inline fn withinLookbehind(end: ?usize) ?usize {
+    const e = end orelse return null;
+    if (lookbehind_limit) |lim| if (e > lim) return null;
+    return e;
+}
+
 fn matchNode(
     node: *const RegexNode,
     input: []const u8,
@@ -2457,9 +2470,9 @@ fn matchNode(
     flags: *const CompiledRegex.Flags,
 ) ?usize {
     switch (node.*) {
-        .literal => |ch| return consumeLiteral(input, pos, ch, flags),
-        .char_class => |cc| return consumeClass(input, pos, cc, flags),
-        .dot => return consumeDot(input, pos, flags),
+        .literal => |ch| return withinLookbehind(consumeLiteral(input, pos, ch, flags)),
+        .char_class => |cc| return withinLookbehind(consumeClass(input, pos, cc, flags)),
+        .dot => return withinLookbehind(consumeDot(input, pos, flags)),
         .anchor_start => return if (testBol(input, pos, flags)) pos else null,
         .anchor_end => return if (testEol(input, pos, flags)) pos else null,
         .word_boundary => return if (atWordBoundary(input, pos)) pos else null,
@@ -2511,7 +2524,12 @@ fn matchNode(
         },
         .look_ahead => |la| {
             const saved_caps = caps.*;
+            // A lookahead nested inside a lookbehind reads *forward* past the
+            // lookbehind's position, so the consume bound does not apply to it.
+            const saved_limit = lookbehind_limit;
+            lookbehind_limit = null;
             const matched = matchNode(la.inner, input, pos, caps, flags) != null;
+            lookbehind_limit = saved_limit;
             // §22.2.2.5: a *positive* assertion's captures survive into the rest
             // of the pattern (`/(?=(a+))/.exec("baa")` reports "aa"); a negative
             // one's are discarded, as are those of a failed positive one.
@@ -2521,6 +2539,9 @@ fn matchNode(
         },
         .look_behind => |lb| {
             var matched_lb = false;
+            const saved_limit = lookbehind_limit;
+            lookbehind_limit = pos;
+            defer lookbehind_limit = saved_limit;
             var j: usize = pos + 1;
             while (j > 0) {
                 j -= 1;
