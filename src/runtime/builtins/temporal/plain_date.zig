@@ -855,10 +855,12 @@ fn getDayOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) any
 }
 fn getWeekOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const d = try requireDate(arena, this_val);
+    if (d.calendar != .iso8601) return Value{};
     return val_mod.makeNumber(arena, @floatFromInt(shared.weekOfYear(d.*)));
 }
 fn getYearOfWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const d = try requireDate(arena, this_val);
+    if (d.calendar != .iso8601) return Value{};
     return val_mod.makeNumber(arena, @floatFromInt(shared.yearOfWeek(d.*)));
 }
 // era / eraYear are undefined for calendars without eras (notably ISO 8601), but

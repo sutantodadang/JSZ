@@ -721,10 +721,12 @@ fn getDayOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) any
 }
 fn getWeekOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
+    if (dt.date.calendar != .iso8601) return Value{};
     return val_mod.makeNumber(arena, @floatFromInt(shared.weekOfYear(dt.date)));
 }
 fn getYearOfWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const dt = try requireDT(arena, this_val);
+    if (dt.date.calendar != .iso8601) return Value{};
     return val_mod.makeNumber(arena, @floatFromInt(shared.yearOfWeek(dt.date)));
 }
 fn getEra(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {

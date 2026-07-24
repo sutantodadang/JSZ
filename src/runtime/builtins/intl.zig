@@ -879,6 +879,17 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
                 .month_day => p = .{ .month = "numeric", .day = "numeric", .hour_cycle = p.hour_cycle },
             };
         }
+        // HandleDateTimeTemporalDate & friends: a date-bearing Temporal value
+        // must either use the ISO calendar (which adopts the formatter's) or the
+        // very calendar the formatter resolved to — anything else is a RangeError.
+        if (args.len > 0) {
+            if (temporalCalendarOf(args[0])) |cal| {
+                const resolved = readOpt(o, "__dtf_calendar");
+                if (cal != .iso8601 and resolved.len > 0 and !std.mem.eql(u8, cal.str(), resolved))
+                    return throwRangeError(arena, "the Temporal object's calendar does not match the formatter's");
+            }
+        }
+
         // A Temporal *plain* value carries no time zone of its own, so the
         // formatter's `timeZoneName` has nothing to name (§11.5.2 drops it). An
         // Instant is a real point in time, and a ZonedDateTime carries its own
@@ -1215,6 +1226,20 @@ fn temporalEpochMs(v: Value) ?i64 {
         },
         else => return null,
     }
+}
+
+/// The `[[Calendar]]` of a date-bearing Temporal value, or null for the types
+/// that carry none (Instant, PlainTime) and for anything else.
+fn temporalCalendarOf(v: Value) ?t_calendar.CalendarId {
+    if (v.bits == 0 or v.unbox() != .object) return null;
+    return switch (v.toPtr().object.internal_kind) {
+        .temporal_plain_date => (t_pdate.getDate(v) orelse return null).calendar,
+        .temporal_plain_date_time => (t_pdatetime.getDateTime(v) orelse return null).date.calendar,
+        .temporal_zoned_date_time => (t_zdt.getZoned(v) orelse return null).calendar,
+        .temporal_plain_year_month => (t_pym.getYearMonth(v) orelse return null).calendar,
+        .temporal_plain_month_day => (t_pmd.getMonthDay(v) orelse return null).calendar,
+        else => null,
+    };
 }
 
 /// Which Temporal type is calling toLocaleString — selects the default

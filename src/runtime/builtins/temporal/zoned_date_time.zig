@@ -586,11 +586,15 @@ fn getDayOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) any
 }
 fn getWeekOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    return val_mod.makeNumber(arena, @floatFromInt(shared.weekOfYear(localDT(z).date)));
+    const d = localDT(z).date;
+    if (d.calendar != .iso8601) return Value{};
+    return val_mod.makeNumber(arena, @floatFromInt(shared.weekOfYear(d)));
 }
 fn getYearOfWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    return val_mod.makeNumber(arena, @floatFromInt(yearOfWeek(localDT(z).date)));
+    const d = localDT(z).date;
+    if (d.calendar != .iso8601) return Value{};
+    return val_mod.makeNumber(arena, @floatFromInt(yearOfWeek(d)));
 }
 fn getEra(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
