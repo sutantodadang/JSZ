@@ -1308,7 +1308,9 @@ pub const FnCompiler = struct {
                 }
             }
             // NamedEvaluation: `x = function(){}` — inject binding name as hint.
-            if (a.target.kind == .identifier and a.value.kind == .function_expr) {
+            // A parenthesized target `(x) = fn` is not an IdentifierReference for
+            // IsIdentifierRef, so it does NOT name (result stays "").
+            if (a.target.kind == .identifier and !a.target.paren and a.value.kind == .function_expr) {
                 self.name_hint = a.target.data.identifier;
             }
             const rhs = try self.compileExpr(a.value);
@@ -2180,7 +2182,11 @@ pub const FnCompiler = struct {
                 continue;
             }
             // NamedEvaluation: `{key: function(){}}` data property — inject key as hint.
-            if (prop.kind == .init and prop.value.kind == .function_expr) {
+            // `__proto__: fn` is a [[Prototype]] mutation, not a PropertyDefinition,
+            // so it never names its value (§B.3.1).
+            if (prop.kind == .init and prop.value.kind == .function_expr and
+                !std.mem.eql(u8, prop.key, "__proto__"))
+            {
                 self.name_hint = prop.key;
             }
             const rval = try self.compileExpr(prop.value);

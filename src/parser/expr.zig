@@ -258,7 +258,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         // `x &&= class{}` / `x ||= class{}` / `x ??= class{}` (§13.15.2) — name the
         // anonymous class after the target (see parseAssignmentExprCore mirror).
         const set_class_hint = isNamedEvalAssignOp(op) and left.kind == .identifier and
-            p.check(.kw_class) and p.export_default_name_hint == null;
+            !left.paren and p.check(.kw_class) and p.export_default_name_hint == null;
         if (set_class_hint) p.export_default_name_hint = left.data.identifier;
         const right = p.parseAssignmentExpr() orelse return null;
         if (set_class_hint) p.export_default_name_hint = null;
@@ -439,7 +439,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         // anonymous class after the target. Threaded to parseClassExpr via the
         // parser hint since the class desugars to an IIFE.
         const set_class_hint = isNamedEvalAssignOp(op) and left.kind == .identifier and
-            p.check(.kw_class) and p.export_default_name_hint == null;
+            !left.paren and p.check(.kw_class) and p.export_default_name_hint == null;
         if (set_class_hint) p.export_default_name_hint = left.data.identifier;
         const right = p.parseAssignmentExpr() orelse return null; // right-assoc
         if (set_class_hint) p.export_default_name_hint = null;

@@ -5069,11 +5069,12 @@ pub const Realm = struct {
         // writable/enumerable/configurable data property with value `true`.
         if (active_sym_unscopables) |unsym| {
             const unsc_list = try JsObject.create(arena, null);
+            // Spec §23.1.3.36 lists these alphabetically; ownKeys order must match.
             const unsc_names = [_][]const u8{
-                "at",            "copyWithin", "entries",  "fill",      "find",
-                "findIndex",     "findLast",   "flat",     "flatMap",   "includes",
-                "keys",          "toReversed", "toSorted", "toSpliced", "values",
-                "findLastIndex",
+                "at",        "copyWithin", "entries",    "fill",       "find",
+                "findIndex", "findLast",   "findLastIndex", "flat",    "flatMap",
+                "includes",  "keys",       "toReversed", "toSorted",   "toSpliced",
+                "values",
             };
             for (unsc_names) |nm| {
                 _ = try unsc_list.defineOwnData(nm, try val_mod.makeBool(arena, true), .{ .writable = true, .enumerable = true, .configurable = true });

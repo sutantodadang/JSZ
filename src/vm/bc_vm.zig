@@ -10,6 +10,7 @@ const val_mod = @import("../value/value.zig");
 const Value = val_mod.Value;
 const JsValue = val_mod.JsValue;
 const JsObject = @import("../object/object.zig").JsObject;
+const MAX_PROTO_DEPTH = @import("../object/object.zig").MAX_PROTO_DEPTH;
 const Op = @import("../bytecode/opcodes.zig").Op;
 const BcFunction = @import("../bytecode/function.zig").BcFunction;
 const build_options = @import("build_options");
@@ -1287,28 +1288,12 @@ pub const BcVm = struct {
         nr.captureIntrinsics();
         snap.restore();
         nr.tagNativeFunctions();
-        // The class desugaring calls these two by name, so a class defined in
-        // this realm's code needs them in this realm's global environment.
-        // (The rest of the `__`-prefixed desugar helpers are still primary-realm
-        // only — a pre-existing gap, not widened here.)
-        {
-            const obj_methods = @import("../runtime/builtins/object_methods.zig");
-            try nr.global_env.define(
-                "__defineNamedMethod__",
-                try val_mod.makeNativeFunction(self.arena, obj_methods.nativeDefineNamedMethod),
-            );
-            try nr.global_env.define(
-                "__nameFn__",
-                try val_mod.makeNativeFunction(self.arena, obj_methods.nativeNameFn),
-            );
-            try nr.global_env.define(
-                "__toPropertyKey__",
-                try val_mod.makeNativeFunction(self.arena, obj_methods.nativeToPropertyKey),
-            );
-            const dstack = @import("../runtime/builtins/disposable_stack.zig");
-            try nr.global_env.define("__usingDispose__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingDispose));
-            try nr.global_env.define("__usingDisposeAsync__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingDisposeAsync));
-        }
+        // The class/destructuring/iterator/generator desugarings call the
+        // `__`-prefixed helpers by name, so code defined in this realm needs the
+        // full set in its own global environment — the same set the primary realm
+        // installs. Previously only a handful were wired up, so e.g. a class with
+        // `extends` (→ `__checkHeritage__`) failed in a `$262.createRealm()` realm.
+        try @import("./isolate.zig").IsolateImpl.defineRealmIntrinsics(nr, self.arena);
         // Cross-realm: make the secondary realm's well-known symbols *shared* with
         // the primary realm by replacing the Symbol constructor's properties directly.
         // Without this, a class defined via g.eval("get [Symbol.species]() { … }")
@@ -2200,7 +2185,7 @@ pub const BcVm = struct {
         var cur: ?*JsObject = root_obj;
         var depth: usize = 0;
         while (cur) |o| {
-            if (depth >= 64) break;
+            if (depth >= MAX_PROTO_DEPTH) break;
             depth += 1;
             // A Proxy in the prototype chain dispatches its own [[Get]] with the
             // original receiver preserved (the root proxy is handled above).
@@ -2250,7 +2235,7 @@ pub const BcVm = struct {
         var cur: ?*JsObject = obj;
         var depth: usize = 0;
         while (cur) |o| {
-            if (depth >= 64) break;
+            if (depth >= MAX_PROTO_DEPTH) break;
             depth += 1;
             if (o.internal_kind == .proxy and o != obj) {
                 return try self.proxySet(obj_val, o, sym_key, value, obj_val);
@@ -2335,7 +2320,7 @@ pub const BcVm = struct {
             var cur: ?*JsObject = if (realm_mod.active_function_proto) |p| p else null;
             var depth: usize = 0;
             while (cur) |o| {
-                if (depth >= 64) break;
+                if (depth >= MAX_PROTO_DEPTH) break;
                 depth += 1;
                 if (o.hasOwn(key)) return true;
                 cur = o.proto;
@@ -2370,7 +2355,7 @@ pub const BcVm = struct {
             var cur: ?*JsObject = if (realm_mod.active_function_proto) |p| p else null;
             var depth: usize = 0;
             while (cur) |o| {
-                if (depth >= 64) break;
+                if (depth >= MAX_PROTO_DEPTH) break;
                 depth += 1;
                 if (key_v.bits != 0 and key_v.unbox() == .symbol) {
                     if (o.getOwnSym(key_v) != null) return true;
@@ -2415,7 +2400,7 @@ pub const BcVm = struct {
             var cur: ?*JsObject = root_obj;
             var depth: usize = 0;
             while (cur) |o| {
-                if (depth >= 64) break;
+                if (depth >= MAX_PROTO_DEPTH) break;
                 depth += 1;
                 // A Proxy in the prototype chain has its own [[HasProperty]];
                 // recurse so the `has` trap (or target walk) is dispatched.
@@ -2439,7 +2424,7 @@ pub const BcVm = struct {
         var cur: ?*JsObject = root_obj;
         var depth: usize = 0;
         while (cur) |o| {
-            if (depth >= 64) break;
+            if (depth >= MAX_PROTO_DEPTH) break;
             depth += 1;
             // A Proxy in the prototype chain has its own [[HasProperty]];
             // recurse so the `has` trap (or target walk) is dispatched.
@@ -2768,7 +2753,7 @@ pub const BcVm = struct {
                     var p: ?*JsObject = obj.proto;
                     var pd: usize = 0;
                     while (p) |pp| : (pd += 1) {
-                        if (pd >= 64) break;
+                        if (pd >= MAX_PROTO_DEPTH) break;
                         if (pp.internal_kind == .module_namespace)
                             return try self.getProp(try val_mod.makeObject(self.arena, pp), key);
                         // A Proxy in the prototype chain dispatches its own [[Get]]
@@ -2805,10 +2790,23 @@ pub const BcVm = struct {
                     const unit = string_proto.cuUnitAt(s, i) orelse return val_mod.makeUndefined(self.arena);
                     return val_mod.makeString(self.arena, try string_proto.cuToString(self.arena, unit));
                 }
-                // Delegate to String.prototype
+                // Delegate to String.prototype (and its own prototype chain up to
+                // Object.prototype). Must honour accessor properties — a getter
+                // defined on String.prototype fires with the primitive string as its
+                // receiver — so walk via findProperty rather than a raw `.get`.
                 const realm_mod = @import("../runtime/realm.zig");
                 if (realm_mod.active_string_proto) |proto| {
-                    if (proto.get(key)) |v| return v;
+                    if (proto.findProperty(key)) |loc| {
+                        const a = loc.holder.attrAt(loc.slot);
+                        const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+                        if (a.is_accessor) {
+                            const getter = accessorMember(raw, "get");
+                            if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                            return try self.callAccessor(getter, obj_val, &[_]Value{});
+                        }
+                        if (raw.bits != 0) return raw;
+                        return val_mod.makeUndefined(self.arena);
+                    }
                 }
                 return val_mod.makeUndefined(self.arena);
             },
@@ -3175,7 +3173,7 @@ pub const BcVm = struct {
                     var cur: ?*JsObject = obj;
                     var depth: usize = 0;
                     while (cur) |c| {
-                        if (depth >= 64) break;
+                        if (depth >= MAX_PROTO_DEPTH) break;
                         depth += 1;
                         if (c.internal_kind == .typed_array) {
                             const td: *typed_array.TypedArrayData = @ptrCast(@alignCast(c.internal_slot.?));
@@ -3200,7 +3198,7 @@ pub const BcVm = struct {
                     var cur: ?*JsObject = obj;
                     var depth: usize = 0;
                     while (cur) |c| {
-                        if (depth >= 64) break;
+                        if (depth >= MAX_PROTO_DEPTH) break;
                         depth += 1;
                         if (c != obj and c.internal_kind == .proxy) {
                             const key_v = try val_mod.makeString(self.arena, key);
@@ -5330,6 +5328,13 @@ pub fn isObjectOperand(v: Value) bool {
         .object, .bc_function => true,
         else => false,
     };
+}
+
+/// True when `v` is a Symbol primitive. Symbols must divert a numeric binary
+/// operator off its plain-number fast path so ToNumeric throws a TypeError
+/// (`sym - 1`, `sym | 0`, …) rather than silently coercing to NaN/0.
+pub fn isSymbolOperand(v: Value) bool {
+    return v.bits != 0 and v.unbox() == .symbol;
 }
 
 /// True when `v` is callable (function-like): a native/bc/legacy function, a
