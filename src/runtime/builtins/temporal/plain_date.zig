@@ -722,6 +722,7 @@ pub fn nativeToZonedDateTime(arena: std.mem.Allocator, this_val: Value, args: []
     const item = if (args.len > 0) args[0] else Value{};
     var zone: timezone.Zone = undefined;
     var time = shared.ISOTime{};
+    var has_time = false;
     if (item.bits != 0 and item.unbox() == .string) {
         zone = try timezone.toZone(arena, item.unbox().string);
     } else if (item.bits != 0 and item.unbox() == .object) {
@@ -730,15 +731,19 @@ pub fn nativeToZonedDateTime(arena: std.mem.Allocator, this_val: Value, args: []
         if (tz_v.bits == 0 or tz_v.unbox() != .string) return realm_mod.throwTypeError(arena, "time zone must be a string");
         zone = try timezone.toZone(arena, tz_v.unbox().string);
         if (try shared.optionGet(arena, o, "plainTime")) |ptv| {
-            time = try pt.toTemporalTime(arena, ptv, .constrain);
+            if (ptv.bits != 0 and ptv.unbox() != .undefined_) {
+                time = try pt.toTemporalTime(arena, ptv, .constrain);
+                has_time = true;
+            }
         }
     } else return realm_mod.throwTypeError(arena, "toZonedDateTime requires a time zone");
-    const wall = @as(i128, shared.isoDateToEpochDays(d.year, d.month, d.day)) * shared.NS_PER_DAY +
-        shared.timeToNanos(time);
     // With no plainTime the result is the start of the day, which a DST jump over
     // midnight can push past 00:00; otherwise the wall time is disambiguated the
     // "compatible" way.
-    const ns = try zoned.disambiguate(arena, zone.id, zone.offset_ns, wall, .compatible);
+    const ns = if (has_time)
+        try zoned.disambiguate(arena, zone.id, zone.offset_ns, @as(i128, shared.isoDateToEpochDays(d.year, d.month, d.day)) * shared.NS_PER_DAY + shared.timeToNanos(time), .compatible)
+    else
+        try zoned.startOfDay(arena, zone.id, zone.offset_ns, d.*);
     return zoned.makeZoned(arena, .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = d.calendar });
 }
 

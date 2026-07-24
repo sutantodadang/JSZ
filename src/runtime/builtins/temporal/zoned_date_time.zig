@@ -1005,10 +1005,21 @@ pub fn nativeStartOfDay(arena: std.mem.Allocator, this_val: Value, _: []const Va
 }
 
 /// GetStartOfDay: the earliest instant of `date` in `tz`. Midnight itself may be
-/// skipped by a DST jump (1919-03-31 in America/Toronto started at 00:30), in
-/// which case the day begins at the transition.
-fn startOfDay(arena: std.mem.Allocator, tz: []const u8, fixed: i128, date: shared.ISODate) !i128 {
-    return disambiguate(arena, tz, fixed, wallNs(.{ .date = date, .time = .{} }), .compatible);
+/// skipped by a DST jump (America/Toronto's clocks went 1919-03-30T23:30 →
+/// 1919-03-31T00:30), and then the day begins at the transition — which is
+/// *earlier* than what "compatible" disambiguation would pick.
+pub fn startOfDay(arena: std.mem.Allocator, tz: []const u8, fixed: i128, date: shared.ISODate) !i128 {
+    _ = arena;
+    const wall = wallNs(.{ .date = date, .time = .{} });
+    const p = possibleInstants(tz, fixed, wall);
+    if (p[0]) |t| return t;
+    const def = tzdata.lookupDef(tz) orelse return wall - fixed;
+    // Midnight is inside the gap [T + offsetBefore, T + offsetAfter), so the
+    // transition T is the first transition at or after `wall - offsetAfter`.
+    const after = zoneOffsetAt(tz, fixed, wall + shared.NS_PER_DAY);
+    const from_sec: i64 = @intCast(@divFloor(wall - after, shared.NS_PER_SECOND) - 1);
+    const t = tzdata.findTransition(def, from_sec, .next) orelse return wall - fixed;
+    return @as(i128, t) * shared.NS_PER_SECOND;
 }
 
 pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
