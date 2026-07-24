@@ -336,6 +336,21 @@ pub const IsolateImpl = struct {
         // fallback resolves to the same (local) prototypes it would default to.
         realm.captureIntrinsics();
 
+        try defineRealmIntrinsics(realm, arena);
+
+        try realm.registerRoots();
+        self.realm = realm;
+        return realm;
+    }
+
+    /// Define the global-environment intrinsics every realm needs: the language
+    /// constants (NaN/Infinity/undefined) and the `__*__` desugar/runtime helpers
+    /// the compiler emits (class heritage checks, NamedEvaluation, destructuring,
+    /// iterators, spread, generators, resource management, module linking, and the
+    /// `$262` cross-realm/host shims). Shared by the primary realm (`ensureRealm`)
+    /// and every secondary realm built by `$262.createRealm` so that class and
+    /// destructuring code works identically in both.
+    pub fn defineRealmIntrinsics(realm: *@import("../runtime/realm.zig").Realm, arena: std.mem.Allocator) !void {
         const nan_val = try val_mod.makeNumber(arena, std.math.nan(f64));
         const inf_val = try val_mod.makeNumber(arena, std.math.inf(f64));
         const undef_val = try val_mod.makeUndefined(arena);
@@ -402,10 +417,6 @@ pub const IsolateImpl = struct {
         // Annex B.3.6 `document.all` stand-in, built on request so the exotic
         // never exists unless a host (the test262 $262 shim) asks for it.
         try realm.global_env.define("__jszMakeHTMLDDA__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeMakeHTMLDDA));
-
-        try realm.registerRoots();
-        self.realm = realm;
-        return realm;
     }
 
     /// Run a compiled `main_func` in the bytecode VM against the persistent realm.

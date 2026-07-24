@@ -1288,28 +1288,12 @@ pub const BcVm = struct {
         nr.captureIntrinsics();
         snap.restore();
         nr.tagNativeFunctions();
-        // The class desugaring calls these two by name, so a class defined in
-        // this realm's code needs them in this realm's global environment.
-        // (The rest of the `__`-prefixed desugar helpers are still primary-realm
-        // only — a pre-existing gap, not widened here.)
-        {
-            const obj_methods = @import("../runtime/builtins/object_methods.zig");
-            try nr.global_env.define(
-                "__defineNamedMethod__",
-                try val_mod.makeNativeFunction(self.arena, obj_methods.nativeDefineNamedMethod),
-            );
-            try nr.global_env.define(
-                "__nameFn__",
-                try val_mod.makeNativeFunction(self.arena, obj_methods.nativeNameFn),
-            );
-            try nr.global_env.define(
-                "__toPropertyKey__",
-                try val_mod.makeNativeFunction(self.arena, obj_methods.nativeToPropertyKey),
-            );
-            const dstack = @import("../runtime/builtins/disposable_stack.zig");
-            try nr.global_env.define("__usingDispose__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingDispose));
-            try nr.global_env.define("__usingDisposeAsync__", try val_mod.makeNativeFunction(self.arena, dstack.nativeUsingDisposeAsync));
-        }
+        // The class/destructuring/iterator/generator desugarings call the
+        // `__`-prefixed helpers by name, so code defined in this realm needs the
+        // full set in its own global environment — the same set the primary realm
+        // installs. Previously only a handful were wired up, so e.g. a class with
+        // `extends` (→ `__checkHeritage__`) failed in a `$262.createRealm()` realm.
+        try @import("./isolate.zig").IsolateImpl.defineRealmIntrinsics(nr, self.arena);
         // Cross-realm: make the secondary realm's well-known symbols *shared* with
         // the primary realm by replacing the Symbol constructor's properties directly.
         // Without this, a class defined via g.eval("get [Symbol.species]() { … }")
