@@ -1028,27 +1028,45 @@ pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, ar
     var dir: ?[]const u8 = null;
     if (arg.bits != 0 and arg.unbox() == .string) {
         dir = arg.unbox().string;
-    } else if (arg.bits != 0 and arg.unbox() == .object) {
-        const o = arg.toPtr().object;
+    } else if (arg.bits == 0 or arg.unbox() == .undefined_) {
+        return realm_mod.throwTypeError(arena, "direction is required");
+    } else {
+        // GetOptionsObject accepts any object — including a callable one.
+        const o = (try shared.getOptionsObject(arena, arg)) orelse
+            return realm_mod.throwTypeError(arena, "invalid direction argument");
         // GetDirectionOption: the value is coerced with ToString (a Symbol is a
         // TypeError) and must be "next"/"previous"; a missing/undefined direction
         // is a RangeError (the option is required with no default).
         const dv = try shared.optionGet(arena, o, "direction") orelse return realm_mod.throwRangeError(arena, "direction is required");
         dir = try shared.valueToString(arena, dv);
-    } else if (arg.bits == 0 or arg.unbox() == .undefined_) {
-        return realm_mod.throwTypeError(arena, "direction is required");
-    } else {
-        return realm_mod.throwTypeError(arena, "invalid direction argument");
     }
     if (!std.mem.eql(u8, dir.?, "next") and !std.mem.eql(u8, dir.?, "previous"))
         return realm_mod.throwRangeError(arena, "direction must be 'next' or 'previous'");
     // Fixed-offset / unknown zones have no transitions. Named IANA zones consult
     // the embedded tzdata for their DST transitions.
     const def = tzdata.lookupDef(z.tz) orelse return val_mod.makeNull(arena);
-    const unix_sec: i64 = @intCast(@divFloor(z.ns, shared.NS_PER_SECOND));
-    const trans_sec = tzdata.findTransition(def, unix_sec, if (std.mem.eql(u8, dir.?, "next")) .next else .previous) orelse
-        return val_mod.makeNull(arena);
-    return instant.makeInstant(arena, @as(i128, trans_sec) * shared.NS_PER_SECOND);
+    const next = std.mem.eql(u8, dir.?, "next");
+    // Transitions land on whole seconds, but the query instant need not: round
+    // *away* from the search direction so a sub-second offset from a transition
+    // still sees (or skips) it correctly.
+    var cur: i64 = @intCast(if (next)
+        @divFloor(z.ns, shared.NS_PER_SECOND)
+    else
+        -@divFloor(-z.ns, shared.NS_PER_SECOND));
+    // The TZDB records rule changes that leave the UTC offset alone (Europe/
+    // London's 1968 switch to permanent BST, the 2038 end-of-table sentinels);
+    // those are not offset transitions, so walk past them.
+    var guard: usize = 0;
+    while (guard < 64) : (guard += 1) {
+        const t = tzdata.findTransition(def, cur, if (next) .next else .previous) orelse
+            return val_mod.makeNull(arena);
+        const after = tzdata.offsetAt(def, t) orelse def.std_offset_sec;
+        const before = tzdata.offsetAt(def, t - 1) orelse def.std_offset_sec;
+        if (after != before)
+            return makeZoned(arena, .{ .ns = @as(i128, t) * shared.NS_PER_SECOND, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
+        cur = t;
+    }
+    return val_mod.makeNull(arena);
 }
 
 pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
