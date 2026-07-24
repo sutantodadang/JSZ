@@ -403,7 +403,9 @@ fn interpretOffset(arena: std.mem.Allocator, tz: []const u8, dt: ISODateTime, zo
             // this wall time; they differ only when none does.
             for (possibleInstants(tz, zone_offset, wall)) |maybe_t| {
                 const t = maybe_t orelse continue;
-                if (zoneOffsetAt(tz, zone_offset, t) == so.ns) return t;
+                const cand = zoneOffsetAt(tz, zone_offset, t);
+                if (cand == so.ns) return t;
+                if (so.match_minutes and roundOffsetToMinutes(cand) == so.ns) return t;
             }
             if (opt == .reject) return realm_mod.throwRangeError(arena, "offset does not match time zone");
             return disambiguate(arena, tz, zone_offset, wall, dis);
@@ -469,7 +471,34 @@ fn extractAnnotations(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
 /// — take the instant verbatim, no zone-match check), or `option` (a numeric
 /// ±HH:MM offset — reconcile it with the zone per the offset option).
 const OffsetBehaviour = enum { wall, exact, option };
-const StringOffset = struct { behaviour: OffsetBehaviour, ns: i128 = 0 };
+const StringOffset = struct {
+    behaviour: OffsetBehaviour,
+    ns: i128 = 0,
+    /// `match-minutes` (ParseISODateTime): an offset written with only hours and
+    /// minutes also matches a zone offset that rounds to it, so
+    /// `-00:45[Africa/Monrovia]` accepts the zone's real -00:44:30.
+    match_minutes: bool = false,
+};
+
+/// True when an offset token carries no seconds — `±HH` or `±HH:MM` in either
+/// the extended or the basic spelling.
+fn offsetIsMinutePrecision(tok: []const u8) bool {
+    var digits: usize = 0;
+    for (tok[1..]) |c| {
+        if (c >= '0' and c <= '9') digits += 1;
+    }
+    return digits <= 4;
+}
+
+/// RoundNumberToIncrement(ns, 60e9, half-expand) — the minute an offset rounds to.
+fn roundOffsetToMinutes(ns: i128) i128 {
+    const minute = shared.NS_PER_MINUTE;
+    const half = @divTrunc(minute, 2);
+    return if (ns >= 0)
+        @divFloor(ns + half, minute) * minute
+    else
+        -(@divFloor(-ns + half, minute) * minute);
+}
 
 /// Extract the trailing UTC offset (ns) and its behaviour from a datetime string.
 fn extractStringOffset(arena: std.mem.Allocator, s: []const u8) !StringOffset {
@@ -481,7 +510,12 @@ fn extractStringOffset(arena: std.mem.Allocator, s: []const u8) !StringOffset {
     while (i < body.len) : (i += 1) {
         const c = body[i];
         if (c == 'Z' or c == 'z') return .{ .behaviour = .exact };
-        if (c == '+' or c == '-') return .{ .behaviour = .option, .ns = try parseOffsetValue(arena, body[i..]) };
+        if (c == '+' or c == '-') return .{
+            .behaviour = .option,
+            .ns = try parseOffsetValue(arena, body[i..]),
+            // Sub-minute precision in the source means an exact match is required.
+            .match_minutes = offsetIsMinutePrecision(body[i..]),
+        };
     }
     return .{ .behaviour = .wall };
 }
@@ -1115,7 +1149,7 @@ fn zonedToString(arena: std.mem.Allocator, ns: i128, offset_ns: i128, tz: []cons
     try buf.append(arena, 'T');
     try buf.appendSlice(arena, try plain_time.timeToStringPrec(arena, tr.time, prec));
     if (show_off == .auto) {
-        try buf.appendSlice(arena, try timezone.formatOffset(arena, offset_ns));
+        try buf.appendSlice(arena, try timezone.formatOffsetRounded(arena, offset_ns));
     }
     if (show_tz != .never) {
         try buf.append(arena, '[');

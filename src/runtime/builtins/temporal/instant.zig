@@ -395,7 +395,7 @@ pub fn nativeToString(arena: std.mem.Allocator, this_val: Value, args: []const V
         const s = try instantToStringPrec(arena, ns + zone.offset_ns, prec);
         var buf = shared.Buf{};
         try buf.appendSlice(arena, s[0 .. s.len - 1]); // drop the "Z"
-        try buf.appendSlice(arena, try timezone.formatOffset(arena, zone.offset_ns));
+        try buf.appendSlice(arena, try timezone.formatOffsetRounded(arena, zone.offset_ns));
         return val_mod.makeString(arena, buf.items);
     }
     return val_mod.makeString(arena, try instantToStringPrec(arena, ns, prec));
