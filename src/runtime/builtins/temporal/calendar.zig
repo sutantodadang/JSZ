@@ -799,29 +799,42 @@ pub fn toIsoFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bo
 pub fn monthDayReference(cal: CalendarId, code_num: u8, code_leap: bool, day: i32, overflow: shared.Overflow) Error!ISODate {
     const limit = shared.isoDateToEpochDays(1972, 12, 31);
     const start_year = fields(cal, shared.epochDaysToISODate(limit)).year;
-    // Two passes: first demanding the exact day, then — only when constraining
-    // — allowing it to be clamped into the month.
-    var pass: u8 = 0;
-    while (pass < 2) : (pass += 1) {
-        if (pass == 1 and overflow == .reject) return error.OutOfRange;
+    // A month/day recurs at least once per leap cycle; the Islamic 30-year cycle
+    // is the longest among the arithmetic calendars. A lunisolar leap month is
+    // far rarer — some (M12L in the Chinese calendar) skip centuries — so those
+    // get a much longer look-back.
+    const limit_years: u32 = if (hasLeapMonths(cal) and code_leap) 400 else 40;
+
+    // Constraining clamps the day to the *longest* this month code ever is, not
+    // to its length in whichever year happens to come first: an Islamic M12-30
+    // is a real month-day, it just only occurs in a leap year — and that is the
+    // year the reference date then lands in.
+    var max_dim: u8 = 0;
+    {
         var y = start_year;
-        // A month/day recurs at least once per leap cycle; the Islamic 30-year
-        // cycle is the longest among the arithmetic calendars. A lunisolar leap
-        // month is far rarer — some (M12L in the Chinese calendar) skip
-        // centuries — so those get a much longer look-back.
-        const limit_years: u32 = if (hasLeapMonths(cal) and code_leap) 400 else 40;
         var tries: u32 = 0;
         while (tries < limit_years) : (tries += 1) {
-            if (monthFromCode(cal, y, code_num, code_leap)) |m| {
-                const dim = daysInMonth(cal, y, m);
-                const use_day = if (pass == 1 and day > dim) dim else day;
-                if (use_day >= 1 and use_day <= dim) {
-                    const iso = try toIso(cal, y, m, use_day, .reject);
-                    if (shared.isoDateToEpochDays(iso.year, iso.month, iso.day) <= limit) return iso;
-                }
-            }
+            if (monthFromCode(cal, y, code_num, code_leap)) |m| max_dim = @max(max_dim, daysInMonth(cal, y, m));
             y -= 1;
         }
+    }
+    if (max_dim == 0) return error.OutOfRange;
+    var use_day = day;
+    if (use_day > max_dim or use_day < 1) {
+        if (overflow == .reject) return error.OutOfRange;
+        use_day = if (use_day < 1) 1 else max_dim;
+    }
+
+    var y = start_year;
+    var tries: u32 = 0;
+    while (tries < limit_years) : (tries += 1) {
+        if (monthFromCode(cal, y, code_num, code_leap)) |m| {
+            if (use_day <= daysInMonth(cal, y, m)) {
+                const iso = try toIso(cal, y, m, use_day, .reject);
+                if (shared.isoDateToEpochDays(iso.year, iso.month, iso.day) <= limit) return iso;
+            }
+        }
+        y -= 1;
     }
     return error.OutOfRange;
 }

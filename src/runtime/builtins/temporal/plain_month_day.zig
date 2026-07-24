@@ -125,6 +125,14 @@ fn monthDayFromBag(arena: std.mem.Allocator, bag: plain_date.DateBag, overflow: 
 
     const has_month = bag.month != null;
     const has_code = bag.month_code != null;
+    if (!has_month and !has_code) return realm_mod.throwTypeError(arena, "missing month or monthCode");
+    // CalendarResolveFields: outside the ISO calendar a *numeric* month names
+    // nothing on its own — which month it is depends on the year (a lunisolar
+    // leap month shifts every later ordinal along) — so a year is required. The
+    // check precedes every range check, so it wins over a month/monthCode
+    // conflict or an out-of-range day.
+    if (bag.calendar != .iso8601 and has_month and bag.year == null and bag.era == null)
+        return realm_mod.throwTypeError(arena, "a numeric month needs a year in a non-ISO calendar");
     var code = shared.MonthCode{ .num = 0 };
     if (bag.month_code) |mc| {
         code = try shared.parseMonthCode(arena, mc, calendar.hasLeapMonths(cal));
@@ -132,8 +140,6 @@ fn monthDayFromBag(arena: std.mem.Allocator, bag: plain_date.DateBag, overflow: 
         const m = floatToI32(mv);
         if (m < 1 or m > 255) return realm_mod.throwRangeError(arena, "month out of range");
         code = .{ .num = @intCast(m) };
-    } else {
-        return realm_mod.throwTypeError(arena, "missing month or monthCode");
     }
 
     // A year (directly or via era/eraYear) pins the month/day to a specific
@@ -141,7 +147,26 @@ fn monthDayFromBag(arena: std.mem.Allocator, bag: plain_date.DateBag, overflow: 
     // resolves which month code it names.
     const has_year = bag.year != null or bag.era != null;
     var resolved_day = day;
-    if (has_year) {
+    if (has_year and cal == .iso8601) {
+        // ISOMonthDayFromFields: the ISO calendar's `year` is consulted *only*
+        // to decide whether February has 29 days — it is never itself range
+        // checked, so `{ year: -999999, monthCode: "M02", day: 29 }` constrains
+        // to the 28th rather than throwing.
+        const y = floatToI32(bag.year.?);
+        var m = code.num;
+        if (m > 12) {
+            if (overflow == .reject) return realm_mod.throwRangeError(arena, "month out of range");
+            m = 12;
+        }
+        if (has_month and has_code and floatToI32(bag.month.?) != @as(i32, m))
+            return realm_mod.throwRangeError(arena, "month and monthCode disagree");
+        const dim = shared.isoDaysInMonth(y, m);
+        if (day > dim or day < 1) {
+            if (overflow == .reject) return realm_mod.throwRangeError(arena, "day out of range");
+            resolved_day = if (day < 1) 1 else dim;
+        }
+        code = .{ .num = m };
+    } else if (has_year) {
         const cal_year = try plain_date.yearFromBag(arena, bag);
         const iso = if (has_code)
             calendar.toIsoFromCode(cal, cal_year, code.num, code.leap, day, overflow) catch
@@ -204,6 +229,8 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     const base = calendar.fields(cal, .{ .year = cur.ref_year, .month = cur.month, .day = cur.day, .calendar = cal });
     var code = shared.MonthCode{ .num = base.code_num, .leap = base.code_leap };
     if (bag.month_code) |mc| code = try shared.parseMonthCode(arena, mc, calendar.hasLeapMonths(cal));
+    if (bag.month != null and bag.year == null and bag.era == null and cal != .iso8601)
+        return realm_mod.throwTypeError(arena, "a numeric month needs a year in a non-ISO calendar");
     if (bag.month) |mv| {
         const m = floatToI32(mv); // readDateBag already rejected month < 1
         if (bag.month_code != null) {
