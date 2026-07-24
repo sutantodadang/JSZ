@@ -113,6 +113,13 @@ pub const JsObject = struct {
     /// survives the round trip (`Object.getPrototypeOf(D) === B`, `typeof` it as
     /// "function"). Null for ordinary objects.
     fn_closure: ?*anyopaque = null,
+    /// §20.2.3: %Function.prototype% is itself a built-in function object — it is
+    /// callable (returning undefined for any arguments) and reports
+    /// `[object Function]` / `typeof "function"`. It cannot carry a `__call__`
+    /// slot to say so, because that slot is found by a prototype-chain walk and
+    /// would make every object inheriting from it look callable too. This flag is
+    /// the brand IsCallable consults instead; only %Function.prototype% sets it.
+    is_callable_intrinsic: bool = false,
     /// Allocator for property storage (the eval arena).
     arena: std.mem.Allocator,
     /// Phase 6 hidden class manager (shared globally).

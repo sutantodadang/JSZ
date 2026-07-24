@@ -544,7 +544,7 @@ fn readIterField(arena: std.mem.Allocator, step: Value, key: []const u8) anyerro
 fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
     const realm_m = @import("../realm.zig");
     const JsObjectT = @import("../../object/object.zig").JsObject;
-    const proto = realm_m.error_proto_TypeError;
+    const proto = realm_m.typeErrorProto();
     const obj = if (realm_m.active_heap) |h|
         try JsObjectT.createOnHeap(h, proto)
     else

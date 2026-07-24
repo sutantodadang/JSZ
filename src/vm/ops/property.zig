@@ -913,6 +913,20 @@ pub inline fn opDeleteProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+/// `proxy.[[GetOwnProperty]](key).[[Enumerable]]` — dispatches the
+/// `getOwnPropertyDescriptor` trap, or reads the target's own attribute when the
+/// handler has none.
+fn proxyKeyEnumerable(self: *BcVm, proxy_obj: *JsObject, key: Value) !bool {
+    if (try proxy_mod.proxyGetOwnPropertyDescriptor(self.arena, proxy_obj, key)) |d| {
+        if (d.bits == 0 or d.unbox() != .object) return false;
+        const e = d.toPtr().object.getOwn("enumerable") orelse return false;
+        return val_mod.toBoolean(e);
+    }
+    const t = proxy_mod.proxyTarget(proxy_obj) orelse return false;
+    if (t.bits == 0 or t.unbox() != .object) return false;
+    return t.toPtr().object.isEnumerable(key.unbox().string);
+}
+
 pub inline fn opGetKeys(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const rdst = code[frame.pc];
@@ -932,6 +946,11 @@ pub inline fn opGetKeys(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             if (try proxy_mod.proxyOwnKeys(self.arena, iv.object)) |keys| {
                 for (keys) |kv| {
                     if (kv.bits != 0 and kv.unbox() == .string) {
+                        // EnumerateObjectProperties (§14.7.5.10 step 2.a.i) calls
+                        // [[GetOwnProperty]] for each key and skips the
+                        // non-enumerable ones — e.g. `length` on an Array target,
+                        // which [[OwnPropertyKeys]] does report.
+                        if (!try proxyKeyEnumerable(self, iv.object, kv)) continue;
                         const idx_str = try std.fmt.allocPrint(self.arena, "{d}", .{count});
                         arr_obj.set(idx_str, kv) catch {};
                         count += 1;

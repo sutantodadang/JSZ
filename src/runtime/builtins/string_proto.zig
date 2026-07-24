@@ -17,7 +17,7 @@ const uprops = @import("unicode_prop_tables.zig");
 /// Used by coerceThis for null/undefined/Symbol receivers.
 fn throwTypeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror![]const u8 {
     const JsObject = @import("../../object/object.zig").JsObject;
-    const obj = try JsObject.create(arena, realm_mod.error_proto_TypeError);
+    const obj = try JsObject.create(arena, realm_mod.typeErrorProto());
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     try obj.set("message", try val_mod.makeString(arena, msg));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
@@ -26,7 +26,7 @@ fn throwTypeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror![]const
 
 fn throwRangeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror![]const u8 {
     const JsObject = @import("../../object/object.zig").JsObject;
-    const obj = try JsObject.create(arena, realm_mod.error_proto_RangeError);
+    const obj = try JsObject.create(arena, realm_mod.rangeErrorProto());
     try obj.set("name", try val_mod.makeString(arena, "RangeError"));
     try obj.set("message", try val_mod.makeString(arena, msg));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
@@ -174,7 +174,7 @@ fn makeRegExpFor(arena: std.mem.Allocator, pattern_val: Value, flags: []const u8
     const cr = try arena.create(regexp_mod.CompiledRegex);
     cr.* = regexp_mod.compileRegex(arena, pat, flags) catch {
         const JsObject = @import("../../object/object.zig").JsObject;
-        const eo = try JsObject.create(arena, realm_mod.error_proto_SyntaxError);
+        const eo = try JsObject.create(arena, realm_mod.syntaxErrorProto());
         try eo.set("name", try val_mod.makeString(arena, "SyntaxError"));
         try eo.set("message", try val_mod.makeString(arena, "Invalid regular expression"));
         realm_mod.pending_exception = try val_mod.makeObject(arena, eo);
@@ -854,7 +854,7 @@ fn isCallable(v: Value) bool {
         // A built-in constructor object (and the Annex B `document.all` stand-in)
         // keeps its [[Call]] behind the `__call__` slot; `invokeCallback` routes
         // both through the VM, so IsCallable has to agree.
-        .object => |obj| obj.internal_kind == .bound_function or obj.get("__call__") != null,
+        .object => |obj| obj.is_callable_intrinsic or obj.internal_kind == .bound_function or obj.get("__call__") != null,
         else => false,
     };
 }
@@ -1172,7 +1172,7 @@ fn argToStr(arena: std.mem.Allocator, a: Value) ![]const u8 {
 fn rejectRegExp(arena: std.mem.Allocator, a: Value) !void {
     if (!(try regexp_mod.isRegExpValue(arena, a))) return;
     const JsObject = @import("../../object/object.zig").JsObject;
-    const obj = try JsObject.create(arena, realm_mod.error_proto_TypeError);
+    const obj = try JsObject.create(arena, realm_mod.typeErrorProto());
     try obj.set("message", try val_mod.makeString(arena, "First argument to String.prototype.startsWith/endsWith/includes must not be a regular expression"));
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
@@ -1464,7 +1464,7 @@ pub fn nativeRepeat(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
     if (n_raw < 0.0 or std.math.isInf(n_raw)) {
         const JsObject = @import("../../object/object.zig").JsObject;
-        const eo = try JsObject.create(arena, realm_mod.error_proto_RangeError);
+        const eo = try JsObject.create(arena, realm_mod.rangeErrorProto());
         try eo.set("message", try val_mod.makeString(arena, "Invalid count value"));
         try eo.set("name", try val_mod.makeString(arena, "RangeError"));
         realm_mod.pending_exception = try val_mod.makeObject(arena, eo);

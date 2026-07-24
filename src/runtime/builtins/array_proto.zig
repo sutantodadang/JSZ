@@ -12,7 +12,7 @@ const typed_array_mod = @import("typed_array.zig");
 /// Throw a TypeError with `msg`, setting realm_mod.pending_exception so the
 /// caught value is a real Error object (not empty).
 fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
-    const obj = try JsObject.create(arena, realm_mod.error_proto_TypeError);
+    const obj = try JsObject.create(arena, realm_mod.typeErrorProto());
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
@@ -21,7 +21,7 @@ fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
 
 /// Throw a RangeError with `msg`, setting realm_mod.pending_exception.
 fn throwRangeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
-    const obj = try JsObject.create(arena, realm_mod.error_proto_RangeError);
+    const obj = try JsObject.create(arena, realm_mod.rangeErrorProto());
     try obj.set("message", try val_mod.makeString(arena, msg));
     try obj.set("name", try val_mod.makeString(arena, "RangeError"));
     realm_mod.pending_exception = try val_mod.makeObject(arena, obj);
@@ -216,7 +216,9 @@ fn flattenInto(
         if (!try genHas(arena, source, i)) continue;
         var elem = try genGet(arena, source, i);
         if (mapper) |m| elem = try callCb(arena, m, mapper_this, elem, @floatFromInt(i), source);
-        const is_arr = elem.bits != 0 and elem.unbox() == .object and elem.toPtr().object.is_array;
+        // §23.1.3.13.1 step 8.c uses IsArray, which unwraps Proxies (and throws on
+        // a revoked one) — a Proxy for an array must still be flattened.
+        const is_arr = try isArraySpec(arena, elem);
         if (depth > 0 and is_arr) {
             const el_len = try genLength(arena, elem);
             try flattenInto(arena, target, elem, el_len, depth - 1, ni, null, mapper_this);
@@ -297,7 +299,7 @@ pub fn valueToJsString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
         .string => |s| s,
         .bigint => try val_mod.bigIntToString(arena, v.unbox().bigint),
         .symbol => {
-            const obj = try JsObject.create(arena, realm_mod.error_proto_TypeError);
+            const obj = try JsObject.create(arena, realm_mod.typeErrorProto());
             try obj.set("message", try val_mod.makeString(arena, "Cannot convert a Symbol value to a string"));
             try obj.set("name", try val_mod.makeString(arena, "TypeError"));
             realm_mod.pending_exception = try val_mod.makeObject(arena, obj);

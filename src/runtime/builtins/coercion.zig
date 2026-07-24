@@ -34,7 +34,7 @@ pub fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .function, .native_function, .bc_function => true,
-        .object => |obj| obj.internal_kind == .bound_function,
+        .object => |obj| obj.is_callable_intrinsic or obj.internal_kind == .bound_function,
         else => false,
     };
 }
@@ -54,7 +54,7 @@ fn getSymMethod(obj: *JsObject, sym: Value) ?Value {
 
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
     // Proto = TypeError.prototype so `caught instanceof TypeError` holds.
-    const proto = realm_mod.error_proto_TypeError;
+    const proto = realm_mod.typeErrorProto();
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, proto)
     else

@@ -512,14 +512,16 @@ fn setTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror!void {
 
 pub fn closeIterator(arena: std.mem.Allocator, iter: Value) void {
     if (iter.bits == 0 or iter.unbox() != .object) return;
-    const ret_fn = iter.toPtr().object.get("return") orelse return;
-    if (!isCallable(ret_fn)) return;
-    // IteratorClose after an abrupt completion: if return() itself throws, that
-    // throw is discarded and the ORIGINAL pending exception propagates (spec
-    // 7.4.11 step 5). Preserve pending_exception across the return() call.
+    // IteratorClose after an abrupt completion: if GetMethod or return() itself
+    // throws, that throw is discarded and the ORIGINAL pending exception
+    // propagates (spec 7.4.11 step 5). Preserve pending_exception across both.
+    // GetMethod is observable, so `return` must be read through the full [[Get]]
+    // -- a bare slot read would skip a `get return()` accessor.
     const saved = realm_mod.pending_exception;
+    defer realm_mod.pending_exception = saved;
+    const ret_fn = jsGet(arena, iter, "return") catch return;
+    if (!isCallable(ret_fn)) return;
     _ = function_proto.invokeCallback(arena, iter, ret_fn, &[_]Value{}) catch {};
-    realm_mod.pending_exception = saved;
 }
 
 /// IteratorClose(iter, NormalCompletion) for the helper's own `.return()` method.
@@ -1863,7 +1865,7 @@ fn isCallable(v: Value) bool {
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .native_function, .bc_function, .function => true,
-        .object => |o| o.get("__call__") != null or o.internal_kind == .bound_function,
+        .object => |o| o.is_callable_intrinsic or o.get("__call__") != null or o.internal_kind == .bound_function,
         else => false,
     };
 }
@@ -1928,6 +1930,11 @@ pub const IterHelperData = struct {
     padding: []Value = &.{}, // longest mode: per-iterator pad value (undefined past end)
     done_flags: []bool = &.{}, // per-iterator exhausted flag (longest mode)
     keys: []Value = &.{}, // zipKeyed: property keys for the result objects
+    /// Has the helper ever been resumed? A zip helper whose `return()` arrives
+    /// while it is still suspended-at-start never enters the "executing" state,
+    /// so a re-entrant next() from a sub-iterator's return() sees "completed"
+    /// (result {undefined, true}) rather than a TypeError.
+    started: bool = false,
 };
 
 /// Iterator record: the source iterator and its cached `next` method
@@ -3227,7 +3234,7 @@ pub fn nativeRetComplVal(arena: std.mem.Allocator, _: Value, args: []const Value
 fn makeTypeErrorVal(arena: std.mem.Allocator, msg: []const u8) !Value {
     // Use the realm's TypeError.prototype so `err instanceof TypeError` and
     // `err.constructor === TypeError` hold (assert.throws relies on both).
-    const proto: ?*JsObject = realm_mod.error_proto_TypeError;
+    const proto: ?*JsObject = realm_mod.typeErrorProto();
     const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, proto) else try JsObject.create(arena, proto);
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
     try obj.set("message", try val_mod.makeString(arena, msg));
@@ -3248,6 +3255,7 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
         unreachable;
     }
     if (d.done) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
+    d.started = true;
     d.running = true;
     defer d.running = false;
     const undef = try val_mod.makeUndefined(arena);
@@ -3454,7 +3462,7 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
                     while (i < n) : (i += 1) {
                         const step = iterStep(arena, d.items[i], d.item_methods[i]) catch |e| {
                             d.done = true;
-                            try zipCloseIterators(arena, d, i, false, true);
+                            try zipCloseIterators(arena, d, i, true, true);
                             return e;
                         };
                         if (step) |v| {
@@ -3502,7 +3510,7 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
                     while (i < n) : (i += 1) {
                         const step = iterStep(arena, d.items[i], d.item_methods[i]) catch |e| {
                             d.done = true;
-                            try zipCloseIterators(arena, d, i, false, true);
+                            try zipCloseIterators(arena, d, i, true, true);
                             return e;
                         };
                         if (step) |v| {
@@ -3543,8 +3551,13 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
                 const obj = if (realm_mod.active_heap) |h| try JsObject.createOnHeap(h, null) else try JsObject.create(arena, null);
                 var i: usize = 0;
                 while (i < n) : (i += 1) {
-                    if (d.keys[i].bits != 0 and d.keys[i].unbox() == .string)
-                        try obj.set(d.keys[i].unbox().string, row[i]);
+                    const k = d.keys[i];
+                    if (k.bits == 0) continue;
+                    if (k.unbox() == .symbol) {
+                        try obj.setSym(k, row[i]);
+                    } else if (k.unbox() == .string) {
+                        try obj.set(k.unbox().string, row[i]);
+                    }
                 }
                 return makeIteratorResult(arena, try val_mod.makeObject(arena, obj), false);
             }
@@ -3565,6 +3578,17 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
 /// return() is discarded and the caller's pending exception is preserved (Throw
 /// completion). Otherwise the FIRST abrupt return() becomes the result and the
 /// remaining iterators are closed with a Throw completion.
+/// IteratorClose the already-opened iterators, LAST opened first (§27.1.4.3
+/// unwinds `iters` in reverse). Used on the abrupt-completion paths in
+/// Iterator.zip/zipKeyed setup, before the helper object exists.
+fn zipCloseOpened(arena: std.mem.Allocator, iters: []const Value) void {
+    var i: usize = iters.len;
+    while (i > 0) {
+        i -= 1;
+        closeIterator(arena, iters[i]);
+    }
+}
+
 fn zipCloseIterators(arena: std.mem.Allocator, d: *IterHelperData, keep_idx: ?usize, only_live: bool, swallow: bool) anyerror!void {
     const outer_saved = realm_mod.pending_exception;
     var captured: ?Value = null;
@@ -3575,7 +3599,16 @@ fn zipCloseIterators(arena: std.mem.Allocator, d: *IterHelperData, keep_idx: ?us
         if (only_live and i < d.done_flags.len and d.done_flags[i]) continue;
         const it = d.items[i];
         if (it.bits == 0 or it.unbox() != .object) continue;
-        const ret_fn = it.toPtr().object.get("return") orelse continue;
+        // GetMethod(iterator, "return") is observable: fire a `get return()`
+        // accessor rather than reading the slot directly.
+        const ret_fn = jsGet(arena, it, "return") catch {
+            if (swallow or captured != null) {
+                realm_mod.pending_exception = outer_saved;
+            } else {
+                captured = realm_mod.pending_exception;
+            }
+            continue;
+        };
         if (!isCallable(ret_fn)) continue;
         if (!swallow and captured == null) {
             // Normal completion so far: a throwing return() becomes the result.
@@ -3633,9 +3666,22 @@ fn nativeIterHelperReturn(arena: std.mem.Allocator, this_val: Value, _: []const 
                     }
                 }
             } else if (d.kind == .zip or d.kind == .zipKeyed) {
+                if (d.running) {
+                    try setTypeError(arena, "Iterator helper is already running");
+                    unreachable;
+                }
                 if (!d.done) {
                     d.done = true;
-                    zipCloseIterators(arena, d, null, true, false) catch {};
+                    // Once resumed at least once, the helper is "executing" while
+                    // it closes, so a sub-iterator's return() that re-enters
+                    // next()/return() sees a TypeError.
+                    d.running = d.started;
+                    defer d.running = false;
+                    // IteratorCloseAll under a normal completion: the FIRST error
+                    // a sub-iterator's return() raises becomes the result of
+                    // `helper.return()` (later ones are discarded), so it must
+                    // propagate rather than be swallowed.
+                    try zipCloseIterators(arena, d, null, true, false);
                 }
             } else if (d.kind == .flatMap) {
                 // flatMap: close the active inner (mapper-result) iterator first,
@@ -3931,8 +3977,11 @@ fn nativeIterFind(arena: std.mem.Allocator, this_val: Value, args: []const Value
 /// NewTarget (the VM applies that post-hoc since we leave pending_new_target).
 fn nativeIteratorCtor(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const nt = realm_mod.pending_new_target;
-    const direct = nt.bits != 0 and nt.unbox() == .object and
-        active_iterator_ctor != null and nt.toPtr().object == active_iterator_ctor.?;
+    // §27.1.1.1: throw when NewTarget is undefined *or* the active function
+    // object. `new Iterator()` threads no explicit NewTarget, which means it is
+    // %Iterator% itself -- only a subclass's super() supplies a different one.
+    const direct = nt.bits == 0 or (nt.unbox() == .object and
+        active_iterator_ctor != null and nt.toPtr().object == active_iterator_ctor.?);
     if (!realm_mod.active_constructing or direct) {
         realm_mod.pending_exception = try makeTypeErrorVal(arena, "Abstract class Iterator not directly constructable");
         return error.JsException;
@@ -4123,9 +4172,9 @@ fn makeZipIterator(arena: std.mem.Allocator, iters: []Value, nexts: []Value, key
 
 /// Read the shared { mode, padding } options for zip/zipKeyed. Reads `mode`
 /// first, then `padding` (only in longest mode), matching the spec order.
-fn readZipOptions(arena: std.mem.Allocator, options: Value, out_mode: *u8, out_padding: *[]Value, collect_padding: bool) anyerror!void {
+fn readZipOptions(arena: std.mem.Allocator, options: Value, out_mode: *u8, out_padding: *Value) anyerror!void {
     out_mode.* = 0;
-    out_padding.* = &.{};
+    out_padding.* = Value{};
     if (options.bits == 0 or options.unbox() == .undefined_) return;
     if (options.unbox() != .object) {
         realm_mod.pending_exception = try makeTypeErrorVal(arena, "Iterator.zip: options is not an object");
@@ -4151,16 +4200,40 @@ fn readZipOptions(arena: std.mem.Allocator, options: Value, out_mode: *u8, out_p
             return error.JsException;
         }
     }
-    if (out_mode.* == 1 and collect_padding) {
+    // `padding` is *read* here (right after `mode`), but only *iterated* once the
+    // sub-iterators are open -- so an abrupt iteration can close them.
+    if (out_mode.* == 1) {
         const pad_v = try ctx.getProp(arena, options, "padding");
         if (!(pad_v.bits == 0 or pad_v.unbox() == .undefined_)) {
             if (pad_v.unbox() != .object) {
                 realm_mod.pending_exception = try makeTypeErrorVal(arena, "Iterator.zip: padding is not an object");
                 return error.JsException;
             }
-            out_padding.* = try collectIterableValues(arena, pad_v);
+            out_padding.* = pad_v;
         }
     }
+}
+
+/// Take at most `n` values from the `padding` iterable, padding the rest with
+/// undefined. An iterator still open after `n` steps is closed (§27.1.2.2 step
+/// 10.d.iv); one that finished on its own is not.
+fn collectPaddingValues(arena: std.mem.Allocator, v: Value, n: usize) anyerror![]Value {
+    const out = try arena.alloc(Value, n);
+    const undef = try val_mod.makeUndefined(arena);
+    @memset(out, undef);
+    if (v.bits == 0) return out;
+    const it = try getIteratorSpec(arena, v);
+    const next_fn = try jsGet(arena, it, "next");
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const step = try iterStep(arena, it, next_fn);
+        const val = step orelse return out; // exhausted early: no close
+        out[i] = val;
+    }
+    // IteratorClose here runs under a *normal* completion, so a throwing
+    // return() (or `return` getter) propagates instead of being discarded.
+    try iteratorCloseThrowing(arena, it);
+    return out;
 }
 
 /// Iterator.zip(iterables[, options]) — zip an iterable of iterables.
@@ -4171,8 +4244,8 @@ fn nativeIteratorZip(arena: std.mem.Allocator, _: Value, args: []const Value) an
         return error.JsException;
     }
     var mode: u8 = 0;
-    var padding: []Value = &.{};
-    try readZipOptions(arena, if (args.len > 1) args[1] else Value{}, &mode, &padding, true);
+    var pad_value: Value = Value{};
+    try readZipOptions(arena, if (args.len > 1) args[1] else Value{}, &mode, &pad_value);
 
     // Open all sub-iterators (after options are read).
     const outer = try getIteratorSpec(arena, iterables);
@@ -4181,23 +4254,30 @@ fn nativeIteratorZip(arena: std.mem.Allocator, _: Value, args: []const Value) an
     var nexts = std.ArrayListUnmanaged(Value){};
     while (true) {
         const step = iterStep(arena, outer, outer_next) catch |e| {
-            for (iters.items) |it| closeIterator(arena, it);
+            zipCloseOpened(arena, iters.items);
             return e;
         };
         const val = step orelse break;
         const it = getIterFlattenable(arena, val) catch |e| {
-            for (iters.items) |o| closeIterator(arena, o);
+            zipCloseOpened(arena, iters.items);
             closeIterator(arena, outer);
             return e;
         };
         const nf = jsGet(arena, it, "next") catch |e| {
-            for (iters.items) |o| closeIterator(arena, o);
+            zipCloseOpened(arena, iters.items);
             closeIterator(arena, it);
             closeIterator(arena, outer);
             return e;
         };
         try iters.append(arena, it);
         try nexts.append(arena, nf);
+    }
+    var padding: []Value = &.{};
+    if (mode == 1) {
+        padding = collectPaddingValues(arena, pad_value, iters.items.len) catch |e| {
+            zipCloseOpened(arena, iters.items);
+            return e;
+        };
     }
     return makeZipIterator(arena, try iters.toOwnedSlice(arena), try nexts.toOwnedSlice(arena), &.{}, mode, padding, false);
 }
@@ -4211,11 +4291,11 @@ fn nativeIteratorZipKeyed(arena: std.mem.Allocator, _: Value, args: []const Valu
         return error.JsException;
     }
     var mode: u8 = 0;
-    var padding_unused: []Value = &.{};
+    var pad_value: Value = Value{};
     const options = if (args.len > 1) args[1] else Value{};
-    // Read only `mode` here; zipKeyed padding is an object keyed by the same
-    // property names, read per key below.
-    try readZipOptions(arena, options, &mode, &padding_unused, false);
+    // zipKeyed's padding is an object keyed by the same property names, so the
+    // shared reader only validates it here; the per-key reads happen below.
+    try readZipOptions(arena, options, &mode, &pad_value);
 
     const iterables_obj = iterables.toPtr().object;
     // Own enumerable string keys of `iterables`, in order (OwnPropertyKeys +
@@ -4229,31 +4309,62 @@ fn nativeIteratorZipKeyed(arena: std.mem.Allocator, _: Value, args: []const Valu
     var nexts = std.ArrayListUnmanaged(Value){};
     // Padding per key (longest mode).
     var padding = std.ArrayListUnmanaged(Value){};
-    const pad_obj: ?Value = if (mode == 1 and options.bits != 0 and options.unbox() == .object) blk: {
-        const pv = try ctx.getProp(arena, options, "padding");
-        break :blk if (pv.bits != 0 and pv.unbox() == .object) pv else null;
-    } else null;
+    const pad_obj: ?Value = if (pad_value.bits != 0) pad_value else null;
 
-    // Own enumerable string keys, snapshotted up front.
-    var key_names = std.ArrayListUnmanaged([]const u8){};
-    for (iterables_obj.ownKeys()) |k| {
-        if (iterables_obj.isEnumerable(k)) try key_names.append(arena, k);
-    }
-    for (key_names.items) |k| {
-        const iterable = try ctx.getProp(arena, iterables, k);
+    // §27.1.2.3 step 6: `iterables.[[OwnPropertyKeys]]()` once, then per key
+    // `[[GetOwnProperty]]` (for [[Enumerable]]) and `[[Get]]` -- interleaved, and
+    // through the MOP so a Proxy's traps are observed. Symbol keys count too.
+    _ = iterables_obj;
+    const reflect_mod = @import("reflect.zig");
+    const keys_arr_v = try reflect_mod.nativeReflectOwnKeys(arena, .{}, &[_]Value{iterables});
+    const keys_arr = keys_arr_v.toPtr().object;
+    const nkeys = keys_arr.getArrayLength();
+    var ki: u32 = 0;
+    while (ki < nkeys) : (ki += 1) {
+        const k = keys_arr.getIndexOwn(ki) orelse continue;
+        const desc = reflect_mod.nativeReflectGetOwnPropertyDescriptor(arena, .{}, &[_]Value{ iterables, k }) catch |e| {
+            zipCloseOpened(arena, iters.items);
+            return e;
+        };
+        if (desc.bits == 0 or desc.unbox() != .object) continue;
+        const enum_v = desc.toPtr().object.getOwn("enumerable") orelse Value{};
+        if (!val_mod.toBoolean(enum_v)) continue;
+        const iterable = (if (k.unbox() == .symbol)
+            ctx.getPropSym(arena, iterables, k)
+        else
+            ctx.getProp(arena, iterables, k.unbox().string)) catch |e| {
+            zipCloseOpened(arena, iters.items);
+            return e;
+        };
         // Spec: keys whose value is undefined are skipped entirely.
         if (iterable.bits == 0 or iterable.unbox() == .undefined_) continue;
         const it = getIterFlattenable(arena, iterable) catch |e| {
-            for (iters.items) |o| closeIterator(arena, o);
+            zipCloseOpened(arena, iters.items);
             return e;
         };
-        const nf = try jsGet(arena, it, "next");
-        try keys.append(arena, try val_mod.makeString(arena, k));
+        const nf = jsGet(arena, it, "next") catch |e| {
+            closeIterator(arena, it);
+            zipCloseOpened(arena, iters.items);
+            return e;
+        };
+        try keys.append(arena, k);
         try iters.append(arena, it);
         try nexts.append(arena, nf);
-        if (mode == 1) {
+    }
+    // Padding is read only after every iterator is open, key by key; an abrupt
+    // read closes them all, last opened first.
+    if (mode == 1) {
+        for (keys.items) |k| {
             var pv: Value = try val_mod.makeUndefined(arena);
-            if (pad_obj) |po| pv = try ctx.getProp(arena, po, k);
+            if (pad_obj) |po| {
+                pv = (if (k.unbox() == .symbol)
+                    ctx.getPropSym(arena, po, k)
+                else
+                    ctx.getProp(arena, po, k.unbox().string)) catch |e| {
+                    zipCloseOpened(arena, iters.items);
+                    return e;
+                };
+            }
             try padding.append(arena, pv);
         }
     }

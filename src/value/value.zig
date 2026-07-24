@@ -51,6 +51,17 @@ pub const NativeFnEntry = struct {
     frozen_intrinsic: bool = false,
 
     pub fn invoke(self: NativeFnEntry, arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+        // Save/restore so both side channels always describe the *innermost*
+        // native currently running. Without this a nested call left the outer
+        // native looking like it belonged to the inner one's realm — which
+        // matters now that error construction reads `g_active_native_realm` to
+        // pick the throwing function's own realm (GetFunctionRealm, §10.2.5).
+        const saved_data = g_active_native_data;
+        const saved_realm = g_active_native_realm;
+        defer {
+            g_active_native_data = saved_data;
+            g_active_native_realm = saved_realm;
+        }
         g_active_native_data = self.data;
         g_active_native_realm = self.realm;
         return self.call(arena, this_val, args);

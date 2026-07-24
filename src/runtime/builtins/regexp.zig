@@ -2449,6 +2449,19 @@ fn atWordBoundary(input: []const u8, pos: usize) bool {
     return before != after;
 }
 
+/// Set while a lookbehind body is being matched: the body may not consume input
+/// beyond the position the lookbehind sits at. The assertion matcher below does
+/// not backtrack, so without this bound a greedy quantifier in `(?<=^\w+)def`
+/// runs to end-of-input and the "must finish exactly here" test never holds.
+/// Cleared while a nested lookahead runs -- that one legitimately reads ahead.
+var lookbehind_limit: ?usize = null;
+
+inline fn withinLookbehind(end: ?usize) ?usize {
+    const e = end orelse return null;
+    if (lookbehind_limit) |lim| if (e > lim) return null;
+    return e;
+}
+
 fn matchNode(
     node: *const RegexNode,
     input: []const u8,
@@ -2457,9 +2470,9 @@ fn matchNode(
     flags: *const CompiledRegex.Flags,
 ) ?usize {
     switch (node.*) {
-        .literal => |ch| return consumeLiteral(input, pos, ch, flags),
-        .char_class => |cc| return consumeClass(input, pos, cc, flags),
-        .dot => return consumeDot(input, pos, flags),
+        .literal => |ch| return withinLookbehind(consumeLiteral(input, pos, ch, flags)),
+        .char_class => |cc| return withinLookbehind(consumeClass(input, pos, cc, flags)),
+        .dot => return withinLookbehind(consumeDot(input, pos, flags)),
         .anchor_start => return if (testBol(input, pos, flags)) pos else null,
         .anchor_end => return if (testEol(input, pos, flags)) pos else null,
         .word_boundary => return if (atWordBoundary(input, pos)) pos else null,
@@ -2511,7 +2524,12 @@ fn matchNode(
         },
         .look_ahead => |la| {
             const saved_caps = caps.*;
+            // A lookahead nested inside a lookbehind reads *forward* past the
+            // lookbehind's position, so the consume bound does not apply to it.
+            const saved_limit = lookbehind_limit;
+            lookbehind_limit = null;
             const matched = matchNode(la.inner, input, pos, caps, flags) != null;
+            lookbehind_limit = saved_limit;
             // §22.2.2.5: a *positive* assertion's captures survive into the rest
             // of the pattern (`/(?=(a+))/.exec("baa")` reports "aa"); a negative
             // one's are discarded, as are those of a failed positive one.
@@ -2521,6 +2539,9 @@ fn matchNode(
         },
         .look_behind => |lb| {
             var matched_lb = false;
+            const saved_limit = lookbehind_limit;
+            lookbehind_limit = pos;
+            defer lookbehind_limit = saved_limit;
             var j: usize = pos + 1;
             while (j > 0) {
                 j -= 1;
@@ -3316,7 +3337,7 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
     const cr = arena.create(CompiledRegex) catch return error.OutOfMemory;
     cr.* = compileRegex(arena, pattern_str, flags_str) catch {
         const msg_s = std.fmt.allocPrint(arena, "Invalid regular expression: /{s}/{s}", .{ pattern_str, flags_str }) catch "Invalid regular expression";
-        const proto_opt = realm_mod.error_proto_SyntaxError;
+        const proto_opt = realm_mod.syntaxErrorProto();
         const proto: ?*JsObject = proto_opt;
         const obj = if (realm_mod.active_heap) |heap|
             JsObject.createOnHeap(heap, proto) catch null
@@ -3351,9 +3372,9 @@ pub fn nativeRegExpCtor(arena: std.mem.Allocator, this_val: Value, args: []const
 fn throwRegExpSyntaxError(arena: std.mem.Allocator, pattern: []const u8, flags: []const u8) anyerror {
     const msg_s = std.fmt.allocPrint(arena, "Invalid regular expression: /{s}/{s}", .{ pattern, flags }) catch "Invalid regular expression";
     const obj = if (realm_mod.active_heap) |heap|
-        JsObject.createOnHeap(heap, realm_mod.error_proto_SyntaxError) catch null
+        JsObject.createOnHeap(heap, realm_mod.syntaxErrorProto()) catch null
     else
-        JsObject.create(arena, realm_mod.error_proto_SyntaxError) catch null;
+        JsObject.create(arena, realm_mod.syntaxErrorProto()) catch null;
     if (obj) |err_obj| {
         err_obj.set("message", val_mod.makeString(arena, msg_s) catch Value{}) catch {};
         err_obj.set("name", val_mod.makeString(arena, "SyntaxError") catch Value{}) catch {};
@@ -3630,7 +3651,10 @@ fn updateLegacyState(s: []const u8, start: usize, end: usize, captures: []const 
 /// The legacy accessors are brand-checked to the %RegExp% constructor itself:
 /// any other receiver (instance, subclass, cross-realm ctor) is a TypeError.
 fn legacyBrandCheck(arena: std.mem.Allocator, this_val: Value) anyerror!void {
-    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object != active_regexp_ctor)
+    // Cross-realm: the receiver must be the %RegExp% of the realm this getter was
+    // created in, not whichever realm's constructor happens to be active.
+    const expected = if (realm_mod.activeNativeRealm()) |r| r.regexp_ctor else active_regexp_ctor;
+    if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object != expected)
         return realm_mod.throwTypeError(arena, "RegExp legacy accessor called on an incompatible receiver");
 }
 
@@ -4369,7 +4393,7 @@ fn regexpFlagBrand(arena: std.mem.Allocator, this_val: Value) anyerror!?*Compile
     if (this_val.bits == 0 or this_val.unbox() != .object)
         return realm_mod.throwTypeError(arena, "RegExp flag getter called on incompatible receiver");
     if (getCompiledRegex(this_val)) |cr| return cr;
-    if (realm_mod.active_regexp_proto) |proto| {
+    if (realm_mod.regexpProtoForActiveNative()) |proto| {
         if (this_val.toPtr().object == proto) return null;
     }
     return realm_mod.throwTypeError(arena, "RegExp flag getter called on incompatible receiver");
@@ -4416,7 +4440,7 @@ pub fn nativeRegExpGetUnicodeSets(arena: std.mem.Allocator, this_val: Value, _: 
     if (getCompiledRegex(this_val) == null) {
         // No [[OriginalFlags]]: only %RegExpPrototype% itself yields undefined;
         // any other object is an incompatible receiver (ES §22.2.6.18 step 3).
-        if (realm_mod.active_regexp_proto) |proto| {
+        if (realm_mod.regexpProtoForActiveNative()) |proto| {
             if (this_val.toPtr().object == proto) return val_mod.makeUndefined(arena);
         }
         return realm_mod.throwTypeError(arena, "RegExp.prototype.unicodeSets called on incompatible receiver");
