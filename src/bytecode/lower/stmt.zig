@@ -436,6 +436,19 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
         try self.compileStmt(init_node, &dummy);
     }
 
+    // CreatePerIterationEnvironment (§14.7.4.3): each iteration of a `for (let
+    // …)` gets its OWN copy of the head bindings, so a closure made in the body
+    // captures that iteration's value rather than the one the loop ended on.
+    // Only `let` is copied — a `const` head binding cannot be updated, so the
+    // spec leaves perIterationLets empty for it.
+    var per_iter = std.ArrayList([]const u8){};
+    if (fs.init) |init_node| try collectPerIterationLets(self, init_node, &per_iter);
+    const has_per_iter = per_iter.items.len > 0;
+    if (has_per_iter) {
+        try emitPerIterationCopy(self, per_iter.items, line, false);
+        self.block_scope_depth += 1;
+    }
+
     try self.resetCompletion(line);
     const loop_start = self.currentOffset();
     var patch_exit: ?usize = null;
@@ -452,8 +465,11 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     try self.loop_stack.append(self.arena, LoopCtx{ .label = loop_lbl, .scope_depth = self.block_scope_depth, .with_depth = self.with_depth, .finally_depth = self.finally_stack.items.len, .continue_finally_depth = self.finally_stack.items.len });
     try self.compileStmt(fs.body, last_expr_reg);
 
-    // continue in a for-loop runs the update expression, then re-tests.
+    // continue in a for-loop runs the update expression, then re-tests. The
+    // per-iteration copy happens first, so the update already writes into the
+    // NEXT iteration's environment (spec order: body, copy, increment).
     const update_offset = self.currentOffset();
+    if (has_per_iter) try emitPerIterationCopy(self, per_iter.items, line, true);
     if (fs.update) |update_node| {
         const r = try self.compileExpr(update_node);
         self.freeReg();
@@ -472,10 +488,56 @@ pub fn lowerForStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{O
     }
     self.resolveLoop(update_offset, exit_offset);
 
+    if (has_per_iter) {
+        try self.emitOp(.EXIT_SCOPE, line);
+        self.block_scope_depth -= 1;
+    }
     if (has_for_scope) {
         try self.emitOp(.EXIT_SCOPE, line);
         self.block_scope_depth -= 1;
     }
+}
+
+/// The `let` names a C-style for head binds, in declaration order. `const` is
+/// excluded (see CreatePerIterationEnvironment). The head is either one
+/// `var_decl` or the transparent block the multi-declarator lowering produces.
+fn collectPerIterationLets(
+    self: *FnCompiler,
+    node: *Node,
+    list: *std.ArrayList([]const u8),
+) error{OutOfMemory}!void {
+    switch (node.kind) {
+        .var_decl => if (node.data.var_decl.kind == .let and node.data.var_decl.name.len > 0)
+            try list.append(self.arena, node.data.var_decl.name),
+        .block_stmt => if (!node.data.block_stmt.lexical_scope) {
+            for (node.data.block_stmt.body) |c| try collectPerIterationLets(self, c, list);
+        },
+        else => {},
+    }
+}
+
+/// Snapshot `names` out of the current environment, swap in a fresh one, and
+/// re-bind them to the snapshot. `replace` pops the previous per-iteration
+/// environment first; the very first call has none to pop. The caller adjusts
+/// `block_scope_depth` (it stays net-unchanged for a replace).
+fn emitPerIterationCopy(
+    self: *FnCompiler,
+    names: []const []const u8,
+    line: u32,
+    replace: bool,
+) error{OutOfMemory}!void {
+    const base_sp = self.sp;
+    var regs = std.ArrayList(u8){};
+    for (names) |nm| {
+        const r = self.allocReg();
+        try self.emitLoad(nm, r, line);
+        try regs.append(self.arena, r);
+    }
+    if (replace) try self.emitOp(.EXIT_SCOPE, line);
+    try self.emitOp(.ENTER_SCOPE, line);
+    for (names) |nm| try self.emitHoistLexical(nm, line);
+    for (names, regs.items) |nm, r| try self.emitInitLexical(nm, r, line, false);
+    self.sp = base_sp;
 }
 
 pub fn lowerReturnStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
