@@ -1201,6 +1201,9 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         },
         // `for (f() in o)`: same Annex B runtime ReferenceError as for-of.
         .call_expr => _ = try self.emitCallTargetRefError(fi.left, line),
+        // A member or destructuring target (`for (x.y in o)`, `for ([a] in o)`)
+        // is assigned exactly as the for-of path does.
+        .array_literal, .object_literal, .member_expr => try self.compileDestructure(fi.left, rkey, line),
         else => {},
     }
     self.freeReg(); // free rkey

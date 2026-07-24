@@ -1217,7 +1217,14 @@ pub fn parseForStmt(p: *Parser) ?*Node {
     }
 
     // Detect for-in: for (var/let/const x in obj) or for (x in obj)
-    if (p.check(.kw_var) or p.check(.kw_let) or p.check(.kw_const)) {
+    // `let` only begins a LexicalDeclaration when a BindingIdentifier / `[` /
+    // `{` follows. In sloppy code `for (let in obj)` is a for-in whose target is
+    // the *identifier* `let`, so leave it to the expression path below.
+    const let_is_decl = !p.check(.kw_let) or p.strict or blk: {
+        const nk = p.peekNext().kind;
+        break :blk nk == .identifier or nk == .left_bracket or nk == .left_brace;
+    };
+    if (let_is_decl and (p.check(.kw_var) or p.check(.kw_let) or p.check(.kw_const))) {
         // save position: for (var/let/const NAME in ...) is for-in
         const decl_kind: ast.VarKind = if (p.check(.kw_var)) .var_ else if (p.check(.kw_let)) .let else .const_;
         _ = p.advance(); // consume declaration keyword
@@ -1330,14 +1337,29 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         // binary operator. Detect this and split it back into a for-in.
         if (expr.kind == .binary_expr and
             expr.data.binary_expr.op == .in and
-            p.check(.right_paren))
+            (p.check(.right_paren) or p.check(.comma)))
         {
+            // The head's right-hand side is an `Expression`, so a comma sequence
+            // may continue past what the binary `in` swallowed:
+            // `for (x in null, {key: 0})` enumerates the object, not `null`.
+            var right = expr.data.binary_expr.right;
+            if (p.check(.comma)) {
+                var seq = std.ArrayList(*Node){};
+                seq.append(p.arena, right) catch return null;
+                while (p.match(.comma)) {
+                    const nxt = p.parseAssignmentExpr() orelse return null;
+                    seq.append(p.arena, nxt) catch return null;
+                }
+                right = p.makeNode(.sequence_expr, start, p.current.start, .{
+                    .sequence_expr = .{ .exprs = seq.items },
+                }) orelse return null;
+            }
             _ = p.expect(.right_paren) orelse return null;
             const body = p.parseStatement() orelse return null;
             return p.makeNode(.for_in_stmt, start, p.current.start, .{
                 .for_in_stmt = .{
                     .left = expr.data.binary_expr.left,
-                    .right = expr.data.binary_expr.right,
+                    .right = right,
                     .body = body,
                     .iterate_values = false,
                 },
