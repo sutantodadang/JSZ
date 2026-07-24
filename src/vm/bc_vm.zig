@@ -2817,6 +2817,25 @@ pub const BcVm = struct {
                 // materialized lazily; other own props live on the backing
                 // object; everything else delegates to Function.prototype.
                 if (std.mem.eql(u8, key, "prototype")) {
+                    // An own "prototype" (re)defined via Object.defineProperty —
+                    // e.g. an accessor on a method that has no natural prototype —
+                    // takes precedence and must fire its getter. closurePrototype
+                    // only handles the lazily-synthesized data property.
+                    if (closure.obj) |op| {
+                        const o: *JsObject = @ptrCast(@alignCast(op));
+                        if (o.hasOwn("prototype")) {
+                            const slot = o.shape.key_to_slot.get("prototype").?;
+                            const a = o.attrAt(slot);
+                            const raw = if (slot < o.slots.items.len) o.slots.items[slot] else Value{};
+                            if (a.is_accessor) {
+                                const getter = accessorMember(raw, "get");
+                                if (!isCallable(getter)) return val_mod.makeUndefined(self.arena);
+                                return try self.callAccessor(getter, obj_val, &[_]Value{});
+                            }
+                            if (raw.bits != 0) return raw;
+                            return val_mod.makeUndefined(self.arena);
+                        }
+                    }
                     return try self.closurePrototype(obj_val, closure);
                 }
                 // Generators inherit caller/arguments %ThrowTypeError% accessors via
