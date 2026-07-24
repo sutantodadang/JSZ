@@ -584,6 +584,11 @@ pub fn parseUsingDeclStmt(p: *Parser, is_await: bool) ?*Node {
 
 pub fn parseStatement(p: *Parser) ?*Node {
     if (p.had_error) return null;
+    // A statement can begin with a RegularExpressionLiteral, but the lexer read
+    // `/` as division because the token before it was a `}` (see
+    // Parser.relexCurrentAsRegex). Statement position settles it: `{}/re/`,
+    // `class A{}/re/` and `function f(){}/re/` are a declaration then a regex.
+    p.relexCurrentAsRegex();
     // Explicit resource management: `using x = ...` / `await using x = ...`
     // declarations. Only recognized when a binding identifier follows (see
     // atUsingDecl/atAwaitUsingDecl); otherwise `using`/`await` stay ordinary.

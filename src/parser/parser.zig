@@ -398,6 +398,18 @@ pub const Parser = struct {
         return prev;
     }
 
+    /// Re-lex `current` as a RegularExpressionLiteral. The lexer decides
+    /// regex-vs-division from the previous token alone, and treats `/` after `}`
+    /// as division — right for `{valueOf(){}} / 1`, wrong for a *statement*
+    /// `{}/re/` or `class A{}/re/`. Only the parser knows which position it is
+    /// in, so it calls this when a statement turns out to begin with `/`.
+    pub fn relexCurrentAsRegex(self: *Parser) void {
+        if (self.current.kind != .slash and self.current.kind != .slash_eq) return;
+        const t = self.current;
+        self.current = self.lexer.relexAsRegexAt(t.start, t.line, t.column) catch return;
+        self.current.line_terminator_before = t.line_terminator_before;
+    }
+
     pub fn check(self: *const Parser, kind: TokenKind) bool {
         return self.current.kind == kind;
     }

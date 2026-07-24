@@ -29,6 +29,24 @@ pub const Lexer = struct {
     /// of the Script grammar only. Cleared by `Parser.parseModule`, where the
     /// same character sequences must stay punctuators (and so a SyntaxError).
     allow_html_comments: bool = true,
+    /// One-shot override for `slashIsRegex`. `/` after `}` is lexed as division
+    /// because a `}` far more often closes an object literal used as an operand,
+    /// but the parser knows when it is at statement position (`{}/re/`,
+    /// `class A{}/re/`) and re-lexes the token with this set. Cleared by the
+    /// next `next()` call.
+    force_regex_once: bool = false,
+
+    /// Rewind to `pos` and pull one token, forcing a leading `/` to lex as a
+    /// RegularExpressionLiteral. `line`/`column` are restored by the caller's
+    /// saved token, so only the scan position matters here.
+    pub fn relexAsRegexAt(self: *Lexer, pos: usize, line: u32, column: u32) LexError!Token {
+        self.pos = pos;
+        self.line = line;
+        self.column = column;
+        self.force_regex_once = true;
+        defer self.force_regex_once = false;
+        return self.next();
+    }
 
     pub fn init(source: []const u8, allocator: std.mem.Allocator) Lexer {
         return Lexer{
@@ -222,6 +240,7 @@ pub const Lexer = struct {
     /// ES5 spec: regex is allowed when the previous token is one of the listed kinds
     /// or there is no previous token.
     fn slashIsRegex(self: *const Lexer) bool {
+        if (self.force_regex_once) return true;
         const p = self.prev_kind orelse return true;
         return switch (p) {
             .left_paren,

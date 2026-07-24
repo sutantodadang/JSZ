@@ -1186,21 +1186,50 @@ fn readSpecifierAt(
     return resolveSpec(allocator, importer_id, lit) catch null;
 }
 
-/// True when the byte before `pos` cannot end a member access, i.e. the word at
-/// `pos` is a real keyword rather than `obj.import` / `obj.export`.
-fn notAfterDot(src: []const u8, pos: usize) bool {
-    if (pos == 0) return true;
-    var k = pos;
-    while (k > 0) {
-        const c = src[k - 1];
-        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
-            k -= 1;
-            continue;
+/// Forward token walk shared by the export-entry scanners: skips comments,
+/// strings and template literals, and yields each identifier-like word together
+/// with the previous significant character — so `obj.export` can be told apart
+/// from a real `export` declaration without scanning backwards over comment text
+/// (a license header ending in "file." would otherwise look like a member access).
+const WordScan = struct {
+    src: []const u8,
+    i: usize = 0,
+    /// Last significant (non-whitespace, non-comment) byte before `word`.
+    prev: u8 = 0,
+
+    const Word = struct { text: []const u8, prev: u8, end: usize };
+
+    fn next(self: *WordScan) ?Word {
+        const src = self.src;
+        while (self.i < src.len) {
+            const c = src[self.i];
+            if (c == '/' and self.i + 1 < src.len and (src[self.i + 1] == '/' or src[self.i + 1] == '*')) {
+                const nxt = skipWsComments(src, self.i);
+                self.i = if (nxt > self.i) nxt else self.i + 1;
+                continue;
+            }
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                self.i += 1;
+                continue;
+            }
+            if (c == '`' or c == '"' or c == '\'') {
+                self.i = skipQuoted(src, self.i);
+                self.prev = c;
+                continue;
+            }
+            if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
+                const start = self.i;
+                while (self.i < src.len and isIdentChar(src[self.i])) : (self.i += 1) {}
+                const was = self.prev;
+                self.prev = src[self.i - 1];
+                return .{ .text = src[start..self.i], .prev = was, .end = self.i };
+            }
+            self.prev = c;
+            self.i += 1;
         }
-        return c != '.';
+        return null;
     }
-    return true;
-}
+};
 
 /// Collect the local-name → (module, import name) bindings introduced by the
 /// `import` declarations in `src`. Sets `unsure` on any form it cannot model.
@@ -1211,33 +1240,17 @@ fn scanImportBindings(
     unsure: *bool,
     allocator: std.mem.Allocator,
 ) void {
-    var i: usize = 0;
-    while (i < src.len) {
-        const c = src[i];
-        if (c == '/' and i + 1 < src.len and (src[i + 1] == '/' or src[i + 1] == '*')) {
-            const next = skipWsComments(src, i);
-            i = if (next > i) next else i + 1;
-            continue;
-        }
-        if (c == '`' or c == '"' or c == '\'') {
-            i = skipQuoted(src, i);
-            continue;
-        }
-        if (!(std.ascii.isAlphabetic(c) or c == '_' or c == '$')) {
-            i += 1;
-            continue;
-        }
-        const ws = i;
-        while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
-        if (!std.mem.eql(u8, src[ws..i], "import")) continue;
-        if (!notAfterDot(src, ws)) continue;
-        var j = skipWsComments(src, i);
+    var scan = WordScan{ .src = src };
+    while (scan.next()) |w| {
+        if (!std.mem.eql(u8, w.text, "import")) continue;
+        if (w.prev == '.') continue;
+        var j = skipWsComments(src, w.end);
         if (j >= src.len) continue;
         // `import(...)` (dynamic) and `import.meta` are not declarations.
         if (src[j] == '(' or src[j] == '.') continue;
         // `import 'spec'` — side effect only, no bindings.
         if (src[j] == '"' or src[j] == '\'') {
-            i = skipQuoted(src, j);
+            scan.i = skipQuoted(src, j);
             continue;
         }
         // `import defer * as ns from 'spec'` / `import source x from 'spec'`.
@@ -1316,17 +1329,17 @@ fn scanImportBindings(
         }
         if (!ok) {
             unsure.* = true;
-            i = j;
+            scan.i = j;
             continue;
         }
         if (!matchKeyword(src, &j, "from")) {
             unsure.* = true;
-            i = j;
+            scan.i = j;
             continue;
         }
         const mod_id = readSpecifierAt(src, &j, importer_id, allocator) orelse {
             unsure.* = true;
-            i = j;
+            scan.i = j;
             continue;
         };
         for (pending.items) |pr| {
@@ -1335,7 +1348,7 @@ fn scanImportBindings(
         for (namespaces.items) |ns| {
             out.put(ns, .{ .module_id = mod_id, .import_name = "" }) catch {};
         }
-        i = j;
+        scan.i = j;
     }
 }
 
@@ -1363,27 +1376,11 @@ fn scanExportEntries(src: []const u8, importer_id: []const u8, allocator: std.me
     var imports = std.StringHashMap(ImportBinding).init(allocator);
     scanImportBindings(src, importer_id, &imports, &unsure, allocator);
 
-    var i: usize = 0;
-    while (i < src.len) {
-        const c = src[i];
-        if (c == '/' and i + 1 < src.len and (src[i + 1] == '/' or src[i + 1] == '*')) {
-            const next = skipWsComments(src, i);
-            i = if (next > i) next else i + 1;
-            continue;
-        }
-        if (c == '`' or c == '"' or c == '\'') {
-            i = skipQuoted(src, i);
-            continue;
-        }
-        if (!(std.ascii.isAlphabetic(c) or c == '_' or c == '$')) {
-            i += 1;
-            continue;
-        }
-        const ws = i;
-        while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
-        if (!std.mem.eql(u8, src[ws..i], "export")) continue;
-        if (!notAfterDot(src, ws)) continue;
-        i = scanOneExport(src, i, importer_id, &imports, &locals, &indirects, &stars, &unsure, allocator);
+    var scan = WordScan{ .src = src };
+    while (scan.next()) |w| {
+        if (!std.mem.eql(u8, w.text, "export")) continue;
+        if (w.prev == '.') continue;
+        scan.i = scanOneExport(src, w.end, importer_id, &imports, &locals, &indirects, &stars, &unsure, allocator);
     }
     return .{
         .locals = locals.items,
