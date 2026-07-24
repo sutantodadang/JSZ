@@ -654,6 +654,11 @@ pub const Parser = struct {
             stmts = final_stmts;
         }
         self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
+        // Explicit resource management is handled by an AST desugar, not by
+        // opcodes; the top level of a Script/Module is a `using` scope too, and
+        // without this a top-level `await using` reached the (dead) USING_*
+        // opcode path in the VM. No-op when the source declares no resources.
+        stmts.items = stmt_mod.desugarUsingScope(self, stmts.items, 0);
         if (self.had_error) {
             return ParseResult{ .err = self.error_info orelse ParseError{
                 .message = "parse error",
@@ -726,6 +731,11 @@ pub const Parser = struct {
             stmts = final_stmts;
         }
         self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
+        // Explicit resource management is handled by an AST desugar, not by
+        // opcodes; the top level of a Script/Module is a `using` scope too, and
+        // without this a top-level `await using` reached the (dead) USING_*
+        // opcode path in the VM. No-op when the source declares no resources.
+        stmts.items = stmt_mod.desugarUsingScope(self, stmts.items, 0);
         if (self.had_error) {
             return ParseResult{ .err = self.error_info orelse ParseError{
                 .message = "parse error",
@@ -1682,6 +1692,11 @@ pub const Parser = struct {
             self.drainExtraStmts(&stmts);
         }
         self.applyLiveBindings(stmts.items, li_start, le_start, la_start);
+        // Explicit resource management is handled by an AST desugar, not by
+        // opcodes; the top level of a Script/Module is a `using` scope too, and
+        // without this a top-level `await using` reached the (dead) USING_*
+        // opcode path in the VM. No-op when the source declares no resources.
+        stmts.items = stmt_mod.desugarUsingScope(self, stmts.items, 0);
         const is_strict = hasUseStrict(stmts.items);
         return .{ .stmts = stmts.items, .is_strict = is_strict };
     }
