@@ -353,6 +353,11 @@ const ClassMember = struct {
     /// (default) means "no real span" → toString falls back to native format.
     src_start: u32 = 0,
     src_end: u32 = 0,
+    /// This member's body contains a SuperProperty. A base class has a home
+    /// object too, so `super.x` is legal in it, but binding `__sproto__` in
+    /// every method would cost an `Object.getPrototypeOf` per call — emit it
+    /// only where it is read. See Parser.super_prop_count.
+    uses_super_prop: bool = false,
 };
 
 /// A parsed class field (`name = init;`, `#name = init;`, `[expr] = init;`,
@@ -372,6 +377,8 @@ const ClassField = struct {
     /// statements instead of a key/initializer; kept in the same list as static
     /// fields because the two run interleaved, in source order.
     static_block: ?[]*Node = null,
+    /// See ClassMember.uses_super_prop.
+    uses_super_prop: bool = false,
 };
 
 const ClassBodyParse = struct {
@@ -418,6 +425,9 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         if (p.match(.semicolon)) continue;
 
+        // Snapshot: any SuperProperty desugared while parsing this member's
+        // initializer/body belongs to it, so `__sproto__` gets bound there.
+        const super_mark = p.super_prop_count;
         var is_static = false;
         if (p.check(.identifier) and std.mem.eql(u8, p.current.value_str, "static") and !nextTokenEndsName(p)) {
             is_static = true;
@@ -507,6 +517,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
                 .name = name,
                 .computed_key = computed_key,
                 .init = init_expr,
+                .uses_super_prop = p.super_prop_count != super_mark,
             }) catch return null;
             continue;
         }
@@ -543,6 +554,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
                 .body = mbody,
                 .src_start = member_start,
                 .src_end = member_end,
+                .uses_super_prop = p.super_prop_count != super_mark,
             }) catch return null;
         }
     }
@@ -1063,7 +1075,7 @@ fn appendDerivedInstanceFields(p: *Parser, list: *std.ArrayList(*Node), fields: 
 /// initializer is therefore wrapped in `(function(){ return <init>; }).call(C)`
 /// rather than assigned directly. A bare `static f = 1` (no `this`) gets the
 /// same wrapper; the result is identical.
-fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node {
+fn makeStaticFieldInit(p: *Parser, class_name: []const u8, super_name: ?[]const u8, f: ClassField) ?*Node {
     const s = p.current.start;
     // ES2022 static initialization block: same `this`-is-the-class wrapper as a
     // static field, but the block's whole statement list is the body and there
@@ -1087,8 +1099,21 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
 
     // Wrap: (function () { return <init>; }).call(ClassName)
     const ret_stmt = p.makeNode(.return_stmt, s, s, .{ .return_stmt = raw_init }) orelse return null;
-    const body = p.arena.alloc(*Node, 1) catch return null;
-    body[0] = ret_stmt;
+    const body = blk_body: {
+        if (!f.uses_super_prop) {
+            const b = p.arena.alloc(*Node, 1) catch return null;
+            b[0] = ret_stmt;
+            break :blk_body b;
+        }
+        // The initializer's home object is the constructor, so `super.x` reads
+        // through its [[Prototype]] — the superclass for a derived class, and
+        // %Function.prototype% (via getPrototypeOf) for a base one.
+        const b = p.arena.alloc(*Node, 3) catch return null;
+        b[0] = superProtoDecl(p, class_name, super_name, true) orelse return null;
+        b[1] = superThisDecl(p) orelse return null;
+        b[2] = ret_stmt;
+        break :blk_body b;
+    };
     const init_fn = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
         .name = null,
         .params = &[_][]const u8{},
@@ -1132,13 +1157,23 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, f: ClassField) ?*Node
 /// Prepend instance-field initializers to a base-class constructor body. Returns
 /// the new body. Only used for base classes (no `extends`); for derived classes
 /// `this` is not available until after `super()` so field init is skipped.
-fn prependInstanceFields(p: *Parser, ctor_body: []*Node, fields: []const ClassField) ?[]*Node {
+fn prependInstanceFields(p: *Parser, class_name: []const u8, ctor_body: []*Node, fields: []const ClassField) ?[]*Node {
     var any = false;
+    var any_super = false;
     for (fields) |f| {
-        if (!f.is_static) any = true;
+        if (f.is_static) continue;
+        any = true;
+        if (f.uses_super_prop) any_super = true;
     }
     if (!any) return ctor_body;
     var stmts = std.ArrayList(*Node){};
+    // An instance field of a base class has `C.prototype` as its home object, so
+    // `super.x` in an initializer reads through that object's [[Prototype]].
+    // Bound once at the head of the constructor, ahead of every field install.
+    if (any_super) {
+        stmts.append(p.arena, superProtoDecl(p, class_name, null, false) orelse return null) catch return null;
+        stmts.append(p.arena, superThisDecl(p) orelse return null) catch return null;
+    }
     for (fields) |f| {
         if (f.is_static) continue;
         const st = makeInstanceFieldInit(p, f) orelse return null;
@@ -1204,6 +1239,42 @@ fn makeCtorBackLink(p: *Parser, class_name: []const u8) ?*Node {
     return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = call });
 }
 
+/// `var __sproto__ = <property base for super.x>` — the superclass prototype (or
+/// the superclass itself, for a static element) when there is a heritage clause,
+/// otherwise the home object's own [[Prototype]]. See `homeObjectNode`.
+fn superProtoDecl(p: *Parser, class_name: []const u8, super_name: ?[]const u8, is_static: bool) ?*Node {
+    const s = p.current.start;
+    const base: *Node = if (super_name) |sname| blk: {
+        const sup = nodeIdent(p, sname) orelse return null;
+        const raw = if (is_static) sup else (nodeMember(p, sup, "prototype") orelse return null);
+        const sup_null = p.makeNode(.null_literal, s, s, .{ .null_literal = {} }) orelse return null;
+        break :blk nullHeritageGuard(p, sname, raw, sup_null, s) orelse return null;
+    } else homeObjectNode(p, class_name, is_static) orelse return null;
+    return p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__sproto__", .init = base } });
+}
+
+/// `var __superthis = this` — the Receiver a `super.x` read/write uses.
+fn superThisDecl(p: *Parser) ?*Node {
+    const s = p.current.start;
+    const this_node = p.makeNode(.this_expr, s, s, .{ .this_expr = {} }) orelse return null;
+    return p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__superthis", .init = this_node } });
+}
+
+/// `Object.getPrototypeOf(<Cls>.prototype)` — or `Object.getPrototypeOf(<Cls>)`
+/// for a static element. This is the property base `super.x` reads in a BASE
+/// class: its home object is the class prototype (resp. the constructor), and
+/// SuperProperty resolves against that object's [[Prototype]].
+fn homeObjectNode(p: *Parser, class_name: []const u8, is_static: bool) ?*Node {
+    const s = p.current.start;
+    const cls = nodeIdent(p, class_name) orelse return null;
+    const home = if (is_static) cls else (nodeMember(p, cls, "prototype") orelse return null);
+    const id_obj = nodeIdent(p, "Object") orelse return null;
+    const callee = nodeMember(p, id_obj, "getPrototypeOf") orelse return null;
+    var args = std.ArrayList(*Node){};
+    args.append(p.arena, home) catch return null;
+    return p.makeNode(.call_expr, s, s, .{ .call_expr = .{ .callee = callee, .args = args.items } });
+}
+
 /// Desugar one class member into a single statement (a property assignment for
 /// methods, or `Object.defineProperty(target, key, { get|set, configurable,
 /// enumerable })` for accessors). `target` is the constructor for static members
@@ -1245,6 +1316,20 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         const sthis_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__superthis", .init = this_node } }) orelse return null;
         var wb = std.ArrayList(*Node){};
         wb.append(p.arena, sup_decl) catch return null;
+        wb.append(p.arena, sproto_decl) catch return null;
+        wb.append(p.arena, sthis_decl) catch return null;
+        for (m.body) |st| wb.append(p.arena, st) catch return null;
+        body = wb.items;
+    } else if (m.uses_super_prop) {
+        // A BASE class has a home object too (`C.prototype`, or `C` for a static
+        // member), so `super.x` is legal in its methods — it just reads through
+        // the home object's own [[Prototype]] rather than a named superclass.
+        // Only emitted where the body actually mentions `super`.
+        const home = homeObjectNode(p, class_name, m.is_static) orelse return null;
+        const sproto_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__sproto__", .init = home } }) orelse return null;
+        const this_node = p.makeNode(.this_expr, s, s, .{ .this_expr = {} }) orelse return null;
+        const sthis_decl = p.makeNode(.var_decl, s, s, .{ .var_decl = .{ .kind = .var_, .name = "__superthis", .init = this_node } }) orelse return null;
+        var wb = std.ArrayList(*Node){};
         wb.append(p.arena, sproto_decl) catch return null;
         wb.append(p.arena, sthis_decl) catch return null;
         for (m.body) |st| wb.append(p.arena, st) catch return null;
@@ -1717,7 +1802,7 @@ fn emitClassStatements(
         ctor_body_effective = ctor_stmts.items;
     } else {
         // Base class: instance fields initialize at the start of the constructor.
-        ctor_body_effective = prependInstanceFields(p, ctor_body_effective, fields) orelse return null;
+        ctor_body_effective = prependInstanceFields(p, class_name, ctor_body_effective, fields) orelse return null;
     }
 
     // var ClassName = function ClassName(...) { ... }
@@ -1826,7 +1911,7 @@ fn emitClassStatements(
     // static fields: `ClassName.<name> = <init>` after the class is defined.
     for (fields) |f| {
         if (!f.is_static) continue;
-        const stmt = makeStaticFieldInit(p, class_name, f) orelse return null;
+        const stmt = makeStaticFieldInit(p, class_name, super_name, f) orelse return null;
         out.append(p.arena, stmt) catch return null;
     }
 

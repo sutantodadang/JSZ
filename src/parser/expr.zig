@@ -1505,7 +1505,10 @@ pub fn rewriteSuperCall(p: *Parser, call_node: *Node) ?*Node {
             const rg_callee = p.makeNode(.member_expr, start, end, .{
                 .member_expr = .{ .object = id_reflect, .property = id_get, .computed = false },
             }) orelse return null;
-            const id_proto = p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
+            const id_proto = blk_sp: {
+        p.super_prop_count += 1;
+        break :blk_sp p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
+    };
             const this_recv = p.makeNode(.this_expr, start, end, .{ .this_expr = {} }) orelse return null;
             var rg_args = std.ArrayList(*Node){};
             rg_args.append(p.arena, id_proto) catch return null;
@@ -1557,7 +1560,10 @@ pub fn rewriteSuperPropAssign(p: *Parser, op: ast.AssignOp, target: *Node, value
     const callee = p.makeNode(.member_expr, start, end, .{
         .member_expr = .{ .object = id_reflect, .property = id_set, .computed = false },
     }) orelse return null;
-    const id_proto = p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
+    const id_proto = blk_sp: {
+        p.super_prop_count += 1;
+        break :blk_sp p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
+    };
     const id_recv = p.makeNode(.identifier, start, end, .{ .identifier = "__superthis" }) orelse return null;
     var args = std.ArrayList(*Node){};
     args.append(p.arena, id_proto) catch return null;
@@ -1603,7 +1609,10 @@ fn rewriteSuperPropRead(p: *Parser, me_node: *Node) ?*Node {
     const callee = p.makeNode(.member_expr, start, end, .{
         .member_expr = .{ .object = id_reflect, .property = id_get, .computed = false },
     }) orelse return null;
-    const id_proto = p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
+    const id_proto = blk_sp: {
+        p.super_prop_count += 1;
+        break :blk_sp p.makeNode(.identifier, start, end, .{ .identifier = "__sproto__" }) orelse return null;
+    };
     const id_recv = p.makeNode(.identifier, start, end, .{ .identifier = "__superthis" }) orelse return null;
     var args = std.ArrayList(*Node){};
     args.append(p.arena, id_proto) catch return null;
