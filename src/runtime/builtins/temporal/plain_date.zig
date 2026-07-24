@@ -761,12 +761,26 @@ pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, args: []
 pub fn nativeToPlainYearMonth(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const d = try requireDate(arena, this_val);
     const pym = @import("plain_year_month.zig");
+    // The calendar comes along, and with it the reference day: a PlainYearMonth
+    // stores the first ISO day of that *calendar* month, not of the ISO month.
+    if (d.calendar != .iso8601) {
+        const f = calendar.fields(d.calendar, d.*);
+        const first = calendar.toIso(d.calendar, f.year, f.month, 1, .constrain) catch
+            return realm_mod.throwRangeError(arena, "year-month out of range");
+        return pym.makeYearMonth(arena, .{ .year = first.year, .month = first.month, .day = first.day, .calendar = d.calendar });
+    }
     return pym.makeYearMonth(arena, .{ .year = d.year, .month = d.month, .day = 1 });
 }
 
 pub fn nativeToPlainMonthDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const d = try requireDate(arena, this_val);
     const pmd = @import("plain_month_day.zig");
+    if (d.calendar != .iso8601) {
+        const f = calendar.fields(d.calendar, d.*);
+        const ref = calendar.monthDayReference(d.calendar, f.code_num, f.code_leap, f.day, .constrain) catch
+            return realm_mod.throwRangeError(arena, "month-day out of range");
+        return pmd.makeMonthDay(arena, .{ .month = ref.month, .day = ref.day, .ref_year = ref.year, .calendar = d.calendar });
+    }
     return pmd.makeMonthDay(arena, .{ .month = d.month, .day = d.day, .ref_year = 1972 });
 }
 
@@ -860,7 +874,7 @@ fn getDayOfWeek(arena: std.mem.Allocator, this_val: Value, _: []const Value) any
 }
 fn getDayOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const d = try requireDate(arena, this_val);
-    return val_mod.makeNumber(arena, @floatFromInt(shared.dayOfYear(d.*)));
+    return val_mod.makeNumber(arena, @floatFromInt(calendar.dayOfYear(d.*.calendar, d.*)));
 }
 fn getWeekOfYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const d = try requireDate(arena, this_val);

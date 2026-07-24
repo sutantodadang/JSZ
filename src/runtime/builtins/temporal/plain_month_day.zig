@@ -95,7 +95,14 @@ pub fn toTemporalMonthDay(arena: std.mem.Allocator, v: Value, overflow: shared.O
         return try monthDayFromFields(arena, v.toPtr().object, overflow);
     }
     if (v.bits != 0 and v.unbox() == .string) {
-        return shared.parseISOMonthDay(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid PlainMonthDay string");
+        const md = shared.parseISOMonthDay(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid PlainMonthDay string");
+        if (md.calendar == .iso8601) return md;
+        // The annotation's calendar owns the month code, so the stored ISO
+        // reference date has to be recomputed for it.
+        const f = calendar.fields(md.calendar, .{ .year = md.ref_year, .month = md.month, .day = md.day });
+        const ref = calendar.monthDayReference(md.calendar, f.code_num, f.code_leap, f.day, .constrain) catch
+            return realm_mod.throwRangeError(arena, "month-day out of range");
+        return .{ .month = ref.month, .day = ref.day, .ref_year = ref.year, .calendar = md.calendar };
     }
     return realm_mod.throwTypeError(arena, "cannot convert to Temporal.PlainMonthDay");
 }
@@ -298,8 +305,10 @@ fn monthDayToString(arena: std.mem.Allocator, md: ISOMonthDay, show: shared.Show
     // The reference year is emitted only when the calendar annotation shows —
     // which includes a non-ISO calendar under `auto`, since it would otherwise
     // be lost in the round-trip.
+    // A non-ISO calendar always emits its reference field, even under
+    // `calendarName: "never"` — the ISO date is otherwise unrecoverable.
     const shows_calendar = show == .always or show == .critical or
-        (show == .auto and md.calendar != .iso8601);
+        md.calendar != .iso8601;
     if (shows_calendar) {
         try shared.appendISOYear(arena, &buf, md.ref_year);
         try buf.append(arena, '-');

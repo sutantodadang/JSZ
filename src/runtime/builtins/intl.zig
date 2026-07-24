@@ -50,6 +50,7 @@ const locale_id = @import("intl_locale_id.zig");
 const likely = @import("intl_likely_subtags.zig");
 const plural = @import("intl_plural.zig");
 const cal_names = @import("intl_calendar_names.zig");
+const tz_names = @import("intl_timezone_names.zig");
 
 // Intl.NumberFormat lives in `intl_number.zig`; re-export the pieces the realm
 // registration and the sibling services (ListFormat / RelativeTimeFormat) use.
@@ -750,6 +751,10 @@ const DTFPattern = struct {
     cal: t_calendar.CalendarId = .gregory,
     /// Whether the locale writes a lunisolar year name in CJK rather than pinyin.
     cjk_year_name: bool = false,
+    /// The zone's UTC offset at the formatted instant, and whether that offset
+    /// is its daylight-saving one — both needed to name the zone.
+    tz_offset_ms: i64 = 0,
+    tz_is_dst: bool = false,
 
     /// True for the two 12-hour cycles, which carry an AM/PM marker.
     fn isHour12(self: DTFPattern) bool {
@@ -867,8 +872,14 @@ fn buildDTFParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
         // A named IANA zone's offset depends on the instant (DST), so resolve it
         // here rather than freezing the standard offset at construction.
         if (t_tzdata.lookupDef(p.tz_id)) |def| {
-            if (t_tzdata.offsetAt(def, @divFloor(ms, 1000))) |sec| offset_ms = @as(i64, sec) * 1000;
+            if (t_tzdata.offsetAt(def, @divFloor(ms, 1000))) |sec| {
+                offset_ms = @as(i64, sec) * 1000;
+                // Off the zone's standard offset means daylight saving is in
+                // force, which selects the other half of its metazone names.
+                p.tz_is_dst = sec != def.std_offset_sec;
+            }
         }
+        p.tz_offset_ms = offset_ms;
         const date_style = readOpt(o, "__dtf_dateStyle");
         const time_style = readOpt(o, "__dtf_timeStyle");
         if (date_style.len > 0) applyDateStyle(date_style, &p);
@@ -1113,15 +1124,29 @@ fn dayPeriodName(hour: i64, minute: i64, second: i64, style: []const u8) []const
 
 /// The `timeZoneName` part for the resolved zone. Only UTC and fixed-offset
 /// zones have real names here; a named IANA zone falls back to its identifier.
-fn timeZoneNameFor(arena: std.mem.Allocator, tz_id: []const u8, style: []const u8) ![]const u8 {
+fn timeZoneNameFor(arena: std.mem.Allocator, p: DTFPattern, style: []const u8) ![]const u8 {
+    const tz_id = p.tz_id;
     const is_utc = std.mem.eql(u8, tz_id, "UTC");
-    if (std.mem.eql(u8, style, "long")) return if (is_utc) "Coordinated Universal Time" else tz_id;
-    if (std.mem.eql(u8, style, "short")) return if (is_utc) "UTC" else tz_id;
-    // The offset styles render the zone's own offset; "GMT" alone for UTC.
-    if (is_utc) return "GMT";
-    if (tz_id.len > 0 and (tz_id[0] == '+' or tz_id[0] == '-'))
-        return std.fmt.allocPrint(arena, "GMT{s}", .{tz_id});
-    return tz_id;
+    const long = std.mem.eql(u8, style, "long");
+    const short = std.mem.eql(u8, style, "short");
+    if (is_utc) {
+        if (long) return "Coordinated Universal Time";
+        if (short) return "UTC";
+        return "GMT";
+    }
+    if (long or short) {
+        // A named zone gets its CLDR metazone name; everything else — an offset
+        // identifier, or a zone this build has no name for — falls back to the
+        // GMT offset, exactly as CLDR does.
+        if (tz_names.lookup(tz_id)) |mz| {
+            const name = if (long)
+                (if (p.tz_is_dst) mz.long_dst else mz.long_std)
+            else
+                (if (p.tz_is_dst) mz.short_dst else mz.short_std);
+            if (name.len > 0) return name;
+        }
+    }
+    return tz_names.gmtOffsetName(arena, p.tz_offset_ms);
 }
 
 /// Render the resolved components into typed parts (shared by `format` and
@@ -1251,7 +1276,7 @@ fn renderDateTimeParts(
 
     if (p.tz_name.len > 0) {
         if (parts.items.len > 0) try parts.append(arena, .{ .type = "literal", .value = " " });
-        try parts.append(arena, .{ .type = "timeZoneName", .value = try timeZoneNameFor(arena, p.tz_id, p.tz_name) });
+        try parts.append(arena, .{ .type = "timeZoneName", .value = try timeZoneNameFor(arena, p, p.tz_name) });
     }
 }
 

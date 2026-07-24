@@ -635,22 +635,26 @@ pub fn isoYearOf(cal: CalendarId, cal_year: i32) i32 {
 // ------------------------------------------------------------------ Japanese ---
 
 /// Japanese era boundaries, most recent first. `y0` is the Gregorian year in
-/// which the era's year 1 falls, so `era_year = iso_year - y0 + 1`.
-const JapaneseEra = struct { name: []const u8, y0: i32, month: u8, day: u8 };
+/// which the era's year 1 falls, so `era_year = iso_year - y0 + 1`. The era only
+/// *applies* from (`start_year`, `month`, `day`) on, which for every era but
+/// Meiji is a date inside `y0`: Japan adopted the Gregorian calendar on
+/// 1873-01-01, so Temporal recognises Meiji only from Meiji 6 and calls
+/// everything before it `ce`.
+const JapaneseEra = struct { name: []const u8, y0: i32, start_year: i32, month: u8, day: u8 };
 const japanese_eras = [_]JapaneseEra{
-    .{ .name = "reiwa", .y0 = 2019, .month = 5, .day = 1 },
-    .{ .name = "heisei", .y0 = 1989, .month = 1, .day = 8 },
-    .{ .name = "showa", .y0 = 1926, .month = 12, .day = 25 },
-    .{ .name = "taisho", .y0 = 1912, .month = 7, .day = 30 },
-    .{ .name = "meiji", .y0 = 1868, .month = 9, .day = 8 },
+    .{ .name = "reiwa", .y0 = 2019, .start_year = 2019, .month = 5, .day = 1 },
+    .{ .name = "heisei", .y0 = 1989, .start_year = 1989, .month = 1, .day = 8 },
+    .{ .name = "showa", .y0 = 1926, .start_year = 1926, .month = 12, .day = 25 },
+    .{ .name = "taisho", .y0 = 1912, .start_year = 1912, .month = 7, .day = 30 },
+    .{ .name = "meiji", .y0 = 1868, .start_year = 1873, .month = 1, .day = 1 },
 };
 
 /// The era in force on `d`, or null for pre-Meiji dates (which fall back to the
 /// Gregorian ce/bce eras).
 fn japaneseEraFor(d: ISODate) ?JapaneseEra {
     for (japanese_eras) |e| {
-        if (d.year > e.y0) return e;
-        if (d.year == e.y0 and (d.month > e.month or (d.month == e.month and d.day >= e.day))) return e;
+        if (d.year > e.start_year) return e;
+        if (d.year == e.start_year and (d.month > e.month or (d.month == e.month and d.day >= e.day))) return e;
     }
     return null;
 }
@@ -789,6 +793,17 @@ pub fn toIsoFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bo
         return toIso(cal, cal_year, monthFromCodeConstrained(cal, cal_year, code_num, code_leap), day, .constrain);
     };
     return toIso(cal, cal_year, m, day, overflow);
+}
+
+/// The 1-based day number of `d` within *its own calendar's* year — which for a
+/// non-ISO calendar starts on a different ISO date than 1 January.
+pub fn dayOfYear(cal: CalendarId, d: ISODate) u16 {
+    if (cal == .iso8601) return shared.dayOfYear(d);
+    const f = fields(cal, d);
+    const new_year = toIso(cal, f.year, 1, 1, .constrain) catch return shared.dayOfYear(d);
+    const start = shared.isoDateToEpochDays(new_year.year, new_year.month, new_year.day);
+    const cur = shared.isoDateToEpochDays(d.year, d.month, d.day);
+    return @intCast(cur - start + 1);
 }
 
 /// CalendarMonthDayToISOReferenceDate: the ISO date a PlainMonthDay stores for

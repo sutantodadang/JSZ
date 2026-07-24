@@ -449,7 +449,15 @@ pub fn parseISOYearMonth(s0: []const u8) ParseError!ISODate {
     if (p.peek()) |c| {
         if ((had_dash and c == '-') or c == 'T' or c == 't' or c == ' ' or (!had_dash and isDigit(c))) {
             const dt = try parseISODateTime(s0);
-            return .{ .year = dt.date.year, .month = dt.date.month, .day = 1, .calendar = dt.date.calendar };
+            // The ISO reference day is 1, but a non-ISO calendar annotation
+            // makes the string's own day meaningful — it names a day inside the
+            // *calendar* month, from which the caller derives the reference day.
+            return .{
+                .year = dt.date.year,
+                .month = dt.date.month,
+                .day = if (dt.date.calendar == .iso8601) 1 else dt.date.day,
+                .calendar = dt.date.calendar,
+            };
         }
     }
     try parseAnnotations(&p, .iso_only);
@@ -469,7 +477,15 @@ pub fn parseISOMonthDay(s0: []const u8) ParseError!ISOMonthDay {
         // The year is only parsed for grammar validity, then discarded, so an
         // unrepresentable year does not make a month-day string invalid.
         const dt = try parseISODateTimeOpts(s0, .{ .ignore_year_range = true });
-        return .{ .month = dt.date.month, .day = dt.date.day, .ref_year = 1972 };
+        // A non-ISO `[u-ca=…]` annotation makes the string's own year part of
+        // the answer: the month code is read from that date, and the caller
+        // re-derives the canonical reference year from it.
+        return .{
+            .month = dt.date.month,
+            .day = dt.date.day,
+            .ref_year = if (dt.date.calendar == .iso8601) 1972 else dt.date.year,
+            .calendar = dt.date.calendar,
+        };
     }
     var p = Parser{ .s = s };
     _ = p.eat('-') and p.eat('-'); // optional "--" prefix

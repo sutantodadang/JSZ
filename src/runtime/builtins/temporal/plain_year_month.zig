@@ -102,7 +102,15 @@ pub fn toTemporalYearMonth(arena: std.mem.Allocator, v: Value, overflow: shared.
             break :blk try yearMonthFromFields(arena, v.toPtr().object, overflow);
         }
         if (v.bits != 0 and v.unbox() == .string) {
-            break :blk shared.parseISOYearMonth(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid PlainYearMonth string");
+            const ym = shared.parseISOYearMonth(v.unbox().string) catch return realm_mod.throwRangeError(arena, "invalid PlainYearMonth string");
+            if (ym.calendar == .iso8601) break :blk ym;
+            // Outside the ISO calendar the reference day is the first ISO day of
+            // the *calendar* month the string names, not of the ISO month.
+            const f = calendar.fields(ym.calendar, ym);
+            var first = calendar.toIso(ym.calendar, f.year, f.month, 1, .constrain) catch
+                return realm_mod.throwRangeError(arena, "year-month out of range");
+            first.calendar = ym.calendar;
+            break :blk first;
         }
         return realm_mod.throwTypeError(arena, "cannot convert to Temporal.PlainYearMonth");
     };
@@ -403,8 +411,10 @@ fn yearMonthToString(arena: std.mem.Allocator, ym: ISODate, show: shared.ShowCal
     // When the calendar is shown — either because it was asked for, or because
     // it is non-ISO and would otherwise be lost — the ISO reference day is
     // emitted too, so the string round-trips back to the same month.
+    // A non-ISO calendar always emits its reference field, even under
+    // `calendarName: "never"` — the ISO date is otherwise unrecoverable.
     const shows_calendar = show == .always or show == .critical or
-        (show == .auto and ym.calendar != .iso8601);
+        ym.calendar != .iso8601;
     if (shows_calendar) {
         try buf.append(arena, '-');
         try shared.appendPadded(arena, &buf, ym.day, 2);
