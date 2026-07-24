@@ -498,6 +498,17 @@ pub inline fn opDefinePrivate(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", msg);
         return error.JsException;
     }
+    // Installing a private element (field / method / accessor) on a non-extensible
+    // object is a TypeError: a base constructor that seals `this` before the
+    // derived class's private install runs (`super(seal)` then `this.#x = ...`)
+    // must reject. Matches V8 / test262 private-class-field-on-nonextensible.
+    if (!obj.extensible) {
+        const realm_mod = @import("../../runtime/realm.zig");
+        const class_mod = @import("../../parser/class.zig");
+        const msg = try std.fmt.allocPrint(self.arena, "Cannot install private member {s} on a non-extensible object", .{class_mod.privateDisplayName(key)});
+        realm_mod.pending_exception = try self.makeErrorObjectBc("TypeError", msg);
+        return error.JsException;
+    }
     // A private method is not writable: `obj.#m = v` must be a TypeError, which
     // `privateSet` derives from the stored attribute.
     _ = try obj.defineOwnData(key, val, .{ .writable = !is_method, .enumerable = false, .configurable = false, .is_private = true });

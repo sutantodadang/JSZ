@@ -2895,6 +2895,14 @@ pub fn nativePrivInstallAcc(arena: std.mem.Allocator, _: Value, args: []const Va
         const msg = try std.fmt.allocPrint(arena, "Cannot install private member {s} twice on the same object", .{class_mod.privateDisplayName(key)});
         return throwTypeError(arena, msg);
     }
+    // Installing a private accessor on a non-extensible object is a TypeError
+    // (matches DEFINE_PRIVATE for fields/methods) — see private-class-field-on
+    // -nonextensible-objects.
+    if (!obj.extensible) {
+        const class_mod = @import("../parser/class.zig");
+        const msg = try std.fmt.allocPrint(arena, "Cannot install private member {s} on a non-extensible object", .{class_mod.privateDisplayName(key)});
+        return throwTypeError(arena, msg);
+    }
     // The accessor holder is the same `{ get, set }` shape the ordinary accessor
     // path stores, so privateGet/privateSet read it unchanged.
     const holder = if (active_heap) |h|

@@ -2107,6 +2107,12 @@ pub const BcVm = struct {
     pub fn privateGet(self: *BcVm, obj_val: Value, key: []const u8) anyerror!Value {
         const root = (try self.privateHolder(obj_val)) orelse return self.throwPrivateBrand(key);
         if (root.findProperty(key)) |loc| {
+            // A private brand check is OWN only — private elements are never
+            // inherited. A static private method reached on a *subclass* receiver
+            // (`class D extends C {}; D.f()` where C.f reads `this.#g`) finds #g on
+            // C via the constructor prototype chain, but D is not branded, so it
+            // must throw rather than resolve the inherited element.
+            if (loc.holder != root) return self.throwPrivateBrand(key);
             const a = loc.holder.attrAt(loc.slot);
             const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
             if (a.is_accessor) {
@@ -2130,6 +2136,8 @@ pub const BcVm = struct {
     pub fn privateSet(self: *BcVm, obj_val: Value, key: []const u8, val: Value) anyerror!bool {
         const root = (try self.privateHolder(obj_val)) orelse return self.throwPrivateBrandBool(key);
         const loc = root.findProperty(key) orelse return self.throwPrivateBrandBool(key);
+        // OWN-only brand check (private elements are never inherited).
+        if (loc.holder != root) return self.throwPrivateBrandBool(key);
         const a = loc.holder.attrAt(loc.slot);
         if (a.is_accessor) {
             const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
