@@ -942,6 +942,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         // target this for-of loop.
         const loop_lbl = self.pending_label;
         self.pending_label = null;
+        const head_scope = try enterForHeadLexScope(self, fo.left, line);
         const base_sp = self.sp;
         const riter = self.allocReg();
         {
@@ -1139,6 +1140,10 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         const exit_offset = self.currentOffset();
         self.patchJump(jmp_after, exit_offset);
         self.resolveLoop(loop_start, exit_offset);
+        if (head_scope) {
+            try self.emitOp(.EXIT_SCOPE, line);
+            self.block_scope_depth -= 1;
+        }
         self.sp = base_sp;
         return;
     }
@@ -1159,6 +1164,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     // target this for-in loop.
     const loop_lbl = self.pending_label;
     self.pending_label = null;
+    _ = try enterForHeadLexScope(self, fi.left, line);
     // Save sp; allocate rkeys, ri, rlen as a contiguous block.
     const base_sp = self.sp;
     const outer_depth = self.block_scope_depth;
@@ -1518,4 +1524,20 @@ pub fn lowerDebuggerStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) er
     // Phase 8: emit a DEBUGGER opcode so the VM can fire a debug
     // hook (breakpoint-style pause). No-op when no hook installed.
     try self.emitOp(.DEBUGGER, line);
+}
+
+/// ForIn/OfHeadEvaluation step 2: when the head is a ForDeclaration
+/// (`for (let x of …)`), its bound names live in a NEW environment that is
+/// already in scope while the iterated expression is evaluated — so a reference
+/// to `x` there hits the TDZ instead of resolving to an outer binding.
+/// Returns true when a scope was pushed (caller pops it at loop exit).
+fn enterForHeadLexScope(self: *FnCompiler, left: *Node, line: u32) error{OutOfMemory}!bool {
+    if (left.kind != .var_decl) return false;
+    const vd = left.data.var_decl;
+    if (vd.kind != .let and vd.kind != .const_) return false;
+    if (vd.name.len == 0) return false;
+    try self.emitOp(.ENTER_SCOPE, line);
+    self.block_scope_depth += 1;
+    try self.emitHoistLexical(vd.name, line);
+    return true;
 }
