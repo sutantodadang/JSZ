@@ -3430,6 +3430,12 @@ pub fn nativeRegExpCompile(arena: std.mem.Allocator, this_val: Value, args: []co
     if (this_val.bits == 0 or this_val.unbox() != .object or this_val.toPtr().object.internal_kind != .regexp)
         return realm_mod.throwTypeError(arena, "RegExp.prototype.compile called on a non-RegExp object");
     const this_obj = this_val.toPtr().object;
+    // Step 3 (legacy-regexp): [[LegacyFeaturesEnabled]] is set only for an
+    // instance %RegExp% itself constructed, which a subclass instance (whose
+    // prototype came from its own newTarget) and a foreign realm's instance are
+    // not.
+    if (this_obj.proto != realm_mod.active_regexp_proto)
+        return realm_mod.throwTypeError(arena, "RegExp.prototype.compile is disabled for this RegExp");
 
     const pattern_arg: Value = if (args.len > 0) args[0] else Value{};
     const flags_arg: Value = if (args.len > 1) args[1] else Value{};
@@ -3468,9 +3474,14 @@ pub fn nativeRegExpCompile(arena: std.mem.Allocator, this_val: Value, args: []co
         return throwRegExpSyntaxError(arena, pattern_str, flags_str);
 
     try this_obj.set("[[OriginalSource]]", try val_mod.makeString(arena, pattern_str));
-    _ = try this_obj.defineOwnData("lastIndex", try val_mod.makeNumber(arena, 0.0), .{ .writable = true, .enumerable = false, .configurable = false });
     this_obj.internal_slot = @ptrCast(cr);
     this_obj.internal_kind = .regexp;
+    // RegExpInitialize's last step is Set(obj, "lastIndex", 0, true) — a throwing
+    // Set, and it runs *after* the source and matcher are already in place.
+    if (this_obj.ownAttr("lastIndex")) |attr| {
+        if (!attr.writable) return realm_mod.throwTypeError(arena, "cannot reset the lastIndex of this RegExp");
+    }
+    _ = try this_obj.defineOwnData("lastIndex", try val_mod.makeNumber(arena, 0.0), .{ .writable = true, .enumerable = false, .configurable = false });
     return this_val;
 }
 

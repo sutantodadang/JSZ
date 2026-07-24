@@ -635,22 +635,26 @@ pub fn isoYearOf(cal: CalendarId, cal_year: i32) i32 {
 // ------------------------------------------------------------------ Japanese ---
 
 /// Japanese era boundaries, most recent first. `y0` is the Gregorian year in
-/// which the era's year 1 falls, so `era_year = iso_year - y0 + 1`.
-const JapaneseEra = struct { name: []const u8, y0: i32, month: u8, day: u8 };
+/// which the era's year 1 falls, so `era_year = iso_year - y0 + 1`. The era only
+/// *applies* from (`start_year`, `month`, `day`) on, which for every era but
+/// Meiji is a date inside `y0`: Japan adopted the Gregorian calendar on
+/// 1873-01-01, so Temporal recognises Meiji only from Meiji 6 and calls
+/// everything before it `ce`.
+const JapaneseEra = struct { name: []const u8, y0: i32, start_year: i32, month: u8, day: u8 };
 const japanese_eras = [_]JapaneseEra{
-    .{ .name = "reiwa", .y0 = 2019, .month = 5, .day = 1 },
-    .{ .name = "heisei", .y0 = 1989, .month = 1, .day = 8 },
-    .{ .name = "showa", .y0 = 1926, .month = 12, .day = 25 },
-    .{ .name = "taisho", .y0 = 1912, .month = 7, .day = 30 },
-    .{ .name = "meiji", .y0 = 1868, .month = 9, .day = 8 },
+    .{ .name = "reiwa", .y0 = 2019, .start_year = 2019, .month = 5, .day = 1 },
+    .{ .name = "heisei", .y0 = 1989, .start_year = 1989, .month = 1, .day = 8 },
+    .{ .name = "showa", .y0 = 1926, .start_year = 1926, .month = 12, .day = 25 },
+    .{ .name = "taisho", .y0 = 1912, .start_year = 1912, .month = 7, .day = 30 },
+    .{ .name = "meiji", .y0 = 1868, .start_year = 1873, .month = 1, .day = 1 },
 };
 
 /// The era in force on `d`, or null for pre-Meiji dates (which fall back to the
 /// Gregorian ce/bce eras).
 fn japaneseEraFor(d: ISODate) ?JapaneseEra {
     for (japanese_eras) |e| {
-        if (d.year > e.y0) return e;
-        if (d.year == e.y0 and (d.month > e.month or (d.month == e.month and d.day >= e.day))) return e;
+        if (d.year > e.start_year) return e;
+        if (d.year == e.start_year and (d.month > e.month or (d.month == e.month and d.day >= e.day))) return e;
     }
     return null;
 }
@@ -791,6 +795,17 @@ pub fn toIsoFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bo
     return toIso(cal, cal_year, m, day, overflow);
 }
 
+/// The 1-based day number of `d` within *its own calendar's* year — which for a
+/// non-ISO calendar starts on a different ISO date than 1 January.
+pub fn dayOfYear(cal: CalendarId, d: ISODate) u16 {
+    if (cal == .iso8601) return shared.dayOfYear(d);
+    const f = fields(cal, d);
+    const new_year = toIso(cal, f.year, 1, 1, .constrain) catch return shared.dayOfYear(d);
+    const start = shared.isoDateToEpochDays(new_year.year, new_year.month, new_year.day);
+    const cur = shared.isoDateToEpochDays(d.year, d.month, d.day);
+    return @intCast(cur - start + 1);
+}
+
 /// CalendarMonthDayToISOReferenceDate: the ISO date a PlainMonthDay stores for
 /// a given month code and day — the latest date on or before 1972-12-31 whose
 /// calendar month code and day match. Walking back matters for month/day pairs
@@ -799,29 +814,42 @@ pub fn toIsoFromCode(cal: CalendarId, cal_year: i32, code_num: u8, code_leap: bo
 pub fn monthDayReference(cal: CalendarId, code_num: u8, code_leap: bool, day: i32, overflow: shared.Overflow) Error!ISODate {
     const limit = shared.isoDateToEpochDays(1972, 12, 31);
     const start_year = fields(cal, shared.epochDaysToISODate(limit)).year;
-    // Two passes: first demanding the exact day, then — only when constraining
-    // — allowing it to be clamped into the month.
-    var pass: u8 = 0;
-    while (pass < 2) : (pass += 1) {
-        if (pass == 1 and overflow == .reject) return error.OutOfRange;
+    // A month/day recurs at least once per leap cycle; the Islamic 30-year cycle
+    // is the longest among the arithmetic calendars. A lunisolar leap month is
+    // far rarer — some (M12L in the Chinese calendar) skip centuries — so those
+    // get a much longer look-back.
+    const limit_years: u32 = if (hasLeapMonths(cal) and code_leap) 400 else 40;
+
+    // Constraining clamps the day to the *longest* this month code ever is, not
+    // to its length in whichever year happens to come first: an Islamic M12-30
+    // is a real month-day, it just only occurs in a leap year — and that is the
+    // year the reference date then lands in.
+    var max_dim: u8 = 0;
+    {
         var y = start_year;
-        // A month/day recurs at least once per leap cycle; the Islamic 30-year
-        // cycle is the longest among the arithmetic calendars. A lunisolar leap
-        // month is far rarer — some (M12L in the Chinese calendar) skip
-        // centuries — so those get a much longer look-back.
-        const limit_years: u32 = if (hasLeapMonths(cal) and code_leap) 400 else 40;
         var tries: u32 = 0;
         while (tries < limit_years) : (tries += 1) {
-            if (monthFromCode(cal, y, code_num, code_leap)) |m| {
-                const dim = daysInMonth(cal, y, m);
-                const use_day = if (pass == 1 and day > dim) dim else day;
-                if (use_day >= 1 and use_day <= dim) {
-                    const iso = try toIso(cal, y, m, use_day, .reject);
-                    if (shared.isoDateToEpochDays(iso.year, iso.month, iso.day) <= limit) return iso;
-                }
-            }
+            if (monthFromCode(cal, y, code_num, code_leap)) |m| max_dim = @max(max_dim, daysInMonth(cal, y, m));
             y -= 1;
         }
+    }
+    if (max_dim == 0) return error.OutOfRange;
+    var use_day = day;
+    if (use_day > max_dim or use_day < 1) {
+        if (overflow == .reject) return error.OutOfRange;
+        use_day = if (use_day < 1) 1 else max_dim;
+    }
+
+    var y = start_year;
+    var tries: u32 = 0;
+    while (tries < limit_years) : (tries += 1) {
+        if (monthFromCode(cal, y, code_num, code_leap)) |m| {
+            if (use_day <= daysInMonth(cal, y, m)) {
+                const iso = try toIso(cal, y, m, use_day, .reject);
+                if (shared.isoDateToEpochDays(iso.year, iso.month, iso.day) <= limit) return iso;
+            }
+        }
+        y -= 1;
     }
     return error.OutOfRange;
 }

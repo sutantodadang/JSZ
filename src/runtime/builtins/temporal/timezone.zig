@@ -201,6 +201,19 @@ fn zoneFromDateTimeOffset(arena: std.mem.Allocator, s: []const u8) !Zone {
     return realm_mod.throwRangeError(arena, "bare date-time is not a time zone");
 }
 
+/// FormatDateTimeUTCOffsetRounded: the offset an ISO string carries is always
+/// whole minutes, so a zone with a sub-minute offset (Africa/Monrovia's
+/// -00:44:30, Europe/Paris's pre-1911 +00:09:21) rounds before it is printed.
+pub fn formatOffsetRounded(arena: std.mem.Allocator, offset_ns: i128) ![]const u8 {
+    const minute = shared.NS_PER_MINUTE;
+    const half = @divTrunc(minute, 2);
+    const rounded: i128 = if (offset_ns >= 0)
+        @divFloor(offset_ns + half, minute) * minute
+    else
+        -(@divFloor(-offset_ns + half, minute) * minute);
+    return formatOffset(arena, rounded);
+}
+
 /// Format a fixed UTC offset (ns) as "±HH:MM" (or "±HH:MM:SS(.fff)" if the
 /// offset carries sub-minute precision — not produced by our zones but handled
 /// for completeness).
