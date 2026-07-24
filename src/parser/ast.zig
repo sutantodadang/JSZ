@@ -249,6 +249,12 @@ pub const CallExpr = struct {
     /// computed-key property (`{[k]: class {}}`) must SetFunctionName on the
     /// constructor it returns.
     anon_class_iife: bool = false,
+    /// This direct `eval(...)` is lexically inside a class field initializer
+    /// (reached without crossing a non-arrow function boundary). PerformEval must
+    /// then apply the "eval inside initializer" early error: a SyntaxError if the
+    /// eval body ContainsArguments (§sec-performeval-rules-in-initializer). Set by
+    /// `markInitializerEvalCalls`; compiled into a MARK_FIELD_EVAL prefix.
+    field_init_eval: bool = false,
 };
 
 pub const NewExpr = struct {

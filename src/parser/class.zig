@@ -746,6 +746,227 @@ const PrivateRewriter = struct {
     }
 };
 
+/// Flag every direct `eval(...)` lexically inside a class field initializer so
+/// PerformEval applies the "eval inside initializer" ContainsArguments early
+/// error (§sec-performeval-rules-in-initializer). The initializer region extends
+/// through arrow functions (an arrow has no own `arguments`), but a non-arrow
+/// FunctionExpression/Declaration/method establishes a fresh `arguments` binding
+/// and ends the region — so this walk descends into arrows but stops at those.
+const InitEvalMarker = struct {
+    fn walkOpt(node: ?*Node) void {
+        if (node) |n| walk(n);
+    }
+    fn walk(node: *Node) void {
+        switch (node.data) {
+            .unary_expr => |u| walk(u.operand),
+            .binary_expr => |b| {
+                walk(b.left);
+                walk(b.right);
+            },
+            .logical_expr => |b| {
+                walk(b.left);
+                walk(b.right);
+            },
+            .assignment_expr => |a| {
+                walk(a.target);
+                walk(a.value);
+            },
+            .update_expr => |u| walk(u.operand),
+            .conditional_expr => |c| {
+                walk(c.test_);
+                walk(c.consequent);
+                walk(c.alternate);
+            },
+            .sequence_expr => |s| for (s.exprs) |e| walk(e),
+            .spread_expr => |e| walk(e),
+            .yield_expr => |e| walkOpt(e),
+            .call_expr => |c| {
+                // A bare `eval(...)` callee (not `x?.()`) is a direct eval; mark it.
+                if (!c.optional and c.callee.kind == .identifier and
+                    std.mem.eql(u8, c.callee.data.identifier, "eval"))
+                    node.data.call_expr.field_init_eval = true;
+                walk(c.callee);
+                for (c.args) |a| walk(a);
+            },
+            .new_expr => |n| {
+                walk(n.callee);
+                for (n.args) |a| walk(a);
+            },
+            .member_expr => |m| {
+                walk(m.object);
+                walk(m.property);
+            },
+            .optional_chain => |e| walk(e),
+            // Arrows keep the enclosing `arguments`, so the region continues into them.
+            .function_expr => |f| if (f.is_arrow) {
+                for (f.param_defaults) |d| walkOpt(d);
+                for (f.body) |s| walk(s);
+            },
+            // A named function declaration is never an arrow; it ends the region.
+            .function_decl => {},
+            .object_literal => |o| for (o.properties) |pr| {
+                walk(pr.value);
+                walkOpt(pr.computed_key);
+            },
+            .array_literal => |a| for (a.elements) |e| walk(e),
+            .expr_stmt => |e| walk(e),
+            .block_stmt => |b| for (b.body) |s| walk(s),
+            .var_decl => |v| walkOpt(v.init),
+            .if_stmt => |i| {
+                walk(i.test_);
+                walk(i.consequent);
+                walkOpt(i.alternate);
+            },
+            .while_stmt => |w| {
+                walk(w.test_);
+                walk(w.body);
+            },
+            .do_while_stmt => |w| {
+                walk(w.body);
+                walk(w.test_);
+            },
+            .with_stmt => |w| {
+                walk(w.object);
+                walk(w.body);
+            },
+            .for_stmt => |f| {
+                walkOpt(f.init);
+                walkOpt(f.test_);
+                walkOpt(f.update);
+                walk(f.body);
+            },
+            .return_stmt => |e| walkOpt(e),
+            .throw_stmt => |e| walk(e),
+            .try_stmt => |t| {
+                walk(t.block);
+                if (t.handler) |h| walk(h.body);
+                walkOpt(t.finalizer);
+            },
+            .for_in_stmt => |f| {
+                walk(f.left);
+                walk(f.right);
+                walk(f.body);
+            },
+            .switch_stmt => |s| {
+                walk(s.discriminant);
+                for (s.cases) |c| {
+                    walkOpt(c.test_);
+                    for (c.body) |st| walk(st);
+                }
+            },
+            .labeled_stmt => |l| walk(l.body),
+            else => {},
+        }
+    }
+};
+
+/// Mark direct-eval calls inside a class field initializer expression (see
+/// `InitEvalMarker`). Runs for every class with fields, before the field
+/// initializers are desugared into constructor/`__superthis` assignments.
+pub fn markInitializerEvalCalls(init: ?*Node) void {
+    if (init) |n| InitEvalMarker.walk(n);
+}
+
+/// ContainsArguments (§sec-static-semantics-containsarguments) over an eval
+/// body: true if an IdentifierReference to `arguments` appears anywhere,
+/// descending into arrow functions (which have no own `arguments`) but stopping
+/// at a non-arrow FunctionExpression/Declaration (which binds its own). A
+/// non-computed member property name is a property key, not a reference, so it
+/// is skipped. Used for the "eval inside initializer" early error.
+const ArgumentsScanner = struct {
+    fn scanOpt(node: ?*Node) bool {
+        return if (node) |n| scan(n) else false;
+    }
+    fn scan(node: *Node) bool {
+        switch (node.data) {
+            .identifier => |name| return std.mem.eql(u8, name, "arguments"),
+            .unary_expr => |u| return scan(u.operand),
+            .binary_expr => |b| return scan(b.left) or scan(b.right),
+            .logical_expr => |b| return scan(b.left) or scan(b.right),
+            .assignment_expr => |a| return scan(a.target) or scan(a.value),
+            .update_expr => |u| return scan(u.operand),
+            .conditional_expr => |c| return scan(c.test_) or scan(c.consequent) or scan(c.alternate),
+            .sequence_expr => |s| {
+                for (s.exprs) |e| if (scan(e)) return true;
+                return false;
+            },
+            .spread_expr => |e| return scan(e),
+            .yield_expr => |e| return scanOpt(e),
+            .call_expr => |c| {
+                if (scan(c.callee)) return true;
+                for (c.args) |a| if (scan(a)) return true;
+                return false;
+            },
+            .new_expr => |n| {
+                if (scan(n.callee)) return true;
+                for (n.args) |a| if (scan(a)) return true;
+                return false;
+            },
+            .member_expr => |m| {
+                if (scan(m.object)) return true;
+                // Only a computed key is an evaluated expression; `x.arguments`
+                // is a property name, not a reference.
+                if (m.computed) return scan(m.property);
+                return false;
+            },
+            .optional_chain => |e| return scan(e),
+            .function_expr => |f| {
+                if (!f.is_arrow) return false;
+                for (f.param_defaults) |d| if (scanOpt(d)) return true;
+                for (f.body) |s| if (scan(s)) return true;
+                return false;
+            },
+            .function_decl => return false,
+            .object_literal => |o| {
+                for (o.properties) |pr| {
+                    if (scan(pr.value)) return true;
+                    if (scanOpt(pr.computed_key)) return true;
+                }
+                return false;
+            },
+            .array_literal => |a| {
+                for (a.elements) |e| if (scan(e)) return true;
+                return false;
+            },
+            .expr_stmt => |e| return scan(e),
+            .block_stmt => |b| {
+                for (b.body) |s| if (scan(s)) return true;
+                return false;
+            },
+            .var_decl => |v| return scanOpt(v.init),
+            .if_stmt => |i| return scan(i.test_) or scan(i.consequent) or scanOpt(i.alternate),
+            .while_stmt => |w| return scan(w.test_) or scan(w.body),
+            .do_while_stmt => |w| return scan(w.body) or scan(w.test_),
+            .with_stmt => |w| return scan(w.object) or scan(w.body),
+            .for_stmt => |f| return scanOpt(f.init) or scanOpt(f.test_) or scanOpt(f.update) or scan(f.body),
+            .return_stmt => |e| return scanOpt(e),
+            .throw_stmt => |e| return scan(e),
+            .try_stmt => |t| {
+                if (scan(t.block)) return true;
+                if (t.handler) |h| if (scan(h.body)) return true;
+                return scanOpt(t.finalizer);
+            },
+            .for_in_stmt => |f| return scan(f.left) or scan(f.right) or scan(f.body),
+            .switch_stmt => |s| {
+                if (scan(s.discriminant)) return true;
+                for (s.cases) |c| {
+                    if (scanOpt(c.test_)) return true;
+                    for (c.body) |st| if (scan(st)) return true;
+                }
+                return false;
+            },
+            .labeled_stmt => |l| return scan(l.body),
+            else => return false,
+        }
+    }
+};
+
+/// True if an eval body ContainsArguments — see `ArgumentsScanner`.
+pub fn evalBodyContainsArguments(stmts: []const *Node) bool {
+    for (stmts) |s| if (ArgumentsScanner.scan(s)) return true;
+    return false;
+}
+
 /// Resolve the private names a direct `eval`'s code refers to against the
 /// PrivateEnvironment its calling context carries (`BcFunction.priv_names`).
 ///
@@ -1682,6 +1903,12 @@ fn emitClassStatements(
     var ctor_body: []*Node = parsed.ctor_body;
     const members = parsed.members;
     const fields = parsed.fields;
+
+    // Flag direct evals inside each field initializer so PerformEval applies the
+    // "eval inside initializer" ContainsArguments early error. Done here (before
+    // the initializers are desugared into constructor assignments and lose their
+    // field-initializer identity) and for every class, private names or not.
+    for (fields) |f| markInitializerEvalCalls(f.init);
 
     // Private instance methods/accessors are installed per instance, not on the
     // prototype (see PrivInstance). Plan the hidden bindings now: the member

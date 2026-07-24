@@ -388,6 +388,11 @@ pub const Op = enum(u8) {
     /// SuppressedError, then re-raise the resulting completion. Always throws.
     /// Declared last (JIT ordinal stability).
     USING_DISPOSE_THROW,
+    /// MARK_FIELD_EVAL | 1 | op. Companion to MARK_DIRECT_EVAL, emitted only when
+    /// the direct eval is lexically inside a class field initializer. PerformEval
+    /// then applies the "eval inside initializer" early error: a SyntaxError if
+    /// the eval body ContainsArguments. Declared last (JIT ordinal stability).
+    MARK_FIELD_EVAL,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -489,6 +494,7 @@ pub fn instrSize(op: Op) usize {
         .DEFINE_PRIVATE => 6,
         .MARK_DIRECT_EVAL => 1,
         .MARK_PARAM_EVAL => 1,
+        .MARK_FIELD_EVAL => 1,
         .TO_PROPERTY_KEY => 2,
         .DEFINE_LOCAL => 4,
         .DEFINE_DATA => 5,

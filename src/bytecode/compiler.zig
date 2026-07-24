@@ -2851,6 +2851,11 @@ pub const FnCompiler = struct {
             // `arguments` binding of its own, so the eval is fine there.
             if (self.in_param_default and !self.is_arrow)
                 try self.emitOp(.MARK_PARAM_EVAL, line);
+            // A direct eval inside a class field initializer must reject `arguments`
+            // in its body (ContainsArguments early error). The parser flagged the
+            // call node when it is lexically inside an initializer.
+            if (c.field_init_eval)
+                try self.emitOp(.MARK_FIELD_EVAL, line);
             // The eval'd source can introduce a binding that shadows one an
             // assignment in this body already resolved, so identifier writes
             // here must go through a Reference captured before the RHS ran.
