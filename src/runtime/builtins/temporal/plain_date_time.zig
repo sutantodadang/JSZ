@@ -596,19 +596,14 @@ pub fn nativeToZonedDateTime(arena: std.mem.Allocator, this_val: Value, args: []
     const v = if (args.len > 0) args[0] else Value{};
     if (v.bits == 0 or v.unbox() != .string) return realm_mod.throwTypeError(arena, "time zone must be a string");
     const zone = try timezone.toZone(arena, v.unbox().string);
-    // disambiguation option is validated but irrelevant for fixed-offset zones.
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
-    _ = try getDisambiguation(arena, opts);
+    const dis = try zoned.getDisambiguationOption(arena, opts);
     const wall = @as(i128, shared.isoDateToEpochDays(dt.date.year, dt.date.month, dt.date.day)) * shared.NS_PER_DAY +
         shared.timeToNanos(dt.time);
-    return zoned.makeZoned(arena, .{ .ns = wall - zone.offset_ns, .tz = zone.id, .offset_ns = zone.offset_ns });
-}
-
-fn getDisambiguation(arena: std.mem.Allocator, opts: ?*JsObject) !void {
-    const s = (try shared.readStringOption(arena, opts, "disambiguation")) orelse return;
-    if (std.mem.eql(u8, s, "compatible") or std.mem.eql(u8, s, "earlier") or
-        std.mem.eql(u8, s, "later") or std.mem.eql(u8, s, "reject")) return;
-    return realm_mod.throwRangeError(arena, "invalid disambiguation");
+    // GetEpochNanosecondsFor: a wall time in a DST gap has no instant and one in
+    // a fall-back repetition has two, so `disambiguation` picks between them.
+    const ns = try zoned.disambiguate(arena, zone.id, zone.offset_ns, wall, dis);
+    return zoned.makeZoned(arena, .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = dt.date.calendar });
 }
 
 pub fn nativeToPlainTime(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {

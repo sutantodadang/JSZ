@@ -735,7 +735,11 @@ pub fn nativeToZonedDateTime(arena: std.mem.Allocator, this_val: Value, args: []
     } else return realm_mod.throwTypeError(arena, "toZonedDateTime requires a time zone");
     const wall = @as(i128, shared.isoDateToEpochDays(d.year, d.month, d.day)) * shared.NS_PER_DAY +
         shared.timeToNanos(time);
-    return zoned.makeZoned(arena, .{ .ns = wall - zone.offset_ns, .tz = zone.id, .offset_ns = zone.offset_ns });
+    // With no plainTime the result is the start of the day, which a DST jump over
+    // midnight can push past 00:00; otherwise the wall time is disambiguated the
+    // "compatible" way.
+    const ns = try zoned.disambiguate(arena, zone.id, zone.offset_ns, wall, .compatible);
+    return zoned.makeZoned(arena, .{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = d.calendar });
 }
 
 pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {

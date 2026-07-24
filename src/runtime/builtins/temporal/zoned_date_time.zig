@@ -59,6 +59,10 @@ pub fn makeZoned(arena: std.mem.Allocator, z: ZonedDT) !Value {
     if (!isValidEpochNs(z.ns)) return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
     const slot = try arena.create(ZonedDT);
     slot.* = z;
+    // A named zone's offset is a function of the instant, so never trust a
+    // caller-supplied one: recompute it here and the slot can never go stale
+    // across a DST boundary. (A fixed-offset identifier keeps what it was given.)
+    slot.offset_ns = zoneOffsetAt(z.tz, z.offset_ns, z.ns);
     const obj = if (realm_mod.active_heap) |h|
         try JsObject.createOnHeap(h, proto_obj)
     else
@@ -72,6 +76,7 @@ fn installInto(arena: std.mem.Allocator, this_val: Value, z: ZonedDT) !Value {
     if (!isValidEpochNs(z.ns)) return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
     const slot = try arena.create(ZonedDT);
     slot.* = z;
+    slot.offset_ns = zoneOffsetAt(z.tz, z.offset_ns, z.ns);
     this_val.toPtr().object.internal_kind = .temporal_zoned_date_time;
     this_val.toPtr().object.internal_slot = slot;
     return this_val;
@@ -172,12 +177,12 @@ fn getOffsetOption(arena: std.mem.Allocator, opts: ?*JsObject, default: OffsetOp
     return realm_mod.throwRangeError(arena, "invalid offset option");
 }
 
-const Disambiguation = enum { compatible, earlier, later, reject };
+pub const Disambiguation = enum { compatible, earlier, later, reject };
 
 /// GetTemporalDisambiguationOption: ToString + membership check, "compatible"
 /// default. Read (and validated) even when the result is unused, because the
 /// exact sequence of option reads is observable.
-fn getDisambiguationOption(arena: std.mem.Allocator, opts: ?*JsObject) !Disambiguation {
+pub fn getDisambiguationOption(arena: std.mem.Allocator, opts: ?*JsObject) !Disambiguation {
     const s = (try shared.readStringOption(arena, opts, "disambiguation")) orelse return .compatible;
     if (std.mem.eql(u8, s, "compatible")) return .compatible;
     if (std.mem.eql(u8, s, "earlier")) return .earlier;
@@ -358,7 +363,7 @@ fn instantCount(p: [2]?i128) usize {
 /// DisambiguatePossibleEpochNanoseconds: resolve a wall time that is ambiguous
 /// (a fall-back repetition, two instants) or nonexistent (a spring-forward gap,
 /// zero instants) according to the `dis` policy.
-fn disambiguate(arena: std.mem.Allocator, tz: []const u8, fixed: i128, wall: i128, dis: Disambiguation) !i128 {
+pub fn disambiguate(arena: std.mem.Allocator, tz: []const u8, fixed: i128, wall: i128, dis: Disambiguation) !i128 {
     const p = possibleInstants(tz, fixed, wall);
     const cnt = instantCount(p);
     if (cnt == 1) return p[0].?;
@@ -637,17 +642,25 @@ fn getHoursInDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
     const z = try requireZoned(arena, this_val);
     // Fixed-offset / unknown zones: every day is 24h. Named IANA zones with DST
     // may have 23h/25h days around a transition.
-    const def = tzdata.lookupDef(z.tz) orelse return val_mod.makeNumber(arena, 24);
-    if (def.rule == null) return val_mod.makeNumber(arena, 24);
+    _ = tzdata.lookupDef(z.tz) orelse return val_mod.makeNumber(arena, 24);
+    // The day's length is the gap between its own start and the next day's, both
+    // resolved through the zone — that is what makes a transition day 23h or 25h.
+    return val_mod.makeNumber(arena, shared.divToF64(try dayLength(arena, z), shared.NS_PER_HOUR));
+}
 
-    const day_start_ns = wallNs(.{ .date = localDT(z).date, .time = .{} }) - z.offset_ns;
-    const day_end_ns = day_start_ns + shared.NS_PER_DAY;
-    const start_sec: i64 = @intCast(@divFloor(day_start_ns, shared.NS_PER_SECOND));
-    const end_sec: i64 = @intCast(@divFloor(day_end_ns, shared.NS_PER_SECOND));
-    const offset_start = @as(i128, tzdata.offsetAt(def, start_sec) orelse def.std_offset_sec) * shared.NS_PER_SECOND;
-    const offset_end = @as(i128, tzdata.offsetAt(def, end_sec) orelse def.std_offset_sec) * shared.NS_PER_SECOND;
-    const day_length = (day_end_ns - offset_end) - (day_start_ns - offset_start);
-    return val_mod.makeNumber(arena, shared.divToF64(day_length, shared.NS_PER_HOUR));
+/// The ZonedDateTime's local day as [start, end) instants, and its length.
+const DaySpan = struct { start: i128, end: i128, len: i128 };
+
+fn daySpan(arena: std.mem.Allocator, z: *const ZonedDT) !DaySpan {
+    const date = localDT(z).date;
+    const start = try startOfDay(arena, z.tz, z.offset_ns, date);
+    const next = shared.balanceISODate(date.year, date.month, @as(i32, date.day) + 1);
+    const end = try startOfDay(arena, z.tz, z.offset_ns, next);
+    return .{ .start = start, .end = end, .len = end - start };
+}
+
+fn dayLength(arena: std.mem.Allocator, z: *const ZonedDT) !i128 {
+    return (try daySpan(arena, z)).len;
 }
 
 /// ISO week-numbering year for a date.
@@ -706,7 +719,12 @@ pub fn nativeWithPlainTime(arena: std.mem.Allocator, this_val: Value, args: []co
         time = try plain_time.toTemporalTime(arena, args[0], .constrain);
     }
     const cur = localDT(z);
-    const ns = wallNs(.{ .date = cur.date, .time = time }) - z.offset_ns;
+    // With no argument the result is the start of the day, which in a zone whose
+    // midnight is skipped is *not* simply wall-midnight (GetStartOfDay).
+    const ns = if (args.len > 0 and args[0].bits != 0 and args[0].unbox() != .undefined_)
+        try disambiguate(arena, z.tz, z.offset_ns, wallNs(.{ .date = cur.date, .time = time }), .compatible)
+    else
+        try startOfDay(arena, z.tz, z.offset_ns, cur.date);
     return makeZoned(arena, .{ .ns = ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
 }
 
@@ -775,7 +793,7 @@ fn addSub(arena: std.mem.Allocator, this_val: Value, args: []const Value, subtra
     var new_ns = z.ns;
     if (dur.years != 0 or dur.months != 0 or dur.weeks != 0 or dur.days != 0) {
         const new_date = try plain_date.addISODate(cur.date, dur.years, dur.months, dur.weeks, dur.days, overflow, arena);
-        new_ns = wallNs(.{ .date = new_date, .time = cur.time }) - z.offset_ns;
+        new_ns = try disambiguate(arena, z.tz, z.offset_ns, wallNs(.{ .date = new_date, .time = cur.time }), .compatible);
     }
     new_ns += durTimeNanos(dur);
     return makeZoned(arena, .{ .ns = new_ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
@@ -948,9 +966,15 @@ pub fn nativeEquals(arena: std.mem.Allocator, this_val: Value, args: []const Val
 
 pub fn nativeStartOfDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const cur = localDT(z);
-    const ns = wallNs(.{ .date = cur.date, .time = .{} }) - z.offset_ns;
+    const ns = try startOfDay(arena, z.tz, z.offset_ns, localDT(z).date);
     return makeZoned(arena, .{ .ns = ns, .tz = z.tz, .offset_ns = z.offset_ns, .calendar = z.calendar });
+}
+
+/// GetStartOfDay: the earliest instant of `date` in `tz`. Midnight itself may be
+/// skipped by a DST jump (1919-03-31 in America/Toronto started at 00:30), in
+/// which case the day begins at the transition.
+fn startOfDay(arena: std.mem.Allocator, tz: []const u8, fixed: i128, date: shared.ISODate) !i128 {
+    return disambiguate(arena, tz, fixed, wallNs(.{ .date = date, .time = .{} }), .compatible);
 }
 
 pub fn nativeGetTimeZoneTransition(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
@@ -1008,9 +1032,9 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     else if (shared.maximumRoundingIncrement(smallest.?)) |maxv|
         try shared.validateRoundingIncrement(arena, inc, maxv, false);
 
-    const cur = localDT(z);
-    const day_start_ns = wallNs(.{ .date = cur.date, .time = .{} }) - z.offset_ns;
-    const day_len = shared.NS_PER_DAY; // fixed-offset zone
+    const span = try daySpan(arena, z);
+    const day_start_ns = span.start;
+    const day_len = span.len;
     const since_start = z.ns - day_start_ns;
     var new_ns: i128 = undefined;
     if (smallest.? == .day) {
