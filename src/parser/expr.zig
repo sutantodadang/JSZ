@@ -1323,27 +1323,12 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
                 // ('(function(){ new.target })')` stays legal.
                 if (p.eval_code and !p.eval_allow_new_target and p.fn_nesting_depth == 0)
                     return p.fail("new.target expression is not allowed here");
-                var nt_node = p.makeNode(.identifier, start, p.current.start, .{
+                const nt_node = p.makeNode(.identifier, start, p.current.start, .{
                     .identifier = "__new_target__",
                 }) orelse return null;
-                while (true) {
-                    if (p.match(.dot)) {
-                        const pt = p.expectIdentifierName() orelse return null;
-                        const pn = p.makeNode(.identifier, pt.start, pt.end, .{
-                            .identifier = pt.value_str,
-                        }) orelse return null;
-                        nt_node = p.makeNode(.member_expr, nt_node.start, p.current.start, .{
-                            .member_expr = .{ .object = nt_node, .property = pn, .computed = false },
-                        }) orelse return null;
-                    } else if (p.match(.left_bracket)) {
-                        const pe = p.parseExpression() orelse return null;
-                        _ = p.expect(.right_bracket) orelse return null;
-                        nt_node = p.makeNode(.member_expr, nt_node.start, p.current.start, .{
-                            .member_expr = .{ .object = nt_node, .property = pe, .computed = true },
-                        }) orelse return null;
-                    } else break;
-                }
-                return nt_node;
+                // Continue with any member/subscript/call/optional tail
+                // (`new.target.prototype`, `new.target?.x`, `new.target?.()`).
+                return parseCallMemberTail(p, nt_node);
             }
             // M16 Phase 4: `await` is reserved in module code; `new await …` is
             // a SyntaxError per spec (await is not a valid NewExpression callee).
@@ -1446,7 +1431,16 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
 /// (`?.`); if any link in the chain is optional, the whole chain is wrapped
 /// in an `optional_chain` node which establishes the short-circuit boundary.
 pub fn parseCallMemberExpr(p: *Parser) ?*Node {
-    var base = p.parsePrimaryExpr() orelse return null;
+    const base = p.parsePrimaryExpr() orelse return null;
+    return parseCallMemberTail(p, base);
+}
+
+/// Parse the `.`/`[]`/`(...)`/`?.` continuation of a CallExpression/MemberExpression
+/// onto an already-parsed `base`, wrapping the result in an `optional_chain` node
+/// when any `?.` link appeared. Shared by `parseCallMemberExpr` and the
+/// `new.target` meta-property (so `new.target?.x` / `new.target?.()` parse).
+pub fn parseCallMemberTail(p: *Parser, base_in: *Node) ?*Node {
+    var base = base_in;
     var saw_optional = false;
     while (true) {
         if (p.match(.question_dot)) {
