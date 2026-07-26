@@ -325,7 +325,13 @@ pub fn nativeObjectAssign(arena: std.mem.Allocator, _: Value, args: []const Valu
         if (src_obj.internal_kind == .proxy) {
             const keys = (try proxy_mod.proxyOwnKeys(arena, src_obj)) orelse continue;
             for (keys) |kv| {
-                const desc = (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, src_obj, kv)) orelse continue;
+                // [[GetOwnProperty]]: resolve the descriptor through the full
+                // Object.getOwnPropertyDescriptor path — when the proxy has no
+                // getOwnPropertyDescriptor trap this forwards to the target, which
+                // proxyGetOwnPropertyDescriptor signals by returning null (a raw
+                // `orelse continue` would silently skip every such key).
+                const desc = try nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ from_val, kv });
+                if (desc.bits == 0 or desc.unbox() == .undefined_) continue;
                 const enumerable = desc.bits != 0 and desc.unbox() == .object and
                     descTruthy(desc.toPtr().object.getOwn("enumerable") orelse Value{});
                 if (!enumerable) continue;
@@ -2147,20 +2153,43 @@ pub fn nativeObjectDefineProperties(arena: std.mem.Allocator, _: Value, args: []
 /// ToPropertyDescriptor(Get(props, key)) then DefinePropertyOrThrow(O, key, desc).
 /// A non-object descriptor value makes ToPropertyDescriptor throw TypeError.
 fn defineFromProps(arena: std.mem.Allocator, target: Value, props_val: Value, props: *JsObject) anyerror!Value {
-    // Delegate each property to Object.defineProperty so exotic [[DefineOwnProperty]]
-    // (TypedArray integer-indexed elements, Proxy, module namespace) is honored
-    // instead of writing straight to ordinary property storage.
-    for (props.ownKeys()) |k| {
-        if (!props.isEnumerable(k)) continue;
-        // Get(props, k) — invokes getters (with props as the receiver), so an
-        // accessor-backed descriptor property is honored with its side effects.
-        const desc_val = try descGet(arena, props_val, props, k);
+    const realm_mod = @import("../realm.zig");
+    // Step 3: keys = props.[[OwnPropertyKeys]]() — trap-aware for a Proxy source and
+    // inclusive of Symbol keys (both of which `props.ownKeys()` alone would miss).
+    const keys = (try ownPropertyKeyValues(arena, props_val)) orelse {
+        // Not a key-bearing object (shouldn't happen — props is already an object).
+        return target;
+    };
+    // Step 4: collect (key, descriptor-object) for every enumerable own key FIRST —
+    // [[GetOwnProperty]] and Get(props, key) run for all keys before any
+    // DefinePropertyOrThrow lands on the target (§20.1.2.3).
+    const Pair = struct { key: Value, desc: Value };
+    var pairs = std.ArrayListUnmanaged(Pair){};
+    for (keys) |kv| {
+        // propDesc = props.[[GetOwnProperty]](key) — resolves through a Proxy trap
+        // (with forwarding to the target when the trap is absent).
+        const pd = try nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ props_val, kv });
+        if (pd.bits == 0 or pd.unbox() != .object) continue;
+        const en = pd.toPtr().object.getOwn("enumerable") orelse Value{};
+        if (!(en.bits != 0 and val_mod.toBoolean(en))) continue;
+        // Get(props, key) — invokes getters/proxy get trap (props as receiver).
+        const desc_val = if (kv.bits != 0 and kv.unbox() == .symbol)
+            (if (realm_mod.active_context) |c| try c.getPropSym(arena, props_val, kv) else descGet(arena, props_val, props, "") catch Value{})
+        else blk: {
+            const ks = if (kv.bits != 0 and kv.unbox() == .string) kv.toPtr().string else "";
+            break :blk if (realm_mod.active_context) |c| try c.getProp(arena, props_val, ks) else try descGet(arena, props_val, props, ks);
+        };
         // ToPropertyDescriptor requires an object (functions count); a primitive
         // descriptor value throws TypeError.
         if ((try resolveObject(arena, desc_val)) == null)
             return throwTypeError(arena, "Property description must be an object");
-        const key_val = try val_mod.makeString(arena, k);
-        _ = try nativeObjectDefineProperty(arena, target, &[_]Value{ target, key_val, desc_val });
+        try pairs.append(arena, .{ .key = kv, .desc = desc_val });
+    }
+    // Delegate each property to Object.defineProperty so exotic [[DefineOwnProperty]]
+    // (TypedArray integer-indexed elements, Proxy, module namespace) is honored
+    // instead of writing straight to ordinary property storage.
+    for (pairs.items) |p| {
+        _ = try nativeObjectDefineProperty(arena, target, &[_]Value{ target, p.key, p.desc });
     }
     return target;
 }

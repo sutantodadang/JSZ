@@ -252,7 +252,10 @@ fn enumOwnStringKeys(arena: std.mem.Allocator, v: Value) anyerror![]const []cons
         if (try px.proxyOwnKeys(arena, obj)) |keys| {
             for (keys) |kv| {
                 if (kv.bits == 0 or kv.unbox() != .string) continue;
-                const desc = (try px.proxyGetOwnPropertyDescriptor(arena, obj, kv)) orelse continue;
+                // Full [[GetOwnProperty]]: a proxy with no getOwnPropertyDescriptor
+                // trap forwards to the target (null return from the proxy helper),
+                // so route through the canonical descriptor path.
+                const desc = try @import("object_methods.zig").nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ v, kv });
                 if (!isObj(desc)) continue;
                 const en = desc.toPtr().object.getOwn("enumerable") orelse continue;
                 if (en.bits != 0 and en.unbox() == .boolean and en.unbox().boolean)
