@@ -2273,7 +2273,44 @@ pub const BcVm = struct {
             try proxy_mod.proxyGetInvariant(self.arena, target, key, res);
             return res;
         }
-        // No trap: forward to the target.
+        // No trap: forward to target.[[Get]](P, Receiver). The Receiver (this
+        // proxy, or whatever was reading through it) is observable only as the
+        // `this` of an accessor getter; data and exotic reads are
+        // receiver-independent, so those use the ordinary [[Get]].
+        if (target.bits != 0 and target.unbox() == .object) {
+            const tobj = target.toPtr().object;
+            if (tobj.internal_kind == .proxy)
+                return try self.proxyGet(receiver, tobj, key);
+            if (key.bits != 0 and key.unbox() == .symbol) {
+                var cur: ?*JsObject = tobj;
+                var d: usize = 0;
+                while (cur) |o| {
+                    if (d >= MAX_PROTO_DEPTH) break;
+                    d += 1;
+                    if (o != tobj and o.internal_kind == .proxy) return try self.proxyGet(receiver, o, key);
+                    if (o.getOwnSymEntry(key)) |sp| {
+                        if (sp.attr.is_accessor) {
+                            const g = accessorMember(sp.value, "get");
+                            if (!isCallable(g)) return val_mod.makeUndefined(self.arena);
+                            return try self.callAccessor(g, receiver, &[_]Value{});
+                        }
+                        break;
+                    }
+                    cur = o.proto;
+                }
+            } else {
+                const key_str2 = try valueToStringArena(self.arena, key);
+                if (tobj.findProperty(key_str2)) |loc| {
+                    const a = loc.holder.attrAt(loc.slot);
+                    if (a.is_accessor) {
+                        const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+                        const g = accessorMember(raw, "get");
+                        if (!isCallable(g)) return val_mod.makeUndefined(self.arena);
+                        return try self.callAccessor(g, receiver, &[_]Value{});
+                    }
+                }
+            }
+        }
         if (key.bits != 0 and key.unbox() == .symbol) return try self.getPropSym(target, key);
         const key_str = try valueToStringArena(self.arena, key);
         return try self.getProp(target, key_str);
