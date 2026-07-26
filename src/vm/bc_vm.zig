@@ -4309,8 +4309,13 @@ pub const BcVm = struct {
         // (non-enumerable, matching the spec's @@iterator on %Array.prototype%).
         const realm_mod = @import("../runtime/realm.zig");
         if (realm_mod.active_sym_iterator) |symv| {
-            const coll = @import("../runtime/builtins/es2015_collections.zig");
-            try obj.setSymAttr(symv, try val_mod.makeNativeFunction(self.arena, coll.nativeArrayValues), .{ .writable = true, .enumerable = false, .configurable = true });
+            // §10.4.4.7/.8: the arguments object's @@iterator IS %Array.prototype.values%
+            // (the SAME function object as `[][Symbol.iterator]`), not a fresh copy.
+            const values_fn = self.realm.array_prototype.getSym(symv) orelse blk: {
+                const coll = @import("../runtime/builtins/es2015_collections.zig");
+                break :blk try val_mod.makeNativeFunction(self.arena, coll.nativeArrayValues);
+            };
+            try obj.setSymAttr(symv, values_fn, .{ .writable = true, .enumerable = false, .configurable = true });
         }
         // Mapped arguments (sloppy mode + simple parameter list): indices alias the
         // parameter bindings both ways (`arguments[0] = v` writes param 0; reading
