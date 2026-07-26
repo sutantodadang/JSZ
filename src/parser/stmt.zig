@@ -595,6 +595,35 @@ pub fn atLetDecl(p: *Parser) bool {
     };
 }
 
+/// LabelledItem : LabelledStatement | FunctionDeclaration. A Declaration
+/// (LexicalDeclaration `let`/`const`, ClassDeclaration, generator/async
+/// HoistableDeclaration) is NOT a valid labelled-statement body; only a plain
+/// sloppy-mode FunctionDeclaration is (Annex B.3.2). Called with the current
+/// token positioned at the start of the body (after the label `:`). Returns an
+/// early-error message when the body starts a forbidden Declaration, else null.
+fn labelBodyDeclError(p: *Parser) ?[]const u8 {
+    switch (p.current.kind) {
+        .kw_const, .kw_class => return "a declaration may not be the body of a labelled statement",
+        .kw_function => {
+            // `function*` (generator) is a HoistableDeclaration → always an error.
+            if (p.peekNext().kind == .star) return "a generator declaration may not be the body of a labelled statement";
+            // A plain FunctionDeclaration is allowed only in sloppy mode.
+            if (p.strict) return "a function declaration may not be the body of a labelled statement in strict mode";
+            return null;
+        },
+        .identifier => {
+            if (atLetDecl(p)) return "a lexical declaration may not be the body of a labelled statement";
+            // `async function` is an async HoistableDeclaration.
+            if (std.mem.eql(u8, p.current.value_str, "async") and
+                p.peekNext().kind == .kw_function and
+                !p.peekNext().line_terminator_before)
+                return "an async function declaration may not be the body of a labelled statement";
+            return null;
+        },
+        else => return null,
+    }
+}
+
 pub fn parseStatement(p: *Parser) ?*Node {
     if (p.had_error) return null;
     // A statement can begin with a RegularExpressionLiteral, but the lexer read
@@ -634,6 +663,7 @@ pub fn parseStatement(p: *Parser) ?*Node {
         const saved = p.current;
         _ = p.advance(); // `yield`
         _ = p.advance(); // `:`
+        if (labelBodyDeclError(p)) |msg| return p.fail(msg);
         const body = p.parseStatement() orelse return null;
         return p.makeNode(.labeled_stmt, saved.start, p.current.start, .{
             .labeled_stmt = .{ .name = "yield", .body = body },
@@ -648,14 +678,29 @@ pub fn parseStatement(p: *Parser) ?*Node {
         _ = p.advance();
         if (p.current.kind == .colon) {
             // It's a label!
+            // A LabelIdentifier may not be a strict-mode future reserved word
+            // (`let`, `static`, `implements`, `yield`, …). `eval`/`arguments`
+            // ARE valid labels even in strict code, so exclude them here.
+            if (p.strict and parser_file.isStrictReservedWord(saved_tok.value_str) and
+                !std.mem.eql(u8, saved_tok.value_str, "eval") and
+                !std.mem.eql(u8, saved_tok.value_str, "arguments"))
+                return p.fail("a strict-mode reserved word may not be used as a label");
             _ = p.advance(); // consume ':'
+            if (labelBodyDeclError(p)) |msg| return p.fail(msg);
             const label_name = saved_tok.value_str;
             const body = p.parseStatement() orelse return null;
             return p.makeNode(.labeled_stmt, saved_tok.start, p.current.start, .{
                 .labeled_stmt = .{ .name = label_name, .body = body },
             });
         } else {
-            // Not a label — restore by re-parsing as expr statement.
+            // Not a label — restore by re-parsing as expr statement. A
+            // statement-leading IdentifierReference that is a strict-mode future
+            // reserved word (`let`, `static`, …) is an early error in strict code
+            // (`eval`/`arguments` exempt — restricted only as binding targets).
+            if (p.strict and parser_file.isStrictReservedWord(saved_tok.value_str) and
+                !std.mem.eql(u8, saved_tok.value_str, "eval") and
+                !std.mem.eql(u8, saved_tok.value_str, "arguments"))
+                return p.fail("unexpected strict-mode reserved word");
             // We consumed the identifier, so construct an identifier node.
             const ident_node = p.makeNode(.identifier, saved_tok.start, saved_tok.end, .{
                 .identifier = if (std.mem.eql(u8, saved_tok.value_str, "undefined")) blk: {
@@ -1086,6 +1131,7 @@ pub fn parseFunctionDecl(p: *Parser, is_async: bool) ?*Node {
     };
     p.in_generator_function = prev_gen;
     if (!parser_file.checkStrictDirectiveSimpleParams(p, parsed_params.non_simple, body)) return null;
+    if (!parser_file.checkStrictBodyFunctionName(p, name)) return null;
     const is_strict = parser_file.hasUseStrict(body);
     return p.makeNode(.function_decl, start, p.current.start, .{
         .function_decl = .{
@@ -1247,6 +1293,9 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         if (p.check(.identifier)) {
             const name_tok = p.current;
             _ = p.advance(); // consume identifier
+            // The loop variable is a BindingIdentifier: strict code may not bind
+            // `eval`/`arguments` or a future reserved word.
+            if (!parser_file.checkStrictBindingName(p, name_tok.value_str, name_tok.line, name_tok.column)) return null;
             if (p.check(.kw_in)) {
                 // It's for-in: for (var/let/const name in expr)
                 _ = p.advance(); // consume 'in'
@@ -1702,6 +1751,9 @@ pub fn parseTryStmt(p: *Parser) ?*Node {
                 break :blk tmp;
             } else blk: {
                 const tok = p.expect(.identifier) orelse return null;
+                // A catch parameter is a BindingIdentifier: in strict code it may
+                // not be `eval`/`arguments` or a future reserved word.
+                if (!parser_file.checkStrictBindingName(p, tok.value_str, tok.line, tok.column)) return null;
                 break :blk tok.value_str;
             };
             _ = p.expect(.right_paren) orelse return null;
@@ -1721,6 +1773,13 @@ pub fn parseTryStmt(p: *Parser) ?*Node {
             p.destruct_out = saved_out;
             p.destruct_kind = saved_kind;
             if (!ok) return null;
+            // A destructuring catch binding introduces BindingIdentifiers: strict
+            // code may not bind `eval`/`arguments` or a future reserved word.
+            for (decls_out.items) |d| {
+                if (d.kind == .var_decl and !std.mem.startsWith(u8, d.data.var_decl.name, "__")) {
+                    if (!parser_file.checkStrictBindingName(p, d.data.var_decl.name, p.current.line, p.current.column)) return null;
+                }
+            }
             var body_stmts = std.ArrayList(*Node){};
             body_stmts.appendSlice(p.arena, decls_out.items) catch return null;
             body_stmts.append(p.arena, catch_body) catch return null;

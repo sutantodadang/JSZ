@@ -389,6 +389,9 @@ const ClassBodyParse = struct {
     // must NOT auto-call super) from a class with no constructor at all (which
     // synthesizes the default `return Reflect.construct(Super, ...)`).
     has_ctor: bool = false,
+    /// The constructor body references `super.x` / `super[e]` (a super *property*,
+    /// not a `super()` call). A base class must still bind `__sproto__` for it.
+    ctor_uses_super: bool = false,
     members: []ClassMember = &[_]ClassMember{},
     fields: []ClassField = &[_]ClassField{},
     /// This class body's PrivateEnvironment, filled in by `manglePrivateNames`.
@@ -533,6 +536,16 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
         // A MethodDefinition takes UniqueFormalParameters (§15.4.1).
         p.require_unique_params = true;
         const mparams = p.parseFunctionParams() orelse return null;
+        // §15.4.1: a getter takes no parameters; a setter takes exactly one (not
+        // a rest parameter).
+        if (accessor == .get and (mparams.params.len != 0 or mparams.rest_param != null)) {
+            _ = p.fail("getter functions must have no arguments");
+            return null;
+        }
+        if (accessor == .set and (mparams.params.len != 1 or mparams.rest_param != null)) {
+            _ = p.fail("setter functions must have exactly one argument");
+            return null;
+        }
         const prev_gen = p.in_generator_function;
         p.in_generator_function = is_generator;
         const mbody = p.parseFunctionBody() orelse {
@@ -547,6 +560,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             res.ctor_rest = mparams.rest_param;
             res.ctor_body = mbody;
             res.has_ctor = true;
+            res.ctor_uses_super = p.super_prop_count != super_mark;
         } else {
             members.append(p.arena, .{
                 .is_static = is_static,
@@ -1414,15 +1428,18 @@ fn prependInstanceFields(
     ctor_body: []*Node,
     fields: []const ClassField,
     priv_plan: []const PrivInstance,
+    ctor_uses_super: bool,
 ) ?[]*Node {
     var any = false;
-    var any_super = false;
+    var any_super = ctor_uses_super;
     for (fields) |f| {
         if (f.is_static) continue;
         any = true;
         if (f.uses_super_prop) any_super = true;
     }
-    if (!any and priv_plan.len == 0) return ctor_body;
+    // The constructor body's own `super.x` needs `__sproto__` even when there
+    // are no instance fields or private members to install.
+    if (!any and priv_plan.len == 0 and !ctor_uses_super) return ctor_body;
     var stmts = std.ArrayList(*Node){};
     // Private methods/accessors are added before any field initializer runs.
     if (!appendPrivInstanceInstalls(p, &stmts, priv_plan, null)) return null;
@@ -2194,7 +2211,7 @@ fn emitClassStatements(
         ctor_body_effective = ctor_stmts.items;
     } else {
         // Base class: instance fields initialize at the start of the constructor.
-        ctor_body_effective = prependInstanceFields(p, class_name, ctor_body_effective, fields, priv_plan) orelse return null;
+        ctor_body_effective = prependInstanceFields(p, class_name, ctor_body_effective, fields, priv_plan, parsed.ctor_uses_super) orelse return null;
     }
 
     // var ClassName = function ClassName(...) { ... }
@@ -2505,6 +2522,25 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         }
         break :blk true;
     };
+    // BoundNames of destructuring parameters live in the desugared prelude as
+    // `let <name> = …` decls (with `__`-prefixed synthetic temps interspersed).
+    // Harvest the user-visible names so duplicates *within* a pattern (`[x,x]`)
+    // and *across* params (`x,[x]`) are detected — these are always errors, even
+    // in a sloppy list, because such a list is non-simple.
+    for (param_prelude.items) |st| {
+        if (st.kind == .var_decl) {
+            const nm = st.data.var_decl.name;
+            if (!std.mem.startsWith(u8, nm, "__")) {
+                // A destructuring pattern may not bind `eval`/`arguments` (nor any
+                // other future reserved word) in strict-mode code.
+                if (!parser_file.checkStrictBindingName(p, nm, p.current.line, p.current.column)) return null;
+                bound.append(p.arena, nm) catch {
+                    p.had_error = true;
+                    return null;
+                };
+            }
+        }
+    }
     p.pending_param_names = bound.items;
     p.pending_params_duplicate = parser_file.hasDuplicateName(bound.items);
     if (p.pending_params_duplicate and (unique_required or p.strict or !simple)) {
@@ -2583,6 +2619,10 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
         .param_defaults = defaults.items,
         .rest_param = rest_param,
         .expected_argc = expected_argc,
+        // IsSimpleParameterList is false when the list has a rest element, a
+        // default value, or a destructuring pattern. `simple` captured that
+        // above (before the default-param TDZ desugar rewrote `defaults`).
+        .non_simple = !simple,
     };
 }
 
@@ -2633,6 +2673,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     const le_start = p.live_exports.items.len;
     const la_start = p.live_export_aliases.items.len;
     var in_prologue = true;
+    var body_has_use_strict = false;
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const s = p.parseStatement() orelse break;
         body.append(p.arena, s) catch {
@@ -2641,7 +2682,10 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
         };
         if (in_prologue) {
             if (parser_file.directiveOf(s)) |dir| {
-                if (std.mem.eql(u8, dir, "use strict")) p.strict = true;
+                if (std.mem.eql(u8, dir, "use strict")) {
+                    p.strict = true;
+                    body_has_use_strict = true;
+                }
             } else in_prologue = false;
         }
         p.drainExtraStmts(&body);
@@ -2652,6 +2696,24 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     // `let`/`const` may never redeclare a parameter (LexicallyDeclaredNames of
     // the FunctionStatementList must be disjoint from BoundNames of the
     // FormalParameters). Both are only decidable once the body has been read.
+    if (!p.had_error) {
+        // A "use strict" prologue also retroactively outlaws a parameter bound to
+        // `eval`/`arguments` or a future reserved word (§15.2.1). Only meaningful
+        // when the body introduced strictness that the params weren't parsed under.
+        if (body_has_use_strict and !saved_strict) {
+            for (param_names) |pn| {
+                if (parser_file.isStrictReservedWord(pn)) {
+                    p.had_error = true;
+                    p.error_info = parser_file.ParseError{
+                        .message = "unexpected strict-mode reserved word as parameter name",
+                        .line = p.current.line,
+                        .column = p.current.column,
+                    };
+                    break;
+                }
+            }
+        }
+    }
     if (!p.had_error) {
         if (params_duplicate and p.strict) {
             parser_file.rejectDuplicateParams(p);
@@ -2675,6 +2737,11 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
         }
     }
     p.strict = saved_strict;
+    // Publish this body's own "use strict" prologue flag for the caller's
+    // checkStrictDirectiveSimpleParams (§15.2.1: a non-simple parameter list may
+    // not be combined with a "use strict" body directive). Set at the end so a
+    // nested function body that already returned doesn't leave a stale value.
+    p.pending_body_use_strict = body_has_use_strict;
     p.fn_nesting_depth -= 1;
     _ = p.expect(.right_brace) orelse return null;
     // Explicit resource management: wrap the user body in the `using` disposal

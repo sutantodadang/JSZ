@@ -77,17 +77,33 @@ pub fn parseExprFromIdent(p: *Parser, ident: *Node) ?*Node {
     return finishBinaryFromBase(p, base);
 }
 
+/// Strict-mode early error: `eval`/`arguments` may not be the operand of a
+/// prefix/postfix `++`/`--` (§13.4). Records the error and returns true when the
+/// operand is one of these bare identifiers in strict code.
+fn strictUpdateTargetError(p: *Parser, operand: *Node) bool {
+    if (p.strict and operand.kind == .identifier and
+        (std.mem.eql(u8, operand.data.identifier, "eval") or
+            std.mem.eql(u8, operand.data.identifier, "arguments")))
+    {
+        _ = p.fail("invalid increment/decrement of eval or arguments in strict mode");
+        return true;
+    }
+    return false;
+}
+
 /// Continue parsing a binary/assignment expression given a left-hand base node.
 fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
     var left = base;
     // Handle postfix ++ / -- that may follow the base.
     if (!p.current.line_terminator_before) {
         if (p.current.kind == .plus_plus) {
+            if (strictUpdateTargetError(p, left)) return null;
             _ = p.advance();
             left = p.makeNode(.update_expr, left.start, p.current.start, .{
                 .update_expr = .{ .op = .inc, .operand = left, .prefix = false },
             }) orelse return null;
         } else if (p.current.kind == .minus_minus) {
+            if (strictUpdateTargetError(p, left)) return null;
             _ = p.advance();
             left = p.makeNode(.update_expr, left.start, p.current.start, .{
                 .update_expr = .{ .op = .dec, .operand = left, .prefix = false },
@@ -1244,6 +1260,11 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
             p.in_delete_operand = true;
             const operand = p.parseUnaryExpr() orelse return null;
             p.in_delete_operand = saved_del;
+            // Strict-mode early error: `delete` of an unqualified reference (a
+            // bare BindingIdentifier, even parenthesized) is a SyntaxError
+            // (§13.5.1.1). A member/element delete (`delete o.x`) stays legal.
+            if (p.strict and operand.kind == .identifier)
+                return p.fail("applying the 'delete' operator to an unqualified name is deprecated");
             return p.makeNode(.unary_expr, start, p.current.start, .{
                 .unary_expr = .{ .op = .delete_, .operand = operand },
             });
@@ -1259,6 +1280,7 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
         .plus_plus => {
             _ = p.advance();
             const operand = p.parseUnaryExpr() orelse return null;
+            if (strictUpdateTargetError(p, operand)) return null;
             return p.makeNode(.update_expr, start, p.current.start, .{
                 .update_expr = .{ .op = .inc, .operand = operand, .prefix = true },
             });
@@ -1266,6 +1288,7 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
         .minus_minus => {
             _ = p.advance();
             const operand = p.parseUnaryExpr() orelse return null;
+            if (strictUpdateTargetError(p, operand)) return null;
             return p.makeNode(.update_expr, start, p.current.start, .{
                 .update_expr = .{ .op = .dec, .operand = operand, .prefix = true },
             });
@@ -1391,11 +1414,13 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
     var expr = p.parseCallMemberExpr() orelse return null;
     if (!p.current.line_terminator_before) {
         if (p.current.kind == .plus_plus) {
+            if (strictUpdateTargetError(p, expr)) return null;
             _ = p.advance();
             expr = p.makeNode(.update_expr, start, p.current.start, .{
                 .update_expr = .{ .op = .inc, .operand = expr, .prefix = false },
             }) orelse return null;
         } else if (p.current.kind == .minus_minus) {
+            if (strictUpdateTargetError(p, expr)) return null;
             _ = p.advance();
             expr = p.makeNode(.update_expr, start, p.current.start, .{
                 .update_expr = .{ .op = .dec, .operand = expr, .prefix = false },
@@ -1726,6 +1751,15 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
     switch (p.current.kind) {
         .number => {
             const v = p.current.value_num;
+            // Strict-mode early error: a LegacyOctalIntegerLiteral (`010`) or
+            // NonOctalDecimalIntegerLiteral (`08`, `09`) is forbidden. Both are
+            // spelled as a leading `0` followed immediately by another decimal
+            // digit (`0x`/`0o`/`0b`/`0.`/`0e`/`0n` all have a non-digit at [1]).
+            if (p.strict) {
+                const s = p.current.value_str;
+                if (s.len >= 2 and s[0] == '0' and s[1] >= '0' and s[1] <= '9')
+                    return p.fail("octal literals are not allowed in strict mode");
+            }
             _ = p.advance();
             return p.makeNode(.number_literal, start, end, .{ .number_literal = v });
         },
@@ -1884,6 +1918,14 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
             }
             const name = p.current.value_str;
             if (p.staticBlockReservedIdent(name)) |msg| return p.fail(msg);
+            // In strict-mode code a future reserved word (`let`, `static`,
+            // `implements`, …) may not appear as an IdentifierReference. `eval`
+            // and `arguments` are exempt — they are only restricted as binding
+            // targets, not as references.
+            if (p.strict and parser_file.isStrictReservedWord(name) and
+                !std.mem.eql(u8, name, "eval") and
+                !std.mem.eql(u8, name, "arguments"))
+                return p.fail("unexpected strict-mode reserved word");
             _ = p.advance();
             // Special: 'undefined' identifier -> undefined literal
             if (std.mem.eql(u8, name, "undefined")) {
@@ -2220,6 +2262,12 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             }
             p.require_unique_params = true;
             const acc_params = p.parseFunctionParams() orelse return null;
+            // §15.4.1: a getter takes no parameters; a setter takes exactly one
+            // (and it may not be a rest parameter).
+            if (acc_kind == .get and (acc_params.params.len != 0 or acc_params.rest_param != null))
+                return p.fail("getter functions must have no arguments");
+            if (acc_kind == .set and (acc_params.params.len != 1 or acc_params.rest_param != null))
+                return p.fail("setter functions must have exactly one argument");
             p.super_used = false;
             const acc_body = p.parseFunctionBody() orelse return null;
             if (!parser_file.checkStrictDirectiveSimpleParams(p, acc_params.non_simple, acc_body)) return null;
@@ -2515,6 +2563,7 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
     };
     p.in_generator_function = prev_gen;
     if (!parser_file.checkStrictDirectiveSimpleParams(p, parsed_params.non_simple, body)) return null;
+    if (name) |nm| if (!parser_file.checkStrictBodyFunctionName(p, nm)) return null;
     const is_strict = parser_file.hasUseStrict(body);
     return p.makeNode(.function_expr, start, p.current.start, .{
         .function_expr = .{

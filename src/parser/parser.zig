@@ -69,6 +69,27 @@ pub fn checkStrictDirectiveSimpleParams(p: *Parser, non_simple: bool, body: []*N
     return true;
 }
 
+/// A function whose body opens with a "use strict" directive makes the whole
+/// function strict, which retroactively forbids its own name being `eval`,
+/// `arguments`, or a future reserved word — even when the surrounding code is
+/// sloppy (`function eval(){"use strict";}` is a SyntaxError). Reads the flag
+/// `parseFunctionBody` published for the just-parsed body. When the enclosing
+/// code was already strict, `checkStrictBindingName` rejected the name earlier.
+pub fn checkStrictBodyFunctionName(p: *Parser, name: []const u8) bool {
+    if (p.pending_body_use_strict and isStrictReservedWord(name)) {
+        if (!p.had_error) {
+            p.had_error = true;
+            p.error_info = ParseError{
+                .message = "unexpected strict-mode reserved word as function name",
+                .line = p.current.line,
+                .column = p.current.column,
+            };
+        }
+        return false;
+    }
+    return true;
+}
+
 /// If `node` is a string-literal expression statement (a member of a directive
 /// prologue), return its raw string value; otherwise null (the prologue ends at
 /// the first non-string-literal statement).
