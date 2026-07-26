@@ -3131,7 +3131,7 @@ pub const FnCompiler = struct {
     /// function's single environment (no parameter expressions) or, when the
     /// parameter list has initializers, at the separate body variable environment
     /// pushed after the parameter prelude (§10.2.11).
-    fn emitBodyScopeDecls(self: *Self, body: []*Node, implicit_return: bool) error{OutOfMemory}!void {
+    fn emitBodyScopeDecls(self: *Self, body: []*Node, implicit_return: bool, extra_blocked: []const []const u8) error{OutOfMemory}!void {
         {
             // Annex B.3.3 first: a block-level function declaration only gets a
             // var-scoped binding when no lexical declaration or parameter between
@@ -3139,6 +3139,11 @@ pub const FnCompiler = struct {
             {
                 var blocked: std.ArrayList([]const u8) = .empty;
                 for (self.param_names) |p| try self.addHoistName(&blocked, p);
+                // A default/destructuring parameter list desugars its bindings into
+                // a leading prelude of `let` statements outside `body`; those names
+                // are still parameters for Annex B purposes, so a same-named body
+                // block-function must not extend past them.
+                for (extra_blocked) |p| try self.addHoistName(&blocked, p);
                 if (!implicit_return and !self.is_arrow) try self.addHoistName(&blocked, "arguments");
                 for (body) |stmt| try self.collectLexicalNames(stmt, &blocked);
                 for (body) |stmt| try self.collectAnnexBNames(stmt, &blocked, &self.annexb_fn_names, false);
@@ -3199,7 +3204,7 @@ pub const FnCompiler = struct {
             for (body[0..n_prelude]) |stmt| try self.collectLexicalNames(stmt, &plex);
             for (plex.items) |name| try self.emitHoistLexical(name, 0);
         } else {
-            try self.emitBodyScopeDecls(body, implicit_return);
+            try self.emitBodyScopeDecls(body, implicit_return, &.{});
         }
 
         // Completion values (eval/REPL): the top-level program accumulates its
@@ -3261,6 +3266,14 @@ pub const FnCompiler = struct {
             // instantiation inside it (§10.2.11 steps 27-28).
             if (has_param_env and stmt_idx == n_prelude) {
                 try self.emitOp(.PUSH_VAR_ENV, 0);
+                // The real parameter names bound by the prelude `let` statements
+                // (the default/destructuring desugar renames the actual parameters
+                // to `__arg_N`/`__param_N`). Needed both to copy same-named body
+                // vars from the parameter value (§10.2.11 step 28) and to block a
+                // same-named body block-function from the Annex B.3.3 extension.
+                var prelude_names: std.ArrayList([]const u8) = .empty;
+                for (body[0..n_prelude]) |stmt2| try self.collectLexicalNames(stmt2, &prelude_names);
+
                 // §10.2.11 step 28: a body `var` whose name is also a parameter is
                 // initialized to that parameter's value, not `undefined`. Copy the
                 // parameter-environment binding into the fresh body environment
@@ -3269,16 +3282,13 @@ pub const FnCompiler = struct {
                 {
                     var body_vars: std.ArrayList([]const u8) = .empty;
                     for (body[n_prelude..]) |stmt2| try self.collectHoistedNames(stmt2, &body_vars, false);
-                    var param_names: std.ArrayList([]const u8) = .empty;
-                    for (self.param_names) |p| try self.addHoistName(&param_names, p);
-                    for (body[0..n_prelude]) |stmt2| try self.collectLexicalNames(stmt2, &param_names);
                     for (body_vars.items) |vn| {
                         var is_param = false;
-                        for (param_names.items) |pn| {
-                            if (std.mem.eql(u8, pn, vn)) {
-                                is_param = true;
-                                break;
-                            }
+                        for (self.param_names) |pn| {
+                            if (std.mem.eql(u8, pn, vn)) is_param = true;
+                        }
+                        for (prelude_names.items) |pn| {
+                            if (std.mem.eql(u8, pn, vn)) is_param = true;
                         }
                         if (!is_param) continue;
                         const r = self.allocReg();
@@ -3287,7 +3297,7 @@ pub const FnCompiler = struct {
                         self.freeReg();
                     }
                 }
-                try self.emitBodyScopeDecls(body[n_prelude..], implicit_return);
+                try self.emitBodyScopeDecls(body[n_prelude..], implicit_return, prelude_names.items);
             }
             // Parameter-initializer code reaches the body two ways: the parser's
             // default-parameter TDZ desugar (flagged on the `let` it emits) and
