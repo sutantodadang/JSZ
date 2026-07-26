@@ -2764,6 +2764,14 @@ pub const FnCompiler = struct {
             if (a.kind == .spread_expr) return try self.compileCallSpread(c, line);
         }
 
+        // A parenthesized optional chain used as a call target — `(a?.b)()`,
+        // `(a?.b)?.()` — resolves to a member Reference whose base is the call's
+        // `this`. The plain `is_method` shape below only matches a bare
+        // member_expr, so route the optional-chain-wrapped member here.
+        if (c.callee.kind == .optional_chain and c.callee.data.optional_chain.kind == .member_expr) {
+            return try self.compileOptionalMethodCall(c, line, tail);
+        }
+
         const is_method = c.callee.kind == .member_expr;
 
         if (is_method) {
@@ -2893,6 +2901,77 @@ pub const FnCompiler = struct {
 
     /// Compile a call whose arguments include a spread (`f(...xs)`,
     /// `obj.m(a, ...xs)`). Builds a runtime argument array and emits CALL_SPREAD.
+    /// `(a?.b)()` / `(a?.b)?.()`: a call whose callee is a parenthesized optional
+    /// chain over a member expression. The base of that member is the call's
+    /// `this`, exactly as for `a.b()`. The inner chain is self-contained (the
+    /// parentheses close it): its nullish guards short-circuit to an `undefined`
+    /// callee within this call, after which the outer call proceeds (a TypeError
+    /// for a non-optional `()`, a short-circuit for an optional `?.()`).
+    pub fn compileOptionalMethodCall(self: *Self, c: ast.CallExpr, line: u32, tail: bool) error{OutOfMemory}!u8 {
+        const me = c.callee.data.optional_chain.data.member_expr;
+        const base = self.sp;
+        _ = self.allocReg(); // R[base] = this
+
+        // Inner optional-chain boundary: guards from the parenthesized chain land
+        // on a local pad producing an undefined callee, not any enclosing chain.
+        var inner_jumps: std.ArrayListUnmanaged(usize) = .empty;
+        const saved = self.optional_jumps;
+        self.optional_jumps = &inner_jumps;
+
+        self.sp = base;
+        _ = try self.compileExpr(me.object); // this into R[base]
+        self.sp = base + 1;
+        if (me.optional) try self.emitOptionalGuard(base, line);
+
+        // R[base+1] = callee = R[base][prop]
+        _ = self.allocReg();
+        self.sp = base + 1;
+        if (!me.computed) {
+            const sv = try val_mod.makeString(self.arena, me.property.data.identifier);
+            const kidx = try self.addConstant(sv);
+            try self.emitOp(.GET_PROP, line);
+            try self.emitU8(base + 1);
+            try self.emitU8(base);
+            try self.emitU16(kidx);
+        } else {
+            const rkey = try self.compileExpr(me.property);
+            try self.emitOp(.GET_PROP_DYN, line);
+            try self.emitU8(base + 1);
+            try self.emitU8(base);
+            try self.emitU8(rkey);
+            self.freeReg(); // free rkey
+        }
+        self.sp = base + 2;
+
+        // Merge the inner chain: normal path skips the pad; the pad (targeted by
+        // the inner guards) loads an undefined callee.
+        try self.emitOp(.JMP, line);
+        const patch_end = self.currentOffset();
+        try self.emitI16(0);
+        const pad = self.currentOffset();
+        for (inner_jumps.items) |p| self.patchJump(p, pad);
+        try self.emitOp(.LOAD_UNDEF, line);
+        try self.emitU8(base + 1);
+        self.patchJump(patch_end, self.currentOffset());
+        self.optional_jumps = saved;
+
+        // Outer optional call `?.()`: short-circuit (via the enclosing chain) when
+        // the resolved callee is nullish.
+        if (c.optional) try self.emitOptionalGuard(base + 1, line);
+
+        const nargs: u8 = @intCast(c.args.len);
+        for (c.args) |arg| {
+            _ = try self.compileExpr(arg);
+        }
+        const ret_dst = base;
+        try self.emitOp(if (tail) .TAIL_METHOD_CALL else .METHOD_CALL, line);
+        try self.emitU8(base);
+        try self.emitU8(nargs);
+        try self.emitU8(ret_dst);
+        self.sp = base + 1;
+        return ret_dst;
+    }
+
     pub fn compileCallSpread(self: *Self, c: ast.CallExpr, line: u32) error{OutOfMemory}!u8 {
         var rthis: u8 = 0;
         var rcallee: u8 = 0;
