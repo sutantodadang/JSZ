@@ -1643,6 +1643,7 @@ pub const BcVm = struct {
                 .DEFINE_PRIVATE => if (try property_ops.opDefinePrivate(self, frame)) |o| return o,
                 .SET_PROP_DYN => if (try property_ops.opSetPropDyn(self, frame)) |o| return o,
                 .DEFINE_DATA => if (try property_ops.opDefineData(self, frame)) |o| return o,
+                .SET_PROTO => if (try property_ops.opSetProto(self, frame)) |o| return o,
                 .DEFINE_DATA_DYN => if (try property_ops.opDefineDataDyn(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR => if (try property_ops.opDefineAccessor(self, frame)) |o| return o,
                 .DEFINE_ACCESSOR_DYN => if (try property_ops.opDefineAccessorDyn(self, frame)) |o| return o,

@@ -572,6 +572,34 @@ pub inline fn opDefineData(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+/// SET_PROTO — the object-initializer `__proto__: value` special form (§B.3.1).
+/// Sets the (freshly created) object-literal's [[Prototype]] directly via
+/// OrdinarySetPrototypeOf when `value` is an Object or null, bypassing any
+/// inherited `__proto__` accessor; any other value type is a silent no-op.
+pub inline fn opSetProto(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    const code = frame.func.chunk.code;
+    const robj = code[frame.pc];
+    frame.pc += 1;
+    const rval = code[frame.pc];
+    frame.pc += 1;
+    const obj_val = frame.registers[robj];
+    const proto_val = frame.registers[rval];
+    // Only Object / null values mutate [[Prototype]]; undefined, numbers,
+    // strings, booleans and symbols are ignored (no throw).
+    const is_proto_kind = proto_val.bits != 0 and switch (proto_val.unbox()) {
+        .object, .null_, .bc_function, .function => true,
+        else => false,
+    };
+    if (!is_proto_kind) return null;
+    const object_methods = @import("../../runtime/builtins/object_methods.zig");
+    _ = object_methods.nativeObjectSetPrototypeOf(self.arena, Value{}, &.{ obj_val, proto_val }) catch |e| {
+        if (e != error.JsException) return e;
+        if (try self.raisePendingException("error setting __proto__")) |oc| return oc;
+        return null;
+    };
+    return null;
+}
+
 /// DEFINE_DATA_DYN — CreateDataPropertyOrThrow with a runtime key.
 pub inline fn opDefineDataDyn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;

@@ -189,6 +189,13 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
             new_pc += 1;
             try writer.print(" R{d} R{d}", .{ rdst, rsrc });
         },
+        .SET_PROTO => {
+            const robj = code[new_pc];
+            new_pc += 1;
+            const rval = code[new_pc];
+            new_pc += 1;
+            try writer.print(" R{d}.__proto__ = R{d}", .{ robj, rval });
+        },
         .YIELD, .YIELD_STAR, .AWAIT, .TO_PROPERTY_KEY => {
             const r = code[new_pc];
             new_pc += 1;

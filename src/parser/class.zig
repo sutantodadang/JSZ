@@ -491,6 +491,10 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             // and `get 16()` define the same accessor (and `1e2` is "100", not
             // "1e2"). The raw spelling would key a distinct, unreachable property.
             name = expr_mod.numericLiteralKey(p) orelse return null;
+        } else if (p.check(.bigint)) {
+            // A BigInt-literal class-element name keys on ToString of its value
+            // (`1n` → "1"), mirroring the NumericLiteral case above.
+            name = expr_mod.bigintLiteralKey(p) orelse return null;
         } else if (p.check(.identifier) or p.check(.string)) {
             name = p.current.value_str;
             _ = p.advance();

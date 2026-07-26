@@ -338,6 +338,12 @@ pub const ObjectProp = struct {
     /// ES6 computed key `{ [expr]: value }`: the key is evaluated at runtime
     /// (may yield a symbol). `null` for ordinary static keys.
     computed_key: ?*Node = null,
+    /// True only for the object-initializer `__proto__: value` colon form
+    /// (§B.3.1), whose semantics are a [[Prototype]] mutation rather than a
+    /// property definition. Shorthand `{ __proto__ }`, method `{ __proto__(){} }`,
+    /// and computed `{ ["__proto__"]: v }` are ordinary properties (flag stays
+    /// false) — only the plain-key colon form triggers prototype mutation.
+    is_proto_setter: bool = false,
 };
 
 /// Phase 3a: object literal { key: value, ... }
