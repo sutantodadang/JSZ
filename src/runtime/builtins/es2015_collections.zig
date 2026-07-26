@@ -2550,7 +2550,10 @@ pub fn nativeDestrObjRest(arena: std.mem.Allocator, _: Value, args: []const Valu
                 const ks_pre = try toPropertyKeyString(arena, kv);
                 for (excl_str.items) |e| if (std.mem.eql(u8, e, ks_pre)) continue :keys;
             }
-            const desc = (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, src_obj, kv)) orelse continue;
+            // [[GetOwnProperty]] via the full descriptor path so a proxy without a
+            // getOwnPropertyDescriptor trap forwards to its target instead of
+            // dropping the key (proxyGetOwnPropertyDescriptor returns null there).
+            const desc = try @import("object_methods.zig").nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ src, kv });
             if (desc.bits == 0 or desc.unbox() != .object) continue;
             const en = desc.toPtr().object.getOwn("enumerable") orelse Value{};
             if (!(en.bits != 0 and isTruthy(en))) continue;
@@ -2634,7 +2637,11 @@ pub fn nativeObjSpreadInto(arena: std.mem.Allocator, _: Value, args: []const Val
         const proxy_mod = @import("proxy.zig");
         const keys = (try proxy_mod.proxyOwnKeys(arena, src_obj)) orelse return val_mod.makeUndefined(arena);
         for (keys) |kv| {
-            const desc = (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, src_obj, kv)) orelse continue;
+            // [[GetOwnProperty]] via the full descriptor path — a proxy with no
+            // getOwnPropertyDescriptor trap forwards to the target (which
+            // proxyGetOwnPropertyDescriptor signals with a null return; a raw
+            // `orelse continue` would drop every such key).
+            const desc = try @import("object_methods.zig").nativeObjectGetOwnPropertyDescriptor(arena, Value{}, &[_]Value{ src, kv });
             if (desc.bits == 0 or desc.unbox() != .object) continue;
             const en = desc.toPtr().object.getOwn("enumerable") orelse Value{};
             if (!(en.bits != 0 and isTruthy(en))) continue;
