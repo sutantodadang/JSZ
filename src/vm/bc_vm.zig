@@ -3274,6 +3274,22 @@ pub const BcVm = struct {
                     try obj.set("length", try val_mod.makeNumber(self.arena, @floatFromInt(u)));
                     return true;
                 }
+                // An own dense array element is a writable/enumerable/configurable
+                // data property, but it lives outside the shape — so findProperty
+                // (shape-only, prototype-walking) would miss it and wrongly consult
+                // an inherited same-index property (e.g. a read-only
+                // Array.prototype["0"]). Handle it here as the own data property it
+                // is, before the prototype walk below.
+                if (obj.is_array and obj.usesDense()) {
+                    if (JsObject.canonicalArrayIndex(key)) |idx| {
+                        if (obj.getIndexOwn(idx) != null) {
+                            if (!sameObject(receiver, obj))
+                                return try self.ordinarySetReceiverWrite(receiver, key, value);
+                            try obj.setIndex(idx, value);
+                            return true;
+                        }
+                    }
+                }
                 if (obj.findProperty(key)) |loc| {
                     const a = loc.holder.attrAt(loc.slot);
                     if (a.is_accessor) {
@@ -4334,7 +4350,21 @@ pub const BcVm = struct {
         const md = try self.arena.create(MappedArgsData);
         const map_count = if (simple) @min(args.len, fn_ptr.param_names.len) else 0;
         const mapped = try self.arena.alloc(bool, map_count);
-        @memset(mapped, true);
+        // CreateMappedArgumentsObject (§10.4.4.7) walks the parameters from last to
+        // first and maps each index to its name only the *first* time that name is
+        // seen — so with a duplicate parameter list (`function (a, a, a)`, legal in
+        // sloppy mode) only the LAST index aliases the binding; earlier indices for
+        // the same name stay unmapped and keep their originally-passed value.
+        for (mapped, 0..) |*m, i| {
+            m.* = true;
+            var j: usize = i + 1;
+            while (j < map_count) : (j += 1) {
+                if (std.mem.eql(u8, fn_ptr.param_names[i], fn_ptr.param_names[j])) {
+                    m.* = false;
+                    break;
+                }
+            }
+        }
         md.* = .{ .env = env, .param_names = fn_ptr.param_names, .count = map_count, .mapped = mapped };
         obj.internal_kind = .mapped_arguments;
         obj.internal_slot = md;
