@@ -197,6 +197,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
         p.arrow_prelude = .{};
+        flagParamPrelude(prelude);
         // An arrow body is its own function-like scope for the class-static-block
         // restrictions: `static { () => { var await; } }` is legal.
         const sb_saved = p.leaveStaticBlock();
@@ -378,6 +379,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
         p.arrow_prelude = .{};
+        flagParamPrelude(prelude);
         // An arrow body is its own function-like scope for the class-static-block
         // restrictions: `static { () => { var await; } }` is legal.
         const sb_saved = p.leaveStaticBlock();
@@ -538,6 +540,16 @@ pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
 
 /// Prepend the destructuring-param prelude (`let` decls) to an arrow body.
 /// Returns `body` unchanged when there is no prelude.
+/// Flag each `var`-decl in an arrow's parameter prelude as parameter-initializer
+/// code (§10.2.11): the bytecode compiler uses this to place the body's `var`
+/// declarations in a separate variable environment, so a default-value closure
+/// cannot observe body `var` bindings.
+fn flagParamPrelude(prelude: []*Node) void {
+    for (prelude) |n| {
+        if (n.kind == .var_decl) n.data.var_decl.param_init = true;
+    }
+}
+
 fn prependPrelude(p: *Parser, prelude: []*Node, body: []*Node) ?[]*Node {
     if (prelude.len == 0) return body;
     var combined = std.ArrayList(*Node){};

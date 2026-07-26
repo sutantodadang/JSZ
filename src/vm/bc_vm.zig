@@ -1570,6 +1570,7 @@ pub const BcVm = struct {
                 .INIT_LEX => if (try load_ops.opInitLexical(self, frame)) |o| return o,
                 .ENTER_SCOPE => if (try load_ops.opEnterScope(self, frame)) |o| return o,
                 .EXIT_SCOPE => if (try load_ops.opExitScope(self, frame)) |o| return o,
+                .PUSH_VAR_ENV => if (try load_ops.opPushVarEnv(self, frame)) |o| return o,
                 .PUSH_WITH => if (try load_ops.opPushWith(self, frame)) |o| return o,
                 .POP_WITH => if (try load_ops.opPopWith(self, frame)) |o| return o,
                 .SET_GLOBAL => if (try load_ops.opSetGlobal(self, frame)) |o| return o,

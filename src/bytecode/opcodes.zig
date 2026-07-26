@@ -400,6 +400,14 @@ pub const Op = enum(u8) {
     /// any other value type. Distinct from SET_PROP, which would invoke the
     /// inherited setter. Declared last (JIT ordinal stability).
     SET_PROTO,
+    /// PUSH_VAR_ENV | 1 | op. Push a fresh *variable* Environment as a child of
+    /// the current one and make it the frame's environment. Used at the
+    /// parameter/body boundary of a function whose parameter list has
+    /// initializer expressions (§10.2.11 steps 27-28): the body's `var`/function
+    /// declarations bind into this separate environment so parameter-scope
+    /// closures never see body `var` bindings. Never paired with an EXIT — the
+    /// frame is discarded on return. Declared last (JIT ordinal stability).
+    PUSH_VAR_ENV,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -503,6 +511,7 @@ pub fn instrSize(op: Op) usize {
         .MARK_PARAM_EVAL => 1,
         .MARK_FIELD_EVAL => 1,
         .SET_PROTO => 3,
+        .PUSH_VAR_ENV => 1,
         .TO_PROPERTY_KEY => 2,
         .DEFINE_LOCAL => 4,
         .DEFINE_DATA => 5,

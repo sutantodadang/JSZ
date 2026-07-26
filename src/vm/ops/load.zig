@@ -391,6 +391,16 @@ pub inline fn opExitScope(_: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     return null;
 }
 
+/// Push a fresh *variable* environment for a function body whose parameter list
+/// has initializer expressions (§10.2.11): body `var`/function declarations bind
+/// here, separate from the parameter environment, so parameter-scope closures
+/// never observe body `var` bindings. Never popped — the frame is discarded on
+/// return.
+pub inline fn opPushVarEnv(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    frame.env = Environment.initVarScope(self.arena, frame.env) catch return error.OutOfMemory;
+    return null;
+}
+
 pub inline fn opPushWith(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const code = frame.func.chunk.code;
     const robj = code[frame.pc];
