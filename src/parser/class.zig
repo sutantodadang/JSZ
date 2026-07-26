@@ -389,6 +389,9 @@ const ClassBodyParse = struct {
     // must NOT auto-call super) from a class with no constructor at all (which
     // synthesizes the default `return Reflect.construct(Super, ...)`).
     has_ctor: bool = false,
+    /// The constructor body references `super.x` / `super[e]` (a super *property*,
+    /// not a `super()` call). A base class must still bind `__sproto__` for it.
+    ctor_uses_super: bool = false,
     members: []ClassMember = &[_]ClassMember{},
     fields: []ClassField = &[_]ClassField{},
     /// This class body's PrivateEnvironment, filled in by `manglePrivateNames`.
@@ -547,6 +550,7 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             res.ctor_rest = mparams.rest_param;
             res.ctor_body = mbody;
             res.has_ctor = true;
+            res.ctor_uses_super = p.super_prop_count != super_mark;
         } else {
             members.append(p.arena, .{
                 .is_static = is_static,
@@ -1414,15 +1418,18 @@ fn prependInstanceFields(
     ctor_body: []*Node,
     fields: []const ClassField,
     priv_plan: []const PrivInstance,
+    ctor_uses_super: bool,
 ) ?[]*Node {
     var any = false;
-    var any_super = false;
+    var any_super = ctor_uses_super;
     for (fields) |f| {
         if (f.is_static) continue;
         any = true;
         if (f.uses_super_prop) any_super = true;
     }
-    if (!any and priv_plan.len == 0) return ctor_body;
+    // The constructor body's own `super.x` needs `__sproto__` even when there
+    // are no instance fields or private members to install.
+    if (!any and priv_plan.len == 0 and !ctor_uses_super) return ctor_body;
     var stmts = std.ArrayList(*Node){};
     // Private methods/accessors are added before any field initializer runs.
     if (!appendPrivInstanceInstalls(p, &stmts, priv_plan, null)) return null;
@@ -2194,7 +2201,7 @@ fn emitClassStatements(
         ctor_body_effective = ctor_stmts.items;
     } else {
         // Base class: instance fields initialize at the start of the constructor.
-        ctor_body_effective = prependInstanceFields(p, class_name, ctor_body_effective, fields, priv_plan) orelse return null;
+        ctor_body_effective = prependInstanceFields(p, class_name, ctor_body_effective, fields, priv_plan, parsed.ctor_uses_super) orelse return null;
     }
 
     // var ClassName = function ClassName(...) { ... }
