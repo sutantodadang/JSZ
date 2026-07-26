@@ -222,7 +222,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         // have a non-simple parameter list. Detect the directive on the raw body,
         // before prependPrelude pushes any default/destructuring inits in front of
         // it (an arrow's `prelude`/`rest_param` mark the list as non-simple).
-        const arrow_use_strict = parser_file.hasUseStrict(body_nodes);
+        const arrow_use_strict = parser_file.hasUseStrict(p.source, body_nodes);
         if ((rest_param != null or prelude.len > 0) and arrow_use_strict) {
             if (!p.had_error) {
                 p.had_error = true;
@@ -403,7 +403,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         // §15.3.1 early error: a ConciseBody with a "use strict" directive may not
         // have a non-simple parameter list (default/rest/destructuring). Detect the
         // directive on the raw body, before prependPrelude pushes any inits ahead.
-        const arrow_use_strict = parser_file.hasUseStrict(body_nodes);
+        const arrow_use_strict = parser_file.hasUseStrict(p.source, body_nodes);
         if ((rest_param != null or prelude.len > 0) and arrow_use_strict) {
             if (!p.had_error) {
                 p.had_error = true;
@@ -2138,7 +2138,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_arrow = false,
                     .is_generator = m_is_gen,
                     .is_async = m_is_async,
-                    .is_strict = parser_file.hasUseStrict(am_body),
+                    .is_strict = parser_file.hasUseStrict(p.source, am_body),
                     .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
@@ -2181,7 +2181,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                         .is_arrow = false,
                         .is_generator = false,
                         .is_async = false,
-                        .is_strict = parser_file.hasUseStrict(cm_body),
+                        .is_strict = parser_file.hasUseStrict(p.source, cm_body),
                         .source_text = p.sourceSlice(prop_start, p.prev_end),
                     },
                 }) orelse return null;
@@ -2298,7 +2298,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_arrow = false,
                     .is_generator = false,
                     .is_async = false,
-                    .is_strict = parser_file.hasUseStrict(acc_body),
+                    .is_strict = parser_file.hasUseStrict(p.source, acc_body),
                     .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
@@ -2333,7 +2333,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_arrow = false,
                     .is_generator = false,
                     .is_async = false,
-                    .is_strict = parser_file.hasUseStrict(m_body),
+                    .is_strict = parser_file.hasUseStrict(p.source, m_body),
                     .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
@@ -2570,7 +2570,7 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
     p.in_generator_function = prev_gen;
     if (!parser_file.checkStrictDirectiveSimpleParams(p, parsed_params.non_simple, body)) return null;
     if (name) |nm| if (!parser_file.checkStrictBodyFunctionName(p, nm)) return null;
-    const is_strict = parser_file.hasUseStrict(body);
+    const is_strict = parser_file.hasUseStrict(p.source, body);
     return p.makeNode(.function_expr, start, p.current.start, .{
         .function_expr = .{
             .name = name,

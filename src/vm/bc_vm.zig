@@ -976,7 +976,7 @@ pub const BcVm = struct {
             realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", msg);
             return error.JsException;
         }
-        const eval_is_strict = parser_mod.hasUseStrict(stmts) or p.strict;
+        const eval_is_strict = parser_mod.hasUseStrict(p.source, stmts) or p.strict;
         // EvalDeclarationInstantiation (§19.2.1.3) validates the whole declaration
         // set BEFORE creating any binding, so a rejected declaration leaves no
         // trace of the ones that would have preceded it.
@@ -1163,7 +1163,7 @@ pub const BcVm = struct {
                 return error.ShadowParseError;
             },
         };
-        const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(stmts) };
+        const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(p.source, stmts) };
         const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<ShadowRealm>");
         if (compiler_mod.last_label_error) |msg| {
             compiler_mod.last_label_error = null;

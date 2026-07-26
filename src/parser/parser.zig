@@ -37,16 +37,36 @@ pub const ParamParse = struct {
     non_simple: bool = false,
 };
 
-/// Check if first statement of body is "use strict" directive.
+/// True if the body's Directive Prologue contains a Use Strict Directive
+/// (§11.2.1 / §11.2.2). The prologue is the leading run of ExpressionStatements
+/// that are string literals; scanning continues past other directives (e.g.
+/// `"bogus"; "use strict";`) until the first non-directive statement. A Use
+/// Strict Directive must be *exactly* `'use strict'` / `"use strict"` in the
+/// SOURCE TEXT — a StringLiteral containing an EscapeSequence or LineContinuation
+/// (`'use strict'`, `'use str\<LF>ict'`) has the cooked value "use strict"
+/// but is NOT a Use Strict Directive, so the raw span is compared, not the
+/// cooked value.
 /// Hoisted to file scope so stmt/expr/class modules can call it without
 /// going through the Parser struct.
-pub fn hasUseStrict(body: []*Node) bool {
-    if (body.len == 0) return false;
-    const first = body[0];
-    if (first.kind != .expr_stmt) return false;
-    const inner = first.data.expr_stmt;
-    if (inner.kind != .string_literal) return false;
-    return std.mem.eql(u8, inner.data.string_literal, "use strict");
+pub fn hasUseStrict(source: []const u8, body: []*Node) bool {
+    for (body) |stmt| {
+        if (stmt.kind != .expr_stmt) return false;
+        const inner = stmt.data.expr_stmt;
+        if (inner.kind != .string_literal) return false;
+        // Compare the raw quoted source: exactly a 12-char `"use strict"` /
+        // `'use strict'` with matching quotes and no escapes.
+        if (inner.end > inner.start and inner.end <= source.len) {
+            const raw = source[inner.start..inner.end];
+            if (raw.len == 12 and (raw[0] == '"' or raw[0] == '\'') and
+                raw[raw.len - 1] == raw[0] and std.mem.eql(u8, raw[1..11], "use strict"))
+                return true;
+        } else if (std.mem.eql(u8, inner.data.string_literal, "use strict")) {
+            // Synthetic node with no source span: fall back to the cooked value.
+            return true;
+        }
+        // Any other string-literal directive: keep scanning the prologue.
+    }
+    return false;
 }
 
 /// §15.2.1 early error: a function whose FunctionBody opens with a "use strict"
@@ -1718,7 +1738,7 @@ pub const Parser = struct {
         // without this a top-level `await using` reached the (dead) USING_*
         // opcode path in the VM. No-op when the source declares no resources.
         stmts.items = stmt_mod.desugarUsingScope(self, stmts.items, 0);
-        const is_strict = hasUseStrict(stmts.items);
+        const is_strict = hasUseStrict(self.source, stmts.items);
         return .{ .stmts = stmts.items, .is_strict = is_strict };
     }
 };
