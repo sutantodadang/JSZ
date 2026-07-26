@@ -118,10 +118,10 @@ pub inline fn opLt(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             if (try self.raisePendingException("error in comparison")) |oc| return oc;
             return null;
         };
-        const r = bcv.jsLessThan(pr.lp, pr.rp) orelse false;
+        const r = bcv.jsLessThan(self.arena, pr.lp, pr.rp) orelse false;
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
     } else {
-        const r = bcv.jsLessThan(lv, rv) orelse false;
+        const r = bcv.jsLessThan(self.arena, lv, rv) orelse false;
         frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
     }
     return null;
@@ -144,11 +144,11 @@ pub inline fn opLe(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             if (try self.raisePendingException("error in comparison")) |oc| return oc;
             return null;
         };
-        const r2 = bcv.jsLessThan(pr.rp, pr.lp);
+        const r2 = bcv.jsLessThan(self.arena, pr.rp, pr.lp);
         const r = if (r2) |v| !v else false;
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
     } else {
-        const r2 = bcv.jsLessThan(rv, lv);
+        const r2 = bcv.jsLessThan(self.arena, rv, lv);
         const r = if (r2) |v| !v else false;
         frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
     }
@@ -171,10 +171,10 @@ pub inline fn opGt(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             if (try self.raisePendingException("error in comparison")) |oc| return oc;
             return null;
         };
-        const r = bcv.jsLessThan(pr.rp, pr.lp) orelse false;
+        const r = bcv.jsLessThan(self.arena, pr.rp, pr.lp) orelse false;
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
     } else {
-        const r = bcv.jsLessThan(rv, lv) orelse false;
+        const r = bcv.jsLessThan(self.arena, rv, lv) orelse false;
         frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
     }
     return null;
@@ -197,11 +197,11 @@ pub inline fn opGe(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             if (try self.raisePendingException("error in comparison")) |oc| return oc;
             return null;
         };
-        const r2 = bcv.jsLessThan(pr.lp, pr.rp);
+        const r2 = bcv.jsLessThan(self.arena, pr.lp, pr.rp);
         const r = if (r2) |v| !v else false;
         self.frames.items[self.frames.items.len - 1].registers[rdst] = try val_mod.makeBool(self.arena, r);
     } else {
-        const r2 = bcv.jsLessThan(lv, rv);
+        const r2 = bcv.jsLessThan(self.arena, lv, rv);
         const r = if (r2) |v| !v else false;
         frame.registers[rdst] = try val_mod.makeBool(self.arena, r);
     }
