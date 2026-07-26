@@ -404,8 +404,12 @@ pub const BcVm = struct {
                     realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", try std.fmt.allocPrint(self.arena, "Class constructor {s} cannot be invoked without 'new'", .{fn_ptr.name orelse ""}));
                     return error.JsException;
                 }
-                // Arrows ignore the provided `this` and use their captured lexical one.
-                const eff_this = if (fn_ptr.is_arrow) closure.captured_this else this_val;
+                // Arrows ignore the provided `this` and use their captured lexical
+                // one; every other function applies the sloppy-mode this
+                // correction (undefined/null → global object) here so generators
+                // and async functions capture the coerced `this` at build time,
+                // matching the ordinary frame path below (§10.2.1.1 step 2).
+                const eff_this = if (fn_ptr.is_arrow) closure.captured_this else try self.bindThisValue(fn_ptr, closure, this_val);
                 if (fn_ptr.is_async and fn_ptr.is_generator) return try self.buildAsyncGenerator(fn_ptr, def_env, eff_this, args, closure);
                 if (fn_ptr.is_async) return try self.buildAsyncFunction(fn_ptr, def_env, eff_this, args, closure);
                 if (fn_ptr.is_generator) return try self.buildGenerator(fn_ptr, def_env, eff_this, args, closure);
@@ -3715,7 +3719,7 @@ pub const BcVm = struct {
                     return try std.fmt.allocPrint(self.arena, "TypeError: Class constructor {s} cannot be invoked without 'new'", .{fn_ptr.name orelse ""});
                 }
                 // An arrow ignores the caller-provided `this`, using its captured one.
-                const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else this_val;
+                const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else try self.bindThisValue(fn_ptr, closure, this_val);
 
                 // W2-async: an async function call runs as a coroutine and
                 // returns a pending Promise.
@@ -4006,7 +4010,7 @@ pub const BcVm = struct {
                 const fn_ptr = closure.func;
                 const def_env: *Environment = @ptrCast(@alignCast(closure.env));
                 // An arrow ignores the receiver, using its captured lexical `this`.
-                const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else this_val;
+                const this_val_eff = if (fn_ptr.is_arrow) closure.captured_this else try self.bindThisValue(fn_ptr, closure, this_val);
 
                 if (fn_ptr.is_async and fn_ptr.is_generator) {
                     var agargs = try self.arena.alloc(Value, nargs);

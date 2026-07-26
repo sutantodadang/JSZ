@@ -2491,7 +2491,12 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
     _ = p.advance(); // consume 'function'
     const is_generator = p.match(.star);
     var name: ?[]const u8 = null;
-    if (p.check(.identifier)) {
+    // A FunctionExpression's BindingIdentifier is evaluated with the *inner*
+    // function's [Yield] parameter, not the enclosing context's — so a non-
+    // generator `function yield(){}` nested inside a generator names it "yield"
+    // (sloppy only; strict keeps yield reserved via checkStrictBindingName).
+    const yield_as_name = p.check(.kw_yield) and !p.strict and !is_generator;
+    if (p.check(.identifier) or yield_as_name) {
         if (!parser_file.checkStrictBindingName(p, p.current.value_str, p.current.line, p.current.column)) return null;
         name = p.current.value_str;
         _ = p.advance();
