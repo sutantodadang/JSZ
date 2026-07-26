@@ -491,6 +491,10 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
             // and `get 16()` define the same accessor (and `1e2` is "100", not
             // "1e2"). The raw spelling would key a distinct, unreachable property.
             name = expr_mod.numericLiteralKey(p) orelse return null;
+        } else if (p.check(.bigint)) {
+            // A BigInt-literal class-element name keys on ToString of its value
+            // (`1n` → "1"), mirroring the NumericLiteral case above.
+            name = expr_mod.bigintLiteralKey(p) orelse return null;
         } else if (p.check(.identifier) or p.check(.string)) {
             name = p.current.value_str;
             _ = p.advance();
@@ -2424,7 +2428,11 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
             if (!p.match(.comma)) break;
             continue;
         }
-        const param_tok = p.expect(.identifier) orelse return null;
+        // `yield` is a valid BindingIdentifier for a parameter in sloppy-mode
+        // code outside a generator (`function m(yield){}`); the strict / generator
+        // cases keep the reserved-word rejection below.
+        const yield_as_param = p.check(.kw_yield) and !p.strict and !p.in_generator_function;
+        const param_tok = if (yield_as_param) p.advance() else (p.expect(.identifier) orelse return null);
         if (!parser_file.checkStrictBindingName(p, param_tok.value_str, param_tok.line, param_tok.column)) return null;
         if (is_rest) {
             saw_rest = true;

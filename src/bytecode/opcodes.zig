@@ -393,6 +393,13 @@ pub const Op = enum(u8) {
     /// then applies the "eval inside initializer" early error: a SyntaxError if
     /// the eval body ContainsArguments. Declared last (JIT ordinal stability).
     MARK_FIELD_EVAL,
+    /// SET_PROTO | 3 | op, Robj u8, Rval u8. The object-initializer `__proto__:`
+    /// special form (§B.3.1): sets R[Robj]'s [[Prototype]] to R[Rval] directly
+    /// via OrdinarySetPrototypeOf when R[Rval] is an Object or null — bypassing
+    /// any `__proto__` accessor on Object.prototype — and is a silent no-op for
+    /// any other value type. Distinct from SET_PROP, which would invoke the
+    /// inherited setter. Declared last (JIT ordinal stability).
+    SET_PROTO,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -495,6 +502,7 @@ pub fn instrSize(op: Op) usize {
         .MARK_DIRECT_EVAL => 1,
         .MARK_PARAM_EVAL => 1,
         .MARK_FIELD_EVAL => 1,
+        .SET_PROTO => 3,
         .TO_PROPERTY_KEY => 2,
         .DEFINE_LOCAL => 4,
         .DEFINE_DATA => 5,

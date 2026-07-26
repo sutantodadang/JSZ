@@ -2185,7 +2185,7 @@ pub const FnCompiler = struct {
             // `__proto__: fn` is a [[Prototype]] mutation, not a PropertyDefinition,
             // so it never names its value (§B.3.1).
             if (prop.kind == .init and prop.value.kind == .function_expr and
-                !std.mem.eql(u8, prop.key, "__proto__"))
+                !prop.is_proto_setter)
             {
                 self.name_hint = prop.key;
             }
@@ -2193,10 +2193,16 @@ pub const FnCompiler = struct {
             self.name_hint = null; // defensive clear (no-op if consumed inside)
             const sv = try val_mod.makeString(self.arena, prop.key);
             const kidx = try self.addConstant(sv);
-            if (prop.kind == .init) {
+            if (prop.is_proto_setter) {
                 // `__proto__: v` is not a property definition at all — it sets
-                // [[Prototype]] — so it keeps the ordinary [[Set]] path.
-                try self.emitOp(if (std.mem.eql(u8, prop.key, "__proto__")) .SET_PROP else .DEFINE_DATA, line);
+                // [[Prototype]] directly (OrdinarySetPrototypeOf), bypassing any
+                // inherited `__proto__` accessor. Only the plain-key colon form
+                // reaches here (shorthand/method/computed are ordinary props).
+                try self.emitOp(.SET_PROTO, line);
+                try self.emitU8(robj);
+                try self.emitU8(rval);
+            } else if (prop.kind == .init) {
+                try self.emitOp(.DEFINE_DATA, line);
                 try self.emitU8(robj);
                 try self.emitU16(kidx);
                 try self.emitU8(rval);

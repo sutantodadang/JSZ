@@ -932,6 +932,8 @@ pub fn parseObjectPattern(p: *Parser) ?*Node {
             _ = p.advance();
         } else if (p.check(.number)) {
             key = numericLiteralKey(p) orelse return null;
+        } else if (p.check(.bigint)) {
+            key = bigintLiteralKey(p) orelse return null;
         } else if (p.check(.identifier)) {
             key = p.current.value_str;
             _ = p.advance();
@@ -1121,6 +1123,22 @@ pub fn numericLiteralKey(p: *Parser) ?[]const u8 {
     // `obj[n]` lookup would produce — including the exponential forms
     // (`0.0000001` keys "1e-7", not "0.0000001").
     return val_mod.formatNumber(p.arena, n) catch {
+        p.had_error = true;
+        return null;
+    };
+}
+
+/// A BigInt literal used as a property key (`{ 1n: v }`, `class{ 1n(){} }`):
+/// the key is ToString of its numeric value ("1"), with the trailing `n` and
+/// any radix prefix resolved. Advances past the `.bigint` token.
+pub fn bigintLiteralKey(p: *Parser) ?[]const u8 {
+    const lit = p.current.value_str;
+    _ = p.advance();
+    const v = val_mod.makeBigIntFromLiteral(p.arena, lit) catch {
+        p.had_error = true;
+        return null;
+    };
+    return val_mod.bigIntToString(p.arena, v.unbox().bigint) catch {
         p.had_error = true;
         return null;
     };
@@ -2149,6 +2167,8 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             _ = p.advance();
         } else if (p.check(.number)) {
             key = numericLiteralKey(p) orelse return null;
+        } else if (p.check(.bigint)) {
+            key = bigintLiteralKey(p) orelse return null;
         } else {
             // Reserved words are valid IdentifierNames as property keys (ES5+).
             const kn = @tagName(p.current.kind);
@@ -2321,7 +2341,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
         if (set_class_hint) p.export_default_name_hint = key;
         const val_node = p.parseAssignmentExpr() orelse return null;
         if (set_class_hint) p.export_default_name_hint = null;
-        props.append(p.arena, ast.ObjectProp{ .key = key, .value = val_node, .kind = .init }) catch {
+        props.append(p.arena, ast.ObjectProp{ .key = key, .value = val_node, .kind = .init, .is_proto_setter = std.mem.eql(u8, key, "__proto__") }) catch {
             p.had_error = true;
             return null;
         };
@@ -2471,7 +2491,12 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
     _ = p.advance(); // consume 'function'
     const is_generator = p.match(.star);
     var name: ?[]const u8 = null;
-    if (p.check(.identifier)) {
+    // A FunctionExpression's BindingIdentifier is evaluated with the *inner*
+    // function's [Yield] parameter, not the enclosing context's — so a non-
+    // generator `function yield(){}` nested inside a generator names it "yield"
+    // (sloppy only; strict keeps yield reserved via checkStrictBindingName).
+    const yield_as_name = p.check(.kw_yield) and !p.strict and !is_generator;
+    if (p.check(.identifier) or yield_as_name) {
         if (!parser_file.checkStrictBindingName(p, p.current.value_str, p.current.line, p.current.column)) return null;
         name = p.current.value_str;
         _ = p.advance();
