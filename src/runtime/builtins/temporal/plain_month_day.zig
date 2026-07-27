@@ -145,8 +145,18 @@ fn monthDayFromBag(arena: std.mem.Allocator, bag: plain_date.DateBag, overflow: 
         code = try shared.parseMonthCode(arena, mc, calendar.hasLeapMonths(cal));
     } else if (bag.month) |mv| {
         const m = floatToI32(mv);
-        if (m < 1 or m > 255) return realm_mod.throwRangeError(arena, "month out of range");
-        code = .{ .num = @intCast(m) };
+        if (m < 1) return realm_mod.throwRangeError(arena, "month out of range");
+        var mm = m;
+        // ISOMonthDayFromFields constrains a numeric month past 12 down to 12
+        // (independently of any reference year); `reject` forbids it. Do this
+        // before storing so the no-year path also honours overflow rather than
+        // failing the reference lookup on an impossible month.
+        if (cal == .iso8601 and mm > 12) {
+            if (overflow == .reject) return realm_mod.throwRangeError(arena, "month out of range");
+            mm = 12;
+        }
+        if (mm > 255) return realm_mod.throwRangeError(arena, "month out of range");
+        code = .{ .num = @intCast(mm) };
     }
 
     // A year (directly or via era/eraYear) pins the month/day to a specific

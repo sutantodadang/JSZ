@@ -456,22 +456,35 @@ pub fn differenceISODate(d1: ISODate, d2: ISODate, largest: shared.Unit) shared.
             var years: i64 = 0;
             var base = d1;
             if (largest == .year) {
+                // Compare in half-day units (×2): a leap month absent from the
+                // target year collapses to the regular month of the same number,
+                // but its natural slot sits *between* that month and the next —
+                // a position no integer epoch day can hold. Placing it at the
+                // odd half-step (2·eom+1) resolves the tie in the right
+                // direction whichever way the walk runs.
+                const target2 = 2 * target_days;
                 years = @as(i64, fb.year) - @as(i64, fa.year);
-                while (years != 0 and surpassesDays(addYearsUnclamped(d1, fa, years), target_days, step)) years -= step;
-                while (!surpassesDays(addYearsUnclamped(d1, fa, years + step), target_days, step)) years += step;
+                while (years != 0 and yearStepSurpasses2x(d1, fa, years, target2, step)) years -= step;
+                while (!yearStepSurpasses2x(d1, fa, years + step, target2, step)) years += step;
                 base = addYearsConstrain(d1, fa, years);
             }
 
             // Then the largest whole-month count from `base` that does not
             // overshoot d2. The absolute-month delta is exact up to the
             // day-of-month clamp, so these loops correct by a step or two.
+            // The month walk holds the *original* day-of-month (`fa.day`), not
+            // `base`'s: a whole-year step may have clamped the day (e.g. a leap
+            // month M06L-30 collapsing to M06-29), and threading that clamped
+            // day would hide a later month step that only reaches the target by
+            // re-clamping — turning "12 months 29 days" into a spurious 13.
             const fbase = calendar.fields(cal, base);
+            const want_day: i32 = fa.day;
             var months: i64 = calendar.absoluteMonth(cal, fb.year, fb.month) -
                 calendar.absoluteMonth(cal, fbase.year, fbase.month);
-            while (months != 0 and surpassesDays(addMonthsUnclamped(base, months), target_days, step)) months -= step;
-            while (!surpassesDays(addMonthsUnclamped(base, months + step), target_days, step)) months += step;
+            while (months != 0 and surpassesDays(addMonthsUnclampedDay(base, months, want_day), target_days, step)) months -= step;
+            while (!surpassesDays(addMonthsUnclampedDay(base, months + step, want_day), target_days, step)) months += step;
 
-            const anchor = addMonthsConstrain(base, months);
+            const anchor = addMonthsConstrainDay(base, months, want_day);
             const days = shared.isoDateToEpochDays(d2.year, d2.month, d2.day) -
                 shared.isoDateToEpochDays(anchor.year, anchor.month, anchor.day);
 
@@ -499,11 +512,18 @@ fn addYearsConstrain(a: ISODate, fa: calendar.CalFields, n: i64) ISODate {
 
 /// Shift `a` by `n` calendar months, clamping the day into the target month.
 fn addMonthsConstrain(a: ISODate, n: i64) ISODate {
+    return addMonthsConstrainDay(a, n, calendar.fields(a.calendar, a).day);
+}
+
+/// As `addMonthsConstrain`, but holding an explicit day-of-month rather than
+/// `a`'s own — so the difference walk can preserve the *original* start day
+/// across a `base` whose day a preceding year step already clamped.
+fn addMonthsConstrainDay(a: ISODate, n: i64, want_day: i32) ISODate {
     const cal = a.calendar;
     const f = calendar.fields(cal, a);
     const ym = calendar.addMonths(cal, f.year, f.month, n) catch return a;
     const dim = calendar.daysInMonth(cal, ym.year, ym.month);
-    const day: i32 = @min(f.day, dim);
+    const day: i32 = @min(want_day, @as(i32, dim));
     return calendar.toIso(cal, ym.year, ym.month, day, .constrain) catch a;
 }
 
@@ -523,13 +543,46 @@ fn unclampedEpochDays(cal: calendar.CalendarId, clamped: ISODate, want_day: u8) 
     return shared.isoDateToEpochDays(clamped.year, clamped.month, clamped.day) + @max(surplus, 0);
 }
 
-fn addMonthsUnclamped(a: ISODate, n: i64) i64 {
-    const f = calendar.fields(a.calendar, a);
-    return unclampedEpochDays(a.calendar, addMonthsConstrain(a, n), f.day);
+fn addMonthsUnclampedDay(a: ISODate, n: i64, want_day: i32) i64 {
+    return unclampedEpochDays(a.calendar, addMonthsConstrainDay(a, n, want_day), @intCast(@max(want_day, 0)));
 }
 
-fn addYearsUnclamped(a: ISODate, fa: calendar.CalFields, n: i64) i64 {
-    return unclampedEpochDays(a.calendar, addYearsConstrain(a, fa, n), fa.day);
+/// A whole-year step's unclamped epoch, in half-day units (×2). A year step
+/// holds the source's month *code*, so adding years to a leap month (MnnL) the
+/// target year lacks constrains it onto a regular month (Mnn for Chinese/Dangi,
+/// the following month for Hebrew). Whichever it collapses *to*, the leap slot
+/// itself always sits immediately after the regular month of the *same* number
+/// (Mnn): day D of MnnL would fall D days past Mnn's end. Modelling the position
+/// there — at the odd half-step `2·(eom(Mnn)+D) − 1`, strictly between the real
+/// dates on either side — means reaching the target only via this collapse (and
+/// any day clamp folded into D) never counts as a whole year, in either walk
+/// direction.
+/// A whole-year step counts only while it reaches `to` cleanly: neither its
+/// constrained landing nor its unclamped (leap-slot / past-month-end) position
+/// may overshoot `to`. Checking both matters when a leap-month collapse or day
+/// clamp puts them on opposite sides of `to` — the constrained date having
+/// slipped past it while the unclamped one has not (or vice-versa) — which a
+/// single-position test would miscount, most visibly on a backward walk from a
+/// leap month. All positions are in half-day (×2) units.
+fn yearStepSurpasses2x(a: ISODate, fa: calendar.CalFields, n: i64, target2: i64, step: i64) bool {
+    const clamped = addYearsConstrain(a, fa, n);
+    const constrained2 = 2 * shared.isoDateToEpochDays(clamped.year, clamped.month, clamped.day);
+    if (surpassesDays(constrained2, target2, step)) return true;
+    return surpassesDays(addYearsUnclamped2x(a, fa, n), target2, step);
+}
+
+fn addYearsUnclamped2x(a: ISODate, fa: calendar.CalFields, n: i64) i64 {
+    const cal = a.calendar;
+    const clamped = addYearsConstrain(a, fa, n);
+    const cf = calendar.fields(cal, clamped);
+    if (fa.code_leap and !cf.code_leap) {
+        if (calendar.monthFromCode(cal, cf.year, fa.code_num, false)) |mnn| {
+            const dim = calendar.daysInMonth(cal, cf.year, mnn);
+            const eom = calendar.toIso(cal, cf.year, mnn, dim, .constrain) catch clamped;
+            return 2 * (shared.isoDateToEpochDays(eom.year, eom.month, eom.day) + @as(i64, fa.day)) - 1;
+        }
+    }
+    return 2 * unclampedEpochDays(cal, clamped, fa.day);
 }
 
 fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Value, since: bool) !Value {
@@ -549,13 +602,14 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
         // Result is a single calendar unit: round the exact difference to that
         // unit, using `from` as the calendar anchor for month/year fractions.
         result = try roundDateDifferenceToUnit(arena, from, to, st.smallest, st.increment, st.mode);
-    } else {
+    } else if (st.smallest == .day and st.increment == 1) {
+        // No rounding to do: the exact multi-unit difference is the answer.
         result = differenceISODate(from, to, st.largest);
-        // Only day-granularity rounding is supported when the result spans
-        // multiple units (a larger largestUnit than smallestUnit).
-        if (st.smallest == .day and st.increment != 1) {
-            result.days = shared.roundNumberToIncrement(result.days, st.increment, st.mode);
-        }
+    } else {
+        // Round the smallest unit while holding every coarser one, then re-express
+        // at `largest` so a rounded unit that fills up bubbles into the next
+        // (NudgeToCalendarUnit + BubbleRelativeDuration).
+        result = try roundDateDiffMulti(arena, from, to, st.largest, st.smallest, st.increment, st.mode);
     }
     if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
@@ -621,6 +675,76 @@ fn roundDateDifferenceToUnit(arena: std.mem.Allocator, from: ISODate, to: ISODat
         else => {},
     }
     return out;
+}
+
+/// Round a multi-unit date difference (largest ≠ smallest) to whole `smallest`
+/// units while preserving every coarser unit, then re-express at `largest` so a
+/// unit that fills up bubbles into the next. Mirrors NudgeToCalendarUnit +
+/// BubbleRelativeDuration. Probing the away-from-zero candidate through
+/// `addISODate` also range-checks it (an out-of-range rounded date throws).
+pub fn roundDateDiffMulti(arena: std.mem.Allocator, from: ISODate, to: ISODate, largest: shared.Unit, smallest: shared.Unit, inc: f64, mode: shared.RoundingMode) !shared.DurationFields {
+    const dur = differenceISODate(from, to, largest);
+    const cmp = compareISODate(from, to);
+    if (cmp == 0) return shared.DurationFields{};
+    const sign: f64 = if (cmp < 0) 1 else -1;
+
+    // Every unit coarser than `smallest` is carried through unchanged.
+    var base = shared.DurationFields{};
+    switch (smallest) {
+        .month => base.years = dur.years,
+        .week => {
+            base.years = dur.years;
+            base.months = dur.months;
+        },
+        .day => {
+            base.years = dur.years;
+            base.months = dur.months;
+            base.weeks = dur.weeks;
+        },
+        else => {},
+    }
+    const unit_val: f64 = switch (smallest) {
+        .year => dur.years,
+        .month => dur.months,
+        .week => dur.weeks,
+        .day => dur.days,
+        else => unreachable,
+    };
+    const q = @trunc(@abs(unit_val) / inc) * inc * sign;
+    const q2 = q + inc * sign;
+    const target: f64 = @floatFromInt(shared.isoDateToEpochDays(to.year, to.month, to.day));
+    const p1 = try candidateEpochDay(arena, from, base, smallest, q);
+    const p2 = try candidateEpochDay(arena, from, base, smallest, q2);
+
+    var total = q;
+    if (p2 != p1) total = q + (target - p1) / (p2 - p1) * inc * sign;
+    const rounded = shared.roundNumberToIncrement(total, inc, mode);
+
+    var res = base;
+    switch (smallest) {
+        .year => res.years = rounded,
+        .month => res.months = rounded,
+        .week => res.weeks = rounded,
+        .day => res.days = rounded,
+        else => {},
+    }
+    const endpoint = try addISODate(from, res.years, res.months, res.weeks, res.days, .constrain, arena);
+    return differenceISODate(from, endpoint, largest);
+}
+
+/// Epoch day of `from` shifted by the coarse `base` plus `q` of the `smallest`
+/// unit — the interpolation anchor for `roundDateDiffMulti`.
+fn candidateEpochDay(arena: std.mem.Allocator, from: ISODate, base: shared.DurationFields, smallest: shared.Unit, q: f64) !f64 {
+    var d = base;
+    switch (smallest) {
+        .year => d.years += q,
+        .month => d.months += q,
+        .week => d.weeks += q,
+        .day => d.days += q,
+        else => {},
+    }
+    const shifted = try addISODate(from, d.years, d.months, d.weeks, d.days, .constrain, arena);
+    return @floatFromInt(shared.isoDateToEpochDays(shifted.year, shifted.month, shifted.day));
 }
 
 /// True iff `from` shifted by `off_months` whole months stays within the
