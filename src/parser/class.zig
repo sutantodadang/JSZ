@@ -427,6 +427,10 @@ fn parseStaticBlockBody(p: *Parser) ?[]*Node {
 /// Parse the body of a class (`{` already consumed). Consumes the closing `}`.
 /// Handles `static`, `get`/`set` accessors, and computed `[expr]` keys.
 fn parseClassMembers(p: *Parser) ?ClassBodyParse {
+    // Mark that we are inside a class body: `super()`/`super.x` in a method or
+    // constructor parsed here is legal even when the surrounding code is eval.
+    p.class_body_depth += 1;
+    defer p.class_body_depth -= 1;
     var res = ClassBodyParse{};
     var members = std.ArrayList(ClassMember){};
     var fields = std.ArrayList(ClassField){};

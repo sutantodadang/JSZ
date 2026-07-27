@@ -1801,7 +1801,7 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
             // checking the caller's chain for the `__sproto__` binding that every
             // super-admitting class desugar introduces. SuperCall stays rejected:
             // a field initializer is not a constructor.
-            if (p.eval_code) {
+            if (p.eval_code and p.class_body_depth == 0) {
                 const after = p.peekNext().kind;
                 const is_super_prop = after == .dot or after == .left_bracket;
                 if (!(is_super_prop and p.eval_allow_super_prop))
