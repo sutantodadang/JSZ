@@ -976,6 +976,12 @@ fn proxyKeyEnumerable(self: *BcVm, proxy_obj: *JsObject, key: Value) !bool {
     }
     const t = proxy_mod.proxyTarget(proxy_obj) orelse return false;
     if (t.bits == 0 or t.unbox() != .object) return false;
+    // A `null` descriptor means the whole no-trap chain forwarded to an ordinary
+    // target. When the direct target is ITSELF a proxy, recurse so the ordinary
+    // target's [[GetOwnProperty]].[[Enumerable]] is what we read — not the inner
+    // proxy object's (empty) own shape.
+    if (t.toPtr().object.internal_kind == .proxy)
+        return proxyKeyEnumerable(self, t.toPtr().object, key);
     return t.toPtr().object.isEnumerable(key.unbox().string);
 }
 
