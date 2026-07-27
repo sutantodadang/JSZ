@@ -2992,27 +2992,33 @@ fn consumeBackref(idx: u32, input: []const u8, pos: usize, caps: *const [MAX_CAP
     if (idx >= MAX_CAPTURES) return pos;
     const cap = caps[idx];
     if (cap.unset()) return pos; // unset group backreference matches the empty string
+    if (flags.cpMode()) {
+        // Under /u the match is code-point-based, so compare the captured span
+        // and the input code point by code point over the full buffer: a WTF-8
+        // surrogate pair combines into one astral code point, so a captured lone
+        // lead surrogate must NOT match the lead of an astral pair (its byte
+        // length would otherwise let a raw slice compare equal). §22.2.2.9.
+        var ip = pos;
+        var cp_off = cap.start;
+        while (cp_off < cap.end) {
+            if (ip >= input.len) return null;
+            const dc = decodeCpAt(input, cp_off);
+            const di = decodeCpAt(input, ip);
+            const a = if (flags.ignore_case) foldCaseCp(dc.cp) else dc.cp;
+            const b = if (flags.ignore_case) foldCaseCp(di.cp) else di.cp;
+            if (a != b) return null;
+            cp_off += dc.len;
+            ip += di.len;
+        }
+        return ip;
+    }
     const captured = input[cap.start..cap.end];
     const clen = captured.len;
     if (pos + clen > input.len) return null;
     const slice = input[pos .. pos + clen];
     if (flags.ignore_case) {
-        if (flags.cpMode()) {
-            // Compare code point by code point under case folding.
-            var a: usize = 0;
-            var b: usize = 0;
-            while (a < slice.len and b < captured.len) {
-                const da = decodeCpAt(slice, a);
-                const db = decodeCpAt(captured, b);
-                if (foldCaseCp(da.cp) != foldCaseCp(db.cp)) return null;
-                a += da.len;
-                b += db.len;
-            }
-            if (a != slice.len or b != captured.len) return null;
-        } else {
-            for (slice, captured) |x, y| {
-                if (foldCase(x) != foldCase(y)) return null;
-            }
+        for (slice, captured) |x, y| {
+            if (foldCase(x) != foldCase(y)) return null;
         }
     } else {
         if (!std.mem.eql(u8, slice, captured)) return null;

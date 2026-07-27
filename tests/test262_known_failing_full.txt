@@ -963,7 +963,6 @@ staging/sm/RegExp/replace-trace.js
 staging/sm/RegExp/replace-twoBytes.js
 staging/sm/RegExp/split-trace.js
 staging/sm/RegExp/toString.js
-staging/sm/RegExp/unicode-back-reference.js
 staging/sm/RegExp/unicode-character-class-escape.js
 staging/sm/RegExp/unicode-class-braced.js
 staging/sm/RegExp/unicode-class-lead-trail.js
