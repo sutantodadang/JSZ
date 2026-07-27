@@ -464,8 +464,8 @@ pub fn differenceISODate(d1: ISODate, d2: ISODate, largest: shared.Unit) shared.
                 // direction whichever way the walk runs.
                 const target2 = 2 * target_days;
                 years = @as(i64, fb.year) - @as(i64, fa.year);
-                while (years != 0 and surpassesDays(addYearsUnclamped2x(d1, fa, years), target2, step)) years -= step;
-                while (!surpassesDays(addYearsUnclamped2x(d1, fa, years + step), target2, step)) years += step;
+                while (years != 0 and yearStepSurpasses2x(d1, fa, years, target2, step)) years -= step;
+                while (!yearStepSurpasses2x(d1, fa, years + step, target2, step)) years += step;
                 base = addYearsConstrain(d1, fa, years);
             }
 
@@ -549,28 +549,38 @@ fn addMonthsUnclampedDay(a: ISODate, n: i64, want_day: i32) i64 {
 
 /// A whole-year step's unclamped epoch, in half-day units (×2). A year step
 /// holds the source's month *code*, so adding years to a leap month (MnnL) the
-/// target year lacks constrains it to the regular Mnn. Since MnnL's true slot
-/// falls after Mnn and before the following month, its unclamped position is the
-/// odd half-step just past Mnn's end (2·eom+1) — strictly after every day of Mnn
-/// yet strictly before the next month's day 1, so reaching the target only by
-/// this collapse never counts as a whole year, in either walk direction.
+/// target year lacks constrains it onto a regular month (Mnn for Chinese/Dangi,
+/// the following month for Hebrew). Whichever it collapses *to*, the leap slot
+/// itself always sits immediately after the regular month of the *same* number
+/// (Mnn): day D of MnnL would fall D days past Mnn's end. Modelling the position
+/// there — at the odd half-step `2·(eom(Mnn)+D) − 1`, strictly between the real
+/// dates on either side — means reaching the target only via this collapse (and
+/// any day clamp folded into D) never counts as a whole year, in either walk
+/// direction.
+/// A whole-year step counts only while it reaches `to` cleanly: neither its
+/// constrained landing nor its unclamped (leap-slot / past-month-end) position
+/// may overshoot `to`. Checking both matters when a leap-month collapse or day
+/// clamp puts them on opposite sides of `to` — the constrained date having
+/// slipped past it while the unclamped one has not (or vice-versa) — which a
+/// single-position test would miscount, most visibly on a backward walk from a
+/// leap month. All positions are in half-day (×2) units.
+fn yearStepSurpasses2x(a: ISODate, fa: calendar.CalFields, n: i64, target2: i64, step: i64) bool {
+    const clamped = addYearsConstrain(a, fa, n);
+    const constrained2 = 2 * shared.isoDateToEpochDays(clamped.year, clamped.month, clamped.day);
+    if (surpassesDays(constrained2, target2, step)) return true;
+    return surpassesDays(addYearsUnclamped2x(a, fa, n), target2, step);
+}
+
 fn addYearsUnclamped2x(a: ISODate, fa: calendar.CalFields, n: i64) i64 {
     const cal = a.calendar;
     const clamped = addYearsConstrain(a, fa, n);
     const cf = calendar.fields(cal, clamped);
     if (fa.code_leap and !cf.code_leap) {
-        // The leap slot lies between two regular months; the calendar collapses
-        // it onto one of them. Chinese/Dangi constrain MnnL down to Mnn (same
-        // number), so the true slot is just *after* it; Hebrew constrains Adar I
-        // (M05L) up to Adar (M06, a higher number), so the slot is just *before*
-        // it. Place the half-step on the correct side of the constrained month.
-        if (cf.code_num > fa.code_num) {
-            const bom = calendar.toIso(cal, cf.year, cf.month, 1, .constrain) catch clamped;
-            return 2 * shared.isoDateToEpochDays(bom.year, bom.month, bom.day) - 1;
+        if (calendar.monthFromCode(cal, cf.year, fa.code_num, false)) |mnn| {
+            const dim = calendar.daysInMonth(cal, cf.year, mnn);
+            const eom = calendar.toIso(cal, cf.year, mnn, dim, .constrain) catch clamped;
+            return 2 * (shared.isoDateToEpochDays(eom.year, eom.month, eom.day) + @as(i64, fa.day)) - 1;
         }
-        const dim = calendar.daysInMonth(cal, cf.year, cf.month);
-        const eom = calendar.toIso(cal, cf.year, cf.month, dim, .constrain) catch clamped;
-        return 2 * shared.isoDateToEpochDays(eom.year, eom.month, eom.day) + 1;
     }
     return 2 * unclampedEpochDays(cal, clamped, fa.day);
 }
