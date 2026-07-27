@@ -152,13 +152,9 @@ built-ins/RegExp/S15.10.2.8_A3_T15.js
 built-ins/RegExp/character-class-escape-non-whitespace.js
 built-ins/RegExp/dotall/with-dotall.js
 built-ins/RegExp/dotall/without-dotall.js
-built-ins/RegExp/lookBehind/back-references-to-captures.js
-built-ins/RegExp/lookBehind/captures.js
-built-ins/RegExp/lookBehind/mutual-recursive.js
 built-ins/RegExp/lookahead-quantifier-match-groups.js
 built-ins/RegExp/match-indices/indices-array-unicode-match.js
 built-ins/RegExp/match-indices/indices-array-unicode-property-names.js
-built-ins/RegExp/named-groups/lookbehind.js
 built-ins/RegExp/named-groups/non-unicode-property-names.js
 built-ins/RegExp/named-groups/unicode-property-names.js
 built-ins/RegExp/nullable-quantifier.js
