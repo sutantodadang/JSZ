@@ -3668,6 +3668,15 @@ fn zipCloseIterators(arena: std.mem.Allocator, d: *IterHelperData, keep_idx: ?us
 
 /// %IteratorHelperPrototype%.return — close the helper and its source.
 fn nativeIterHelperReturn(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
+    // Brand check: %IteratorHelperPrototype%.return requires the internal
+    // Iterator Helper slots; calling it on a plain generator/object is a TypeError.
+    if (this_val.bits == 0 or this_val.unbox() != .object or
+        this_val.toPtr().object.internal_kind != .iterator_helper or
+        this_val.toPtr().object.internal_slot == null)
+    {
+        try setTypeError(arena, "Iterator Helper method called on wrong type");
+        unreachable;
+    }
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const obj = this_val.toPtr().object;
         if (obj.internal_kind == .iterator_helper and obj.internal_slot != null) {

@@ -341,6 +341,11 @@ const ClassMember = struct {
     accessor: AccessorKind = .none,
     name: []const u8 = "",
     computed_key: ?*Node = null,
+    /// Hidden `var` holding the pre-evaluated property key for a computed method/
+    /// accessor key (`__ck_N__`). Like ClassField.key_var, the ClassElementName is
+    /// evaluated once at class-definition time, in the enclosing execution context
+    /// (so `[yield]`/`[await]` work), rather than inline inside the class body.
+    key_var: ?[]const u8 = null,
     params: [][]const u8 = &[_][]const u8{},
     param_defaults: []?*Node = &[_]?*Node{},
     /// ExpectedArgumentCount for `fn.length` (see parser.ParamParse).
@@ -1664,7 +1669,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
             const assign = p.makeNode(.assignment_expr, s, s, .{ .assignment_expr = .{ .op = .assign, .target = lhs, .value = fn_expr } }) orelse return null;
             return p.makeNode(.expr_stmt, s, s, .{ .expr_stmt = assign });
         }
-        const key_val = if (m.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = m.name }) orelse return null);
+        const key_val = if (m.key_var) |kv| (nodeIdent(p, kv) orelse return null) else if (m.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = m.name }) orelse return null);
         const t_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
         const f_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = false }) orelse return null;
         var props = std.ArrayList(ast.ObjectProp){};
@@ -1689,7 +1694,7 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
     }
 
     // Accessor: Object.defineProperty(target, key, { get|set: fn, configurable: true, enumerable: false })
-    const key_val = if (m.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = m.name }) orelse return null);
+    const key_val = if (m.key_var) |kv| (nodeIdent(p, kv) orelse return null) else if (m.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = m.name }) orelse return null);
     const t_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
     const f_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = false }) orelse return null;
     var props = std.ArrayList(ast.ObjectProp){};
@@ -1728,18 +1733,44 @@ pub fn parseClassDeclStmt(p: *Parser) ?*Node {
     var parsed = parseClassMembers(p) orelse return null;
     if (!manglePrivateNames(p, &parsed)) return null;
 
-    const out = emitClassStatements(p, .{
+    // The class name has TWO bindings: the immutable *inner* binding (visible to
+    // methods, static/instance field initializers) and the mutable *outer*
+    // declaration binding in the enclosing scope. The class body is wrapped in an
+    // IIFE whose local `let <ClassName>` is the inner binding, and the outer
+    // declaration `let <ClassName> = <iife>()` receives the constructed class. A
+    // user reassignment of the outer name (`C = null`) then no longer affects
+    // what the class body sees — matching ClassDefinitionEvaluation's classScope.
+    //
+    // Context-sensitive evaluations (the `extends` heritage and computed key
+    // names, which may contain yield/await) are routed to `prelude` and emitted
+    // BEFORE the IIFE, in the enclosing execution context.
+    var prelude = std.ArrayList(*Node){};
+    var out = emitClassStatements(p, .{
         .class_name = class_name,
         .ctor_fn_name = class_name,
-    }, heritage, parsed, start) orelse return null;
+    }, heritage, parsed, start, &prelude) orelse return null;
     attachPrivScope(p.arena, out.items, parsed.priv_names);
 
-    if (out.items.len == 1) return out.items[0];
-    // Transparent container: the `let <ClassName>` binding (and helpers) belong
-    // to the enclosing scope, not a fresh block scope, so a following
-    // `class B extends A` can resolve `A`.
+    const ret_id = p.makeNode(.identifier, start, start, .{ .identifier = class_name }) orelse return null;
+    const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
+    out.append(p.arena, ret_stmt) catch return null;
+    const fn_expr = p.makeNode(.function_expr, start, p.current.start, .{
+        .function_expr = .{ .name = null, .params = &[_][]const u8{}, .body = out.items, .is_arrow = false },
+    }) orelse return null;
+    const iife = p.makeNode(.call_expr, start, p.current.start, .{
+        .call_expr = .{ .callee = fn_expr, .args = &[_]*Node{} },
+    }) orelse return null;
+    const class_decl = p.makeNode(.var_decl, start, p.current.start, .{
+        .var_decl = .{ .kind = .let, .name = class_name, .init = iife },
+    }) orelse return null;
+
+    if (prelude.items.len == 0) return class_decl;
+    // Transparent container: the prelude helpers and the `let <ClassName>` binding
+    // belong to the enclosing scope (not a fresh block), so a following
+    // `class B extends A` still resolves `A`.
+    prelude.append(p.arena, class_decl) catch return null;
     return p.makeNode(.block_stmt, start, p.current.start, .{
-        .block_stmt = .{ .body = out.items, .lexical_scope = false },
+        .block_stmt = .{ .body = prelude.items, .lexical_scope = false },
     });
 }
 
@@ -1929,6 +1960,13 @@ fn emitClassStatements(
     heritage: Heritage,
     parsed: ClassBodyParse,
     start: u32,
+    // When non-null, the context-sensitive evaluations — the ClassHeritage
+    // (`extends <expr>`) and the computed ClassElementName keys — are routed here
+    // instead of into `out`. These may contain `yield`/`await` and must run in the
+    // enclosing execution context; the declaration form emits them OUTSIDE the
+    // inner-name-binding IIFE for that reason. Null keeps them inline (expression
+    // form, whose IIFE already is the enclosing evaluation).
+    prelude: ?*std.ArrayList(*Node),
 ) ?std.ArrayList(*Node) {
     const class_name = form.class_name;
     const super_name = heritage.super_name;
@@ -1970,6 +2008,27 @@ fn emitClassStatements(
         const call = p.makeNode(.call_expr, start, start, .{ .call_expr = .{ .callee = helper, .args = ck_args.items } }) orelse return null;
         const decl = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = .var_, .name = kv, .init = call } }) orelse return null;
         key_evals.append(p.arena, decl) catch return null;
+    }
+    // Likewise pre-evaluate computed method/accessor keys (`get [expr]() {}`).
+    // Evaluating them inline inside the body would place a `[yield]`/`[await]`
+    // key in the wrong (non-generator/non-async) execution context once the body
+    // is wrapped in the inner-name-binding IIFE; the pre-eval runs in the
+    // enclosing context via the prelude and emitClassMember reads `key_var`.
+    // Only for the IIFE-wrapped declaration form (prelude != null); the
+    // expression form keeps its existing inline evaluation order.
+    if (prelude != null) {
+        for (parsed.members) |*m| {
+            const k = m.computed_key orelse continue;
+            const kv = std.fmt.allocPrint(p.arena, "__ck_{d}__", .{p.param_destruct_counter}) catch return null;
+            p.param_destruct_counter += 1;
+            m.key_var = kv;
+            const helper = nodeIdent(p, "__toPropertyKey__") orelse return null;
+            var ck_args = std.ArrayList(*Node){};
+            ck_args.append(p.arena, k) catch return null;
+            const call = p.makeNode(.call_expr, start, start, .{ .call_expr = .{ .callee = helper, .args = ck_args.items } }) orelse return null;
+            const decl = p.makeNode(.var_decl, start, start, .{ .var_decl = .{ .kind = .var_, .name = kv, .init = call } }) orelse return null;
+            key_evals.append(p.arena, decl) catch return null;
+        }
     }
 
     if (!parsed.has_ctor) {
@@ -2027,7 +2086,8 @@ fn emitClassStatements(
         const hv = p.makeNode(.var_decl, start, start, .{
             .var_decl = .{ .kind = .var_, .name = super_name.?, .init = he },
         }) orelse return null;
-        out.append(p.arena, hv) catch return null;
+        // Heritage may contain yield/await → keep it in the enclosing context.
+        (prelude orelse &out).append(p.arena, hv) catch return null;
     }
 
     var ctor_body_effective = ctor_body;
@@ -2240,7 +2300,11 @@ fn emitClassStatements(
     // bound (so a key may reference the class name) but before static field value
     // initializers and any `new ClassName()`, so every ClassElementName is
     // evaluated exactly once, in source order, at class-definition time.
-    for (key_evals.items) |kd| out.append(p.arena, kd) catch return null;
+    // Computed ClassElementName keys may contain yield/await → keep them in the
+    // enclosing context (prelude) when the caller wraps the body in an IIFE. The
+    // static/instance field initializers inside read the resulting `__ck_N__`
+    // bindings through the closure.
+    for (key_evals.items) |kd| (prelude orelse &out).append(p.arena, kd) catch return null;
 
     if (super_name) |sname| {
         // Object.setPrototypeOf(ClassName, Super) — static inheritance
@@ -2372,7 +2436,7 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
     var out = emitClassStatements(p, .{
         .class_name = class_name,
         .ctor_fn_name = if (has_name) class_name else (anon_name_hint orelse ""),
-    }, heritage, parsed, start) orelse return null;
+    }, heritage, parsed, start, null) orelse return null;
     attachPrivScope(p.arena, out.items, parsed.priv_names);
 
     // The IIFE evaluates to the constructor.

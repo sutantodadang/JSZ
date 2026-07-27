@@ -423,12 +423,40 @@ pub const BcVm = struct {
                 }
                 try self.defineArguments(call_env, fn_ptr, args, closure);
                 try self.bindRestParam(call_env, fn_ptr, args);
+                // NFE self-binding: a named function expression binds its own name
+                // (immutably) inside its scope so the body can refer to itself even
+                // when the outer binding is reassigned. The doCall/doMethodCall
+                // paths do this; the construct + native-callback path must too, or
+                // `new (function C(){ this.f = () => C; })` loses `C`.
+                if (fn_ptr.nfe_name) |fname| {
+                    var is_param = false;
+                    for (fn_ptr.param_names) |p| {
+                        if (std.mem.eql(u8, p, fname)) {
+                            is_param = true;
+                            break;
+                        }
+                    }
+                    if (!is_param and !fn_ptr.is_eval) call_env.defineImmutable(fname, fn_val, fn_ptr.is_strict) catch {};
+                }
                 const num_regs = if (fn_ptr.num_regs > 0) fn_ptr.num_regs else 1;
                 const new_regs = try self.arena.alloc(Value, num_regs);
                 for (new_regs) |*r| r.* = Value{};
                 for (fn_ptr.param_names, 0..) |_, i| {
                     if (i < num_regs) {
                         new_regs[i] = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
+                    }
+                }
+                if (fn_ptr.nfe_name) |fname| {
+                    var is_param = false;
+                    for (fn_ptr.param_names) |p| {
+                        if (std.mem.eql(u8, p, fname)) {
+                            is_param = true;
+                            break;
+                        }
+                    }
+                    if (!is_param and !fn_ptr.is_eval) {
+                        const nfe_slot = fn_ptr.param_names.len;
+                        if (nfe_slot < num_regs) new_regs[nfe_slot] = fn_val;
                     }
                 }
                 // Sloppy-mode this correction (ES §10.2.1.1 step 2): non-strict
