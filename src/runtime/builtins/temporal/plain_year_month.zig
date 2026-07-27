@@ -270,33 +270,15 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
     result.weeks = 0;
     result.days = 0;
 
-    // differenceISODate already split years/months using the calendar's own
-    // months-per-year, so only re-derive the split when rounding disturbs it.
-    // The total-months form assumes 12 months per year and is reached only for
-    // year-granularity or multi-month increments.
-    if (smallest.? == .year) {
-        // Rounding at year granularity collapses to a whole number of years.
-        var total_months = result.years * 12.0 + result.months;
-        total_months = shared.roundNumberToIncrement(total_months, inc * 12.0, mode);
-        result.years = @trunc(total_months / 12.0);
-        result.months = total_months - result.years * 12.0;
-    } else if (inc != 1) {
-        // smallestUnit is month. When the largest unit is also month everything
-        // collapses to one months count; otherwise NudgeToCalendarUnit rounds the
-        // months field while holding the years (carrying a full year on overflow).
-        if (largest.? == .month) {
-            var total_months = result.years * 12.0 + result.months;
-            total_months = shared.roundNumberToIncrement(total_months, inc, mode);
-            result.years = 0;
-            result.months = total_months;
-        } else {
-            result.months = shared.roundNumberToIncrement(result.months, inc, mode);
-            if (@abs(result.months) >= 12.0) {
-                const carry = @trunc(result.months / 12.0);
-                result.years += carry;
-                result.months -= carry * 12.0;
-            }
-        }
+    // NudgeToCalendarUnit runs whenever the smallest unit is not month or the
+    // increment is not 1; it rounds the smallest unit (holding coarser ones) and
+    // range-checks the away-from-zero candidate date, throwing if it falls
+    // outside the ISO range. Otherwise the exact difference stands, only
+    // collapsed to total months when that is the largest unit.
+    if (smallest.? == .year or inc != 1) {
+        result = try plain_date.roundDateDiffMulti(arena, ym.*, other, largest.?, smallest.?, inc, mode);
+        result.weeks = 0;
+        result.days = 0;
     } else if (largest.? == .month) {
         result.months = result.years * 12.0 + result.months;
         result.years = 0;

@@ -376,11 +376,15 @@ pub fn roundRelative(
     mode: shared.RoundingMode,
     largest: shared.Unit,
 ) !shared.DurationFields {
-    if (unitRank(smallest) >= unitRank(.hour)) {
+    // `day` and finer are NudgeToDayOrTime units: they round on a plain
+    // nanosecond total (a PlainDateTime day is exactly 24h), never on a
+    // reconstructed endpoint date — so a huge increment like 1e9 days can round
+    // without demanding an out-of-range intermediate date.
+    if (unitRank(smallest) >= unitRank(.hour) or smallest == .day) {
         var res = roundTimeOnly(dur, smallest, inc, mode, largest);
-        // When the time rounding spilled into an extra day and `largest` is a
-        // calendar unit, that day can complete a month/year: re-anchor the date
-        // part from `from` so the overflow bubbles up (BubbleRelativeDuration).
+        // When the rounding spilled into extra days and `largest` is a coarser
+        // calendar unit, those days can complete a week/month/year: re-anchor the
+        // date part from `from` so the overflow bubbles up (BubbleRelativeDuration).
         if (unitRank(largest) < unitRank(.day)) {
             const end = try plain_date.addISODate(from.date, res.years, res.months, res.weeks, res.days, .constrain, arena);
             const rebal = plain_date.differenceISODate(from.date, end, largest);
@@ -475,6 +479,19 @@ fn roundTimeOnly(dur: shared.DurationFields, smallest: shared.Unit, inc: f64, mo
     if (unitRank(largest) >= unitRank(.hour)) {
         const total = @as(i128, @intFromFloat(dur.days)) * shared.NS_PER_DAY + durTimeNanos(dur);
         return balanceTime(shared.roundI128ToIncrement(total, inc_ns, mode), largest);
+    }
+    // Rounding to whole days: the day count itself is part of the total, so it
+    // rounds together with the time (which is then zero) — the calendar fields
+    // ride along and any bubbling is handled by the caller.
+    if (smallest == .day) {
+        const total = @as(i128, @intFromFloat(dur.days)) * shared.NS_PER_DAY + durTimeNanos(dur);
+        const rounded_ns = shared.roundI128ToIncrement(total, inc_ns, mode);
+        var out = shared.DurationFields{};
+        out.years = dur.years;
+        out.months = dur.months;
+        out.weeks = dur.weeks;
+        out.days = @floatFromInt(@divTrunc(rounded_ns, shared.NS_PER_DAY));
+        return out;
     }
     const rounded = shared.roundI128ToIncrement(durTimeNanos(dur), inc_ns, mode);
     // Rounding the time can spill into a whole extra day.

@@ -592,13 +592,14 @@ fn nativeDifference(arena: std.mem.Allocator, this_val: Value, args: []const Val
         // Result is a single calendar unit: round the exact difference to that
         // unit, using `from` as the calendar anchor for month/year fractions.
         result = try roundDateDifferenceToUnit(arena, from, to, st.smallest, st.increment, st.mode);
-    } else {
+    } else if (st.smallest == .day and st.increment == 1) {
+        // No rounding to do: the exact multi-unit difference is the answer.
         result = differenceISODate(from, to, st.largest);
-        // Only day-granularity rounding is supported when the result spans
-        // multiple units (a larger largestUnit than smallestUnit).
-        if (st.smallest == .day and st.increment != 1) {
-            result.days = shared.roundNumberToIncrement(result.days, st.increment, st.mode);
-        }
+    } else {
+        // Round the smallest unit while holding every coarser one, then re-express
+        // at `largest` so a rounded unit that fills up bubbles into the next
+        // (NudgeToCalendarUnit + BubbleRelativeDuration).
+        result = try roundDateDiffMulti(arena, from, to, st.largest, st.smallest, st.increment, st.mode);
     }
     if (since) result = shared.negateFields(result);
     return duration.makeDuration(arena, result);
@@ -664,6 +665,76 @@ fn roundDateDifferenceToUnit(arena: std.mem.Allocator, from: ISODate, to: ISODat
         else => {},
     }
     return out;
+}
+
+/// Round a multi-unit date difference (largest ≠ smallest) to whole `smallest`
+/// units while preserving every coarser unit, then re-express at `largest` so a
+/// unit that fills up bubbles into the next. Mirrors NudgeToCalendarUnit +
+/// BubbleRelativeDuration. Probing the away-from-zero candidate through
+/// `addISODate` also range-checks it (an out-of-range rounded date throws).
+pub fn roundDateDiffMulti(arena: std.mem.Allocator, from: ISODate, to: ISODate, largest: shared.Unit, smallest: shared.Unit, inc: f64, mode: shared.RoundingMode) !shared.DurationFields {
+    const dur = differenceISODate(from, to, largest);
+    const cmp = compareISODate(from, to);
+    if (cmp == 0) return shared.DurationFields{};
+    const sign: f64 = if (cmp < 0) 1 else -1;
+
+    // Every unit coarser than `smallest` is carried through unchanged.
+    var base = shared.DurationFields{};
+    switch (smallest) {
+        .month => base.years = dur.years,
+        .week => {
+            base.years = dur.years;
+            base.months = dur.months;
+        },
+        .day => {
+            base.years = dur.years;
+            base.months = dur.months;
+            base.weeks = dur.weeks;
+        },
+        else => {},
+    }
+    const unit_val: f64 = switch (smallest) {
+        .year => dur.years,
+        .month => dur.months,
+        .week => dur.weeks,
+        .day => dur.days,
+        else => unreachable,
+    };
+    const q = @trunc(@abs(unit_val) / inc) * inc * sign;
+    const q2 = q + inc * sign;
+    const target: f64 = @floatFromInt(shared.isoDateToEpochDays(to.year, to.month, to.day));
+    const p1 = try candidateEpochDay(arena, from, base, smallest, q);
+    const p2 = try candidateEpochDay(arena, from, base, smallest, q2);
+
+    var total = q;
+    if (p2 != p1) total = q + (target - p1) / (p2 - p1) * inc * sign;
+    const rounded = shared.roundNumberToIncrement(total, inc, mode);
+
+    var res = base;
+    switch (smallest) {
+        .year => res.years = rounded,
+        .month => res.months = rounded,
+        .week => res.weeks = rounded,
+        .day => res.days = rounded,
+        else => {},
+    }
+    const endpoint = try addISODate(from, res.years, res.months, res.weeks, res.days, .constrain, arena);
+    return differenceISODate(from, endpoint, largest);
+}
+
+/// Epoch day of `from` shifted by the coarse `base` plus `q` of the `smallest`
+/// unit — the interpolation anchor for `roundDateDiffMulti`.
+fn candidateEpochDay(arena: std.mem.Allocator, from: ISODate, base: shared.DurationFields, smallest: shared.Unit, q: f64) !f64 {
+    var d = base;
+    switch (smallest) {
+        .year => d.years += q,
+        .month => d.months += q,
+        .week => d.weeks += q,
+        .day => d.days += q,
+        else => {},
+    }
+    const shifted = try addISODate(from, d.years, d.months, d.weeks, d.days, .constrain, arena);
+    return @floatFromInt(shared.isoDateToEpochDays(shifted.year, shifted.month, shifted.day));
 }
 
 /// True iff `from` shifted by `off_months` whole months stays within the
