@@ -213,6 +213,17 @@ pub const FnCompiler = struct {
         };
     }
 
+    /// True when a formal parameter of the function being compiled is literally
+    /// named `arguments`. For an arrow function this is the only way `arguments`
+    /// becomes a parameter-scope binding, so it gates the §19.2.1.3-step-5.d
+    /// `var arguments` collision check inside a direct eval in a param default.
+    fn paramListBindsArguments(self: *Self) bool {
+        for (self.param_names) |p| {
+            if (std.mem.eql(u8, p, "arguments")) return true;
+        }
+        return false;
+    }
+
     /// Allocate a new register and track high-water mark.
     pub fn allocReg(self: *Self) u8 {
         const r = self.sp;
@@ -633,6 +644,17 @@ pub const FnCompiler = struct {
         const sv = try val_mod.makeString(self.arena, name);
         const kidx = try self.addConstant(sv);
         try self.emitOp(.DEFINE_GLOBAL, line);
+        try self.emitU16(kidx);
+        try self.emitU8(rsrc);
+    }
+
+    /// Like `emitDefine`, but for a top-level function declaration — emits
+    /// DEFINE_GLOBAL_FN so the global-object mirror uses CreateGlobalFunctionBinding
+    /// semantics (redefine an existing configurable property's descriptor).
+    pub fn emitDefineFn(self: *Self, name: []const u8, rsrc: u8, line: u32) !void {
+        const sv = try val_mod.makeString(self.arena, name);
+        const kidx = try self.addConstant(sv);
+        try self.emitOp(.DEFINE_GLOBAL_FN, line);
         try self.emitU16(kidx);
         try self.emitU8(rsrc);
     }
@@ -2910,8 +2932,9 @@ pub const FnCompiler = struct {
             // A direct eval in a formal-parameter initializer cannot declare
             // `var arguments`: the parameter scope of a non-arrow function
             // already binds that name (§19.2.1.3 step 5.d). An arrow has no
-            // `arguments` binding of its own, so the eval is fine there.
-            if (self.in_param_default and !self.is_arrow)
+            // *implicit* `arguments` binding, but it collides just the same when
+            // one of its own formal parameters is literally named `arguments`.
+            if (self.in_param_default and (!self.is_arrow or self.paramListBindsArguments()))
                 try self.emitOp(.MARK_PARAM_EVAL, line);
             // A direct eval inside a class field initializer must reject `arguments`
             // in its body (ContainsArguments early error). The parser flagged the

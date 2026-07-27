@@ -724,7 +724,7 @@ fn disasmOne(chunk: *const Chunk, pc: usize, writer: anytype) !usize {
                 try writer.print(" K{d}", .{kidx});
             }
         },
-        .DEFINE_GLOBAL, .DEFINE_LOCAL => {
+        .DEFINE_GLOBAL, .DEFINE_LOCAL, .DEFINE_GLOBAL_FN => {
             const lo = code[new_pc];
             new_pc += 1;
             const hi = code[new_pc];

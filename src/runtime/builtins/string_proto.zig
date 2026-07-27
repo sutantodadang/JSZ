@@ -280,6 +280,51 @@ pub fn decodeWtf8At(s: []const u8, i: usize) struct { cp: u21, len: usize } {
     return .{ .cp = b0, .len = 1 };
 }
 
+/// Decode one *canonical scalar* at byte offset `i`: like `decodeWtf8At`, but a
+/// stored high-surrogate immediately followed by a low-surrogate (the WTF-8
+/// surrogate-pair form) is combined into the astral scalar it denotes, so it
+/// reads identically to the same character stored as plain 4-byte UTF-8. Returns
+/// the scalar and the number of bytes consumed.
+fn decodeCanonAt(s: []const u8, i: usize) struct { cp: u21, len: usize } {
+    const dec = decodeWtf8At(s, i);
+    if (dec.cp >= 0xD800 and dec.cp <= 0xDBFF) {
+        const next_i = i + dec.len;
+        if (next_i < s.len) {
+            const dec2 = decodeWtf8At(s, next_i);
+            if (dec2.cp >= 0xDC00 and dec2.cp <= 0xDFFF) {
+                const astral: u21 = 0x10000 +
+                    ((@as(u21, dec.cp - 0xD800) << 10) | @as(u21, dec2.cp - 0xDC00));
+                return .{ .cp = astral, .len = dec.len + dec2.len };
+            }
+        }
+    }
+    return .{ .cp = dec.cp, .len = dec.len };
+}
+
+/// True when `a` and `b` denote the same sequence of UTF-16 code units. A fast
+/// raw-byte compare handles the common case; the slow path exists because a
+/// single astral character has two WTF-8 byte representations in this engine (a
+/// 4-byte UTF-8 sequence from a literal vs. a 6-byte surrogate pair from a `\u`
+/// escape / fromCharCode), which must compare equal even though their bytes
+/// differ. See the astral-string-equality note.
+pub fn wtf8CanonEqual(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    // Bytes differ. They can still denote the same UTF-16 units when an astral
+    // character appears in different byte forms; the walk folds both and exits at
+    // the first genuinely differing code point, so an early ASCII mismatch costs
+    // about the same as the `memcmp` above.
+    var ia: usize = 0;
+    var ib: usize = 0;
+    while (ia < a.len and ib < b.len) {
+        const da = decodeCanonAt(a, ia);
+        const db = decodeCanonAt(b, ib);
+        if (da.cp != db.cp) return false;
+        ia += da.len;
+        ib += db.len;
+    }
+    return ia == a.len and ib == b.len;
+}
+
 // ---------------------------------------------------------------------------
 // UTF-16 code-unit view over WTF-8 storage
 //
