@@ -335,6 +335,12 @@ pub const Parser = struct {
     /// chain. Only then is SuperProperty (`super.x`) legal inside the eval'd
     /// code; SuperCall never is, and an indirect eval permits neither.
     eval_allow_super_prop: bool = false,
+    /// Nesting depth of class bodies currently being parsed. `super()`/`super.x`
+    /// inside a class DEFINED WITHIN an eval (e.g. `eval("class D extends C {
+    /// constructor(){ super(); } }")`) is self-contained and legal even though
+    /// the eval's own context supplies no home object; the eval-code SuperCall
+    /// rejection below only applies when this depth is zero.
+    class_body_depth: u32 = 0,
     /// Bumped every time a SuperProperty (`super.x`, `super[x]`, `super.m()`) is
     /// desugared to its `__sproto__`/`__superthis` form. The class emitter
     /// snapshots it around each member so it can bind those two names only in the
