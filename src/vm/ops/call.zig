@@ -454,6 +454,7 @@ pub inline fn opYield(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     state.resume_reg = rsrc;
     state.last_suspend_await = false; // a `yield` suspend
     state.raw_yield = false; // plain yield → consumer gets a wrapped result
+    state.at_user_yield = true; // now in "suspendedYield"
     state.frame = frame.*; // pc already advanced past YIELD
     _ = self.frames.pop();
     self.result = yielded;
@@ -484,6 +485,7 @@ pub inline fn opYieldStar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     state.resume_reg = rsrc;
     state.last_suspend_await = false; // still a `yield` suspend
     state.raw_yield = true; // delegated yield → pass inner result through unwrapped
+    state.at_user_yield = true; // now in "suspendedYield"
     state.frame = frame.*; // pc already advanced past YIELD_STAR
     _ = self.frames.pop();
     self.result = yielded;

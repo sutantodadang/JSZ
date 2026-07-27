@@ -125,6 +125,13 @@ pub const BcGeneratorState = struct {
     /// Set once the eager parameter-initialization phase (PARAMS_DONE) has run.
     /// Distinguishes the build-time param-init suspend from later user yields.
     params_initialized: bool = false,
+    /// True only while suspended AT a user `yield` (generator state
+    /// "suspendedYield"), as opposed to "suspendedStart" (param-init done but the
+    /// body has not reached a yield). `.return()`/AsyncGeneratorAwaitReturn need
+    /// this distinction: a suspendedStart async generator awaits the return value
+    /// WITHOUT resuming the body, whereas a suspendedYield one resumes to run
+    /// try/finally.
+    at_user_yield: bool = false,
 };
 
 /// Backing data for a mapped `arguments` object (sloppy mode + simple parameter
@@ -3209,8 +3216,27 @@ pub const BcVm = struct {
     /// prototype chain (e.g. `Object.create(ta)[i] = v` or a Proxy of such): the
     /// exotic method intercepts canonical numeric indices, and for a valid index
     /// with a different Receiver, OrdinarySet writes onto the Receiver instead.
+    /// OrdinarySet with a PRIMITIVE receiver (`sym.x = v`, `(42).x = v`, …). Per
+    /// PutValue → ToObject → [[Set]], the receiver stays the primitive: an
+    /// inherited accessor setter fires (this = primitive), but a data property or
+    /// an absent property would need CreateDataProperty on the primitive, which
+    /// fails. Returns false in every non-setter case so a strict-mode assignment
+    /// throws TypeError and a sloppy one is a silent no-op.
+    fn primitiveOrdinarySet(self: *BcVm, proto_opt: ?*JsObject, key: []const u8, value: Value, receiver: Value) anyerror!bool {
+        const proto = proto_opt orelse return false;
+        const loc = proto.findProperty(key) orelse return false;
+        const a = loc.holder.attrAt(loc.slot);
+        if (!a.is_accessor) return false;
+        const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+        const setter = accessorMember(raw, "set");
+        if (!isCallable(setter)) return false;
+        _ = try self.callAccessor(setter, receiver, &[_]Value{value});
+        return true;
+    }
+
     pub fn setPropR(self: *BcVm, obj_val: Value, key: []const u8, value: Value, receiver: Value) anyerror!bool {
         if (obj_val.bits == 0) return true;
+        const realm_mod_setr = @import("../runtime/realm.zig");
         switch (obj_val.unbox()) {
             .object => |obj| {
                 if (obj.internal_kind == .proxy) {
@@ -3403,6 +3429,17 @@ pub const BcVm = struct {
                 try o.set(key, value);
                 return true;
             },
+            // Property assignment to a primitive base: fire an inherited setter,
+            // otherwise fail (strict → TypeError, sloppy → no-op).
+            .symbol => return self.primitiveOrdinarySet(realm_mod_setr.active_symbol_proto, key, value, receiver),
+            .string => {
+                // A canonical index / "length" is a non-writable data property →
+                // fail; other keys resolve through String.prototype.
+                return self.primitiveOrdinarySet(realm_mod_setr.active_string_proto, key, value, receiver);
+            },
+            .number => return self.primitiveOrdinarySet(realm_mod_setr.active_number_proto, key, value, receiver),
+            .boolean => return self.primitiveOrdinarySet(realm_mod_setr.active_boolean_proto, key, value, receiver),
+            .bigint => return self.primitiveOrdinarySet(realm_mod_setr.active_bigint_proto, key, value, receiver),
             else => return true,
         }
     }
@@ -4917,15 +4954,43 @@ pub const BcVm = struct {
         agc.cur_promise = req.promise;
 
         if (req.is_return) {
-            // Resume a suspended-started generator with a return-completion so its
+            // A suspendedYield generator resumes with a return-completion so its
             // try/finally runs (driveAsyncGen converts the escaped sentinel to a
-            // normal done result); otherwise complete directly.
-            if (!agc.state.done and agc.state.started) {
-                const sentinel = try self.makeReturnCompletion(req.return_val);
-                try self.driveAsyncGen(agc, .{ .throw_ = sentinel });
+            // normal done result). A suspendedStart or completed one does NOT run
+            // the body — it takes AsyncGeneratorAwaitReturn instead (else branch).
+            if (!agc.state.done and agc.state.at_user_yield) {
+                // AsyncGeneratorUnwrapYieldResumption (§27.6.3.7): the yield point
+                // AWAITS the return value first; a fulfilled value resumes the body
+                // with a return-completion carrying the UNWRAPPED value (running
+                // try/finally), while a rejected await is THROWN into the body so
+                // its try/catch can observe it.
+                const promise_mod = @import("../runtime/builtins/promise.zig");
+                const realm_m = @import("../runtime/realm.zig");
+                const on_f = try val_mod.makeNativeFunctionData(self.arena, asyncGenYieldReturnFulfill, agc);
+                const on_r = try val_mod.makeNativeFunctionData(self.arena, asyncGenYieldReturnReject, agc);
+                promise_mod.subscribeAwait(self.arena, req.return_val, on_f, on_r) catch {
+                    const reason = realm_m.pending_exception;
+                    realm_m.pending_exception = Value{};
+                    try self.driveAsyncGen(agc, .{ .throw_ = reason });
+                };
             } else {
                 agc.state.done = true;
-                try self.asyncGenComplete(agc, req.return_val, true, false);
+                // AsyncGeneratorAwaitReturn (§27.6.3.8): a `.return(v)` on a
+                // suspendedStart or already-completed generator AWAITS v, then
+                // resolves the iterator result with the UNWRAPPED value — not the
+                // promise/thenable itself. A rejected/broken awaited value rejects.
+                const promise_mod = @import("../runtime/builtins/promise.zig");
+                const realm_m = @import("../runtime/realm.zig");
+                const on_f = try val_mod.makeNativeFunctionData(self.arena, asyncGenReturnAwaitFulfill, agc);
+                const on_r = try val_mod.makeNativeFunctionData(self.arena, asyncGenReturnAwaitReject, agc);
+                // The Await's PromiseResolve reads `value.constructor`; a poisoned
+                // getter throws. Per the spec that abrupt completion rejects the
+                // request promise rather than throwing out of `.return()`.
+                promise_mod.subscribeAwait(self.arena, req.return_val, on_f, on_r) catch {
+                    const reason = realm_m.pending_exception;
+                    realm_m.pending_exception = Value{};
+                    try self.asyncGenComplete(agc, reason, true, true);
+                };
             }
             return;
         }
@@ -5344,10 +5409,23 @@ fn asyncGenEnqueue(arena: std.mem.Allocator, agc: *AsyncGenCtx, req_kind: Resume
     return p;
 }
 
+/// AsyncGeneratorValidate abrupt completion: AsyncGenerator.prototype.{next,
+/// return, throw} do NOT throw synchronously on a bad `this` — they
+/// IfAbruptRejectPromise, i.e. return a promise already rejected with the
+/// TypeError (§27.6.1.2–4).
+fn rejectedAsyncGenTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror!Value {
+    const realm_m = @import("../runtime/realm.zig");
+    const promise_mod = @import("../runtime/builtins/promise.zig");
+    realm_m.throwTypeError(arena, msg) catch {};
+    const reason = realm_m.pending_exception;
+    realm_m.pending_exception = Value{};
+    return promise_mod.makeRejectedPromise(arena, reason);
+}
+
 fn nativeAsyncGenNext(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const realm_m = @import("../runtime/realm.zig");
     if (realm_m.active_constructing) { realm_m.active_constructing = false; return realm_m.throwTypeError(arena, "AsyncGenerator.prototype.next is not a constructor"); }
-    const agc = asyncGenCtxFrom(this_val) orelse return realm_m.throwTypeError(arena, "AsyncGenerator.prototype.next called on incompatible receiver");
+    const agc = asyncGenCtxFrom(this_val) orelse return rejectedAsyncGenTypeError(arena, "AsyncGenerator.prototype.next called on incompatible receiver");
     const sent = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     return asyncGenEnqueue(arena, agc, .{ .next = sent }, false, Value{});
 }
@@ -5355,7 +5433,7 @@ fn nativeAsyncGenNext(arena: std.mem.Allocator, this_val: Value, args: []const V
 fn nativeAsyncGenReturn(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const realm_m = @import("../runtime/realm.zig");
     if (realm_m.active_constructing) { realm_m.active_constructing = false; return realm_m.throwTypeError(arena, "AsyncGenerator.prototype.return is not a constructor"); }
-    const agc = asyncGenCtxFrom(this_val) orelse return realm_m.throwTypeError(arena, "AsyncGenerator.prototype.return called on incompatible receiver");
+    const agc = asyncGenCtxFrom(this_val) orelse return rejectedAsyncGenTypeError(arena, "AsyncGenerator.prototype.return called on incompatible receiver");
     const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     return asyncGenEnqueue(arena, agc, .{ .next = v }, true, v);
 }
@@ -5363,7 +5441,7 @@ fn nativeAsyncGenReturn(arena: std.mem.Allocator, this_val: Value, args: []const
 fn nativeAsyncGenThrow(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const realm_m = @import("../runtime/realm.zig");
     if (realm_m.active_constructing) { realm_m.active_constructing = false; return realm_m.throwTypeError(arena, "AsyncGenerator.prototype.throw is not a constructor"); }
-    const agc = asyncGenCtxFrom(this_val) orelse return realm_m.throwTypeError(arena, "AsyncGenerator.prototype.throw called on incompatible receiver");
+    const agc = asyncGenCtxFrom(this_val) orelse return rejectedAsyncGenTypeError(arena, "AsyncGenerator.prototype.throw called on incompatible receiver");
     const e = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     return asyncGenEnqueue(arena, agc, .{ .throw_ = e }, false, Value{});
 }
@@ -5379,6 +5457,46 @@ fn asyncGenOnFulfill(arena: std.mem.Allocator, _: Value, args: []const Value) an
 
 /// Internal await rejected: throw the reason at the suspended await point.
 fn asyncGenOnReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const agc: *AsyncGenCtx = @ptrCast(@alignCast(slot));
+    const e = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    try agc.vm.driveAsyncGen(agc, .{ .throw_ = e });
+    return val_mod.makeUndefined(arena);
+}
+
+/// AsyncGeneratorAwaitReturn fulfilled: resolve the iterator result with the
+/// awaited (unwrapped) return value and done=true.
+fn asyncGenReturnAwaitFulfill(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const agc: *AsyncGenCtx = @ptrCast(@alignCast(slot));
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    try agc.vm.asyncGenComplete(agc, v, true, false);
+    return val_mod.makeUndefined(arena);
+}
+
+/// AsyncGeneratorAwaitReturn rejected: reject the request promise with the reason.
+fn asyncGenReturnAwaitReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const agc: *AsyncGenCtx = @ptrCast(@alignCast(slot));
+    const e = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    try agc.vm.asyncGenComplete(agc, e, true, true);
+    return val_mod.makeUndefined(arena);
+}
+
+/// UnwrapYieldResumption fulfilled: resume the suspendedYield body with a
+/// return-completion carrying the awaited (unwrapped) value.
+fn asyncGenYieldReturnFulfill(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+    const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
+    const agc: *AsyncGenCtx = @ptrCast(@alignCast(slot));
+    const v = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const sentinel = try agc.vm.makeReturnCompletion(v);
+    try agc.vm.driveAsyncGen(agc, .{ .throw_ = sentinel });
+    return val_mod.makeUndefined(arena);
+}
+
+/// UnwrapYieldResumption rejected: throw the reason into the suspendedYield body
+/// so its try/catch/finally observes it.
+fn asyncGenYieldReturnReject(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const slot = val_mod.g_active_native_data orelse return val_mod.makeUndefined(arena);
     const agc: *AsyncGenCtx = @ptrCast(@alignCast(slot));
     const e = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);

@@ -3553,6 +3553,223 @@ fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, args: []const
     return val_mod.makeString(arena, try numberToRadixString(arena, n, radix));
 }
 
+/// Exact Number.prototype.toFixed for a finite, non-negative `x` and `f` in
+/// [0,100]: computes n = round(x * 10^f) (ties toward the larger n, per spec)
+/// with big-integer arithmetic so every digit of the double's exact value is
+/// preserved (Zig's float formatter rounds to ~17 significant digits, which
+/// loses the tail of large integers such as 1e18 + 128).
+fn exactToFixedAbs(arena: std.mem.Allocator, x: f64, f: usize) ![]const u8 {
+    const Managed = std.math.big.int.Managed;
+    // Decompose x = m * 2^e (IEEE-754 binary64).
+    const bits: u64 = @bitCast(x);
+    const raw_exp: u64 = (bits >> 52) & 0x7FF;
+    const raw_frac: u64 = bits & 0xFFFFFFFFFFFFF;
+    var m_int: u64 = undefined;
+    var e: i64 = undefined;
+    if (raw_exp == 0) {
+        m_int = raw_frac;
+        e = -1074;
+    } else {
+        m_int = raw_frac | (@as(u64, 1) << 52);
+        e = @as(i64, @intCast(raw_exp)) - 1075;
+    }
+    // num = m * 5^f  (then scale by 2^(e+f)).
+    var num = try Managed.initSet(arena, m_int);
+    {
+        var five = try Managed.initSet(arena, 5);
+        var acc = try Managed.initSet(arena, 1);
+        var tmp = try Managed.init(arena);
+        var k: usize = 0;
+        while (k < f) : (k += 1) {
+            try tmp.mul(&acc, &five);
+            acc.swap(&tmp);
+        }
+        try tmp.mul(&num, &acc);
+        num.swap(&tmp);
+    }
+    const p: i64 = e + @as(i64, @intCast(f));
+    var n = try Managed.init(arena);
+    if (p >= 0) {
+        try n.shiftLeft(&num, @intCast(p));
+    } else {
+        const shift: usize = @intCast(-p);
+        // Round to nearest, ties up: (num + 2^(shift-1)) >> shift.
+        var half = try Managed.initSet(arena, 1);
+        try half.shiftLeft(&half, shift - 1);
+        var summed = try Managed.init(arena);
+        try summed.add(&num, &half);
+        try n.shiftRight(&summed, shift);
+    }
+    const digits = try n.toConst().toStringAlloc(arena, 10, .lower);
+    if (f == 0) return digits;
+    if (digits.len <= f) {
+        // 0.<pad><digits>
+        var buf = std.ArrayList(u8){};
+        try buf.appendSlice(arena, "0.");
+        try buf.appendNTimes(arena, '0', f - digits.len);
+        try buf.appendSlice(arena, digits);
+        return buf.items;
+    }
+    const split = digits.len - f;
+    var buf = std.ArrayList(u8){};
+    try buf.appendSlice(arena, digits[0..split]);
+    try buf.append(arena, '.');
+    try buf.appendSlice(arena, digits[split..]);
+    return buf.items;
+}
+
+/// round(m * 2^e * 10^k) as a big integer (m ≥ 0), ties toward +∞. Used by the
+/// exact exponential/precision formatters.
+fn exactRoundScaled(arena: std.mem.Allocator, m_int: u64, e: i64, k: i64) !std.math.big.int.Managed {
+    const Managed = std.math.big.int.Managed;
+    var num = try Managed.initSet(arena, m_int);
+    var den = try Managed.initSet(arena, 1);
+    if (k != 0) {
+        // 5^|k|
+        var five_pow = try Managed.initSet(arena, 1);
+        {
+            var five = try Managed.initSet(arena, 5);
+            var tmp = try Managed.init(arena);
+            var kk: usize = @intCast(@abs(k));
+            while (kk > 0) : (kk -= 1) {
+                try tmp.mul(&five_pow, &five);
+                five_pow.swap(&tmp);
+            }
+        }
+        var tmp = try Managed.init(arena);
+        if (k > 0) {
+            try tmp.mul(&num, &five_pow);
+            num.swap(&tmp);
+        } else {
+            try tmp.mul(&den, &five_pow);
+            den.swap(&tmp);
+        }
+    }
+    const two_exp: i64 = e + k;
+    if (two_exp >= 0) {
+        var tmp = try Managed.init(arena);
+        try tmp.shiftLeft(&num, @intCast(two_exp));
+        num.swap(&tmp);
+    } else {
+        var tmp = try Managed.init(arena);
+        try tmp.shiftLeft(&den, @intCast(-two_exp));
+        den.swap(&tmp);
+    }
+    // n = round(num/den), ties up: q = num div den; if 2*rem >= den, q += 1.
+    var q = try Managed.init(arena);
+    var rem = try Managed.init(arena);
+    try q.divTrunc(&rem, &num, &den);
+    var rem2 = try Managed.init(arena);
+    try rem2.shiftLeft(&rem, 1);
+    if (rem2.toConst().order(den.toConst()) != .lt) {
+        var one = try Managed.initSet(arena, 1);
+        var tmp = try Managed.init(arena);
+        try tmp.add(&q, &one);
+        q.swap(&tmp);
+    }
+    return q;
+}
+
+/// Sign of (x − 10^d) for x = m·2^e (m > 0), computed exactly. Returns .lt/.eq/
+/// .gt. Cross-multiplies to a pair of non-negative big integers so no fraction
+/// is ever formed.
+fn compareXvsPow10(arena: std.mem.Allocator, m_int: u64, e: i64, d: i64) !std.math.Order {
+    const Managed = std.math.big.int.Managed;
+    // LHS = m · 2^max(e,0) · 10^max(-d,0);  RHS = 10^max(d,0) · 2^max(-e,0)
+    var lhs = try Managed.initSet(arena, m_int);
+    var rhs = try Managed.initSet(arena, 1);
+    if (e > 0) {
+        var t = try Managed.init(arena);
+        try t.shiftLeft(&lhs, @intCast(e));
+        lhs.swap(&t);
+    } else if (e < 0) {
+        var t = try Managed.init(arena);
+        try t.shiftLeft(&rhs, @intCast(-e));
+        rhs.swap(&t);
+    }
+    const pow10 = struct {
+        fn mul(a: std.mem.Allocator, target: *Managed, n: usize) !void {
+            var ten = try Managed.initSet(a, 10);
+            var tmp = try Managed.init(a);
+            var k: usize = 0;
+            while (k < n) : (k += 1) {
+                try tmp.mul(target, &ten);
+                target.swap(&tmp);
+            }
+        }
+    };
+    if (d < 0) try pow10.mul(arena, &lhs, @intCast(-d));
+    if (d > 0) try pow10.mul(arena, &rhs, @intCast(d));
+    return lhs.toConst().order(rhs.toConst());
+}
+
+/// Exact floor(log10(x)) for a positive finite `x`, seeded by the float estimate
+/// and corrected with exact comparisons (float log10 is off by one for values
+/// just below a power of ten, e.g. the double nearest 1e-21).
+fn floorLog10(arena: std.mem.Allocator, m_int: u64, e: i64, x: f64) !i64 {
+    var d: i64 = @intFromFloat(@floor(std.math.log10(x)));
+    // Ensure 10^d ≤ x.
+    while ((try compareXvsPow10(arena, m_int, e, d)) == .lt) d -= 1;
+    // Ensure x < 10^(d+1).
+    while ((try compareXvsPow10(arena, m_int, e, d + 1)) != .lt) d += 1;
+    return d;
+}
+
+/// Exact significant digits of a positive finite `x`: returns exactly `sig`
+/// decimal digits (10^(sig-1) ≤ n < 10^sig) plus the base-10 exponent of the
+/// leading digit. Ties round toward +∞.
+fn exactSignificant(arena: std.mem.Allocator, x: f64, sig: usize) !struct { digits: []const u8, exp: i64 } {
+    const bits: u64 = @bitCast(x);
+    const raw_exp: u64 = (bits >> 52) & 0x7FF;
+    const raw_frac: u64 = bits & 0xFFFFFFFFFFFFF;
+    var m_int: u64 = undefined;
+    var e2: i64 = undefined;
+    if (raw_exp == 0) {
+        m_int = raw_frac;
+        e2 = -1074;
+    } else {
+        m_int = raw_frac | (@as(u64, 1) << 52);
+        e2 = @as(i64, @intCast(raw_exp)) - 1075;
+    }
+    // Exact decimal exponent, then correct for a rounding carry into the next
+    // decade below.
+    var edec: i64 = try floorLog10(arena, m_int, e2, x);
+    var attempts: usize = 0;
+    while (attempts < 4) : (attempts += 1) {
+        const k: i64 = @as(i64, @intCast(sig - 1)) - edec;
+        var n = try exactRoundScaled(arena, m_int, e2, k);
+        const digits = try n.toConst().toStringAlloc(arena, 10, .lower);
+        if (digits.len == sig) {
+            return .{ .digits = digits, .exp = edec };
+        } else if (digits.len == sig + 1) {
+            // Rounding carried into an extra digit (…→10^sig): drop the trailing
+            // 0 and bump the exponent.
+            return .{ .digits = digits[0..sig], .exp = edec + 1 };
+        } else if (digits.len < sig) {
+            edec -= 1;
+        } else {
+            edec += 1;
+        }
+    }
+    // Fallback (should not happen): pad/truncate to sig digits at the estimate.
+    const k: i64 = @as(i64, @intCast(sig - 1)) - edec;
+    var n = try exactRoundScaled(arena, m_int, e2, k);
+    const digits = try n.toConst().toStringAlloc(arena, 10, .lower);
+    return .{ .digits = digits, .exp = edec };
+}
+
+/// Format `edec` as the `e±N` exponent suffix (no leading zeros).
+fn appendExpSuffix(arena: std.mem.Allocator, buf: *std.ArrayList(u8), edec: i64) !void {
+    try buf.append(arena, 'e');
+    if (edec >= 0) {
+        try buf.append(arena, '+');
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(edec))}));
+    } else {
+        try buf.append(arena, '-');
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(-edec))}));
+    }
+}
+
 fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toFixed requires a Number");
     // f = ToIntegerOrInfinity(fractionDigits): ToNumber throws TypeError for
@@ -3566,8 +3783,13 @@ fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const 
     if (@abs(n) >= 1e21) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     const fu: usize = @intCast(f);
     // -0 formats without a sign ("0.00", not "-0.00").
-    const nf: f64 = if (n == 0) 0.0 else n;
-    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ nf, fu }));
+    const negative = n < 0.0;
+    const abs_n = @abs(n);
+    const body = try exactToFixedAbs(arena, abs_n, fu);
+    if (negative and abs_n != 0.0) {
+        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "-{s}", .{body}));
+    }
+    return val_mod.makeString(arena, body);
 }
 
 /// Shared helper: format `n` in exponential notation.
@@ -3607,20 +3829,29 @@ fn numberToExponentialImpl(arena: std.mem.Allocator, n: f64, f: i64) ![]const u8
             if (end > 0 and full[end - 1] == '.') end -= 1;
         }
         try buf.appendSlice(arena, full[0..end]);
-    } else {
-        const fu: usize = @intCast(f);
-        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ mant, fu }));
+        try appendExpSuffix(arena, &buf, exp);
+        return buf.items;
     }
 
-    // Exponent: e+N or e-N, no leading zeros
-    try buf.append(arena, 'e');
-    if (exp >= 0) {
-        try buf.append(arena, '+');
-        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(exp))}));
-    } else {
-        try buf.append(arena, '-');
-        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(-exp))}));
+    // Fixed fractionDigits: emit exactly f+1 significant digits (d.ddd…) using
+    // the exact decimal value of the double.
+    const fu: usize = @intCast(f);
+    if (abs_n == 0.0) {
+        try buf.append(arena, '0');
+        if (fu > 0) {
+            try buf.append(arena, '.');
+            try buf.appendNTimes(arena, '0', fu);
+        }
+        try appendExpSuffix(arena, &buf, 0);
+        return buf.items;
     }
+    const sd = try exactSignificant(arena, abs_n, fu + 1);
+    try buf.append(arena, sd.digits[0]);
+    if (fu > 0) {
+        try buf.append(arena, '.');
+        try buf.appendSlice(arena, sd.digits[1..]);
+    }
+    try appendExpSuffix(arena, &buf, sd.exp);
     return buf.items;
 }
 
@@ -3658,20 +3889,46 @@ fn nativeNumberToPrecision(arena: std.mem.Allocator, this_val: Value, args: []co
     if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     if (p_int < 1 or p_int > 100) return throwRangeError(arena, "toPrecision() argument must be between 1 and 100");
     const p: i64 = @intFromFloat(p_int);
+    const pu: usize = @intCast(p);
     const abs_n = @abs(n);
-    // -0 formats without a sign (ES: the "-" prefix is added only when x < 0).
-    const nf: f64 = if (abs_n == 0.0) 0.0 else n;
-    // e = floor(log10(|n|)), 0 for n == 0
-    const e: i64 = if (abs_n == 0.0) 0 else @as(i64, @intFromFloat(@floor(std.math.log10(abs_n))));
-    if (e >= p or e < -6) {
-        // Exponential form: p-1 fraction digits
-        return val_mod.makeString(arena, try numberToExponentialImpl(arena, nf, p - 1));
-    } else {
-        // Fixed form: p-1-e fraction digits
-        const frac: i64 = p - 1 - e;
-        const fu: usize = if (frac < 0) 0 else @intCast(frac);
-        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ nf, fu }));
+    const negative = n < 0.0 and abs_n != 0.0;
+    var buf = std.ArrayList(u8){};
+    if (negative) try buf.append(arena, '-');
+    // Zero: "0" / "0.000…" with p-1 fraction digits (e = 0, never exponential).
+    if (abs_n == 0.0) {
+        try buf.append(arena, '0');
+        if (pu > 1) {
+            try buf.append(arena, '.');
+            try buf.appendNTimes(arena, '0', pu - 1);
+        }
+        return val_mod.makeString(arena, buf.items);
     }
+    // Exact p significant digits + the base-10 exponent of the leading digit.
+    const sd = try exactSignificant(arena, abs_n, pu);
+    const e = sd.exp;
+    if (e < -6 or e >= p) {
+        // Exponential form: d.ddd…e±e with p-1 fraction digits.
+        try buf.append(arena, sd.digits[0]);
+        if (pu > 1) {
+            try buf.append(arena, '.');
+            try buf.appendSlice(arena, sd.digits[1..]);
+        }
+        try appendExpSuffix(arena, &buf, e);
+    } else if (e >= 0) {
+        // Fixed, |x| ≥ 1: e+1 integer digits, remaining p-1-e as the fraction.
+        const int_len: usize = @intCast(e + 1);
+        try buf.appendSlice(arena, sd.digits[0..int_len]);
+        if (int_len < pu) {
+            try buf.append(arena, '.');
+            try buf.appendSlice(arena, sd.digits[int_len..]);
+        }
+    } else {
+        // Fixed, |x| < 1: 0.<zeros><digits> with (-e-1) leading fraction zeros.
+        try buf.appendSlice(arena, "0.");
+        try buf.appendNTimes(arena, '0', @intCast(-e - 1));
+        try buf.appendSlice(arena, sd.digits);
+    }
+    return val_mod.makeString(arena, buf.items);
 }
 
 /// ES Number.isInteger / isFinite / isNaN / isSafeInteger: no coercion — a
@@ -3881,12 +4138,16 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
             try src.appendSlice(arena, try rawToStr(arena, args[args.len - 1]));
         }
         try src.appendSlice(arena, "\n})");
-        // NewTarget [[Prototype]] override for dynamic generator/async-generator
-        // functions (CreateDynamicFunction step 18: proto from newTarget's realm).
-        // IMPORTANT: capture pending_new_target BEFORE evalSource/shadowEval, because
-        // bcInvokeJs (called inside evalSource) unconditionally clears pending_new_target.
-        const is_gen = !std.mem.eql(u8, keyword, "function");
-        const captured_nt = if (is_gen) pending_new_target else Value{};
+        // NewTarget [[Prototype]] override (CreateDynamicFunction step 18: proto
+        // from newTarget's realm). Applies to EVERY dynamic-function kind, not just
+        // generators: `Reflect.construct(Function, [], otherRealmFn)` must give the
+        // result `otherRealm.Function.prototype`.
+        // IMPORTANT: capture pending_new_target/active_constructing BEFORE
+        // evalSource/shadowEval, because bcInvokeJs (called inside evalSource)
+        // unconditionally clears them. Only honor the newTarget when we are actually
+        // constructing — a plain `Function(...)` call keeps the default proto.
+        const is_gen = !std.mem.eql(u8, keyword, "function") and !std.mem.eql(u8, keyword, "async function");
+        const captured_nt = if (active_constructing) pending_new_target else Value{};
         // Cross-realm: if the constructor realm's global env differs from the
         // current active global env, run the body in the constructor realm's scope
         // so closures capture that realm's globals and the realm tag propagates.
@@ -3903,16 +4164,24 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
             }
             break :blk try ctx.evalSource(arena, src.items);
         };
-        if (is_gen and captured_nt.bits != 0) {
+        if (captured_nt.bits != 0) {
             const nt = captured_nt;
             const derived_proto: ?*JsObject = proto_blk: {
                 const pv = try ctx.getProp(arena, nt, "prototype");
                 if (pv.bits != 0 and pv.unbox() == .object) break :proto_blk pv.toPtr().object;
-                // Fallback: GetFunctionRealm(newTarget) then that realm's gen proto.
+                // Fallback: GetPrototypeFromConstructor uses GetFunctionRealm(newTarget)
+                // then that realm's intrinsic prototype for THIS function kind.
                 if (getFunctionRealm(nt)) |fr| {
-                    try ctx.ensureGenChain(@ptrCast(fr));
-                    const is_async_gen = std.mem.eql(u8, keyword, "async function*");
-                    break :proto_blk if (is_async_gen) fr.async_gen_fn_proto else fr.gen_fn_proto;
+                    if (is_gen) {
+                        try ctx.ensureGenChain(@ptrCast(fr));
+                        const is_async_gen = std.mem.eql(u8, keyword, "async function*");
+                        break :proto_blk if (is_async_gen) fr.async_gen_fn_proto else fr.gen_fn_proto;
+                    }
+                    if (std.mem.eql(u8, keyword, "async function")) {
+                        try ctx.ensureGenChain(@ptrCast(fr));
+                        break :proto_blk fr.async_fn_proto orelse fr.function_prototype;
+                    }
+                    break :proto_blk fr.function_prototype;
                 }
                 break :proto_blk null;
             };
@@ -3924,7 +4193,7 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
             }
             // Consume pending newTarget so constructImpl's post-hoc override does
             // not attempt to re-apply it (it only handles .object returns, not
-            // .bc_function — the generator function type).
+            // .bc_function — the function type dynamic functions produce).
             pending_new_target = Value{};
         }
         if (ctor_realm) |r| val_mod.setValueRealm(result, r);

@@ -1325,6 +1325,9 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     self.patchJump(patch_exit, exit_offset);
     self.resolveLoop(continue_offset, exit_offset);
 
+    // Pop the ForIn/OfHeadEvaluation ForDeclaration scope (`for (let x in …)`).
+    // Without this, the head binding leaks into the enclosing scope in TDZ and a
+    // later `typeof x` throws instead of seeing no binding (Annex B / §14.7.5.7).
     if (head_scope) {
         try self.emitOp(.EXIT_SCOPE, line);
         self.block_scope_depth -= 1;

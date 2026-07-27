@@ -2889,10 +2889,15 @@ fn nativeAsyncFromSyncThrow(arena: std.mem.Allocator, this_val: Value, args: []c
         promise_mod.settleResult(arena, p, try makeTypeErrorVal(arena, "iterator 'throw' did not return an object"), false);
         return p;
     }
-    // NB: AsyncFromSyncIteratorContinuation also awaits the yielded value, but
-    // `awaitValue` here is a *synchronous* microtask drain, and `throw` is
-    // normally invoked from inside a reaction job — re-entering the drain
-    // corrupts the queue. The delegating loop awaits this result anyway.
+    // AsyncFromSyncIteratorContinuation: await/unwrap the result value so a sync
+    // iterator whose throw() yields a promise resolves to the settled value.
+    if (r.toPtr().object.get("value")) |val| {
+        const awaited = promise_mod.awaitValue(arena, val) catch {
+            promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+            return p;
+        };
+        try r.toPtr().object.set("value", awaited);
+    }
     promise_mod.settleResult(arena, p, r, true);
     return p;
 }
@@ -2938,13 +2943,26 @@ fn nativeAsyncFromSyncReturn(arena: std.mem.Allocator, this_val: Value, args: []
         promise_mod.settleResult(arena, p, done_result, true);
         return p;
     }
-    const r = function_proto.invokeCallback(arena, sync_it, ret, &[_]Value{arg}) catch {
+    // §27.1.4.2.2 step 6: call return() with NO argument when `value` is absent,
+    // so an `arguments.length`-observing sync `return` sees zero args.
+    const fwd_args: []const Value = if (args.len > 0) args[0..1] else &[_]Value{};
+    const r = function_proto.invokeCallback(arena, sync_it, ret, fwd_args) catch {
         promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
         return p;
     };
     if (r.bits == 0 or r.unbox() != .object) {
         promise_mod.settleResult(arena, p, try makeTypeErrorVal(arena, "iterator 'return' did not return an object"), false);
         return p;
+    }
+    // AsyncFromSyncIteratorContinuation: await/unwrap the result value so a sync
+    // iterator whose return() yields a promise resolves to the settled value
+    // (§27.1.4.2.3). A rejected await rejects the continuation promise.
+    if (r.toPtr().object.get("value")) |val| {
+        const awaited = promise_mod.awaitValue(arena, val) catch {
+            promise_mod.settleResult(arena, p, realm_mod.pending_exception, false);
+            return p;
+        };
+        try r.toPtr().object.set("value", awaited);
     }
     promise_mod.settleResult(arena, p, r, true);
     return p;

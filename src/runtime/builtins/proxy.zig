@@ -365,7 +365,15 @@ pub fn proxySetInvariant(arena: std.mem.Allocator, target: Value, key: Value, va
 pub fn proxyDefineProperty(arena: std.mem.Allocator, proxy_obj: *JsObject, key: Value, desc_obj: Value) anyerror!?bool {
     const handler = proxyHandler(proxy_obj) orelse return throwRevoked(arena);
     const target = proxyTarget(proxy_obj) orelse return throwRevoked(arena);
-    const trap_fn = try getTrap(arena, handler, "defineProperty") orelse return null;
+    const trap_fn = try getTrap(arena, handler, "defineProperty") orelse {
+        // No trap: [[DefineOwnProperty]] forwards to the target. A proxy target
+        // must run its OWN [[DefineOwnProperty]] (which enforces invariants such
+        // as non-extensibility), so recurse instead of letting the caller define
+        // directly on the inner proxy object.
+        if (target.bits != 0 and target.unbox() == .object and target.toPtr().object.internal_kind == .proxy)
+            return proxyDefineProperty(arena, target.toPtr().object, key, desc_obj);
+        return null;
+    };
     const res = try function_proto.invokeCallback(arena, handler, trap_fn, &[_]Value{ target, key, desc_obj });
     if (!val_mod.toBoolean(res)) return false;
 
