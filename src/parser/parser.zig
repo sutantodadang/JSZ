@@ -281,6 +281,13 @@ pub const Parser = struct {
     /// usage so it can bind `super`/`__sproto__`/`__superthis` to the home
     /// object's prototype (object literals have no Super class binding).
     super_used: bool,
+    /// Set when a *direct* eval (a call to the bare identifier `eval`) is parsed.
+    /// parseObjectLiteral saves/clears it around each method body just like
+    /// `super_used`: a concise method always has a home object, so a `super`
+    /// inside a direct eval in that method (`m(){ eval("super.x") }`) is legal
+    /// and needs the `super`/`__sproto__`/`__superthis` bindings injected even
+    /// though the method body contains no *syntactic* super.
+    direct_eval_used: bool,
     /// Monotonic counter for the hidden `__home_N` capture var injected by
     /// parseObjectLiteral for object literals whose methods use `super`.
     home_obj_counter: u32,
@@ -405,6 +412,7 @@ pub const Parser = struct {
             .export_default_name_hint = null,
             .saw_top_level_await = false,
             .super_used = false,
+            .direct_eval_used = false,
             .home_obj_counter = 0,
             .arrow_prelude = .{},
             .param_destruct_counter = 0,

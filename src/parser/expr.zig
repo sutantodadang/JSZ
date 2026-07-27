@@ -45,6 +45,11 @@ pub fn parseExprFromIdent(p: *Parser, ident: *Node) ?*Node {
                 }) orelse return null;
             }
         } else if (p.check(.left_paren)) {
+            // A call to the bare identifier `eval` is a direct eval: note it so an
+            // enclosing object method binds its home object even when the method's
+            // own body has no syntactic `super` (the `super` may live in the eval).
+            if (base.kind == .identifier and std.mem.eql(u8, base.data.identifier, "eval"))
+                p.direct_eval_used = true;
             const args = p.parseArgs() orelse return null;
             const raw_call = p.makeNode(.call_expr, base.start, p.current.start, .{
                 .call_expr = .{ .callee = base, .args = args },
@@ -202,6 +207,13 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         // restrictions: `static { () => { var await; } }` is legal.
         const sb_saved = p.leaveStaticBlock();
         defer p.restoreStaticBlock(sb_saved);
+        // An arrow body is a function body: `return` is legal inside it even in
+        // eval code (§19.2.1.1 only forbids `return` outside *any* function), so
+        // count it in fn_nesting_depth just as parseFunctionBody does. A block
+        // body parses via parseBlock (not parseFunctionBody), so without this the
+        // depth would stay 0 and `eval("() => { return 1; }")` would wrongly throw.
+        p.fn_nesting_depth += 1;
+        defer p.fn_nesting_depth -= 1;
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
@@ -384,6 +396,13 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         // restrictions: `static { () => { var await; } }` is legal.
         const sb_saved = p.leaveStaticBlock();
         defer p.restoreStaticBlock(sb_saved);
+        // An arrow body is a function body: `return` is legal inside it even in
+        // eval code (§19.2.1.1 only forbids `return` outside *any* function), so
+        // count it in fn_nesting_depth just as parseFunctionBody does. A block
+        // body parses via parseBlock (not parseFunctionBody), so without this the
+        // depth would stay 0 and `eval("() => { return 1; }")` would wrongly throw.
+        p.fn_nesting_depth += 1;
+        defer p.fn_nesting_depth -= 1;
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
@@ -1467,6 +1486,11 @@ pub fn parseCallMemberTail(p: *Parser, base_in: *Node) ?*Node {
                 }) orelse return null;
             }
         } else if (p.check(.left_paren)) {
+            // A call to the bare identifier `eval` is a direct eval: note it so an
+            // enclosing object method binds its home object even when the method's
+            // own body has no syntactic `super` (the `super` may live in the eval).
+            if (base.kind == .identifier and std.mem.eql(u8, base.data.identifier, "eval"))
+                p.direct_eval_used = true;
             const args = p.parseArgs() orelse return null;
             const raw_call = p.makeNode(.call_expr, base.start, p.current.start, .{
                 .call_expr = .{ .callee = base, .args = args },
@@ -2055,6 +2079,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
     // preserves any pending super flag from the enclosing scope so it is not
     // swallowed by this object's method-body parses.
     const saved_super = p.super_used;
+    const saved_direct_eval = p.direct_eval_used;
     var super_methods = std.ArrayList(*Node){};
     while (!p.check(.right_brace) and !p.check(.eof) and !p.had_error) {
         const prop_start = p.current.start;
@@ -2118,6 +2143,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             p.require_unique_params = true;
             const am_params = p.parseFunctionParams() orelse return null;
             p.super_used = false;
+            p.direct_eval_used = false;
             const prev_gen = p.in_generator_function;
             p.in_generator_function = m_is_gen;
             const am_body = p.parseFunctionBody() orelse {
@@ -2142,7 +2168,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
-            if (p.super_used) super_methods.append(p.arena, am_fn) catch {
+            if (p.super_used or p.direct_eval_used) super_methods.append(p.arena, am_fn) catch {
                 p.had_error = true;
                 return null;
             };
@@ -2165,6 +2191,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                 p.require_unique_params = true;
                 const cm_params = p.parseFunctionParams() orelse return null;
                 p.super_used = false;
+                p.direct_eval_used = false;
                 const cm_body = p.parseFunctionBody() orelse return null;
                 if (!parser_file.checkStrictDirectiveSimpleParams(p, cm_params.non_simple, cm_body)) return null;
                 const cm_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
@@ -2185,7 +2212,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                         .source_text = p.sourceSlice(prop_start, p.prev_end),
                     },
                 }) orelse return null;
-                if (p.super_used) super_methods.append(p.arena, cm_fn) catch {
+                if (p.super_used or p.direct_eval_used) super_methods.append(p.arena, cm_fn) catch {
                     p.had_error = true;
                     return null;
                 };
@@ -2275,6 +2302,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             if (acc_kind == .set and (acc_params.params.len != 1 or acc_params.rest_param != null))
                 return p.fail("setter functions must have exactly one argument");
             p.super_used = false;
+            p.direct_eval_used = false;
             const acc_body = p.parseFunctionBody() orelse return null;
             if (!parser_file.checkStrictDirectiveSimpleParams(p, acc_params.non_simple, acc_body)) return null;
             const acc_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
@@ -2302,7 +2330,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
-            if (p.super_used) super_methods.append(p.arena, acc_fn) catch {
+            if (p.super_used or p.direct_eval_used) super_methods.append(p.arena, acc_fn) catch {
                 p.had_error = true;
                 return null;
             };
@@ -2319,6 +2347,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
             p.require_unique_params = true;
             const m_params = p.parseFunctionParams() orelse return null;
             p.super_used = false;
+            p.direct_eval_used = false;
             const m_body = p.parseFunctionBody() orelse return null;
             if (!parser_file.checkStrictDirectiveSimpleParams(p, m_params.non_simple, m_body)) return null;
             const m_fn = p.makeNode(.function_expr, prop_start, p.current.start, .{
@@ -2337,7 +2366,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
-            if (p.super_used) super_methods.append(p.arena, m_fn) catch {
+            if (p.super_used or p.direct_eval_used) super_methods.append(p.arena, m_fn) catch {
                 p.had_error = true;
                 return null;
             };
@@ -2406,6 +2435,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
     // Restore the enclosing scope's super flag; this object's methods consumed
     // their own super references into `super_methods`.
     p.super_used = saved_super;
+    p.direct_eval_used = saved_direct_eval;
     const obj_lit = p.makeNode(.object_literal, start, obj_end, .{
         .object_literal = .{ .properties = props.items },
     }) orelse return null;

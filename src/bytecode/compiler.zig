@@ -3091,6 +3091,19 @@ pub const FnCompiler = struct {
             }
         }
 
+        // `eval(...xs)` is still a *direct* eval: the callee is the bare
+        // identifier `eval` (§13.3.6.1 keys off the CallExpression's syntactic
+        // shape, not its argument list). Flag it exactly as the static-args path
+        // does so CALL_SPREAD runs the eval'd code in this scope. Emitted after
+        // the args array so an argument's own call cannot consume the flag first.
+        if (!c.optional and c.callee.kind == .identifier and
+            std.mem.eql(u8, c.callee.data.identifier, "eval"))
+        {
+            try self.emitOp(.MARK_DIRECT_EVAL, line);
+            self.saw_dynamic_scope = true;
+            self.saw_arguments = true;
+        }
+
         try self.emitOp(.CALL_SPREAD, line);
         try self.emitU8(rcallee);
         try self.emitU8(rthis);
