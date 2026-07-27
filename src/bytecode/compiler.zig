@@ -2292,6 +2292,17 @@ pub const FnCompiler = struct {
 
     pub fn compileUpdate(self: *Self, u: ast.UpdateExpr, line: u32) error{OutOfMemory}!u8 {
         if (try self.emitCallTargetRefError(u.operand, line)) |r| return r;
+        // Plain member target (`obj[key]++`): evaluate base and ToPropertyKey(key)
+        // exactly ONCE via a PreparedRef, so a computed key's @@toPrimitive runs a
+        // single time (§13.4 UpdateExpression). Super/private forms keep the older
+        // double-eval path below (no separately observable key expression).
+        if (u.operand.kind == .member_expr) {
+            const me = u.operand.data.member_expr;
+            const is_super = me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super");
+            if (!me.private_define and !me.define_data and !is_super) {
+                return try self.compileUpdateMember(u, me, line);
+            }
+        }
         // As with compound assignment, the operand's Reference is resolved once
         // and reused for the write-back (`with (o) { x++ }` keeps assigning o.x
         // even if reading it removed the property).
@@ -2345,6 +2356,37 @@ pub const FnCompiler = struct {
             if (rref) |r| return self.collapseRef(r, r_old, line);
             return r_old; // return old (numeric) value
         }
+    }
+
+    /// `obj[key]++` / `--obj.p` on a plain member target: base and computed key
+    /// are evaluated once (PreparedRef), read through, then written back through
+    /// the same reference. Returns the new value for a prefix update, the numeric
+    /// old value for a postfix one — landing in `rres` (allocated first so an
+    /// update in argument position lands in the lowest register).
+    fn compileUpdateMember(self: *Self, u: ast.UpdateExpr, me: ast.MemberExpr, line: u32) error{OutOfMemory}!u8 {
+        const rres = self.allocReg();
+        const pr = (try self.prepareMemberRef(me)) orelse unreachable; // not private
+        if (pr.rkey) |rk| {
+            try self.emitRequireCoercible(pr.robj, line);
+            try self.emitOp(.TO_PROPERTY_KEY, line);
+            try self.emitU8(rk);
+        }
+        const r_old = self.allocReg();
+        try self.emitPreparedRead(pr, r_old, line); // r_old = GetValue(ref)
+        // ToNumeric(old) exactly once — runs any valueOf/@@toPrimitive here.
+        try self.emitOp(.TO_NUMERIC, line);
+        try self.emitU8(r_old);
+        try self.emitU8(r_old);
+        const r_new = self.allocReg();
+        try self.emitOp(if (u.op == .inc) .INC else .DEC, line);
+        try self.emitU8(r_new);
+        try self.emitU8(r_old);
+        try self.emitPreparedWrite(pr, r_new, line); // PutValue(ref, r_new)
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(rres);
+        try self.emitU8(if (u.prefix) r_new else r_old);
+        self.sp = rres + 1; // free base/key/old/new; keep the result
+        return rres;
     }
 
     /// Sync `yield* rhs` with full next/throw/return forwarding (ES
@@ -3183,10 +3225,11 @@ pub const FnCompiler = struct {
         // parameter environment; the body's `var`/function declarations must then
         // live in a SEPARATE variable environment so parameter-scope closures
         // cannot observe body `var` bindings. `n_prelude` is the count of leading
-        // parameter-initializer statements. Generators run this prelude eagerly
-        // across the initial suspend, so they keep the single-environment model.
+        // parameter-initializer statements. Generators run this prelude eagerly up
+        // to PARAMS_DONE; the PUSH_VAR_ENV still lands just before that marker, so
+        // the fresh body environment persists across the initial suspend.
         var n_prelude: usize = 0;
-        if (!self.is_generator and !self.is_async_generator) {
+        {
             while (n_prelude < body.len) : (n_prelude += 1) {
                 const s = body[n_prelude];
                 const is_pinit = (n_prelude < self.param_init_stmts) or

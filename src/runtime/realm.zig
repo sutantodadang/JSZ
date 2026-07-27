@@ -2966,6 +2966,20 @@ pub fn nativePrivInstallAcc(arena: std.mem.Allocator, _: Value, args: []const Va
     return Value{};
 }
 
+/// Monotonic source of per-evaluation class brand ids. Every evaluation of a
+/// class definition that declares private names calls `__getClassBrand__()` once
+/// and stores the result in its class-scope `__cbrand_<id>__` binding; private
+/// ops append it to the mangled key so instances of one evaluation are not
+/// mistaken for instances of another. A single global counter suffices — brands
+/// only need to be unique, never compared across classes or realms.
+var class_brand_counter: u64 = 0;
+
+/// `__getClassBrand__()` — return the next unique class-evaluation brand id.
+pub fn nativeGetClassBrand(arena: std.mem.Allocator, _: Value, _: []const Value) anyerror!Value {
+    class_brand_counter += 1;
+    return val_mod.makeNumber(arena, @floatFromInt(class_brand_counter));
+}
+
 /// `__superSet__(base, key, value, receiver, strict)` — PutValue on a Super
 /// Reference. `Reflect.set` alone is not enough on two counts: an assignment
 /// evaluates to the assigned *value*, not to the set's boolean result, and in
