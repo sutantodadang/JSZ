@@ -595,6 +595,12 @@ fn roundRelative(
 
     const start_date = try pd.addISODate(R, ry, rmo, rw, rd, .constrain, arena);
     const end_date = try pd.addISODate(R, ry + step_y, rmo + step_mo, rw + step_w, rd + step_d, .constrain, arena);
+    // NudgeToCalendarUnit adds the r1/r2 candidate durations to the relativeTo
+    // date via CalendarDateAdd, which rejects a result outside the ISO limits.
+    // `addISODate`'s own guard is looser (±300000 years), so re-check against the
+    // tight PlainDateTime range here.
+    if (!shared.isoDateWithinLimits(start_date) or !shared.isoDateWithinLimits(end_date))
+        return realm_mod.throwRangeError(arena, "rounded date is outside the valid ISO range");
     const start_ns: i128 = @as(i128, epochDaysOf(start_date)) * DAY;
     const end_ns: i128 = @as(i128, epochDaysOf(end_date)) * DAY;
     const dest_ns: i128 = @as(i128, epochDaysOf(dest_date)) * DAY + time_rem;
