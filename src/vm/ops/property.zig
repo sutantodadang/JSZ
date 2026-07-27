@@ -107,7 +107,7 @@ pub inline fn opGetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // ordinary string-property read.)
     if (key.len > 0 and key[0] == '#') {
         const frame_idx = self.frames.items.len - 1;
-        const result = self.privateGet(obj_val, key) catch |e| {
+        const result = self.privateGet(obj_val, key, frame.env) catch |e| {
             if (e != error.JsException) return e;
             if (try self.raisePendingException("private member access")) |oc| return oc;
             return null;
@@ -391,7 +391,17 @@ pub inline fn opSetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const rval = code[frame.pc];
     frame.pc += 1;
     const key_val = frame.func.chunk.constants[kidx];
-    const key = key_val.toPtr().string;
+    // A static-key `#x = v` write is a PrivateElement [[Set]]: brand the key with
+    // this evaluation's id (see brandedPrivateKey) so the write lands on / rejects
+    // against the correct per-evaluation private element. Threaded through both
+    // privateSet and the ordinary-set fallthrough (branding is idempotent). kbuf
+    // outlives every use below (function-scoped).
+    var kbuf: [256]u8 = undefined;
+    const raw_key = key_val.toPtr().string;
+    const key = if (raw_key.len > 0 and raw_key[0] == '#')
+        self.brandedPrivateKey(frame.env, raw_key, &kbuf)
+    else
+        raw_key;
     const obj_val = frame.registers[robj];
     const val = frame.registers[rval];
     if (obj_val.isNullish()) return nullishWriteThrow(self, obj_val, key);
@@ -404,7 +414,7 @@ pub inline fn opSetProp(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
         // privateSet only runs user code (a setter) on its handled path, which
         // returns immediately; the fallthrough path is pure, so `frame` stays
         // valid below.
-        const handled = self.privateSet(obj_val, key, val) catch |e| {
+        const handled = self.privateSet(obj_val, key, val, frame.env) catch |e| {
             if (e != error.JsException) return e;
             if (try self.raisePendingException("private member write")) |oc| return oc;
             return null;
@@ -471,7 +481,10 @@ pub inline fn opDefinePrivate(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const is_method = code[frame.pc] != 0;
     frame.pc += 1;
-    const key = frame.func.chunk.constants[kidx].toPtr().string;
+    // Brand the key with this class evaluation's id so the installed element is
+    // only visible to methods of the same evaluation (see brandedPrivateKey).
+    var kbuf: [256]u8 = undefined;
+    const key = self.brandedPrivateKey(frame.env, frame.func.chunk.constants[kidx].toPtr().string, &kbuf);
     const obj_val = frame.registers[robj];
     const val = frame.registers[rval];
     if (obj_val.bits == 0) return null;
@@ -899,6 +912,16 @@ pub inline fn opIn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     var key_v = frame.registers[rkey];
     const obj_v = frame.registers[robj];
+    // `#x in obj` (ergonomic brand check): brand the private key with this
+    // evaluation's id so it only matches instances of the same class evaluation.
+    if (key_v.bits != 0 and key_v.unbox() == .string) {
+        const raw = key_v.toPtr().string;
+        if (raw.len > 0 and raw[0] == '#') {
+            var kbuf: [256]u8 = undefined;
+            const branded = self.brandedPrivateKey(frame.env, raw, &kbuf);
+            if (branded.ptr != raw.ptr) key_v = try val_mod.makeString(self.arena, branded);
+        }
+    }
     // ToPropertyKey(key): an object key (e.g. `new String("x") in o`, or an
     // object with a user valueOf/toString) is coerced via ToPrimitive(string) —
     // symbols stay symbols. hasProperty then stringifies the primitive result.

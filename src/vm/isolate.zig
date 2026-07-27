@@ -399,6 +399,8 @@ pub const IsolateImpl = struct {
         try realm.global_env.define("__derivedReturn__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeDerivedReturn));
         // Class desugar: PrivateMethodOrAccessorAdd for a private accessor pair.
         try realm.global_env.define("__privInstallAcc__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativePrivInstallAcc));
+        // Class desugar: per-evaluation brand id source (see nativeGetClassBrand).
+        try realm.global_env.define("__getClassBrand__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeGetClassBrand));
         // PutValue on a Super Reference (`super.x = v`).
         try realm.global_env.define("__superSet__", try val_mod.makeNativeFunction(arena, @import("../runtime/realm.zig").nativeSuperSet));
         // Class desugar: IsConstructor gate on the evaluated ClassHeritage.

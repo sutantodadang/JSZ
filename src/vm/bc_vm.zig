@@ -699,7 +699,13 @@ pub const BcVm = struct {
                 // `__new_target__`) so a derived ctor's super() forwards it unchanged.
                 realm_m.pending_new_target = new_target;
                 const result = try bcInvokeJs(self, self.arena, this_val, ctor, args);
-                return if (result.bits != 0 and result.unbox() == .object) result else this_val;
+                // [[Construct]] adopts ANY object return (§10.2.2 step 13) — and in
+                // our split value model a callable (plain function / bound / native)
+                // is an object too, so `function F(){ return function g(){}; }` uses g.
+                return if (result.bits != 0 and switch (result.unbox()) {
+                    .object, .bc_function, .native_function, .function => true,
+                    else => false,
+                }) result else this_val;
             },
             .native_function => {
                 // A bare native_function is a built-in *method* (Math.max,
@@ -1834,7 +1840,11 @@ pub const BcVm = struct {
                     }
                     return "constructor threw";
                 };
-                const final = if (result.bits != 0 and result.unbox() == .object) result else this_val;
+                // Adopt ANY object return, callables included (see constructImpl).
+                const final = if (result.bits != 0 and switch (result.unbox()) {
+                    .object, .bc_function, .native_function, .function => true,
+                    else => false,
+                }) result else this_val;
                 if (self.frames.items.len > 0) {
                     self.frames.items[self.frames.items.len - 1].registers[rdst] = final;
                 }
@@ -2145,6 +2155,28 @@ pub const BcVm = struct {
         };
     }
 
+    /// Resolve the effective (per-evaluation-branded) private key for `base_key`
+    /// in `env`. Each class evaluation seeds a `__cbrand_<id>__` binding in its
+    /// scope (see class desugar); the branded key is `base ++ brand_sep ++ brand`,
+    /// so an instance branded by one evaluation is invisible to a method of
+    /// another evaluation of the same class. Falls back to `base_key` when no
+    /// brand is in scope (a class without private names never gets here). The
+    /// returned slice may point into `buf`, which the caller must keep alive.
+    pub fn brandedPrivateKey(_: *BcVm, env: *Environment, base_key: []const u8, buf: []u8) []const u8 {
+        const class_mod = @import("../parser/class.zig");
+        // Idempotent: an already-branded key (a caller pre-branded it, e.g.
+        // opSetProp threading one effective key through both privateSet and the
+        // ordinary-set fallthrough) is returned unchanged.
+        if (std.mem.indexOfScalar(u8, base_key, class_mod.brand_sep) != null) return base_key;
+        const cid = class_mod.privClassId(base_key) orelse return base_key;
+        var nbuf: [32]u8 = undefined;
+        const vname = class_mod.brandVarName(&nbuf, cid);
+        const bv = env.lookup(vname) catch return base_key;
+        if (bv.bits == 0 or bv.unbox() != .number) return base_key;
+        const brand: u64 = @intFromFloat(bv.unbox().number);
+        return class_mod.brandedKey(buf, base_key, brand);
+    }
+
     /// Throw the "no private brand" TypeError and surface it as error.JsException.
     fn throwPrivateBrand(self: *BcVm, key: []const u8) anyerror!Value {
         const realm_m = @import("../runtime/realm.zig");
@@ -2159,7 +2191,9 @@ pub const BcVm = struct {
     /// accessor with no getter also throws. Private fields live as own slots on
     /// the instance; private methods/accessors live on the class prototype, so a
     /// prototype-chain walk (findProperty) resolves both.
-    pub fn privateGet(self: *BcVm, obj_val: Value, key: []const u8) anyerror!Value {
+    pub fn privateGet(self: *BcVm, obj_val: Value, key_in: []const u8, env: *Environment) anyerror!Value {
+        var kbuf: [256]u8 = undefined;
+        const key = self.brandedPrivateKey(env, key_in, &kbuf);
         const root = (try self.privateHolder(obj_val)) orelse return self.throwPrivateBrand(key);
         if (root.findProperty(key)) |loc| {
             // A private brand check is OWN only — private elements are never
@@ -2188,7 +2222,9 @@ pub const BcVm = struct {
     /// here (private accessor → invoke its setter, or TypeError when it has
     /// none); false to fall through to the ordinary set path, which updates the
     /// existing writable data field.
-    pub fn privateSet(self: *BcVm, obj_val: Value, key: []const u8, val: Value) anyerror!bool {
+    pub fn privateSet(self: *BcVm, obj_val: Value, key_in: []const u8, val: Value, env: *Environment) anyerror!bool {
+        var kbuf: [256]u8 = undefined;
+        const key = self.brandedPrivateKey(env, key_in, &kbuf);
         const root = (try self.privateHolder(obj_val)) orelse return self.throwPrivateBrandBool(key);
         const loc = root.findProperty(key) orelse return self.throwPrivateBrandBool(key);
         // OWN-only brand check (private elements are never inherited).

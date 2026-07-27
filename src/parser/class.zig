@@ -403,6 +403,11 @@ const ClassBodyParse = struct {
     /// The desugared statements get it stamped onto every function they contain
     /// (`attachPrivScope`) so a direct `eval` inside a method can resolve `#x`.
     priv_names: []const ast.PrivName = &.{},
+    /// This class body's PrivateEnvironment id (the numeric suffix shared by all
+    /// its mangled keys), or null when the body declares no private names. Drives
+    /// the per-evaluation brand: the desugar seeds `__cbrand_<id>__` in the class
+    /// scope, and every private op looks the brand up by this id.
+    priv_class_id: ?u32 = null,
 };
 
 /// True when the token after `current` means `current` (a contextual keyword like
@@ -614,6 +619,39 @@ pub fn privateDisplayName(key: []const u8) []const u8 {
     return key[0..i];
 }
 
+/// Separator between a mangled private key and its *per-evaluation* brand id.
+/// Each evaluation of a class definition creates a fresh PrivateName set (spec
+/// ClassDefinitionEvaluation); two evaluations of the same class expression must
+/// not accept each other's instances. The mangled key alone is parse-time
+/// constant (shared across evaluations), so the runtime appends a brand id read
+/// from the class scope's hidden `__cbrand_<id>__` binding. U+0002 cannot appear
+/// in source, so it never collides with a user key.
+pub const brand_sep: u8 = 0x02;
+
+/// The PrivateEnvironment id embedded in a mangled key ("#x\x014" → 4), or null
+/// for an unmangled/plain key. Stops at the brand separator if already branded.
+pub fn privClassId(key: []const u8) ?u32 {
+    const i = std.mem.indexOfScalar(u8, key, mangled_priv_sep) orelse return null;
+    var end = i + 1;
+    while (end < key.len and key[end] >= '0' and key[end] <= '9') end += 1;
+    if (end == i + 1) return null;
+    return std.fmt.parseInt(u32, key[i + 1 .. end], 10) catch null;
+}
+
+/// The hidden class-scope binding name that holds a class evaluation's brand id.
+/// Namespaced by the PrivateEnvironment id so a private access to an *enclosing*
+/// class's `#x` (lexically legal) reads that class's brand, not an inner one's.
+pub fn brandVarName(buf: []u8, id: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "__cbrand_{d}__", .{id}) catch "__cbrand__";
+}
+
+/// `base ++ brand_sep ++ brand` written into `buf` (falls back to `base` if it
+/// does not fit). Both the VM private ops and `nativePrivInstallAcc` format keys
+/// through here so an install and a later read agree on the effective key.
+pub fn brandedKey(buf: []u8, base: []const u8, brand: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}{c}{d}", .{ base, brand_sep, brand }) catch base;
+}
+
 fn isPrivateName(name: []const u8) bool {
     return name.len > 0 and name[0] == '#';
 }
@@ -634,6 +672,27 @@ fn markPrivateDefine(n: *Node, is_method: bool) *Node {
         n.data.member_expr.define_data = true;
     }
     return n;
+}
+
+/// Build the runtime expression for a *branded* private accessor key:
+/// `mangledKey + "\x02" + __cbrand_<id>__`. Accessor installs run through a
+/// helper (`__privInstallAcc__`) or `Object.defineProperty`, neither of which
+/// can consult the VM's env to brand the key the way the DEFINE_PRIVATE opcode
+/// does — so the desugar bakes the brand in here, reading the class scope's
+/// `__cbrand_<id>__` binding. Matches `brandedKey`'s format so a later
+/// privateGet/privateSet (which brands via `brandedPrivateKey`) agrees.
+fn brandedKeyNode(p: *Parser, mangled_key: []const u8, id: u32, s: u32) ?*Node {
+    const base = p.makeNode(.string_literal, s, s, .{ .string_literal = mangled_key }) orelse return null;
+    const sep = p.makeNode(.string_literal, s, s, .{ .string_literal = &[_]u8{brand_sep} }) orelse return null;
+    const base_sep = p.makeNode(.binary_expr, s, s, .{
+        .binary_expr = .{ .op = .add, .left = base, .right = sep },
+    }) orelse return null;
+    var vbuf: [32]u8 = undefined;
+    const vname = p.arena.dupe(u8, brandVarName(&vbuf, id)) catch return null;
+    const brand = nodeIdent(p, vname) orelse return null;
+    return p.makeNode(.binary_expr, s, s, .{
+        .binary_expr = .{ .op = .add, .left = base_sep, .right = brand },
+    });
 }
 
 /// Rewrites the private names declared by one class body to that class's
@@ -1177,6 +1236,7 @@ fn manglePrivateNames(p: *Parser, parsed: *ClassBodyParse) bool {
 
     const id = p.private_class_counter;
     p.private_class_counter += 1;
+    parsed.priv_class_id = id;
     var mangled = std.ArrayList([]const u8){};
     for (raw.items) |r| {
         const m = std.fmt.allocPrint(p.arena, "{s}{c}{d}", .{ r, mangled_priv_sep, id }) catch return false;
@@ -1339,10 +1399,11 @@ fn appendDerivedInstanceFields(
     list: *std.ArrayList(*Node),
     fields: []const ClassField,
     priv_plan: []const PrivInstance,
+    priv_class_id: ?u32,
 ) bool {
     // InitializeInstanceElements adds the private methods/accessors BEFORE
     // running any field initializer, so a field's initializer may call `this.#m`.
-    if (!appendPrivInstanceInstalls(p, list, priv_plan, "__superthis")) return false;
+    if (!appendPrivInstanceInstalls(p, list, priv_plan, "__superthis", priv_class_id)) return false;
     for (fields) |f| {
         if (f.is_static) continue;
         const st = makeDerivedInstanceFieldInit(p, f) orelse return false;
@@ -1459,6 +1520,7 @@ fn prependInstanceFields(
     fields: []const ClassField,
     priv_plan: []const PrivInstance,
     ctor_uses_super: bool,
+    priv_class_id: ?u32,
 ) ?[]*Node {
     var any = false;
     var any_super = ctor_uses_super;
@@ -1472,7 +1534,7 @@ fn prependInstanceFields(
     if (!any and priv_plan.len == 0 and !ctor_uses_super) return ctor_body;
     var stmts = std.ArrayList(*Node){};
     // Private methods/accessors are added before any field initializer runs.
-    if (!appendPrivInstanceInstalls(p, &stmts, priv_plan, null)) return null;
+    if (!appendPrivInstanceInstalls(p, &stmts, priv_plan, null, priv_class_id)) return null;
     // An instance field of a base class has `C.prototype` as its home object, so
     // `super.x` in an initializer reads through that object's [[Prototype]].
     // Bound once at the head of the constructor, ahead of every field install.
@@ -1585,7 +1647,7 @@ fn homeObjectNode(p: *Parser, class_name: []const u8, is_static: bool) ?*Node {
 /// methods, or `Object.defineProperty(target, key, { get|set, configurable,
 /// enumerable })` for accessors). `target` is the constructor for static members
 /// and `ClassName.prototype` otherwise.
-fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, m: ClassMember, hidden: ?[]const u8) ?*Node {
+fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, m: ClassMember, hidden: ?[]const u8, priv_class_id: ?u32) ?*Node {
     const s = p.current.start;
 
     // Instance methods of a derived class may use `super.foo()`; bind
@@ -1719,7 +1781,16 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
     }
 
     // Accessor: Object.defineProperty(target, key, { get|set: fn, configurable: true, enumerable: false })
-    const key_val = if (m.key_var) |kv| (nodeIdent(p, kv) orelse return null) else if (m.computed_key) |k| k else (p.makeNode(.string_literal, s, s, .{ .string_literal = m.name }) orelse return null);
+    // A private (static) accessor's key is branded with the class evaluation id so
+    // it matches the branded key a later privateGet/privateSet computes.
+    const key_val = if (m.key_var) |kv|
+        (nodeIdent(p, kv) orelse return null)
+    else if (m.computed_key) |k|
+        k
+    else if (m.name.len > 0 and m.name[0] == '#' and priv_class_id != null)
+        (brandedKeyNode(p, m.name, priv_class_id.?, s) orelse return null)
+    else
+        (p.makeNode(.string_literal, s, s, .{ .string_literal = m.name }) orelse return null);
     const t_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = true }) orelse return null;
     const f_val = p.makeNode(.bool_literal, s, s, .{ .bool_literal = false }) orelse return null;
     var props = std.ArrayList(ast.ObjectProp){};
@@ -1921,6 +1992,7 @@ fn appendPrivInstanceInstalls(
     list: *std.ArrayList(*Node),
     plan: []const PrivInstance,
     target_name: ?[]const u8,
+    priv_class_id: ?u32,
 ) bool {
     const s = p.current.start;
     for (plan) |e| {
@@ -1939,7 +2011,11 @@ fn appendPrivInstanceInstalls(
             continue;
         }
         const callee = nodeIdent(p, "__privInstallAcc__") orelse return false;
-        const key_node = p.makeNode(.string_literal, s, s, .{ .string_literal = e.key }) orelse return false;
+        // Brand the accessor key so it matches the branded key privateGet reads.
+        const key_node = if (priv_class_id) |cid|
+            (brandedKeyNode(p, e.key, cid, s) orelse return false)
+        else
+            (p.makeNode(.string_literal, s, s, .{ .string_literal = e.key }) orelse return false);
         const undef = struct {
             fn go(pp: *Parser, at: u32) ?*Node {
                 return pp.makeNode(.undefined_literal, at, at, .{ .undefined_literal = {} });
@@ -2095,7 +2171,7 @@ fn emitClassStatements(
                 }) orelse return null;
                 const assign_stmt = p.makeNode(.expr_stmt, start, start, .{ .expr_stmt = assign }) orelse return null;
                 body.append(p.arena, assign_stmt) catch return null;
-                if (!appendDerivedInstanceFields(p, &body, fields, priv_plan)) return null;
+                if (!appendDerivedInstanceFields(p, &body, fields, priv_plan, parsed.priv_class_id)) return null;
             } else {
                 const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = rc_call }) orelse return null;
                 body.append(p.arena, ret_stmt) catch return null;
@@ -2107,6 +2183,24 @@ fn emitClassStatements(
     }
 
     var out = std.ArrayList(*Node){};
+    // Per-evaluation brand: seed `var __cbrand_<id>__ = __getClassBrand__();` in
+    // the class scope so every method/constructor closure captures it. Private
+    // ops read this to distinguish instances of *this* evaluation from those of
+    // another evaluation of the same class expression (ClassDefinitionEvaluation
+    // creates a fresh PrivateName set each time). Only when the body declares
+    // private names, since a brand is meaningless otherwise.
+    if (parsed.priv_class_id) |cid| {
+        var vbuf: [32]u8 = undefined;
+        const vname = p.arena.dupe(u8, brandVarName(&vbuf, cid)) catch return null;
+        const callee = nodeIdent(p, "__getClassBrand__") orelse return null;
+        const call = p.makeNode(.call_expr, start, start, .{
+            .call_expr = .{ .callee = callee, .args = &[_]*Node{} },
+        }) orelse return null;
+        const decl = p.makeNode(.var_decl, start, start, .{
+            .var_decl = .{ .kind = .var_, .name = vname, .init = call },
+        }) orelse return null;
+        out.append(p.arena, decl) catch return null;
+    }
     if (heritage_expr) |he| {
         const hv = p.makeNode(.var_decl, start, start, .{
             .var_decl = .{ .kind = .var_, .name = super_name.?, .init = he },
@@ -2239,7 +2333,7 @@ fn emitClassStatements(
         helper_body.append(p.arena, assign_stmt) catch return null;
         // Install instance fields on `__superthis` right after the parent ctor
         // returns — the spec point where a derived class initializes its fields.
-        if (!appendDerivedInstanceFields(p, &helper_body, fields, priv_plan)) return null;
+        if (!appendDerivedInstanceFields(p, &helper_body, fields, priv_plan, parsed.priv_class_id)) return null;
         helper_body.append(p.arena, helper_ret) catch return null;
         const helper_fn = p.makeNode(.function_expr, start, start, .{
             .function_expr = .{
@@ -2296,7 +2390,7 @@ fn emitClassStatements(
         ctor_body_effective = ctor_stmts.items;
     } else {
         // Base class: instance fields initialize at the start of the constructor.
-        ctor_body_effective = prependInstanceFields(p, class_name, ctor_body_effective, fields, priv_plan, parsed.ctor_uses_super) orelse return null;
+        ctor_body_effective = prependInstanceFields(p, class_name, ctor_body_effective, fields, priv_plan, parsed.ctor_uses_super, parsed.priv_class_id) orelse return null;
     }
 
     // var ClassName = function ClassName(...) { ... }
@@ -2408,7 +2502,7 @@ fn emitClassStatements(
     // prototype + static methods/accessors
     for (members, 0..) |m, mi| {
         const hidden: ?[]const u8 = if (hidden_of[mi].len > 0) hidden_of[mi] else null;
-        const stmt = emitClassMember(p, class_name, super_name, m, hidden) orelse return null;
+        const stmt = emitClassMember(p, class_name, super_name, m, hidden, parsed.priv_class_id) orelse return null;
         out.append(p.arena, stmt) catch return null;
     }
 
