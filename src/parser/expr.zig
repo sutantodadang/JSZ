@@ -202,6 +202,13 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         // restrictions: `static { () => { var await; } }` is legal.
         const sb_saved = p.leaveStaticBlock();
         defer p.restoreStaticBlock(sb_saved);
+        // An arrow body is a function body: `return` is legal inside it even in
+        // eval code (§19.2.1.1 only forbids `return` outside *any* function), so
+        // count it in fn_nesting_depth just as parseFunctionBody does. A block
+        // body parses via parseBlock (not parseFunctionBody), so without this the
+        // depth would stay 0 and `eval("() => { return 1; }")` would wrongly throw.
+        p.fn_nesting_depth += 1;
+        defer p.fn_nesting_depth -= 1;
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
@@ -384,6 +391,13 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         // restrictions: `static { () => { var await; } }` is legal.
         const sb_saved = p.leaveStaticBlock();
         defer p.restoreStaticBlock(sb_saved);
+        // An arrow body is a function body: `return` is legal inside it even in
+        // eval code (§19.2.1.1 only forbids `return` outside *any* function), so
+        // count it in fn_nesting_depth just as parseFunctionBody does. A block
+        // body parses via parseBlock (not parseFunctionBody), so without this the
+        // depth would stay 0 and `eval("() => { return 1; }")` would wrongly throw.
+        p.fn_nesting_depth += 1;
+        defer p.fn_nesting_depth -= 1;
         var body_nodes: []*Node = undefined;
         if (p.check(.left_brace)) {
             const blk = p.parseBlock() orelse return null;
