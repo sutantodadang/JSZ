@@ -2437,10 +2437,14 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
     // string. The explicit "" matters: the ctor is bound as `<synthetic_name> =
     // <ctor fn>` inside the IIFE, and without it the compiler's NamedEvaluation
     // would leak that synthetic binding name onto a genuinely anonymous class.
+    // Route computed ClassElementName keys AND the ClassHeritage expression to a
+    // prelude: they may contain `yield`/`await`, which are only legal in the
+    // enclosing (possibly generator/async) context — not inside the wrapper IIFE.
+    var iife_prelude = std.ArrayList(*Node){};
     var out = emitClassStatements(p, .{
         .class_name = class_name,
         .ctor_fn_name = if (has_name) class_name else (anon_name_hint orelse ""),
-    }, heritage, parsed, start, null) orelse return null;
+    }, heritage, parsed, start, &iife_prelude) orelse return null;
     attachPrivScope(p.arena, out.items, parsed.priv_names);
 
     // The IIFE evaluates to the constructor.
@@ -2448,13 +2452,33 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
     const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
     out.append(p.arena, ret_stmt) catch return null;
 
+    // An expression cannot emit statements into its enclosing context, so each
+    // prelude `var NAME = INIT;` becomes an IIFE parameter NAME whose ARGUMENT is
+    // INIT. The arguments are evaluated left-to-right in the enclosing context
+    // (heritage first, then keys in source order — matching the declaration form),
+    // so a `[yield x]` key or `extends (yield x)` heritage suspends the enclosing
+    // generator correctly, and NAME is bound inside the class body via the closure.
+    var iife_params = std.ArrayList([]const u8){};
+    var iife_args = std.ArrayList(*Node){};
+    for (iife_prelude.items) |st| {
+        if (st.kind != .var_decl) {
+            // Defensive: unexpected prelude shape — keep it as a leading statement.
+            out.insert(p.arena, 0, st) catch return null;
+            continue;
+        }
+        const vd = st.data.var_decl;
+        iife_params.append(p.arena, vd.name) catch return null;
+        const arg = vd.init orelse (p.makeNode(.identifier, start, start, .{ .identifier = "undefined" }) orelse return null);
+        iife_args.append(p.arena, arg) catch return null;
+    }
+
     const fn_expr = p.makeNode(.function_expr, start, p.current.start, .{
-        .function_expr = .{ .name = null, .params = &[_][]const u8{}, .body = out.items, .is_arrow = false },
+        .function_expr = .{ .name = null, .params = iife_params.items, .body = out.items, .is_arrow = false },
     }) orelse return null;
     return p.makeNode(.call_expr, start, p.current.start, .{
         .call_expr = .{
             .callee = fn_expr,
-            .args = &[_]*Node{},
+            .args = iife_args.items,
             .anon_class_iife = !has_name and anon_name_hint == null,
         },
     });
