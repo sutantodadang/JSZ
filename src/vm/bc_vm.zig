@@ -416,7 +416,13 @@ pub const BcVm = struct {
                 // Eval code shares the calling/global VariableEnvironment directly
                 // so its top-level declarations hoist there (not a discarded child).
                 const call_env = if (fn_ptr.is_eval) def_env else try Environment.initVarScope(self.arena, def_env);
-                try call_env.define("__new_target__", if (captured_nt.bits != 0) captured_nt else try val_mod.makeUndefined(self.arena));
+                // Eval code has no NewTarget of its own: `new.target` inside a direct
+                // eval resolves to the ENCLOSING function's binding through the shared
+                // VariableEnvironment. Defining one here (undefined for a plain
+                // `eval(...)` call) would clobber the caller's, so only bind it for a
+                // real function/constructor frame.
+                if (!fn_ptr.is_eval)
+                    try call_env.define("__new_target__", if (captured_nt.bits != 0) captured_nt else try val_mod.makeUndefined(self.arena));
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
                     try call_env.define(pname, av);
@@ -969,7 +975,10 @@ pub const BcVm = struct {
                 i -= 1;
                 const cf = self.frames.items[i].func;
                 if (cf.is_eval) continue;
-                p.eval_allow_new_target = !cf.is_program;
+                // The containing function code must not be an ArrowFunction's:
+                // `(() => eval('new.target'))()` is an early SyntaxError even
+                // though the arrow would otherwise inherit its NewTarget.
+                p.eval_allow_new_target = !cf.is_program and !cf.is_arrow;
                 break;
             }
         }
