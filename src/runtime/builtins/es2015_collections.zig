@@ -1035,22 +1035,25 @@ fn iterableWeakInit(
         // IteratorStep: call iter.next()
         const step = nativeIterStep(arena, Value{}, &.{iter}) catch |e| return e;
 
-        // IteratorComplete
-        const done_v: Value = if (step.bits != 0 and step.unbox() == .object)
-            step.toPtr().object.get("done") orelse Value{}
-        else
-            Value{};
+        // IteratorComplete — part of IteratorStep: `Get(result, "done")` is
+        // observable (may fire a getter). An abrupt completion here does NOT
+        // close the iterator (the iterator is already considered done/errored).
+        const done_v: Value = blk: {
+            if (step.bits != 0 and step.unbox() == .object) {
+                if (realm_mod.active_context) |ctx|
+                    break :blk try ctx.getProp(arena, step, "done");
+                break :blk step.toPtr().object.get("done") orelse Value{};
+            }
+            break :blk Value{};
+        };
         if (isTruthy(done_v)) break;
 
-        // IteratorValue (observable getProp for getter-throw support)
+        // IteratorValue — `? Get(result, "value")`. An abrupt completion here also
+        // does NOT close the iterator (spec: the `?` propagates directly).
         const item: Value = blk: {
             if (step.bits != 0 and step.unbox() == .object) {
-                if (realm_mod.active_context) |ctx| {
-                    break :blk ctx.getProp(arena, step, "value") catch |e| {
-                        closeIterator(arena, iter);
-                        return e;
-                    };
-                }
+                if (realm_mod.active_context) |ctx|
+                    break :blk try ctx.getProp(arena, step, "value");
                 break :blk step.toPtr().object.get("value") orelse try val_mod.makeUndefined(arena);
             }
             break :blk try val_mod.makeUndefined(arena);
@@ -1587,10 +1590,13 @@ pub fn nativeSetUnion(arena: std.mem.Allocator, this_val: Value, args: []const V
     const this_data = try getSetDataBranded(arena, this_val);
     const other = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     const rec = try getSetRecord(arena, other);
+    // Spec order: GetKeysIterator (reads `keys()` and its `next` method, both
+    // observable) happens BEFORE copying O.[[SetData]]. A `next` getter that
+    // mutates O must therefore be reflected in the copied result.
+    const iter = try openKeysIterator(arena, rec);
     const result = try newSetFromData(arena, this_data);
     const rd: *SetData = @ptrCast(@alignCast(result.toPtr().object.internal_slot.?));
     // Add other's keys (canonicalized) if not already present.
-    const iter = try openKeysIterator(arena, rec);
     while (try keysStep(arena, iter)) |val| {
         if (!setDataHas(rd, val)) try rd.values.append(arena, val);
     }
@@ -1634,9 +1640,10 @@ pub fn nativeSetDifference(arena: std.mem.Allocator, this_val: Value, args: []co
     // When |this| ≤ |other|, walk this and probe other.has; otherwise walk
     // other.keys() (avoids calling has entirely — a spec-observable difference).
     if (@as(f64, @floatFromInt(this_data.values.items.len)) <= rec.size) {
-        var i: usize = 0;
-        while (i < this_data.values.items.len) : (i += 1) {
-            const e = this_data.values.items[i];
+        // Spec iterates resultSetData (the COPY) at fixed indices with thisSize
+        // captured up front — NOT live O, whose `has` callback may mutate it.
+        const snapshot = try arena.dupe(Value, rd.values.items);
+        for (snapshot) |e| {
             const has_r = try function_proto.invokeCallback(arena, rec.obj, rec.has, &.{e});
             if (isTruthy(has_r)) setDataRemove(rd, e);
         }
@@ -1653,10 +1660,11 @@ pub fn nativeSetSymmetricDifference(arena: std.mem.Allocator, this_val: Value, a
     const this_data = try getSetDataBranded(arena, this_val);
     const other = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     const rec = try getSetRecord(arena, other);
+    // Spec order: GetKeysIterator (observable) precedes copying O.[[SetData]].
+    const iter = try openKeysIterator(arena, rec);
     const result = try newSetFromData(arena, this_data);
     const rd: *SetData = @ptrCast(@alignCast(result.toPtr().object.internal_slot.?));
     // For each key in other: toggle relative to the ORIGINAL this membership.
-    const iter = try openKeysIterator(arena, rec);
     while (try keysStep(arena, iter)) |val| {
         const in_result = setDataHas(rd, val);
         if (setDataHas(this_data, val)) {
