@@ -750,7 +750,13 @@ fn emitTemplateLiteralSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8),
         switch (ch) {
             '"' => try out.appendSlice(arena, "\\\""),
             '\n' => try out.appendSlice(arena, "\\n"),
-            '\r' => try out.appendSlice(arena, "\\r"),
+            // §12.8.6 TRV: <CR> and <CR><LF> both normalize to a single LF in a
+            // template's cooked (and raw) value. Collapse a raw CRLF; map a lone
+            // raw CR to LF too.
+            '\r' => {
+                try out.appendSlice(arena, "\\n");
+                if (i + 1 < segment.len and segment[i + 1] == '\n') i += 1;
+            },
             '\\' => try out.appendSlice(arena, "\\\\"), // a lone trailing backslash
             else => try out.append(arena, ch),
         }
@@ -836,12 +842,19 @@ fn slashStartsRegex(source: []const u8, slash_idx: usize) bool {
 /// backslash is doubled so escape sequences survive uncooked (for `.raw`).
 fn emitRawSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8), segment: []const u8) !void {
     try out.append(arena, '"');
-    for (segment) |ch| {
+    var i: usize = 0;
+    while (i < segment.len) : (i += 1) {
+        const ch = segment[i];
         switch (ch) {
             '\\' => try out.appendSlice(arena, "\\\\"),
             '"' => try out.appendSlice(arena, "\\\""),
             '\n' => try out.appendSlice(arena, "\\n"),
-            '\r' => try out.appendSlice(arena, "\\r"),
+            // §12.8.6 TRV normalizes a raw <CR> / <CR><LF> line terminator to a
+            // single LF (0x000A) in `.raw`, just as in the cooked value.
+            '\r' => {
+                try out.appendSlice(arena, "\\n");
+                if (i + 1 < segment.len and segment[i + 1] == '\n') i += 1;
+            },
             else => try out.append(arena, ch),
         }
     }
@@ -850,6 +863,65 @@ fn emitRawSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8), segment: []
 
 /// Rewrite a tagged template starting at the opening backtick `btick` (the tag
 /// expression has already been emitted to `out`). Appends
+/// True when `seg` (raw template text, backslash escapes verbatim) contains an
+/// escape sequence that is NOT a valid EscapeSequence — legacy octal (`\1`-`\9`,
+/// `\0` followed by a digit), an incomplete hex escape (`\x` without two hex
+/// digits), or a malformed unicode escape (`\u` not followed by 4 hex digits or
+/// a valid `\u{…}`). In a tagged template the cooked value of such a segment is
+/// `undefined` (§12.8.6 TemplateCharacter / NotEscapeSequence).
+fn templateSegmentHasIllegalEscape(seg: []const u8) bool {
+    var i: usize = 0;
+    while (i < seg.len) : (i += 1) {
+        if (seg[i] != '\\') continue;
+        if (i + 1 >= seg.len) return false; // trailing '\' (won't happen for a closed template)
+        const c = seg[i + 1];
+        switch (c) {
+            '0' => {
+                // `\0` is NUL only when NOT followed by a decimal digit.
+                if (i + 2 < seg.len and seg[i + 2] >= '0' and seg[i + 2] <= '9') return true;
+                i += 1;
+            },
+            '1', '2', '3', '4', '5', '6', '7', '8', '9' => return true, // legacy octal / \8 \9
+            'x' => {
+                if (i + 3 >= seg.len or !isHexDigit(seg[i + 2]) or !isHexDigit(seg[i + 3])) return true;
+                i += 3;
+            },
+            'u' => {
+                if (i + 2 < seg.len and seg[i + 2] == '{') {
+                    // \u{ HexDigits } — at least one hex digit, then '}', ≤ 0x10FFFF.
+                    var j = i + 3;
+                    var cp: u32 = 0;
+                    var any = false;
+                    while (j < seg.len and isHexDigit(seg[j])) : (j += 1) {
+                        cp = cp *% 16 + hexVal(seg[j]);
+                        any = true;
+                        if (cp > 0x10FFFF) return true;
+                    }
+                    if (!any or j >= seg.len or seg[j] != '}') return true;
+                    i = j;
+                } else {
+                    // \uHHHH — exactly four hex digits.
+                    if (i + 5 >= seg.len or !isHexDigit(seg[i + 2]) or !isHexDigit(seg[i + 3]) or
+                        !isHexDigit(seg[i + 4]) or !isHexDigit(seg[i + 5])) return true;
+                    i += 5;
+                }
+            },
+            else => i += 1, // any other escape (n, t, r, `, \, LineContinuation, …) is legal
+        }
+    }
+    return false;
+}
+
+fn isHexDigit(c: u8) bool {
+    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
+fn hexVal(c: u8) u32 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    return c - 'A' + 10;
+}
+
 /// `(__jsztag([cooked…],[raw…]), (sub1), (sub2)…)` after the tag and returns the
 /// source index just past the closing backtick.
 fn rewriteTaggedTemplate(arena: std.mem.Allocator, out: *std.ArrayList(u8), source: []const u8, btick: usize) error{OutOfMemory}!usize {
@@ -912,7 +984,14 @@ fn rewriteTaggedTemplate(arena: std.mem.Allocator, out: *std.ArrayList(u8), sour
     try out.appendSlice(arena, ",[");
     for (cooked.items, 0..) |seg, k| {
         if (k > 0) try out.appendSlice(arena, ",");
-        try emitTemplateLiteralSegment(arena, out, seg, false);
+        // §12.8.6: a tagged template tolerates an otherwise-illegal escape
+        // sequence (legacy octal, bad \x / \u) — its COOKED value is `undefined`
+        // while `.raw` still holds the text. (Untagged templates make it a
+        // SyntaxError, handled by the string lexer on the emitted literal.)
+        if (templateSegmentHasIllegalEscape(seg))
+            try out.appendSlice(arena, "undefined")
+        else
+            try emitTemplateLiteralSegment(arena, out, seg, false);
     }
     try out.appendSlice(arena, "],[");
     for (raw.items, 0..) |seg, k| {

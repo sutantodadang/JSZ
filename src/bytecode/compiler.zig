@@ -3135,8 +3135,11 @@ pub const FnCompiler = struct {
         {
             // Annex B.3.3 first: a block-level function declaration only gets a
             // var-scoped binding when no lexical declaration or parameter between
-            // it and this scope would make `var F` an early error.
-            {
+            // it and this scope would make `var F` an early error. The whole
+            // extension is web-compat sloppy-mode-only (B.3.3.1/.2/.3 all begin
+            // "If strict is false"): in strict code a block-level function stays
+            // purely block-scoped, so collect nothing.
+            if (!self.is_strict) {
                 var blocked: std.ArrayList([]const u8) = .empty;
                 for (self.param_names) |p| try self.addHoistName(&blocked, p);
                 // A default/destructuring parameter list desugars its bindings into

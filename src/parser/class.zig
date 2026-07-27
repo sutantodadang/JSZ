@@ -451,7 +451,14 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
         // (which it interleaves with) rather than as a member.
         if (is_static and p.check(.left_brace)) {
             const block = parseStaticBlockBody(p) orelse return null;
-            fields.append(p.arena, .{ .is_static = true, .static_block = block }) catch {
+            fields.append(p.arena, .{
+                .is_static = true,
+                .static_block = block,
+                // A `super.x` inside the block reads through the class's own
+                // [[Prototype]] (home object = the constructor), so it needs the
+                // same `__sproto__`/`__superthis` binding a static field gets.
+                .uses_super_prop = p.super_prop_count != super_mark,
+            }) catch {
                 p.had_error = true;
                 return null;
             };
@@ -1186,6 +1193,9 @@ fn manglePrivateNames(p: *Parser, parsed: *ClassBodyParse) bool {
         if (f.computed_key == null) f.name = rw.map(f.name);
         rw.walkOpt(f.computed_key);
         rw.walkOpt(f.init);
+        // A static initialization block shares the class's PrivateEnvironment, so
+        // `#x` inside it resolves to the same mangled key as the members do.
+        if (f.static_block) |sb| for (sb) |st| rw.walk(st);
     }
     for (parsed.members) |*m| {
         if (m.computed_key == null) m.name = rw.map(m.name);
@@ -1355,10 +1365,21 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, super_name: ?[]const 
     // static field, but the block's whole statement list is the body and there
     // is nothing to assign. `(function () { <body> }).call(ClassName);`
     if (f.static_block) |block| {
+        // `super.x` in a static block reads through the class's [[Prototype]]
+        // (its home object is the constructor). Bind `__sproto__` (property base)
+        // and `__superthis` (= `this`, the class) ahead of the block body, the
+        // same shape a static field with super uses.
+        const blk_body: []*Node = if (!f.uses_super_prop) block else blk: {
+            var stmts = std.ArrayList(*Node){};
+            stmts.append(p.arena, superProtoDecl(p, class_name, super_name, true) orelse return null) catch return null;
+            stmts.append(p.arena, superThisDecl(p) orelse return null) catch return null;
+            stmts.appendSlice(p.arena, block) catch return null;
+            break :blk stmts.items;
+        };
         const blk_fn = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
             .name = null,
             .params = &[_][]const u8{},
-            .body = block,
+            .body = blk_body,
             .is_arrow = false,
         } }) orelse return null;
         const blk_call_member = nodeMember(p, blk_fn, "call") orelse return null;
@@ -2295,8 +2316,13 @@ fn emitClassStatements(
             .source_text = p.sourceSlice(start, p.prev_end),
         },
     }) orelse return null;
+    // The class name's INNER binding is immutable (ClassDefinitionEvaluation
+    // CreateImmutableBinding): a `ClassName = …` inside a method / field
+    // initializer / static block is a TypeError. The desugar only ever reads or
+    // mutates properties of this binding (never reassigns it), so `const` is safe
+    // here; the mutable OUTER declaration binding is emitted separately.
     const ctor_decl = p.makeNode(.var_decl, start, p.current.start, .{
-        .var_decl = .{ .kind = .let, .name = class_name, .init = ctor_fn },
+        .var_decl = .{ .kind = .const_, .name = class_name, .init = ctor_fn },
     }) orelse return null;
     out.append(p.arena, ctor_decl) catch return null;
 
@@ -2437,10 +2463,14 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
     // string. The explicit "" matters: the ctor is bound as `<synthetic_name> =
     // <ctor fn>` inside the IIFE, and without it the compiler's NamedEvaluation
     // would leak that synthetic binding name onto a genuinely anonymous class.
+    // Route computed ClassElementName keys AND the ClassHeritage expression to a
+    // prelude: they may contain `yield`/`await`, which are only legal in the
+    // enclosing (possibly generator/async) context — not inside the wrapper IIFE.
+    var iife_prelude = std.ArrayList(*Node){};
     var out = emitClassStatements(p, .{
         .class_name = class_name,
         .ctor_fn_name = if (has_name) class_name else (anon_name_hint orelse ""),
-    }, heritage, parsed, start, null) orelse return null;
+    }, heritage, parsed, start, &iife_prelude) orelse return null;
     attachPrivScope(p.arena, out.items, parsed.priv_names);
 
     // The IIFE evaluates to the constructor.
@@ -2448,13 +2478,33 @@ pub fn parseClassExpr(p: *Parser) ?*Node {
     const ret_stmt = p.makeNode(.return_stmt, start, start, .{ .return_stmt = ret_id }) orelse return null;
     out.append(p.arena, ret_stmt) catch return null;
 
+    // An expression cannot emit statements into its enclosing context, so each
+    // prelude `var NAME = INIT;` becomes an IIFE parameter NAME whose ARGUMENT is
+    // INIT. The arguments are evaluated left-to-right in the enclosing context
+    // (heritage first, then keys in source order — matching the declaration form),
+    // so a `[yield x]` key or `extends (yield x)` heritage suspends the enclosing
+    // generator correctly, and NAME is bound inside the class body via the closure.
+    var iife_params = std.ArrayList([]const u8){};
+    var iife_args = std.ArrayList(*Node){};
+    for (iife_prelude.items) |st| {
+        if (st.kind != .var_decl) {
+            // Defensive: unexpected prelude shape — keep it as a leading statement.
+            out.insert(p.arena, 0, st) catch return null;
+            continue;
+        }
+        const vd = st.data.var_decl;
+        iife_params.append(p.arena, vd.name) catch return null;
+        const arg = vd.init orelse (p.makeNode(.identifier, start, start, .{ .identifier = "undefined" }) orelse return null);
+        iife_args.append(p.arena, arg) catch return null;
+    }
+
     const fn_expr = p.makeNode(.function_expr, start, p.current.start, .{
-        .function_expr = .{ .name = null, .params = &[_][]const u8{}, .body = out.items, .is_arrow = false },
+        .function_expr = .{ .name = null, .params = iife_params.items, .body = out.items, .is_arrow = false },
     }) orelse return null;
     return p.makeNode(.call_expr, start, p.current.start, .{
         .call_expr = .{
             .callee = fn_expr,
-            .args = &[_]*Node{},
+            .args = iife_args.items,
             .anon_class_iife = !has_name and anon_name_hint == null,
         },
     });
