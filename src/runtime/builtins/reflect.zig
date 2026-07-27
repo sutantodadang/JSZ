@@ -956,7 +956,8 @@ pub fn nativeReflectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value,
     // rather than duplicating the native-entry descriptor tables here.
     if (!isObj(args[0]))
         return @import("object_methods.zig").nativeObjectGetOwnPropertyDescriptor(arena, .{}, args);
-    const obj = args[0].toPtr().object;
+    const obj = (try reflectTargetObj(arena, args[0])) orelse
+        return @import("object_methods.zig").nativeObjectGetOwnPropertyDescriptor(arena, .{}, args);
 
     if (args.len < 2) return val_mod.makeUndefined(arena);
     const key_arg = try toPropertyKey(arena, args[1]);
