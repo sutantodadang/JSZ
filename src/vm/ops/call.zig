@@ -376,6 +376,18 @@ pub inline fn opCallSpread(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             try args_list.append(self.arena, ev);
         }
     }
+    // Consume the one-shot direct-eval marker exactly as doCall does: `eval(...xs)`
+    // is a direct eval only when the callee genuinely *is* %eval%. bcEval reads
+    // self.direct_eval_call and runs in the current (caller) frame's scope, which
+    // is still on top of the stack across this native invokeCallback.
+    const realm_mod = @import("../../runtime/realm.zig");
+    const prev_direct_eval = self.direct_eval_call;
+    self.direct_eval_call = self.direct_eval_mark and realm_mod.isEvalIntrinsic(callee_v);
+    self.direct_eval_mark = false;
+    self.param_eval_mark = false;
+    self.field_eval_mark = false;
+    defer self.direct_eval_call = prev_direct_eval;
+
     const fp = @import("../../runtime/builtins/function_proto.zig");
     const result = fp.invokeCallback(self.arena, this_v, callee_v, args_list.items) catch |e| {
         if (e != error.JsException) return e;
