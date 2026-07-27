@@ -1164,6 +1164,11 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     // target this for-in loop.
     const loop_lbl = self.pending_label;
     self.pending_label = null;
+    // The lexical head scope holds the loop var in TDZ while the enumerated
+    // object (`right`) is evaluated (so `for (let g in g)` is a ReferenceError),
+    // then the per-iteration scope below shadows it. It MUST be exited at loop
+    // end — otherwise the uninitialized binding leaks into the enclosing scope
+    // and `typeof g` after the loop throws instead of yielding "undefined".
     const head_scope = try enterForHeadLexScope(self, fi.left, line);
     // Save sp; allocate rkeys, ri, rlen as a contiguous block.
     const base_sp = self.sp;
@@ -1327,7 +1332,6 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
         try self.emitOp(.EXIT_SCOPE, line);
         self.block_scope_depth -= 1;
     }
-
     // restore sp to base_sp (free rlen, ri, rkeys, robj_tmp)
     self.sp = base_sp;
 }
