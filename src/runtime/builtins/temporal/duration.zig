@@ -444,7 +444,7 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
         // validated against the zone and the instant is range-checked. A bare
         // `Z` with no `[tz]` annotation is not a valid relativeTo.
         if (hasTimeZoneAnnotation(str)) {
-            const z = try zdt.toTemporalZoned(arena, rv, null);
+            const z = try zdt.toTemporalZoned(arena, rv, val_mod.Value{});
             return zdt.localISODate(&z);
         }
         if (has_utc)
@@ -462,7 +462,7 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
         // A bag naming a time zone is a *zoned* relativeTo, so its time zone and
         // offset have to be validated even though only the date survives.
         if (bag.time_zone != null) {
-            const z = try zdt.toTemporalZoned(arena, rv, null);
+            const z = try zdt.toTemporalZoned(arena, rv, val_mod.Value{});
             return zdt.localISODate(&z);
         }
         return try pd.dateFromBag(arena, bag, .constrain);

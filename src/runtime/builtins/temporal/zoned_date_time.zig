@@ -257,18 +257,21 @@ fn od(s: []const u8, i: usize) ?i128 {
 }
 
 /// Convert a value to a ZonedDateTime (used by from/compare/equals/since/until).
-pub fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts: ?*JsObject) !ZonedDT {
+/// `opts_v` is the raw options value: it is coerced with GetOptionsObject only
+/// *after* the item's fields are read (property bag) or the string is parsed,
+/// so a primitive options value's TypeError does not pre-empt those reads.
+pub fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts_v: Value) !ZonedDT {
     if (getZoned(v)) |z| return z.*;
     if (v.bits != 0 and v.unbox() == .object) {
-        return try zonedFromFields(arena, v.toPtr().object, opts);
+        return try zonedFromFields(arena, v.toPtr().object, opts_v);
     }
     if (v.bits != 0 and v.unbox() == .string) {
-        return try zonedFromString(arena, v.unbox().string, opts);
+        return try zonedFromString(arena, v.unbox().string, opts_v);
     }
     return realm_mod.throwTypeError(arena, "cannot convert to Temporal.ZonedDateTime");
 }
 
-fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !ZonedDT {
+fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts_v: Value) !ZonedDT {
     // ToTemporalZonedDateTime reads the calendar first (ToTemporalCalendarIdentifier;
     // ISO strings ok), then does a single PrepareCalendarFields sweep over the
     // remaining fields — day, hour, microsecond, millisecond, minute, month,
@@ -276,6 +279,10 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
     // alphabetical, observable order.
     const cal = if (try shared.optionGet(arena, o, "calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
     const bag = try plain_date.readDateBag(arena, o, .{ .time = true, .zoned = true, .fixed_cal = cal });
+
+    // GetOptionsObject runs only now — after every field has been read — so a
+    // primitive options value throws its TypeError *after* the observable reads.
+    const opts = try shared.getOptionsObject(arena, opts_v);
 
     // timeZone is required (a present-but-undefined value reads as absent).
     const tz_v = bag.time_zone orelse return realm_mod.throwTypeError(arena, "missing timeZone");
@@ -416,7 +423,7 @@ fn interpretOffset(arena: std.mem.Allocator, tz: []const u8, dt: ISODateTime, zo
     }
 }
 
-fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !ZonedDT {
+fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts_v: Value) !ZonedDT {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     // A single [tz] bracket is mandatory; validate all annotations in one pass.
     const bracket = try extractAnnotations(arena, s);
@@ -426,6 +433,8 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
     // The parsed wall-clock datetime must itself be representable.
     if (!shared.isoDateTimeWithinLimits(dt.date, dt.time)) return realm_mod.throwRangeError(arena, "ZonedDateTime wall-clock time out of range");
     const str_off = extractStringOffset(arena, s) catch |e| return e;
+    // Options are coerced (GetOptionsObject) only after the string is parsed.
+    const opts = try shared.getOptionsObject(arena, opts_v);
     // Options are read after the string is parsed, in observable order:
     // disambiguation, offset, overflow.
     const dis = try getDisambiguationOption(arena, opts);
@@ -527,23 +536,24 @@ fn extractStringOffset(arena: std.mem.Allocator, s: []const u8) !StringOffset {
 
 pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else Value{};
-    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
+    const opts_v = if (args.len > 1) args[1] else Value{};
     // An already-constructed ZonedDateTime is copied, but the options are still
     // read and validated (disambiguation, offset, overflow).
     if (getZoned(v)) |z| {
+        const opts = try shared.getOptionsObject(arena, opts_v);
         try readFromOptions(arena, opts);
         return makeZoned(arena, z.*);
     }
-    // A string is parsed before its options are read; a property bag reads its
-    // fields then options. Both paths read/validate the options inside
-    // toTemporalZoned, so `from` does not read them again.
-    const z = try toTemporalZoned(arena, v, opts);
+    // A string is parsed before its options are coerced/read; a property bag
+    // reads its fields then its options. Both paths do this inside
+    // toTemporalZoned, so `from` does not touch the options again.
+    const z = try toTemporalZoned(arena, v, opts_v);
     return makeZoned(arena, z);
 }
 
 pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const a = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
-    const b = try toTemporalZoned(arena, if (args.len > 1) args[1] else Value{}, null);
+    const a = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, Value{});
+    const b = try toTemporalZoned(arena, if (args.len > 1) args[1] else Value{}, Value{});
     const r: f64 = if (a.ns < b.ns) -1 else if (a.ns > b.ns) 1 else 0;
     return val_mod.makeNumber(arena, r);
 }
@@ -878,7 +888,7 @@ fn unitRank(u: shared.Unit) u8 {
 
 fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, since: bool) !Value {
     const z = try requireZoned(arena, this_val);
-    const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
+    const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, Value{});
     if (z.calendar != other.calendar) return realm_mod.throwRangeError(arena, "calendar mismatch");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
 
@@ -1071,7 +1081,7 @@ pub fn nativeSince(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
 pub fn nativeEquals(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
+    const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, Value{});
     // Equality is on the instant, the zone *and* the calendar.
     return val_mod.makeBool(arena, z.ns == other.ns and timeZoneEquals(z.tz, other.tz) and
         z.calendar == other.calendar);
