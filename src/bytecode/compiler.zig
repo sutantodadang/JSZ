@@ -2764,6 +2764,14 @@ pub const FnCompiler = struct {
             if (a.kind == .spread_expr) return try self.compileCallSpread(c, line);
         }
 
+        // A parenthesized optional chain used as a call target — `(a?.b)()`,
+        // `(a?.b)?.()` — resolves to a member Reference whose base is the call's
+        // `this`. The plain `is_method` shape below only matches a bare
+        // member_expr, so route the optional-chain-wrapped member here.
+        if (c.callee.kind == .optional_chain and c.callee.data.optional_chain.kind == .member_expr) {
+            return try self.compileOptionalMethodCall(c, line, tail);
+        }
+
         const is_method = c.callee.kind == .member_expr;
 
         if (is_method) {
@@ -2893,6 +2901,77 @@ pub const FnCompiler = struct {
 
     /// Compile a call whose arguments include a spread (`f(...xs)`,
     /// `obj.m(a, ...xs)`). Builds a runtime argument array and emits CALL_SPREAD.
+    /// `(a?.b)()` / `(a?.b)?.()`: a call whose callee is a parenthesized optional
+    /// chain over a member expression. The base of that member is the call's
+    /// `this`, exactly as for `a.b()`. The inner chain is self-contained (the
+    /// parentheses close it): its nullish guards short-circuit to an `undefined`
+    /// callee within this call, after which the outer call proceeds (a TypeError
+    /// for a non-optional `()`, a short-circuit for an optional `?.()`).
+    pub fn compileOptionalMethodCall(self: *Self, c: ast.CallExpr, line: u32, tail: bool) error{OutOfMemory}!u8 {
+        const me = c.callee.data.optional_chain.data.member_expr;
+        const base = self.sp;
+        _ = self.allocReg(); // R[base] = this
+
+        // Inner optional-chain boundary: guards from the parenthesized chain land
+        // on a local pad producing an undefined callee, not any enclosing chain.
+        var inner_jumps: std.ArrayListUnmanaged(usize) = .empty;
+        const saved = self.optional_jumps;
+        self.optional_jumps = &inner_jumps;
+
+        self.sp = base;
+        _ = try self.compileExpr(me.object); // this into R[base]
+        self.sp = base + 1;
+        if (me.optional) try self.emitOptionalGuard(base, line);
+
+        // R[base+1] = callee = R[base][prop]
+        _ = self.allocReg();
+        self.sp = base + 1;
+        if (!me.computed) {
+            const sv = try val_mod.makeString(self.arena, me.property.data.identifier);
+            const kidx = try self.addConstant(sv);
+            try self.emitOp(.GET_PROP, line);
+            try self.emitU8(base + 1);
+            try self.emitU8(base);
+            try self.emitU16(kidx);
+        } else {
+            const rkey = try self.compileExpr(me.property);
+            try self.emitOp(.GET_PROP_DYN, line);
+            try self.emitU8(base + 1);
+            try self.emitU8(base);
+            try self.emitU8(rkey);
+            self.freeReg(); // free rkey
+        }
+        self.sp = base + 2;
+
+        // Merge the inner chain: normal path skips the pad; the pad (targeted by
+        // the inner guards) loads an undefined callee.
+        try self.emitOp(.JMP, line);
+        const patch_end = self.currentOffset();
+        try self.emitI16(0);
+        const pad = self.currentOffset();
+        for (inner_jumps.items) |p| self.patchJump(p, pad);
+        try self.emitOp(.LOAD_UNDEF, line);
+        try self.emitU8(base + 1);
+        self.patchJump(patch_end, self.currentOffset());
+        self.optional_jumps = saved;
+
+        // Outer optional call `?.()`: short-circuit (via the enclosing chain) when
+        // the resolved callee is nullish.
+        if (c.optional) try self.emitOptionalGuard(base + 1, line);
+
+        const nargs: u8 = @intCast(c.args.len);
+        for (c.args) |arg| {
+            _ = try self.compileExpr(arg);
+        }
+        const ret_dst = base;
+        try self.emitOp(if (tail) .TAIL_METHOD_CALL else .METHOD_CALL, line);
+        try self.emitU8(base);
+        try self.emitU8(nargs);
+        try self.emitU8(ret_dst);
+        self.sp = base + 1;
+        return ret_dst;
+    }
+
     pub fn compileCallSpread(self: *Self, c: ast.CallExpr, line: u32) error{OutOfMemory}!u8 {
         var rthis: u8 = 0;
         var rcallee: u8 = 0;
@@ -3045,25 +3124,26 @@ pub const FnCompiler = struct {
         }
     }
 
-    /// Compile a function body. `implicit_return` is true only for the top-level
-    /// program (so eval/REPL yields the last expression-statement value); function
-    /// bodies pass false and return undefined on fall-through.
-    pub fn compileBody(self: *Self, body: []*Node, implicit_return: bool) error{OutOfMemory}!void {
-        // Hoisting pre-pass: bind every `var` and function-declaration name in
-        // this scope to `undefined` at entry, so reads before initialization
-        // yield undefined while genuinely-undeclared names throw ReferenceError.
+    /// Emit the variable-environment declaration instantiation for a body scope:
+    /// hoist every `var`/function-declaration name to `undefined`, put every
+    /// `let`/`const` into TDZ, and fully instantiate direct-child function
+    /// declarations. Factored out of `compileBody` so it can run either at the
+    /// function's single environment (no parameter expressions) or, when the
+    /// parameter list has initializers, at the separate body variable environment
+    /// pushed after the parameter prelude (§10.2.11).
+    fn emitBodyScopeDecls(self: *Self, body: []*Node, implicit_return: bool, extra_blocked: []const []const u8) error{OutOfMemory}!void {
         {
             // Annex B.3.3 first: a block-level function declaration only gets a
-            // var-scoped binding when no lexical declaration or parameter
-            // between it and this scope would make `var F` an early error.
+            // var-scoped binding when no lexical declaration or parameter between
+            // it and this scope would make `var F` an early error.
             {
                 var blocked: std.ArrayList([]const u8) = .empty;
                 for (self.param_names) |p| try self.addHoistName(&blocked, p);
-                // B.3.3.1 skips the name "arguments" whenever the enclosing
-                // function has an arguments object: `{ function arguments(){} }`
-                // stays block-scoped rather than clobbering it. `implicit_return`
-                // marks Script/eval code, which has no arguments object, and an
-                // arrow resolves `arguments` lexically.
+                // A default/destructuring parameter list desugars its bindings into
+                // a leading prelude of `let` statements outside `body`; those names
+                // are still parameters for Annex B purposes, so a same-named body
+                // block-function must not extend past them.
+                for (extra_blocked) |p| try self.addHoistName(&blocked, p);
                 if (!implicit_return and !self.is_arrow) try self.addHoistName(&blocked, "arguments");
                 for (body) |stmt| try self.collectLexicalNames(stmt, &blocked);
                 for (body) |stmt| try self.collectAnnexBNames(stmt, &blocked, &self.annexb_fn_names, false);
@@ -3073,21 +3153,11 @@ pub const FnCompiler = struct {
             for (self.annexb_fn_names.items) |name| try self.addHoistName(&hoisted, name);
             for (hoisted.items) |name| try self.emitHoist(name, 0);
         }
-
-        // Lexical hoisting pre-pass: declare every `let`/`const` name as an
-        // uninitialized lexical binding (TDZ) at scope entry, so reads before
-        // initialization throw ReferenceError instead of returning undefined.
         {
             var lexical: std.ArrayList([]const u8) = .empty;
             for (body) |stmt| try self.collectLexicalNames(stmt, &lexical);
             for (lexical.items) |name| try self.emitHoistLexical(name, 0);
         }
-
-        // Function declarations are fully instantiated (closure created AND
-        // bound) at scope entry, before any statement executes — so forward
-        // references resolve. Emit direct-child function declarations here and
-        // skip them in the statement loop below. (Nested-block function decls
-        // are still lowered at their source position via compileStmt.)
         {
             const lower = @import("./lower/stmt.zig");
             var fd_reg: ?u8 = null;
@@ -3095,6 +3165,46 @@ pub const FnCompiler = struct {
                 if (stmt.kind == .function_decl)
                     try lower.lowerFunctionDecl(self, stmt, &fd_reg);
             }
+        }
+    }
+
+    /// Compile a function body. `implicit_return` is true only for the top-level
+    /// program (so eval/REPL yields the last expression-statement value); function
+    /// bodies pass false and return undefined on fall-through.
+    pub fn compileBody(self: *Self, body: []*Node, implicit_return: bool) error{OutOfMemory}!void {
+        // Parameter/body environment boundary (§10.2.11 steps 27-28): a function
+        // whose parameter list has initializer expressions desugars those inits
+        // into a leading run of body statements — synthetic `if (p===undefined)…`
+        // assignments counted by `param_init_stmts`, or `let`-bindings flagged
+        // `param_init` (the simple-named-default TDZ desugar). Those run in the
+        // parameter environment; the body's `var`/function declarations must then
+        // live in a SEPARATE variable environment so parameter-scope closures
+        // cannot observe body `var` bindings. `n_prelude` is the count of leading
+        // parameter-initializer statements. Generators run this prelude eagerly
+        // across the initial suspend, so they keep the single-environment model.
+        var n_prelude: usize = 0;
+        if (!self.is_generator and !self.is_async_generator) {
+            while (n_prelude < body.len) : (n_prelude += 1) {
+                const s = body[n_prelude];
+                const is_pinit = (n_prelude < self.param_init_stmts) or
+                    (s.kind == .var_decl and s.data.var_decl.param_init);
+                if (!is_pinit) break;
+            }
+        }
+        const has_param_env = n_prelude > 0;
+
+        // Hoisting pre-pass: bind every `var`/function-declaration name to
+        // `undefined`, put `let`/`const` in TDZ, and instantiate function
+        // declarations. When there is a parameter prelude this is deferred to the
+        // body variable environment (pushed at the boundary in the loop below);
+        // only the parameter-scope lexicals (the desugared `let` param bindings)
+        // are hoisted here, into the parameter environment.
+        if (has_param_env) {
+            var plex: std.ArrayList([]const u8) = .empty;
+            for (body[0..n_prelude]) |stmt| try self.collectLexicalNames(stmt, &plex);
+            for (plex.items) |name| try self.emitHoistLexical(name, 0);
+        } else {
+            try self.emitBodyScopeDecls(body, implicit_return, &.{});
         }
 
         // Completion values (eval/REPL): the top-level program accumulates its
@@ -3151,6 +3261,44 @@ pub const FnCompiler = struct {
         const reclaim_floor: u8 = if (body_do_dispose) body_d_rstack + 1 else if (self.completion_reg) |cr| cr + 1 else 0;
 
         for (body, 0..) |stmt, stmt_idx| {
+            // At the parameter/body boundary, open the separate body variable
+            // environment and run the deferred body-scope declaration
+            // instantiation inside it (§10.2.11 steps 27-28).
+            if (has_param_env and stmt_idx == n_prelude) {
+                try self.emitOp(.PUSH_VAR_ENV, 0);
+                // The real parameter names bound by the prelude `let` statements
+                // (the default/destructuring desugar renames the actual parameters
+                // to `__arg_N`/`__param_N`). Needed both to copy same-named body
+                // vars from the parameter value (§10.2.11 step 28) and to block a
+                // same-named body block-function from the Annex B.3.3 extension.
+                var prelude_names: std.ArrayList([]const u8) = .empty;
+                for (body[0..n_prelude]) |stmt2| try self.collectLexicalNames(stmt2, &prelude_names);
+
+                // §10.2.11 step 28: a body `var` whose name is also a parameter is
+                // initialized to that parameter's value, not `undefined`. Copy the
+                // parameter-environment binding into the fresh body environment
+                // before hoisting shadows it (a body function declaration of the
+                // same name still wins — emitBodyScopeDecls instantiates it after).
+                {
+                    var body_vars: std.ArrayList([]const u8) = .empty;
+                    for (body[n_prelude..]) |stmt2| try self.collectHoistedNames(stmt2, &body_vars, false);
+                    for (body_vars.items) |vn| {
+                        var is_param = false;
+                        for (self.param_names) |pn| {
+                            if (std.mem.eql(u8, pn, vn)) is_param = true;
+                        }
+                        for (prelude_names.items) |pn| {
+                            if (std.mem.eql(u8, pn, vn)) is_param = true;
+                        }
+                        if (!is_param) continue;
+                        const r = self.allocReg();
+                        try self.emitLoad(vn, r, 0);
+                        try self.emitDefineLocal(vn, r, 0);
+                        self.freeReg();
+                    }
+                }
+                try self.emitBodyScopeDecls(body[n_prelude..], implicit_return, prelude_names.items);
+            }
             // Parameter-initializer code reaches the body two ways: the parser's
             // default-parameter TDZ desugar (flagged on the `let` it emits) and
             // `applyParamDefaults` below (a leading run of synthetic statements).

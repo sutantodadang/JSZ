@@ -1004,7 +1004,7 @@ pub const BcVm = struct {
             realm_mod.pending_exception = try self.makeErrorObjectBc("SyntaxError", msg);
             return error.JsException;
         }
-        const eval_is_strict = parser_mod.hasUseStrict(stmts) or p.strict;
+        const eval_is_strict = parser_mod.hasUseStrict(p.source, stmts) or p.strict;
         // EvalDeclarationInstantiation (§19.2.1.3) validates the whole declaration
         // set BEFORE creating any binding, so a rejected declaration leaves no
         // trace of the ones that would have preceded it.
@@ -1191,7 +1191,7 @@ pub const BcVm = struct {
                 return error.ShadowParseError;
             },
         };
-        const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(stmts) };
+        const prog = ast_mod.Program{ .body = stmts, .is_strict = parser_mod.hasUseStrict(p.source, stmts) };
         const main_func = try compiler_mod.compileProgram(self.arena, &prog, "<ShadowRealm>");
         if (compiler_mod.last_label_error) |msg| {
             compiler_mod.last_label_error = null;
@@ -1598,6 +1598,7 @@ pub const BcVm = struct {
                 .INIT_LEX => if (try load_ops.opInitLexical(self, frame)) |o| return o,
                 .ENTER_SCOPE => if (try load_ops.opEnterScope(self, frame)) |o| return o,
                 .EXIT_SCOPE => if (try load_ops.opExitScope(self, frame)) |o| return o,
+                .PUSH_VAR_ENV => if (try load_ops.opPushVarEnv(self, frame)) |o| return o,
                 .PUSH_WITH => if (try load_ops.opPushWith(self, frame)) |o| return o,
                 .POP_WITH => if (try load_ops.opPopWith(self, frame)) |o| return o,
                 .SET_GLOBAL => if (try load_ops.opSetGlobal(self, frame)) |o| return o,
@@ -4336,8 +4337,13 @@ pub const BcVm = struct {
         // (non-enumerable, matching the spec's @@iterator on %Array.prototype%).
         const realm_mod = @import("../runtime/realm.zig");
         if (realm_mod.active_sym_iterator) |symv| {
-            const coll = @import("../runtime/builtins/es2015_collections.zig");
-            try obj.setSymAttr(symv, try val_mod.makeNativeFunction(self.arena, coll.nativeArrayValues), .{ .writable = true, .enumerable = false, .configurable = true });
+            // §10.4.4.7/.8: the arguments object's @@iterator IS %Array.prototype.values%
+            // (the SAME function object as `[][Symbol.iterator]`), not a fresh copy.
+            const values_fn = self.realm.array_prototype.getSym(symv) orelse blk: {
+                const coll = @import("../runtime/builtins/es2015_collections.zig");
+                break :blk try val_mod.makeNativeFunction(self.arena, coll.nativeArrayValues);
+            };
+            try obj.setSymAttr(symv, values_fn, .{ .writable = true, .enumerable = false, .configurable = true });
         }
         // Mapped arguments (sloppy mode + simple parameter list): indices alias the
         // parameter bindings both ways (`arguments[0] = v` writes param 0; reading
@@ -5677,7 +5683,7 @@ pub fn formatNumber(arena: std.mem.Allocator, n: f64) ![]const u8 {
     return val_mod.formatNumber(arena, n);
 }
 
-pub fn jsLessThan(left: Value, right: Value) ?bool {
+pub fn jsLessThan(arena: std.mem.Allocator, left: Value, right: Value) ?bool {
     const lstr = if (left.bits != 0) left.unbox() == .string else false;
     const rstr = if (right.bits != 0) right.unbox() == .string else false;
     if (lstr and rstr) {
@@ -5688,6 +5694,17 @@ pub fn jsLessThan(left: Value, right: Value) ?bool {
     const lbig = left.bits != 0 and left.unbox() == .bigint;
     const rbig = right.bits != 0 and right.unbox() == .bigint;
     if (lbig and rbig) return val_mod.bigIntOrder(left, right) == .lt;
+    // BigInt vs String (§7.2.13): StringToBigInt the string operand; an
+    // unparseable string yields `undefined`, so the comparison is `undefined`
+    // (null here) and the relational operator evaluates to false.
+    if (lbig and rstr) {
+        const yb = val_mod.stringToBigInt(arena, right.toPtr().string) catch return null;
+        return val_mod.bigIntOrder(left, yb) == .lt;
+    }
+    if (rbig and lstr) {
+        const yb = val_mod.stringToBigInt(arena, left.toPtr().string) catch return null;
+        return val_mod.bigIntOrder(yb, right) == .lt;
+    }
     if (lbig and !rstr) {
         const ord = val_mod.bigIntOrderNumber(left, toNumber(right)) orelse return null;
         return ord == .lt;
@@ -5704,26 +5721,19 @@ pub fn jsLessThan(left: Value, right: Value) ?bool {
 
 /// BigInt == Number (spec): equal iff the Number is a finite integer whose
 /// mathematical value equals the BigInt. NaN/±Inf/non-integers are never equal.
-fn bigIntEqualsNumber(arena: std.mem.Allocator, big: Value, num: f64) bool {
-    if (!std.math.isFinite(num) or num != @trunc(num)) return false;
-    const yb = if (num >= -9.0e18 and num <= 9.0e18)
-        (val_mod.makeBigIntFromI64(arena, @intFromFloat(num)) catch return false)
-    else blk: {
-        const s = std.fmt.allocPrint(arena, "{d}", .{num}) catch return false;
-        break :blk (val_mod.makeBigIntFromLiteral(arena, s) catch return false);
-    };
-    return val_mod.bigIntEql(big, yb);
+/// `bigIntOrderNumber` compares exactly (no lossy f64 round-trip), so it stays
+/// correct for values beyond i64 range such as `Number.MAX_VALUE`.
+fn bigIntEqualsNumber(_: std.mem.Allocator, big: Value, num: f64) bool {
+    return (val_mod.bigIntOrderNumber(big, num) orelse return false) == .eq;
 }
 
 /// BigInt == String (spec): StringToBigInt(string); equal iff it parses to a
 /// BigInt mathematically equal to `big`. Unparseable strings are never equal.
 fn bigIntEqualsString(arena: std.mem.Allocator, big: Value, s: []const u8) bool {
-    const t = std.mem.trim(u8, s, " \t\n\r\x0b\x0c");
-    const body = if (t.len > 0 and t[0] == '+') t[1..] else t;
-    const yb = if (body.len == 0)
-        (val_mod.makeBigIntFromI64(arena, 0) catch return false)
-    else
-        (val_mod.makeBigIntFromLiteral(arena, body) catch return false);
+    // StringToBigInt handles surrounding whitespace, an empty string (0n), a
+    // leading +/- sign, and 0x/0o/0b prefixes; an unparseable string yields
+    // `undefined`, which is never loosely equal to a BigInt.
+    const yb = val_mod.stringToBigInt(arena, s) catch return false;
     return val_mod.bigIntEql(big, yb);
 }
 

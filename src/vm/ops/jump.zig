@@ -165,7 +165,7 @@ pub inline fn opJge(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const hi = code[frame.pc];
     frame.pc += 1;
     const offset: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
-    const lt = bcv.jsLessThan(frame.registers[rlhs], frame.registers[rrhs]);
+    const lt = bcv.jsLessThan(self.arena, frame.registers[rlhs], frame.registers[rrhs]);
     const ge = if (lt) |v| !v else false;
     if (ge) {
         const new_pc: i64 = @intCast(frame.pc);

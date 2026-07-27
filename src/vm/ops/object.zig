@@ -91,9 +91,20 @@ pub inline fn opArraySpread(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
                 break;
             };
             if (step.bits == 0 or step.unbox() != .object) break;
-            const done_v = step.toPtr().object.get("done") orelse break;
+            // IteratorComplete: an absent `done` is `undefined` (falsy), not the
+            // end of iteration. IteratorValue reads `value` through the full
+            // [[Get]] path so an accessor getter runs and a throw propagates.
+            const done_v = self.getProp(step, "done") catch |e| {
+                if (e != error.JsException) return e;
+                if (try self.raisePendingException("iterator error")) |oc| return oc;
+                break;
+            };
             if (bcv.isTruthy(done_v)) break;
-            const v = step.toPtr().object.get("value") orelse try val_mod.makeUndefined(self.arena);
+            const v = self.getProp(step, "value") catch |e| {
+                if (e != error.JsException) return e;
+                if (try self.raisePendingException("iterator error")) |oc| return oc;
+                break;
+            };
             try arr.appendElement(v);
         }
     }

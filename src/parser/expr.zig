@@ -197,6 +197,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
         p.arrow_prelude = .{};
+        flagParamPrelude(prelude);
         // An arrow body is its own function-like scope for the class-static-block
         // restrictions: `static { () => { var await; } }` is legal.
         const sb_saved = p.leaveStaticBlock();
@@ -221,7 +222,7 @@ fn finishBinaryFromBase(p: *Parser, base: *Node) ?*Node {
         // have a non-simple parameter list. Detect the directive on the raw body,
         // before prependPrelude pushes any default/destructuring inits in front of
         // it (an arrow's `prelude`/`rest_param` mark the list as non-simple).
-        const arrow_use_strict = parser_file.hasUseStrict(body_nodes);
+        const arrow_use_strict = parser_file.hasUseStrict(p.source, body_nodes);
         if ((rest_param != null or prelude.len > 0) and arrow_use_strict) {
             if (!p.had_error) {
                 p.had_error = true;
@@ -378,6 +379,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         // body (a nested arrow would otherwise overwrite p.arrow_prelude).
         const prelude = p.arrow_prelude.items;
         p.arrow_prelude = .{};
+        flagParamPrelude(prelude);
         // An arrow body is its own function-like scope for the class-static-block
         // restrictions: `static { () => { var await; } }` is legal.
         const sb_saved = p.leaveStaticBlock();
@@ -401,7 +403,7 @@ pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
         // §15.3.1 early error: a ConciseBody with a "use strict" directive may not
         // have a non-simple parameter list (default/rest/destructuring). Detect the
         // directive on the raw body, before prependPrelude pushes any inits ahead.
-        const arrow_use_strict = parser_file.hasUseStrict(body_nodes);
+        const arrow_use_strict = parser_file.hasUseStrict(p.source, body_nodes);
         if ((rest_param != null or prelude.len > 0) and arrow_use_strict) {
             if (!p.had_error) {
                 p.had_error = true;
@@ -538,6 +540,16 @@ pub fn extractArrowParams(p: *Parser, lhs: *Node) ?[][]const u8 {
 
 /// Prepend the destructuring-param prelude (`let` decls) to an arrow body.
 /// Returns `body` unchanged when there is no prelude.
+/// Flag each `var`-decl in an arrow's parameter prelude as parameter-initializer
+/// code (§10.2.11): the bytecode compiler uses this to place the body's `var`
+/// declarations in a separate variable environment, so a default-value closure
+/// cannot observe body `var` bindings.
+fn flagParamPrelude(prelude: []*Node) void {
+    for (prelude) |n| {
+        if (n.kind == .var_decl) n.data.var_decl.param_init = true;
+    }
+}
+
 fn prependPrelude(p: *Parser, prelude: []*Node, body: []*Node) ?[]*Node {
     if (prelude.len == 0) return body;
     var combined = std.ArrayList(*Node){};
@@ -1311,27 +1323,12 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
                 // ('(function(){ new.target })')` stays legal.
                 if (p.eval_code and !p.eval_allow_new_target and p.fn_nesting_depth == 0)
                     return p.fail("new.target expression is not allowed here");
-                var nt_node = p.makeNode(.identifier, start, p.current.start, .{
+                const nt_node = p.makeNode(.identifier, start, p.current.start, .{
                     .identifier = "__new_target__",
                 }) orelse return null;
-                while (true) {
-                    if (p.match(.dot)) {
-                        const pt = p.expectIdentifierName() orelse return null;
-                        const pn = p.makeNode(.identifier, pt.start, pt.end, .{
-                            .identifier = pt.value_str,
-                        }) orelse return null;
-                        nt_node = p.makeNode(.member_expr, nt_node.start, p.current.start, .{
-                            .member_expr = .{ .object = nt_node, .property = pn, .computed = false },
-                        }) orelse return null;
-                    } else if (p.match(.left_bracket)) {
-                        const pe = p.parseExpression() orelse return null;
-                        _ = p.expect(.right_bracket) orelse return null;
-                        nt_node = p.makeNode(.member_expr, nt_node.start, p.current.start, .{
-                            .member_expr = .{ .object = nt_node, .property = pe, .computed = true },
-                        }) orelse return null;
-                    } else break;
-                }
-                return nt_node;
+                // Continue with any member/subscript/call/optional tail
+                // (`new.target.prototype`, `new.target?.x`, `new.target?.()`).
+                return parseCallMemberTail(p, nt_node);
             }
             // M16 Phase 4: `await` is reserved in module code; `new await …` is
             // a SyntaxError per spec (await is not a valid NewExpression callee).
@@ -1434,7 +1431,16 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
 /// (`?.`); if any link in the chain is optional, the whole chain is wrapped
 /// in an `optional_chain` node which establishes the short-circuit boundary.
 pub fn parseCallMemberExpr(p: *Parser) ?*Node {
-    var base = p.parsePrimaryExpr() orelse return null;
+    const base = p.parsePrimaryExpr() orelse return null;
+    return parseCallMemberTail(p, base);
+}
+
+/// Parse the `.`/`[]`/`(...)`/`?.` continuation of a CallExpression/MemberExpression
+/// onto an already-parsed `base`, wrapping the result in an `optional_chain` node
+/// when any `?.` link appeared. Shared by `parseCallMemberExpr` and the
+/// `new.target` meta-property (so `new.target?.x` / `new.target?.()` parse).
+pub fn parseCallMemberTail(p: *Parser, base_in: *Node) ?*Node {
+    var base = base_in;
     var saw_optional = false;
     while (true) {
         if (p.match(.question_dot)) {
@@ -2132,7 +2138,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_arrow = false,
                     .is_generator = m_is_gen,
                     .is_async = m_is_async,
-                    .is_strict = parser_file.hasUseStrict(am_body),
+                    .is_strict = parser_file.hasUseStrict(p.source, am_body),
                     .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
@@ -2175,7 +2181,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                         .is_arrow = false,
                         .is_generator = false,
                         .is_async = false,
-                        .is_strict = parser_file.hasUseStrict(cm_body),
+                        .is_strict = parser_file.hasUseStrict(p.source, cm_body),
                         .source_text = p.sourceSlice(prop_start, p.prev_end),
                     },
                 }) orelse return null;
@@ -2292,7 +2298,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_arrow = false,
                     .is_generator = false,
                     .is_async = false,
-                    .is_strict = parser_file.hasUseStrict(acc_body),
+                    .is_strict = parser_file.hasUseStrict(p.source, acc_body),
                     .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
@@ -2327,7 +2333,7 @@ pub fn parseObjectLiteral(p: *Parser) ?*Node {
                     .is_arrow = false,
                     .is_generator = false,
                     .is_async = false,
-                    .is_strict = parser_file.hasUseStrict(m_body),
+                    .is_strict = parser_file.hasUseStrict(p.source, m_body),
                     .source_text = p.sourceSlice(prop_start, p.prev_end),
                 },
             }) orelse return null;
@@ -2564,7 +2570,7 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
     p.in_generator_function = prev_gen;
     if (!parser_file.checkStrictDirectiveSimpleParams(p, parsed_params.non_simple, body)) return null;
     if (name) |nm| if (!parser_file.checkStrictBodyFunctionName(p, nm)) return null;
-    const is_strict = parser_file.hasUseStrict(body);
+    const is_strict = parser_file.hasUseStrict(p.source, body);
     return p.makeNode(.function_expr, start, p.current.start, .{
         .function_expr = .{
             .name = name,
