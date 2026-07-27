@@ -644,7 +644,16 @@ pub inline fn opPutRef(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
             return null;
         }
-        try self.setProp(token, name, value);
+        const ok = try self.setPropR(token, name, value, token);
+        // A failed [[Set]] on the binding object (e.g. a non-writable property)
+        // is a TypeError in strict code, a silent no-op otherwise.
+        if (!ok and frame.func.is_strict) {
+            const msg = try std.fmt.allocPrint(self.arena, "Cannot assign to read only property '{s}'", .{name});
+            const exc_val = try self.makeErrorObjectBc("TypeError", msg);
+            self.last_exception_value = exc_val;
+            const found = try self.throwException(exc_val);
+            if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+        }
         return null;
     }
     if (token.bits != 0 and token.unbox() == .number) {
@@ -704,7 +713,16 @@ fn setBindingByName(self: *BcVm, frame_in: *BcCallFrame, name: []const u8, value
     // `with` scopes: assign through an object whose [[HasProperty]] is true.
     if (frame.with_stack.items.len > 0) {
         if (try ownWith(self, frame, name)) |wobj| {
-            try self.setProp(wobj, name, value);
+            const ok = try self.setPropR(wobj, name, value, wobj);
+            // A failed assignment (e.g. a non-writable property on the with
+            // object) is a TypeError in strict code, a silent no-op otherwise.
+            if (!ok and cur_is_strict) {
+                const msg = try std.fmt.allocPrint(self.arena, "Cannot assign to read only property '{s}'", .{name});
+                const exc_val = try self.makeErrorObjectBc("TypeError", msg);
+                self.last_exception_value = exc_val;
+                const found = try self.throwException(exc_val);
+                if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+            }
             return null;
         }
         // ownWith may have run a @@unscopables getter that reallocated frames.
@@ -733,7 +751,14 @@ fn setBindingByName(self: *BcVm, frame_in: *BcCallFrame, name: []const u8, value
             // inherited from the function's definition site still encloses it,
             // and PutValue writes through it before reaching the global object.
             if (try inheritedWith(self, frame, name)) |wobj| {
-                try self.setProp(wobj, name, value);
+                const ok = try self.setPropR(wobj, name, value, wobj);
+                if (!ok and cur_is_strict) {
+                    const msg = try std.fmt.allocPrint(self.arena, "Cannot assign to read only property '{s}'", .{name});
+                    const exc_val = try self.makeErrorObjectBc("TypeError", msg);
+                    self.last_exception_value = exc_val;
+                    const found = try self.throwException(exc_val);
+                    if (!found) return RunOutcome{ .exception_value = .{ .msg = msg, .value = exc_val } };
+                }
                 return null;
             }
             frame = &self.frames.items[self.frames.items.len - 1];

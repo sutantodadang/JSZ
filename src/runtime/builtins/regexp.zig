@@ -1450,7 +1450,26 @@ const PatternParser = struct {
         const h3 = hexVal(self.src[self.pos + 2]) orelse return ParseError.InvalidPattern;
         const h4 = hexVal(self.src[self.pos + 3]) orelse return ParseError.InvalidPattern;
         self.pos += 4;
-        return @intCast(@as(u32, h1) * 4096 + @as(u32, h2) * 256 + @as(u32, h3) * 16 + h4);
+        const lead: u21 = @intCast(@as(u32, h1) * 4096 + @as(u32, h2) * 256 + @as(u32, h3) * 16 + h4);
+        // Under /u a \uHHHH high surrogate immediately followed by a \uHHHH low
+        // surrogate combines into a single astral code point (RegExpUnicode
+        // EscapeSequence trailing-surrogate rule).
+        if (self.unicode and lead >= 0xD800 and lead <= 0xDBFF and
+            self.pos + 5 < self.src.len and self.src[self.pos] == '\\' and self.src[self.pos + 1] == 'u')
+        {
+            const t1 = hexVal(self.src[self.pos + 2]);
+            const t2 = hexVal(self.src[self.pos + 3]);
+            const t3 = hexVal(self.src[self.pos + 4]);
+            const t4 = hexVal(self.src[self.pos + 5]);
+            if (t1 != null and t2 != null and t3 != null and t4 != null) {
+                const trail: u21 = @intCast(@as(u32, t1.?) * 4096 + @as(u32, t2.?) * 256 + @as(u32, t3.?) * 16 + t4.?);
+                if (trail >= 0xDC00 and trail <= 0xDFFF) {
+                    self.pos += 6;
+                    return @intCast(0x10000 + ((@as(u32, lead) - 0xD800) << 10) + (@as(u32, trail) - 0xDC00));
+                }
+            }
+        }
+        return lead;
     }
 
     /// Parse the end of a char-class range that starts with \. Returns codepoint.
