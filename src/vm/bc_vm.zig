@@ -1634,6 +1634,7 @@ pub const BcVm = struct {
                 .GET_REF => if (try load_ops.opGetRef(self, frame)) |o| return o,
                 .PUT_REF => if (try load_ops.opPutRef(self, frame)) |o| return o,
                 .DEFINE_GLOBAL => if (try load_ops.opDefineGlobal(self, frame)) |o| return o,
+                .DEFINE_GLOBAL_FN => if (try load_ops.opDefineGlobalFn(self, frame)) |o| return o,
                 .MARK_DIRECT_EVAL => self.direct_eval_mark = true,
                 .MARK_PARAM_EVAL => self.param_eval_mark = true,
                 .MARK_FIELD_EVAL => self.field_eval_mark = true,
@@ -5955,7 +5956,7 @@ pub fn jsStrictEqual(x: Value, y: Value) bool {
             return xn == yn;
         },
         .string => {
-            return std.mem.eql(u8, x.toPtr().string, y.toPtr().string);
+            return @import("../runtime/builtins/string_proto.zig").wtf8CanonEqual(x.toPtr().string, y.toPtr().string);
         },
         .boolean => {
             return x.unbox().boolean == y.unbox().boolean;

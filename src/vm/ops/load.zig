@@ -118,6 +118,30 @@ fn mirrorGlobalBindingOptsIn(frame: *BcCallFrame, target: *Environment, name: []
     _ = obj.defineOwnData(name, value, .{ .writable = true, .enumerable = true, .configurable = configurable }) catch {};
 }
 
+/// CreateGlobalFunctionBinding (§10.1.1.4.18) mirror for a top-level function
+/// declaration. Unlike the `var` mirror, when a same-named own property already
+/// exists it *redefines* the descriptor — to { writable, enumerable, configurable:D }
+/// — whenever the existing property is configurable, and otherwise just updates
+/// the value. This is what makes `Object.defineProperty(this,'f',{configurable:true,
+/// writable:false}); eval('function f(){}')` leave `f` writable & enumerable.
+fn mirrorGlobalFunctionBinding(frame: *BcCallFrame, target: *Environment, name: []const u8, value: Value, configurable: bool) void {
+    if (target.parent != null) return;
+    if (frame.func.is_module) return;
+    if (isReservedRuntimeGlobal(name)) return;
+    const gt = frame.env.lookup("globalThis") catch return;
+    if (gt.bits == 0 or gt.unbox() != .object) return;
+    const obj = gt.toPtr().object;
+    if (obj.ownAttr(name)) |existing| {
+        // Existing non-configurable property: keep its descriptor, set value only.
+        if (!existing.configurable) {
+            obj.set(name, value) catch {};
+            return;
+        }
+    }
+    // No property, or an existing configurable one: (re)define fully.
+    _ = obj.defineOwnData(name, value, .{ .writable = true, .enumerable = true, .configurable = configurable }) catch {};
+}
+
 pub inline fn opLoadK(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     _ = self;
     const code = frame.func.chunk.code;
@@ -324,7 +348,21 @@ pub inline fn opHoistVar(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     const shadows_global = target.parent == null and !frame.func.is_module and
         !isReservedRuntimeGlobal(name) and
         !target.bindings.contains(name) and globalObjectHasOwn(frame, name);
-    if (!shadows_global) target.hoistVar(name, undef) catch return error.OutOfMemory;
+    // EvalDeclarationInstantiation (§19.2.1.3) creates its top-level `var`/
+    // function bindings by calling CreateMutableBinding(N, true) — the `true`
+    // marks them deletable, so a later `delete N` inside the eval body (or a
+    // closure that captured N) actually removes the binding. This applies to
+    // eval whose VariableEnvironment is a *function* var scope; at global scope
+    // the binding lives in the global Environment Record and its deletability is
+    // carried by the mirrored global-object property (deleteName returns
+    // `global_object_ref` there), so the record binding itself stays plain.
+    // Script/function body vars are never deletable.
+    if (!shadows_global) {
+        if (frame.func.is_eval and target.parent != null)
+            target.hoistVarDeletable(name, undef) catch return error.OutOfMemory
+        else
+            target.hoistVar(name, undef) catch return error.OutOfMemory;
+    }
     // ES §9.1.1.4.17 CreateGlobalVarBinding: a top-level `var`/function name in
     // Script or eval code reserves an own property of the global object at
     // declaration-instantiation time, even when it is never assigned (`var x;`
@@ -833,6 +871,29 @@ pub inline fn opDefineGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // while eval-introduced ones are deletable (EvalDeclarationInstantiation
     // passes varEnv.CreateGlobal{Var,Function}Binding a `true` deletable flag).
     mirrorGlobalBinding(frame, name, value, frame.func.is_eval);
+    return null;
+}
+
+/// DEFINE_GLOBAL_FN: a top-level function declaration. Identical binding
+/// resolution to DEFINE_GLOBAL, but the global-object mirror uses
+/// CreateGlobalFunctionBinding semantics (redefine an existing configurable
+/// property's descriptor to writable+enumerable) rather than leaving it intact.
+pub inline fn opDefineGlobalFn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
+    _ = self;
+    const code = frame.func.chunk.code;
+    const lo = code[frame.pc];
+    frame.pc += 1;
+    const hi = code[frame.pc];
+    frame.pc += 1;
+    const kidx: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+    const rsrc = code[frame.pc];
+    frame.pc += 1;
+    const name = frame.func.chunk.constants[kidx].toPtr().string;
+    const value = frame.registers[rsrc];
+    frame.env.assign(name, value) catch {
+        varTargetEnv(frame).define(name, value) catch return error.OutOfMemory;
+    };
+    mirrorGlobalFunctionBinding(frame, varTargetEnv(frame), name, value, frame.func.is_eval);
     return null;
 }
 

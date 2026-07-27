@@ -711,7 +711,10 @@ const PatternParser = struct {
     /// Under /u, read a full UTF-8 codepoint from the pattern; else return single byte.
     fn readCp(self: *PatternParser) u21 {
         if (self.unicode and self.pos < self.src.len and self.src[self.pos] >= 0x80) {
-            const dc = decodeUtf8At(self.src, self.pos);
+            // `decodeCpAt` folds a WTF-8 surrogate pair (an astral character read
+            // from a string-form pattern, `new RegExp("𝌆","u")`) into the
+            // single astral code point `/u` mode must see.
+            const dc = decodeCpAt(self.src, self.pos);
             self.pos += dc.len;
             return dc.cp;
         }
@@ -1147,7 +1150,7 @@ const PatternParser = struct {
                 self.advance();
                 return b;
             }
-            const dc = decodeUtf8At(self.src, self.pos);
+            const dc = decodeCpAt(self.src, self.pos);
             self.pos += dc.len;
             return dc.cp;
         }
@@ -1382,13 +1385,14 @@ const PatternParser = struct {
                         cc.addCpRange(self.alloc, lo, lo) catch return ParseError.OutOfMemory;
                     }
                 }
-            } else if (ch >= 0x80) {
-                // Non-ASCII code-point start: decode the whole code unit and store
-                // it as a code point in BOTH modes. Non-/u class membership is
-                // tested against decoded code points (consumeClass), so a literal
-                // multi-byte member such as `[à]` must be stored as its code point
-                // rather than as individual WTF-8 bytes.
-                const dc = decodeUtf8At(self.src, self.pos);
+            } else if (self.unicode and ch >= 0x80) {
+                // Non-ASCII codepoint start in unicode mode -- decode the full
+                // codepoint. Use `decodeCpAt` (not `decodeUtf8At`) so a WTF-8
+                // surrogate *pair* — how `new RegExp("[𝌆]","u")` stores
+                // an astral character read from a string argument — folds into the
+                // single astral code point `/u` mode must see, exactly as a 4-byte
+                // literal already does.
+                const dc = decodeCpAt(self.src, self.pos);
                 self.pos += dc.len;
                 const start_cp = dc.cp;
                 if (!self.eof() and self.cur() == '-' and
@@ -1402,7 +1406,7 @@ const PatternParser = struct {
                         const ep = try self.parseUEscapeOrByte();
                         break :blk ep;
                     } else blk: {
-                        const edc = decodeUtf8At(self.src, self.pos);
+                        const edc = decodeCpAt(self.src, self.pos);
                         self.pos += edc.len;
                         break :blk edc.cp;
                     };
