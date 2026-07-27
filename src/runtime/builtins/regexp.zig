@@ -3816,13 +3816,22 @@ fn getStrProp(arena: std.mem.Allocator, obj: Value, key: []const u8) ![]const u8
     return realm_mod.stringPrimitive(arena, v);
 }
 
+/// Type(v) is Object — callables (functions) are objects in our model.
+fn isObjectVal(v: Value) bool {
+    if (v.bits == 0) return false;
+    return switch (v.unbox()) {
+        .object, .bc_function, .native_function, .function => true,
+        else => false,
+    };
+}
+
 /// RegExpExec(R, S) — ES §22.2.7.1: dispatch to a user `exec` if callable,
 /// otherwise RegExpBuiltinExec. Result must be an Object or null.
 fn regExpExec(arena: std.mem.Allocator, R: Value, s_val: Value) !Value {
     const exec = try ctxGetProp(arena, R, "exec");
     if (fp.isCallableFn(exec)) {
         const res = try fp.invokeCallback(arena, R, exec, &[_]Value{s_val});
-        if (res.bits != 0 and (res.unbox() == .object or res.unbox() == .null_)) return res;
+        if (res.bits != 0 and (isObjectVal(res) or res.unbox() == .null_)) return res;
         return realm_mod.throwTypeError(arena, "RegExp exec method returned a non-object, non-null value");
     }
     if (getCompiledRegex(R) == null)
@@ -4361,6 +4370,7 @@ fn escapeRegExpPattern(arena: std.mem.Allocator, src: []const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
     var i: usize = 0;
     var escaped = false; // preceding char was an unescaped backslash
+    var in_class = false; // inside a character class [...] where '/' need not be escaped
     while (i < src.len) {
         const c = src[i];
         if (c == '\\') {
@@ -4369,14 +4379,23 @@ fn escapeRegExpPattern(arena: std.mem.Allocator, src: []const u8) ![]const u8 {
             i += 1;
             continue;
         }
-        if (c == '/' and !escaped) {
+        if (c == '[' and !escaped) {
+            in_class = true;
+        } else if (c == ']' and !escaped) {
+            in_class = false;
+        }
+        // A raw LineTerminator must be escaped. When it is already preceded by an
+        // (unescaped) backslash we emitted, that backslash + the escape letter
+        // together form the sequence, so we append only the letter.
+        if (c == '/' and !escaped and !in_class) {
             try buf.appendSlice(arena, "\\/");
         } else if (c == '\n') {
-            try buf.appendSlice(arena, "\\n");
+            try buf.appendSlice(arena, if (escaped) "n" else "\\n");
         } else if (c == '\r') {
-            try buf.appendSlice(arena, "\\r");
+            try buf.appendSlice(arena, if (escaped) "r" else "\\r");
         } else if (c == 0xE2 and i + 2 < src.len and src[i + 1] == 0x80 and (src[i + 2] == 0xA8 or src[i + 2] == 0xA9)) {
-            try buf.appendSlice(arena, if (src[i + 2] == 0xA8) "\\u2028" else "\\u2029");
+            const is_u2028 = src[i + 2] == 0xA8;
+            try buf.appendSlice(arena, if (escaped) (if (is_u2028) "u2028" else "u2029") else (if (is_u2028) "\\u2028" else "\\u2029"));
             i += 3;
             escaped = false;
             continue;

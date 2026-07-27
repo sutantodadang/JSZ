@@ -733,6 +733,12 @@ pub const BcVm = struct {
                         if (o.get("prototype")) |pv| {
                             if (try self.protoObjOf(pv)) |po| default_proto = po;
                         }
+                        // OrdinaryCreateFromConstructor(newTarget): a subclass instance
+                        // must already carry its OWN prototype during the ctor body, so
+                        // that ctors reading a method off `this` via [[Get]] (Map's `set`
+                        // / Set's `add` adder) observe the subclass override. When the
+                        // ctor defers proto (TypedArray) it re-applies below — harmless.
+                        if (try self.protoFromNewTarget(new_target, ctor, default_proto)) |po| default_proto = po;
                         const new_obj = if (self.heap) |heap|
                             try JsObject.createOnHeap(heap, default_proto)
                         else
