@@ -3201,8 +3201,27 @@ pub const BcVm = struct {
     /// prototype chain (e.g. `Object.create(ta)[i] = v` or a Proxy of such): the
     /// exotic method intercepts canonical numeric indices, and for a valid index
     /// with a different Receiver, OrdinarySet writes onto the Receiver instead.
+    /// OrdinarySet with a PRIMITIVE receiver (`sym.x = v`, `(42).x = v`, …). Per
+    /// PutValue → ToObject → [[Set]], the receiver stays the primitive: an
+    /// inherited accessor setter fires (this = primitive), but a data property or
+    /// an absent property would need CreateDataProperty on the primitive, which
+    /// fails. Returns false in every non-setter case so a strict-mode assignment
+    /// throws TypeError and a sloppy one is a silent no-op.
+    fn primitiveOrdinarySet(self: *BcVm, proto_opt: ?*JsObject, key: []const u8, value: Value, receiver: Value) anyerror!bool {
+        const proto = proto_opt orelse return false;
+        const loc = proto.findProperty(key) orelse return false;
+        const a = loc.holder.attrAt(loc.slot);
+        if (!a.is_accessor) return false;
+        const raw = if (loc.slot < loc.holder.slots.items.len) loc.holder.slots.items[loc.slot] else Value{};
+        const setter = accessorMember(raw, "set");
+        if (!isCallable(setter)) return false;
+        _ = try self.callAccessor(setter, receiver, &[_]Value{value});
+        return true;
+    }
+
     pub fn setPropR(self: *BcVm, obj_val: Value, key: []const u8, value: Value, receiver: Value) anyerror!bool {
         if (obj_val.bits == 0) return true;
+        const realm_mod_setr = @import("../runtime/realm.zig");
         switch (obj_val.unbox()) {
             .object => |obj| {
                 if (obj.internal_kind == .proxy) {
@@ -3395,6 +3414,17 @@ pub const BcVm = struct {
                 try o.set(key, value);
                 return true;
             },
+            // Property assignment to a primitive base: fire an inherited setter,
+            // otherwise fail (strict → TypeError, sloppy → no-op).
+            .symbol => return self.primitiveOrdinarySet(realm_mod_setr.active_symbol_proto, key, value, receiver),
+            .string => {
+                // A canonical index / "length" is a non-writable data property →
+                // fail; other keys resolve through String.prototype.
+                return self.primitiveOrdinarySet(realm_mod_setr.active_string_proto, key, value, receiver);
+            },
+            .number => return self.primitiveOrdinarySet(realm_mod_setr.active_number_proto, key, value, receiver),
+            .boolean => return self.primitiveOrdinarySet(realm_mod_setr.active_boolean_proto, key, value, receiver),
+            .bigint => return self.primitiveOrdinarySet(realm_mod_setr.active_bigint_proto, key, value, receiver),
             else => return true,
         }
     }
