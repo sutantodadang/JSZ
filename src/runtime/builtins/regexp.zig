@@ -556,6 +556,11 @@ pub const CompiledRegex = struct {
     /// Whether the pattern contains a backreference outside any lookaround.
     /// Such patterns are NP-hard in general, so they keep the backtracker.
     has_backref: bool = false,
+    /// Whether the pattern requires ES §22.2.2.5.1 step-2b processing:
+    /// zero-width optional iterations must discard their captures and, for
+    /// patterns with lazy inner quantifiers, trigger a forced non-empty retry.
+    /// Patterns with this flag always use the backtracking engine.
+    needs_step2b: bool = false,
 
     pub const Flags = struct {
         ignore_case: bool = false,
@@ -1517,7 +1522,8 @@ const PatternParser = struct {
             const name_start = self.pos;
             while (!self.eof() and self.cur() != '>') self.advance();
             if (self.eof()) return ParseError.InvalidPattern;
-            const name = self.src[name_start..self.pos];
+            const name = decodeGroupNameId(self.alloc, self.src[name_start..self.pos]) catch
+                return ParseError.OutOfMemory;
             self.advance(); // >
             var hits = std.ArrayList(u32){};
             for (self.group_names) |ni| {
@@ -2129,12 +2135,16 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
     if (!pp.eof()) return error.InvalidPattern; // unconsumed chars
 
     const br = hasBackref(&root);
+    // Patterns requiring ES §22.2.2.5.1 step-2b processing must use the
+    // backtracking engine; the Pike VM cannot correctly discard captures from
+    // zero-width optional iterations or implement the forced non-empty retry.
+    const ns2b = hasNullableLazy(&root) or hasNullableWithLookAhead(&root);
     // The Pike VM's `look` instruction keeps a pointer to its assertion node, so
     // the root must outlive this frame: a pattern that IS an assertion (`/(?=a)/`)
     // would otherwise bake in a pointer to this function's stack slot.
     const root_ptr = try alloc.create(RegexNode);
     root_ptr.* = root;
-    const prog = if (!br and !hasModifier(&root)) buildProgram(alloc, root_ptr, pp.next_cap - 1) else null;
+    const prog = if (!br and !hasModifier(&root) and !ns2b) buildProgram(alloc, root_ptr, pp.next_cap - 1) else null;
 
     return CompiledRegex{
         .root = root,
@@ -2144,6 +2154,7 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
         .alloc = alloc,
         .has_backref = br,
         .program = prog,
+        .needs_step2b = ns2b,
     };
 }
 
@@ -2151,6 +2162,60 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
 fn isGroupNameChar(c: u8) bool {
     return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
         (c >= '0' and c <= '9') or c == '_' or c == '$' or c >= 0x80;
+}
+
+/// Decode a group-name source slice (the bytes between `(?<` and `>`) into a
+/// normalized UTF-8 identifier by expanding `\uXXXX` and `\u{…}` escape
+/// sequences. Consecutive `\uHigh\uLow` surrogate pairs are folded into a
+/// single astral code point so that `/(?<𝑓>a)/` and `/(?<𝑓>a)/`
+/// produce the same property key on the groups object. Literal UTF-8 bytes
+/// (including multi-byte sequences already in the source) are copied unchanged.
+fn decodeGroupNameId(alloc: std.mem.Allocator, src: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < src.len) {
+        if (src[i] == '\\' and i + 1 < src.len and src[i + 1] == 'u') {
+            i += 2; // skip \u
+            var cp: u21 = 0;
+            if (i < src.len and src[i] == '{') {
+                // \u{HEX…}
+                i += 1; // skip {
+                while (i < src.len and src[i] != '}') {
+                    cp = cp * 16 + (hexVal(src[i]) orelse 0);
+                    i += 1;
+                }
+                if (i < src.len) i += 1; // skip }
+            } else {
+                // \uXXXX — exactly 4 hex digits
+                var k: usize = 0;
+                while (k < 4 and i < src.len) : (k += 1) {
+                    cp = cp * 16 + (hexVal(src[i]) orelse 0);
+                    i += 1;
+                }
+                // Surrogate pair: \uD800-\uDBFF followed immediately by \uDC00-\uDFFF
+                if (cp >= 0xD800 and cp <= 0xDBFF and
+                    i + 5 < src.len and src[i] == '\\' and src[i + 1] == 'u' and src[i + 2] != '{')
+                {
+                    var low: u21 = 0;
+                    var m: usize = 0;
+                    while (m < 4) : (m += 1) {
+                        low = low * 16 + (hexVal(src[i + 2 + m]) orelse 0);
+                    }
+                    if (low >= 0xDC00 and low <= 0xDFFF) {
+                        cp = 0x10000 + (cp - 0xD800) * 0x400 + (low - 0xDC00);
+                        i += 6; // skip \uLow (backslash+u+4digits)
+                    }
+                }
+            }
+            var buf: [4]u8 = undefined;
+            const n = encodeUtf8Cp(@intCast(cp), &buf);
+            try out.appendSlice(alloc, buf[0..n]);
+        } else {
+            try out.append(alloc, src[i]);
+            i += 1;
+        }
+    }
+    return out.items;
 }
 
 /// Pre-scan a pattern for `(?<name>...)` groups, assigning each the 1-based
@@ -2212,7 +2277,9 @@ fn scanGroupNames(alloc: std.mem.Allocator, src: []const u8, total_caps: *u32) !
                     cap += 1;
                     var j = i + 3;
                     while (j < src.len and src[j] != '>') j += 1;
-                    try names.append(alloc, .{ .name = src[i + 3 .. j], .idx = cap });
+                    const raw_name = src[i + 3 .. j];
+                    const decoded_name = try decodeGroupNameId(alloc, raw_name);
+                    try names.append(alloc, .{ .name = decoded_name, .idx = cap });
                     try paths.append(alloc, try alloc.dupe(PathEntry, stack.items));
                     try stack.append(alloc, opened);
                     i = if (j < src.len) j + 1 else j;
@@ -2290,7 +2357,12 @@ pub fn matchAt(
         return cr.pike_vm.?.runAnchored(input, start, &regex.flags);
     }
     var caps = [_]CaptureSpan{INVALID_CAP} ** MAX_CAPTURES;
-    const end_pos = matchNode(&regex.root, input, start, &caps, &regex.flags) orelse return null;
+    match_step2b = regex.needs_step2b;
+    const end_pos = matchNode(&regex.root, input, start, &caps, &regex.flags) orelse {
+        match_step2b = false;
+        return null;
+    };
+    match_step2b = false;
     return MatchState{ .pos = end_pos, .captures = caps };
 }
 
@@ -2476,12 +2548,65 @@ fn atWordBoundary(input: []const u8, pos: usize) bool {
     return before != after;
 }
 
+/// Return the slice of alternatives if `node` is an `alt` (possibly wrapped in
+/// a non-capturing group or a capturing group). Used in the lookbehind loop to
+/// try each alternative independently when the standard matchNode ends at the
+/// wrong position — preventing a high-priority arm (e.g. `^`) from shadowing a
+/// lower-priority arm (e.g. `[ab]`) that would have ended at the target position.
+fn lbAltArms(node: *const RegexNode) ?[]const RegexNode {
+    return switch (node.*) {
+        .alt => |arms| arms,
+        .group => |g| lbAltArms(g.inner),
+        .non_capturing => |inner| lbAltArms(inner),
+        else => null,
+    };
+}
+
+/// Try to match `inner` starting at `j` such that the match ends exactly at
+/// `target`. On success, writes the resulting captures to `out_caps` and returns
+/// true. Extends matchNode by also trying each arm of a top-level alt node
+/// individually (handles priority-shadowing in lookbehind alternations).
+fn lbMatchAt(
+    inner: *const RegexNode,
+    input: []const u8,
+    j: usize,
+    target: usize,
+    out_caps: *[MAX_CAPTURES]CaptureSpan,
+    base_caps: *const [MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+) bool {
+    var tmp = base_caps.*;
+    if (matchNode(inner, input, j, &tmp, flags)) |end| {
+        if (end == target) { out_caps.* = tmp; return true; }
+    }
+    // The standard match ended at the wrong position. Try each arm of a top-level
+    // alt independently — a higher-priority arm may have succeeded at the wrong end.
+    const arms = lbAltArms(inner) orelse return false;
+    for (arms) |*arm| {
+        tmp = base_caps.*;
+        if (matchNode(arm, input, j, &tmp, flags)) |end| {
+            if (end == target) { out_caps.* = tmp; return true; }
+        }
+    }
+    return false;
+}
+
 /// Set while a lookbehind body is being matched: the body may not consume input
 /// beyond the position the lookbehind sits at. The assertion matcher below does
 /// not backtrack, so without this bound a greedy quantifier in `(?<=^\w+)def`
 /// runs to end-of-input and the "must finish exactly here" test never holds.
 /// Cleared while a nested lookahead runs -- that one legitimately reads ahead.
 var lookbehind_limit: ?usize = null;
+
+/// Set before calling matchNode for patterns with `needs_step2b = true`.
+/// When true, matchQuant applies ES §22.2.2.5.1 step 2b: optional (min=0)
+/// iterations that are zero-width discard their captures and try a forced
+/// non-empty retry under `g_force_greedy`.
+var match_step2b: bool = false;
+
+/// Set transiently inside matchQuant's step-2b forced retry so that lazy
+/// quantifiers inside the body act greedily, enabling a non-empty match.
+var g_force_greedy: bool = false;
 
 inline fn withinLookbehind(end: ?usize) ?usize {
     const e = end orelse return null;
@@ -2569,16 +2694,41 @@ fn matchNode(
             const saved_limit = lookbehind_limit;
             lookbehind_limit = pos;
             defer lookbehind_limit = saved_limit;
-            var j: usize = pos + 1;
-            while (j > 0) {
-                j -= 1;
-                var tmp_caps = caps.*;
-                if (matchNode(lb.inner, input, j, &tmp_caps, flags)) |end| {
-                    if (end == pos) {
-                        matched_lb = true;
-                        // A positive lookbehind contributes its captures.
-                        if (!lb.negative) caps.* = tmp_caps;
-                        break;
+            // Phase 1: scan j from 0 upward (leftmost = greedy/longest match).
+            // Standard matchNode respects alternation priority correctly.
+            {
+                var j: usize = 0;
+                while (j <= pos) : (j += 1) {
+                    var tmp_caps = caps.*;
+                    if (matchNode(lb.inner, input, j, &tmp_caps, flags)) |end| {
+                        if (end == pos) {
+                            matched_lb = true;
+                            // A positive lookbehind contributes its captures.
+                            if (!lb.negative) caps.* = tmp_caps;
+                            break;
+                        }
+                    }
+                }
+            }
+            // Phase 2: if still unmatched and inner is a top-level alternation,
+            // try each arm independently across all j values. This handles
+            // priority-shadowing where a higher-priority arm (e.g. `^`, always
+            // zero-width) succeeds at j but ends at the wrong position, masking a
+            // lower-priority arm (e.g. `[ab]`) that ends exactly at pos.
+            if (!matched_lb) {
+                if (lbAltArms(lb.inner)) |arms| {
+                    phase2: for (arms) |*arm| {
+                        var j: usize = 0;
+                        while (j <= pos) : (j += 1) {
+                            var tmp_caps = caps.*;
+                            if (matchNode(arm, input, j, &tmp_caps, flags)) |end| {
+                                if (end == pos) {
+                                    matched_lb = true;
+                                    if (!lb.negative) caps.* = tmp_caps;
+                                    break :phase2;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2652,7 +2802,9 @@ fn matchQuant(
     // RepeatMatcher resets the quantified atom's own captures before every
     // repetition, so an earlier iteration's groups cannot leak into a later one.
     const clear_range = captureRange(inner);
-    if (lazy) {
+    // Under g_force_greedy (step-2b retry), lazy quantifiers act greedy so that
+    // the retry can produce a non-empty match.
+    if (lazy and !g_force_greedy) {
         var count: u32 = 0;
         var pos = start;
 
@@ -2692,6 +2844,24 @@ fn matchQuant(
             count += 1;
             positions[count] = next;
             if (next == pos) {
+                if (count >= min and match_step2b) {
+                    // ES §22.2.2.5.1 step 2b: optional iteration is zero-width.
+                    // Discard its captures and try a forced non-empty retry with
+                    // lazy quants acting greedily.
+                    caps.* = saved_caps;
+                    clearCaptures(caps, clear_range);
+                    const old_force = g_force_greedy;
+                    g_force_greedy = true;
+                    const forced = matchNode(inner, input, pos, caps, flags);
+                    g_force_greedy = old_force;
+                    if (forced != null and forced.? > pos) {
+                        positions[count] = forced.?;
+                        pos = forced.?;
+                        if (count >= 1024 - 1) break;
+                        continue;
+                    }
+                    caps.* = saved_caps; // forced also zero-width or failed
+                }
                 break;
             }
             pos = next;
@@ -2978,6 +3148,95 @@ fn hasModifier(node: *const RegexNode) bool {
         .quant => |q| hasModifier(q.inner),
         .look_ahead => |la| hasModifier(la.inner),
         .look_behind => |lb| hasModifier(lb.inner),
+        else => false,
+    };
+}
+
+/// True if `node` contains a look_ahead (positive or negative).
+fn hasLookAhead(node: *const RegexNode) bool {
+    return switch (node.*) {
+        .look_ahead => true,
+        .seq => |nodes| blk: {
+            for (nodes) |*c| if (hasLookAhead(c)) break :blk true;
+            break :blk false;
+        },
+        .alt => |arms| blk: {
+            for (arms) |*c| if (hasLookAhead(c)) break :blk true;
+            break :blk false;
+        },
+        .group => |g| hasLookAhead(g.inner),
+        .non_capturing => |inner| hasLookAhead(inner),
+        .quant => |q| hasLookAhead(q.inner),
+        .look_behind => |lb| hasLookAhead(lb.inner),
+        .modifier => |m| hasLookAhead(m.inner),
+        else => false,
+    };
+}
+
+/// True if there is a nullable quantifier (min=0) whose body contains a
+/// look_ahead. The Pike VM cannot correctly discard zero-width captures from
+/// such an optional body (step 2b), so these patterns use the backtracking engine.
+fn hasNullableWithLookAhead(node: *const RegexNode) bool {
+    return switch (node.*) {
+        .quant => |q| (q.min == 0 and hasLookAhead(q.inner)) or hasNullableWithLookAhead(q.inner),
+        .seq => |nodes| blk: {
+            for (nodes) |*c| if (hasNullableWithLookAhead(c)) break :blk true;
+            break :blk false;
+        },
+        .alt => |arms| blk: {
+            for (arms) |*c| if (hasNullableWithLookAhead(c)) break :blk true;
+            break :blk false;
+        },
+        .group => |g| hasNullableWithLookAhead(g.inner),
+        .non_capturing => |inner| hasNullableWithLookAhead(inner),
+        .look_ahead => |la| hasNullableWithLookAhead(la.inner),
+        .look_behind => |lb| hasNullableWithLookAhead(lb.inner),
+        .modifier => |m| hasNullableWithLookAhead(m.inner),
+        else => false,
+    };
+}
+
+/// True if `node` contains a lazy quantifier anywhere in its subtree.
+fn hasLazyQuant(node: *const RegexNode) bool {
+    return switch (node.*) {
+        .quant => |q| q.lazy or hasLazyQuant(q.inner),
+        .seq => |nodes| blk: {
+            for (nodes) |*c| if (hasLazyQuant(c)) break :blk true;
+            break :blk false;
+        },
+        .alt => |arms| blk: {
+            for (arms) |*c| if (hasLazyQuant(c)) break :blk true;
+            break :blk false;
+        },
+        .group => |g| hasLazyQuant(g.inner),
+        .non_capturing => |inner| hasLazyQuant(inner),
+        .look_ahead => |la| hasLazyQuant(la.inner),
+        .look_behind => |lb| hasLazyQuant(lb.inner),
+        .modifier => |m| hasLazyQuant(m.inner),
+        else => false,
+    };
+}
+
+/// True if there is a quantifier with optional iterations (min < max) whose
+/// body contains a lazy quantifier. Such patterns need the backtracking engine
+/// with step-2b mode: a zero-width optional iteration forces a non-empty retry
+/// with the lazy quants temporarily acting greedy.
+fn hasNullableLazy(node: *const RegexNode) bool {
+    return switch (node.*) {
+        .quant => |q| (q.min < q.max and hasLazyQuant(q.inner)) or hasNullableLazy(q.inner),
+        .seq => |nodes| blk: {
+            for (nodes) |*c| if (hasNullableLazy(c)) break :blk true;
+            break :blk false;
+        },
+        .alt => |arms| blk: {
+            for (arms) |*c| if (hasNullableLazy(c)) break :blk true;
+            break :blk false;
+        },
+        .group => |g| hasNullableLazy(g.inner),
+        .non_capturing => |inner| hasNullableLazy(inner),
+        .look_ahead => |la| hasNullableLazy(la.inner),
+        .look_behind => |lb| hasNullableLazy(lb.inner),
+        .modifier => |m| hasNullableLazy(m.inner),
         else => false,
     };
 }
