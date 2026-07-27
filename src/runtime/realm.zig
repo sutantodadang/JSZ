@@ -3618,6 +3618,158 @@ fn exactToFixedAbs(arena: std.mem.Allocator, x: f64, f: usize) ![]const u8 {
     return buf.items;
 }
 
+/// round(m * 2^e * 10^k) as a big integer (m ≥ 0), ties toward +∞. Used by the
+/// exact exponential/precision formatters.
+fn exactRoundScaled(arena: std.mem.Allocator, m_int: u64, e: i64, k: i64) !std.math.big.int.Managed {
+    const Managed = std.math.big.int.Managed;
+    var num = try Managed.initSet(arena, m_int);
+    var den = try Managed.initSet(arena, 1);
+    if (k != 0) {
+        // 5^|k|
+        var five_pow = try Managed.initSet(arena, 1);
+        {
+            var five = try Managed.initSet(arena, 5);
+            var tmp = try Managed.init(arena);
+            var kk: usize = @intCast(@abs(k));
+            while (kk > 0) : (kk -= 1) {
+                try tmp.mul(&five_pow, &five);
+                five_pow.swap(&tmp);
+            }
+        }
+        var tmp = try Managed.init(arena);
+        if (k > 0) {
+            try tmp.mul(&num, &five_pow);
+            num.swap(&tmp);
+        } else {
+            try tmp.mul(&den, &five_pow);
+            den.swap(&tmp);
+        }
+    }
+    const two_exp: i64 = e + k;
+    if (two_exp >= 0) {
+        var tmp = try Managed.init(arena);
+        try tmp.shiftLeft(&num, @intCast(two_exp));
+        num.swap(&tmp);
+    } else {
+        var tmp = try Managed.init(arena);
+        try tmp.shiftLeft(&den, @intCast(-two_exp));
+        den.swap(&tmp);
+    }
+    // n = round(num/den), ties up: q = num div den; if 2*rem >= den, q += 1.
+    var q = try Managed.init(arena);
+    var rem = try Managed.init(arena);
+    try q.divTrunc(&rem, &num, &den);
+    var rem2 = try Managed.init(arena);
+    try rem2.shiftLeft(&rem, 1);
+    if (rem2.toConst().order(den.toConst()) != .lt) {
+        var one = try Managed.initSet(arena, 1);
+        var tmp = try Managed.init(arena);
+        try tmp.add(&q, &one);
+        q.swap(&tmp);
+    }
+    return q;
+}
+
+/// Sign of (x − 10^d) for x = m·2^e (m > 0), computed exactly. Returns .lt/.eq/
+/// .gt. Cross-multiplies to a pair of non-negative big integers so no fraction
+/// is ever formed.
+fn compareXvsPow10(arena: std.mem.Allocator, m_int: u64, e: i64, d: i64) !std.math.Order {
+    const Managed = std.math.big.int.Managed;
+    // LHS = m · 2^max(e,0) · 10^max(-d,0);  RHS = 10^max(d,0) · 2^max(-e,0)
+    var lhs = try Managed.initSet(arena, m_int);
+    var rhs = try Managed.initSet(arena, 1);
+    if (e > 0) {
+        var t = try Managed.init(arena);
+        try t.shiftLeft(&lhs, @intCast(e));
+        lhs.swap(&t);
+    } else if (e < 0) {
+        var t = try Managed.init(arena);
+        try t.shiftLeft(&rhs, @intCast(-e));
+        rhs.swap(&t);
+    }
+    const pow10 = struct {
+        fn mul(a: std.mem.Allocator, target: *Managed, n: usize) !void {
+            var ten = try Managed.initSet(a, 10);
+            var tmp = try Managed.init(a);
+            var k: usize = 0;
+            while (k < n) : (k += 1) {
+                try tmp.mul(target, &ten);
+                target.swap(&tmp);
+            }
+        }
+    };
+    if (d < 0) try pow10.mul(arena, &lhs, @intCast(-d));
+    if (d > 0) try pow10.mul(arena, &rhs, @intCast(d));
+    return lhs.toConst().order(rhs.toConst());
+}
+
+/// Exact floor(log10(x)) for a positive finite `x`, seeded by the float estimate
+/// and corrected with exact comparisons (float log10 is off by one for values
+/// just below a power of ten, e.g. the double nearest 1e-21).
+fn floorLog10(arena: std.mem.Allocator, m_int: u64, e: i64, x: f64) !i64 {
+    var d: i64 = @intFromFloat(@floor(std.math.log10(x)));
+    // Ensure 10^d ≤ x.
+    while ((try compareXvsPow10(arena, m_int, e, d)) == .lt) d -= 1;
+    // Ensure x < 10^(d+1).
+    while ((try compareXvsPow10(arena, m_int, e, d + 1)) != .lt) d += 1;
+    return d;
+}
+
+/// Exact significant digits of a positive finite `x`: returns exactly `sig`
+/// decimal digits (10^(sig-1) ≤ n < 10^sig) plus the base-10 exponent of the
+/// leading digit. Ties round toward +∞.
+fn exactSignificant(arena: std.mem.Allocator, x: f64, sig: usize) !struct { digits: []const u8, exp: i64 } {
+    const bits: u64 = @bitCast(x);
+    const raw_exp: u64 = (bits >> 52) & 0x7FF;
+    const raw_frac: u64 = bits & 0xFFFFFFFFFFFFF;
+    var m_int: u64 = undefined;
+    var e2: i64 = undefined;
+    if (raw_exp == 0) {
+        m_int = raw_frac;
+        e2 = -1074;
+    } else {
+        m_int = raw_frac | (@as(u64, 1) << 52);
+        e2 = @as(i64, @intCast(raw_exp)) - 1075;
+    }
+    // Exact decimal exponent, then correct for a rounding carry into the next
+    // decade below.
+    var edec: i64 = try floorLog10(arena, m_int, e2, x);
+    var attempts: usize = 0;
+    while (attempts < 4) : (attempts += 1) {
+        const k: i64 = @as(i64, @intCast(sig - 1)) - edec;
+        var n = try exactRoundScaled(arena, m_int, e2, k);
+        const digits = try n.toConst().toStringAlloc(arena, 10, .lower);
+        if (digits.len == sig) {
+            return .{ .digits = digits, .exp = edec };
+        } else if (digits.len == sig + 1) {
+            // Rounding carried into an extra digit (…→10^sig): drop the trailing
+            // 0 and bump the exponent.
+            return .{ .digits = digits[0..sig], .exp = edec + 1 };
+        } else if (digits.len < sig) {
+            edec -= 1;
+        } else {
+            edec += 1;
+        }
+    }
+    // Fallback (should not happen): pad/truncate to sig digits at the estimate.
+    const k: i64 = @as(i64, @intCast(sig - 1)) - edec;
+    var n = try exactRoundScaled(arena, m_int, e2, k);
+    const digits = try n.toConst().toStringAlloc(arena, 10, .lower);
+    return .{ .digits = digits, .exp = edec };
+}
+
+/// Format `edec` as the `e±N` exponent suffix (no leading zeros).
+fn appendExpSuffix(arena: std.mem.Allocator, buf: *std.ArrayList(u8), edec: i64) !void {
+    try buf.append(arena, 'e');
+    if (edec >= 0) {
+        try buf.append(arena, '+');
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(edec))}));
+    } else {
+        try buf.append(arena, '-');
+        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(-edec))}));
+    }
+}
+
 fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toFixed requires a Number");
     // f = ToIntegerOrInfinity(fractionDigits): ToNumber throws TypeError for
@@ -3677,20 +3829,29 @@ fn numberToExponentialImpl(arena: std.mem.Allocator, n: f64, f: i64) ![]const u8
             if (end > 0 and full[end - 1] == '.') end -= 1;
         }
         try buf.appendSlice(arena, full[0..end]);
-    } else {
-        const fu: usize = @intCast(f);
-        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ mant, fu }));
+        try appendExpSuffix(arena, &buf, exp);
+        return buf.items;
     }
 
-    // Exponent: e+N or e-N, no leading zeros
-    try buf.append(arena, 'e');
-    if (exp >= 0) {
-        try buf.append(arena, '+');
-        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(exp))}));
-    } else {
-        try buf.append(arena, '-');
-        try buf.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@as(u64, @intCast(-exp))}));
+    // Fixed fractionDigits: emit exactly f+1 significant digits (d.ddd…) using
+    // the exact decimal value of the double.
+    const fu: usize = @intCast(f);
+    if (abs_n == 0.0) {
+        try buf.append(arena, '0');
+        if (fu > 0) {
+            try buf.append(arena, '.');
+            try buf.appendNTimes(arena, '0', fu);
+        }
+        try appendExpSuffix(arena, &buf, 0);
+        return buf.items;
     }
+    const sd = try exactSignificant(arena, abs_n, fu + 1);
+    try buf.append(arena, sd.digits[0]);
+    if (fu > 0) {
+        try buf.append(arena, '.');
+        try buf.appendSlice(arena, sd.digits[1..]);
+    }
+    try appendExpSuffix(arena, &buf, sd.exp);
     return buf.items;
 }
 
@@ -3728,20 +3889,46 @@ fn nativeNumberToPrecision(arena: std.mem.Allocator, this_val: Value, args: []co
     if (!std.math.isFinite(n)) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     if (p_int < 1 or p_int > 100) return throwRangeError(arena, "toPrecision() argument must be between 1 and 100");
     const p: i64 = @intFromFloat(p_int);
+    const pu: usize = @intCast(p);
     const abs_n = @abs(n);
-    // -0 formats without a sign (ES: the "-" prefix is added only when x < 0).
-    const nf: f64 = if (abs_n == 0.0) 0.0 else n;
-    // e = floor(log10(|n|)), 0 for n == 0
-    const e: i64 = if (abs_n == 0.0) 0 else @as(i64, @intFromFloat(@floor(std.math.log10(abs_n))));
-    if (e >= p or e < -6) {
-        // Exponential form: p-1 fraction digits
-        return val_mod.makeString(arena, try numberToExponentialImpl(arena, nf, p - 1));
-    } else {
-        // Fixed form: p-1-e fraction digits
-        const frac: i64 = p - 1 - e;
-        const fu: usize = if (frac < 0) 0 else @intCast(frac);
-        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ nf, fu }));
+    const negative = n < 0.0 and abs_n != 0.0;
+    var buf = std.ArrayList(u8){};
+    if (negative) try buf.append(arena, '-');
+    // Zero: "0" / "0.000…" with p-1 fraction digits (e = 0, never exponential).
+    if (abs_n == 0.0) {
+        try buf.append(arena, '0');
+        if (pu > 1) {
+            try buf.append(arena, '.');
+            try buf.appendNTimes(arena, '0', pu - 1);
+        }
+        return val_mod.makeString(arena, buf.items);
     }
+    // Exact p significant digits + the base-10 exponent of the leading digit.
+    const sd = try exactSignificant(arena, abs_n, pu);
+    const e = sd.exp;
+    if (e < -6 or e >= p) {
+        // Exponential form: d.ddd…e±e with p-1 fraction digits.
+        try buf.append(arena, sd.digits[0]);
+        if (pu > 1) {
+            try buf.append(arena, '.');
+            try buf.appendSlice(arena, sd.digits[1..]);
+        }
+        try appendExpSuffix(arena, &buf, e);
+    } else if (e >= 0) {
+        // Fixed, |x| ≥ 1: e+1 integer digits, remaining p-1-e as the fraction.
+        const int_len: usize = @intCast(e + 1);
+        try buf.appendSlice(arena, sd.digits[0..int_len]);
+        if (int_len < pu) {
+            try buf.append(arena, '.');
+            try buf.appendSlice(arena, sd.digits[int_len..]);
+        }
+    } else {
+        // Fixed, |x| < 1: 0.<zeros><digits> with (-e-1) leading fraction zeros.
+        try buf.appendSlice(arena, "0.");
+        try buf.appendNTimes(arena, '0', @intCast(-e - 1));
+        try buf.appendSlice(arena, sd.digits);
+    }
+    return val_mod.makeString(arena, buf.items);
 }
 
 /// ES Number.isInteger / isFinite / isNaN / isSafeInteger: no coercion — a
