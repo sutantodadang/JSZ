@@ -2428,8 +2428,17 @@ pub fn nativeObjectGetOwnPropertySymbols(arena: std.mem.Allocator, _: Value, arg
     // ToObject(O): undefined/null throw TypeError; other primitives box → no symbols → [].
     if (args.len == 0 or args[0].isNullish())
         return throwTypeError(arena, "Cannot convert undefined or null to object");
-    if (args[0].unbox() != .object) return val_mod.makeObject(arena, arr);
-    const obj = args[0].toPtr().object;
+    // A callable (function / class constructor) IS an object; its own symbol
+    // keys live on its lazily-created backing object (e.g. a class's static
+    // `[sym]()` methods). Resolve it like the string-key reflection paths do.
+    const obj: *JsObject = switch (args[0].unbox()) {
+        .object => args[0].toPtr().object,
+        .bc_function, .function, .native_function => if (realm_mod.active_context) |ctx|
+            ((try ctx.backingObject(arena, args[0])) orelse return val_mod.makeObject(arena, arr))
+        else
+            return val_mod.makeObject(arena, arr),
+        else => return val_mod.makeObject(arena, arr),
+    };
     // import-defer: [[OwnPropertyKeys]] triggers evaluation; it also clears the
     // internal deferred-id symbol so it does not leak as an own symbol key.
     if (obj.internal_kind == .module_namespace) try namespace_mod.triggerAll(arena, obj);

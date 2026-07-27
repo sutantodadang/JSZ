@@ -628,10 +628,16 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
         arr.array_length = idx;
         return val_mod.makeObject(arena, arr);
     }
-    if (!isObj(args[0])) {
-        return val_mod.makeObject(arena, arr);
-    }
-    const obj = args[0].toPtr().object;
+    // A class constructor / ordinary function value keeps its own keys (incl.
+    // static `[sym]()` methods and length/name/prototype) on its backing object.
+    const obj: *JsObject = switch (args[0].unbox()) {
+        .object => args[0].toPtr().object,
+        .bc_function, .function => if (realm_mod.active_context) |ctx|
+            ((try ctx.backingObject(arena, args[0])) orelse return val_mod.makeObject(arena, arr))
+        else
+            return val_mod.makeObject(arena, arr),
+        else => return val_mod.makeObject(arena, arr),
+    };
 
     // Proxy [[OwnPropertyKeys]]: dispatch the `ownKeys` trap (all keys, strings
     // and symbols) or forward to the target — never the proxy's own slots.
