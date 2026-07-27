@@ -451,7 +451,14 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
         // (which it interleaves with) rather than as a member.
         if (is_static and p.check(.left_brace)) {
             const block = parseStaticBlockBody(p) orelse return null;
-            fields.append(p.arena, .{ .is_static = true, .static_block = block }) catch {
+            fields.append(p.arena, .{
+                .is_static = true,
+                .static_block = block,
+                // A `super.x` inside the block reads through the class's own
+                // [[Prototype]] (home object = the constructor), so it needs the
+                // same `__sproto__`/`__superthis` binding a static field gets.
+                .uses_super_prop = p.super_prop_count != super_mark,
+            }) catch {
                 p.had_error = true;
                 return null;
             };
@@ -1186,6 +1193,9 @@ fn manglePrivateNames(p: *Parser, parsed: *ClassBodyParse) bool {
         if (f.computed_key == null) f.name = rw.map(f.name);
         rw.walkOpt(f.computed_key);
         rw.walkOpt(f.init);
+        // A static initialization block shares the class's PrivateEnvironment, so
+        // `#x` inside it resolves to the same mangled key as the members do.
+        if (f.static_block) |sb| for (sb) |st| rw.walk(st);
     }
     for (parsed.members) |*m| {
         if (m.computed_key == null) m.name = rw.map(m.name);
@@ -1355,10 +1365,21 @@ fn makeStaticFieldInit(p: *Parser, class_name: []const u8, super_name: ?[]const 
     // static field, but the block's whole statement list is the body and there
     // is nothing to assign. `(function () { <body> }).call(ClassName);`
     if (f.static_block) |block| {
+        // `super.x` in a static block reads through the class's [[Prototype]]
+        // (its home object is the constructor). Bind `__sproto__` (property base)
+        // and `__superthis` (= `this`, the class) ahead of the block body, the
+        // same shape a static field with super uses.
+        const blk_body: []*Node = if (!f.uses_super_prop) block else blk: {
+            var stmts = std.ArrayList(*Node){};
+            stmts.append(p.arena, superProtoDecl(p, class_name, super_name, true) orelse return null) catch return null;
+            stmts.append(p.arena, superThisDecl(p) orelse return null) catch return null;
+            stmts.appendSlice(p.arena, block) catch return null;
+            break :blk stmts.items;
+        };
         const blk_fn = p.makeNode(.function_expr, s, s, .{ .function_expr = .{
             .name = null,
             .params = &[_][]const u8{},
-            .body = block,
+            .body = blk_body,
             .is_arrow = false,
         } }) orelse return null;
         const blk_call_member = nodeMember(p, blk_fn, "call") orelse return null;
