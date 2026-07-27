@@ -436,6 +436,13 @@ fn parseClassMembers(p: *Parser) ?ClassBodyParse {
     // constructor parsed here is legal even when the surrounding code is eval.
     p.class_body_depth += 1;
     defer p.class_body_depth -= 1;
+    // All parts of a class body are strict mode code (§11.2.2), regardless of a
+    // "use strict" directive or the surrounding code's mode — so method/field/
+    // static-block bodies and the SuperProperty-assignment `strict` flag are all
+    // parsed strict. The heritage expression is parsed before this (sloppy-safe).
+    const saved_strict = p.strict;
+    p.strict = true;
+    defer p.strict = saved_strict;
     var res = ClassBodyParse{};
     var members = std.ArrayList(ClassMember){};
     var fields = std.ArrayList(ClassField){};
@@ -1727,6 +1734,8 @@ fn emitClassMember(p: *Parser, class_name: []const u8, super_name: ?[]const u8, 
         .body = body,
         .is_arrow = false,
         .is_method = true,
+        // Class member bodies are always strict mode code (§11.2.2).
+        .is_strict = true,
         .is_generator = m.is_generator,
         .is_async = m.is_async,
         .source_text = p.sourceSlice(m.src_start, m.src_end),
