@@ -750,7 +750,13 @@ fn emitTemplateLiteralSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8),
         switch (ch) {
             '"' => try out.appendSlice(arena, "\\\""),
             '\n' => try out.appendSlice(arena, "\\n"),
-            '\r' => try out.appendSlice(arena, "\\r"),
+            // §12.8.6 TRV: <CR> and <CR><LF> both normalize to a single LF in a
+            // template's cooked (and raw) value. Collapse a raw CRLF; map a lone
+            // raw CR to LF too.
+            '\r' => {
+                try out.appendSlice(arena, "\\n");
+                if (i + 1 < segment.len and segment[i + 1] == '\n') i += 1;
+            },
             '\\' => try out.appendSlice(arena, "\\\\"), // a lone trailing backslash
             else => try out.append(arena, ch),
         }
@@ -836,12 +842,19 @@ fn slashStartsRegex(source: []const u8, slash_idx: usize) bool {
 /// backslash is doubled so escape sequences survive uncooked (for `.raw`).
 fn emitRawSegment(arena: std.mem.Allocator, out: *std.ArrayList(u8), segment: []const u8) !void {
     try out.append(arena, '"');
-    for (segment) |ch| {
+    var i: usize = 0;
+    while (i < segment.len) : (i += 1) {
+        const ch = segment[i];
         switch (ch) {
             '\\' => try out.appendSlice(arena, "\\\\"),
             '"' => try out.appendSlice(arena, "\\\""),
             '\n' => try out.appendSlice(arena, "\\n"),
-            '\r' => try out.appendSlice(arena, "\\r"),
+            // §12.8.6 TRV normalizes a raw <CR> / <CR><LF> line terminator to a
+            // single LF (0x000A) in `.raw`, just as in the cooked value.
+            '\r' => {
+                try out.appendSlice(arena, "\\n");
+                if (i + 1 < segment.len and segment[i + 1] == '\n') i += 1;
+            },
             else => try out.append(arena, ch),
         }
     }
