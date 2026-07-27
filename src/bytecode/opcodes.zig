@@ -408,6 +408,15 @@ pub const Op = enum(u8) {
     /// closures never see body `var` bindings. Never paired with an EXIT — the
     /// frame is discarded on return. Declared last (JIT ordinal stability).
     PUSH_VAR_ENV,
+    /// DEFINE_GLOBAL_FN | 4 | op, Kname u16-LE, Rsrc u8. Like DEFINE_GLOBAL, but
+    /// for a top-level *function* declaration in Script or eval code. When the
+    /// binding lands on the global object and a same-named own property already
+    /// exists, CreateGlobalFunctionBinding (§10.1.1.4.18) fully *redefines* that
+    /// property to { writable: true, enumerable: true, configurable: D } when
+    /// the existing one is configurable — unlike CreateGlobalVarBinding (plain
+    /// DEFINE_GLOBAL), which leaves an existing property's attributes intact.
+    /// Declared last (JIT ordinal stability).
+    DEFINE_GLOBAL_FN,
 };
 
 /// Returns the number of bytes an encoded instruction occupies (op byte + operands).
@@ -512,6 +521,7 @@ pub fn instrSize(op: Op) usize {
         .MARK_FIELD_EVAL => 1,
         .SET_PROTO => 3,
         .PUSH_VAR_ENV => 1,
+        .DEFINE_GLOBAL_FN => 4,
         .TO_PROPERTY_KEY => 2,
         .DEFINE_LOCAL => 4,
         .DEFINE_DATA => 5,

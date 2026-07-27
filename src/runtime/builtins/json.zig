@@ -967,9 +967,17 @@ const JsonParser = struct {
         }
         if (self.peek() == '.') {
             self.pos += 1;
+            // JSONFraction = "." 1*DIGIT — at least one digit is required, so
+            // `1.` and `1.e3` are SyntaxErrors (unlike JS numeric literals).
+            var frac_digits: usize = 0;
             while (self.peek()) |dd| {
-                if (dd >= '0' and dd <= '9') self.pos += 1 else break;
+                if (dd >= '0' and dd <= '9') {
+                    self.pos += 1;
+                    frac_digits += 1;
+                } else break;
             }
+            if (frac_digits == 0)
+                return throwSyntaxError(self.arena, "JSON.parse: invalid number");
         }
         if (self.peek()) |e| {
             if (e == 'e' or e == 'E') {
@@ -977,9 +985,16 @@ const JsonParser = struct {
                 if (self.peek()) |pm| {
                     if (pm == '+' or pm == '-') self.pos += 1;
                 }
+                // JSONExponent = ("e"/"E") ["+"/"-"] 1*DIGIT — at least one digit.
+                var exp_digits: usize = 0;
                 while (self.peek()) |dd| {
-                    if (dd >= '0' and dd <= '9') self.pos += 1 else break;
+                    if (dd >= '0' and dd <= '9') {
+                        self.pos += 1;
+                        exp_digits += 1;
+                    } else break;
                 }
+                if (exp_digits == 0)
+                    return throwSyntaxError(self.arena, "JSON.parse: invalid number");
             }
         }
         const num_str = self.src[start..self.pos];

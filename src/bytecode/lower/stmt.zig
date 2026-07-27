@@ -289,7 +289,7 @@ fn lowerFunctionDeclInto(self: *FnCompiler, node: *Node, last_expr_reg: *?u8, lo
     try self.emitU8(r);
     try self.emitU16(child_idx);
     // Phase 4d: function declarations are var-like bindings; use DEFINE_GLOBAL.
-    if (local) try self.emitDefineLocal(fd.name, r, line) else try self.emitDefine(fd.name, r, line);
+    if (local) try self.emitDefineLocal(fd.name, r, line) else try self.emitDefineFn(fd.name, r, line);
     self.freeReg();
 }
 
