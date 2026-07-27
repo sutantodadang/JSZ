@@ -156,7 +156,6 @@ built-ins/RegExp/S15.10.2.8_A3_T14.js
 built-ins/RegExp/S15.10.2.8_A3_T15.js
 built-ins/RegExp/S15.10.2.8_A3_T8.js
 built-ins/RegExp/S15.10.2.8_A3_T9.js
-built-ins/RegExp/character-class-escape-non-whitespace-u180e.js
 built-ins/RegExp/character-class-escape-non-whitespace.js
 built-ins/RegExp/dotall/with-dotall.js
 built-ins/RegExp/dotall/without-dotall.js
@@ -167,10 +166,8 @@ built-ins/RegExp/lookahead-quantifier-match-groups.js
 built-ins/RegExp/match-indices/indices-array-unicode-match.js
 built-ins/RegExp/match-indices/indices-array-unicode-property-names.js
 built-ins/RegExp/named-groups/lookbehind.js
-built-ins/RegExp/named-groups/non-unicode-property-names-invalid.js
 built-ins/RegExp/named-groups/non-unicode-property-names-valid.js
 built-ins/RegExp/named-groups/non-unicode-property-names.js
-built-ins/RegExp/named-groups/unicode-property-names-invalid.js
 built-ins/RegExp/named-groups/unicode-property-names-valid.js
 built-ins/RegExp/named-groups/unicode-property-names.js
 built-ins/RegExp/nullable-quantifier.js
