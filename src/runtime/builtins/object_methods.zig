@@ -1355,7 +1355,7 @@ pub fn nativeObjectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []co
         // is a bc_function value; its static members live on a lazily-created
         // backing object. Resolve to that so the constructor static chain links
         // (needed for multi-level subclasses: @@species etc. inherit through it).
-        .bc_function, .function => if (@import("../realm.zig").active_context) |ctx|
+        .bc_function, .function, .native_function => if (@import("../realm.zig").active_context) |ctx|
             (try ctx.backingObject(arena, proto_arg))
         else
             null,
