@@ -2529,6 +2529,49 @@ fn atWordBoundary(input: []const u8, pos: usize) bool {
     return before != after;
 }
 
+/// Return the slice of alternatives if `node` is an `alt` (possibly wrapped in
+/// a non-capturing group or a capturing group). Used in the lookbehind loop to
+/// try each alternative independently when the standard matchNode ends at the
+/// wrong position — preventing a high-priority arm (e.g. `^`) from shadowing a
+/// lower-priority arm (e.g. `[ab]`) that would have ended at the target position.
+fn lbAltArms(node: *const RegexNode) ?[]const RegexNode {
+    return switch (node.*) {
+        .alt => |arms| arms,
+        .group => |g| lbAltArms(g.inner),
+        .non_capturing => |inner| lbAltArms(inner),
+        else => null,
+    };
+}
+
+/// Try to match `inner` starting at `j` such that the match ends exactly at
+/// `target`. On success, writes the resulting captures to `out_caps` and returns
+/// true. Extends matchNode by also trying each arm of a top-level alt node
+/// individually (handles priority-shadowing in lookbehind alternations).
+fn lbMatchAt(
+    inner: *const RegexNode,
+    input: []const u8,
+    j: usize,
+    target: usize,
+    out_caps: *[MAX_CAPTURES]CaptureSpan,
+    base_caps: *const [MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+) bool {
+    var tmp = base_caps.*;
+    if (matchNode(inner, input, j, &tmp, flags)) |end| {
+        if (end == target) { out_caps.* = tmp; return true; }
+    }
+    // The standard match ended at the wrong position. Try each arm of a top-level
+    // alt independently — a higher-priority arm may have succeeded at the wrong end.
+    const arms = lbAltArms(inner) orelse return false;
+    for (arms) |*arm| {
+        tmp = base_caps.*;
+        if (matchNode(arm, input, j, &tmp, flags)) |end| {
+            if (end == target) { out_caps.* = tmp; return true; }
+        }
+    }
+    return false;
+}
+
 /// Set while a lookbehind body is being matched: the body may not consume input
 /// beyond the position the lookbehind sits at. The assertion matcher below does
 /// not backtrack, so without this bound a greedy quantifier in `(?<=^\w+)def`
@@ -2632,16 +2675,41 @@ fn matchNode(
             const saved_limit = lookbehind_limit;
             lookbehind_limit = pos;
             defer lookbehind_limit = saved_limit;
-            var j: usize = pos + 1;
-            while (j > 0) {
-                j -= 1;
-                var tmp_caps = caps.*;
-                if (matchNode(lb.inner, input, j, &tmp_caps, flags)) |end| {
-                    if (end == pos) {
-                        matched_lb = true;
-                        // A positive lookbehind contributes its captures.
-                        if (!lb.negative) caps.* = tmp_caps;
-                        break;
+            // Phase 1: scan j from 0 upward (leftmost = greedy/longest match).
+            // Standard matchNode respects alternation priority correctly.
+            {
+                var j: usize = 0;
+                while (j <= pos) : (j += 1) {
+                    var tmp_caps = caps.*;
+                    if (matchNode(lb.inner, input, j, &tmp_caps, flags)) |end| {
+                        if (end == pos) {
+                            matched_lb = true;
+                            // A positive lookbehind contributes its captures.
+                            if (!lb.negative) caps.* = tmp_caps;
+                            break;
+                        }
+                    }
+                }
+            }
+            // Phase 2: if still unmatched and inner is a top-level alternation,
+            // try each arm independently across all j values. This handles
+            // priority-shadowing where a higher-priority arm (e.g. `^`, always
+            // zero-width) succeeds at j but ends at the wrong position, masking a
+            // lower-priority arm (e.g. `[ab]`) that ends exactly at pos.
+            if (!matched_lb) {
+                if (lbAltArms(lb.inner)) |arms| {
+                    phase2: for (arms) |*arm| {
+                        var j: usize = 0;
+                        while (j <= pos) : (j += 1) {
+                            var tmp_caps = caps.*;
+                            if (matchNode(arm, input, j, &tmp_caps, flags)) |end| {
+                                if (end == pos) {
+                                    matched_lb = true;
+                                    if (!lb.negative) caps.* = tmp_caps;
+                                    break :phase2;
+                                }
+                            }
+                        }
                     }
                 }
             }
