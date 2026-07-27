@@ -299,7 +299,7 @@ fn sameValueV(x: Value, y: Value) bool {
 pub fn proxyGetInvariant(arena: std.mem.Allocator, target: Value, key: Value, trap_result: Value) anyerror!void {
     if (target.bits == 0 or target.unbox() != .object) return;
     if (target.toPtr().object.internal_kind == .proxy) return;
-    const td = targetDescOf(target, key) orelse return;
+    const td = targetDescOf(arena, target, key) orelse return;
     if (td.configurable) return;
     if (td.isData() and !td.writable) {
         if (!sameValueV(trap_result, td.value))
@@ -375,7 +375,7 @@ pub fn proxyDefineProperty(arena: std.mem.Allocator, proxy_obj: *JsObject, key: 
 
     // Invariant enforcement (spec 10.5.6 steps 12-16).
     const desc = if (desc_obj.bits != 0 and desc_obj.unbox() == .object) toPropDesc(desc_obj) else PDesc{};
-    const target_desc = targetDescOf(target, key);
+    const target_desc = targetDescOf(arena, target, key);
     const extensible = try isExtensibleValue(arena, target);
     const setting_config_false = desc.has_configurable and !desc.configurable;
     if (target_desc == null) {
@@ -424,7 +424,7 @@ pub fn proxyGetOwnPropertyDescriptor(arena: std.mem.Allocator, proxy_obj: *JsObj
     if (target.bits != 0 and target.unbox() == .object and target.toPtr().object.internal_kind == .proxy)
         return if (res_is_obj) res else try val_mod.makeUndefined(arena);
 
-    const target_desc = targetDescOf(target, key);
+    const target_desc = targetDescOf(arena, target, key);
 
     if (res_is_undef) {
         if (target_desc == null) return try val_mod.makeUndefined(arena);
@@ -513,9 +513,8 @@ fn toPropDesc(obj_val: Value) PDesc {
 
 /// Concrete own-property descriptor of a (non-proxy) target, or null if absent.
 /// All present fields are marked `has_* = true`.
-fn targetDescOf(target: Value, key: Value) ?PDesc {
-    if (target.bits == 0 or target.unbox() != .object) return null;
-    const t = target.toPtr().object;
+fn targetDescOf(arena: std.mem.Allocator, target: Value, key: Value) ?PDesc {
+    const t = targetBackingObj(arena, target) orelse return null;
     var d = PDesc{ .has_enumerable = true, .has_configurable = true };
     if (key.bits != 0 and key.unbox() == .symbol) {
         const sp = t.getOwnSymEntry(key) orelse return null;
@@ -616,9 +615,27 @@ pub fn throwTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror {
 
 /// IsExtensible(target) that dispatches a proxy target's own isExtensible trap
 /// (so nested proxies observe the invariant call), else reads the flag.
+/// The *JsObject a proxy target denotes. A callable (function / class ctor) is
+/// an Object: resolve its lazily-materialized backing object so invariant checks
+/// over a function target (e.g. `new Proxy(function(){}, …)`) see real
+/// length/name descriptors and extensibility. Null for a primitive / native fn
+/// without a backing object.
+fn targetBackingObj(arena: std.mem.Allocator, v: Value) ?*JsObject {
+    if (v.bits == 0) return null;
+    return switch (v.unbox()) {
+        .object => v.toPtr().object,
+        .bc_function, .function => if (realm_mod.active_context) |ctx|
+            (ctx.backingObject(arena, v) catch null)
+        else
+            null,
+        else => null,
+    };
+}
+
 fn isExtensibleValue(arena: std.mem.Allocator, v: Value) anyerror!bool {
-    if (v.bits == 0 or v.unbox() != .object) return false;
-    const o = v.toPtr().object;
+    const o = targetBackingObj(arena, v) orelse
+        // A native function with no backing object is still an extensible object.
+        return v.bits != 0 and v.unbox() == .native_function;
     if (o.internal_kind == .proxy) {
         if (try proxyIsExtensible(arena, o)) |b| return b;
         if (proxyTarget(o)) |t| return isExtensibleValue(arena, t);
