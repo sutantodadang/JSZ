@@ -119,7 +119,11 @@ fn wallNs(dt: ISODateTime) i128 {
 /// Read a time-zone-like value into a Zone. Only string identifiers are
 /// accepted (non-strings throw TypeError, matching the spec).
 /// When `epoch_ns` is provided, uses `toZoneAtInstant` for DST-aware lookup.
-fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128) !timezone.Zone {
+/// `strict` selects the constructor's `ParseTimeZoneIdentifier` (a *bare*
+/// identifier only) over the more lenient `ToTemporalTimeZoneIdentifier` used by
+/// `from` / `withTimeZone` / property bags, which also accepts a full datetime
+/// string and takes the zone from its offset or `[tz]` bracket.
+fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128, strict: bool) !timezone.Zone {
     if (v.bits == 0) return realm_mod.throwTypeError(arena, "time zone must be a string");
     // A Temporal.ZonedDateTime stands in for its own [[TimeZone]]
     // (ToTemporalTimeZoneIdentifier).
@@ -129,9 +133,8 @@ fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128) !timezone.Zon
     }
     switch (v.unbox()) {
         .string => |s| {
-            if (epoch_ns) |ns| {
-                return timezone.toZoneAtInstant(arena, s, ns);
-            }
+            if (strict) return timezone.toZoneIdentifier(arena, s, epoch_ns);
+            if (epoch_ns) |ns| return timezone.toZoneAtInstant(arena, s, ns);
             return timezone.toZone(arena, s);
         },
         .undefined_, .null_, .boolean, .number, .bigint, .symbol => return realm_mod.throwTypeError(arena, "time zone must be a string"),
@@ -157,7 +160,7 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (ns_arg.bits == 0 or ns_arg.unbox() != .bigint) return realm_mod.throwTypeError(arena, "epochNanoseconds must be a BigInt");
     const ns = shared.bigIntToI128(ns_arg) orelse return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
     if (!isValidEpochNs(ns)) return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
-    const zone = try toTimeZone(arena, if (args.len > 1) args[1] else Value{}, ns);
+    const zone = try toTimeZone(arena, if (args.len > 1) args[1] else Value{}, ns, true);
     const cal = if (args.len > 2) try resolveCtorCalendar(arena, args[2]) else .iso8601;
     const z = ZonedDT{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = cal };
     if (this_val.bits != 0 and this_val.unbox() == .object) return installInto(arena, this_val, z);
@@ -276,7 +279,7 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
 
     // timeZone is required (a present-but-undefined value reads as absent).
     const tz_v = bag.time_zone orelse return realm_mod.throwTypeError(arena, "missing timeZone");
-    const zone = try toTimeZone(arena, tz_v, null);
+    const zone = try toTimeZone(arena, tz_v, null, false);
 
     // An offset given as a field is an "option"-behaviour offset; absent is "wall".
     var so = StringOffset{ .behaviour = .wall };
@@ -686,15 +689,32 @@ fn getHoursInDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
 const DaySpan = struct { start: i128, end: i128, len: i128 };
 
 fn daySpan(arena: std.mem.Allocator, z: *const ZonedDT) !DaySpan {
+    return daySpanImpl(arena, z, false);
+}
+
+/// `daySpan` that surfaces GetStartOfDay's range failure (for `round` day
+/// rounding and `hoursInDay`, per the spec); the plain variant is used by the
+/// difference nudge, which must not throw at the representable boundary.
+fn daySpanChecked(arena: std.mem.Allocator, z: *const ZonedDT) !DaySpan {
+    return daySpanImpl(arena, z, true);
+}
+
+fn daySpanImpl(arena: std.mem.Allocator, z: *const ZonedDT, checked: bool) !DaySpan {
     const date = localDT(z).date;
-    const start = try startOfDay(arena, z.tz, z.offset_ns, date);
     const next = shared.balanceISODate(date.year, date.month, @as(i32, date.day) + 1);
-    const end = try startOfDay(arena, z.tz, z.offset_ns, next);
+    const start = if (checked)
+        try startOfDayChecked(arena, z.tz, z.offset_ns, date)
+    else
+        try startOfDay(arena, z.tz, z.offset_ns, date);
+    const end = if (checked)
+        try startOfDayChecked(arena, z.tz, z.offset_ns, next)
+    else
+        try startOfDay(arena, z.tz, z.offset_ns, next);
     return .{ .start = start, .end = end, .len = end - start };
 }
 
 fn dayLength(arena: std.mem.Allocator, z: *const ZonedDT) !i128 {
-    return (try daySpan(arena, z)).len;
+    return (try daySpanChecked(arena, z)).len;
 }
 
 /// ISO week-numbering year for a date.
@@ -730,7 +750,7 @@ pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, _: []con
 
 pub fn nativeWithTimeZone(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const zone = try toTimeZone(arena, if (args.len > 0) args[0] else Value{}, z.ns);
+    const zone = try toTimeZone(arena, if (args.len > 0) args[0] else Value{}, z.ns, false);
     return makeZoned(arena, .{ .ns = z.ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = z.calendar });
 }
 
@@ -1070,11 +1090,16 @@ pub fn nativeStartOfDay(arena: std.mem.Allocator, this_val: Value, _: []const Va
 /// 1919-03-31T00:30), and then the day begins at the transition — which is
 /// *earlier* than what "compatible" disambiguation would pick.
 pub fn startOfDay(arena: std.mem.Allocator, tz: []const u8, fixed: i128, date: shared.ISODate) !i128 {
+    _ = arena;
     const wall = wallNs(.{ .date = date, .time = .{} });
-    const ns = startOfDayRaw(tz, fixed, wall);
-    // GetStartOfDay feeds DisambiguatePossibleEpochNanoseconds, which rejects an
-    // instant outside the representable range — reachable when the day's midnight
-    // in this zone falls just past the epoch-nanoseconds limit.
+    return startOfDayRaw(tz, fixed, wall);
+}
+
+/// GetStartOfDay with the DisambiguatePossibleEpochNanoseconds range gate: used
+/// where the spec surfaces the failure — day rounding and `hoursInDay` — but not
+/// in the difference nudge, whose day-length probe tolerates a boundary day.
+fn startOfDayChecked(arena: std.mem.Allocator, tz: []const u8, fixed: i128, date: shared.ISODate) !i128 {
+    const ns = try startOfDay(arena, tz, fixed, date);
     if (!isValidEpochNs(ns)) return realm_mod.throwRangeError(arena, "start of day is outside the representable range");
     return ns;
 }
@@ -1164,7 +1189,9 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     else if (shared.maximumRoundingIncrement(smallest.?)) |maxv|
         try shared.validateRoundingIncrement(arena, inc, maxv, false);
 
-    const span = try daySpan(arena, z);
+    // Day rounding must reject a boundary day whose start/end escapes the range
+    // (GetStartOfDay); a time-unit round only needs the day length to fold.
+    const span = if (smallest.? == .day) try daySpanChecked(arena, z) else try daySpan(arena, z);
     const day_start_ns = span.start;
     const day_len = span.len;
     const since_start = z.ns - day_start_ns;
