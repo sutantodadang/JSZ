@@ -45,7 +45,13 @@ fn isObj(v: Value) bool {
     if (v.bits == 0) return false;
     // Must be a real heap pointer; SMIs and immediates are not objects.
     if (!v.isHeapPtr()) return false;
-    return v.toPtr().* == .object;
+    // Functions are objects too: `Reflect.apply(fn, thisArg, aFunction)` reads
+    // `length`/indices off the arraylist, and Reflect.get/ownKeys/etc. accept any
+    // callable. Only primitives (number/string/symbol/…) are non-objects.
+    return switch (v.toPtr().*) {
+        .object, .bc_function, .native_function => true,
+        else => false,
+    };
 }
 
 /// The *JsObject a Reflect target denotes, including a function's lazily

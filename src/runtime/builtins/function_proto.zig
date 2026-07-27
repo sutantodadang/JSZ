@@ -167,7 +167,13 @@ pub fn nativeFunctionApply(arena: std.mem.Allocator, this_val: Value, args: []co
 /// CreateListFromArrayLike (ES §7.3.18): reads "length" (ToLength) and each
 /// indexed element via [[Get]]. Throws TypeError if `obj` is not an Object.
 fn createListFromArrayLike(arena: std.mem.Allocator, obj: Value) ![]Value {
-    if (obj.bits == 0 or obj.unbox() != .object) {
+    // Functions are objects: `fn.apply(thisArg, aFunction)` reads length/indices
+    // off the callable argument. Only primitives are rejected.
+    const is_obj = obj.bits != 0 and obj.isHeapPtr() and switch (obj.toPtr().*) {
+        .object, .bc_function, .native_function => true,
+        else => false,
+    };
+    if (!is_obj) {
         realm_mod.pending_exception = try makeTypeError(arena, "CreateListFromArrayLike called on non-object");
         return error.JsException;
     }
