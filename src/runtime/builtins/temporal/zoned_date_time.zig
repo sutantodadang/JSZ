@@ -674,11 +674,11 @@ fn getInLeapYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
 }
 fn getHoursInDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    // Fixed-offset / unknown zones: every day is 24h. Named IANA zones with DST
-    // may have 23h/25h days around a transition.
-    _ = tzdata.lookupDef(z.tz) orelse return val_mod.makeNumber(arena, 24);
     // The day's length is the gap between its own start and the next day's, both
-    // resolved through the zone — that is what makes a transition day 23h or 25h.
+    // resolved through the zone — that is what makes a transition day 23h or 25h
+    // (a fixed-offset zone always yields 24h). Both boundaries go through
+    // GetStartOfDay, which throws when the day's start/end falls outside the
+    // representable range even though the length itself would be plain 24h.
     return val_mod.makeNumber(arena, shared.divToF64(try dayLength(arena, z), shared.NS_PER_HOUR));
 }
 
@@ -1070,8 +1070,16 @@ pub fn nativeStartOfDay(arena: std.mem.Allocator, this_val: Value, _: []const Va
 /// 1919-03-31T00:30), and then the day begins at the transition — which is
 /// *earlier* than what "compatible" disambiguation would pick.
 pub fn startOfDay(arena: std.mem.Allocator, tz: []const u8, fixed: i128, date: shared.ISODate) !i128 {
-    _ = arena;
     const wall = wallNs(.{ .date = date, .time = .{} });
+    const ns = startOfDayRaw(tz, fixed, wall);
+    // GetStartOfDay feeds DisambiguatePossibleEpochNanoseconds, which rejects an
+    // instant outside the representable range — reachable when the day's midnight
+    // in this zone falls just past the epoch-nanoseconds limit.
+    if (!isValidEpochNs(ns)) return realm_mod.throwRangeError(arena, "start of day is outside the representable range");
+    return ns;
+}
+
+fn startOfDayRaw(tz: []const u8, fixed: i128, wall: i128) i128 {
     const p = possibleInstants(tz, fixed, wall);
     if (p[0]) |t| return t;
     const def = tzdata.lookupDef(tz) orelse return wall - fixed;
