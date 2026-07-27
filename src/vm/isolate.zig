@@ -861,8 +861,15 @@ fn rewriteTaggedTemplate(arena: std.mem.Allocator, out: *std.ArrayList(u8), sour
     while (i < source.len) {
         if (source[i] == '\\' and i + 1 < source.len) {
             try literal_buf.append(arena, source[i]);
-            try literal_buf.append(arena, source[i + 1]);
-            i += 2;
+            // A LineContinuation (`\` <CR> / `\` <CR><LF>) normalizes its line
+            // terminator to a single <LF> in the raw string (§12.9.6.1).
+            if (source[i + 1] == '\r') {
+                try literal_buf.append(arena, '\n');
+                i += if (i + 2 < source.len and source[i + 2] == '\n') 3 else 2;
+            } else {
+                try literal_buf.append(arena, source[i + 1]);
+                i += 2;
+            }
             continue;
         }
         if (source[i] == '$' and i + 1 < source.len and source[i + 1] == '{') {
@@ -894,6 +901,13 @@ fn rewriteTaggedTemplate(arena: std.mem.Allocator, out: *std.ArrayList(u8), sour
         if (source[i] == '`') {
             i += 1; // consume closing backtick
             break;
+        }
+        // TRV/TV line-terminator normalization (§12.9.6.1): a literal <CR> or
+        // <CR><LF> becomes a single <LF> in BOTH the raw and cooked strings.
+        if (source[i] == '\r') {
+            try literal_buf.append(arena, '\n');
+            i += if (i + 1 < source.len and source[i + 1] == '\n') 2 else 1;
+            continue;
         }
         try literal_buf.append(arena, source[i]);
         i += 1;
