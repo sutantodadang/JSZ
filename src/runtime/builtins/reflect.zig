@@ -773,13 +773,13 @@ pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
         return throwTypeErrorReflect(arena, "Reflect.setPrototypeOf called on non-object");
     const obj = (try reflectTargetObj(arena, args[0])) orelse
         return throwTypeErrorReflect(arena, "Reflect.setPrototypeOf called on non-object");
-    const new_proto: ?*JsObject = blk: {
-        if (args.len < 2 or args[1].bits == 0) break :blk null;
-        break :blk switch (args[1].unbox()) {
-            .object => |o| o,
-            .null_ => null,
-            else => return throwTypeErrorReflect(arena, "Reflect.setPrototypeOf proto must be an object or null"),
-        };
+    // proto must be an Object or Null; a missing/undefined argument is a TypeError.
+    if (args.len < 2 or args[1].bits == 0)
+        return throwTypeErrorReflect(arena, "Reflect.setPrototypeOf proto must be an object or null");
+    const new_proto: ?*JsObject = switch (args[1].unbox()) {
+        .object => |o| o,
+        .null_ => null,
+        else => return throwTypeErrorReflect(arena, "Reflect.setPrototypeOf proto must be an object or null"),
     };
     // Module Namespace [[SetPrototypeOf]] is SetImmutablePrototype: succeeds (true)
     // only when the requested prototype equals the current one (null); any other
@@ -1176,8 +1176,7 @@ fn throwReferenceErrorReflect(arena: std.mem.Allocator, name: []const u8) anyerr
 
 pub fn nativeReflectConstruct(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
-    if (args.len < 1) return val_mod.makeUndefined(arena);
-    const target = args[0];
+    const target = if (args.len >= 1) args[0] else Value{};
     // Reflect.construct(target, argsList[, newTarget]):
     // 1. If IsConstructor(target) is false, throw a TypeError.
     if (!isConstructorVal(target)) return throwTypeErrorReflect(arena, "Reflect.construct target is not a constructor");
@@ -1185,10 +1184,9 @@ pub fn nativeReflectConstruct(arena: std.mem.Allocator, _: Value, args: []const 
     // Unpack argsList (second argument) via CreateListFromArrayLike: reads
     // "length" and each index through [[Get]], propagating any abrupt completion
     // and throwing a TypeError when the list is not an object.
-    const arg_list: []Value = if (args.len >= 2)
-        try createListFromArrayLike(arena, args[1])
-    else
-        &[_]Value{};
+    // A missing argumentsList is `undefined`, which CreateListFromArrayLike
+    // rejects with a TypeError (spec step 3 — argumentsList must be an object).
+    const arg_list: []Value = try createListFromArrayLike(arena, if (args.len >= 2) args[1] else Value{});
 
     const ctx = realm_mod.active_context orelse {
         realm_mod.pending_exception = try val_mod.makeString(arena, "no active context");

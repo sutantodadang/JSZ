@@ -629,9 +629,10 @@ pub fn nativeObjectHasOwn(arena: std.mem.Allocator, _: Value, args: []const Valu
 
 /// hasOwnProperty(key): checks if own prop exists (not in proto chain).
 pub fn nativeHasOwnProperty(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0) return val_mod.makeBool(arena, false);
-    // Step 1: P = ToPropertyKey(V) — coercion (which may throw) precedes ToObject(this).
-    const key_v = try toPropertyKeyValue(arena, args[0]);
+    // Step 1: P = ToPropertyKey(V) — coercion (which may throw) precedes ToObject
+    // (this). A missing argument is `undefined` (→ the "undefined" key), NOT an
+    // early false: `hasOwnProperty.call(null)` must still throw on ToObject.
+    const key_v = try toPropertyKeyValue(arena, if (args.len > 0) args[0] else Value{});
     // Step 2: ToObject(this) throws for null/undefined (callables/primitives box).
     if (this_val.isNullish()) return throwTypeError(arena, "Object.prototype.hasOwnProperty called on null or undefined");
     // native_function has own "length" and "name" unless deleted (ES spec §10.3).
