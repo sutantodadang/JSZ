@@ -444,7 +444,7 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
         // validated against the zone and the instant is range-checked. A bare
         // `Z` with no `[tz]` annotation is not a valid relativeTo.
         if (hasTimeZoneAnnotation(str)) {
-            const z = try zdt.toTemporalZoned(arena, rv, null);
+            const z = try zdt.toTemporalZoned(arena, rv, val_mod.Value{});
             return zdt.localISODate(&z);
         }
         if (has_utc)
@@ -462,7 +462,7 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
         // A bag naming a time zone is a *zoned* relativeTo, so its time zone and
         // offset have to be validated even though only the date survives.
         if (bag.time_zone != null) {
-            const z = try zdt.toTemporalZoned(arena, rv, null);
+            const z = try zdt.toTemporalZoned(arena, rv, val_mod.Value{});
             return zdt.localISODate(&z);
         }
         return try pd.dateFromBag(arena, bag, .constrain);
@@ -595,6 +595,12 @@ fn roundRelative(
 
     const start_date = try pd.addISODate(R, ry, rmo, rw, rd, .constrain, arena);
     const end_date = try pd.addISODate(R, ry + step_y, rmo + step_mo, rw + step_w, rd + step_d, .constrain, arena);
+    // NudgeToCalendarUnit adds the r1/r2 candidate durations to the relativeTo
+    // date via CalendarDateAdd, which rejects a result outside the ISO limits.
+    // `addISODate`'s own guard is looser (±300000 years), so re-check against the
+    // tight PlainDateTime range here.
+    if (!shared.isoDateWithinLimits(start_date) or !shared.isoDateWithinLimits(end_date))
+        return realm_mod.throwRangeError(arena, "rounded date is outside the valid ISO range");
     const start_ns: i128 = @as(i128, epochDaysOf(start_date)) * DAY;
     const end_ns: i128 = @as(i128, epochDaysOf(end_date)) * DAY;
     const dest_ns: i128 = @as(i128, epochDaysOf(dest_date)) * DAY + time_rem;

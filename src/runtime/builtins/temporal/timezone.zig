@@ -140,6 +140,28 @@ pub fn toZone(arena: std.mem.Allocator, s0: []const u8) !Zone {
 
 /// Resolve a time-zone identifier at a given instant (epoch nanoseconds).
 /// Returns the correct UTC offset (DST-aware) for named IANA zones.
+/// ToTemporalTimeZoneIdentifier: unlike `toZone`, the string must be a *bare*
+/// time-zone identifier — "UTC", a known IANA name, or a numeric UTC offset. A
+/// full datetime string (even one carrying a `[tz]` bracket) is not a valid
+/// identifier for a constructor / `withTimeZone` argument.
+pub fn toZoneIdentifier(arena: std.mem.Allocator, s0: []const u8, epoch_ns: ?i128) !Zone {
+    const s = std.mem.trim(u8, s0, " \t\n\r");
+    if (eqIgnoreCase(s, "UTC")) return .{ .id = "UTC", .offset_ns = 0 };
+    if (tzdata.isKnownZone(s)) {
+        const def = tzdata.lookupDef(s) orelse unreachable;
+        const offset_sec = if (epoch_ns) |ns|
+            (tzdata.offsetAt(def, @intCast(@divFloor(ns, shared.NS_PER_SECOND))) orelse def.std_offset_sec)
+        else
+            def.std_offset_sec;
+        return .{ .id = def.name, .offset_ns = @as(i128, offset_sec) * shared.NS_PER_SECOND };
+    }
+    var buf: [7]u8 = undefined;
+    if (parseOffsetIdentifier(s, &buf)) |ns| {
+        return .{ .id = try arena.dupe(u8, buf[0..6]), .offset_ns = ns };
+    }
+    return realm_mod.throwRangeError(arena, "invalid time zone identifier");
+}
+
 pub fn toZoneAtInstant(arena: std.mem.Allocator, s0: []const u8, epoch_ns: i128) !Zone {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     if (s.len == 0) return realm_mod.throwRangeError(arena, "invalid time zone");
