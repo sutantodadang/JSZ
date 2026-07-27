@@ -147,14 +147,8 @@ built-ins/Reflect/apply/arguments-list-is-not-array-like-but-still-valid.js
 built-ins/Reflect/defineProperty/return-abrupt-from-attributes.js
 built-ins/RegExp/CharacterClassEscapes/character-class-non-whitespace-class-escape-negative-cases.js
 built-ins/RegExp/CharacterClassEscapes/character-class-whitespace-class-escape-positive-cases.js
-built-ins/RegExp/S15.10.2.11_A1_T8.js
-built-ins/RegExp/S15.10.2.11_A1_T9.js
 built-ins/RegExp/S15.10.2.7_A2_T1.js
-built-ins/RegExp/S15.10.2.8_A2_T1.js
-built-ins/RegExp/S15.10.2.8_A3_T14.js
 built-ins/RegExp/S15.10.2.8_A3_T15.js
-built-ins/RegExp/S15.10.2.8_A3_T8.js
-built-ins/RegExp/S15.10.2.8_A3_T9.js
 built-ins/RegExp/character-class-escape-non-whitespace.js
 built-ins/RegExp/dotall/with-dotall.js
 built-ins/RegExp/dotall/without-dotall.js
@@ -165,9 +159,7 @@ built-ins/RegExp/lookahead-quantifier-match-groups.js
 built-ins/RegExp/match-indices/indices-array-unicode-match.js
 built-ins/RegExp/match-indices/indices-array-unicode-property-names.js
 built-ins/RegExp/named-groups/lookbehind.js
-built-ins/RegExp/named-groups/non-unicode-property-names-valid.js
 built-ins/RegExp/named-groups/non-unicode-property-names.js
-built-ins/RegExp/named-groups/unicode-property-names-valid.js
 built-ins/RegExp/named-groups/unicode-property-names.js
 built-ins/RegExp/nullable-quantifier.js
 built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji.js
