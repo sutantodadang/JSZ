@@ -119,7 +119,11 @@ fn wallNs(dt: ISODateTime) i128 {
 /// Read a time-zone-like value into a Zone. Only string identifiers are
 /// accepted (non-strings throw TypeError, matching the spec).
 /// When `epoch_ns` is provided, uses `toZoneAtInstant` for DST-aware lookup.
-fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128) !timezone.Zone {
+/// `strict` selects the constructor's `ParseTimeZoneIdentifier` (a *bare*
+/// identifier only) over the more lenient `ToTemporalTimeZoneIdentifier` used by
+/// `from` / `withTimeZone` / property bags, which also accepts a full datetime
+/// string and takes the zone from its offset or `[tz]` bracket.
+fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128, strict: bool) !timezone.Zone {
     if (v.bits == 0) return realm_mod.throwTypeError(arena, "time zone must be a string");
     // A Temporal.ZonedDateTime stands in for its own [[TimeZone]]
     // (ToTemporalTimeZoneIdentifier).
@@ -129,9 +133,8 @@ fn toTimeZone(arena: std.mem.Allocator, v: Value, epoch_ns: ?i128) !timezone.Zon
     }
     switch (v.unbox()) {
         .string => |s| {
-            if (epoch_ns) |ns| {
-                return timezone.toZoneAtInstant(arena, s, ns);
-            }
+            if (strict) return timezone.toZoneIdentifier(arena, s, epoch_ns);
+            if (epoch_ns) |ns| return timezone.toZoneAtInstant(arena, s, ns);
             return timezone.toZone(arena, s);
         },
         .undefined_, .null_, .boolean, .number, .bigint, .symbol => return realm_mod.throwTypeError(arena, "time zone must be a string"),
@@ -157,7 +160,7 @@ pub fn nativeCtor(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (ns_arg.bits == 0 or ns_arg.unbox() != .bigint) return realm_mod.throwTypeError(arena, "epochNanoseconds must be a BigInt");
     const ns = shared.bigIntToI128(ns_arg) orelse return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
     if (!isValidEpochNs(ns)) return realm_mod.throwRangeError(arena, "ZonedDateTime out of range");
-    const zone = try toTimeZone(arena, if (args.len > 1) args[1] else Value{}, ns);
+    const zone = try toTimeZone(arena, if (args.len > 1) args[1] else Value{}, ns, true);
     const cal = if (args.len > 2) try resolveCtorCalendar(arena, args[2]) else .iso8601;
     const z = ZonedDT{ .ns = ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = cal };
     if (this_val.bits != 0 and this_val.unbox() == .object) return installInto(arena, this_val, z);
@@ -254,18 +257,21 @@ fn od(s: []const u8, i: usize) ?i128 {
 }
 
 /// Convert a value to a ZonedDateTime (used by from/compare/equals/since/until).
-pub fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts: ?*JsObject) !ZonedDT {
+/// `opts_v` is the raw options value: it is coerced with GetOptionsObject only
+/// *after* the item's fields are read (property bag) or the string is parsed,
+/// so a primitive options value's TypeError does not pre-empt those reads.
+pub fn toTemporalZoned(arena: std.mem.Allocator, v: Value, opts_v: Value) !ZonedDT {
     if (getZoned(v)) |z| return z.*;
     if (v.bits != 0 and v.unbox() == .object) {
-        return try zonedFromFields(arena, v.toPtr().object, opts);
+        return try zonedFromFields(arena, v.toPtr().object, opts_v);
     }
     if (v.bits != 0 and v.unbox() == .string) {
-        return try zonedFromString(arena, v.unbox().string, opts);
+        return try zonedFromString(arena, v.unbox().string, opts_v);
     }
     return realm_mod.throwTypeError(arena, "cannot convert to Temporal.ZonedDateTime");
 }
 
-fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !ZonedDT {
+fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts_v: Value) !ZonedDT {
     // ToTemporalZonedDateTime reads the calendar first (ToTemporalCalendarIdentifier;
     // ISO strings ok), then does a single PrepareCalendarFields sweep over the
     // remaining fields — day, hour, microsecond, millisecond, minute, month,
@@ -274,9 +280,13 @@ fn zonedFromFields(arena: std.mem.Allocator, o: *JsObject, opts: ?*JsObject) !Zo
     const cal = if (try shared.optionGet(arena, o, "calendar")) |cv| try shared.resolveCalendarArg(arena, cv) else .iso8601;
     const bag = try plain_date.readDateBag(arena, o, .{ .time = true, .zoned = true, .fixed_cal = cal });
 
+    // GetOptionsObject runs only now — after every field has been read — so a
+    // primitive options value throws its TypeError *after* the observable reads.
+    const opts = try shared.getOptionsObject(arena, opts_v);
+
     // timeZone is required (a present-but-undefined value reads as absent).
     const tz_v = bag.time_zone orelse return realm_mod.throwTypeError(arena, "missing timeZone");
-    const zone = try toTimeZone(arena, tz_v, null);
+    const zone = try toTimeZone(arena, tz_v, null, false);
 
     // An offset given as a field is an "option"-behaviour offset; absent is "wall".
     var so = StringOffset{ .behaviour = .wall };
@@ -413,7 +423,7 @@ fn interpretOffset(arena: std.mem.Allocator, tz: []const u8, dt: ISODateTime, zo
     }
 }
 
-fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !ZonedDT {
+fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts_v: Value) !ZonedDT {
     const s = std.mem.trim(u8, s0, " \t\n\r");
     // A single [tz] bracket is mandatory; validate all annotations in one pass.
     const bracket = try extractAnnotations(arena, s);
@@ -423,6 +433,8 @@ fn zonedFromString(arena: std.mem.Allocator, s0: []const u8, opts: ?*JsObject) !
     // The parsed wall-clock datetime must itself be representable.
     if (!shared.isoDateTimeWithinLimits(dt.date, dt.time)) return realm_mod.throwRangeError(arena, "ZonedDateTime wall-clock time out of range");
     const str_off = extractStringOffset(arena, s) catch |e| return e;
+    // Options are coerced (GetOptionsObject) only after the string is parsed.
+    const opts = try shared.getOptionsObject(arena, opts_v);
     // Options are read after the string is parsed, in observable order:
     // disambiguation, offset, overflow.
     const dis = try getDisambiguationOption(arena, opts);
@@ -524,23 +536,24 @@ fn extractStringOffset(arena: std.mem.Allocator, s: []const u8) !StringOffset {
 
 pub fn nativeFrom(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const v = if (args.len > 0) args[0] else Value{};
-    const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
+    const opts_v = if (args.len > 1) args[1] else Value{};
     // An already-constructed ZonedDateTime is copied, but the options are still
     // read and validated (disambiguation, offset, overflow).
     if (getZoned(v)) |z| {
+        const opts = try shared.getOptionsObject(arena, opts_v);
         try readFromOptions(arena, opts);
         return makeZoned(arena, z.*);
     }
-    // A string is parsed before its options are read; a property bag reads its
-    // fields then options. Both paths read/validate the options inside
-    // toTemporalZoned, so `from` does not read them again.
-    const z = try toTemporalZoned(arena, v, opts);
+    // A string is parsed before its options are coerced/read; a property bag
+    // reads its fields then its options. Both paths do this inside
+    // toTemporalZoned, so `from` does not touch the options again.
+    const z = try toTemporalZoned(arena, v, opts_v);
     return makeZoned(arena, z);
 }
 
 pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const a = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
-    const b = try toTemporalZoned(arena, if (args.len > 1) args[1] else Value{}, null);
+    const a = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, Value{});
+    const b = try toTemporalZoned(arena, if (args.len > 1) args[1] else Value{}, Value{});
     const r: f64 = if (a.ns < b.ns) -1 else if (a.ns > b.ns) 1 else 0;
     return val_mod.makeNumber(arena, r);
 }
@@ -674,11 +687,11 @@ fn getInLeapYear(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
 }
 fn getHoursInDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    // Fixed-offset / unknown zones: every day is 24h. Named IANA zones with DST
-    // may have 23h/25h days around a transition.
-    _ = tzdata.lookupDef(z.tz) orelse return val_mod.makeNumber(arena, 24);
     // The day's length is the gap between its own start and the next day's, both
-    // resolved through the zone — that is what makes a transition day 23h or 25h.
+    // resolved through the zone — that is what makes a transition day 23h or 25h
+    // (a fixed-offset zone always yields 24h). Both boundaries go through
+    // GetStartOfDay, which throws when the day's start/end falls outside the
+    // representable range even though the length itself would be plain 24h.
     return val_mod.makeNumber(arena, shared.divToF64(try dayLength(arena, z), shared.NS_PER_HOUR));
 }
 
@@ -686,15 +699,32 @@ fn getHoursInDay(arena: std.mem.Allocator, this_val: Value, _: []const Value) an
 const DaySpan = struct { start: i128, end: i128, len: i128 };
 
 fn daySpan(arena: std.mem.Allocator, z: *const ZonedDT) !DaySpan {
+    return daySpanImpl(arena, z, false);
+}
+
+/// `daySpan` that surfaces GetStartOfDay's range failure (for `round` day
+/// rounding and `hoursInDay`, per the spec); the plain variant is used by the
+/// difference nudge, which must not throw at the representable boundary.
+fn daySpanChecked(arena: std.mem.Allocator, z: *const ZonedDT) !DaySpan {
+    return daySpanImpl(arena, z, true);
+}
+
+fn daySpanImpl(arena: std.mem.Allocator, z: *const ZonedDT, checked: bool) !DaySpan {
     const date = localDT(z).date;
-    const start = try startOfDay(arena, z.tz, z.offset_ns, date);
     const next = shared.balanceISODate(date.year, date.month, @as(i32, date.day) + 1);
-    const end = try startOfDay(arena, z.tz, z.offset_ns, next);
+    const start = if (checked)
+        try startOfDayChecked(arena, z.tz, z.offset_ns, date)
+    else
+        try startOfDay(arena, z.tz, z.offset_ns, date);
+    const end = if (checked)
+        try startOfDayChecked(arena, z.tz, z.offset_ns, next)
+    else
+        try startOfDay(arena, z.tz, z.offset_ns, next);
     return .{ .start = start, .end = end, .len = end - start };
 }
 
 fn dayLength(arena: std.mem.Allocator, z: *const ZonedDT) !i128 {
-    return (try daySpan(arena, z)).len;
+    return (try daySpanChecked(arena, z)).len;
 }
 
 /// ISO week-numbering year for a date.
@@ -730,7 +760,7 @@ pub fn nativeToPlainDateTime(arena: std.mem.Allocator, this_val: Value, _: []con
 
 pub fn nativeWithTimeZone(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const zone = try toTimeZone(arena, if (args.len > 0) args[0] else Value{}, z.ns);
+    const zone = try toTimeZone(arena, if (args.len > 0) args[0] else Value{}, z.ns, false);
     return makeZoned(arena, .{ .ns = z.ns, .tz = zone.id, .offset_ns = zone.offset_ns, .calendar = z.calendar });
 }
 
@@ -858,7 +888,7 @@ fn unitRank(u: shared.Unit) u8 {
 
 fn difference(arena: std.mem.Allocator, this_val: Value, args: []const Value, since: bool) !Value {
     const z = try requireZoned(arena, this_val);
-    const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
+    const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, Value{});
     if (z.calendar != other.calendar) return realm_mod.throwRangeError(arena, "calendar mismatch");
     const opts = try shared.getOptionsObject(arena, if (args.len > 1) args[1] else null);
 
@@ -1051,7 +1081,7 @@ pub fn nativeSince(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
 pub fn nativeEquals(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const z = try requireZoned(arena, this_val);
-    const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, null);
+    const other = try toTemporalZoned(arena, if (args.len > 0) args[0] else Value{}, Value{});
     // Equality is on the instant, the zone *and* the calendar.
     return val_mod.makeBool(arena, z.ns == other.ns and timeZoneEquals(z.tz, other.tz) and
         z.calendar == other.calendar);
@@ -1072,6 +1102,19 @@ pub fn nativeStartOfDay(arena: std.mem.Allocator, this_val: Value, _: []const Va
 pub fn startOfDay(arena: std.mem.Allocator, tz: []const u8, fixed: i128, date: shared.ISODate) !i128 {
     _ = arena;
     const wall = wallNs(.{ .date = date, .time = .{} });
+    return startOfDayRaw(tz, fixed, wall);
+}
+
+/// GetStartOfDay with the DisambiguatePossibleEpochNanoseconds range gate: used
+/// where the spec surfaces the failure — day rounding and `hoursInDay` — but not
+/// in the difference nudge, whose day-length probe tolerates a boundary day.
+fn startOfDayChecked(arena: std.mem.Allocator, tz: []const u8, fixed: i128, date: shared.ISODate) !i128 {
+    const ns = try startOfDay(arena, tz, fixed, date);
+    if (!isValidEpochNs(ns)) return realm_mod.throwRangeError(arena, "start of day is outside the representable range");
+    return ns;
+}
+
+fn startOfDayRaw(tz: []const u8, fixed: i128, wall: i128) i128 {
     const p = possibleInstants(tz, fixed, wall);
     if (p[0]) |t| return t;
     const def = tzdata.lookupDef(tz) orelse return wall - fixed;
@@ -1156,7 +1199,9 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     else if (shared.maximumRoundingIncrement(smallest.?)) |maxv|
         try shared.validateRoundingIncrement(arena, inc, maxv, false);
 
-    const span = try daySpan(arena, z);
+    // Day rounding must reject a boundary day whose start/end escapes the range
+    // (GetStartOfDay); a time-unit round only needs the day length to fold.
+    const span = if (smallest.? == .day) try daySpanChecked(arena, z) else try daySpan(arena, z);
     const day_start_ns = span.start;
     const day_len = span.len;
     const since_start = z.ns - day_start_ns;
