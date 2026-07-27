@@ -1164,7 +1164,7 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     // target this for-in loop.
     const loop_lbl = self.pending_label;
     self.pending_label = null;
-    _ = try enterForHeadLexScope(self, fi.left, line);
+    const head_scope = try enterForHeadLexScope(self, fi.left, line);
     // Save sp; allocate rkeys, ri, rlen as a contiguous block.
     const base_sp = self.sp;
     const outer_depth = self.block_scope_depth;
@@ -1319,6 +1319,14 @@ pub fn lowerForInStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error
     const exit_offset = self.currentOffset();
     self.patchJump(patch_exit, exit_offset);
     self.resolveLoop(continue_offset, exit_offset);
+
+    // Pop the ForIn/OfHeadEvaluation ForDeclaration scope (`for (let x in …)`).
+    // Without this, the head binding leaks into the enclosing scope in TDZ and a
+    // later `typeof x` throws instead of seeing no binding (Annex B / §14.7.5.7).
+    if (head_scope) {
+        try self.emitOp(.EXIT_SCOPE, line);
+        self.block_scope_depth -= 1;
+    }
 
     // restore sp to base_sp (free rlen, ri, rkeys, robj_tmp)
     self.sp = base_sp;

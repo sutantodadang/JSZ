@@ -3881,12 +3881,16 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
             try src.appendSlice(arena, try rawToStr(arena, args[args.len - 1]));
         }
         try src.appendSlice(arena, "\n})");
-        // NewTarget [[Prototype]] override for dynamic generator/async-generator
-        // functions (CreateDynamicFunction step 18: proto from newTarget's realm).
-        // IMPORTANT: capture pending_new_target BEFORE evalSource/shadowEval, because
-        // bcInvokeJs (called inside evalSource) unconditionally clears pending_new_target.
-        const is_gen = !std.mem.eql(u8, keyword, "function");
-        const captured_nt = if (is_gen) pending_new_target else Value{};
+        // NewTarget [[Prototype]] override (CreateDynamicFunction step 18: proto
+        // from newTarget's realm). Applies to EVERY dynamic-function kind, not just
+        // generators: `Reflect.construct(Function, [], otherRealmFn)` must give the
+        // result `otherRealm.Function.prototype`.
+        // IMPORTANT: capture pending_new_target/active_constructing BEFORE
+        // evalSource/shadowEval, because bcInvokeJs (called inside evalSource)
+        // unconditionally clears them. Only honor the newTarget when we are actually
+        // constructing — a plain `Function(...)` call keeps the default proto.
+        const is_gen = !std.mem.eql(u8, keyword, "function") and !std.mem.eql(u8, keyword, "async function");
+        const captured_nt = if (active_constructing) pending_new_target else Value{};
         // Cross-realm: if the constructor realm's global env differs from the
         // current active global env, run the body in the constructor realm's scope
         // so closures capture that realm's globals and the realm tag propagates.
@@ -3903,16 +3907,24 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
             }
             break :blk try ctx.evalSource(arena, src.items);
         };
-        if (is_gen and captured_nt.bits != 0) {
+        if (captured_nt.bits != 0) {
             const nt = captured_nt;
             const derived_proto: ?*JsObject = proto_blk: {
                 const pv = try ctx.getProp(arena, nt, "prototype");
                 if (pv.bits != 0 and pv.unbox() == .object) break :proto_blk pv.toPtr().object;
-                // Fallback: GetFunctionRealm(newTarget) then that realm's gen proto.
+                // Fallback: GetPrototypeFromConstructor uses GetFunctionRealm(newTarget)
+                // then that realm's intrinsic prototype for THIS function kind.
                 if (getFunctionRealm(nt)) |fr| {
-                    try ctx.ensureGenChain(@ptrCast(fr));
-                    const is_async_gen = std.mem.eql(u8, keyword, "async function*");
-                    break :proto_blk if (is_async_gen) fr.async_gen_fn_proto else fr.gen_fn_proto;
+                    if (is_gen) {
+                        try ctx.ensureGenChain(@ptrCast(fr));
+                        const is_async_gen = std.mem.eql(u8, keyword, "async function*");
+                        break :proto_blk if (is_async_gen) fr.async_gen_fn_proto else fr.gen_fn_proto;
+                    }
+                    if (std.mem.eql(u8, keyword, "async function")) {
+                        try ctx.ensureGenChain(@ptrCast(fr));
+                        break :proto_blk fr.async_fn_proto orelse fr.function_prototype;
+                    }
+                    break :proto_blk fr.function_prototype;
                 }
                 break :proto_blk null;
             };
@@ -3924,7 +3936,7 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
             }
             // Consume pending newTarget so constructImpl's post-hoc override does
             // not attempt to re-apply it (it only handles .object returns, not
-            // .bc_function — the generator function type).
+            // .bc_function — the function type dynamic functions produce).
             pending_new_target = Value{};
         }
         if (ctor_realm) |r| val_mod.setValueRealm(result, r);
