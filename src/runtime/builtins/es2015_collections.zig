@@ -2300,15 +2300,18 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
         };
     }
     const arr = d.seq.toPtr().object;
-    // Array iterator length: a true Array uses its [[ArrayLength]]; a generic
-    // array-like (e.g. the `arguments` object) reads its `length` property.
-    const arr_len: usize = if (arr.is_array) arr.getArrayLength() else blk: {
-        const lv = arr.get("length") orelse break :blk 0;
-        if (lv.bits == 0 or lv.unbox() != .number) break :blk 0;
-        const n = lv.unbox().number;
-        if (!(n > 0)) break :blk 0;
+    // CreateArrayIterator reads length and elements via [[Get]]. A true dense
+    // Array (no exotic get) uses the fast [[ArrayLength]]/slot path; any other
+    // array-like — the `arguments` object, or a Proxy — must go through the
+    // observable [[Get]] so its `length`/index accessors and Proxy get trap run.
+    const generic = !arr.is_array;
+    const arr_len: usize = if (!generic) arr.getArrayLength() else blk: {
+        const lv = if (realm_mod.active_context) |ctx| try ctx.getProp(arena, d.seq, "length") else (arr.get("length") orelse Value{});
+        // ToLength(? Get(O, "length")).
+        const n: f64 = if (lv.bits != 0 and lv.unbox() == .number) lv.unbox().number else try coercion.toNumberThrowing(arena, lv);
+        if (std.math.isNan(n) or !(n > 0)) break :blk 0;
         if (n > 9007199254740991.0) break :blk 9007199254740991;
-        break :blk @intFromFloat(n);
+        break :blk @intFromFloat(@trunc(n));
     };
     if (d.index >= arr_len) {
         d.done = true;
@@ -2317,7 +2320,10 @@ fn nativeSeqIterNext(arena: std.mem.Allocator, this_val: Value, _: []const Value
     const idx = d.index;
     d.index += 1;
     const idx_str = try std.fmt.allocPrint(arena, "{d}", .{idx});
-    const v = arr.get(idx_str) orelse try val_mod.makeUndefined(arena);
+    const v = if (generic) blk: {
+        if (realm_mod.active_context) |ctx| break :blk try ctx.getProp(arena, d.seq, idx_str);
+        break :blk arr.get(idx_str) orelse try val_mod.makeUndefined(arena);
+    } else (arr.get(idx_str) orelse try val_mod.makeUndefined(arena));
     return switch (d.kind) {
         .key => makeIteratorResult(arena, try val_mod.makeNumber(arena, @floatFromInt(idx)), false),
         .value => makeIteratorResult(arena, v, false),
