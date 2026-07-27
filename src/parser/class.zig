@@ -2316,8 +2316,13 @@ fn emitClassStatements(
             .source_text = p.sourceSlice(start, p.prev_end),
         },
     }) orelse return null;
+    // The class name's INNER binding is immutable (ClassDefinitionEvaluation
+    // CreateImmutableBinding): a `ClassName = …` inside a method / field
+    // initializer / static block is a TypeError. The desugar only ever reads or
+    // mutates properties of this binding (never reassigns it), so `const` is safe
+    // here; the mutable OUTER declaration binding is emitted separately.
     const ctor_decl = p.makeNode(.var_decl, start, p.current.start, .{
-        .var_decl = .{ .kind = .let, .name = class_name, .init = ctor_fn },
+        .var_decl = .{ .kind = .const_, .name = class_name, .init = ctor_fn },
     }) orelse return null;
     out.append(p.arena, ctor_decl) catch return null;
 
