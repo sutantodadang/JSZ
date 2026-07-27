@@ -767,7 +767,7 @@ pub const Lexer = struct {
                         self.column += 1;
                     } else if (nc == '\\' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == 'u') {
                         if (parseUnicodeEscape(self.source, self.pos + 2)) |r2| {
-                            try appendWtf8(&buf, self.allocator, r2.cp);
+                            try appendIdentCp(&buf, self.allocator, r2.cp);
                             self.column += @intCast(r2.end - self.pos);
                             self.pos = r2.end;
                         } else break;
@@ -795,7 +795,7 @@ pub const Lexer = struct {
             if (parseUnicodeEscape(self.source, self.pos + 2)) |r| {
                 var buf = std.ArrayList(u8){};
                 defer buf.deinit(self.allocator);
-                try appendWtf8(&buf, self.allocator, r.cp);
+                try appendIdentCp(&buf, self.allocator, r.cp);
                 self.column += @intCast(r.end - self.pos);
                 self.pos = r.end;
                 // Consume any following raw ident chars or additional \uXXXX escapes.
@@ -807,7 +807,7 @@ pub const Lexer = struct {
                         self.column += 1;
                     } else if (nc == '\\' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == 'u') {
                         if (parseUnicodeEscape(self.source, self.pos + 2)) |r2| {
-                            try appendWtf8(&buf, self.allocator, r2.cp);
+                            try appendIdentCp(&buf, self.allocator, r2.cp);
                             self.column += @intCast(r2.end - self.pos);
                             self.pos = r2.end;
                         } else break;
@@ -857,7 +857,7 @@ pub const Lexer = struct {
                         self.column += 1;
                     } else if (nc == '\\' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == 'u') {
                         if (parseUnicodeEscape(self.source, self.pos + 2)) |r2| {
-                            try appendWtf8(&buf, self.allocator, r2.cp);
+                            try appendIdentCp(&buf, self.allocator, r2.cp);
                             self.column += @intCast(r2.end - self.pos);
                             self.pos = r2.end;
                         } else break;
@@ -1179,6 +1179,24 @@ fn appendWtf8(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, cp: u32) error{
         const lo: u32 = 0xDC00 + (v & 0x3FF);
         try appendWtf8(buf, alloc, hi);
         try appendWtf8(buf, alloc, lo);
+    }
+}
+
+/// Append a code point as *real* UTF-8, used for identifier names built from
+/// `\u` escapes. Unlike `appendWtf8`, an astral code point is encoded as a
+/// single 4-byte sequence (not a surrogate pair) so that `\u{1D4D1}` produces
+/// the same bytes as the literal character `𝓑` in source — identifiers are keys
+/// compared for equality, and regex named-group keys use real UTF-8 too, so both
+/// must agree. Lone surrogates (which real UTF-8 cannot represent) fall back to
+/// the WTF-8 3-byte encoding.
+fn appendIdentCp(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, cp: u32) error{OutOfMemory}!void {
+    if (cp >= 0x10000 and cp <= 0x10FFFF) {
+        try buf.append(alloc, @intCast(0xF0 | (cp >> 18)));
+        try buf.append(alloc, @intCast(0x80 | ((cp >> 12) & 0x3F)));
+        try buf.append(alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+        try buf.append(alloc, @intCast(0x80 | (cp & 0x3F)));
+    } else {
+        try appendWtf8(buf, alloc, cp);
     }
 }
 

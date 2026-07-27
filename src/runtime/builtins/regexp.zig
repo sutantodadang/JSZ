@@ -1382,8 +1382,12 @@ const PatternParser = struct {
                         cc.addCpRange(self.alloc, lo, lo) catch return ParseError.OutOfMemory;
                     }
                 }
-            } else if (self.unicode and ch >= 0x80) {
-                // Non-ASCII codepoint start in unicode mode -- decode the full codepoint.
+            } else if (ch >= 0x80) {
+                // Non-ASCII code-point start: decode the whole code unit and store
+                // it as a code point in BOTH modes. Non-/u class membership is
+                // tested against decoded code points (consumeClass), so a literal
+                // multi-byte member such as `[à]` must be stored as its code point
+                // rather than as individual WTF-8 bytes.
                 const dc = decodeUtf8At(self.src, self.pos);
                 self.pos += dc.len;
                 const start_cp = dc.cp;
@@ -1539,26 +1543,23 @@ const PatternParser = struct {
                 const cc = try self.alloc.create(CharClass);
                 cc.* = CharClass{};
                 const lower = if (c >= 'A' and c <= 'Z') c + 32 else c;
-                if (lower == 's' and self.unicode) {
-                    // Unicode \s / \S
+                // `\s` matches the full Unicode WhiteSpace + LineTerminator set in
+                // BOTH /u and non-/u modes -- CharacterClassEscape :: s is defined
+                // over code points, not affected by the /u flag. consumeClass
+                // decodes a whole code unit in either mode, so the extra_ranges
+                // (Unicode spaces beyond Latin-1) apply regardless of /u.
+                if (lower == 's') {
                     cc.addPredefinedUnicodeS(self.alloc) catch return ParseError.OutOfMemory;
                 } else {
                     cc.addPredefined(lower, false);
                 }
+                // `\D`/`\W`/`\S` are the complements of `\d`/`\w`/`\s`. Use the
+                // global negate flag (rather than bitmap inversion) so the
+                // complement covers code points > 255 too -- e.g. `\S` must match
+                // U+180E (a non-whitespace astral-ish BMP char) and `\D` must
+                // match any non-ASCII-digit code point.
                 if (c == 'D' or c == 'W' or c == 'S') {
-                    // Invert bitmap only (extra_ranges stay empty for \D/\W; \S non-ASCII kept negated)
-                    var i: usize = 0;
-                    while (i < 256) : (i += 1) cc.bitmap[i] = !cc.bitmap[i];
-                    // For \S under /u the extra unicode whitespace in extra_ranges should also be inverted.
-                    // Since we can't easily invert an arbitrary set, we just set negate=true for the
-                    // extra ranges -- matchesCp handles cc.negate globally.
-                    if (lower == 's' and self.unicode) {
-                        // Reset bitmap to the NON-inverted whitespace then set negate=true so
-                        // matchesCp inverts: clear the inversion we just did.
-                        var j: usize = 0;
-                        while (j < 256) : (j += 1) cc.bitmap[j] = !cc.bitmap[j];
-                        cc.negate = true;
-                    }
+                    cc.negate = true;
                 }
                 return RegexNode{ .char_class = cc };
             },
@@ -2218,6 +2219,34 @@ fn decodeGroupNameId(alloc: std.mem.Allocator, src: []const u8) ![]const u8 {
     return out.items;
 }
 
+/// Validate a decoded group name against the RegExpIdentifierName grammar
+/// (§22.2.1): the first code point must be an IdentifierStart (ID_Start, `$` or
+/// `_`), and every subsequent one an IdentifierPart (ID_Continue, `$`, `_`, ZWNJ
+/// or ZWJ). Names failing this are early SyntaxErrors — e.g. an emoji group
+/// name. Astral code points are folded from any WTF-8 surrogate pair first.
+fn validGroupName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const id_start = uprop.lookup("ID_Start") orelse return true;
+    const id_cont = uprop.lookup("ID_Continue") orelse return true;
+    var i: usize = 0;
+    var first = true;
+    while (i < name.len) {
+        const dc = decodeCpAt(name, i);
+        if (dc.len == 0) return false;
+        i += dc.len;
+        const cp = dc.cp;
+        if (first) {
+            first = false;
+            if (cp == '$' or cp == '_') continue;
+            if (!cpInTable(id_start, cp)) return false;
+        } else {
+            if (cp == '$' or cp == '_' or cp == 0x200C or cp == 0x200D) continue;
+            if (!cpInTable(id_cont, cp)) return false;
+        }
+    }
+    return true;
+}
+
 /// Pre-scan a pattern for `(?<name>...)` groups, assigning each the 1-based
 /// capture index it will receive during parsing. Skips char classes, escapes,
 /// and non-capturing / assertion groups so indices match the parser exactly.
@@ -2279,6 +2308,7 @@ fn scanGroupNames(alloc: std.mem.Allocator, src: []const u8, total_caps: *u32) !
                     while (j < src.len and src[j] != '>') j += 1;
                     const raw_name = src[i + 3 .. j];
                     const decoded_name = try decodeGroupNameId(alloc, raw_name);
+                    if (!validGroupName(decoded_name)) return error.InvalidPattern;
                     try names.append(alloc, .{ .name = decoded_name, .idx = cap });
                     try paths.append(alloc, try alloc.dupe(PathEntry, stack.items));
                     try stack.append(alloc, opened);
@@ -2378,8 +2408,18 @@ pub fn matchAnywhere(
             return .{ .start = i, .state = ms };
         }
         if (i >= input.len) break;
-        // Under /u, advance by full codepoint to stay on codepoint boundaries.
-        i += if (regex.flags.cpMode()) @as(usize, cpByteLenAt(input, i)) else 1;
+        // Advance to the next code-unit boundary so a match never starts in the
+        // middle of a multi-byte sequence. Under /u that is a full code point
+        // (folding a WTF-8 surrogate pair); in non-/u it is one UTF-16 code unit
+        // — a BMP char spans 1–3 WTF-8 bytes, a WTF-8-encoded surrogate is 3
+        // bytes, and a raw 4-byte astral (two units the byte model can't split)
+        // advances a single byte, mirroring consumeDot.
+        if (regex.flags.cpMode()) {
+            i += @as(usize, cpByteLenAt(input, i));
+        } else {
+            const w = utf8ByteLenAt(input, i);
+            i += if (w >= 1 and w <= 3) @as(usize, w) else 1;
+        }
     }
     return null;
 }
@@ -2489,20 +2529,23 @@ fn consumeClass(input: []const u8, pos: usize, cc: *const CharClass, flags: *con
         if (!(if (cc.negate) !raw else raw)) return null;
         return pos + dc.len;
     } else {
-        // Byte-based (non-/u): the Pike VM and backtracker both step one WTF-8
-        // byte at a time here, so class membership is tested per byte. (A
-        // multi-byte class member cannot be represented in this model — that is a
-        // known limitation of the byte-based non-/u engine.)
-        var c = input[pos];
-        if (flags.ignore_case) c = foldCase(c);
-        var hit = cc.bitmap[c];
-        if (flags.ignore_case and !hit) {
+        // Non-/u mode iterates UTF-16 code units, not raw bytes: a BMP code point
+        // is one unit spanning 1–3 WTF-8 bytes (mirroring consumeDot). Class
+        // members are stored as code points (addCpRange puts <=255 in the bitmap,
+        // >255 in extra_ranges), so membership is tested against the decoded code
+        // point — letting `\s`/`\S` and Latin-1 members match multi-byte input.
+        const dc = decodeUtf8At(input, pos);
+        const len: usize = if (dc.len >= 1 and dc.len <= 3) dc.len else 1;
+        const cp: u21 = if (dc.len >= 1 and dc.len <= 3) dc.cp else input[pos];
+        var hit = cc.containsCp(cp);
+        if (flags.ignore_case and !hit and cp < 0x80) {
+            const c: u8 = @intCast(cp);
             const alt = if (c >= 'a' and c <= 'z') c - 32 else if (c >= 'A' and c <= 'Z') c + 32 else c;
             hit = cc.bitmap[alt];
         }
         const result = if (cc.negate) !hit else hit;
         if (!result) return null;
-        return pos + 1;
+        return pos + len;
     }
 }
 
@@ -3276,9 +3319,11 @@ const PikeVM = struct {
     // Two thread lists (current / next), each a flat SoA of (pc, caps).
     a_pcs: []usize,
     a_caps: []isize,
+    a_pos: []usize, // per-thread consume position (for variable-width consumes)
     a_n: usize = 0,
     b_pcs: []usize,
     b_caps: []isize,
+    b_pos: []usize,
     b_n: usize = 0,
     seen: []u64, // per-pc generation stamp for closure dedup
     gen: u64 = 0,
@@ -3289,13 +3334,21 @@ const PikeVM = struct {
     fn init(alloc: std.mem.Allocator, prog: *const Program) !PikeVM {
         const plen = prog.insts.len;
         const ns = prog.num_slots;
+        // Consuming ops can advance a variable number of bytes (a multi-byte
+        // class/dot, up to 6 for a WTF-8 surrogate pair), so threads waiting at
+        // several byte offsets ahead of `sp` coexist in one list. Each distinct
+        // in-flight offset holds up to `plen` de-duplicated threads, so size the
+        // lists for the widest window rather than a single position's `plen`.
+        const cap = plen * 8;
         return .{
             .prog = prog,
             .ns = ns,
-            .a_pcs = try alloc.alloc(usize, plen),
-            .a_caps = try alloc.alloc(isize, plen * ns),
-            .b_pcs = try alloc.alloc(usize, plen),
-            .b_caps = try alloc.alloc(isize, plen * ns),
+            .a_pcs = try alloc.alloc(usize, cap),
+            .a_caps = try alloc.alloc(isize, cap * ns),
+            .a_pos = try alloc.alloc(usize, cap),
+            .b_pcs = try alloc.alloc(usize, cap),
+            .b_caps = try alloc.alloc(isize, cap * ns),
+            .b_pos = try alloc.alloc(usize, cap),
             .seen = try alloc.alloc(u64, plen),
             .work = try alloc.alloc(isize, ns),
             .matched = try alloc.alloc(isize, ns),
@@ -3309,6 +3362,7 @@ const PikeVM = struct {
         self: *PikeVM,
         list_pcs: []usize,
         list_caps: []isize,
+        list_pos: []usize,
         n_ptr: *usize,
         pc: usize,
         sp: usize,
@@ -3319,42 +3373,42 @@ const PikeVM = struct {
         if (self.seen[pc] == self.gen) return;
         self.seen[pc] = self.gen;
         switch (self.prog.insts[pc]) {
-            .jmp => |t| self.addThread(list_pcs, list_caps, n_ptr, t, sp, caps, input, flags),
+            .jmp => |t| self.addThread(list_pcs, list_caps, list_pos, n_ptr, t, sp, caps, input, flags),
             .split => |s| {
-                self.addThread(list_pcs, list_caps, n_ptr, s.a, sp, caps, input, flags);
-                self.addThread(list_pcs, list_caps, n_ptr, s.b, sp, caps, input, flags);
+                self.addThread(list_pcs, list_caps, list_pos, n_ptr, s.a, sp, caps, input, flags);
+                self.addThread(list_pcs, list_caps, list_pos, n_ptr, s.b, sp, caps, input, flags);
             },
             .save => |slot| {
                 if (slot < self.ns) {
                     const old = caps[slot];
                     caps[slot] = @intCast(sp);
-                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                    self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags);
                     caps[slot] = old;
                 } else {
-                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                    self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags);
                 }
             },
             .clear => |r| {
                 const lo = 2 * @as(usize, r.lo);
                 const hi = @min(2 * @as(usize, r.hi) + 2, self.ns);
                 if (lo >= hi) {
-                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                    self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags);
                 } else {
                     var saved: [2 * MAX_CAPTURES]isize = undefined;
                     @memcpy(saved[0 .. hi - lo], caps[lo..hi]);
                     @memset(caps[lo..hi], -1);
-                    self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags);
+                    self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags);
                     @memcpy(caps[lo..hi], saved[0 .. hi - lo]);
                 }
             },
             .assert_bol => if (testBol(input, sp, flags))
-                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
+                self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags),
             .assert_eol => if (testEol(input, sp, flags))
-                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
+                self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags),
             .assert_wb => if (atWordBoundary(input, sp))
-                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
+                self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags),
             .assert_nwb => if (!atWordBoundary(input, sp))
-                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, caps, input, flags),
+                self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags),
             .look => |lnode| {
                 var tmp = [_]CaptureSpan{INVALID_CAP} ** MAX_CAPTURES;
                 if (matchNode(lnode, input, sp, &tmp, flags) == null) return;
@@ -3372,13 +3426,17 @@ const PikeVM = struct {
                     touched = true;
                 }
                 const next_caps = if (touched) merged[0..self.ns] else caps;
-                self.addThread(list_pcs, list_caps, n_ptr, pc + 1, sp, next_caps, input, flags);
+                self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, next_caps, input, flags);
             },
-            // Leaf: a consuming op or `match`. Snapshot caps into the list slot.
+            // Leaf: a consuming op or `match`. Snapshot caps + the position at
+            // which this thread will consume (needed because consuming ops can
+            // advance a variable number of bytes — a multi-byte class/dot — so
+            // threads are no longer guaranteed to sit at a single shared `sp`).
             .char, .class, .any_char, .match => {
                 const idx = n_ptr.*;
                 @memcpy(list_caps[idx * self.ns .. idx * self.ns + self.ns], caps);
                 list_pcs[idx] = pc;
+                list_pos[idx] = sp;
                 n_ptr.* = idx + 1;
             },
         }
@@ -3398,15 +3456,17 @@ const PikeVM = struct {
 
         var cur_pcs = self.a_pcs;
         var cur_caps = self.a_caps;
+        var cur_pos = self.a_pos;
         var cur_n: usize = 0;
         var nxt_pcs = self.b_pcs;
         var nxt_caps = self.b_caps;
+        var nxt_pos = self.b_pos;
         var nxt_n: usize = 0;
 
         // Seed the current list at `start`.
         @memset(self.work, -1);
         self.gen += 1;
-        self.addThread(cur_pcs, cur_caps, &cur_n, 0, start, self.work, input, flags);
+        self.addThread(cur_pcs, cur_caps, cur_pos, &cur_n, 0, start, self.work, input, flags);
 
         var sp = start;
         while (true) {
@@ -3415,24 +3475,36 @@ const PikeVM = struct {
             var ti: usize = 0;
             while (ti < cur_n) : (ti += 1) {
                 const pc = cur_pcs[ti];
+                const tpos = cur_pos[ti];
                 const tcaps = cur_caps[ti * self.ns .. ti * self.ns + self.ns];
+                // A consuming op may have advanced past `sp` (multi-byte class or
+                // dot). Threads waiting at a later byte are carried forward
+                // unchanged until `sp` reaches them, preserving priority order.
+                if (tpos > sp) {
+                    const idx = nxt_n;
+                    @memcpy(nxt_caps[idx * self.ns .. idx * self.ns + self.ns], tcaps);
+                    nxt_pcs[idx] = pc;
+                    nxt_pos[idx] = tpos;
+                    nxt_n = idx + 1;
+                    continue;
+                }
                 switch (self.prog.insts[pc]) {
                     .char => |ch| {
                         if (consumeLiteral(input, sp, ch, flags)) |np| {
                             @memcpy(self.work, tcaps);
-                            self.addThread(nxt_pcs, nxt_caps, &nxt_n, pc + 1, np, self.work, input, flags);
+                            self.addThread(nxt_pcs, nxt_caps, nxt_pos, &nxt_n, pc + 1, np, self.work, input, flags);
                         }
                     },
                     .class => |cc| {
                         if (consumeClass(input, sp, cc, flags)) |np| {
                             @memcpy(self.work, tcaps);
-                            self.addThread(nxt_pcs, nxt_caps, &nxt_n, pc + 1, np, self.work, input, flags);
+                            self.addThread(nxt_pcs, nxt_caps, nxt_pos, &nxt_n, pc + 1, np, self.work, input, flags);
                         }
                     },
                     .any_char => {
                         if (consumeDot(input, sp, flags)) |np| {
                             @memcpy(self.work, tcaps);
-                            self.addThread(nxt_pcs, nxt_caps, &nxt_n, pc + 1, np, self.work, input, flags);
+                            self.addThread(nxt_pcs, nxt_caps, nxt_pos, &nxt_n, pc + 1, np, self.work, input, flags);
                         }
                     },
                     .match => {
@@ -3448,17 +3520,19 @@ const PikeVM = struct {
             // Swap current <-> next.
             const t_pcs = cur_pcs;
             const t_caps = cur_caps;
+            const t_pos = cur_pos;
             cur_pcs = nxt_pcs;
             cur_caps = nxt_caps;
+            cur_pos = nxt_pos;
             cur_n = nxt_n;
             nxt_pcs = t_pcs;
             nxt_caps = t_caps;
+            nxt_pos = t_pos;
             if (cur_n == 0) break;
-            // All live threads sit at the same input position, so advance by the
-            // width of the code point at `sp` under `u`/`v` — otherwise a
-            // consuming instruction after a multi-byte code point would read from
-            // the middle of a UTF-8 sequence.
-            sp += if (flags.cpMode() and sp < input.len) @as(usize, cpByteLenAt(input, sp)) else 1;
+            // Step one byte at a time. Threads whose consume position is still
+            // ahead of `sp` (a multi-byte code unit was consumed) wait in the list
+            // and fire once `sp` reaches them — see the carry above.
+            sp += 1;
         }
 
         if (!self.matched_valid) return null;
