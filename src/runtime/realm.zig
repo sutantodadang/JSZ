@@ -3553,6 +3553,71 @@ fn nativeNumberToString(arena: std.mem.Allocator, this_val: Value, args: []const
     return val_mod.makeString(arena, try numberToRadixString(arena, n, radix));
 }
 
+/// Exact Number.prototype.toFixed for a finite, non-negative `x` and `f` in
+/// [0,100]: computes n = round(x * 10^f) (ties toward the larger n, per spec)
+/// with big-integer arithmetic so every digit of the double's exact value is
+/// preserved (Zig's float formatter rounds to ~17 significant digits, which
+/// loses the tail of large integers such as 1e18 + 128).
+fn exactToFixedAbs(arena: std.mem.Allocator, x: f64, f: usize) ![]const u8 {
+    const Managed = std.math.big.int.Managed;
+    // Decompose x = m * 2^e (IEEE-754 binary64).
+    const bits: u64 = @bitCast(x);
+    const raw_exp: u64 = (bits >> 52) & 0x7FF;
+    const raw_frac: u64 = bits & 0xFFFFFFFFFFFFF;
+    var m_int: u64 = undefined;
+    var e: i64 = undefined;
+    if (raw_exp == 0) {
+        m_int = raw_frac;
+        e = -1074;
+    } else {
+        m_int = raw_frac | (@as(u64, 1) << 52);
+        e = @as(i64, @intCast(raw_exp)) - 1075;
+    }
+    // num = m * 5^f  (then scale by 2^(e+f)).
+    var num = try Managed.initSet(arena, m_int);
+    {
+        var five = try Managed.initSet(arena, 5);
+        var acc = try Managed.initSet(arena, 1);
+        var tmp = try Managed.init(arena);
+        var k: usize = 0;
+        while (k < f) : (k += 1) {
+            try tmp.mul(&acc, &five);
+            acc.swap(&tmp);
+        }
+        try tmp.mul(&num, &acc);
+        num.swap(&tmp);
+    }
+    const p: i64 = e + @as(i64, @intCast(f));
+    var n = try Managed.init(arena);
+    if (p >= 0) {
+        try n.shiftLeft(&num, @intCast(p));
+    } else {
+        const shift: usize = @intCast(-p);
+        // Round to nearest, ties up: (num + 2^(shift-1)) >> shift.
+        var half = try Managed.initSet(arena, 1);
+        try half.shiftLeft(&half, shift - 1);
+        var summed = try Managed.init(arena);
+        try summed.add(&num, &half);
+        try n.shiftRight(&summed, shift);
+    }
+    const digits = try n.toConst().toStringAlloc(arena, 10, .lower);
+    if (f == 0) return digits;
+    if (digits.len <= f) {
+        // 0.<pad><digits>
+        var buf = std.ArrayList(u8){};
+        try buf.appendSlice(arena, "0.");
+        try buf.appendNTimes(arena, '0', f - digits.len);
+        try buf.appendSlice(arena, digits);
+        return buf.items;
+    }
+    const split = digits.len - f;
+    var buf = std.ArrayList(u8){};
+    try buf.appendSlice(arena, digits[0..split]);
+    try buf.append(arena, '.');
+    try buf.appendSlice(arena, digits[split..]);
+    return buf.items;
+}
+
 fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const n = thisNumber(this_val) orelse return throwTypeError(arena, "Number.prototype.toFixed requires a Number");
     // f = ToIntegerOrInfinity(fractionDigits): ToNumber throws TypeError for
@@ -3566,8 +3631,13 @@ fn nativeNumberToFixed(arena: std.mem.Allocator, this_val: Value, args: []const 
     if (@abs(n) >= 1e21) return val_mod.makeString(arena, try val_mod.formatNumber(arena, n));
     const fu: usize = @intCast(f);
     // -0 formats without a sign ("0.00", not "-0.00").
-    const nf: f64 = if (n == 0) 0.0 else n;
-    return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "{d:.[1]}", .{ nf, fu }));
+    const negative = n < 0.0;
+    const abs_n = @abs(n);
+    const body = try exactToFixedAbs(arena, abs_n, fu);
+    if (negative and abs_n != 0.0) {
+        return val_mod.makeString(arena, try std.fmt.allocPrint(arena, "-{s}", .{body}));
+    }
+    return val_mod.makeString(arena, body);
 }
 
 /// Shared helper: format `n` in exponential notation.
