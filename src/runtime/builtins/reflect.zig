@@ -48,6 +48,16 @@ fn isObj(v: Value) bool {
     return v.toPtr().* == .object;
 }
 
+/// Type(v) is Object — includes callables (functions / class constructors),
+/// which are Objects in the spec even though we tag them separately.
+fn isObjectLike(v: Value) bool {
+    if (v.bits == 0 or !v.isHeapPtr()) return false;
+    return switch (v.unbox()) {
+        .object, .bc_function, .native_function, .function => true,
+        else => false,
+    };
+}
+
 /// The *JsObject a Reflect target denotes, including a function's lazily
 /// materialized backing object (a callable IS an object). Null for primitives.
 pub fn reflectTargetObjPub(arena: std.mem.Allocator, v: Value) anyerror!?*JsObject {
@@ -475,8 +485,8 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
 
 pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
-    if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
-    const target_obj = args[0].toPtr().object;
+    if (args.len == 0 or !isObjectLike(args[0])) return val_mod.makeBool(arena, false);
+    const target_obj = (try reflectTargetObj(arena, args[0])) orelse return val_mod.makeBool(arena, false);
     const key = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
 
     if (isSym(key)) {
@@ -555,8 +565,8 @@ pub fn nativeReflectHas(arena: std.mem.Allocator, _: Value, args: []const Value)
 
 pub fn nativeReflectDeleteProperty(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     if (args.len == 0 or isPrimitiveTarget(args[0])) return throwTypeErrorReflect(arena, "Reflect target must be an object");
-    if (args.len == 0 or !isObj(args[0])) return val_mod.makeBool(arena, false);
-    const target_obj = args[0].toPtr().object;
+    if (args.len == 0 or !isObjectLike(args[0])) return val_mod.makeBool(arena, false);
+    const target_obj = (try reflectTargetObj(arena, args[0])) orelse return val_mod.makeBool(arena, false);
     const key = try toPropertyKey(arena, if (args.len > 1) args[1] else Value{});
 
     // Proxy [[Delete]](P): dispatch the `deleteProperty` trap (with invariant),
@@ -628,10 +638,9 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
         arr.array_length = idx;
         return val_mod.makeObject(arena, arr);
     }
-    if (!isObj(args[0])) {
+    const obj = (try reflectTargetObj(arena, args[0])) orelse {
         return val_mod.makeObject(arena, arr);
-    }
-    const obj = args[0].toPtr().object;
+    };
 
     // Proxy [[OwnPropertyKeys]]: dispatch the `ownKeys` trap (all keys, strings
     // and symbols) or forward to the target — never the proxy's own slots.
@@ -720,8 +729,26 @@ pub fn nativeReflectOwnKeys(arena: std.mem.Allocator, _: Value, args: []const Va
 // ---------------------------------------------------------------- Reflect.getPrototypeOf ---
 
 pub fn nativeReflectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or !isObj(args[0]))
+    if (args.len == 0 or !isObjectLike(args[0]))
         return throwTypeErrorReflect(arena, "Reflect.getPrototypeOf called on non-object");
+    // A callable (function/class ctor) is an Object: its [[Prototype]] lives on a
+    // native default (%Function.prototype%) or a lazily-created backing object.
+    switch (args[0].unbox()) {
+        .native_function => {
+            if (@import("../realm.zig").active_function_proto) |fproto| return val_mod.makeObject(arena, fproto);
+            return val_mod.makeNull(arena);
+        },
+        .bc_function, .function => {
+            if (@import("../realm.zig").active_context) |ctx| {
+                if (try ctx.backingObject(arena, args[0])) |bo| {
+                    if (bo.proto) |p| return val_mod.makeObjectOrFunction(arena, p);
+                }
+            }
+            if (@import("../realm.zig").active_function_proto) |fproto| return val_mod.makeObject(arena, fproto);
+            return val_mod.makeNull(arena);
+        },
+        else => {},
+    }
     const obj = args[0].toPtr().object;
     if (obj.internal_kind == .proxy) {
         if (try proxy_mod.proxyGetPrototypeOf(arena, obj)) |p| return p;
@@ -736,9 +763,10 @@ pub fn nativeReflectGetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []c
 // ---------------------------------------------------------------- Reflect.setPrototypeOf ---
 
 pub fn nativeReflectSetPrototypeOf(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or !isObj(args[0]))
+    if (args.len == 0 or !isObjectLike(args[0]))
         return throwTypeErrorReflect(arena, "Reflect.setPrototypeOf called on non-object");
-    const obj = args[0].toPtr().object;
+    const obj = (try reflectTargetObj(arena, args[0])) orelse
+        return throwTypeErrorReflect(arena, "Reflect.setPrototypeOf called on non-object");
     const new_proto: ?*JsObject = blk: {
         if (args.len < 2 or args[1].bits == 0) break :blk null;
         break :blk switch (args[1].unbox()) {
@@ -1040,9 +1068,10 @@ pub fn nativeReflectGetOwnPropertyDescriptor(arena: std.mem.Allocator, _: Value,
 // ---------------------------------------------------------------- Reflect.isExtensible ---
 
 pub fn nativeReflectIsExtensible(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or !isObj(args[0]))
+    if (args.len == 0 or !isObjectLike(args[0]))
         return throwTypeErrorReflect(arena, "Reflect.isExtensible called on non-object");
-    const obj = args[0].toPtr().object;
+    const obj = (try reflectTargetObj(arena, args[0])) orelse
+        return throwTypeErrorReflect(arena, "Reflect.isExtensible called on non-object");
     if (obj.internal_kind == .proxy) {
         if (try proxy_mod.proxyIsExtensible(arena, obj)) |b| return val_mod.makeBool(arena, b);
         if (proxy_mod.proxyTarget(obj)) |t| return nativeReflectIsExtensible(arena, Value{}, &[_]Value{t});
@@ -1053,9 +1082,10 @@ pub fn nativeReflectIsExtensible(arena: std.mem.Allocator, _: Value, args: []con
 // ---------------------------------------------------------------- Reflect.preventExtensions ---
 
 pub fn nativeReflectPreventExtensions(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    if (args.len == 0 or !isObj(args[0]))
+    if (args.len == 0 or !isObjectLike(args[0]))
         return throwTypeErrorReflect(arena, "Reflect.preventExtensions called on non-object");
-    const obj = args[0].toPtr().object;
+    const obj = (try reflectTargetObj(arena, args[0])) orelse
+        return throwTypeErrorReflect(arena, "Reflect.preventExtensions called on non-object");
     if (obj.internal_kind == .proxy) {
         if (try proxy_mod.proxyPreventExtensions(arena, obj)) |b| return val_mod.makeBool(arena, b);
         if (proxy_mod.proxyTarget(obj)) |t| return nativeReflectPreventExtensions(arena, Value{}, &[_]Value{t});
