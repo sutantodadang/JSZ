@@ -1245,7 +1245,7 @@ pub fn nativeWith(arena: std.mem.Allocator, this_val: Value, args: []const Value
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const v = if (i == k) value else try genGet(arena, this_val, i);
-        try genSet(arena, arr_val, i, v);
+        try genCreate(arena, arr_val, i, v);
     }
     return arr_val;
 }
@@ -1260,7 +1260,7 @@ pub fn nativeToReversed(arena: std.mem.Allocator, this_val: Value, _: []const Va
     const arr_val = try val_mod.makeObject(arena, new_arr);
     var i: usize = 0;
     while (i < len) : (i += 1) {
-        try genSet(arena, arr_val, i, try genGet(arena, this_val, len - 1 - i));
+        try genCreate(arena, arr_val, i, try genGet(arena, this_val, len - 1 - i));
     }
     return arr_val;
 }
@@ -1288,7 +1288,7 @@ pub fn nativeToSorted(arena: std.mem.Allocator, this_val: Value, args: []const V
     try sortValues(arena, elems, cmp_fn);
 
     for (0..len) |k| {
-        try genSet(arena, arr_val, k, elems[k]);
+        try genCreate(arena, arr_val, k, elems[k]);
     }
     return arr_val;
 }
@@ -1320,16 +1320,16 @@ pub fn nativeToSpliced(arena: std.mem.Allocator, this_val: Value, args: []const 
     var j: usize = 0;
     var i: usize = 0;
     while (i < start0) : (i += 1) {
-        try genSet(arena, arr_val, j, try genGet(arena, this_val, i));
+        try genCreate(arena, arr_val, j, try genGet(arena, this_val, i));
         j += 1;
     }
     for (items) |it| {
-        try genSet(arena, arr_val, j, it);
+        try genCreate(arena, arr_val, j, it);
         j += 1;
     }
     i = start0 + del_count;
     while (i < len) : (i += 1) {
-        try genSet(arena, arr_val, j, try genGet(arena, this_val, i));
+        try genCreate(arena, arr_val, j, try genGet(arena, this_val, i));
         j += 1;
     }
     new_arr.array_length = @intCast(new_len);
