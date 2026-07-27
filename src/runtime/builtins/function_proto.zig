@@ -367,7 +367,6 @@ pub fn nativeFunctionBind(arena: std.mem.Allocator, this_val: Value, args: []con
 /// implicit on the four callable representations until deleted, so the check is
 /// per-representation rather than a lookup in one property table.
 fn hasOwnFnProp(arena: std.mem.Allocator, v: Value, key: []const u8) !bool {
-    _ = arena;
     if (v.bits == 0) return false;
     return switch (v.unbox()) {
         .native_function => |e| if (std.mem.eql(u8, key, "length")) !e.length_deleted else !e.name_deleted,
@@ -380,7 +379,15 @@ fn hasOwnFnProp(arena: std.mem.Allocator, v: Value, key: []const u8) !bool {
             const o: *JsObject = @ptrCast(@alignCast(op));
             break :blk o.hasOwn(key);
         } else true,
-        .object => |o| o.hasOwn(key),
+        // HasOwnProperty(proxy, key) = its [[GetOwnProperty]] (the trap) is not
+        // undefined. A `null` return means "no trap → forward" to the target.
+        .object => |o| if (o.internal_kind == .proxy) blk: {
+            const keyv = try val_mod.makeString(arena, key);
+            if (try proxy_mod.proxyGetOwnPropertyDescriptor(arena, o, keyv)) |d|
+                break :blk !(d.bits == 0 or d.unbox() == .undefined_);
+            if (proxy_mod.proxyTarget(o)) |t| break :blk try hasOwnFnProp(arena, t, key);
+            break :blk false;
+        } else o.hasOwn(key),
         else => false,
     };
 }

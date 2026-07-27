@@ -897,8 +897,18 @@ pub inline fn opIn(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     frame.pc += 1;
     const robj = code[frame.pc];
     frame.pc += 1;
-    const key_v = frame.registers[rkey];
+    var key_v = frame.registers[rkey];
     const obj_v = frame.registers[robj];
+    // ToPropertyKey(key): an object key (e.g. `new String("x") in o`, or an
+    // object with a user valueOf/toString) is coerced via ToPrimitive(string) —
+    // symbols stay symbols. hasProperty then stringifies the primitive result.
+    if (key_v.bits != 0 and key_v.unbox() == .object) {
+        key_v = coerceObjectKey(self, key_v) catch |e| {
+            if (e != error.JsException) return e;
+            if (try self.raisePendingException("error in toPrimitive")) |oc| return oc;
+            return null;
+        };
+    }
     // Functions (native, bytecode, legacy) are objects — hasProperty handles
     // them; do NOT throw for any callable.
     const obj_is_valid = if (obj_v.bits == 0) false else switch (obj_v.unbox()) {
