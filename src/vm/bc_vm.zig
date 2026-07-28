@@ -428,7 +428,10 @@ pub const BcVm = struct {
                 // VariableEnvironment. Defining one here (undefined for a plain
                 // `eval(...)` call) would clobber the caller's, so only bind it for a
                 // real function/constructor frame.
-                if (!fn_ptr.is_eval)
+                // Arrows have no NewTarget of their own and inherit it lexically,
+                // so leave their `__new_target__` unbound (resolving through the
+                // definition env); eval likewise shares the caller's binding.
+                if (!fn_ptr.is_eval and !fn_ptr.is_arrow)
                     try call_env.define("__new_target__", if (captured_nt.bits != 0) captured_nt else try val_mod.makeUndefined(self.arena));
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
@@ -2024,6 +2027,11 @@ pub const BcVm = struct {
                     return null;
                 }
                 const call_env = try Environment.initVarScope(self.arena, def_env);
+                // A [[Call]] supplies no NewTarget, so bind `__new_target__`
+                // undefined here — otherwise `new.target` in this body would leak
+                // the enclosing constructor's binding through the lexical env
+                // chain. Arrows are skipped: they inherit new.target lexically.
+                if (!fn_ptr.is_arrow and !fn_ptr.is_program and !fn_ptr.is_eval) try call_env.define("__new_target__", try val_mod.makeUndefined(self.arena));
                 for (fn_ptr.param_names, 0..) |pname, i| {
                     const av: Value = if (i < nargs)
                         frame.registers[base + 1 + @as(u8, @intCast(i))]
@@ -3935,6 +3943,10 @@ pub const BcVm = struct {
 
                 // Create call environment.
                 const call_env = try Environment.initVarScope(self.arena, def_env);
+                // A [[Call]] supplies no NewTarget — bind `__new_target__`
+                // undefined so `new.target` here doesn't leak the enclosing
+                // constructor's binding (arrows inherit it lexically, so skip).
+                if (!fn_ptr.is_arrow and !fn_ptr.is_program and !fn_ptr.is_eval) try call_env.define("__new_target__", try val_mod.makeUndefined(self.arena));
 
                 // Bind parameters.
                 for (fn_ptr.param_names, 0..) |pname, i| {
@@ -4206,6 +4218,10 @@ pub const BcVm = struct {
                 }
 
                 const call_env = try Environment.initVarScope(self.arena, def_env);
+                // A [[Call]] supplies no NewTarget — bind `__new_target__`
+                // undefined so `new.target` here doesn't leak the enclosing
+                // constructor's binding (arrows inherit it lexically, so skip).
+                if (!fn_ptr.is_arrow and !fn_ptr.is_program and !fn_ptr.is_eval) try call_env.define("__new_target__", try val_mod.makeUndefined(self.arena));
 
                 // Bind parameters. Args are at R[base+2..base+1+nargs].
                 for (fn_ptr.param_names, 0..) |pname, i| {

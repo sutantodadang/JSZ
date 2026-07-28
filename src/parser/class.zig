@@ -2619,6 +2619,12 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
     // `{y = arguments}` is fine there.
     const sb_saved = p.leaveStaticBlock();
     defer p.restoreStaticBlock(sb_saved);
+    // Formal parameters are function code: a default expression like
+    // `x = new.target` sits inside the function, not at the enclosing eval/script
+    // top level. parseFunctionBody only bumps the depth once it reaches `{`, so
+    // count the parameter list here too (balanced before the body opens).
+    p.fn_nesting_depth += 1;
+    defer p.fn_nesting_depth -= 1;
     _ = p.expect(.left_paren) orelse return null;
     var params = std.ArrayList([]const u8){};
     var defaults = std.ArrayList(?*Node){};
