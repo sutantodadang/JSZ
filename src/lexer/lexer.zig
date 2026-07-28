@@ -533,14 +533,19 @@ pub const Lexer = struct {
                 'v' => try buf.append(self.allocator, 0x0B),
                 'b' => try buf.append(self.allocator, 0x08),
                 'f' => try buf.append(self.allocator, 0x0C),
-                '0' => {
-                    // `\0`: the NUL escape, OR the start of a legacy octal escape
-                    // (non-strict) when followed by octal digits. A leading 0 is in
-                    // the 0–3 range, so up to two further octal digits may follow
-                    // (`\000` is one NUL; `\0002` is NUL followed by a literal '2').
-                    var val: u32 = 0;
+                '0', '1', '2', '3', '4', '5', '6', '7' => {
+                    // Legacy octal escape (Annex B.1.2 LegacyOctalEscapeSequence),
+                    // valid only in non-strict code. The first digit bounds the
+                    // total length so the value never exceeds 255: a leading digit
+                    // in 0–3 permits up to three octal digits, a leading 4–7 only
+                    // two (`\400` is `\40` followed by a literal '0'). `\0` not
+                    // followed by an octal digit is the NUL escape (also legal in
+                    // strict code; strict rejection of the octal forms is a
+                    // separate early error not enforced here).
+                    var val: u32 = esc - '0';
+                    const max_more: usize = if (esc <= '3') 2 else 1;
                     var consumed: usize = 0;
-                    while (consumed < 2 and self.pos < self.source.len) {
+                    while (consumed < max_more and self.pos < self.source.len) {
                         const d = self.source[self.pos];
                         if (d < '0' or d > '7') break;
                         val = val * 8 + (d - '0');

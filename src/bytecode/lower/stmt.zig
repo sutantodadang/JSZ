@@ -540,6 +540,28 @@ fn emitPerIterationCopy(
     self.sp = base_sp;
 }
 
+/// The tail-call fast path in `lowerReturnStmt` relies on `compileCall` emitting
+/// a self-returning TAIL_CALL / TAIL_METHOD_CALL, so no RETURN is written after
+/// it. Several `compileCall` shapes take an early exit that returns a value
+/// register WITHOUT emitting any return instruction, so they must NOT use the
+/// tail path — otherwise the value is dropped and the function falls through to
+/// the implicit `RETURN_UNDEF`. Those shapes are:
+///   * `await x` / `yield* x` (desugared to `__await__` / `__yield_star__`
+///     intrinsics) — suspend points compiled to YIELD / a delegation loop.
+///   * a call with a spread argument (`f(...xs)`) — compiled via CALL_SPREAD,
+///     which has no tail variant.
+fn dropsTailValue(c: ast.CallExpr) bool {
+    if (c.callee.kind == .identifier) {
+        const name = c.callee.data.identifier;
+        if (std.mem.eql(u8, name, "__await__") or std.mem.eql(u8, name, "__yield_star__"))
+            return true;
+    }
+    for (c.args) |a| {
+        if (a.kind == .spread_expr) return true;
+    }
+    return false;
+}
+
 pub fn lowerReturnStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) error{OutOfMemory}!void {
     _ = last_expr_reg;
     const line: u32 = node.start;
@@ -550,7 +572,7 @@ pub fn lowerReturnStmt(self: *FnCompiler, node: *Node, last_expr_reg: *?u8) erro
         // (direct) or TAIL_METHOD_CALL (member); the opcode performs the
         // return itself, so no RETURN is emitted here.
         if (self.is_strict and self.try_depth == 0 and
-            rv_node.kind == .call_expr)
+            rv_node.kind == .call_expr and !dropsTailValue(rv_node.data.call_expr))
         {
             _ = try self.compileCall(rv_node.data.call_expr, rv_node.start, true);
         } else {
