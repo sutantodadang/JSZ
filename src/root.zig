@@ -30,7 +30,7 @@ const IsolateImpl = isolate_mod.IsolateImpl;
 const val_mod = @import("./value/value.zig");
 const realm_mod = @import("./runtime/realm.zig");
 
-pub const version = "0.0.0-phase9-scaffold";
+pub const version = "0.1.0";
 
 /// Interpreter mode: bytecode VM (only remaining engine).
 pub const InterpMode = isolate_mod.InterpMode;

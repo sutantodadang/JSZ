@@ -56,7 +56,7 @@ registrations (`registerNativeFn`) live for the `Isolate`'s lifetime.
 
 | Name | Definition | Description |
 |---|---|---|
-| `version` | `"0.0.0-phase9-scaffold"` | Semantic version string. Pre-1.0; do not parse as semver yet. |
+| `version` | `"0.1.0"` | Semantic version string. Pre-1.0; do not parse as semver yet. |
 | `jit_build` | `bool` (from `build_options.jit_enabled`) | `true` when this binary was built with `-Djit=true` (Cranelift backend linked). |
 | `JszError` | `error{ NotImplemented, OutOfMemory }` | Error set for all jsz operations. |
 

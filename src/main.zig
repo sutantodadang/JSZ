@@ -202,7 +202,7 @@ fn debugHook(_: ?*anyopaque, stop: jsz.debug.DebugStop) void {
     e.flush() catch {};
 }
 
-fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode, limits: jsz.Limits, ic_stats: bool, is_module: bool) !void {
+fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8, interp: jsz.InterpMode, dump_bc: bool, source_map: bool, debug: bool, emit_bc_path: []const u8, show_gc_stats: bool, gc_after: bool, jit_mode: jsz.JitMode, limits: jsz.Limits, ic_stats: bool, is_module: bool, print_result: bool) !void {
     if (dump_bc or source_map) {
         // Compile-only modes: delegate to the jsz public API and exit.
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -262,8 +262,12 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
     const result = if (is_module) ctx.evalModule(source, source_name) else ctx.eval(source, source_name);
     switch (result) {
         .ok => |v| {
-            const s = jsz.valueToDisplayString(arena.allocator(), v) catch "?";
-            try out.print("{s}\n", .{s});
+            // Script files behave like every other runtime: only the program's
+            // own output is printed. `-e` prints the completion value.
+            if (print_result) {
+                const s = jsz.valueToDisplayString(arena.allocator(), v) catch "?";
+                try out.print("{s}\n", .{s});
+            }
         },
         .exception => |e| {
             try out.print("Uncaught {s}\n", .{e.message});
@@ -378,7 +382,10 @@ fn runRepl(allocator: std.mem.Allocator, interp: jsz.InterpMode) !void {
         try out.print(">> ", .{});
         try out.flush();
 
-        const line = in.takeDelimiterExclusive('\n') catch break;
+        // takeDelimiter consumes the trailing '\n' (takeDelimiterExclusive
+        // leaves it buffered, which spins this loop on empty lines forever)
+        // and returns null at end-of-stream so piped stdin terminates cleanly.
+        const line = (in.takeDelimiter('\n') catch break) orelse break;
         const trimmed = std.mem.trimRight(u8, line, "\r\n ");
         if (std.mem.eql(u8, trimmed, ".exit")) break;
         if (trimmed.len == 0) continue;
@@ -432,7 +439,7 @@ pub fn main() !void {
             }
         },
         .eval => {
-            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats, args.module);
+            try runEval(allocator, args.expr, "<eval>", args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats, args.module, true);
         },
         .interactive => {
             try runRepl(allocator, args.interp);
@@ -453,7 +460,7 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer allocator.free(cjs_wrapped);
-            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats, args.module);
+            try runEval(allocator, cjs_wrapped, args.script_path, args.interp, args.dump_bytecode, args.source_map, args.debug, args.emit_bc_path, args.gc_stats, args.gc_after_eval, args.jit_mode, args.limits, args.ic_stats, args.module, false);
         },
     }
 }
@@ -470,8 +477,8 @@ pub fn main() !void {
 /// Build the entry source wrapped with a `__modules__` registry of all
 /// transitively reachable relative modules (delegates to the shared host
 /// loader in `runtime/module.zig`). Modules absent on disk are skipped
-/// (resolved at runtime). Appends a trailing `module.exports;` so the script's
-/// completion value is the entry module's exports.
+/// (resolved at runtime). The completion value is not printed in file mode
+/// (see `runEval`'s `print_result`), matching how other runtimes run scripts.
 fn buildWrappedScript(gpa: std.mem.Allocator, script_path: []const u8, entry_src: []const u8) ![]const u8 {
     const base_dir = std.fs.path.dirname(script_path) orelse ".";
     // A HashbangComment is only a comment at offset 0, and the entry source is
@@ -480,7 +487,7 @@ fn buildWrappedScript(gpa: std.mem.Allocator, script_path: []const u8, entry_src
     // comment rather than deleted, to keep line numbers aligned.
     const src = if (std.mem.startsWith(u8, entry_src, "#!")) entry_src[2..] else entry_src;
     const lead = if (std.mem.startsWith(u8, entry_src, "#!")) "//" else "";
-    const wrapped_src = try std.fmt.allocPrint(gpa, "{s}{s}\nmodule.exports;", .{ lead, src });
+    const wrapped_src = try std.fmt.allocPrint(gpa, "{s}{s}", .{ lead, src });
     defer gpa.free(wrapped_src);
     const entry_id = std.fs.path.basename(script_path);
     const __b = try jsz.module_loader.buildBundle(gpa, base_dir, entry_id, wrapped_src);

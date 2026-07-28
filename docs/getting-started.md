@@ -54,7 +54,7 @@ Check the version and flag list while you're here:
 
 ```sh
 $ zig-out/bin/jsz --version
-jsz 0.0.0-phase9-scaffold
+jsz 0.1.0
 $ zig-out/bin/jsz --help
 ```
 
@@ -80,15 +80,13 @@ Run it:
 ```sh
 $ zig-out/bin/jsz hello.js
 Hello, jsz!
-true
 ```
 
 jsz runs a script file as a CommonJS module (so `require`/`module.exports`
-work — see [docs/cookbook.md](cookbook.md)). `console.log` writes to stdout;
-the trailing `true` is a completion signal printed after the module finishes
-without throwing, not your script's return value. To inspect an expression
-value directly, use `-e` (previous step) or the REPL (next step). To see a
-script fail loudly, introduce a bug:
+work — see [docs/cookbook.md](cookbook.md)). Like other runtimes, file mode
+prints only what your script writes; to inspect an expression value directly,
+use `-e` (previous step) or the REPL (next step). To see a script fail
+loudly, introduce a bug:
 
 ```sh
 $ zig-out/bin/jsz -e "null.x"

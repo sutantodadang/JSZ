@@ -35,7 +35,7 @@ argv, all other flags are ignored, help is printed, and the process exits `0`
 
 ### `--version`
 
-Print `jsz <version>` (currently `jsz 0.0.0-phase9-scaffold`, from
+Print `jsz <version>` (currently `jsz 0.1.0`, from
 `jsz.version`) to stdout and exit `0`.
 
 ### `-e <expr>`
@@ -235,7 +235,7 @@ stderr and exits `1`.
 
 ```
 $ jsz --version
-jsz 0.0.0-phase9-scaffold
+jsz 0.1.0
 
 $ jsz -e "1 + 1"
 2
