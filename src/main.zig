@@ -194,7 +194,7 @@ var dbg_source: []const u8 = "";
 fn debugHook(_: ?*anyopaque, stop: jsz.debug.DebugStop) void {
     const pos = jsz.debug.offsetToLineCol(dbg_source, stop.source_offset);
     var ebuf: [256]u8 = undefined;
-    var ew = std.fs.File.stderr().writer(&ebuf);
+    var ew = std.fs.File.stderr().writerStreaming(&ebuf);
     const e = &ew.interface;
     e.print("[debugger] paused at {s}:{d}:{d} in {s} (pc={d})\n", .{
         stop.source_name, pos.line, pos.column, stop.function_name, stop.pc,
@@ -208,7 +208,7 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         var buf: [8192]u8 = undefined;
-        var w = std.fs.File.stdout().writer(&buf);
+        var w = std.fs.File.stdout().writerStreaming(&buf);
         const out = &w.interface;
         if (dump_bc) {
             try jsz.dumpBytecode(arena.allocator(), source, source_name, out);
@@ -229,7 +229,7 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
         defer allocator.free(image);
         try std.fs.cwd().writeFile(.{ .sub_path = emit_bc_path, .data = image });
         var ebuf: [256]u8 = undefined;
-        var ew = std.fs.File.stderr().writer(&ebuf);
+        var ew = std.fs.File.stderr().writerStreaming(&ebuf);
         const e = &ew.interface;
         try e.print("wrote {d} bytes to {s}\n", .{ image.len, emit_bc_path });
         try e.flush();
@@ -252,7 +252,7 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
     ctx.setLimits(limits);
 
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.fs.File.stdout().writerStreaming(&buf);
     const out = &w.interface;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -318,7 +318,7 @@ fn runEval(allocator: std.mem.Allocator, source: []const u8, source_name: []cons
 fn runSnapshot(allocator: std.mem.Allocator, path: []const u8) !void {
     const image = std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024 * 1024) catch |err| {
         var errbuf: [256]u8 = undefined;
-        var ew = std.fs.File.stderr().writer(&errbuf);
+        var ew = std.fs.File.stderr().writerStreaming(&errbuf);
         const e = &ew.interface;
         try e.print("jsz: cannot read snapshot '{s}': {s}\n", .{ path, @errorName(err) });
         try e.flush();
@@ -332,7 +332,7 @@ fn runSnapshot(allocator: std.mem.Allocator, path: []const u8) !void {
     defer ctx.deinit();
 
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.fs.File.stdout().writerStreaming(&buf);
     const out = &w.interface;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -358,7 +358,7 @@ fn runSnapshot(allocator: std.mem.Allocator, path: []const u8) !void {
 
 fn runRepl(allocator: std.mem.Allocator, interp: jsz.InterpMode) !void {
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.fs.File.stdout().writerStreaming(&buf);
     const out = &w.interface;
 
     var iso = try jsz.Isolate.init(allocator);
@@ -413,10 +413,10 @@ pub fn main() !void {
     const args = parseArgs(argv);
 
     var buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&buf);
+    var stdout_writer = std.fs.File.stdout().writerStreaming(&buf);
     const stdout = &stdout_writer.interface;
     var errbuf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&errbuf);
+    var stderr_writer = std.fs.File.stderr().writerStreaming(&errbuf);
     const stderr = &stderr_writer.interface;
 
     switch (args.mode) {

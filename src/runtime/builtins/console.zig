@@ -86,7 +86,7 @@ fn logImpl(arena: std.mem.Allocator, args: []const Value, writer: anytype) !void
 // stdout targets: log / info / debug
 pub fn nativeConsoleLog(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.fs.File.stdout().writerStreaming(&buf);
     const out = &w.interface;
     try logImpl(arena, args, out);
     return val_mod.makeUndefined(arena);
@@ -94,7 +94,7 @@ pub fn nativeConsoleLog(arena: std.mem.Allocator, _: Value, args: []const Value)
 
 pub fn nativeConsoleInfo(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.fs.File.stdout().writerStreaming(&buf);
     const out = &w.interface;
     try logImpl(arena, args, out);
     return val_mod.makeUndefined(arena);
@@ -102,7 +102,7 @@ pub fn nativeConsoleInfo(arena: std.mem.Allocator, _: Value, args: []const Value
 
 pub fn nativeConsoleDebug(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.fs.File.stdout().writerStreaming(&buf);
     const out = &w.interface;
     try logImpl(arena, args, out);
     return val_mod.makeUndefined(arena);
@@ -111,7 +111,7 @@ pub fn nativeConsoleDebug(arena: std.mem.Allocator, _: Value, args: []const Valu
 // stderr targets: error / warn
 pub fn nativeConsoleError(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.fs.File.stderr().writerStreaming(&buf);
     const out = &w.interface;
     try logImpl(arena, args, out);
     return val_mod.makeUndefined(arena);
@@ -119,7 +119,7 @@ pub fn nativeConsoleError(arena: std.mem.Allocator, _: Value, args: []const Valu
 
 pub fn nativeConsoleWarn(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.fs.File.stderr().writerStreaming(&buf);
     const out = &w.interface;
     try logImpl(arena, args, out);
     return val_mod.makeUndefined(arena);
