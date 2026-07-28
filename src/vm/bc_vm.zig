@@ -754,7 +754,21 @@ pub const BcVm = struct {
                         // that ctors reading a method off `this` via [[Get]] (Map's `set`
                         // / Set's `add` adder) observe the subclass override. When the
                         // ctor defers proto (TypedArray) it re-applies below — harmless.
-                        if (try self.protoFromNewTarget(new_target, ctor, default_proto)) |po| default_proto = po;
+                        //
+                        // EXCEPT the dynamic Function/GeneratorFunction/AsyncFunction/
+                        // AsyncGeneratorFunction constructors: CreateDynamicFunction parses
+                        // the assembled source (steps ~5-17) BEFORE GetPrototypeFromConstructor
+                        // (step 18). Reading `newTarget.prototype` here, ahead of the call,
+                        // would run a `prototype` getter before a bad parameter/body list's
+                        // SyntaxError — observable via
+                        // `Reflect.construct(Function, ["@error"], newTargetWithGetter)`.
+                        // `functionCtorImpl` already derives the real prototype itself, in
+                        // the correct order, once parsing has succeeded — so skip the eager
+                        // read here and let that (or the "didn't consume" fallback below,
+                        // which stays inert once it does) apply it instead.
+                        if (!realm_m.isDynamicFunctionCtor(cv.toPtr().native_function.call)) {
+                            if (try self.protoFromNewTarget(new_target, ctor, default_proto)) |po| default_proto = po;
+                        }
                         const new_obj = if (self.heap) |heap|
                             try JsObject.createOnHeap(heap, default_proto)
                         else
@@ -982,26 +996,55 @@ pub const BcVm = struct {
         // SuperProperty is legal inside a direct eval whose calling context has a
         // [[HomeObject]]. JSZ's class desugar marks exactly those contexts —
         // methods, derived constructors and field initializers — by binding
-        // `__sproto__` (the parent prototype), which the eval inherits through
-        // the caller's chain, so its presence is the home-object test.
+        // `__sproto__` (the parent prototype). An *arrow* function has no
+        // [[HomeObject]] of its own and is transparent to this lookup (it
+        // inherits the enclosing one, so `eval` inside an arrow inside a
+        // method must still see `__sproto__` — staging/sm/class/
+        // superPropEvalInsideArrow.js). An *ordinary* (non-arrow) function
+        // DOES have its own [[HomeObject]] slot (undefined unless it's itself
+        // a method) that is NOT inherited from its lexical parent — so the
+        // walk must stop the instant it crosses into one, even though a plain
+        // `Environment.lookup` would happily keep walking outward through it
+        // (staging/sm/class/superPropEvalInsideNested.js: `eval` inside a
+        // plain function nested in a method must NOT see the method's
+        // `__sproto__`). Every non-arrow function call binds its own
+        // `__new_target__` (arrows don't — see the new.target walk just
+        // below); reuse that as the "crossed a real function boundary" test.
         if (direct) {
-            if (outer_env.lookup("__sproto__")) |_| {
-                p.eval_allow_super_prop = true;
-            } else |_| {}
+            var se: ?*Environment = outer_env;
+            while (se) |e| {
+                if (e.bindings.contains("__sproto__")) {
+                    p.eval_allow_super_prop = true;
+                    break;
+                }
+                if (e.bindings.contains("__new_target__")) break;
+                if (e == self.realm.global_env) break;
+                se = e.parent;
+            }
             // §13.3.12.1: `new.target` needs function code around it. Eval code
-            // takes that from its calling context, so walk down to the nearest
-            // frame that is not itself eval code and ask whether it is a
-            // function literal rather than a Script/module top level.
-            var i = self.frames.items.len;
-            while (i > 0) {
-                i -= 1;
-                const cf = self.frames.items[i].func;
-                if (cf.is_eval) continue;
-                // The containing function code must not be an ArrowFunction's:
-                // `(() => eval('new.target'))()` is an early SyntaxError even
-                // though the arrow would otherwise inherit its NewTarget.
-                p.eval_allow_new_target = !cf.is_program and !cf.is_arrow;
-                break;
+            // takes that from its calling context — but "function code around
+            // it" is LEXICAL, not the dynamic call stack: an arrow function's
+            // `new.target` is inherited from wherever it was DEFINED, not from
+            // whoever happens to call it (`assertNewTarget` may return an arrow
+            // that gets invoked from a completely different call site and must
+            // still report the new.target active when the arrow was created —
+            // staging/sm/class/newTargetArrow.js/newTargetEval.js). Every
+            // non-arrow function's call env binds `__new_target__` (defaulting
+            // to undefined), so walking the caller's lexical env chain for an
+            // OWN binding of that name (never recursing past it, unlike
+            // `Environment.lookup`) is the right test — EXCEPT the global env
+            // itself also carries an unconditional `__new_target__ = undefined`
+            // fallback (realm.zig, so an ordinary non-construct call observes
+            // `undefined` instead of a ReferenceError), which is not a function
+            // context at all. Stop the walk there rather than including it.
+            var nt_env: ?*Environment = outer_env;
+            while (nt_env) |e| {
+                if (e == self.realm.global_env) break;
+                if (e.bindings.contains("__new_target__")) {
+                    p.eval_allow_new_target = true;
+                    break;
+                }
+                nt_env = e.parent;
             }
         }
         const parse_result = p.parseScript();
@@ -2324,12 +2367,10 @@ pub const BcVm = struct {
         if (obj.internal_kind == .proxy) {
             return try self.proxySet(obj_val, obj, sym_key, value, obj_val);
         }
-        // M16: Module Namespace exotic [[Set]] always fails.
-        if (obj.internal_kind == .module_namespace) {
-            const realm_m = @import("../runtime/realm.zig");
-            realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot set property on module namespace object");
-            return error.JsException;
-        }
+        // M16: Module Namespace exotic [[Set]] always fails (the strict
+        // module caller turns the false return into a TypeError) — mirrors
+        // the string-key path in setPropR, which never throws here itself.
+        if (obj.internal_kind == .module_namespace) return false;
         // OrdinarySet: walk the prototype chain for a symbol-keyed accessor. An
         // accessor (own or inherited) routes the write through its setter; an own
         // data property (or none) is created/overwritten directly on the receiver.
@@ -4538,6 +4579,15 @@ pub const BcVm = struct {
     /// a BcGeneratorState registered for GC scanning. The frame starts at pc 0.
     fn buildGenState(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, callee: ?*BcClosure) !*BcGeneratorState {
         const call_env = try Environment.initVarScope(self.arena, def_env);
+        // Generator/async functions are never constructible (no [[Construct]]
+        // slot), so `new.target` inside one is always undefined — but the
+        // binding still needs to EXIST here (matching the ordinary-call path's
+        // `call_env.define("__new_target__", ...)`), both so `new.target` reads
+        // don't fall through to the outer scope's, and so a direct eval called
+        // from inside a generator can find an own `__new_target__` in its
+        // caller's env chain and correctly permit `new.target` in the eval'd
+        // code (staging/sm/class/newTargetGenerators.js).
+        try call_env.define("__new_target__", try val_mod.makeUndefined(self.arena));
         for (fn_ptr.param_names, 0..) |pname, i| {
             const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
             try call_env.define(pname, av);

@@ -4173,7 +4173,14 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
                     const saved_sr = active_shadow_realm;
                     active_shadow_realm = rp;
                     defer active_shadow_realm = saved_sr;
-                    break :blk try ctx.shadowEval(arena, src.items, @ptrCast(rp.global_env));
+                    // A parse failure of the assembled source surfaces as a real
+                    // SyntaxError (pending_exception already holds it); callers
+                    // only recognize `error.JsException` as "catchable JS throw",
+                    // so re-tag it here (mirrors ShadowRealm.prototype.evaluate).
+                    break :blk ctx.shadowEval(arena, src.items, @ptrCast(rp.global_env)) catch |e| {
+                        if (e == error.ShadowParseError) return error.JsException;
+                        return e;
+                    };
                 }
             }
             break :blk try ctx.evalSource(arena, src.items);
@@ -4222,7 +4229,7 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
     return val_mod.makeObject(arena, o);
 }
 
-fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
+pub fn nativeFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     return functionCtorImpl(arena, args, "function");
 }
 
@@ -4236,6 +4243,17 @@ pub fn nativeAsyncGeneratorFunctionCtor(arena: std.mem.Allocator, _: Value, args
 
 pub fn nativeAsyncFunctionCtor(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     return functionCtorImpl(arena, args, "async function");
+}
+
+/// True when `fp` is one of the four dynamic-function constructors
+/// (Function / GeneratorFunction / AsyncFunction / AsyncGeneratorFunction).
+/// `bc_vm.constructImpl`'s generic native-constructor dispatch uses this to
+/// skip its eager `GetPrototypeFromConstructor(newTarget)` read: these four
+/// constructors parse their assembled source themselves, in the correct
+/// (parse-before-getPrototype) order, inside `functionCtorImpl`.
+pub fn isDynamicFunctionCtor(fp: val_mod.NativeFnPtr) bool {
+    return fp == &nativeFunctionCtor or fp == &nativeGeneratorFunctionCtor or
+        fp == &nativeAsyncGeneratorFunctionCtor or fp == &nativeAsyncFunctionCtor;
 }
 
 // ---- Function.prototype.toString ----

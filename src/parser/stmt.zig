@@ -100,7 +100,7 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
         const modname = p.current.value_str;
         _ = p.advance();
         const type_attr = skipImportAttributes(p); // `with { ... }` / `assert { ... }`
-        p.consumeSemicolon();
+        p.consumeSemicolon() orelse return null;
         const req = p.mkRequire(typedSpecifier(p, modname, type_attr)) orelse return null;
         const stmt = p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = req }) orelse return null;
         // M16 Phase 5: hoist side-effect imports to the bundle hoist point so
@@ -137,7 +137,7 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
             if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
             const spec_tok = p.expect(.string) orelse return null;
             _ = skipImportAttributes(p);
-            p.consumeSemicolon();
+            p.consumeSemicolon() orelse return null;
             const arg = p.makeNode(.string_literal, start, p.current.start, .{ .string_literal = spec_tok.value_str }) orelse return null;
             const call = p.mkCall1("__moduleSource__", arg) orelse return null;
             const stmt = p.mkVar(bind_tok.value_str, call) orelse return null;
@@ -164,7 +164,7 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
             if (!p.matchContextual("from")) return p.fail("expected 'from' in import declaration");
             const dmodtok = p.expect(.string) orelse return null;
             const dtype = skipImportAttributes(p); // `with { ... }` / `assert { ... }`
-            p.consumeSemicolon();
+            p.consumeSemicolon() orelse return null;
             const arg = p.makeNode(.string_literal, start, p.current.start, .{
                 .string_literal = typedSpecifier(p, dmodtok.value_str, dtype),
             }) orelse return null;
@@ -217,7 +217,7 @@ pub fn parseImportDecl(p: *Parser) ?*Node {
     const modtok = p.expect(.string) orelse return null;
     const modname = modtok.value_str;
     const type_attr = skipImportAttributes(p); // `with { ... }` / `assert { ... }`
-    p.consumeSemicolon();
+    p.consumeSemicolon() orelse return null;
 
     // A JSON module exposes only a `default` export (ES "json-modules"): an
     // `import { name }` of any other binding is a resolution-phase SyntaxError.
@@ -350,7 +350,10 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
                         .is_strict = is_strict,
                     },
                 }) orelse return null;
-                p.consumeSemicolon();
+                // `export default function(){}` is a HoistableDeclaration, not
+                // an AssignmentExpression — it self-terminates at the body's
+                // `}` and needs no `;`/ASI (unlike the `export default expr;`
+                // form below). No consumeSemicolon call here at all.
                 const ident = p.mkIdent(internal_name) orelse return null;
                 const assign = p.mkExportAssign("default", ident) orelse return null;
                 var out = std.ArrayList(*Node){};
@@ -359,11 +362,17 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
                 return p.finishMulti(out.items);
             }
         }
+        // `export default ClassDeclaration` is likewise a declaration form
+        // that self-terminates at the class body's `}` — no `;`/ASI needed,
+        // unlike the general `export default AssignmentExpression ;` case
+        // (ESM §sec-exports: the grammar only requires the terminating `;`
+        // when the default export does NOT start with `function`/`class`).
+        const is_class_start = p.check(.kw_class);
         // Set name hint for anonymous class / other anonymous expression.
         p.export_default_name_hint = "default";
         const expr = p.parseAssignmentExpr() orelse return null;
         p.export_default_name_hint = null;
-        p.consumeSemicolon();
+        if (!is_class_start) p.consumeSemicolon() orelse return null;
         return p.mkExportAssign("default", expr);
     }
 
@@ -376,7 +385,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             if (!p.matchContextual("from")) return p.fail("expected 'from' after export * as");
             const mod_tok = p.expect(.string) orelse return null;
             _ = skipImportAttributes(p);
-            p.consumeSemicolon();
+            p.consumeSemicolon() orelse return null;
             const req = p.mkRequire(mod_tok.value_str) orelse return null;
             const ns_val = p.mkCall1("__makeNamespace__", req) orelse return null;
             const stmt = p.mkExportAssign(ns_tok.value_str, ns_val);
@@ -393,7 +402,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             if (!p.matchContextual("from")) return p.fail("expected 'from' after export *");
             const mod_tok = p.expect(.string) orelse return null;
             _ = skipImportAttributes(p);
-            p.consumeSemicolon();
+            p.consumeSemicolon() orelse return null;
             const req = p.mkRequire(mod_tok.value_str) orelse return null;
             const callee = p.mkIdent("__exportStar__") orelse return null;
             const exports_id = p.mkIdent("exports") orelse return null;
@@ -439,7 +448,7 @@ pub fn parseExportDecl(p: *Parser) ?*Node {
             const req = p.mkRequire(modtok.value_str) orelse return null;
             out.append(p.arena, p.mkVar(tmp.?, req) orelse return null) catch return null;
         }
-        p.consumeSemicolon();
+        p.consumeSemicolon() orelse return null;
         for (specs.items) |sp| {
             if (tmp) |t| {
                 // Re-export (`export { X as Y } from './mod'`):
@@ -576,7 +585,7 @@ pub fn parseUsingDeclStmt(p: *Parser, is_await: bool) ?*Node {
         };
         if (!p.match(.comma)) break;
     }
-    p.consumeSemicolon();
+    p.consumeSemicolon() orelse return null;
     if (decls.items.len == 1) return decls.items[0];
     // Transparent container: these using bindings belong to the enclosing scope.
     return p.makeNode(.block_stmt, start, p.current.start, .{ .block_stmt = .{ .body = decls.items, .lexical_scope = false } });
@@ -589,8 +598,16 @@ pub fn parseUsingDeclStmt(p: *Parser, is_await: bool) ?*Node {
 /// via `checkStrictBindingName`.
 pub fn atLetDecl(p: *Parser) bool {
     if (p.current.kind != .identifier or !std.mem.eql(u8, p.current.value_str, "let")) return false;
-    return switch (p.peekNext().kind) {
-        .identifier, .left_bracket, .left_brace => true,
+    const nxt = p.peekNext();
+    return switch (nxt.kind) {
+        // `let` immediately followed by `{`/`[` on a DIFFERENT line is the ASI
+        // escape parseLexicalDeclStmt also applies: `let` alone is an
+        // identifier expression statement, not the start of a declaration
+        // (language/statements/labeled/let-block-with-newline.js,
+        // let-identifier-with-newline.js — both wrap `let\n{}` in a label,
+        // which is legal only because it's NOT a lexical declaration there).
+        .left_bracket, .left_brace => nxt.line == p.current.line,
+        .identifier => true,
         // `let yield = …` binds `yield` in sloppy non-generator code (a
         // BindingIdentifier tokenized as the contextual keyword `yield`, which
         // parseVarDeclarator accepts). Without this `let` is misread as an
@@ -718,7 +735,7 @@ pub fn parseStatement(p: *Parser) ?*Node {
             }) orelse return null;
             // Now parse the rest as an expression starting from ident_node.
             const full_expr = p.parseExprFromIdent(ident_node) orelse return null;
-            p.consumeSemicolon();
+            p.consumeSemicolon() orelse return null;
             return p.makeNode(.expr_stmt, ident_node.start, p.current.start, .{ .expr_stmt = full_expr });
         }
     }
@@ -765,7 +782,7 @@ pub fn parseStatement(p: *Parser) ?*Node {
         .kw_debugger => {
             const start = p.current.start;
             _ = p.advance();
-            p.consumeSemicolon();
+            p.consumeSemicolon() orelse return null;
             return p.makeNode(.debugger_stmt, start, p.current.start, .{ .debugger_stmt = {} });
         },
         else => p.parseExprStmt(),
@@ -1016,7 +1033,7 @@ pub fn parseVarDeclarators(p: *Parser, start: u32, kind: ast.VarKind, consume_se
         };
         if (!p.match(.comma)) break;
     }
-    if (consume_semicolon) p.consumeSemicolon();
+    if (consume_semicolon) p.consumeSemicolon() orelse return null;
     if (decls.items.len == 1) return decls.items[0];
     // Multiple declarators: wrap in a transparent block_stmt (bindings belong to
     // the enclosing scope, not a fresh block scope).
@@ -1126,12 +1143,25 @@ pub fn parseFunctionDecl(p: *Parser, is_async: bool) ?*Node {
     p.async_kw_start = 0;
     _ = p.advance(); // consume 'function'
     const is_generator = p.match(.star);
-    const name_tok = p.expect(.identifier) orelse return null;
+    // `yield` is a valid BindingIdentifier for a function/generator declaration's
+    // own name in sloppy-mode code outside a generator (`function yield(){}`,
+    // `function* yield(){}`) — the name is bound in the *enclosing* scope, not
+    // inside the function itself, so it's the enclosing strict/generator context
+    // that matters here. Strict mode (checked below) still rejects it.
+    const yield_as_name = p.check(.kw_yield) and !p.strict and !p.in_generator_function;
+    const name_tok = if (yield_as_name) p.advance() else (p.expect(.identifier) orelse return null);
     const name = name_tok.value_str;
     if (!parser_file.checkStrictBindingName(p, name, name_tok.line, name_tok.column)) return null;
-    const parsed_params = p.parseFunctionParams() orelse return null;
+    // The parameter list is parsed under THIS function's own [Yield] parameter,
+    // not the enclosing one — `function* g() { function f(yield) {} }` binds a
+    // plain parameter named `yield` in the nested ordinary function `f`, even
+    // though `g` is a generator. Flip the flag before parsing params, not after.
     const prev_gen = p.in_generator_function;
     p.in_generator_function = is_generator;
+    const parsed_params = p.parseFunctionParams() orelse {
+        p.in_generator_function = prev_gen;
+        return null;
+    };
     const body = p.parseFunctionBody() orelse {
         p.in_generator_function = prev_gen;
         return null;
@@ -1206,7 +1236,9 @@ pub fn parseDoWhileStmt(p: *Parser) ?*Node {
     _ = p.expect(.left_paren) orelse return null;
     const test_ = p.parseExpression() orelse return null;
     _ = p.expect(.right_paren) orelse return null;
-    p.consumeSemicolon();
+    // §13.7.2 special exception: ASI applies unconditionally right after a
+    // do-while's `)`, not just under the ordinary hasSemicolon() conditions.
+    p.consumeSemicolonAlways();
     return p.makeNode(.do_while_stmt, start, p.current.start, .{
         .do_while_stmt = .{ .body = body, .test_ = test_ },
     });
@@ -1297,7 +1329,10 @@ pub fn parseForStmt(p: *Parser) ?*Node {
         if (p.check(.left_bracket) or p.check(.left_brace)) {
             return p.parseForDestructuring(start, decl_kind, for_await);
         }
-        if (p.check(.identifier)) {
+        // `yield` is a valid BindingIdentifier in sloppy-mode code outside a
+        // generator (`for (var yield = 4; ; )`); mirrors parseVarDeclarator.
+        const yield_as_ident = p.check(.kw_yield) and !p.strict and !p.in_generator_function;
+        if (p.check(.identifier) or yield_as_ident) {
             const name_tok = p.current;
             _ = p.advance(); // consume identifier
             // The loop variable is a BindingIdentifier: strict code may not bind
@@ -1401,7 +1436,11 @@ pub fn parseForStmt(p: *Parser) ?*Node {
     } else if (!p.check(.semicolon)) {
         // for (expr in ...) or for (expr; ...)
         // Parse the expression
-        const expr = p.parseAssignmentExpr() orelse return null;
+        const saved_for_head = p.in_for_head_lhs;
+        p.in_for_head_lhs = true;
+        const expr_res = p.parseAssignmentExpr();
+        p.in_for_head_lhs = saved_for_head;
+        const expr = expr_res orelse return null;
         // `for (lhs in rhs)`: parseAssignmentExpr eagerly consumed `in` as a
         // binary operator. Detect this and split it back into a for-in.
         if (expr.kind == .binary_expr and
@@ -1652,7 +1691,7 @@ pub fn parseReturnStmt(p: *Parser) ?*Node {
     if (!p.hasSemicolon()) {
         value = p.parseExpression();
     }
-    p.consumeSemicolon();
+    p.consumeSemicolon() orelse return null;
     return p.makeNode(.return_stmt, start, p.current.start, .{ .return_stmt = value });
 }
 
@@ -1669,7 +1708,7 @@ pub fn parseBreakStmt(p: *Parser) ?*Node {
     // statement, which need not be a loop, so it is not checked here.)
     if (label == null and p.iteration_depth == 0 and p.switch_depth == 0)
         return p.fail("Illegal break statement");
-    p.consumeSemicolon();
+    p.consumeSemicolon() orelse return null;
     return p.makeNode(.break_stmt, start, p.current.start, .{ .break_stmt = label });
 }
 
@@ -1686,7 +1725,7 @@ pub fn parseContinueStmt(p: *Parser) ?*Node {
     // which likewise requires an enclosing loop).
     if (p.iteration_depth == 0)
         return p.fail("Illegal continue statement");
-    p.consumeSemicolon();
+    p.consumeSemicolon() orelse return null;
     return p.makeNode(.continue_stmt, start, p.current.start, .{ .continue_stmt = label });
 }
 
@@ -1706,7 +1745,7 @@ pub fn parseThrowStmt(p: *Parser) ?*Node {
         return null;
     }
     const argument = p.parseExpression() orelse return null;
-    p.consumeSemicolon();
+    p.consumeSemicolon() orelse return null;
     return p.makeNode(.throw_stmt, start, p.current.start, .{ .throw_stmt = argument });
 }
 
@@ -1825,6 +1864,6 @@ pub fn parseTryStmt(p: *Parser) ?*Node {
 pub fn parseExprStmt(p: *Parser) ?*Node {
     const start = p.current.start;
     const expr = p.parseExpression() orelse return null;
-    p.consumeSemicolon();
+    p.consumeSemicolon() orelse return null;
     return p.makeNode(.expr_stmt, start, p.current.start, .{ .expr_stmt = expr });
 }

@@ -833,6 +833,25 @@ fn setBindingByName(self: *BcVm, frame_in: *BcCallFrame, name: []const u8, value
                 } else |_| {}
             }
             if (cur_is_strict) {
+                // Before concluding this is unresolvable: a binding that lives on the
+                // real global object (e.g. a sloppy-mode implicit global created
+                // elsewhere, or a realm-level global binding not reachable through
+                // this frame's own env chain) is NOT undeclared — assignment to an
+                // *existing* global is legal in strict mode; only a truly
+                // unresolvable reference throws (mirrors the GET_GLOBAL fallback
+                // in `getBindingByName` below).
+                if (self.realm.global_env.assign(name, value)) |_| {
+                    return null;
+                } else |_| {}
+                const wrote_existing = blk: {
+                    const gt = frame.env.lookup("globalThis") catch break :blk false;
+                    if (gt.bits == 0 or gt.unbox() != .object) break :blk false;
+                    const obj = gt.toPtr().object;
+                    if (!obj.hasOwn(name)) break :blk false;
+                    obj.set(name, value) catch break :blk false;
+                    break :blk true;
+                };
+                if (wrote_existing) return null;
                 // Phase 4d: strict mode — undeclared variable assignment is a ReferenceError.
                 const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{name});
                 const exc_val = try self.makeErrorObjectBc("ReferenceError", msg);

@@ -205,56 +205,10 @@ fn readFromOptions(arena: std.mem.Allocator, opts: ?*JsObject) !void {
 }
 
 /// Parse an offset *value* string (sub-minute allowed): "±HH:MM(:SS(.fff))" /
-/// "Z". Returns ns.
-fn parseOffsetValue(arena: std.mem.Allocator, s: []const u8) !i128 {
-    if (s.len == 1 and (s[0] == 'Z' or s[0] == 'z')) return 0;
-    if (s.len < 3 or (s[0] != '+' and s[0] != '-')) return realm_mod.throwRangeError(arena, "invalid offset string");
-    const sign: i128 = if (s[0] == '-') -1 else 1;
-    var i: usize = 1;
-    const h = od(s, i) orelse return realm_mod.throwRangeError(arena, "invalid offset string");
-    i += 2;
-    var m: i128 = 0;
-    var sec: i128 = 0;
-    var sub: i128 = 0;
-    // The `:` separator must be used consistently: either every HH/MM/SS group
-    // is colon-separated or none is. Record the first choice and enforce it.
-    var colon: ?bool = null;
-    if (i < s.len) {
-        if (s[i] == ':') {
-            colon = true;
-            i += 1;
-        } else colon = false;
-        m = od(s, i) orelse return realm_mod.throwRangeError(arena, "invalid offset string");
-        i += 2;
-        if (i < s.len and s[i] != '.' and s[i] != ',') {
-            const has_colon = s[i] == ':';
-            if (has_colon != colon.?) return realm_mod.throwRangeError(arena, "inconsistent offset separators");
-            if (has_colon) i += 1;
-            sec = od(s, i) orelse return realm_mod.throwRangeError(arena, "invalid offset string");
-            i += 2;
-            if (i < s.len and (s[i] == '.' or s[i] == ',')) {
-                i += 1;
-                var frac: [9]u8 = .{ '0', '0', '0', '0', '0', '0', '0', '0', '0' };
-                var k: usize = 0;
-                while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-                    if (k < 9) frac[k] = s[i];
-                    k += 1;
-                }
-                if (k == 0 or k > 9) return realm_mod.throwRangeError(arena, "invalid offset string");
-                sub = std.fmt.parseInt(i128, &frac, 10) catch 0;
-            }
-        }
-    }
-    if (i != s.len) return realm_mod.throwRangeError(arena, "invalid offset string");
-    if (h > 23 or m > 59 or sec > 59) return realm_mod.throwRangeError(arena, "invalid offset string");
-    return sign * (h * shared.NS_PER_HOUR + m * shared.NS_PER_MINUTE + sec * shared.NS_PER_SECOND + sub);
-}
-
-fn od(s: []const u8, i: usize) ?i128 {
-    if (i + 2 > s.len) return null;
-    if (s[i] < '0' or s[i] > '9' or s[i + 1] < '0' or s[i + 1] > '9') return null;
-    return @as(i128, s[i] - '0') * 10 + (s[i + 1] - '0');
-}
+/// "Z". Returns ns. (Moved to shared.zig so PrepareTemporalFields can
+/// syntax-validate the "offset" field at its alphabetical read position,
+/// before later fields like "year" are read/coerced.)
+const parseOffsetValue = shared.parseOffsetValue;
 
 /// Convert a value to a ZonedDateTime (used by from/compare/equals/since/until).
 /// `opts_v` is the raw options value: it is coerced with GetOptionsObject only
@@ -410,7 +364,14 @@ fn interpretOffset(arena: std.mem.Allocator, tz: []const u8, dt: ISODateTime, zo
             if (opt == .use) return wall - so.ns;
             if (opt == .ignore) return disambiguate(arena, tz, zone_offset, wall, dis);
             // "prefer" and "reject" both honour an offset that really occurs at
-            // this wall time; they differ only when none does.
+            // this wall time; they differ only when none does. Per spec, this
+            // branch first runs CheckISODaysRange on the *raw* (unbalanced)
+            // parsed date — a wall-clock date more than 10^8 days from the
+            // epoch is rejected outright, even if resolving the offset would
+            // land back in range (e.g. "-271821-04-19T23:00-01:00[-01:00]":
+            // the date "-271821-04-19" alone is already one day past the
+            // boundary, regardless of the -01:00 offset).
+            if (!shared.isoDaysInRange(dt.date)) return realm_mod.throwRangeError(arena, "ZonedDateTime string date out of range");
             for (possibleInstants(tz, zone_offset, wall)) |maybe_t| {
                 const t = maybe_t orelse continue;
                 const cand = zoneOffsetAt(tz, zone_offset, t);

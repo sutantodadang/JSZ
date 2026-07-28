@@ -519,6 +519,17 @@ fn hourCycle12(locale: []const u8) []const u8 {
     return if (std.mem.eql(u8, primaryLanguage(locale), "ja")) "h11" else "h12";
 }
 
+/// The locale's default numbering system (CLDR `numbers/defaultNumberingSystem`)
+/// when neither the `numberingSystem` option nor a `-u-nu-` extension was
+/// requested. Almost every language defaults to Western Arabic digits
+/// ("latn"); Arabic itself is the one exception this build carries real data
+/// for — CLDR's `ar` root still gives it "arab" (Arabic-Indic digits), even
+/// though several individual Arabic-speaking countries override back to latn.
+fn defaultNumberingSystem(locale: []const u8) []const u8 {
+    if (std.mem.eql(u8, primaryLanguage(locale), "ar")) return "arab";
+    return "latn";
+}
+
 /// `new Intl.DateTimeFormat(locales, options)` — CreateDateTimeFormat (§11.1.2).
 ///
 /// Every option is read through `dnGetOption`, in the spec's order, so throwing
@@ -640,7 +651,7 @@ pub fn nativeDateTimeFormatCtor(arena: std.mem.Allocator, this_val: Value, args:
                 break :blk ext;
             }
         }
-        break :blk "latn";
+        break :blk defaultNumberingSystem(req.base);
     };
     const hc_default = defaultHourCycle(req.base);
     var hour_cycle: []const u8 = hc_default;
@@ -1019,13 +1030,160 @@ fn dtfRangeParts(arena: std.mem.Allocator, this_val: Value, args: []const Value)
             break;
         }
     };
-    // Identical ends collapse to one set of "shared" parts; otherwise each side
-    // is attributed to its own end of the range and only the separator is shared.
+    // Identical ends collapse to one set of "shared" parts; otherwise the
+    // output is split at the *greatest difference* field (PartitionDateTime-
+    // RangePattern, ECMA-402 §11.5.9): every field coarser than that field is
+    // shared (its value is provably equal); the field itself and everything
+    // finer is rendered twice, once per side, joined by the range separator.
     if (same) return start;
+    if (start.items.len == end.items.len) {
+        if (rangeCollapseParts(arena, start.items, end.items)) |out| return out;
+    }
+    // Fallback (shape mismatch between the two sides' parts): the previous
+    // whole-side split, so formatting never regresses to a crash or garbage.
     var out = std.ArrayListUnmanaged(DTPart){};
     for (start.items) |p| try out.append(arena, .{ .type = p.type, .value = p.value, .source = "startRange" });
     try out.append(arena, .{ .type = "literal", .value = " " ++ range_separator ++ " " });
     for (end.items) |p| try out.append(arena, .{ .type = p.type, .value = p.value, .source = "endRange" });
+    return out;
+}
+
+/// Significance rank of a DTPart type, coarsest (era) to finest
+/// (fractionalSecond). Types that always vary together (year/relatedYear/
+/// yearName; dayPeriod/hour) share a rank so they split or stay shared as a
+/// unit. `literal` has no intrinsic rank — it is classified from its
+/// neighbours in `rangeCollapseParts`.
+fn dtPartRank(t: []const u8) u8 {
+    if (std.mem.eql(u8, t, "era")) return 0;
+    if (std.mem.eql(u8, t, "year") or std.mem.eql(u8, t, "relatedYear") or std.mem.eql(u8, t, "yearName")) return 1;
+    if (std.mem.eql(u8, t, "month")) return 2;
+    if (std.mem.eql(u8, t, "weekday")) return 3;
+    if (std.mem.eql(u8, t, "day")) return 4;
+    if (std.mem.eql(u8, t, "dayPeriod") or std.mem.eql(u8, t, "hour")) return 5;
+    if (std.mem.eql(u8, t, "minute")) return 6;
+    if (std.mem.eql(u8, t, "second")) return 7;
+    if (std.mem.eql(u8, t, "fractionalSecond")) return 8;
+    return 9; // timeZoneName and anything else: finest / always split.
+}
+
+/// The three interval-formatting groups a DTPart type falls into. Real CLDR
+/// interval-pattern data only ever *partially* collapses within a group that
+/// has a named (non-numeric) field — a pure-numeric skeleton like "M/d/y" has
+/// no such data and always fully duplicates once any field in it differs; the
+/// clock (`time`) group has no ECMA-402/CLDR collapsing data at all (this is
+/// most visible with `fractionalSecondDigits`, an ECMA-402-only field with no
+/// CLDR interval entry) and is always all-or-nothing. `other` covers
+/// `timeZoneName` and anything unrecognized.
+const DTGroup = enum { date, time, other };
+fn dtPartGroup(t: []const u8) DTGroup {
+    if (std.mem.eql(u8, t, "era") or std.mem.eql(u8, t, "year") or std.mem.eql(u8, t, "relatedYear") or
+        std.mem.eql(u8, t, "yearName") or std.mem.eql(u8, t, "month") or std.mem.eql(u8, t, "weekday") or
+        std.mem.eql(u8, t, "day")) return .date;
+    if (std.mem.eql(u8, t, "dayPeriod") or std.mem.eql(u8, t, "hour") or std.mem.eql(u8, t, "minute") or
+        std.mem.eql(u8, t, "second") or std.mem.eql(u8, t, "fractionalSecond")) return .time;
+    return .other;
+}
+
+/// Split `start`/`end` (same shape, at least one differing field) into
+/// shared/startRange/endRange runs. Returns null when the two sides' parts
+/// don't line up 1:1 by type (shape mismatch) so the caller can fall back
+/// safely.
+fn rangeCollapseParts(arena: std.mem.Allocator, start: []const DTPart, end: []const DTPart) ?std.ArrayListUnmanaged(DTPart) {
+    for (start, end) |a, b| {
+        if (!std.mem.eql(u8, a.type, b.type)) return null;
+    }
+
+    // The date group only gets a fine-grained (per-field) collapse when it
+    // carries a named field — a lettered month (short/long/narrow) or any
+    // weekday/era/yearName part. A purely-numeric date (all digits) has no
+    // CLDR interval data, so it is all-or-nothing like the time group.
+    var date_named = false;
+    for (start) |a| {
+        if (std.mem.eql(u8, a.type, "weekday") or std.mem.eql(u8, a.type, "yearName") or std.mem.eql(u8, a.type, "era")) {
+            date_named = true;
+        } else if (std.mem.eql(u8, a.type, "month")) {
+            for (a.value) |c| {
+                if (!std.ascii.isDigit(c)) {
+                    date_named = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    var date_any_diff = false;
+    var time_any_diff = false;
+    var other_any_diff = false;
+    var date_diff_rank: ?u8 = null;
+    for (start, end) |a, b| {
+        if (std.mem.eql(u8, a.type, "literal")) continue;
+        if (std.mem.eql(u8, a.value, b.value)) continue;
+        switch (dtPartGroup(a.type)) {
+            .date => {
+                date_any_diff = true;
+                const r = dtPartRank(a.type);
+                if (date_diff_rank == null or r < date_diff_rank.?) date_diff_rank = r;
+            },
+            .time => time_any_diff = true,
+            .other => other_any_diff = true,
+        }
+    }
+    if (!date_any_diff and !time_any_diff and !other_any_diff) return null;
+
+    // Classify every non-literal index: a group with no differing field is
+    // wholly shared; a differing pure-numeric-date or time/other group is
+    // wholly split; a differing named-date group splits only the fields at
+    // or finer than its own greatest-difference field.
+    const split = arena.alloc(bool, start.len) catch return null;
+    for (start, 0..) |a, i| {
+        if (std.mem.eql(u8, a.type, "literal")) continue;
+        split[i] = switch (dtPartGroup(a.type)) {
+            .date => date_any_diff and (!date_named or dtPartRank(a.type) >= date_diff_rank.?),
+            .time => time_any_diff,
+            .other => other_any_diff,
+        };
+    }
+    // A literal splits only when BOTH its nearest non-literal neighbours
+    // split (an internal separator like ":" between two split fields);
+    // otherwise it is shared (a boundary literal, rendered once, next to the
+    // shared side it borders).
+    for (start, 0..) |a, i| {
+        if (!std.mem.eql(u8, a.type, "literal")) continue;
+        var prev_split = false;
+        var j = i;
+        while (j > 0) {
+            j -= 1;
+            if (!std.mem.eql(u8, start[j].type, "literal")) {
+                prev_split = split[j];
+                break;
+            }
+        }
+        var next_split = false;
+        var k = i + 1;
+        while (k < start.len) : (k += 1) {
+            if (!std.mem.eql(u8, start[k].type, "literal")) {
+                next_split = split[k];
+                break;
+            }
+        }
+        split[i] = prev_split and next_split;
+    }
+
+    var out = std.ArrayListUnmanaged(DTPart){};
+    var i: usize = 0;
+    while (i < start.len) {
+        const cur = split[i];
+        var j = i;
+        while (j < start.len and split[j] == cur) : (j += 1) {}
+        if (cur) {
+            for (start[i..j]) |p| out.append(arena, .{ .type = p.type, .value = p.value, .source = "startRange" }) catch return null;
+            out.append(arena, .{ .type = "literal", .value = " " ++ range_separator ++ " ", .source = "shared" }) catch return null;
+            for (end[i..j]) |p| out.append(arena, .{ .type = p.type, .value = p.value, .source = "endRange" }) catch return null;
+        } else {
+            for (start[i..j]) |p| out.append(arena, .{ .type = p.type, .value = p.value, .source = "shared" }) catch return null;
+        }
+        i = j;
+    }
     return out;
 }
 
@@ -1039,6 +1197,9 @@ pub fn nativeDateTimeFormatFormatRange(arena: std.mem.Allocator, this_val: Value
 pub fn nativeDateTimeFormatFormatRangeToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const parts = try dtfRangeParts(arena, this_val, args);
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    var arr_val = try val_mod.makeObject(arena, arr);
+    try rootConstructing(&arr_val);
+    defer unrootConstructing(&arr_val);
     for (parts.items) |p| {
         const o = try dnEmptyObj(arena);
         try defineData(o, "type", try val_mod.makeString(arena, p.type));
@@ -1046,7 +1207,7 @@ pub fn nativeDateTimeFormatFormatRangeToParts(arena: std.mem.Allocator, this_val
         try defineData(o, "source", try val_mod.makeString(arena, p.source));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
-    return val_mod.makeObject(arena, arr);
+    return arr_val;
 }
 
 /// `dtf.formatToParts(date)` → array of `{ type, value }` records.
@@ -1057,6 +1218,9 @@ pub fn nativeDateTimeFormatFormatToParts(arena: std.mem.Allocator, this_val: Val
         return realm_mod.throwTypeError(arena, "Intl.DateTimeFormat.prototype.formatToParts called on incompatible receiver");
     const parts = try buildDTFParts(arena, this_val, args);
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    var arr_val = try val_mod.makeObject(arena, arr);
+    try rootConstructing(&arr_val);
+    defer unrootConstructing(&arr_val);
     for (parts.items) |p| {
         const o = if (realm_mod.active_heap) |h|
             try JsObject.createOnHeap(h, realm_mod.active_object_proto)
@@ -1066,7 +1230,7 @@ pub fn nativeDateTimeFormatFormatToParts(arena: std.mem.Allocator, this_val: Val
         try defineData(o, "value", try val_mod.makeString(arena, p.value));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
-    return val_mod.makeObject(arena, arr);
+    return arr_val;
 }
 
 /// One segment of a formatted date-time, as produced by `formatToParts`.
@@ -1171,7 +1335,14 @@ fn renderDateTimeParts(
         .day = @intCast(f.day),
     });
     const cal_year: i64 = cf.era_year orelse cf.year;
-    const cal_month: i64 = cf.month;
+    // `cf.month` is the raw sequential ordinal (1..12, or 1..13 across a
+    // lunisolar leap year); `cf.code_num` is the base month number a leap
+    // month shares with its predecessor (e.g. ordinal 6 in a year with a leap
+    // 5th month is code_num 5, code_leap true). The numeric `month` part must
+    // render the latter — see the "bis" leap-month suffix below — so it
+    // matches `Temporal.PlainDate.monthCode`'s own numbering. The two only
+    // differ for lunisolar calendars; everywhere else code_num === month.
+    const cal_month: i64 = cf.code_num;
     const cal_day: i64 = cf.day;
     const cal_month_name: ?[]const u8 = try cal_names.monthName(arena, p.cal, cf.code_num, cf.code_leap, cf.month);
     // The lunisolar calendars number their years by the Gregorian year they
@@ -1206,7 +1377,16 @@ fn renderDateTimeParts(
         if (p.weekday.len > 0) try parts.append(arena, .{ .type = "literal", .value = ", " });
         var first = true;
         if (month.len > 0) {
-            try parts.append(arena, .{ .type = "month", .value = try fieldStr(arena, cal_month, month) });
+            // A numeric month has no digit left over to signal "leap" the way a
+            // named month can fold it into the month name, so a lunisolar leap
+            // month (e.g. Chinese/Dangi leap 5th month) appends CLDR's "bis"
+            // marker to the plain number — "5bis", not "6". Consumers that
+            // reconstruct a Temporal monthCode from this field (as CLDR's own
+            // ICU does) treat any non-purely-numeric month value as a leap month
+            // of the parsed base number.
+            const digits = try fieldStr(arena, cal_month, month);
+            const mval = if (cf.code_leap) try std.fmt.allocPrint(arena, "{s}bis", .{digits}) else digits;
+            try parts.append(arena, .{ .type = "month", .value = mval });
             first = false;
         }
         if (p.day.len > 0) {
@@ -1429,6 +1609,21 @@ pub fn temporalToLocaleString(arena: std.mem.Allocator, receiver: Value, args: [
         null;
     const tls_tz_name: ?[]const u8 = if (kind == .zoned and dtfWantsDefaults(opts_v)) "short" else null;
     const dtf = try buildLocaleDTF(arena, if (args.len > 0) args[0] else Value{}, opts_v, required, defaults, restrict, tls_tz, tls_tz_name);
+    // Temporal.PlainMonthDay/PlainYearMonth.prototype.toLocaleString: the
+    // formatter's resolved calendar must match the receiver's calendar exactly
+    // (§ CalendarEquals), including when the receiver is "iso8601" — no real
+    // locale ever resolves to the ISO calendar, so an iso8601 instance always
+    // mismatches unless the caller explicitly requested `calendar: "iso8601"`.
+    if (kind == .month_day or kind == .year_month) {
+        const receiver_cal: t_calendar.CalendarId = switch (kind) {
+            .month_day => (t_pmd.getMonthDay(receiver) orelse return realm_mod.throwTypeError(arena, "not a Temporal.PlainMonthDay")).calendar,
+            .year_month => (t_pym.getYearMonth(receiver) orelse return realm_mod.throwTypeError(arena, "not a Temporal.PlainYearMonth")).calendar,
+            else => unreachable,
+        };
+        const dtf_cal_str = readOpt(dtf.toPtr().object, "__dtf_calendar");
+        const dtf_cal: t_calendar.CalendarId = if (dtf_cal_str.len > 0) (t_calendar.canonicalize(dtf_cal_str) orelse .gregory) else .gregory;
+        if (dtf_cal != receiver_cal) return realm_mod.throwRangeError(arena, "calendar mismatch");
+    }
     return nativeDateTimeFormatFormat(arena, dtf, &[_]Value{receiver});
 }
 
@@ -3049,8 +3244,33 @@ fn localePrefList(arena: std.mem.Allocator, this_val: Value, slot: []const u8, f
 pub fn nativeLocaleGetCalendars(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     return localePrefList(arena, this_val, "[[loc_calendar]]", "gregory");
 }
+/// True for a 3-letter language subtag in the "qaa".."qtz" private-use range
+/// (BCP 47 / ISO 639-2 reserved for private use), which by definition never
+/// has CLDR semantics.
+fn isPrivateUseLanguage(lang: []const u8) bool {
+    if (lang.len != 3) return false;
+    if (lang[0] != 'q') return false;
+    if (lang[1] < 'a' or lang[1] > 't') return false;
+    if (lang[2] < 'a' or lang[2] > 'z') return false;
+    return true;
+}
+
+/// §14.3.9 `getCollations` — CollationsOfLocale: an explicit "co" keyword
+/// always wins. Otherwise, per spec step 4, a locale that matches no available
+/// %Intl.Collator% locale falls back to the hardcoded root list « "emoji",
+/// "eor" ». This build carries no real CLDR match table, so "no match" is
+/// approximated by the two categories that are *guaranteed* not to match any
+/// real locale: the "und" (undetermined) language, and private-use language
+/// subtags ("qaa".."qtz", which never carry CLDR semantics). Every other
+/// language falls back to this implementation's single supported collation.
 pub fn nativeLocaleGetCollations(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
-    return localePrefList(arena, this_val, "[[loc_collation]]", "default");
+    const o = try requireLocale(arena, this_val);
+    if (localeSlotStr(o, "[[loc_collation]]")) |co|
+        return makeStringArray(arena, &[_][]const u8{co});
+    const lang = localeSlotStr(o, "[[loc_language]]") orelse "und";
+    if (std.mem.eql(u8, lang, "und") or isPrivateUseLanguage(lang))
+        return makeStringArray(arena, &[_][]const u8{ "emoji", "eor" });
+    return makeStringArray(arena, &[_][]const u8{"default"});
 }
 pub fn nativeLocaleGetHourCycles(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
     return localePrefList(arena, this_val, "[[loc_hourCycle]]", "h12");
@@ -3326,13 +3546,16 @@ pub fn nativeListFormatFormat(arena: std.mem.Allocator, this_val: Value, args: [
 pub fn nativeListFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const parts = try lfBuildParts(arena, this_val, args);
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    var arr_val = try val_mod.makeObject(arena, arr);
+    try rootConstructing(&arr_val);
+    defer unrootConstructing(&arr_val);
     for (parts) |p| {
         const o = try dnEmptyObj(arena);
         try defineData(o, "type", try val_mod.makeString(arena, p.type));
         try defineData(o, "value", try val_mod.makeString(arena, p.value));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
-    return val_mod.makeObject(arena, arr);
+    return arr_val;
 }
 
 pub fn nativeListFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -3617,6 +3840,9 @@ pub fn nativeRelativeTimeFormatFormat(arena: std.mem.Allocator, this_val: Value,
 pub fn nativeRelativeTimeFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const parts = try rtfBuildParts(arena, this_val, args);
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    var arr_val = try val_mod.makeObject(arena, arr);
+    try rootConstructing(&arr_val);
+    defer unrootConstructing(&arr_val);
     for (parts) |p| {
         const o = try dnEmptyObj(arena);
         try defineData(o, "type", try val_mod.makeString(arena, p.type));
@@ -3624,7 +3850,7 @@ pub fn nativeRelativeTimeFormatFormatToParts(arena: std.mem.Allocator, this_val:
         if (p.source) |unit| try defineData(o, "unit", try val_mod.makeString(arena, unit));
         try arr.appendElement(try val_mod.makeObject(arena, o));
     }
-    return val_mod.makeObject(arena, arr);
+    return arr_val;
 }
 
 pub fn nativeRelativeTimeFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {
@@ -3667,6 +3893,25 @@ fn dnEmptyObj(arena: std.mem.Allocator) !*JsObject {
         try JsObject.createOnHeap(h, realm_mod.active_object_proto)
     else
         try JsObject.create(arena, realm_mod.active_object_proto);
+}
+
+/// GC-root a `formatToParts`-style result array for the duration of its
+/// construction loop. Each per-part object below is allocated with
+/// `dnEmptyObj`/`createOnHeap`, and `Heap.maybeCollect` fires at the TOP of
+/// `allocateObject` — protecting only the object about to be made, never ones
+/// already made. Until the array is returned to the caller and lands in a
+/// register/binding, it is reachable from nothing but this native stack frame;
+/// without an explicit root, a GC triggered by allocating part N+1 sees part N
+/// (already appended to `arr.dense`, but `arr` itself unreachable) as garbage
+/// and frees it — a use-after-free the next time the array is read (e.g. via
+/// `Array.prototype.find` in a callback). No-op in arena-only mode (nothing is
+/// ever swept early there).
+fn rootConstructing(v: *Value) !void {
+    if (realm_mod.active_heap) |h| try h.addRoot(v);
+}
+
+fn unrootConstructing(v: *Value) void {
+    if (realm_mod.active_heap) |h| h.removeRoot(v);
 }
 
 /// An absent `options` argument becomes OrdinaryObjectCreate(**null**), so a
@@ -4464,6 +4709,9 @@ pub fn nativeDurationFormatFormat(arena: std.mem.Allocator, this_val: Value, arg
 pub fn nativeDurationFormatFormatToParts(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
     const parts = try dfBuildParts(arena, this_val, args);
     const arr = try JsObject.createArray(arena, realm_mod.active_array_proto);
+    var arr_val = try val_mod.makeObject(arena, arr);
+    try rootConstructing(&arr_val);
+    defer unrootConstructing(&arr_val);
     for (parts) |p| {
         const part = try dnEmptyObj(arena);
         try defineData(part, "type", try val_mod.makeString(arena, p.type));
@@ -4471,7 +4719,7 @@ pub fn nativeDurationFormatFormatToParts(arena: std.mem.Allocator, this_val: Val
         if (p.source) |unit| try defineData(part, "unit", try val_mod.makeString(arena, unit));
         try arr.appendElement(try val_mod.makeObject(arena, part));
     }
-    return val_mod.makeObject(arena, arr);
+    return arr_val;
 }
 
 pub fn nativeDurationFormatResolved(arena: std.mem.Allocator, this_val: Value, _: []const Value) anyerror!Value {

@@ -481,7 +481,6 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.setMethod(arena, proto, "since", nativeSince);
     try intrinsics.setMethod(arena, proto, "round", nativeRound);
     try intrinsics.setMethod(arena, proto, "equals", nativeEquals);
-    try intrinsics.setMethod(arena, proto, "toPlainDateTime", nativeToPlainDateTime);
     try intrinsics.setMethod(arena, proto, "toString", nativeToString);
     try intrinsics.setMethodLen(arena, proto, "toJSON", nativeToJSON, 0);
     try intrinsics.setMethod(arena, proto, "toLocaleString", nativeToLocaleString);

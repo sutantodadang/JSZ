@@ -465,16 +465,12 @@ pub fn register(ctx: *const intrinsics.Ctx) !void {
     try intrinsics.setMethod(arena, proto, "valueOf", nativeValueOf);
     try intrinsics.setMethod(arena, proto, "toZonedDateTimeISO", nativeToZonedDateTimeISO);
 
-    try intrinsics.defineGetter(arena, proto, "epochSeconds", getEpochSeconds);
     try intrinsics.defineGetter(arena, proto, "epochMilliseconds", getEpochMilliseconds);
-    try intrinsics.defineGetter(arena, proto, "epochMicroseconds", getEpochMicroseconds);
     try intrinsics.defineGetter(arena, proto, "epochNanoseconds", getEpochNanoseconds);
 
     const ctor = try intrinsics.makeCtor(arena, proto, nativeCtor, ctx.function_proto);
     try intrinsics.setMethod(arena, ctor, "from", nativeFrom);
-    try intrinsics.setMethod(arena, ctor, "fromEpochSeconds", nativeFromEpochSeconds);
     try intrinsics.setMethod(arena, ctor, "fromEpochMilliseconds", nativeFromEpochMilliseconds);
-    try intrinsics.setMethod(arena, ctor, "fromEpochMicroseconds", nativeFromEpochMicroseconds);
     try intrinsics.setMethod(arena, ctor, "fromEpochNanoseconds", nativeFromEpochNanoseconds);
     try intrinsics.setMethod(arena, ctor, "compare", nativeCompare);
     _ = try ctor.defineOwnData("length", try val_mod.makeNumber(arena, 1), .{ .writable = false, .enumerable = false, .configurable = true });

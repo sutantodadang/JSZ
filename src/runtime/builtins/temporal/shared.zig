@@ -1123,6 +1123,73 @@ pub fn isoDateWithinLimits(d: ISODate) bool {
     return isoDateTimeWithinLimits(d, .{ .hour = 12 });
 }
 
+/// CheckISODaysRange: guards GetUTCEpochNanoseconds against being called with a
+/// date whose epoch-day count exceeds the Instant range (±10^8 days), *before*
+/// any offset/timezone balancing. Spec: InterpretISODateTimeOffset's
+/// offsetOption-is-prefer-or-reject branch runs this on the *raw* parsed
+/// ISODate — a stricter, earlier gate than the final IsValidEpochNanoseconds
+/// check on the resolved instant, since a wall-clock date one day beyond the
+/// boundary is rejected outright even when some offset would resolve it back
+/// into range.
+pub fn isoDaysInRange(d: ISODate) bool {
+    const days = isoDateToEpochDays(d.year, d.month, d.day);
+    return @abs(days) <= 100_000_000;
+}
+
+/// Parse an offset *value* string (sub-minute allowed): "±HH:MM(:SS(.fff))" /
+/// "Z". Returns ns. Used both for the final offset resolution and, via
+/// PrepareTemporalFields, to syntax-validate the "offset" field the moment
+/// it is read (before later alphabetical fields like "year" are coerced).
+pub fn parseOffsetValue(arena: std.mem.Allocator, s: []const u8) !i128 {
+    if (s.len == 1 and (s[0] == 'Z' or s[0] == 'z')) return 0;
+    if (s.len < 3 or (s[0] != '+' and s[0] != '-')) return realm_mod.throwRangeError(arena, "invalid offset string");
+    const sign: i128 = if (s[0] == '-') -1 else 1;
+    var i: usize = 1;
+    const h = offsetDigitPair(s, i) orelse return realm_mod.throwRangeError(arena, "invalid offset string");
+    i += 2;
+    var m: i128 = 0;
+    var sec: i128 = 0;
+    var sub: i128 = 0;
+    // The `:` separator must be used consistently: either every HH/MM/SS group
+    // is colon-separated or none is. Record the first choice and enforce it.
+    var colon: ?bool = null;
+    if (i < s.len) {
+        if (s[i] == ':') {
+            colon = true;
+            i += 1;
+        } else colon = false;
+        m = offsetDigitPair(s, i) orelse return realm_mod.throwRangeError(arena, "invalid offset string");
+        i += 2;
+        if (i < s.len and s[i] != '.' and s[i] != ',') {
+            const has_colon = s[i] == ':';
+            if (has_colon != colon.?) return realm_mod.throwRangeError(arena, "inconsistent offset separators");
+            if (has_colon) i += 1;
+            sec = offsetDigitPair(s, i) orelse return realm_mod.throwRangeError(arena, "invalid offset string");
+            i += 2;
+            if (i < s.len and (s[i] == '.' or s[i] == ',')) {
+                i += 1;
+                var frac: [9]u8 = .{ '0', '0', '0', '0', '0', '0', '0', '0', '0' };
+                var k: usize = 0;
+                while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+                    if (k < 9) frac[k] = s[i];
+                    k += 1;
+                }
+                if (k == 0 or k > 9) return realm_mod.throwRangeError(arena, "invalid offset string");
+                sub = std.fmt.parseInt(i128, &frac, 10) catch 0;
+            }
+        }
+    }
+    if (i != s.len) return realm_mod.throwRangeError(arena, "invalid offset string");
+    if (h > 23 or m > 59 or sec > 59) return realm_mod.throwRangeError(arena, "invalid offset string");
+    return sign * (h * NS_PER_HOUR + m * NS_PER_MINUTE + sec * NS_PER_SECOND + sub);
+}
+
+fn offsetDigitPair(s: []const u8, i: usize) ?i128 {
+    if (i + 2 > s.len) return null;
+    if (s[i] < '0' or s[i] > '9' or s[i + 1] < '0' or s[i + 1] > '9') return null;
+    return @as(i128, s[i] - '0') * 10 + (s[i + 1] - '0');
+}
+
 /// Negate every Duration field. Adding 0.0 normalizes the -0.0 that negating a
 /// zero field would otherwise produce: a Duration field that is zero must read
 /// as +0 regardless of the duration's overall sign.

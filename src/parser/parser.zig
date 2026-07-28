@@ -226,6 +226,17 @@ pub const Parser = struct {
     /// M16 Phase 5: nesting depth inside function bodies. 0 = top-level module code;
     /// incremented by parseFunctionBody so import hoisting only applies at top level.
     fn_nesting_depth: u32,
+    /// Like `fn_nesting_depth`, but counts only REAL (non-arrow) function
+    /// nesting — incremented alongside it in parseFunctionParams/
+    /// parseFunctionBody, but NOT for an arrow body (expr.zig's arrow-function
+    /// parsing bumps only `fn_nesting_depth`, for the unrelated `return`-inside-
+    /// eval legality check). An arrow provides no NewTarget of its own — it
+    /// inherits lexically from whatever real function encloses it — so
+    /// `new.target` legality inside eval code must key off THIS counter, not
+    /// `fn_nesting_depth` (staging/sm/class/newTargetArrow.js:
+    /// `eval('() => new.target')` at eval's top level must still be a
+    /// SyntaxError even though the arrow bumps fn_nesting_depth to 1).
+    fn_nesting_depth_real: u32 = 0,
     /// Nesting depth inside `{ }` blocks (and switch bodies). A `using`/`await
     /// using` declaration is a SyntaxError at the top level of a Script or eval
     /// code, but allowed inside any block/function and at Module top level — so
@@ -272,6 +283,27 @@ pub const Parser = struct {
     /// `Reflect.get`) so the compiler emits the spec ReferenceError for
     /// `delete super.x` (§13.5.1.2 IsSuperReference).
     in_delete_operand: bool = false,
+    /// True while parsing the operand of a PREFIX `++`/`--`. The operator token
+    /// precedes the operand in the source (unlike postfix, where it trails the
+    /// member expression and superReadFollows sees it directly as `p.current`),
+    /// so by the time a `super.x` / `super[e]` finishes parsing here the `++`/`--`
+    /// has already been consumed. Keeps that member a raw super reference (left
+    /// for the bytecode compiler's super-update path) instead of desugaring the
+    /// read to `Reflect.get`, mirroring `in_delete_operand`.
+    in_update_operand: bool = false,
+    /// True while parsing the initial LeftHandSideExpression of a non-declaration
+    /// `for (LHS in/of RHS)` head, before the parser has seen whether `in`/`of`
+    /// follows (it's parsed as a generic AssignmentExpression first — see
+    /// parseForStmt's "for (expr in ...) or for (expr; ...)" branch — and only
+    /// re-classified as a for-in/for-of head afterward). A trailing `in`/`of`
+    /// there is the loop keyword, not the binary `in` operator or a read that
+    /// happens to precede an unrelated identifier, so a `super.x`/`super[e]`
+    /// LHS must stay a raw super reference for the compiler's super-write path
+    /// (mirrors in_delete_operand / in_update_operand). Outside a for-head, a
+    /// trailing `kw_in`/`kw_of` after a super read is either the ordinary binary
+    /// `in` operator (`super.x in y`) or unreachable, so this flag — not the
+    /// token alone — gates the exclusion.
+    in_for_head_lhs: bool = false,
     /// M16 TLA: set when an `await` is parsed at module top level (function
     /// nesting depth 0). The module then has top-level await and its top-level
     /// program is compiled/driven as an async body (real per-await suspension).
@@ -609,11 +641,35 @@ pub const Parser = struct {
         return false;
     }
 
-    pub fn consumeSemicolon(self: *Parser) void {
+    /// Consume a statement-terminating `;`, or apply Automatic Semicolon
+    /// Insertion (§12.10.1) when it's legal to: the next token is `}`/EOF, or
+    /// is preceded by a LineTerminator (see `hasSemicolon`). Otherwise two
+    /// statements sit on the same line with nothing separating them — e.g.
+    /// `a.1` lexes as the identifier `a` immediately followed by the number
+    /// literal `.1` — which is a SyntaxError, not two implicitly-separated
+    /// statements. Returns null (having recorded the error via `p.fail`) so
+    /// callers propagate failure the same way `orelse return null` already
+    /// does for every other required-token check.
+    pub fn consumeSemicolon(self: *Parser) ?void {
         if (self.current.kind == .semicolon) {
             _ = self.advance();
+            return;
         }
-        // Otherwise ASI is implied.
+        if (self.hasSemicolon()) return;
+        _ = self.fail("missing semicolon");
+        return null;
+    }
+
+    /// The one ASI carve-out beyond `hasSemicolon`'s ordinary conditions
+    /// (§13.7.2 special exception, note in the do-while grammar): "The previous
+    /// token is `)` and the inserted semicolon would then be parsed as the
+    /// terminating semicolon of a do-while statement" — automatic semicolon
+    /// insertion applies UNCONDITIONALLY right after a do-while's `)`, even with
+    /// no line terminator and a following token that isn't `}`/EOF (`do; while
+    /// (0) x = 42;` parses as two statements). Use only for that one terminator.
+    pub fn consumeSemicolonAlways(self: *Parser) void {
+        if (self.current.kind == .semicolon) _ = self.advance();
+        // Otherwise ASI is implied unconditionally — no failure path.
     }
 
     // ---------------------------------------------------------------- parse ---

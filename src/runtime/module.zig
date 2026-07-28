@@ -299,11 +299,116 @@ pub fn resolveSpec(allocator: std.mem.Allocator, importer_id: []const u8, spec: 
     return normalizeRel(allocator, joined);
 }
 
+/// Best-effort collection of `const|let|var NAME = 'STRING';` single-literal
+/// initializers in `src`, keyed by `NAME`. Used only to reconstruct dynamic
+/// `import(x + a)` / `import(x += a)` specifiers built by concatenating
+/// string-literal-valued identifiers — a shape a real host resolves at
+/// runtime (`ToString` of the evaluated argument) but which this ahead-of-time
+/// bundler must reconstruct statically to know which on-disk fixture to link.
+/// Anything more complex than a bare literal initializer is simply absent from
+/// the map, so a concatenation referencing it fails closed (discovers
+/// nothing) rather than guessing.
+fn collectStringBindings(src: []const u8, out: *std.StringHashMap([]const u8)) void {
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '/' and i + 1 < src.len and (src[i + 1] == '/' or src[i + 1] == '*')) {
+            i = skipWsComments(src, i);
+            continue;
+        }
+        if (c == '"' or c == '\'' or c == '`') {
+            i += 1;
+            while (i < src.len and src[i] != c) : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (isIdentChar(c) and !std.ascii.isDigit(c)) {
+            const ws = i;
+            while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
+            const word = src[ws..i];
+            if (!(std.mem.eql(u8, word, "const") or std.mem.eql(u8, word, "let") or std.mem.eql(u8, word, "var"))) continue;
+            var j = skipWsComments(src, i);
+            if (j >= src.len or !(isIdentChar(src[j]) and !std.ascii.isDigit(src[j]))) continue;
+            const ns = j;
+            while (j < src.len and isIdentChar(src[j])) : (j += 1) {}
+            const name = src[ns..j];
+            j = skipWsComments(src, j);
+            if (j >= src.len or src[j] != '=') continue;
+            j = skipWsComments(src, j + 1);
+            if (j >= src.len or !(src[j] == '"' or src[j] == '\'')) continue;
+            const q = src[j];
+            const s = j + 1;
+            var k = s;
+            while (k < src.len and src[k] != q) : (k += 1) {
+                if (src[k] == '\\') k += 1;
+            }
+            out.put(name, src[s..@min(k, src.len)]) catch {};
+            i = k + 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Parse a `+`/`+=`-joined run of string-literal or bound-identifier terms
+/// starting right after the `(` at `paren_open` in an `import(...)` call,
+/// stopping at the first top-level `,` or the matching `)`. Returns the
+/// concatenated string when every term resolves (a literal, or a name found in
+/// `bindings`); null the moment anything else appears (a call, member access,
+/// number, etc.) — this "fails closed" rather than guessing at a specifier.
+fn tryResolveConcatSpecifier(src: []const u8, paren_open: usize, bindings: *const std.StringHashMap([]const u8), allocator: std.mem.Allocator) ?[]const u8 {
+    var i = paren_open + 1;
+    var buf: std.ArrayList(u8) = .empty;
+    var any_term = false;
+    while (true) {
+        i = skipWsComments(src, i);
+        if (i >= src.len) return null;
+        const c = src[i];
+        if (c == '"' or c == '\'') {
+            const s = i + 1;
+            var k = s;
+            while (k < src.len and src[k] != c) : (k += 1) {
+                if (src[k] == '\\') k += 1;
+            }
+            buf.appendSlice(allocator, src[s..@min(k, src.len)]) catch return null;
+            i = k + 1;
+            any_term = true;
+        } else if (isIdentChar(c) and !std.ascii.isDigit(c)) {
+            const ns = i;
+            while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
+            const val = bindings.get(src[ns..i]) orelse return null;
+            buf.appendSlice(allocator, val) catch return null;
+            any_term = true;
+        } else return null;
+        i = skipWsComments(src, i);
+        if (i >= src.len) return null;
+        if (src[i] == ')' or src[i] == ',') break;
+        if (src[i] != '+') return null;
+        i += 1;
+        if (i < src.len and src[i] == '=') i += 1; // tolerate `+=` as one token
+    }
+    if (!any_term) return null;
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
 /// Append canonical ids of relative module specifiers found in `src` (resolved
 /// against `importer_id`) to `out`. Skips line/block comments and treats string
-/// and template-literal bodies as opaque, so prose apostrophes/quotes inside
-/// comments cannot be mistaken for specifier delimiters.
+/// and template-literal bodies as opaque (except for specifier discovery, see
+/// below), so prose apostrophes/quotes inside comments cannot be mistaken for
+/// specifier delimiters.
+///
+/// Bundling-only permissiveness beyond the literal `"./…"` case: a *static*
+/// (no `${}` substitution) template-literal specifier is checked the same way
+/// a string literal is (covers `import(tag\`./x.js\`)`); a string literal that
+/// itself looks like it embeds a nested `import('./x.js')` is recursively
+/// scanned (covers `eval("import('./x.js')")`); and `import(x + a)` /
+/// `import(x += a)` calls are resolved via `tryResolveConcatSpecifier` when
+/// every operand is a literal or a simply-bound identifier.
 pub fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) void {
+    var bindings: ?std.StringHashMap([]const u8) = null;
+    var prev_word: []const u8 = "";
     var i: usize = 0;
     while (i < src.len) {
         const c = src[i];
@@ -321,15 +426,36 @@ pub fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayL
                 continue;
             }
         }
-        // Template literal: opaque body (nested `${}` substitutions may contain
-        // strings, but they cannot be a top-level import specifier, so skipping
-        // the whole template is safe for discovery).
+        // Template literal. Real dynamic-import specifiers are never template
+        // literals with substitutions (a `${}` value can't be known statically
+        // here), but a *static* one — e.g. `import(tag\`./x.js\`)` — is exactly
+        // as discoverable as a plain string literal.
         if (c == '`') {
-            i += 1;
-            while (i < src.len and src[i] != '`') : (i += 1) {
-                if (src[i] == '\\') i += 1;
+            const start = i + 1;
+            var j = start;
+            var has_subst = false;
+            while (j < src.len and src[j] != '`') : (j += 1) {
+                if (src[j] == '\\') {
+                    j += 1;
+                    continue;
+                }
+                if (src[j] == '$' and j + 1 < src.len and src[j + 1] == '{') has_subst = true;
             }
-            i += 1;
+            if (!has_subst and j <= src.len) {
+                const end = @min(j, src.len);
+                const lit = src[start..end];
+                if (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../")) {
+                    var id = resolveSpec(allocator, importer_id, lit) catch "";
+                    if (id.len > 0) {
+                        if (attrTypeAfter(src, j + 1, lit)) |ty| {
+                            id = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ id, ty }) catch id;
+                        }
+                        out.append(allocator, id) catch {};
+                    }
+                }
+            }
+            i = j + 1;
+            prev_word = "";
             continue;
         }
         if (c == '"' or c == '\'') {
@@ -347,16 +473,44 @@ pub fn scanSpecifiers(src: []const u8, importer_id: []const u8, out: *std.ArrayL
                     // makes this a typed (JSON/text) module: encode the type into
                     // the id so it keys distinctly and gets a synthetic factory.
                     if (id.len > 0) {
-                        if (attrTypeAfter(src, j + 1)) |ty| {
+                        if (attrTypeAfter(src, j + 1, lit)) |ty| {
                             id = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ id, ty }) catch id;
                         }
                         out.append(allocator, id) catch {};
                     }
+                } else if (std.mem.indexOf(u8, lit, "import") != null and std.mem.indexOf(u8, lit, "./") != null) {
+                    // Heuristic: a string (typically an `eval()` argument) that
+                    // itself textually contains a dynamic `import(` and a
+                    // relative path. Recurse so a specifier nested inside a
+                    // string isn't invisible to the bundler. Bounded: each
+                    // recursion operates on a strictly smaller slice.
+                    scanSpecifiers(lit, importer_id, out, allocator);
                 }
             }
             i = j + 1;
+            prev_word = "";
             continue;
         }
+        if (isIdentChar(c) and !std.ascii.isDigit(c)) {
+            const ws = i;
+            while (i < src.len and isIdentChar(src[i])) : (i += 1) {}
+            prev_word = src[ws..i];
+            continue;
+        }
+        if (c == '(' and std.mem.eql(u8, prev_word, "import")) {
+            if (bindings == null) {
+                var b = std.StringHashMap([]const u8).init(allocator);
+                collectStringBindings(src, &b);
+                bindings = b;
+            }
+            if (tryResolveConcatSpecifier(src, i, &bindings.?, allocator)) |spec| {
+                if (std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../")) {
+                    const id = resolveSpec(allocator, importer_id, spec) catch "";
+                    if (id.len > 0) out.append(allocator, id) catch {};
+                }
+            }
+        }
+        if (c != ' ' and c != '\t' and c != '\r' and c != '\n') prev_word = "";
         i += 1;
     }
 }
@@ -400,7 +554,7 @@ fn scanStaticSpecifiers(src: []const u8, importer_id: []const u8, out: *std.Arra
             if (is_static and (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../"))) {
                 var id = resolveSpec(allocator, importer_id, lit) catch "";
                 if (id.len > 0) {
-                    if (attrTypeAfter(src, j + 1)) |ty| {
+                    if (attrTypeAfter(src, j + 1, lit)) |ty| {
                         id = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ id, ty }) catch id;
                     }
                     out.append(allocator, id) catch {};
@@ -491,7 +645,7 @@ pub fn scanDeferredSpecifiers(src: []const u8, importer_id: []const u8, out: *st
             if (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../")) {
                 var id = resolveSpec(allocator, importer_id, lit) catch "";
                 if (id.len > 0) {
-                    if (attrTypeAfter(src, k + 1)) |ty| {
+                    if (attrTypeAfter(src, k + 1, lit)) |ty| {
                         id = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ id, ty }) catch id;
                     }
                     out.append(allocator, id) catch {};
@@ -545,26 +699,14 @@ fn appendJsString(gpa: std.mem.Allocator, sb: *std.ArrayList(u8), s: []const u8)
     try sb.append(gpa, '"');
 }
 
-/// If a `with { type: '...' }` / `assert { ... }` import-attribute clause begins
-/// at `pos` (after optional whitespace/comments), return the `type` attribute's
-/// string value (e.g. "json", "text"); otherwise null. Used by `scanSpecifiers`
-/// to classify a discovered specifier as a typed (synthetic) module.
-fn attrTypeAfter(src: []const u8, pos: usize) ?[]const u8 {
-    var i = skipWsComments(src, pos);
-    // Match the `with` / `assert` keyword as a standalone word.
-    const kw_with = i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "with") and
-        (i + 4 == src.len or !isIdentChar(src[i + 4]));
-    const kw_assert = i + 6 <= src.len and std.mem.eql(u8, src[i .. i + 6], "assert") and
-        (i + 6 == src.len or !isIdentChar(src[i + 6]));
-    if (kw_with) {
-        i += 4;
-    } else if (kw_assert) {
-        i += 6;
-    } else return null;
-    i = skipWsComments(src, i);
-    if (i >= src.len or src[i] != '{') return null;
-    i += 1;
-    // Scan the brace body for a `type` key followed by a string value.
+/// Scan a `{ ... }` object body whose opening brace sits at `brace_pos` for a
+/// top-level string-valued `type` key (e.g. `{ type: 'json' }`). Returns the
+/// string value, or null if absent. Shared core for both the static
+/// `with {...}` import-attribute clause and the object literal nested inside a
+/// dynamic `import(spec, { with: { type: '...' } })` call (see
+/// `findWithAttrType` below).
+fn scanTypeKeyInBraces(src: []const u8, brace_pos: usize) ?[]const u8 {
+    var i = brace_pos + 1;
     var saw_type_key = false;
     var saw_colon = false;
     while (i < src.len and src[i] != '}') {
@@ -604,6 +746,126 @@ fn attrTypeAfter(src: []const u8, pos: usize) ?[]const u8 {
         i += 1;
     }
     return null;
+}
+
+/// Index just past the `}` matching the `{` at `open_pos` (comment/string/
+/// template aware), or `src.len` if unterminated.
+fn matchingBraceEnd(src: []const u8, open_pos: usize) usize {
+    var i = open_pos + 1;
+    var depth: usize = 1;
+    while (i < src.len and depth > 0) {
+        const c = src[i];
+        if (c == '/' and i + 1 < src.len and (src[i + 1] == '/' or src[i + 1] == '*')) {
+            i = skipWsComments(src, i);
+            continue;
+        }
+        if (c == '"' or c == '\'' or c == '`') {
+            i += 1;
+            while (i < src.len and src[i] != c) : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == '}') {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    return i;
+}
+
+/// Search the object-literal body starting at `from` (up to `end_limit`,
+/// exclusive) for a top-level `with`/`assert` key mapped to a nested object,
+/// and return that nested object's `type` value. Used to read the *dynamic*
+/// `import(specifier, { with: { type: '...' } })` call-expression's second
+/// argument — an ordinary object-literal expression, not the static `with
+/// {...}` clause grammar. Comment/string aware; ignores unrelated keys.
+fn findWithAttrType(src: []const u8, from: usize, end_limit: usize) ?[]const u8 {
+    var i = from;
+    const limit = @min(end_limit, src.len);
+    while (i < limit) {
+        const c = src[i];
+        if (c == '/' and i + 1 < limit and (src[i + 1] == '/' or src[i + 1] == '*')) {
+            i = skipWsComments(src, i);
+            continue;
+        }
+        if (c == '"' or c == '\'' or c == '`') {
+            i += 1;
+            while (i < limit and src[i] != c) : (i += 1) {
+                if (src[i] == '\\') i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (isIdentChar(c) and !std.ascii.isDigit(c)) {
+            const s = i;
+            while (i < limit and isIdentChar(src[i])) : (i += 1) {}
+            const word = src[s..i];
+            if (std.mem.eql(u8, word, "with") or std.mem.eql(u8, word, "assert")) {
+                var j = skipWsComments(src, i);
+                if (j < limit and src[j] == ':') {
+                    j = skipWsComments(src, j + 1);
+                    if (j < limit and src[j] == '{') {
+                        if (scanTypeKeyInBraces(src, j)) |ty| return ty;
+                    }
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// If a `with { type: '...' }` / `assert { ... }` import-attribute clause begins
+/// at `pos` (after optional whitespace/comments), return the `type` attribute's
+/// string value (e.g. "json", "text"); otherwise null. Used by `scanSpecifiers`
+/// to classify a discovered specifier as a typed (synthetic) module.
+///
+/// Also recognizes the *dynamic* `import(specifier, optionsExpr)` call shape,
+/// where `pos` lands right after the specifier's closing quote and the next
+/// significant token is `,` rather than `with`/`assert` directly: when the
+/// second argument is an inline object literal (`{ with: { type: '...' } }`),
+/// extract the type the same way the runtime's `importReadTypeAttr` would.
+/// When the second argument isn't statically readable (a variable, a Proxy —
+/// e.g. `import(spec, options)`), fall back to the specifier's own file
+/// extension (`.json`) for bundling purposes only: a wrong guess here just
+/// means an unused synthetic registry entry, never a false rejection of a real
+/// one, since the actual type used for lookup is always computed at runtime.
+fn attrTypeAfter(src: []const u8, pos: usize, spec_hint: []const u8) ?[]const u8 {
+    var i = skipWsComments(src, pos);
+    // Match the `with` / `assert` keyword as a standalone word (the static
+    // import-attribute clause grammar).
+    const kw_with = i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "with") and
+        (i + 4 == src.len or !isIdentChar(src[i + 4]));
+    const kw_assert = i + 6 <= src.len and std.mem.eql(u8, src[i .. i + 6], "assert") and
+        (i + 6 == src.len or !isIdentChar(src[i + 6]));
+    if (kw_with) {
+        i += 4;
+    } else if (kw_assert) {
+        i += 6;
+    } else if (i < src.len and src[i] == ',') {
+        // Dynamic `import(spec, optionsExpr)`: the second argument is an
+        // ordinary expression, evaluated at runtime — not the static clause.
+        const j = skipWsComments(src, i + 1);
+        if (j < src.len and src[j] == '{') {
+            const end = matchingBraceEnd(src, j);
+            if (findWithAttrType(src, j + 1, if (end > 0) end - 1 else j + 1)) |ty| return ty;
+        }
+        if (std.mem.endsWith(u8, spec_hint, ".json")) return "json";
+        return null;
+    } else return null;
+    i = skipWsComments(src, i);
+    if (i >= src.len or src[i] != '{') return null;
+    return scanTypeKeyInBraces(src, i);
 }
 
 /// Read a module file under `base_dir` by canonical id, trying `id` then `id.js`.
@@ -1180,7 +1442,7 @@ fn readSpecifierAt(
     if (j >= src.len) return null;
     const lit = src[s + 1 .. j];
     i.* = j + 1;
-    if (attrTypeAfter(src, j + 1) != null) return null;
+    if (attrTypeAfter(src, j + 1, lit) != null) return null;
     if (std.mem.indexOfScalar(u8, lit, '\\') != null) return null;
     if (!std.mem.startsWith(u8, lit, "./") and !std.mem.startsWith(u8, lit, "../")) return null;
     return resolveSpec(allocator, importer_id, lit) catch null;
@@ -2180,9 +2442,17 @@ fn buildBundleImpl(gpa: std.mem.Allocator, base_dir: []const u8, entry_id: ?[]co
     var qi: usize = 0;
     while (qi < queue.items.len) : (qi += 1) {
         const id = queue.items[qi];
-        // The entry resolves to itself via the pre-registered `module` (below),
-        // not a disk re-read, so skip its own id here.
-        if (std.mem.eql(u8, id, self_id)) continue;
+        // A *module*-entry resolves a self-import to itself via the
+        // pre-registered `module` (below) — the very same live module record,
+        // not a fresh disk re-read — since real ES module self-import is a
+        // single-record singleton. A *script* entry has no such live module
+        // record (scripts have no Module Record); the dynamic `import()` of
+        // its own filename from a script is a genuinely separate Module
+        // Record load of the same source (sec-hostimportmoduledynamically —
+        // see `eval-self-once-script.js`), so let it fall through to the
+        // normal disk-read path below, which happens to read this very file
+        // (base_dir/self_id is the test's own path).
+        if (std.mem.eql(u8, id, self_id) and !entry_is_script) continue;
         if (registry.contains(id)) continue;
         const src = readModuleFile(arena, base_dir, id) orelse {
             try missing_ids.put(id, {});

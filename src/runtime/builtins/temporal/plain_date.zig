@@ -254,7 +254,13 @@ pub fn readDateBag(arena: std.mem.Allocator, o: *JsObject, want: BagWant) !DateB
         if (try shared.optionGet(arena, o, "nanosecond")) |v| bag.nanosecond = try shared.toIntegerWithTruncation(arena, v);
     }
     if (want.zoned) {
-        if (try shared.optionGet(arena, o, "offset")) |v| bag.offset = try shared.toPrimitiveRequireString(arena, v);
+        if (try shared.optionGet(arena, o, "offset")) |v| {
+            bag.offset = try shared.toPrimitiveRequireString(arena, v);
+            // The offset field's well-formedness (grammar, not tz-matching) is
+            // validated the moment it is read — before "second"/"timeZone"/
+            // "year" are read/coerced in the alphabetical sweep below.
+            _ = try shared.parseOffsetValue(arena, bag.offset.?);
+        }
     }
     if (want.time) {
         if (try shared.optionGet(arena, o, "second")) |v| bag.second = try shared.toIntegerWithTruncation(arena, v);
