@@ -463,6 +463,37 @@ pub fn nativeReflectSet(arena: std.mem.Allocator, _: Value, args: []const Value)
             // a non-export create on the non-extensible namespace both fail.
             return val_mod.makeBool(arena, false);
         }
+        // When the receiver is a Proxy, we must route [[GetOwnProperty]] and
+        // [[DefineOwnProperty]] through the proxy MOP (spec §10.1.9.1
+        // OrdinarySetWithOwnDescriptor step 3.c–3.d and step 4).
+        // Bypassing via robj.resolveOwnSlot silently skips those traps.
+        if (robj.internal_kind == .proxy) {
+            const realm = @import("../realm.zig");
+            const obj_proto: ?*JsObject = if (realm.active_object_proto) |p| p else null;
+            const key_v = try val_mod.makeString(arena, k);
+            const existing = try nativeReflectGetOwnPropertyDescriptor(arena, .{}, &[_]Value{ receiver, key_v });
+            const is_undef = existing.bits == 0 or existing.unbox() == .undefined_;
+            if (!is_undef) {
+                // Receiver has own property P: check if accessor or non-writable.
+                if (existing.unbox() == .object) {
+                    const desc_obj = existing.toPtr().object;
+                    if (desc_obj.hasOwn("get") or desc_obj.hasOwn("set")) return val_mod.makeBool(arena, false);
+                    const wr = desc_obj.getOwn("writable");
+                    if (wr == null or !val_mod.toBoolean(wr.?)) return val_mod.makeBool(arena, false);
+                }
+                // Receiver.[[DefineOwnProperty]](P, { [[Value]]: V })
+                const upd = try JsObject.create(arena, obj_proto);
+                try upd.set("value", value);
+                return nativeReflectDefineProperty(arena, .{}, &[_]Value{ receiver, key_v, try val_mod.makeObject(arena, upd) });
+            }
+            // Receiver does not have P: CreateDataProperty(Receiver, P, V)
+            const nd = try JsObject.create(arena, obj_proto);
+            try nd.set("value", value);
+            try nd.set("writable", try val_mod.makeBool(arena, true));
+            try nd.set("enumerable", try val_mod.makeBool(arena, true));
+            try nd.set("configurable", try val_mod.makeBool(arena, true));
+            return nativeReflectDefineProperty(arena, .{}, &[_]Value{ receiver, key_v, try val_mod.makeObject(arena, nd) });
+        }
         if (robj.resolveOwnSlot(k)) |slot| {
             const rattr = robj.attrAt(slot);
             if (rattr.is_accessor) return val_mod.makeBool(arena, false);

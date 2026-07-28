@@ -1096,8 +1096,9 @@ pub fn nativeReverse(arena: std.mem.Allocator, this_val: Value, _: []const Value
             try genSet(arena, O, lower, uv);
             try genDelete(arena, O, upper);
         } else if (lower_exists) {
-            try genSet(arena, O, upper, lv);
+            // Spec §23.1.3.26 step j: Delete lowerP first, then Set upperP.
             try genDelete(arena, O, lower);
+            try genSet(arena, O, upper, lv);
         }
     }
     return O;
