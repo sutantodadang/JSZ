@@ -25,32 +25,8 @@ jobs:
         run: zig build fuzz
         timeout-minutes: 10
 
-  # Coverage-guided fuzzing (manual only). Zig 0.15's in-process fuzzer is
-  # experimental and currently panics in std.Build.Fuzz.addEntryPoint
-  # ("start index 1 is larger than end index 0") before fuzzing starts;
-  # it also never terminates on its own, so a wall-clock timeout counts as
-  # success here. Re-evaluate when the upstream fuzzer stabilizes.
-  fuzz-guided:
-    name: Fuzz (coverage-guided, best effort)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    continue-on-error: true
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Zig 0.15.2
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Fuzz for 4 minutes
-        run: |
-          set +e
-          timeout --preserve-status 240 zig build fuzz --fuzz
-          code=$?
-          # 124/143 = killed by timeout after fuzzing ran: success.
-          if [ "$code" = "124" ] || [ "$code" = "143" ] || [ "$code" = "0" ]; then
-            exit 0
-          fi
-          exit "$code"
+  # Coverage-guided fuzzing ('zig build fuzz --fuzz') is intentionally NOT run
+  # in CI: Zig 0.15's experimental in-process fuzzer panics deterministically
+  # in std.Build.Fuzz.addEntryPoint ("start index 1 is larger than end index
+  # 0") before fuzzing starts, on every run. Re-add a guided job when the
+  # upstream fuzzer stabilizes; until then run it locally if needed.
