@@ -37,27 +37,48 @@ fn isSuperDotCall(callee: *Node) bool {
     return obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "super");
 }
 
-/// True when `node` is the desugared super-property *read* or *write* form,
-/// i.e. `Reflect.get(__sproto__, KEY, __superthis)` or
-/// `Reflect.set(__sproto__, KEY, VALUE, __superthis)` (produced by
-/// rewriteSuperPropRead / rewriteSuperPropAssign). Identified by a `Reflect.get`
-/// / `Reflect.set` callee, a `__sproto__` first argument, and an `__superthis`
-/// receiver as the last argument. Super *method* calls are excluded: their
-/// Reflect.get receiver is a `this` expression (which this pass turns into a
-/// `__checkthis__()` call), never the bare `__superthis` identifier.
-fn isSuperPropReflect(node: *Node) bool {
+/// True when `node` is the desugared super-property *read* form,
+/// i.e. `Reflect.get(__sproto__, KEY, __superthis)` (produced by
+/// rewriteSuperPropRead). Identified by a `Reflect.get` callee, a `__sproto__`
+/// first argument, and an `__superthis` receiver as the last argument. Super
+/// *method* calls are excluded: their Reflect.get receiver is a `this`
+/// expression (which this pass turns into a `__checkthis__()` call), never the
+/// bare `__superthis` identifier.
+fn isSuperPropReflectGet(node: *Node) bool {
     if (node.kind != .call_expr) return false;
     const c = node.data.call_expr;
     if (c.callee.kind != .member_expr) return false;
     const m = c.callee.data.member_expr;
     if (m.computed) return false;
     if (!(m.object.kind == .identifier and std.mem.eql(u8, m.object.data.identifier, "Reflect"))) return false;
-    if (!(m.property.kind == .identifier and
-        (std.mem.eql(u8, m.property.data.identifier, "get") or std.mem.eql(u8, m.property.data.identifier, "set")))) return false;
+    if (!(m.property.kind == .identifier and std.mem.eql(u8, m.property.data.identifier, "get"))) return false;
     if (c.args.len < 3) return false;
     if (!(c.args[0].kind == .identifier and std.mem.eql(u8, c.args[0].data.identifier, "__sproto__"))) return false;
     const last = c.args[c.args.len - 1];
     return last.kind == .identifier and std.mem.eql(u8, last.data.identifier, "__superthis");
+}
+
+/// True when `node` is the desugared super-property *write* form,
+/// `__superSet__(__sproto__, KEY, VALUE, __superthis, strict)` (produced by
+/// rewriteSuperPropAssign for a plain `super.x = v` / `super[e] = v`). Its
+/// Receiver sits at args[3] (args[4] is the trailing strict-mode flag), unlike
+/// isSuperPropReflectGet's trailing-arg Reflect.get shape.
+fn isSuperPropSet(node: *Node) bool {
+    if (node.kind != .call_expr) return false;
+    const c = node.data.call_expr;
+    if (!(c.callee.kind == .identifier and std.mem.eql(u8, c.callee.data.identifier, "__superSet__"))) return false;
+    if (c.args.len < 4) return false;
+    if (!(c.args[0].kind == .identifier and std.mem.eql(u8, c.args[0].data.identifier, "__sproto__"))) return false;
+    const recv = c.args[3];
+    return recv.kind == .identifier and std.mem.eql(u8, recv.data.identifier, "__superthis");
+}
+
+/// True when `node` is either desugared super-property form (see
+/// isSuperPropReflectGet / isSuperPropSet) — the shapes rewriteThisToSuperThis
+/// guards with a leading `__checkthis__()` TDZ check (§13.3.7.1 SuperProperty:
+/// GetThisBinding runs BEFORE the property key is evaluated).
+fn isSuperPropReflect(node: *Node) bool {
+    return isSuperPropReflectGet(node) or isSuperPropSet(node);
 }
 
 /// True when `node` is a `super.x` / `super[e]` member access (object is the
@@ -68,6 +89,28 @@ fn isSuperMember(node: *Node) bool {
     if (node.kind != .member_expr) return false;
     const m = node.data.member_expr;
     return m.object.kind == .identifier and std.mem.eql(u8, m.object.data.identifier, "super");
+}
+
+/// Recurse into a genuine VALUE-position sub-expression (array/object literal
+/// element, call/new argument, sequence-expression member) and, if it's a raw
+/// `super.x` / `super[e]`, guard it for the derived-constructor this-TDZ —
+/// mirrors the existing `.assignment_expr` / `.update_expr` handling below.
+/// Since superReadFollows (expr.zig) now defers the parse-time Reflect.get
+/// rewrite for a member immediately followed by `,` / `]` / `}` / `:`, an
+/// array/object literal element might turn out to be a plain read rather than
+/// a destructuring-pattern target, so a raw super member can reach here needing
+/// the same guard the eager-rewrite path got for free via isSuperPropReflect.
+///
+/// MUST recurse (rewriteThisToSuperThis) BEFORE checking/guarding, and MUST NOT
+/// recurse again afterward: guardWithCheckThis clones the member_expr's
+/// (unmutated-by-recursion) data into a fresh node reachable from `node`, and
+/// that clone is still shaped like a super member — re-entering this same
+/// function on it (guard-then-recurse) would re-guard the clone, whose guard
+/// wraps another clone, forever.
+fn rewriteSuperValueElem(p: *Parser, node: *Node) void {
+    const super_elem = isSuperMember(node);
+    rewriteThisToSuperThis(p, node);
+    if (super_elem) guardWithCheckThis(p, node);
 }
 
 /// Wrap `node` (already rewritten in place) as `(__checkthis__(), <node>)` so
@@ -98,7 +141,20 @@ fn rewriteThisToSuperThis(p: *Parser, node: *Node) void {
             node.kind = .call_expr;
             node.data = .{ .call_expr = .{ .callee = callee, .args = &[_]*Node{} } };
         },
-        .unary_expr => |u| rewriteThisToSuperThis(p, u.operand),
+        .unary_expr => |u| {
+            // `delete super[e]` always evaluates to a ReferenceError (the
+            // compiler throws once it sees the Super Reference), but per spec
+            // (SuperProperty evaluation, GetThisBinding) the this-TDZ check
+            // happens BEFORE the computed key `e` is evaluated — so a key with
+            // its own `super()` call (or other observable effect) must never
+            // run when `this` is still uninitialized
+            // (language/expressions/delete/super-property-uninitialized-this.js).
+            // Recurse into the operand FIRST (still a plain member_expr here;
+            // guardWithCheckThis clones it), then guard the OUTER delete node.
+            const super_target = u.op == .delete_ and isSuperMember(u.operand);
+            rewriteThisToSuperThis(p, u.operand);
+            if (super_target) guardWithCheckThis(p, node);
+        },
         .binary_expr => |b| {
             rewriteThisToSuperThis(p, b.left);
             rewriteThisToSuperThis(p, b.right);
@@ -126,7 +182,7 @@ fn rewriteThisToSuperThis(p: *Parser, node: *Node) void {
             rewriteThisToSuperThis(p, c.consequent);
             rewriteThisToSuperThis(p, c.alternate);
         },
-        .sequence_expr => |s| for (s.exprs) |e| rewriteThisToSuperThis(p, e),
+        .sequence_expr => |s| for (s.exprs) |e| rewriteSuperValueElem(p, e),
         .spread_expr => |e| rewriteThisToSuperThis(p, e),
         .yield_expr => |e| if (e) |ee| rewriteThisToSuperThis(p, ee),
         .call_expr => |c| {
@@ -144,7 +200,7 @@ fn rewriteThisToSuperThis(p: *Parser, node: *Node) void {
                 c.args[0].data = .{ .identifier = "__superthis" };
                 start_i = 1;
             }
-            for (c.args[start_i..]) |a| rewriteThisToSuperThis(p, a);
+            for (c.args[start_i..]) |a| rewriteSuperValueElem(p, a);
             // A super-property read/write (`super.x` / `super[e]` / `super.x = v`)
             // desugars to `Reflect.get/set(__sproto__, KEY, …, __superthis)`. Per
             // spec (SuperProperty evaluation) the this-binding is fetched — and a
@@ -158,7 +214,7 @@ fn rewriteThisToSuperThis(p: *Parser, node: *Node) void {
         },
         .new_expr => |n| {
             rewriteThisToSuperThis(p, n.callee);
-            for (n.args) |a| rewriteThisToSuperThis(p, a);
+            for (n.args) |a| rewriteSuperValueElem(p, a);
         },
         .member_expr => |m| {
             rewriteThisToSuperThis(p, m.object);
@@ -170,10 +226,10 @@ fn rewriteThisToSuperThis(p: *Parser, node: *Node) void {
             for (f.body) |s| rewriteThisToSuperThis(p, s);
         },
         .object_literal => |o| for (o.properties) |pr| {
-            rewriteThisToSuperThis(p, pr.value);
+            rewriteSuperValueElem(p, pr.value);
             if (pr.computed_key) |k| rewriteThisToSuperThis(p, k);
         },
-        .array_literal => |a| for (a.elements) |e| rewriteThisToSuperThis(p, e),
+        .array_literal => |a| for (a.elements) |e| rewriteSuperValueElem(p, e),
         .expr_stmt => |e| rewriteThisToSuperThis(p, e),
         .block_stmt => |b| for (b.body) |s| rewriteThisToSuperThis(p, s),
         .var_decl => |v| if (v.init) |i| rewriteThisToSuperThis(p, i),
@@ -1617,6 +1673,17 @@ fn makeCtorBackLink(p: *Parser, class_name: []const u8) ?*Node {
 /// `var __sproto__ = <property base for super.x>` — the superclass prototype (or
 /// the superclass itself, for a static element) when there is a heritage clause,
 /// otherwise the home object's own [[Prototype]]. See `homeObjectNode`.
+///
+/// NOTE: this is a one-time snapshot taken when the declaration runs (method
+/// entry), not a live re-derivation from the home object's *current*
+/// [[Prototype]] on every `super.x` access. It is therefore stale after
+/// `Object.setPrototypeOf(ClassName.prototype, X)` runs later in the same
+/// method body (staging/sm/class/superPropProtoChanges.js, superPropOrdering.js
+/// — both currently fail on this gap). Fixing it needs every `__sproto__`
+/// consumer (rewriteSuperPropRead/Assign/Call in expr.zig, prepareSuperPropRef
+/// in compiler.zig) to compute `Object.getPrototypeOf(__shome__)` fresh instead
+/// of reading a pre-resolved variable — a wider change than this function
+/// alone; left as-is pending that.
 fn superProtoDecl(p: *Parser, class_name: []const u8, super_name: ?[]const u8, is_static: bool) ?*Node {
     const s = p.current.start;
     const base: *Node = if (super_name) |sname| blk: {
@@ -2625,6 +2692,8 @@ pub fn parseFunctionParams(p: *Parser) ?parser_file.ParamParse {
     // count the parameter list here too (balanced before the body opens).
     p.fn_nesting_depth += 1;
     defer p.fn_nesting_depth -= 1;
+    p.fn_nesting_depth_real += 1;
+    defer p.fn_nesting_depth_real -= 1;
     _ = p.expect(.left_paren) orelse return null;
     var params = std.ArrayList([]const u8){};
     var defaults = std.ArrayList(?*Node){};
@@ -2867,6 +2936,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     p.pending_params_duplicate = false;
     _ = p.expect(.left_brace) orelse return null;
     p.fn_nesting_depth += 1;
+    p.fn_nesting_depth_real += 1;
     // A function body starts its own break/continue scope: an enclosing loop or
     // switch does not extend into it.
     const saved_iter_depth = p.iteration_depth;
@@ -2970,6 +3040,7 @@ pub fn parseFunctionBody(p: *Parser) ?[]*Node {
     // nested function body that already returned doesn't leave a stale value.
     p.pending_body_use_strict = body_has_use_strict;
     p.fn_nesting_depth -= 1;
+    p.fn_nesting_depth_real -= 1;
     _ = p.expect(.right_brace) orelse return null;
     // Explicit resource management: wrap the user body in the `using` disposal
     // desugar (a no-op unless it contains `using`/`await using` declarations)

@@ -4173,7 +4173,14 @@ fn functionCtorImpl(arena: std.mem.Allocator, args: []const Value, keyword: []co
                     const saved_sr = active_shadow_realm;
                     active_shadow_realm = rp;
                     defer active_shadow_realm = saved_sr;
-                    break :blk try ctx.shadowEval(arena, src.items, @ptrCast(rp.global_env));
+                    // A parse failure of the assembled source surfaces as a real
+                    // SyntaxError (pending_exception already holds it); callers
+                    // only recognize `error.JsException` as "catchable JS throw",
+                    // so re-tag it here (mirrors ShadowRealm.prototype.evaluate).
+                    break :blk ctx.shadowEval(arena, src.items, @ptrCast(rp.global_env)) catch |e| {
+                        if (e == error.ShadowParseError) return error.JsException;
+                        return e;
+                    };
                 }
             }
             break :blk try ctx.evalSource(arena, src.items);

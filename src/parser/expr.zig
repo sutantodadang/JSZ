@@ -1310,7 +1310,11 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
         },
         .plus_plus => {
             _ = p.advance();
-            const operand = p.parseUnaryExpr() orelse return null;
+            const saved_upd = p.in_update_operand;
+            p.in_update_operand = true;
+            const operand_res = p.parseUnaryExpr();
+            p.in_update_operand = saved_upd;
+            const operand = operand_res orelse return null;
             if (strictUpdateTargetError(p, operand)) return null;
             return p.makeNode(.update_expr, start, p.current.start, .{
                 .update_expr = .{ .op = .inc, .operand = operand, .prefix = true },
@@ -1318,7 +1322,11 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
         },
         .minus_minus => {
             _ = p.advance();
-            const operand = p.parseUnaryExpr() orelse return null;
+            const saved_upd = p.in_update_operand;
+            p.in_update_operand = true;
+            const operand_res = p.parseUnaryExpr();
+            p.in_update_operand = saved_upd;
+            const operand = operand_res orelse return null;
             if (strictUpdateTargetError(p, operand)) return null;
             return p.makeNode(.update_expr, start, p.current.start, .{
                 .update_expr = .{ .op = .dec, .operand = operand, .prefix = true },
@@ -1339,8 +1347,13 @@ pub fn parseUnaryExpr(p: *Parser) ?*Node {
                 // to be a function — a direct eval inside one qualifies, an
                 // indirect eval (global code) never does. Inside a function
                 // literal the eval'd source declares itself, so `(0, eval)
-                // ('(function(){ new.target })')` stays legal.
-                if (p.eval_code and !p.eval_allow_new_target and p.fn_nesting_depth == 0)
+                // ('(function(){ new.target })')` stays legal. `fn_nesting_depth_real`
+                // (not `fn_nesting_depth`, which also counts arrow bodies) is the
+                // right counter: an arrow provides no NewTarget of its own, so
+                // `eval('() => new.target')` must still fail at eval's top level
+                // even though the arrow body counts toward `fn_nesting_depth`
+                // (staging/sm/class/newTargetArrow.js).
+                if (p.eval_code and !p.eval_allow_new_target and p.fn_nesting_depth_real == 0)
                     return p.fail("new.target expression is not allowed here");
                 const nt_node = p.makeNode(.identifier, start, p.current.start, .{
                     .identifier = "__new_target__",
@@ -1505,7 +1518,15 @@ pub fn parseCallMemberTail(p: *Parser, base_in: *Node) ?*Node {
             base = p.makeNode(.member_expr, base.start, p.current.start, .{
                 .member_expr = .{ .object = base, .property = prop, .computed = false },
             }) orelse return null;
-            if (superReadFollows(p, obj)) base = rewriteSuperPropRead(p, base) orelse return null;
+            if (superReadFollows(p, obj)) {
+                base = rewriteSuperPropRead(p, base) orelse return null;
+            } else if (isSuperIdentifier(obj)) {
+                // Left as a plain member form for `delete`/update/compound-assign
+                // (superReadFollows == false). Still mark this method as needing
+                // the __sproto__/__superthis bindings — the bytecode compiler's
+                // super-update/compound-assign path reads them directly.
+                p.super_prop_count += 1;
+            }
         } else if (p.match(.left_bracket)) {
             const obj = base;
             const prop = p.parseExpression() orelse return null;
@@ -1513,7 +1534,11 @@ pub fn parseCallMemberTail(p: *Parser, base_in: *Node) ?*Node {
             base = p.makeNode(.member_expr, base.start, p.current.start, .{
                 .member_expr = .{ .object = base, .property = prop, .computed = true },
             }) orelse return null;
-            if (superReadFollows(p, obj)) base = rewriteSuperPropRead(p, base) orelse return null;
+            if (superReadFollows(p, obj)) {
+                base = rewriteSuperPropRead(p, base) orelse return null;
+            } else if (isSuperIdentifier(obj)) {
+                p.super_prop_count += 1;
+            }
         } else {
             break;
         }
@@ -1697,6 +1722,10 @@ fn rewriteSuperPropRead(p: *Parser, me_node: *Node) ?*Node {
     });
 }
 
+fn isSuperIdentifier(obj: *Node) bool {
+    return obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "super");
+}
+
 /// True when a just-parsed `super.x` / `super[e]` member node is a plain *read*
 /// and so should go through rewriteSuperPropRead. The token that follows tells
 /// us which desugar owns it: `(` means a super method call (rewriteSuperCall),
@@ -1704,14 +1733,34 @@ fn rewriteSuperPropRead(p: *Parser, me_node: *Node) ?*Node {
 /// (rewriteSuperPropAssign), and `++`/`--` is an update whose existing
 /// (member-based) handling we leave untouched.
 fn superReadFollows(p: *Parser, obj: *Node) bool {
-    if (!(obj.kind == .identifier and std.mem.eql(u8, obj.data.identifier, "super"))) return false;
+    if (!isSuperIdentifier(obj)) return false;
     // `delete super.x` / `delete super[e]`: this super member is the delete target
     // and must stay a raw super reference (the compiler throws ReferenceError). A
     // chained `delete super.x.y` has a `.`/`[` next, so the inner read still
     // rewrites — only the whole-operand form is a Super Reference.
     if (p.in_delete_operand and p.current.kind != .dot and p.current.kind != .left_bracket) return false;
+    // `++super.x` / `--super[e]`: same story for a PREFIX update. Its `++`/`--`
+    // token precedes the operand and is already consumed by the time this member
+    // finishes parsing, so `p.current` alone can't see it the way postfix does
+    // (`.plus_plus`/`.minus_minus` below). `p.in_update_operand` is set around the
+    // recursive parse of a prefix update's operand for exactly this reason.
+    if (p.in_update_operand and p.current.kind != .dot and p.current.kind != .left_bracket) return false;
+    // `for (super.x in obj)` / `for (super[e] of iter)`: parsed here as a plain
+    // AssignmentExpression before the loop head is known (see parseForStmt), so
+    // a trailing `in`/`of` is the loop keyword, not the binary `in` operator or
+    // an ordinary read — keep the member form for the compiler's super-write path.
+    if (p.in_for_head_lhs and (p.current.kind == .kw_in or p.current.kind == .kw_of)) return false;
+    // `[super.x, super.y] = arr`: an array/object literal element is parsed as a
+    // plain expression long before the parser knows whether the literal will
+    // turn out to be a destructuring-assignment PATTERN (decided only once `=`
+    // is seen after the closing `]`/`}`) or an ordinary value literal. Defer in
+    // both cases — the closing/separator token is `,`, `]`, `}`, or `:` (an
+    // object-literal key/value separator) — and let the *compiler* decide read
+    // vs. write from the member's actual AST position: compileMemberRead falls
+    // back to the identical Reflect.get read for a raw super member that turns
+    // out NOT to be a target, so deferring here is always safe.
     return switch (p.current.kind) {
-        .left_paren, .plus_plus, .minus_minus => false,
+        .left_paren, .plus_plus, .minus_minus, .comma, .right_bracket, .right_brace, .colon => false,
         else => !isAssignOp(p.current.kind),
     };
 }
@@ -2590,9 +2639,14 @@ pub fn parseFunctionExpr(p: *Parser, is_async: bool) ?*Node {
         name = p.export_default_name_hint;
         p.export_default_name_hint = null;
     }
-    const parsed_params = p.parseFunctionParams() orelse return null;
+    // The parameter list is parsed under THIS function's own [Yield] parameter,
+    // not the enclosing one (see parseFunctionDecl for the declaration analog).
     const prev_gen = p.in_generator_function;
     p.in_generator_function = is_generator;
+    const parsed_params = p.parseFunctionParams() orelse {
+        p.in_generator_function = prev_gen;
+        return null;
+    };
     const body = p.parseFunctionBody() orelse {
         p.in_generator_function = prev_gen;
         return null;

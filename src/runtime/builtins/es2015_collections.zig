@@ -2098,6 +2098,7 @@ pub fn initArrayIteratorProto(arena: std.mem.Allocator, object_proto: *JsObject)
     _ = try iter_proto.defineOwnData("some",    try val_mod.makeNativeFunctionNamed(arena, nativeIterSome,    "some",    1), cfg);
     _ = try iter_proto.defineOwnData("every",   try val_mod.makeNativeFunctionNamed(arena, nativeIterEvery,   "every",   1), cfg);
     _ = try iter_proto.defineOwnData("find",    try val_mod.makeNativeFunctionNamed(arena, nativeIterFind,    "find",    1), cfg);
+    _ = try iter_proto.defineOwnData("join",    try val_mod.makeNativeFunctionNamed(arena, nativeIterJoin,    "join",    1), cfg);
     // %IteratorPrototype%[@@dispose] — closes the iterator via its `return` method.
     if (realm_mod.active_sym_dispose) |sym|
         try iter_proto.setSymAttr(sym, try val_mod.makeNativeFunctionNamed(arena, nativeIterDispose, "[Symbol.dispose]", 0), cfg);
@@ -4034,6 +4035,71 @@ fn nativeIterFind(arena: std.mem.Allocator, this_val: Value, args: []const Value
         }
     }
     return try val_mod.makeUndefined(arena);
+}
+
+/// ToString(v) for Iterator.prototype.join: mirrors array_proto.valueToJsString
+/// but lives locally to avoid a circular import (array_proto.zig already
+/// imports this file as `coll_mod`).
+fn iterJoinToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
+    if (v.bits == 0) return "undefined";
+    return switch (v.unbox()) {
+        .undefined_ => "undefined",
+        .null_ => "null",
+        .boolean => |b| if (b) "true" else "false",
+        .number => |n| try val_mod.formatNumber(arena, n),
+        .string => |s| s,
+        .bigint => try val_mod.bigIntToString(arena, v.unbox().bigint),
+        .symbol => {
+            try setTypeError(arena, "Cannot convert a Symbol value to a string");
+            unreachable;
+        },
+        else => blk: {
+            const prim = (try coercion.toPrimitive(arena, v, .string)) orelse v;
+            if (!coercion.isPrimitive(prim)) break :blk "[object Object]";
+            break :blk try iterJoinToString(arena, prim);
+        },
+    };
+}
+
+/// Iterator.prototype.join ( separator ) — joins the receiver's produced values
+/// into a string (like Array.prototype.join, but driven by GetIteratorDirect
+/// instead of array indices). Per the proposal, IteratorClose (i.e. calling the
+/// receiver's `return`) fires only when an abrupt completion happens while
+/// *processing* a step (coercing the separator or a yielded value) — NOT when
+/// the abrupt completion comes from Call(next) itself, from reading
+/// done/value, or from looking up `next` while building the iterator record.
+fn nativeIterJoin(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
+    try requireObjectIter(arena, this_val);
+
+    const sep_arg = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    const sep: []const u8 = if (sep_arg.bits == 0 or sep_arg.unbox() == .undefined_)
+        ","
+    else
+        iterJoinToString(arena, sep_arg) catch |e| {
+            closeIterator(arena, this_val);
+            return e;
+        };
+
+    // `next` is looked up (GetIteratorDirect) only after the separator has been
+    // coerced — see next-lookup-after-separator-tostring.js.
+    const it = try getIteratorDirect(arena, this_val);
+
+    var buf = std.ArrayList(u8){};
+    var first = true;
+    while (true) {
+        const step = iterStep(arena, it.source, it.next_fn) catch |e| return e;
+        const value = step orelse break;
+        if (!first) try buf.appendSlice(arena, sep);
+        first = false;
+        if (!(value.bits == 0) and value.unbox() != .undefined_ and value.unbox() != .null_) {
+            const s = iterJoinToString(arena, value) catch |e| {
+                closeIterator(arena, it.source);
+                return e;
+            };
+            try buf.appendSlice(arena, s);
+        }
+    }
+    return val_mod.makeString(arena, buf.items);
 }
 
 // ============================================================

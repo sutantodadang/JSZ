@@ -14,6 +14,7 @@ const realm_mod = @import("../../realm.zig");
 const intrinsics = @import("../intrinsics.zig");
 const shared = @import("shared.zig");
 const DurationFields = shared.DurationFields;
+const zdt = @import("zoned_date_time.zig");
 
 pub var proto_obj: ?*JsObject = null;
 
@@ -201,7 +202,11 @@ pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) an
 
     // Comparing durations with calendar units (years/months/weeks) needs a
     // relativeTo reference; with one, compare their exact endpoints from R.
-    if (hasCalendarUnits(a) or hasCalendarUnits(b)) {
+    // A zoned relativeTo also needs it for a pure `days` duration — `days` has
+    // TemporalUnitCategory "date", so AddZonedDateTime (and its range check)
+    // still applies even though `days` isn't a *calendar* unit here.
+    const zoned_needs_r = rel != null and rel.?.zoned != null and (hasDateUnits(a) or hasDateUnits(b));
+    if (hasCalendarUnits(a) or hasCalendarUnits(b) or zoned_needs_r) {
         const R = rel orelse return realm_mod.throwRangeError(arena, "Duration.compare with calendar units requires relativeTo");
         const na = try durationEndpointNs(arena, a, R);
         const nb = try durationEndpointNs(arena, b, R);
@@ -215,14 +220,18 @@ pub fn nativeCompare(arena: std.mem.Allocator, _: Value, args: []const Value) an
     return val_mod.makeNumber(arena, r);
 }
 
-/// The exact epoch-nanosecond endpoint of `d` measured from PlainDate `R`
-/// (24-hour days); used by Duration.compare with a relativeTo reference.
-fn durationEndpointNs(arena: std.mem.Allocator, d: DurationFields, R: ISODate) !i128 {
+/// The exact epoch-nanosecond endpoint of `d` measured from `R` (24-hour
+/// days); used by Duration.compare with a relativeTo reference. When `R` came
+/// from a ZonedDateTime, the candidate endpoint is also reconciled through the
+/// real zone and range-checked (AddZonedDateTime), matching spec even for a
+/// duration with no calendar units.
+fn durationEndpointNs(arena: std.mem.Allocator, d: DurationFields, R: RelDate) !i128 {
     const DAY = shared.NS_PER_DAY;
     const time_ns = timePartNanos(d);
     const extra_days = @divTrunc(time_ns, DAY);
     const rem = time_ns - extra_days * DAY;
-    const end = try pd.addISODate(R, d.years, d.months, d.weeks, d.days + @as(f64, @floatFromInt(extra_days)), .constrain, arena);
+    const end = try pd.addISODate(R.date, d.years, d.months, d.weeks, d.days + @as(f64, @floatFromInt(extra_days)), .constrain, arena);
+    if (R.zoned) |z| return try zonedEndpointNs(arena, z, end, rem);
     return @as(i128, epochDaysOf(end)) * DAY + rem;
 }
 
@@ -241,6 +250,13 @@ fn timeDurationNanos(d: DurationFields) i128 {
 
 fn hasCalendarUnits(d: DurationFields) bool {
     return d.years != 0 or d.months != 0 or d.weeks != 0;
+}
+
+/// TemporalUnitCategory "date": year/month/week/day. Unlike `hasCalendarUnits`,
+/// this includes `days` — used to decide whether a zoned relativeTo must
+/// reconcile through AddZonedDateTime even for a plain `days` duration.
+fn hasDateUnits(d: DurationFields) bool {
+    return hasCalendarUnits(d) or d.days != 0;
 }
 
 /// Whether a (possibly absent) unit is a calendar unit — year/month/week —
@@ -410,10 +426,19 @@ fn timePartNanos(d: DurationFields) i128 {
         @as(i128, @intFromFloat(d.nanoseconds));
 }
 
+/// `relativeTo`, resolved to a PlainDate-style reference for the ISO-calendar
+/// arithmetic in this file, plus (when the source was a ZonedDateTime) the
+/// full zoned reference so range-sensitive callers can reconcile a candidate
+/// result through the real time zone rather than trusting the reduced date.
+pub const RelDate = struct {
+    date: ISODate,
+    zoned: ?zdt.ZonedDT = null,
+};
+
 /// Resolve the `relativeTo` option to a PlainDate (iso8601). Returns null when
 /// absent/undefined. A value with a non-iso calendar or that cannot be read as a
 /// date propagates the appropriate error from toTemporalDate.
-fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
+fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?RelDate {
     const o = opts orelse return null;
     // Read relativeTo through [[Get]] so observers/getters run (option-read order).
     const rv = (try shared.optionGet(arena, o, "relativeTo")) orelse Value{};
@@ -425,10 +450,11 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
         .null_, .boolean, .number, .bigint, .symbol => return realm_mod.throwTypeError(arena, "relativeTo must be a string or object"),
         else => {},
     }
-    // A ZonedDateTime relativeTo is reduced to its local calendar date (we do not
-    // model per-day time-zone offset changes; correct for fixed-offset zones).
-    const zdt = @import("zoned_date_time.zig");
-    if (zdt.getZoned(rv)) |z| return zdt.localISODate(z);
+    // A ZonedDateTime relativeTo is reduced to its local calendar date for the
+    // arithmetic below (we do not model per-day time-zone offset changes; correct
+    // for fixed-offset zones), but the zoned reference itself is kept so range
+    // checks can reconcile a candidate result through the real time zone.
+    if (zdt.getZoned(rv)) |z| return .{ .date = zdt.localISODate(z), .zoned = z.* };
     // For a string, a UTC "Z" designator makes it a zoned relativeTo, which is
     // only valid alongside a [time zone] annotation. We reduce a zoned reference
     // to its local calendar date (fixed-offset accurate); a bare "…Z" without a
@@ -445,15 +471,15 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
         // `Z` with no `[tz]` annotation is not a valid relativeTo.
         if (hasTimeZoneAnnotation(str)) {
             const z = try zdt.toTemporalZoned(arena, rv, val_mod.Value{});
-            return zdt.localISODate(&z);
+            return .{ .date = zdt.localISODate(&z), .zoned = z };
         }
         if (has_utc)
             return realm_mod.throwRangeError(arena, "UTC designator without a time zone is not a valid relativeTo");
     }
     // A Temporal.PlainDate / PlainDateTime relativeTo uses its internal ISO date
     // directly — its property-bag fields must NOT be observed.
-    if (pd.getDate(rv)) |dd| return dd.*;
-    if (@import("plain_date_time.zig").getDateTime(rv)) |dt| return dt.date;
+    if (pd.getDate(rv)) |dd| return .{ .date = dd.* };
+    if (@import("plain_date_time.zig").getDateTime(rv)) |dt| return .{ .date = dt.date };
     // A property bag is read as a full ZonedDateTime-shaped bag (time, offset
     // and timeZone included) even though only the date is kept: which fields are
     // touched is observable.
@@ -463,11 +489,29 @@ fn readRelativeDate(arena: std.mem.Allocator, opts: ?*JsObject) !?ISODate {
         // offset have to be validated even though only the date survives.
         if (bag.time_zone != null) {
             const z = try zdt.toTemporalZoned(arena, rv, val_mod.Value{});
-            return zdt.localISODate(&z);
+            return .{ .date = zdt.localISODate(&z), .zoned = z };
         }
-        return try pd.dateFromBag(arena, bag, .constrain);
+        return .{ .date = try pd.dateFromBag(arena, bag, .constrain) };
     }
-    return try pd.toTemporalDate(arena, rv, .constrain);
+    return .{ .date = try pd.toTemporalDate(arena, rv, .constrain) };
+}
+
+/// AddZonedDateTime's final range check: reconcile a candidate local
+/// date+(sub-day time remainder) against `z`'s actual time zone and validate
+/// that the resulting instant is representable. Spec: even a pure `days`
+/// duration (no years/months/weeks) has TemporalUnitCategory "date", so a
+/// ZonedDateTime relativeTo must always reconcile through AddZonedDateTime —
+/// our fast integer-nanosecond paths skip that reconciliation, so callers with
+/// a zoned relativeTo must run this check explicitly wherever they would
+/// otherwise bypass `roundRelative`.
+fn zonedEndpointNs(arena: std.mem.Allocator, z: zdt.ZonedDT, date: ISODate, time_rem_ns: i128) !i128 {
+    // CheckISODaysRange-equivalent: guard the multiplication below before it can
+    // even be formed, independent of the final strict bounds check.
+    if (!shared.isoDaysInRange(date)) return realm_mod.throwRangeError(arena, "relativeTo result is outside the representable range");
+    const wall: i128 = @as(i128, shared.isoDateToEpochDays(date.year, date.month, date.day)) * shared.NS_PER_DAY + time_rem_ns;
+    const ns = try zdt.disambiguate(arena, z.tz, z.offset_ns, wall, .compatible);
+    if (ns < -shared.NS_LIMIT or ns > shared.NS_LIMIT) return realm_mod.throwRangeError(arena, "relativeTo result is outside the representable range");
+    return ns;
 }
 
 /// True if the string carries an RFC 9557 time-zone annotation — a `[...]`
@@ -512,18 +556,23 @@ const RelResult = struct { d: DurationFields, total: f64 };
 fn roundRelative(
     arena: std.mem.Allocator,
     d0: DurationFields,
-    R: ISODate,
+    Rd: RelDate,
     smallest: shared.Unit,
     largest: shared.Unit,
     inc: f64,
     mode: shared.RoundingMode,
 ) !RelResult {
+    const R = Rd.date;
     const DAY = shared.NS_PER_DAY;
     const time_ns = timePartNanos(d0);
     // Fold the sub-day/over-day time into whole days plus a sub-day remainder.
     const extra_days = @divTrunc(time_ns, DAY);
     const time_rem = time_ns - extra_days * DAY;
     const dest_date = try pd.addISODate(R, d0.years, d0.months, d0.weeks, d0.days + @as(f64, @floatFromInt(extra_days)), .constrain, arena);
+    // AddZonedDateTime: a zoned relativeTo must reconcile the candidate result
+    // through the real time zone and range-check it, even for a duration with
+    // no calendar units (TemporalUnitCategory("day") is "date", not "time").
+    if (Rd.zoned) |z| _ = try zonedEndpointNs(arena, z, dest_date, time_rem);
 
     const s = d0.sign();
     const sgn: f64 = if (s < 0) -1 else 1;
@@ -601,6 +650,10 @@ fn roundRelative(
     // tight PlainDateTime range here.
     if (!shared.isoDateWithinLimits(start_date) or !shared.isoDateWithinLimits(end_date))
         return realm_mod.throwRangeError(arena, "rounded date is outside the valid ISO range");
+    if (Rd.zoned) |z| {
+        _ = try zonedEndpointNs(arena, z, start_date, 0);
+        _ = try zonedEndpointNs(arena, z, end_date, 0);
+    }
     const start_ns: i128 = @as(i128, epochDaysOf(start_date)) * DAY;
     const end_ns: i128 = @as(i128, epochDaysOf(end_date)) * DAY;
     const dest_ns: i128 = @as(i128, epochDaysOf(dest_date)) * DAY + time_rem;
@@ -651,7 +704,7 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     var smallest: ?shared.Unit = null;
     var largest: ?shared.Unit = null;
     var given = false; // at least one of smallestUnit/largestUnit was supplied
-    var rel_date: ?shared.ISODate = null;
+    var rel_date: ?RelDate = null;
     var mode: shared.RoundingMode = .half_expand;
     var inc: f64 = 1;
     const arg0 = if (args.len > 0) args[0] else Value{};
@@ -699,7 +752,11 @@ pub fn nativeRound(arena: std.mem.Allocator, this_val: Value, args: []const Valu
 
     // Anything touching calendar units (in the receiver or as a rounding unit)
     // needs a reference date; resolve relativeTo and use the calendar algorithm.
-    const needs_relative = hasCalendarUnits(d.*) or isCalendarUnit(small) or isCalendarUnit(large);
+    // A zoned relativeTo also routes through it when `day` is involved: `day`
+    // has TemporalUnitCategory "date", so AddZonedDateTime (and its range
+    // check) applies even though `day` isn't a *calendar* unit here.
+    const zoned_day = rel_date != null and rel_date.?.zoned != null and (small == .day or large == .day);
+    const needs_relative = hasCalendarUnits(d.*) or isCalendarUnit(small) or isCalendarUnit(large) or zoned_day;
     if (needs_relative) {
         const R = rel_date orelse return realm_mod.throwRangeError(arena, "Duration.round with calendar units requires relativeTo");
         const res = try roundRelative(arena, d.*, R, small, large, inc, mode);
@@ -797,7 +854,7 @@ pub fn nativeTotal(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     const d = try requireDuration(arena, this_val);
     var unit: ?shared.Unit = null;
     var opts: ?*JsObject = null;
-    var rel_date: ?shared.ISODate = null;
+    var rel_date: ?RelDate = null;
     const arg0 = if (args.len > 0) args[0] else Value{};
     if (arg0.bits == 0 or arg0.unbox() == .undefined_) return realm_mod.throwTypeError(arena, "total() requires a unit argument");
     if (arg0.unbox() == .string) {
@@ -810,8 +867,11 @@ pub fn nativeTotal(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     }
     const u = unit orelse return realm_mod.throwRangeError(arena, "total() requires a unit");
 
-    // Calendar units (in the receiver or as the target unit) need relativeTo.
-    if (hasCalendarUnits(d.*) or isCalendarUnit(u)) {
+    // Calendar units (in the receiver or as the target unit) need relativeTo. A
+    // zoned relativeTo also routes through it for `unit: "day"` — see the note
+    // in nativeRound.
+    const zoned_day = rel_date != null and rel_date.?.zoned != null and u == .day;
+    if (hasCalendarUnits(d.*) or isCalendarUnit(u) or zoned_day) {
         const R = rel_date orelse
             return realm_mod.throwRangeError(arena, "Duration.total with calendar units requires relativeTo");
         const res = try roundRelative(arena, d.*, R, u, u, 1, .trunc);

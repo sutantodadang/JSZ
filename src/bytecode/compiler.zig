@@ -996,17 +996,16 @@ pub const FnCompiler = struct {
                     // property and yield a boolean result.
                     const me = operand.data.member_expr;
                     // `delete super.x` / `delete super[e]` is always a ReferenceError
-                    // (IsSuperReference, §13.5.1.2). But evaluating the operand
-                    // `super[e]` first FORMS a Super Reference (§13.3.7.1): a
-                    // computed key expression and its ToPropertyKey coercion run —
-                    // and are observable — BEFORE `delete` sees the Super Reference
-                    // and throws. So evaluate the key for its side effects here.
+                    // (IsSuperReference, §13.5.1.2). The computed key EXPRESSION is
+                    // still evaluated for its own side effects (e.g. a throwing
+                    // function call), but ToPropertyKey coercion is NOT applied —
+                    // per staging/sm/class/superElemDelete.js an object key's
+                    // `toString`/`@@toPrimitive` must NOT be observably invoked
+                    // before the ReferenceError fires.
                     if (me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super")) {
                         if (me.computed) {
                             const rkey = try self.compileExpr(me.property);
-                            try self.emitOp(.TO_PROPERTY_KEY, line);
-                            try self.emitU8(rkey);
-                            self.sp = rkey; // discard the coerced key
+                            self.sp = rkey; // discard the (uncoerced) key
                         }
                         return try self.emitThrowError("ReferenceError", "Unsupported reference to 'super'", line);
                     }
@@ -1383,6 +1382,7 @@ pub const FnCompiler = struct {
             if (!me.private_define and !me.define_data and !is_super) {
                 return try self.compileCompoundMember(a, me, line);
             }
+            if (is_super) return try self.compileSuperCompoundMember(a, me, line);
         }
         // Compound assignment. Like simple assignment, the target's Reference is
         // resolved once up front; `rref` sits below `rcur` so resetting sp to
@@ -1981,6 +1981,24 @@ pub const FnCompiler = struct {
     }
 
     pub fn compileMemberRead(self: *Self, me: ast.MemberExpr, line: u32) error{OutOfMemory}!u8 {
+        // A raw `super.x` / `super[e]` read reaches here only from a position
+        // where the parser couldn't yet tell whether it would end up a read or
+        // an assignment target — e.g. an array/object literal element that turns
+        // out NOT to be a destructuring pattern (superReadFollows defers in that
+        // position because it might be one; see prepareSuperPropRef's callers for
+        // the write side). Read it the same way rewriteSuperPropRead's AST rewrite
+        // would: Reflect.get(__sproto__, key, __superthis) (§13.3.7 SuperProperty).
+        if (me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super")) {
+            const save_sp = self.sp;
+            const pr = try self.prepareSuperPropRef(me, line);
+            const rdst = self.allocReg();
+            try self.emitSuperPropGet(pr, rdst, line);
+            try self.emitOp(.MOVE, line);
+            try self.emitU8(save_sp);
+            try self.emitU8(rdst);
+            self.sp = save_sp + 1;
+            return save_sp;
+        }
         const robj = try self.compileExpr(me.object);
         // ES2020 `obj?.prop`: short-circuit the whole chain if obj is nullish.
         if (me.optional) try self.emitOptionalGuard(robj, line);
@@ -2072,6 +2090,20 @@ pub const FnCompiler = struct {
     }
 
     pub fn compileMemberWrite(self: *Self, me: ast.MemberExpr, rval: u8, line: u32) error{OutOfMemory}!void {
+        // `super.x = v` / `super[e] = v` reaching here comes from a context that
+        // bypasses rewriteSuperPropAssign's `=`-only Reflect desugar (assignment
+        // destructuring targets, `for (super.x in/of …)` loop targets — see
+        // superReadFollows / in_for_head_lhs): route through the same
+        // Reflect.get/__superSet__ path so the write lands on the home object's
+        // [[Prototype]] with the correct Receiver (§13.3.7 SuperProperty), not on
+        // whatever the unbound `super` identifier would otherwise resolve to.
+        if (me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super")) {
+            const save_sp = self.sp;
+            const pr = try self.prepareSuperPropRef(me, line);
+            try self.emitSuperPropSet(pr, rval, line);
+            self.sp = save_sp;
+            return;
+        }
         const robj = try self.compileExpr(me.object);
         if (!me.computed) {
             const prop_name = me.property.data.identifier;
@@ -2333,6 +2365,7 @@ pub const FnCompiler = struct {
             if (!me.private_define and !me.define_data and !is_super) {
                 return try self.compileUpdateMember(u, me, line);
             }
+            if (is_super) return try self.compileSuperUpdateMember(u, me, line);
         }
         // As with compound assignment, the operand's Reference is resolved once
         // and reused for the write-back (`with (o) { x++ }` keeps assigning o.x
@@ -2387,6 +2420,162 @@ pub const FnCompiler = struct {
             if (rref) |r| return self.collapseRef(r, r_old, line);
             return r_old; // return old (numeric) value
         }
+    }
+
+    /// Registers holding the three operands of a desugared super-property
+    /// reference (`__sproto__`, the property key, `__superthis`), evaluated
+    /// once and reused for both the Reflect.get read and the __superSet__
+    /// write-back of a `super[e]++` / `super.x += v` lowering.
+    const SuperPropRef = struct {
+        rproto: u8,
+        rkey: u8,
+        rrecv: u8,
+    };
+
+    /// Evaluate a super-property member's base/key/receiver into fresh
+    /// registers, exactly once. Mirrors what rewriteSuperPropRead /
+    /// rewriteSuperPropAssign build at the AST level (Reflect.get/set against
+    /// `__sproto__` with `__superthis` as Receiver — the spec's SuperProperty
+    /// `Get`/`Set(homeProto, key, …, thisValue)`), but keeps the key live in a
+    /// register so an update/compound-assign can read AND write through it
+    /// without evaluating a computed key twice.
+    fn prepareSuperPropRef(self: *Self, me: ast.MemberExpr, line: u32) error{OutOfMemory}!SuperPropRef {
+        const rproto = self.allocReg();
+        try self.emitLoad("__sproto__", rproto, line);
+        const rkey = self.allocReg();
+        if (me.computed) {
+            const rk = try self.compileExpr(me.property);
+            if (rk != rkey) {
+                try self.emitOp(.MOVE, line);
+                try self.emitU8(rkey);
+                try self.emitU8(rk);
+            }
+            self.sp = rkey + 1;
+        } else {
+            const name = me.property.data.identifier;
+            const sv = try val_mod.makeString(self.arena, name);
+            const kidx = try self.addConstant(sv);
+            try self.emitOp(.LOAD_K, line);
+            try self.emitU8(rkey);
+            try self.emitU16(kidx);
+        }
+        const rrecv = self.allocReg();
+        try self.emitLoad("__superthis", rrecv, line);
+        return .{ .rproto = rproto, .rkey = rkey, .rrecv = rrecv };
+    }
+
+    /// `dst = Reflect.get(pr.rproto, pr.rkey, pr.rrecv)`. Scratch registers are
+    /// allocated above the caller's live set and released before returning.
+    fn emitSuperPropGet(self: *Self, pr: SuperPropRef, dst: u8, line: u32) error{OutOfMemory}!void {
+        const save_sp = self.sp;
+        const robj = self.allocReg();
+        try self.emitLoad("Reflect", robj, line);
+        const callee = self.allocReg();
+        const kidx = try self.addConstant(try val_mod.makeString(self.arena, "get"));
+        try self.emitOp(.GET_PROP, line);
+        try self.emitU8(callee);
+        try self.emitU8(robj);
+        try self.emitU16(kidx);
+        const a0 = self.allocReg();
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(a0);
+        try self.emitU8(pr.rproto);
+        const a1 = self.allocReg();
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(a1);
+        try self.emitU8(pr.rkey);
+        const a2 = self.allocReg();
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(a2);
+        try self.emitU8(pr.rrecv);
+        try self.emitOp(.CALL, line);
+        try self.emitU8(callee);
+        try self.emitU8(3);
+        try self.emitU8(dst);
+        self.sp = save_sp;
+    }
+
+    /// `__superSet__(pr.rproto, pr.rkey, rvalue, pr.rrecv, is_strict)` — PutValue
+    /// on the Super Reference (§6.2.5.6). The call's result (the assigned value)
+    /// is discarded; the caller already holds `rvalue`.
+    fn emitSuperPropSet(self: *Self, pr: SuperPropRef, rvalue: u8, line: u32) error{OutOfMemory}!void {
+        const save_sp = self.sp;
+        const callee = self.allocReg();
+        const gi = try self.addConstant(try val_mod.makeString(self.arena, "__superSet__"));
+        try self.emitOp(.GET_GLOBAL, line);
+        try self.emitU8(callee);
+        try self.emitU16(@intCast(gi));
+        const a0 = self.allocReg();
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(a0);
+        try self.emitU8(pr.rproto);
+        const a1 = self.allocReg();
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(a1);
+        try self.emitU8(pr.rkey);
+        const a2 = self.allocReg();
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(a2);
+        try self.emitU8(rvalue);
+        const a3 = self.allocReg();
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(a3);
+        try self.emitU8(pr.rrecv);
+        const a4 = self.allocReg();
+        if (self.is_strict) {
+            try self.emitOp(.LOAD_TRUE, line);
+        } else {
+            try self.emitOp(.LOAD_FALSE, line);
+        }
+        try self.emitU8(a4);
+        const dst = self.allocReg(); // discard __superSet__'s return
+        try self.emitOp(.CALL, line);
+        try self.emitU8(callee);
+        try self.emitU8(5);
+        try self.emitU8(dst);
+        self.sp = save_sp;
+    }
+
+    /// `super[key]++` / `--super.x` — the update-expression counterpart of
+    /// compileUpdateMember, but through Reflect.get/__superSet__ (§13.3.7
+    /// SuperProperty: base is the home object's [[Prototype]], Receiver is the
+    /// enclosing `this`/`__superthis` — a plain member op cannot express that
+    /// split). The key is evaluated exactly once via prepareSuperPropRef.
+    fn compileSuperUpdateMember(self: *Self, u: ast.UpdateExpr, me: ast.MemberExpr, line: u32) error{OutOfMemory}!u8 {
+        const rres = self.allocReg();
+        const pr = try self.prepareSuperPropRef(me, line);
+        const r_old = self.allocReg();
+        try self.emitSuperPropGet(pr, r_old, line);
+        try self.emitOp(.TO_NUMERIC, line);
+        try self.emitU8(r_old);
+        try self.emitU8(r_old);
+        const r_new = self.allocReg();
+        try self.emitOp(if (u.op == .inc) .INC else .DEC, line);
+        try self.emitU8(r_new);
+        try self.emitU8(r_old);
+        try self.emitSuperPropSet(pr, r_new, line);
+        try self.emitOp(.MOVE, line);
+        try self.emitU8(rres);
+        try self.emitU8(if (u.prefix) r_new else r_old);
+        self.sp = rres + 1; // free proto/key/recv/old/new; keep the result
+        return rres;
+    }
+
+    /// `super[key] op= rhs` — the compound-assignment counterpart, mirroring
+    /// compileCompoundMember but through Reflect.get/__superSet__ for the same
+    /// dual base/receiver reason as compileSuperUpdateMember.
+    fn compileSuperCompoundMember(self: *Self, a: ast.AssignExpr, me: ast.MemberExpr, line: u32) error{OutOfMemory}!u8 {
+        const rres = self.allocReg();
+        const pr = try self.prepareSuperPropRef(me, line);
+        try self.emitSuperPropGet(pr, rres, line);
+        const rrhs = try self.compileExpr(a.value);
+        try self.emitOp(compoundBinOp(a.op), line);
+        try self.emitU8(rres);
+        try self.emitU8(rres);
+        try self.emitU8(rrhs);
+        try self.emitSuperPropSet(pr, rres, line);
+        self.sp = rres + 1; // free proto/key/recv/rhs; keep the result
+        return rres;
     }
 
     /// `obj[key]++` / `--obj.p` on a plain member target: base and computed key

@@ -989,19 +989,29 @@ pub const BcVm = struct {
                 p.eval_allow_super_prop = true;
             } else |_| {}
             // §13.3.12.1: `new.target` needs function code around it. Eval code
-            // takes that from its calling context, so walk down to the nearest
-            // frame that is not itself eval code and ask whether it is a
-            // function literal rather than a Script/module top level.
-            var i = self.frames.items.len;
-            while (i > 0) {
-                i -= 1;
-                const cf = self.frames.items[i].func;
-                if (cf.is_eval) continue;
-                // The containing function code must not be an ArrowFunction's:
-                // `(() => eval('new.target'))()` is an early SyntaxError even
-                // though the arrow would otherwise inherit its NewTarget.
-                p.eval_allow_new_target = !cf.is_program and !cf.is_arrow;
-                break;
+            // takes that from its calling context — but "function code around
+            // it" is LEXICAL, not the dynamic call stack: an arrow function's
+            // `new.target` is inherited from wherever it was DEFINED, not from
+            // whoever happens to call it (`assertNewTarget` may return an arrow
+            // that gets invoked from a completely different call site and must
+            // still report the new.target active when the arrow was created —
+            // staging/sm/class/newTargetArrow.js/newTargetEval.js). Every
+            // non-arrow function's call env binds `__new_target__` (defaulting
+            // to undefined), so walking the caller's lexical env chain for an
+            // OWN binding of that name (never recursing past it, unlike
+            // `Environment.lookup`) is the right test — EXCEPT the global env
+            // itself also carries an unconditional `__new_target__ = undefined`
+            // fallback (realm.zig, so an ordinary non-construct call observes
+            // `undefined` instead of a ReferenceError), which is not a function
+            // context at all. Stop the walk there rather than including it.
+            var nt_env: ?*Environment = outer_env;
+            while (nt_env) |e| {
+                if (e == self.realm.global_env) break;
+                if (e.bindings.contains("__new_target__")) {
+                    p.eval_allow_new_target = true;
+                    break;
+                }
+                nt_env = e.parent;
             }
         }
         const parse_result = p.parseScript();
@@ -2324,12 +2334,10 @@ pub const BcVm = struct {
         if (obj.internal_kind == .proxy) {
             return try self.proxySet(obj_val, obj, sym_key, value, obj_val);
         }
-        // M16: Module Namespace exotic [[Set]] always fails.
-        if (obj.internal_kind == .module_namespace) {
-            const realm_m = @import("../runtime/realm.zig");
-            realm_m.pending_exception = try self.makeErrorObjectBc("TypeError", "Cannot set property on module namespace object");
-            return error.JsException;
-        }
+        // M16: Module Namespace exotic [[Set]] always fails (the strict
+        // module caller turns the false return into a TypeError) — mirrors
+        // the string-key path in setPropR, which never throws here itself.
+        if (obj.internal_kind == .module_namespace) return false;
         // OrdinarySet: walk the prototype chain for a symbol-keyed accessor. An
         // accessor (own or inherited) routes the write through its setter; an own
         // data property (or none) is created/overwritten directly on the receiver.
@@ -4538,6 +4546,15 @@ pub const BcVm = struct {
     /// a BcGeneratorState registered for GC scanning. The frame starts at pc 0.
     fn buildGenState(self: *BcVm, fn_ptr: *const BcFunction, def_env: *Environment, this_val: Value, args: []const Value, callee: ?*BcClosure) !*BcGeneratorState {
         const call_env = try Environment.initVarScope(self.arena, def_env);
+        // Generator/async functions are never constructible (no [[Construct]]
+        // slot), so `new.target` inside one is always undefined — but the
+        // binding still needs to EXIST here (matching the ordinary-call path's
+        // `call_env.define("__new_target__", ...)`), both so `new.target` reads
+        // don't fall through to the outer scope's, and so a direct eval called
+        // from inside a generator can find an own `__new_target__` in its
+        // caller's env chain and correctly permit `new.target` in the eval'd
+        // code (staging/sm/class/newTargetGenerators.js).
+        try call_env.define("__new_target__", try val_mod.makeUndefined(self.arena));
         for (fn_ptr.param_names, 0..) |pname, i| {
             const av: Value = if (i < args.len) args[i] else try val_mod.makeUndefined(self.arena);
             try call_env.define(pname, av);

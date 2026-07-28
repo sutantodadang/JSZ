@@ -16,3 +16,4 @@ jit-native/target/
 .hermes/
 .claude/.test262_shards/
 .test262_shards/
+scratch262/
