@@ -1385,16 +1385,26 @@ const PatternParser = struct {
                         cc.addCpRange(self.alloc, lo, lo) catch return ParseError.OutOfMemory;
                     }
                 }
-            } else if (self.unicode and ch >= 0x80) {
-                // Non-ASCII codepoint start in unicode mode -- decode the full
-                // codepoint. Use `decodeCpAt` (not `decodeUtf8At`) so a WTF-8
-                // surrogate *pair* — how `new RegExp("[𝌆]","u")` stores
-                // an astral character read from a string argument — folds into the
-                // single astral code point `/u` mode must see, exactly as a 4-byte
-                // literal already does.
-                const dc = decodeCpAt(self.src, self.pos);
-                self.pos += dc.len;
-                const start_cp = dc.cp;
+            } else if (ch >= 0x80) {
+                // Non-ASCII codepoint start -- decode the full codepoint and store
+                // it as a code point, mirroring how `consumeClass` decodes the
+                // subject in *both* modes. Under /u, `decodeCpAt` folds a WTF-8
+                // surrogate *pair* — how `new RegExp("[𝌆]","u")` stores an astral
+                // character read from a string argument — into the single astral
+                // code point `/u` mode must see. In non-/u (code-unit) mode a
+                // multibyte member such as an Arabic-Indic digit (`[٠-٩]`) must be
+                // added as its code point too, else `[٠١…]` — with each member
+                // formerly split into raw bytes — would never match the decoded
+                // code point the matcher tests.
+                const start_cp: u21 = if (self.unicode) blk: {
+                    const d = decodeCpAt(self.src, self.pos);
+                    self.pos += d.len;
+                    break :blk d.cp;
+                } else blk: {
+                    const d = decodeUtf8At(self.src, self.pos);
+                    self.pos += d.len;
+                    break :blk d.cp;
+                };
                 if (!self.eof() and self.cur() == '-' and
                     self.pos + 1 <= self.src.len and
                     (self.pos >= self.src.len or self.src[self.pos] != ']'))
@@ -1405,8 +1415,12 @@ const PatternParser = struct {
                         if (self.eof()) return ParseError.InvalidPattern;
                         const ep = try self.parseUEscapeOrByte();
                         break :blk ep;
-                    } else blk: {
+                    } else if (self.unicode) blk: {
                         const edc = decodeCpAt(self.src, self.pos);
+                        self.pos += edc.len;
+                        break :blk edc.cp;
+                    } else blk: {
+                        const edc = decodeUtf8At(self.src, self.pos);
                         self.pos += edc.len;
                         break :blk edc.cp;
                     };

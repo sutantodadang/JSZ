@@ -3091,9 +3091,12 @@ pub const FnCompiler = struct {
             }
         }
 
-        // `eval(...args)` is still a *direct* eval — the spread form does not
-        // change the syntactic callee. Mark it just like the fixed-arity path
-        // (see compileCall) so the eval'd code sees this scope.
+        // `eval(...args)` is still a *direct* eval: the callee is the bare
+        // identifier `eval` (§13.3.6.1 keys off the CallExpression's syntactic
+        // shape, not its argument list). Mark it exactly as the static-args path
+        // (see compileCall), including the param/field-eval markers, so the
+        // eval'd code sees this scope. Emitted after the args array so an
+        // argument's own call cannot consume the flag first.
         if (!c.optional and c.callee.kind == .identifier and
             std.mem.eql(u8, c.callee.data.identifier, "eval"))
         {

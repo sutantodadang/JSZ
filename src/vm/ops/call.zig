@@ -379,7 +379,9 @@ pub inline fn opCallSpread(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // Consume the one-shot direct-eval markers just as doCall does, so
     // `eval(...args)` runs as a *direct* eval (seeing the caller's scope)
     // rather than indirectly in global scope. The marker only takes effect
-    // when the callee genuinely is %eval% (§13.3.6.1 step 6).
+    // when the callee genuinely is %eval% (§13.3.6.1 step 6). bcEval reads
+    // self.direct_eval_call and runs in the current (caller) frame's scope,
+    // which is still on top of the stack across this native invokeCallback.
     const realm = @import("../../runtime/realm.zig");
     const prev_direct_eval = self.direct_eval_call;
     const prev_param_eval = self.param_eval_call;
