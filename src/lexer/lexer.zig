@@ -429,6 +429,31 @@ pub const Lexer = struct {
 
         // Decimal/octal
         try self.scanDigits(isDecDigit);
+        // Annex B.1.1 LegacyOctalIntegerLiteral: in non-strict code an integer
+        // with a leading `0` followed only by octal digits (no 8/9, no `.`, `e`,
+        // or `n`) is valued in base 8 — `070` === 56. A leading `0` followed by
+        // an 8/9 (`08`) is instead a NonOctalDecimalIntegerLiteral and keeps its
+        // decimal value (handled by the fall-through below). Strict-mode rejection
+        // of the leading-0 form is an early error raised by the parser.
+        if (self.source[start] == '0' and self.pos - start >= 2) {
+            const digits = self.source[start..self.pos];
+            var all_octal = true;
+            for (digits) |d| {
+                if (d < '0' or d > '7') {
+                    all_octal = false;
+                    break;
+                }
+            }
+            const after: u8 = if (self.pos < self.source.len) self.source[self.pos] else 0;
+            if (all_octal and after != '.' and after != 'e' and after != 'E' and after != 'n') {
+                const oct_val = std.fmt.parseUnsigned(u64, digits, 8) catch return LexError.InvalidNumericLiteral;
+                var t = Token.initSimple(.number, @intCast(start), @intCast(self.pos), self.line, start_col, lt_before);
+                t.value_num = @floatFromInt(oct_val);
+                t.value_str = digits;
+                self.prev_kind = .number;
+                return t;
+            }
+        }
         // BigInt decimal literal: 123n (integer only, no fraction/exponent).
         // A leading-dot number (e.g. `.5n`) already consumed its `.` in the
         // dispatcher, so `source[start] == '.'` means it is a fraction and the
