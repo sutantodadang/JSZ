@@ -93,7 +93,9 @@ pub fn isValidDuration(d: DurationFields) bool {
     for (times, scales) |f, scale| {
         const mag = @abs(f);
         if (mag >= 1.0e30) return false; // 10^30 ns ≫ 2^53 s on its own
-        total_ns += @as(i256, @intFromFloat(mag)) * scale;
+        // f64 -> i256 fptosi has no libcall on aarch64 (LLVM "Unsupported
+        // library call operation"); mag < 1e30 fits i128, widen after.
+        total_ns += @as(i256, @as(i128, @intFromFloat(mag))) * scale;
         if (total_ns >= limit_ns) return false;
     }
     return true;
