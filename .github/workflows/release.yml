@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig 0.15.2
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Cross-compile all targets
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          # musl on Linux -> fully static binaries with no libc dependency.
+          targets=(
+            x86_64-linux-musl
+            aarch64-linux-musl
+            x86_64-macos
+            aarch64-macos
+            x86_64-windows
+            aarch64-windows
+          )
+          for t in "${targets[@]}"; do
+            echo "::group::build $t"
+            rm -rf zig-out
+            zig build -Doptimize=ReleaseSafe -Dtarget="$t"
+            case "$t" in
+              *windows*)
+                zip -qj "dist/jsz-${VERSION}-${t}.zip" zig-out/bin/jsz.exe
+                ;;
+              *)
+                tar -czf "dist/jsz-${VERSION}-${t}.tar.gz" -C zig-out/bin jsz
+                ;;
+            esac
+            echo "::endgroup::"
+          done
+          (cd dist && sha256sum ./* > SHA256SUMS.txt)
+          ls -la dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "jsz $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*
