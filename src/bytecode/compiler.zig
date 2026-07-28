@@ -3091,6 +3091,21 @@ pub const FnCompiler = struct {
             }
         }
 
+        // `eval(...args)` is still a *direct* eval — the spread form does not
+        // change the syntactic callee. Mark it just like the fixed-arity path
+        // (see compileCall) so the eval'd code sees this scope.
+        if (!c.optional and c.callee.kind == .identifier and
+            std.mem.eql(u8, c.callee.data.identifier, "eval"))
+        {
+            try self.emitOp(.MARK_DIRECT_EVAL, line);
+            if (self.in_param_default and (!self.is_arrow or self.paramListBindsArguments()))
+                try self.emitOp(.MARK_PARAM_EVAL, line);
+            if (c.field_init_eval)
+                try self.emitOp(.MARK_FIELD_EVAL, line);
+            self.saw_dynamic_scope = true;
+            self.saw_arguments = true;
+        }
+
         try self.emitOp(.CALL_SPREAD, line);
         try self.emitU8(rcallee);
         try self.emitU8(rthis);
