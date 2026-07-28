@@ -709,13 +709,13 @@ pub fn nativeAt(arena: std.mem.Allocator, this_val: Value, args: []const Value) 
 
 /// ES2022 Array.prototype.findLast — like find, scans from the end.
 pub fn nativeFindLast(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    try requireCoercible(arena, this_val);
-    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    try requireCallable(arena, cb);
-    const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    // Spec order: ToObject(this) → LengthOfArrayLike → IsCallable(predicate).
     const O = try toObject(arena, this_val);
     try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
+    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    try requireCallable(arena, cb);
+    const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
     if (len == 0) return val_mod.makeUndefined(arena);
     var i: usize = len;
     while (i > 0) {
@@ -729,13 +729,13 @@ pub fn nativeFindLast(arena: std.mem.Allocator, this_val: Value, args: []const V
 
 /// ES2022 Array.prototype.findLastIndex — like findIndex, scans from the end.
 pub fn nativeFindLastIndex(arena: std.mem.Allocator, this_val: Value, args: []const Value) anyerror!Value {
-    try requireCoercible(arena, this_val);
-    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
-    try requireCallable(arena, cb);
-    const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
+    // Spec order: ToObject(this) → LengthOfArrayLike → IsCallable(predicate).
     const O = try toObject(arena, this_val);
     try typed_array_mod.validateReceiver(arena, this_val);
     const len = try genLength(arena, this_val);
+    const cb = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
+    try requireCallable(arena, cb);
+    const cb_this = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
     if (len == 0) return val_mod.makeNumber(arena, -1.0);
     var i: usize = len;
     while (i > 0) {
@@ -1096,8 +1096,9 @@ pub fn nativeReverse(arena: std.mem.Allocator, this_val: Value, _: []const Value
             try genSet(arena, O, lower, uv);
             try genDelete(arena, O, upper);
         } else if (lower_exists) {
-            try genSet(arena, O, upper, lv);
+            // Spec §23.1.3.26 step j: Delete lowerP first, then Set upperP.
             try genDelete(arena, O, lower);
+            try genSet(arena, O, upper, lv);
         }
     }
     return O;
