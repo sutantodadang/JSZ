@@ -376,11 +376,65 @@ pub fn parseAssignmentExpr(p: *Parser) ?*Node {
     return p.parseAssignmentExprCore(false);
 }
 
+/// `YieldExpression` (ES §14.4): `yield`, `yield AssignmentExpression`, or
+/// `yield * AssignmentExpression`. This is a direct alternative of
+/// AssignmentExpression, NOT reachable through ConditionalExpression/binary-
+/// operand parsing — called only from `parseAssignmentExprCore`'s lookahead,
+/// before it descends into `parseConditionalExpr`. Keeping it out of
+/// `parsePrimaryExpr`'s leaf dispatch means a nested `3 + yield 4` (yield as a
+/// `+` operand) fails to parse instead of silently becoming a second,
+/// illegally-placed YieldExpression — see the `.kw_yield` arm there.
+fn parseYieldExpr(p: *Parser) ?*Node {
+    const start = p.current.start;
+    _ = p.advance();
+    // `yield * AssignmentExpression` requires the `*` on the SAME line as
+    // `yield` (ES §14.4: "yield [no LineTerminator here] *"). A newline
+    // before `*` means this is a plain arg-less `yield` instead — ASI then
+    // ends the statement there, and a bare `*` cannot start the next one
+    // (e.g. `yield\n* foo` is a SyntaxError, unlike `yield *\nfoo`).
+    if (!p.current.line_terminator_before and p.match(.star)) {
+        const delegated = p.parseAssignmentExpr() orelse {
+            if (!p.had_error) {
+                p.had_error = true;
+                p.error_info = parser_file.ParseError{
+                    .message = "expected expression after yield*",
+                    .line = p.current.line,
+                    .column = p.current.column,
+                };
+            }
+            return null;
+        };
+        const helper = p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__yield_star__" }) orelse return null;
+        var args = std.ArrayList(*Node){};
+        args.append(p.arena, delegated) catch return null;
+        return p.makeNode(.call_expr, start, p.current.start, .{
+            .call_expr = .{ .callee = helper, .args = args.items },
+        });
+    }
+    // YieldExpression arg is optional: present only when the next token can
+    // begin an AssignmentExpression. Closers/separators that cannot (`)`, `]`,
+    // `,`, `:`, `;`, `}`, EOF, or a line terminator) → arg-less yield.
+    const can_have_arg = !(p.current.line_terminator_before or p.check(.semicolon) or
+        p.check(.right_brace) or p.check(.right_paren) or p.check(.right_bracket) or
+        p.check(.comma) or p.check(.colon) or p.check(.eof));
+    const yielded = if (can_have_arg) p.parseAssignmentExpr() orelse return null else null;
+    return p.makeNode(.yield_expr, start, p.current.start, .{ .yield_expr = yielded });
+}
+
 pub fn parseAssignmentExprCore(p: *Parser, is_async_arrow: bool) ?*Node {
     const start = p.current.start;
     // Source span for an async arrow begins at the caller-consumed `async`.
     const src_start = if (is_async_arrow and p.async_kw_start != 0) p.async_kw_start else start;
     p.async_kw_start = 0;
+    // `YieldExpression` is a direct AssignmentExpression alternative (ES
+    // §14.4) — recognize a bare `yield` HERE, before ever descending into
+    // ConditionalExpression/binary-operand parsing, so it can only start a
+    // *whole* AssignmentExpression, never appear as a binary operand or a
+    // conditional's (unparenthesized) test. See `parseYieldExpr` and the
+    // `.kw_yield` arm in `parsePrimaryExpr`.
+    if (p.in_generator_function and p.check(.kw_yield)) {
+        return parseYieldExpr(p);
+    }
     // Conditional has higher precedence than assignment.
     const left = p.parseConditionalExpr() orelse return null;
     // ES2015 arrow function: params => body
@@ -1950,34 +2004,28 @@ pub fn parsePrimaryExpr(p: *Parser) ?*Node {
                 }
                 return null;
             }
-            _ = p.advance();
-            if (p.match(.star)) {
-                const delegated = p.parseAssignmentExpr() orelse {
-                    if (!p.had_error) {
-                        p.had_error = true;
-                        p.error_info = parser_file.ParseError{
-                            .message = "expected expression after yield*",
-                            .line = p.current.line,
-                            .column = p.current.column,
-                        };
-                    }
-                    return null;
+            // A generator's `yield` reaching the *primary*-expression leaf
+            // parser means it was found where a UnaryExpression is required —
+            // a binary operator's operand, `**`'s base, a conditional's
+            // (unparenthesized) test, etc. `YieldExpression` is a direct
+            // AssignmentExpression alternative (ES §14.4), handled ONLY by
+            // `parseAssignmentExprCore`'s own lookahead before it ever
+            // descends into `parseConditionalExpr`/`parseBinaryExpr` — so a
+            // bare `yield` cannot legally appear here (e.g. `yield 3 + yield
+            // 4`, i.e. `yield (3 + yield 4)`, is a SyntaxError: the second
+            // `yield` is `+`'s right operand). A *parenthesized* `(yield)` is
+            // fine — it re-enters via the primary expression's own
+            // parseAssignmentExpr call for the parenthesized contents, never
+            // reaching this arm as an operand.
+            if (!p.had_error) {
+                p.had_error = true;
+                p.error_info = parser_file.ParseError{
+                    .message = "yield expression not allowed here",
+                    .line = p.current.line,
+                    .column = p.current.column,
                 };
-                const helper = p.makeNode(.identifier, start, p.current.start, .{ .identifier = "__yield_star__" }) orelse return null;
-                var args = std.ArrayList(*Node){};
-                args.append(p.arena, delegated) catch return null;
-                return p.makeNode(.call_expr, start, p.current.start, .{
-                    .call_expr = .{ .callee = helper, .args = args.items },
-                });
             }
-            // YieldExpression arg is optional: present only when the next token can
-            // begin an AssignmentExpression. Closers/separators that cannot (`)`, `]`,
-            // `,`, `:`, `;`, `}`, EOF, or a line terminator) → arg-less yield.
-            const can_have_arg = !(p.current.line_terminator_before or p.check(.semicolon) or
-                p.check(.right_brace) or p.check(.right_paren) or p.check(.right_bracket) or
-                p.check(.comma) or p.check(.colon) or p.check(.eof));
-            const yielded = if (can_have_arg) p.parseAssignmentExpr() orelse return null else null;
-            return p.makeNode(.yield_expr, start, p.current.start, .{ .yield_expr = yielded });
+            return null;
         },
         .kw_of => {
             // `of` is a contextual keyword (only special in `for…of`); it is a

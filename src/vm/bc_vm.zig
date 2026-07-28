@@ -754,7 +754,21 @@ pub const BcVm = struct {
                         // that ctors reading a method off `this` via [[Get]] (Map's `set`
                         // / Set's `add` adder) observe the subclass override. When the
                         // ctor defers proto (TypedArray) it re-applies below — harmless.
-                        if (try self.protoFromNewTarget(new_target, ctor, default_proto)) |po| default_proto = po;
+                        //
+                        // EXCEPT the dynamic Function/GeneratorFunction/AsyncFunction/
+                        // AsyncGeneratorFunction constructors: CreateDynamicFunction parses
+                        // the assembled source (steps ~5-17) BEFORE GetPrototypeFromConstructor
+                        // (step 18). Reading `newTarget.prototype` here, ahead of the call,
+                        // would run a `prototype` getter before a bad parameter/body list's
+                        // SyntaxError — observable via
+                        // `Reflect.construct(Function, ["@error"], newTargetWithGetter)`.
+                        // `functionCtorImpl` already derives the real prototype itself, in
+                        // the correct order, once parsing has succeeded — so skip the eager
+                        // read here and let that (or the "didn't consume" fallback below,
+                        // which stays inert once it does) apply it instead.
+                        if (!realm_m.isDynamicFunctionCtor(cv.toPtr().native_function.call)) {
+                            if (try self.protoFromNewTarget(new_target, ctor, default_proto)) |po| default_proto = po;
+                        }
                         const new_obj = if (self.heap) |heap|
                             try JsObject.createOnHeap(heap, default_proto)
                         else
@@ -982,12 +996,31 @@ pub const BcVm = struct {
         // SuperProperty is legal inside a direct eval whose calling context has a
         // [[HomeObject]]. JSZ's class desugar marks exactly those contexts —
         // methods, derived constructors and field initializers — by binding
-        // `__sproto__` (the parent prototype), which the eval inherits through
-        // the caller's chain, so its presence is the home-object test.
+        // `__sproto__` (the parent prototype). An *arrow* function has no
+        // [[HomeObject]] of its own and is transparent to this lookup (it
+        // inherits the enclosing one, so `eval` inside an arrow inside a
+        // method must still see `__sproto__` — staging/sm/class/
+        // superPropEvalInsideArrow.js). An *ordinary* (non-arrow) function
+        // DOES have its own [[HomeObject]] slot (undefined unless it's itself
+        // a method) that is NOT inherited from its lexical parent — so the
+        // walk must stop the instant it crosses into one, even though a plain
+        // `Environment.lookup` would happily keep walking outward through it
+        // (staging/sm/class/superPropEvalInsideNested.js: `eval` inside a
+        // plain function nested in a method must NOT see the method's
+        // `__sproto__`). Every non-arrow function call binds its own
+        // `__new_target__` (arrows don't — see the new.target walk just
+        // below); reuse that as the "crossed a real function boundary" test.
         if (direct) {
-            if (outer_env.lookup("__sproto__")) |_| {
-                p.eval_allow_super_prop = true;
-            } else |_| {}
+            var se: ?*Environment = outer_env;
+            while (se) |e| {
+                if (e.bindings.contains("__sproto__")) {
+                    p.eval_allow_super_prop = true;
+                    break;
+                }
+                if (e.bindings.contains("__new_target__")) break;
+                if (e == self.realm.global_env) break;
+                se = e.parent;
+            }
             // §13.3.12.1: `new.target` needs function code around it. Eval code
             // takes that from its calling context — but "function code around
             // it" is LEXICAL, not the dynamic call stack: an arrow function's
