@@ -3887,12 +3887,18 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
     const last_index = try realm_mod.toLengthValue(arena, li_raw);
 
     const use_li = cr.flags.global or cr.flags.sticky;
+    // `lastIndex` lives in UTF-16 code-unit space (observable to JS), while the
+    // matcher scans WTF-8 `s` in byte space. Convert on the way in and back out;
+    // for an all-ASCII subject the two spaces coincide, so skip the O(n) walks.
+    const s_ascii = isByteAscii(s);
     // Step 8: if neither global nor sticky, the search starts at 0.
-    const from: usize = if (use_li) last_index else 0;
+    const from: usize = if (!use_li) 0 else if (s_ascii) last_index else string_proto.cuByteOf(s, last_index);
 
-    // An out-of-bounds lastIndex fails immediately (and resets when g/y).
-    if (from > s.len) {
-        if (use_li) try setLastIndexThrow(arena, this_val, 0);
+    // An out-of-bounds lastIndex fails immediately (and resets when g/y). The
+    // bound is the code-unit length; cuByteOf clamps into range, so guard here.
+    const cu_len = if (s_ascii) s.len else string_proto.cuLen(s);
+    if (use_li and last_index > cu_len) {
+        try setLastIndexThrow(arena, this_val, 0);
         return val_mod.makeNull(arena);
     }
 
@@ -3901,7 +3907,7 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
         return val_mod.makeNull(arena);
     };
 
-    if (use_li) try setLastIndexThrow(arena, this_val, result.state.pos);
+    if (use_li) try setLastIndexThrow(arena, this_val, if (s_ascii) result.state.pos else string_proto.cuIndexOfByte(s, result.state.pos));
 
     const arr_proto = realm_mod.active_array_proto;
     const arr = try JsObject.createArray(arena, arr_proto);
@@ -4209,13 +4215,28 @@ fn regExpExec(arena: std.mem.Allocator, R: Value, s_val: Value) !Value {
     return nativeRegExpExec(arena, R, &[_]Value{s_val});
 }
 
-/// AdvanceStringIndex(S, index, unicode) approximated over UTF-8 bytes.
+/// True when every byte is < 0x80, i.e. UTF-16 code-unit indices and WTF-8 byte
+/// offsets coincide — the hot path for `lastIndex` bookkeeping in exec.
+fn isByteAscii(s: []const u8) bool {
+    for (s) |b| {
+        if (b >= 0x80) return false;
+    }
+    return true;
+}
+
+/// AdvanceStringIndex(S, index, unicode) (§22.2.7.3) over UTF-16 code units.
+/// `index` and the result are code-unit offsets (the same space `lastIndex`
+/// lives in); S is stored as WTF-8. Only a lead+trail surrogate pair advances
+/// by two — a lone surrogate or a non-astral unit advances by one.
 fn advanceStringIndex(s: []const u8, index: usize, unicode: bool) usize {
-    if (!unicode or index >= s.len) return index + 1;
-    // decodeCpAt folds a WTF-8 surrogate pair into one code point, so an astral
-    // char advances past both halves regardless of which storage form it uses.
-    const dc = decodeCpAt(s, index);
-    return index + if (dc.len == 0) 1 else dc.len;
+    if (!unicode) return index + 1;
+    const len = string_proto.cuLen(s);
+    if (index + 1 >= len) return index + 1;
+    const first = string_proto.cuUnitAt(s, index) orelse return index + 1;
+    if (first < 0xD800 or first > 0xDBFF) return index + 1;
+    const second = string_proto.cuUnitAt(s, index + 1) orelse return index + 1;
+    if (second < 0xDC00 or second > 0xDFFF) return index + 1;
+    return index + 2;
 }
 
 fn requireObject(arena: std.mem.Allocator, v: Value, comptime what: []const u8) !void {
@@ -4524,10 +4545,13 @@ pub fn nativeRegExpSymbolSplit(arena: std.mem.Allocator, this_val: Value, args: 
         return val_mod.makeObject(arena, arr);
     }
 
+    // p, q and e are all UTF-16 code-unit offsets (§22.2.6.14); s_str is WTF-8,
+    // so slicing converts code-unit bounds to byte offsets via cuByteOf.
+    const s_size = string_proto.cuLen(s_str);
     var out_n: u32 = 0;
     var p: usize = 0; // start of current segment
     var q: usize = 0; // scan position
-    while (q < s_str.len) {
+    while (q < s_size) {
         try ctxSetPropThrow(arena, splitter, "lastIndex", try val_mod.makeNumber(arena, @floatFromInt(q)));
         const z = try regExpExec(arena, splitter, s_val);
         if (z.bits == 0 or z.unbox() == .null_) {
@@ -4535,14 +4559,14 @@ pub fn nativeRegExpSymbolSplit(arena: std.mem.Allocator, this_val: Value, args: 
             continue;
         }
         var e = try toLengthArg(arena, try ctxGetProp(arena, splitter, "lastIndex"));
-        if (e > s_str.len) e = s_str.len;
+        if (e > s_size) e = s_size;
         if (e == p) {
             q = advanceStringIndex(s_str, q, unicode);
             continue;
         }
         // Segment [p, q).
         const key = try std.fmt.allocPrint(arena, "{d}", .{out_n});
-        try arr.set(key, try val_mod.makeString(arena, s_str[p..q]));
+        try arr.set(key, try val_mod.makeString(arena, s_str[string_proto.cuByteOf(s_str, p)..string_proto.cuByteOf(s_str, q)]));
         out_n += 1;
         if (out_n >= lim) {
             arr.array_length = out_n;
@@ -4568,7 +4592,7 @@ pub fn nativeRegExpSymbolSplit(arena: std.mem.Allocator, this_val: Value, args: 
     }
     // Final segment [p, end).
     const key = try std.fmt.allocPrint(arena, "{d}", .{out_n});
-    try arr.set(key, try val_mod.makeString(arena, s_str[p..]));
+    try arr.set(key, try val_mod.makeString(arena, s_str[string_proto.cuByteOf(s_str, p)..]));
     out_n += 1;
     arr.array_length = out_n;
     return val_mod.makeObject(arena, arr);

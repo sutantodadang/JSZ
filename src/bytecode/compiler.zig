@@ -996,9 +996,18 @@ pub const FnCompiler = struct {
                     // property and yield a boolean result.
                     const me = operand.data.member_expr;
                     // `delete super.x` / `delete super[e]` is always a ReferenceError
-                    // (IsSuperReference). Thrown WITHOUT evaluating the base or the
-                    // key expression (ES: ToPropertyKey/this-binding never reached).
+                    // (IsSuperReference, §13.5.1.2). But evaluating the operand
+                    // `super[e]` first FORMS a Super Reference (§13.3.7.1): a
+                    // computed key expression and its ToPropertyKey coercion run —
+                    // and are observable — BEFORE `delete` sees the Super Reference
+                    // and throws. So evaluate the key for its side effects here.
                     if (me.object.kind == .identifier and std.mem.eql(u8, me.object.data.identifier, "super")) {
+                        if (me.computed) {
+                            const rkey = try self.compileExpr(me.property);
+                            try self.emitOp(.TO_PROPERTY_KEY, line);
+                            try self.emitU8(rkey);
+                            self.sp = rkey; // discard the coerced key
+                        }
                         return try self.emitThrowError("ReferenceError", "Unsupported reference to 'super'", line);
                     }
                     const robj = try self.compileExpr(me.object);
