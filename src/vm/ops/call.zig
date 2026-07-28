@@ -376,17 +376,25 @@ pub inline fn opCallSpread(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
             try args_list.append(self.arena, ev);
         }
     }
-    // Consume the one-shot direct-eval marker exactly as doCall does: `eval(...xs)`
-    // is a direct eval only when the callee genuinely *is* %eval%. bcEval reads
-    // self.direct_eval_call and runs in the current (caller) frame's scope, which
-    // is still on top of the stack across this native invokeCallback.
-    const realm_mod = @import("../../runtime/realm.zig");
+    // Consume the one-shot direct-eval markers just as doCall does, so
+    // `eval(...args)` runs as a *direct* eval (seeing the caller's scope)
+    // rather than indirectly in global scope. The marker only takes effect
+    // when the callee genuinely is %eval% (§13.3.6.1 step 6). bcEval reads
+    // self.direct_eval_call and runs in the current (caller) frame's scope,
+    // which is still on top of the stack across this native invokeCallback.
+    const realm = @import("../../runtime/realm.zig");
     const prev_direct_eval = self.direct_eval_call;
-    self.direct_eval_call = self.direct_eval_mark and realm_mod.isEvalIntrinsic(callee_v);
+    const prev_param_eval = self.param_eval_call;
+    const prev_field_eval = self.field_eval_call;
+    self.direct_eval_call = self.direct_eval_mark and realm.isEvalIntrinsic(callee_v);
+    self.param_eval_call = self.direct_eval_call and self.param_eval_mark;
+    self.field_eval_call = self.direct_eval_call and self.field_eval_mark;
     self.direct_eval_mark = false;
     self.param_eval_mark = false;
     self.field_eval_mark = false;
     defer self.direct_eval_call = prev_direct_eval;
+    defer self.param_eval_call = prev_param_eval;
+    defer self.field_eval_call = prev_field_eval;
 
     const fp = @import("../../runtime/builtins/function_proto.zig");
     const result = fp.invokeCallback(self.arena, this_v, callee_v, args_list.items) catch |e| {

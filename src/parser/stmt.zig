@@ -591,6 +591,13 @@ pub fn atLetDecl(p: *Parser) bool {
     if (p.current.kind != .identifier or !std.mem.eql(u8, p.current.value_str, "let")) return false;
     return switch (p.peekNext().kind) {
         .identifier, .left_bracket, .left_brace => true,
+        // `let yield = …` binds `yield` in sloppy non-generator code (a
+        // BindingIdentifier tokenized as the contextual keyword `yield`, which
+        // parseVarDeclarator accepts). Without this `let` is misread as an
+        // identifier expression. Strict/generator rejection happens downstream.
+        // `of` is deliberately excluded — `for (let of x)` is a for-of whose
+        // loop target is the identifier `let`, not a `let of` declaration.
+        .kw_yield => !p.strict and !p.in_generator_function,
         else => false,
     };
 }

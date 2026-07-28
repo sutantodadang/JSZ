@@ -1520,29 +1520,37 @@ const PatternParser = struct {
         if (self.eof()) return ParseError.InvalidPattern;
         const c = self.cur();
         self.advance();
-        // Backreferences \1..\N (DecimalEscape is maximal-munch: `\10` names
-        // group 10 when ten groups exist).
+        // Backreferences \1..\N (DecimalEscape greedily consumes all decimal
+        // digits, so `\10` references group 10, not `\1` followed by "0").
         if (c >= '1' and c <= '9') {
-            const after_first = self.pos; // cursor just past the first digit
-            var n: u32 = c - '0';
-            while (!self.eof() and self.cur() >= '0' and self.cur() <= '9') {
-                if (n < 100_000_000) n = n * 10 + (self.cur() - '0');
-                self.advance();
+            const idx: u8 = c - '0';
+            // Peek the full decimal number without committing: the extra digits
+            // are only consumed if the result is a valid backreference.
+            var n: u32 = idx;
+            var extra: usize = 0;
+            while (self.pos + extra < self.src.len and
+                self.src[self.pos + extra] >= '0' and self.src[self.pos + extra] <= '9')
+            {
+                n = @min(n * 10 + (self.src[self.pos + extra] - '0'), MAX_CAPTURES + 1);
+                extra += 1;
             }
             // Under /u a DecimalEscape is always a backreference, so naming a
             // group that does not exist is an early error.
             if (self.unicode) {
                 if (n > self.total_caps) return ParseError.InvalidPattern;
+                self.pos += extra;
                 return RegexNode{ .back_ref = @intCast(n) };
             }
             // Annex B: a DecimalEscape referring to an existing capture group is a
-            // backreference. Otherwise it is not one: rewind and reinterpret from
-            // the first digit as a LegacyOctalEscapeSequence (\1-\7) or, for
-            // \8/\9, an IdentityEscape (the literal digit).
-            if (n <= self.total_caps) return RegexNode{ .back_ref = @intCast(n) };
-            self.pos = after_first;
+            // backreference (consuming every digit); otherwise it is not a
+            // backreference and only the first digit stands: \1-\7 are
+            // LegacyOctalEscapeSequences and \8/\9 are IdentityEscapes.
+            if (n <= self.total_caps) {
+                self.pos += extra;
+                return RegexNode{ .back_ref = @intCast(n) };
+            }
             if (c == '8' or c == '9') return RegexNode{ .literal = @as(u21, c) };
-            return self.cpLiteralNode(self.readLegacyOctalRest(@as(u21, c) - '0'));
+            return self.cpLiteralNode(self.readLegacyOctalRest(idx));
         }
         // Named backreference \k<name> (only meaningful when the pattern has
         // named groups; otherwise `\k` is a literal 'k' in non-unicode mode).
@@ -2171,7 +2179,10 @@ pub fn compileRegex(alloc: std.mem.Allocator, pattern: []const u8, flags_str: []
     // would otherwise bake in a pointer to this function's stack slot.
     const root_ptr = try alloc.create(RegexNode);
     root_ptr.* = root;
-    const prog = if (!br and !hasModifier(&root) and !ns2b) buildProgram(alloc, root_ptr, pp.next_cap - 1) else null;
+    const prog = if (!br and !hasModifier(&root) and !ns2b and !hasCapturingLookBehind(&root))
+        buildProgram(alloc, root_ptr, pp.next_cap - 1)
+    else
+        null;
 
     return CompiledRegex{
         .root = root,
@@ -2413,7 +2424,15 @@ pub fn matchAt(
         return cr.pike_vm.?.runAnchored(input, start, &regex.flags);
     }
     var caps = [_]CaptureSpan{INVALID_CAP} ** MAX_CAPTURES;
-    const end_pos = matchNode(&regex.root, input, start, &caps, &regex.flags) orelse return null;
+    // `match_step2b` stays set for the legacy `matchNode` path that lookbehind
+    // sub-matches still use; the CPS engine implements the zero-width guard
+    // directly in its RepeatMatcher continuation.
+    match_step2b = regex.needs_step2b;
+    const end_pos = matchN(&regex.root, input, start, &caps, &regex.flags, null) orelse {
+        match_step2b = false;
+        return null;
+    };
+    match_step2b = false;
     return MatchState{ .pos = end_pos, .captures = caps };
 }
 
@@ -2457,6 +2476,11 @@ pub fn findMatch(
         return null;
     }
     return matchAnywhere(regex, input, from);
+}
+
+fn isWordChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_';
 }
 
 fn isLineTerminator(c: u8) bool {
@@ -2586,6 +2610,118 @@ fn consumeDot(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) 
     }
 }
 
+/// Decode the code point/unit ending at `pos`, moving backward (used by the
+/// reverse matcher for lookbehind). Returns the decoded value and the byte
+/// offset where it starts. Mirrors `decodeCpAt`/`decodeUtf8At` but backward,
+/// including WTF-8 surrogate-pair combining under `/u`.
+fn decodeUnitBefore(input: []const u8, pos: usize, cp_mode: bool) ?struct { cp: u21, start: usize } {
+    if (pos == 0) return null;
+    var s = pos - 1;
+    while (s > 0 and (input[s] & 0xC0) == 0x80) s -= 1;
+    const dec = decodeUtf8At(input, s);
+    // Malformed or the sequence does not line up with `pos`: consume one byte.
+    if (s + dec.len != pos) return .{ .cp = input[pos - 1], .start = pos - 1 };
+    if (cp_mode) {
+        // Combine an astral surrogate pair encoded as two WTF-8 surrogates.
+        if (dec.cp >= 0xDC00 and dec.cp <= 0xDFFF and s > 0) {
+            var s2 = s - 1;
+            while (s2 > 0 and (input[s2] & 0xC0) == 0x80) s2 -= 1;
+            const dec2 = decodeUtf8At(input, s2);
+            if (s2 + dec2.len == s and dec2.cp >= 0xD800 and dec2.cp <= 0xDBFF) {
+                return .{ .cp = 0x10000 + ((dec2.cp - 0xD800) << 10) + (dec.cp - 0xDC00), .start = s2 };
+            }
+        }
+        return .{ .cp = dec.cp, .start = s };
+    }
+    // Non-/u iterates UTF-16 code units: a BMP char is 1–3 bytes; a 4-byte
+    // astral is two code units the byte model cannot split, so back up one byte.
+    if (dec.len >= 1 and dec.len <= 3) return .{ .cp = dec.cp, .start = s };
+    return .{ .cp = input[pos - 1], .start = pos - 1 };
+}
+
+/// Backward counterpart of `consumeLiteral`: match `ch` ending at `pos`.
+fn consumeLiteralB(input: []const u8, pos: usize, ch: u21, flags: *const CompiledRegex.Flags) ?usize {
+    if (flags.cpMode()) {
+        const u = decodeUnitBefore(input, pos, true) orelse return null;
+        if (flags.ignore_case) {
+            if (foldCaseCp(u.cp) != foldCaseCp(ch)) return null;
+        } else if (u.cp != ch) return null;
+        return u.start;
+    } else {
+        if (ch > 255 or pos == 0) return null;
+        const c = input[pos - 1];
+        const cb: u8 = @intCast(ch);
+        if (flags.ignore_case) {
+            if (foldCase(c) != foldCase(cb)) return null;
+        } else if (c != cb) return null;
+        return pos - 1;
+    }
+}
+
+/// Backward counterpart of `consumeClass`.
+fn consumeClassB(input: []const u8, pos: usize, cc: *const CharClass, flags: *const CompiledRegex.Flags) ?usize {
+    const u = decodeUnitBefore(input, pos, flags.cpMode()) orelse return null;
+    const cp = u.cp;
+    var hit = cc.containsCp(cp);
+    if (flags.ignore_case and !hit) {
+        if (flags.cpMode()) {
+            const f = foldCaseCp(cp);
+            if (f != cp) hit = cc.containsCp(f);
+            if (!hit) for (casefold.unfold(f)) |uf| {
+                if (uf.cp != cp and cc.containsCp(uf.cp)) {
+                    hit = true;
+                    break;
+                }
+            };
+        } else if (cp < 0x80) {
+            const c: u8 = @intCast(cp);
+            const alt = if (c >= 'a' and c <= 'z') c - 32 else if (c >= 'A' and c <= 'Z') c + 32 else c;
+            hit = cc.bitmap[alt];
+        }
+    }
+    if (!(if (cc.negate) !hit else hit)) return null;
+    return u.start;
+}
+
+/// Backward counterpart of `consumeDot`.
+fn consumeDotB(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) ?usize {
+    const u = decodeUnitBefore(input, pos, flags.cpMode()) orelse return null;
+    if (!flags.dotall and isUnicodeLineTerminator(u.cp)) return null;
+    return u.start;
+}
+
+/// Backward counterpart of `consumeBackref`: match the captured text ending at
+/// `pos`. Compares code point by code point under `/u`.
+fn consumeBackrefB(idx: u32, input: []const u8, pos: usize, caps: *const [MAX_CAPTURES]CaptureSpan, flags: *const CompiledRegex.Flags) ?usize {
+    if (idx >= MAX_CAPTURES) return pos;
+    const cap = caps[idx];
+    if (cap.unset()) return pos;
+    if (flags.cpMode()) {
+        var ip = pos;
+        var cp_end = cap.end;
+        while (cp_end > cap.start) {
+            const dc = decodeUnitBefore(input, cp_end, true) orelse return null;
+            const di = decodeUnitBefore(input, ip, true) orelse return null;
+            const a = if (flags.ignore_case) foldCaseCp(dc.cp) else dc.cp;
+            const b = if (flags.ignore_case) foldCaseCp(di.cp) else di.cp;
+            if (a != b) return null;
+            cp_end = dc.start;
+            ip = di.start;
+        }
+        return ip;
+    }
+    const captured = input[cap.start..cap.end];
+    const clen = captured.len;
+    if (pos < clen) return null;
+    const slice = input[pos - clen .. pos];
+    if (flags.ignore_case) {
+        for (slice, captured) |x, y| {
+            if (foldCase(x) != foldCase(y)) return null;
+        }
+    } else if (!std.mem.eql(u8, slice, captured)) return null;
+    return pos - clen;
+}
+
 /// Zero-width `^` assertion test.
 fn testBol(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) bool {
     if (pos == 0) return true;
@@ -2601,31 +2737,9 @@ fn testEol(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) boo
 }
 
 /// True at a word boundary (\b); its negation is \B.
-/// Code point ending immediately to the left of `pos`, or null at the start.
-fn cpBefore(input: []const u8, pos: usize) ?u21 {
-    if (pos == 0) return null;
-    var i = pos - 1;
-    // Back up over UTF-8 continuation bytes (0x80..0xBF) to the lead byte.
-    while (i > 0 and input[i] >= 0x80 and input[i] < 0xC0) : (i -= 1) {}
-    return decodeUtf8At(input, i).cp;
-}
-
-/// A word character for `\b`: [A-Za-z0-9_], plus — when ignoreCase is set — any
-/// code point whose case fold lands in that set (e.g. ſ→s, U+212A KELVIN→k),
-/// per §22.2.2.7.3 IsWordChar / GetWordCharacters with Canonicalize.
-fn isWordCp(cp: u21, flags: *const CompiledRegex.Flags) bool {
-    if ((cp >= 'a' and cp <= 'z') or (cp >= 'A' and cp <= 'Z') or
-        (cp >= '0' and cp <= '9') or cp == '_') return true;
-    if (flags.ignore_case) {
-        const f = foldCaseCp(cp);
-        if ((f >= 'a' and f <= 'z') or (f >= '0' and f <= '9') or f == '_') return true;
-    }
-    return false;
-}
-
-fn atWordBoundary(input: []const u8, pos: usize, flags: *const CompiledRegex.Flags) bool {
-    const before = if (cpBefore(input, pos)) |c| isWordCp(c, flags) else false;
-    const after = if (pos < input.len) isWordCp(decodeUtf8At(input, pos).cp, flags) else false;
+fn atWordBoundary(input: []const u8, pos: usize) bool {
+    const before = if (pos > 0) isWordChar(input[pos - 1]) else false;
+    const after = if (pos < input.len) isWordChar(input[pos]) else false;
     return before != after;
 }
 
@@ -2679,46 +2793,15 @@ fn lbMatchAt(
 /// Cleared while a nested lookahead runs -- that one legitimately reads ahead.
 var lookbehind_limit: ?usize = null;
 
-/// Backtracking step budget. The CPS matcher below explores the full search
-/// tree of a backreference/modifier pattern (the Pike VM handles everything
-/// else), which is worst-case exponential. To keep a catastrophic-backtracking
-/// pattern from hanging the process we abort a match attempt after this many
-/// continuation steps and report no match. test262 inputs are tiny, so a large
-/// budget never trips on a legitimate match.
-const MATCH_STEP_BUDGET: u64 = 20_000_000;
-var match_steps: u64 = 0;
+/// Set before calling matchNode for patterns with `needs_step2b = true`.
+/// When true, matchQuant applies ES §22.2.2.5.1 step 2b: optional (min=0)
+/// iterations that are zero-width discard their captures and try a forced
+/// non-empty retry under `g_force_greedy`.
+var match_step2b: bool = false;
 
-/// A continuation frame: what remains to be matched after the current atom.
-/// The backtracking matcher is written in continuation-passing style so that a
-/// quantifier or group can hand control to the rest of the pattern and, on
-/// failure, backtrack into an earlier atom (`/(aa).+\1/` must shorten `.+`).
-const Cont = struct {
-    const Kind = union(enum) {
-        /// Match this list of nodes in order, then the parent continuation.
-        seq: []const RegexNode,
-        /// Close capture group `idx`: record its span [`start`, current position].
-        /// The start is carried here (not written to `caps` on group entry) so a
-        /// self-reference like `(?<a>\k<a>\w)` sees group `a` as not-yet-set while
-        /// its own body matches, matching the empty string per spec.
-        close_group: struct { idx: u32, start: usize },
-        /// One more repetition of a quantifier (the RepeatMatcher `d` closure).
-        repeat: RepeatState,
-        /// Restore the active flag set (leaving a `(?flags:...)` modifier group).
-        set_flags: *const CompiledRegex.Flags,
-    };
-    kind: Kind,
-    next: ?*const Cont,
-};
-
-const RepeatState = struct {
-    inner: *const RegexNode,
-    min: u32,
-    max: u32, // std.math.maxInt(u32) = infinity
-    greedy: bool,
-    prev_pos: usize,
-    clear_range: ?CaptureRange,
-    cont: ?*const Cont,
-};
+/// Set transiently inside matchQuant's step-2b forced retry so that lazy
+/// quantifiers inside the body act greedily, enabling a non-empty match.
+var g_force_greedy: bool = false;
 
 inline fn withinLookbehind(end: ?usize) ?usize {
     const e = end orelse return null;
@@ -2726,9 +2809,6 @@ inline fn withinLookbehind(end: ?usize) ?usize {
     return e;
 }
 
-/// Public entry to the backtracking matcher. Resets the step budget and runs
-/// `node` at `pos` with an empty continuation. Also used for lookaround inner
-/// assertions (each is an independent sub-match with a fresh budget).
 fn matchNode(
     node: *const RegexNode,
     input: []const u8,
@@ -2736,102 +2816,47 @@ fn matchNode(
     caps: *[MAX_CAPTURES]CaptureSpan,
     flags: *const CompiledRegex.Flags,
 ) ?usize {
-    match_steps = 0;
-    return matchNodeK(node, input, pos, caps, flags, null);
-}
-
-/// Run the continuation chain at `pos`. A null chain is success (return `pos`).
-fn runCont(
-    cont: ?*const Cont,
-    input: []const u8,
-    pos: usize,
-    caps: *[MAX_CAPTURES]CaptureSpan,
-    flags: *const CompiledRegex.Flags,
-) ?usize {
-    match_steps += 1;
-    if (match_steps > MATCH_STEP_BUDGET) return null;
-    const c = cont orelse return pos;
-    switch (c.kind) {
-        .seq => |nodes| {
-            if (nodes.len == 0) return runCont(c.next, input, pos, caps, flags);
-            const tail = Cont{ .kind = .{ .seq = nodes[1..] }, .next = c.next };
-            return matchNodeK(&nodes[0], input, pos, caps, flags, &tail);
-        },
-        .close_group => |cg| {
-            const saved = caps[cg.idx];
-            caps[cg.idx] = .{ .start = cg.start, .end = pos };
-            if (runCont(c.next, input, pos, caps, flags)) |e| return e;
-            caps[cg.idx] = saved;
-            return null;
-        },
-        .set_flags => |f| return runCont(c.next, input, pos, caps, f),
-        .repeat => |rs| {
-            // The RepeatMatcher `d` closure: one repetition just ended at `pos`,
-            // having started at `rs.prev_pos`.
-            if (rs.min == 0 and pos == rs.prev_pos) return null; // empty-iteration guard
-            const min2: u32 = if (rs.min == 0) 0 else rs.min - 1;
-            const inf = std.math.maxInt(u32);
-            const max2: u32 = if (rs.max == inf) inf else rs.max - 1;
-            return repeatMatcher(rs.inner, min2, max2, rs.greedy, input, pos, caps, flags, rs.cont, rs.clear_range);
-        },
-    }
-}
-
-/// Match a single AST node at `pos`, then hand off to `cont`. Returns the final
-/// end index of a complete match, or null.
-fn matchNodeK(
-    node: *const RegexNode,
-    input: []const u8,
-    pos: usize,
-    caps: *[MAX_CAPTURES]CaptureSpan,
-    flags: *const CompiledRegex.Flags,
-    cont: ?*const Cont,
-) ?usize {
-    match_steps += 1;
-    if (match_steps > MATCH_STEP_BUDGET) return null;
     switch (node.*) {
-        .literal => |ch| {
-            const e = withinLookbehind(consumeLiteral(input, pos, ch, flags)) orelse return null;
-            return runCont(cont, input, e, caps, flags);
-        },
-        .char_class => |cc| {
-            const e = withinLookbehind(consumeClass(input, pos, cc, flags)) orelse return null;
-            return runCont(cont, input, e, caps, flags);
-        },
-        .dot => {
-            const e = withinLookbehind(consumeDot(input, pos, flags)) orelse return null;
-            return runCont(cont, input, e, caps, flags);
-        },
-        .anchor_start => return if (testBol(input, pos, flags)) runCont(cont, input, pos, caps, flags) else null,
-        .anchor_end => return if (testEol(input, pos, flags)) runCont(cont, input, pos, caps, flags) else null,
-        .word_boundary => return if (atWordBoundary(input, pos, flags)) runCont(cont, input, pos, caps, flags) else null,
-        .non_word_boundary => return if (!atWordBoundary(input, pos, flags)) runCont(cont, input, pos, caps, flags) else null,
+        .literal => |ch| return withinLookbehind(consumeLiteral(input, pos, ch, flags)),
+        .char_class => |cc| return withinLookbehind(consumeClass(input, pos, cc, flags)),
+        .dot => return withinLookbehind(consumeDot(input, pos, flags)),
+        .anchor_start => return if (testBol(input, pos, flags)) pos else null,
+        .anchor_end => return if (testEol(input, pos, flags)) pos else null,
+        .word_boundary => return if (atWordBoundary(input, pos)) pos else null,
+        .non_word_boundary => return if (!atWordBoundary(input, pos)) pos else null,
         .seq => |nodes| {
-            const f = Cont{ .kind = .{ .seq = nodes }, .next = cont };
-            return runCont(&f, input, pos, caps, flags);
+            var cur_pos = pos;
+            for (nodes) |*child| {
+                cur_pos = matchNode(child, input, cur_pos, caps, flags) orelse return null;
+            }
+            return cur_pos;
         },
         .alt => |arms| {
             for (arms) |*arm| {
                 const saved_caps = caps.*;
-                if (matchNodeK(arm, input, pos, caps, flags, cont)) |end| return end;
+                if (matchNode(arm, input, pos, caps, flags)) |end| return end;
                 caps.* = saved_caps;
             }
             return null;
         },
         .group => |g| {
             const cap_idx = g.idx;
-            if (cap_idx == 0 or cap_idx >= MAX_CAPTURES) {
-                return matchNodeK(g.inner, input, pos, caps, flags, cont);
-            }
-            // Do not touch caps[cap_idx] here — the close frame records the span
-            // once the body matches, so a self-reference sees the group unset.
-            const close = Cont{ .kind = .{ .close_group = .{ .idx = cap_idx, .start = pos } }, .next = cont };
-            return matchNodeK(g.inner, input, pos, caps, flags, &close);
+            if (cap_idx >= MAX_CAPTURES) return matchNode(g.inner, input, pos, caps, flags);
+            const saved_start = caps[cap_idx].start;
+            const saved_end = caps[cap_idx].end;
+            const inner_end = matchNode(g.inner, input, pos, caps, flags) orelse {
+                caps[cap_idx] = .{ .start = saved_start, .end = saved_end };
+                return null;
+            };
+            caps[cap_idx] = .{ .start = pos, .end = inner_end };
+            return inner_end;
         },
-        .non_capturing => |inner| return matchNodeK(inner, input, pos, caps, flags, cont),
+        .non_capturing => |inner| {
+            return matchNode(inner, input, pos, caps, flags);
+        },
         .modifier => |m| {
-            // Rebind i/m/s for the enclosed disjunction only; the continuation
-            // after the group restores the original flag set via a set_flags frame.
+            // Rebind i/m/s for the enclosed disjunction only. The copy lives on
+            // this frame, so the original flags are restored on return.
             var scoped = flags.*;
             if (m.add.ignore_case) scoped.ignore_case = true;
             if (m.add.multiline) scoped.multiline = true;
@@ -2839,11 +2864,10 @@ fn matchNodeK(
             if (m.remove.ignore_case) scoped.ignore_case = false;
             if (m.remove.multiline) scoped.multiline = false;
             if (m.remove.dotall) scoped.dotall = false;
-            const restore = Cont{ .kind = .{ .set_flags = flags }, .next = cont };
-            return matchNodeK(m.inner, input, pos, caps, &scoped, &restore);
+            return matchNode(m.inner, input, pos, caps, &scoped);
         },
         .quant => |q| {
-            return repeatMatcher(q.inner, q.min, q.max, !q.lazy, input, pos, caps, flags, cont, captureRange(q.inner));
+            return matchQuant(q.inner, q.min, q.max, q.lazy, input, pos, caps, flags);
         },
         .look_ahead => |la| {
             const saved_caps = caps.*;
@@ -2857,27 +2881,57 @@ fn matchNodeK(
             // of the pattern (`/(?=(a+))/.exec("baa")` reports "aa"); a negative
             // one's are discarded, as are those of a failed positive one.
             if (la.negative or !matched) caps.* = saved_caps;
-            if (la.negative) {
-                if (matched) return null;
-                return runCont(cont, input, pos, caps, flags);
-            }
-            if (!matched) return null;
-            if (runCont(cont, input, pos, caps, flags)) |e| return e;
-            caps.* = saved_caps;
-            return null;
+            if (la.negative) return if (!matched) pos else null;
+            return if (matched) pos else null;
         },
         .look_behind => |lb| {
-            const saved_caps = caps.*;
-            const matched = matchLookbehind(lb.inner, lb.negative, input, pos, caps, flags);
-            if (lb.negative or !matched) caps.* = saved_caps;
-            if (lb.negative) {
-                if (matched) return null;
-                return runCont(cont, input, pos, caps, flags);
+            var matched_lb = false;
+            const saved_limit = lookbehind_limit;
+            lookbehind_limit = pos;
+            defer lookbehind_limit = saved_limit;
+            // Phase 1: scan j from 0 upward (leftmost = greedy/longest match).
+            // Standard matchNode respects alternation priority correctly.
+            {
+                var j: usize = 0;
+                while (j <= pos) : (j += 1) {
+                    var tmp_caps = caps.*;
+                    if (matchNode(lb.inner, input, j, &tmp_caps, flags)) |end| {
+                        if (end == pos) {
+                            matched_lb = true;
+                            // A positive lookbehind contributes its captures.
+                            if (!lb.negative) caps.* = tmp_caps;
+                            break;
+                        }
+                    }
+                }
             }
-            if (!matched) return null;
-            if (runCont(cont, input, pos, caps, flags)) |e| return e;
-            caps.* = saved_caps;
-            return null;
+            // Phase 2: if still unmatched and inner is a top-level alternation,
+            // try each arm independently across all j values. This handles
+            // priority-shadowing where a higher-priority arm (e.g. `^`, always
+            // zero-width) succeeds at j but ends at the wrong position, masking a
+            // lower-priority arm (e.g. `[ab]`) that ends exactly at pos.
+            if (!matched_lb) {
+                if (lbAltArms(lb.inner)) |arms| {
+                    phase2: for (arms) |*arm| {
+                        var j: usize = 0;
+                        while (j <= pos) : (j += 1) {
+                            var tmp_caps = caps.*;
+                            if (matchNode(arm, input, j, &tmp_caps, flags)) |end| {
+                                if (end == pos) {
+                                    matched_lb = true;
+                                    if (!lb.negative) caps.* = tmp_caps;
+                                    break :phase2;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (lb.negative) {
+                return if (!matched_lb) pos else null;
+            } else {
+                return if (matched_lb) pos else null;
+            }
         },
         .back_ref_multi => |idxs| {
             var chosen: ?CaptureSpan = null;
@@ -2888,88 +2942,40 @@ fn matchNodeK(
                     break;
                 }
             }
-            const cap = chosen orelse return runCont(cont, input, pos, caps, flags);
-            const e = matchBackrefSpan(cap, input, pos, flags) orelse return null;
-            return runCont(cont, input, e, caps, flags);
+            const cap = chosen orelse return pos;
+            const captured = input[cap.start..cap.end];
+            const clen = captured.len;
+            if (pos + clen > input.len) return null;
+            const slice = input[pos .. pos + clen];
+            if (flags.ignore_case) {
+                for (slice, captured) |a, b| {
+                    if (foldCase(a) != foldCase(b)) return null;
+                }
+            } else {
+                if (!std.mem.eql(u8, slice, captured)) return null;
+            }
+            return pos + clen;
         },
         .back_ref => |idx| {
-            if (idx >= MAX_CAPTURES) return runCont(cont, input, pos, caps, flags);
+            if (idx >= MAX_CAPTURES) return pos;
             const cap = caps[idx];
-            if (cap.unset()) return runCont(cont, input, pos, caps, flags);
-            const e = matchBackrefSpan(cap, input, pos, flags) orelse return null;
-            return runCont(cont, input, e, caps, flags);
+            if (cap.unset()) {
+                return pos;
+            }
+            const captured = input[cap.start..cap.end];
+            const clen = captured.len;
+            if (pos + clen > input.len) return null;
+            const slice = input[pos .. pos + clen];
+            if (flags.ignore_case) {
+                for (slice, captured) |a, b| {
+                    if (foldCase(a) != foldCase(b)) return null;
+                }
+            } else {
+                if (!std.mem.eql(u8, slice, captured)) return null;
+            }
+            return pos + clen;
         },
     }
-}
-
-/// Consume the text of a backreference capture at `pos`, honoring ignoreCase.
-/// Returns the end position, or null if the text does not match.
-fn matchBackrefSpan(
-    cap: CaptureSpan,
-    input: []const u8,
-    pos: usize,
-    flags: *const CompiledRegex.Flags,
-) ?usize {
-    // Guard against a not-fully-set span (should not occur, but a stray sentinel
-    // must never index out of bounds).
-    if (cap.start > cap.end or cap.end > input.len) return null;
-    const captured = input[cap.start..cap.end];
-    const clen = captured.len;
-    if (pos + clen > input.len) return null;
-    const slice = input[pos .. pos + clen];
-    if (flags.ignore_case) {
-        for (slice, captured) |a, b| {
-            if (foldCase(a) != foldCase(b)) return null;
-        }
-    } else {
-        if (!std.mem.eql(u8, slice, captured)) return null;
-    }
-    return pos + clen;
-}
-
-/// Evaluate a lookbehind assertion ending at `pos`. Returns whether it matched
-/// and, for a positive assertion, leaves its captures in `caps`.
-fn matchLookbehind(
-    lb_inner: *const RegexNode,
-    negative: bool,
-    input: []const u8,
-    pos: usize,
-    caps: *[MAX_CAPTURES]CaptureSpan,
-    flags: *const CompiledRegex.Flags,
-) bool {
-    const saved_limit = lookbehind_limit;
-    lookbehind_limit = pos;
-    defer lookbehind_limit = saved_limit;
-    // Phase 1: scan j from 0 upward (leftmost = greedy/longest match).
-    {
-        var j: usize = 0;
-        while (j <= pos) : (j += 1) {
-            var tmp_caps = caps.*;
-            if (matchNode(lb_inner, input, j, &tmp_caps, flags)) |end| {
-                if (end == pos) {
-                    if (!negative) caps.* = tmp_caps;
-                    return true;
-                }
-            }
-        }
-    }
-    // Phase 2: if still unmatched and inner is a top-level alternation, try each
-    // arm independently across all j values (priority-shadowing guard).
-    if (lbAltArms(lb_inner)) |arms| {
-        for (arms) |*arm| {
-            var j: usize = 0;
-            while (j <= pos) : (j += 1) {
-                var tmp_caps = caps.*;
-                if (matchNode(arm, input, j, &tmp_caps, flags)) |end| {
-                    if (end == pos) {
-                        if (!negative) caps.* = tmp_caps;
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    return false;
 }
 
 fn clearCaptures(caps: *[MAX_CAPTURES]CaptureSpan, range: ?CaptureRange) void {
@@ -2978,58 +2984,556 @@ fn clearCaptures(caps: *[MAX_CAPTURES]CaptureSpan, range: ?CaptureRange) void {
     while (i <= r.hi and i < MAX_CAPTURES) : (i += 1) caps[i] = INVALID_CAP;
 }
 
-/// ES2024 22.2.2.5.1 RepeatMatcher. Matches between `min` and `max` repetitions
-/// of `inner` at `pos` (greedy or lazy) and then the continuation `cont`, with
-/// full backtracking across the repetition boundary.
-fn repeatMatcher(
+// ============================================================================
+// CPS backtracking matcher
+//
+// A continuation-passing matcher that implements the ES §22.2.2 Matcher
+// semantics faithfully, including backtracking across sequence boundaries.
+// The older `matchNode` returned a single end position per node and therefore
+// could not retry earlier choices when a later atom (a backreference, a
+// following literal) failed — so `/(aa).+\1/` and friends never matched.
+//
+// Each node is matched together with a continuation `Cont` describing the rest
+// of the pattern still to match. `matchN(node, pos, cont)` returns the final end
+// position of the *whole* match on success, so a node can try alternatives and
+// let the continuation drive backtracking. Lookbehind still delegates to the
+// legacy `matchNode` helper (kept below); everything else runs here.
+// ============================================================================
+
+const RepState = struct {
     inner: *const RegexNode,
     min: u32,
-    max: u32,
+    max: u32, // std.math.maxInt(u32) = infinity
     greedy: bool,
+    last_pos: usize,
+};
+
+const Cont = struct {
+    kind: union(enum) {
+        /// Remaining elements of a `seq` starting at `idx`.
+        seq_rest: struct { nodes: []const RegexNode, idx: usize },
+        /// Close capture group `idx` with span [start, current pos).
+        close_cap: struct { idx: u32, start: usize },
+        /// One "attempt another iteration or stop" step of a quantifier.
+        rep: RepState,
+        /// Switch the active flags for the remainder (exit of a `(?ims-:…)`).
+        set_flags: *const CompiledRegex.Flags,
+    },
+    next: ?*const Cont,
+};
+
+/// Run a continuation at `pos`. A null continuation means the whole pattern has
+/// matched, so `pos` is the final end position.
+fn matchC(
+    cont: ?*const Cont,
+    input: []const u8,
+    pos: usize,
+    caps: *[MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+) ?usize {
+    const c = cont orelse return pos;
+    switch (c.kind) {
+        .seq_rest => |sr| return matchSeq(sr.nodes, sr.idx, input, pos, caps, flags, c.next),
+        .close_cap => |cc| {
+            const saved = caps[cc.idx];
+            caps[cc.idx] = .{ .start = cc.start, .end = pos };
+            const r = matchC(c.next, input, pos, caps, flags);
+            if (r == null) caps[cc.idx] = saved;
+            return r;
+        },
+        .set_flags => |f| return matchC(c.next, input, pos, caps, f),
+        .rep => |rs| {
+            // This is the RepeatMatcher continuation `d(y)`: one iteration of the
+            // quantified atom has just completed at `pos`.
+            if (rs.min == 0 and pos == rs.last_pos) return null; // zero-width guard
+            const min2: u32 = if (rs.min == 0) 0 else rs.min - 1;
+            const max2: u32 = if (rs.max == std.math.maxInt(u32)) std.math.maxInt(u32) else rs.max - 1;
+            return repMatch(rs.inner, min2, max2, rs.greedy, c.next, input, pos, caps, flags);
+        },
+    }
+}
+
+/// Match `nodes[idx..]` in order, then the outer continuation.
+fn matchSeq(
+    nodes: []const RegexNode,
+    idx: usize,
     input: []const u8,
     pos: usize,
     caps: *[MAX_CAPTURES]CaptureSpan,
     flags: *const CompiledRegex.Flags,
     cont: ?*const Cont,
-    clear_range: ?CaptureRange,
 ) ?usize {
-    match_steps += 1;
-    if (match_steps > MATCH_STEP_BUDGET) return null;
-    if (max == 0) return runCont(cont, input, pos, caps, flags);
-    // `d`: after matching one instance of `inner`, take another repetition.
-    const d = Cont{ .kind = .{ .repeat = .{
+    if (idx >= nodes.len) return matchC(cont, input, pos, caps, flags);
+    const rest = Cont{ .kind = .{ .seq_rest = .{ .nodes = nodes, .idx = idx + 1 } }, .next = cont };
+    return matchN(&nodes[idx], input, pos, caps, flags, &rest);
+}
+
+/// ES §22.2.2.5.1 RepeatMatcher: match the quantified atom `inner` between `min`
+/// and `max` more times (greedy or lazy), then `cont`.
+fn repMatch(
+    inner: *const RegexNode,
+    min: u32,
+    max: u32,
+    greedy: bool,
+    cont: ?*const Cont,
+    input: []const u8,
+    pos: usize,
+    caps: *[MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+) ?usize {
+    if (max == 0) return matchC(cont, input, pos, caps, flags);
+    const clear_range = captureRange(inner);
+    const d = Cont{ .kind = .{ .rep = .{
         .inner = inner,
         .min = min,
         .max = max,
         .greedy = greedy,
-        .prev_pos = pos,
-        .clear_range = clear_range,
-        .cont = cont,
-    } }, .next = null };
+        .last_pos = pos,
+    } }, .next = cont };
 
     if (min != 0) {
-        // Must match at least one more; reset the atom's own captures first.
         const saved = caps.*;
         clearCaptures(caps, clear_range);
-        if (matchNodeK(inner, input, pos, caps, flags, &d)) |e| return e;
-        caps.* = saved;
-        return null;
+        const r = matchN(inner, input, pos, caps, flags, &d);
+        if (r == null) caps.* = saved;
+        return r;
     }
     if (greedy) {
-        // Try one more repetition, then fall back to the continuation.
         const saved = caps.*;
         clearCaptures(caps, clear_range);
-        if (matchNodeK(inner, input, pos, caps, flags, &d)) |e| return e;
-        caps.* = saved; // restore original captures before the skip path
-        return runCont(cont, input, pos, caps, flags);
+        const z = matchN(inner, input, pos, caps, flags, &d);
+        if (z != null) return z;
+        caps.* = saved; // restore x's captures before `c(x)`
+        return matchC(cont, input, pos, caps, flags);
     } else {
-        // Lazy: try the continuation (zero more), then one more repetition.
-        if (runCont(cont, input, pos, caps, flags)) |e| return e;
+        const z = matchC(cont, input, pos, caps, flags);
+        if (z != null) return z;
         const saved = caps.*;
         clearCaptures(caps, clear_range);
-        if (matchNodeK(inner, input, pos, caps, flags, &d)) |e| return e;
+        const r = matchN(inner, input, pos, caps, flags, &d);
+        if (r == null) caps.* = saved;
+        return r;
+    }
+}
+
+/// Consume a backreference to capture `idx` at `pos`; null if it does not match.
+fn consumeBackref(idx: u32, input: []const u8, pos: usize, caps: *const [MAX_CAPTURES]CaptureSpan, flags: *const CompiledRegex.Flags) ?usize {
+    if (idx >= MAX_CAPTURES) return pos;
+    const cap = caps[idx];
+    if (cap.unset()) return pos; // unset group backreference matches the empty string
+    if (flags.cpMode()) {
+        // Under /u the match is code-point-based, so compare the captured span
+        // and the input code point by code point over the full buffer: a WTF-8
+        // surrogate pair combines into one astral code point, so a captured lone
+        // lead surrogate must NOT match the lead of an astral pair (its byte
+        // length would otherwise let a raw slice compare equal). §22.2.2.9.
+        var ip = pos;
+        var cp_off = cap.start;
+        while (cp_off < cap.end) {
+            if (ip >= input.len) return null;
+            const dc = decodeCpAt(input, cp_off);
+            const di = decodeCpAt(input, ip);
+            const a = if (flags.ignore_case) foldCaseCp(dc.cp) else dc.cp;
+            const b = if (flags.ignore_case) foldCaseCp(di.cp) else di.cp;
+            if (a != b) return null;
+            cp_off += dc.len;
+            ip += di.len;
+        }
+        return ip;
+    }
+    const captured = input[cap.start..cap.end];
+    const clen = captured.len;
+    if (pos + clen > input.len) return null;
+    const slice = input[pos .. pos + clen];
+    if (flags.ignore_case) {
+        for (slice, captured) |x, y| {
+            if (foldCase(x) != foldCase(y)) return null;
+        }
+    } else {
+        if (!std.mem.eql(u8, slice, captured)) return null;
+    }
+    return pos + clen;
+}
+
+/// Match a single node followed by its continuation.
+fn matchN(
+    node: *const RegexNode,
+    input: []const u8,
+    pos: usize,
+    caps: *[MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+    cont: ?*const Cont,
+) ?usize {
+    switch (node.*) {
+        .literal => |ch| {
+            const np = consumeLiteral(input, pos, ch, flags) orelse return null;
+            return matchC(cont, input, np, caps, flags);
+        },
+        .char_class => |cc| {
+            const np = consumeClass(input, pos, cc, flags) orelse return null;
+            return matchC(cont, input, np, caps, flags);
+        },
+        .dot => {
+            const np = consumeDot(input, pos, flags) orelse return null;
+            return matchC(cont, input, np, caps, flags);
+        },
+        .anchor_start => return if (testBol(input, pos, flags)) matchC(cont, input, pos, caps, flags) else null,
+        .anchor_end => return if (testEol(input, pos, flags)) matchC(cont, input, pos, caps, flags) else null,
+        .word_boundary => return if (atWordBoundary(input, pos)) matchC(cont, input, pos, caps, flags) else null,
+        .non_word_boundary => return if (!atWordBoundary(input, pos)) matchC(cont, input, pos, caps, flags) else null,
+        .seq => |nodes| return matchSeq(nodes, 0, input, pos, caps, flags, cont),
+        .alt => |arms| {
+            for (arms) |*arm| {
+                const saved = caps.*;
+                if (matchN(arm, input, pos, caps, flags, cont)) |end| return end;
+                caps.* = saved;
+            }
+            return null;
+        },
+        .group => |g| {
+            if (g.idx >= MAX_CAPTURES) return matchN(g.inner, input, pos, caps, flags, cont);
+            const saved = caps[g.idx];
+            const close = Cont{ .kind = .{ .close_cap = .{ .idx = g.idx, .start = pos } }, .next = cont };
+            const r = matchN(g.inner, input, pos, caps, flags, &close);
+            if (r == null) caps[g.idx] = saved;
+            return r;
+        },
+        .non_capturing => |inner| return matchN(inner, input, pos, caps, flags, cont),
+        .modifier => |m| {
+            var scoped = flags.*;
+            if (m.add.ignore_case) scoped.ignore_case = true;
+            if (m.add.multiline) scoped.multiline = true;
+            if (m.add.dotall) scoped.dotall = true;
+            if (m.remove.ignore_case) scoped.ignore_case = false;
+            if (m.remove.multiline) scoped.multiline = false;
+            if (m.remove.dotall) scoped.dotall = false;
+            // The rest of the pattern (after this group) reverts to the outer flags.
+            const restore = Cont{ .kind = .{ .set_flags = flags }, .next = cont };
+            return matchN(m.inner, input, pos, caps, &scoped, &restore);
+        },
+        .quant => |q| return repMatch(q.inner, q.min, q.max, !q.lazy, cont, input, pos, caps, flags),
+        .look_ahead => |la| {
+            const saved = caps.*;
+            // A lookahead nested inside a lookbehind reads *forward* past the
+            // lookbehind's position, so the legacy consume bound does not apply.
+            const saved_limit = lookbehind_limit;
+            lookbehind_limit = null;
+            const matched = matchN(la.inner, input, pos, caps, flags, null) != null;
+            lookbehind_limit = saved_limit;
+            // A positive assertion's captures survive; a negative one's (or a
+            // failed positive one's) are discarded.
+            if (la.negative or !matched) caps.* = saved;
+            if (la.negative) return if (!matched) matchC(cont, input, pos, caps, flags) else null;
+            return if (matched) matchC(cont, input, pos, caps, flags) else null;
+        },
+        .look_behind => |lb| {
+            // Match the assertion's Disjunction backward from `pos`; a positive
+            // assertion's captures survive, a negative (or failed) one's do not.
+            const saved = caps.*;
+            const matched = matchNb(lb.inner, input, pos, caps, flags, null) != null;
+            if (lb.negative or !matched) caps.* = saved;
+            if (lb.negative) return if (!matched) matchC(cont, input, pos, caps, flags) else null;
+            return if (matched) matchC(cont, input, pos, caps, flags) else null;
+        },
+        .back_ref_multi => |idxs| {
+            var chosen: ?u32 = null;
+            for (idxs) |i| {
+                if (i >= MAX_CAPTURES) continue;
+                if (!caps[i].unset()) {
+                    chosen = i;
+                    break;
+                }
+            }
+            const idx = chosen orelse return matchC(cont, input, pos, caps, flags);
+            const np = consumeBackref(idx, input, pos, caps, flags) orelse return null;
+            return matchC(cont, input, np, caps, flags);
+        },
+        .back_ref => |idx| {
+            const np = consumeBackref(idx, input, pos, caps, flags) orelse return null;
+            return matchC(cont, input, np, caps, flags);
+        },
+    }
+}
+
+// ============================================================================
+// Reverse (backward) CPS matcher — used to match a lookbehind's Disjunction
+// with direction = backward (ES §22.2.2.1). Position decreases as atoms are
+// consumed; a `seq` matches its last element first; a group's capture span is
+// [final_pos, entry_pos). A nested lookahead flips back to forward matching.
+// ============================================================================
+
+fn matchCb(
+    cont: ?*const Cont,
+    input: []const u8,
+    pos: usize,
+    caps: *[MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+) ?usize {
+    const c = cont orelse return pos;
+    switch (c.kind) {
+        .seq_rest => |sr| return matchSeqB(sr.nodes, sr.idx, input, pos, caps, flags, c.next),
+        .close_cap => |cc| {
+            // Backward: we entered the group at `cc.start` (its right edge) and
+            // finished at `pos` (its left edge).
+            const saved = caps[cc.idx];
+            caps[cc.idx] = .{ .start = pos, .end = cc.start };
+            const r = matchCb(c.next, input, pos, caps, flags);
+            if (r == null) caps[cc.idx] = saved;
+            return r;
+        },
+        .set_flags => |f| return matchCb(c.next, input, pos, caps, f),
+        .rep => |rs| {
+            if (rs.min == 0 and pos == rs.last_pos) return null;
+            const min2: u32 = if (rs.min == 0) 0 else rs.min - 1;
+            const max2: u32 = if (rs.max == std.math.maxInt(u32)) std.math.maxInt(u32) else rs.max - 1;
+            return repMatchB(rs.inner, min2, max2, rs.greedy, c.next, input, pos, caps, flags);
+        },
+    }
+}
+
+/// Match `nodes[0..n]` backward (element `n-1` first), then the continuation.
+fn matchSeqB(
+    nodes: []const RegexNode,
+    n: usize,
+    input: []const u8,
+    pos: usize,
+    caps: *[MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+    cont: ?*const Cont,
+) ?usize {
+    if (n == 0) return matchCb(cont, input, pos, caps, flags);
+    const rest = Cont{ .kind = .{ .seq_rest = .{ .nodes = nodes, .idx = n - 1 } }, .next = cont };
+    return matchNb(&nodes[n - 1], input, pos, caps, flags, &rest);
+}
+
+fn repMatchB(
+    inner: *const RegexNode,
+    min: u32,
+    max: u32,
+    greedy: bool,
+    cont: ?*const Cont,
+    input: []const u8,
+    pos: usize,
+    caps: *[MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+) ?usize {
+    if (max == 0) return matchCb(cont, input, pos, caps, flags);
+    const clear_range = captureRange(inner);
+    const d = Cont{ .kind = .{ .rep = .{
+        .inner = inner,
+        .min = min,
+        .max = max,
+        .greedy = greedy,
+        .last_pos = pos,
+    } }, .next = cont };
+
+    if (min != 0) {
+        const saved = caps.*;
+        clearCaptures(caps, clear_range);
+        const r = matchNb(inner, input, pos, caps, flags, &d);
+        if (r == null) caps.* = saved;
+        return r;
+    }
+    if (greedy) {
+        const saved = caps.*;
+        clearCaptures(caps, clear_range);
+        const z = matchNb(inner, input, pos, caps, flags, &d);
+        if (z != null) return z;
         caps.* = saved;
-        return null;
+        return matchCb(cont, input, pos, caps, flags);
+    } else {
+        const z = matchCb(cont, input, pos, caps, flags);
+        if (z != null) return z;
+        const saved = caps.*;
+        clearCaptures(caps, clear_range);
+        const r = matchNb(inner, input, pos, caps, flags, &d);
+        if (r == null) caps.* = saved;
+        return r;
+    }
+}
+
+/// Match a single node backward, then its continuation.
+fn matchNb(
+    node: *const RegexNode,
+    input: []const u8,
+    pos: usize,
+    caps: *[MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+    cont: ?*const Cont,
+) ?usize {
+    switch (node.*) {
+        .literal => |ch| {
+            const np = consumeLiteralB(input, pos, ch, flags) orelse return null;
+            return matchCb(cont, input, np, caps, flags);
+        },
+        .char_class => |cc| {
+            const np = consumeClassB(input, pos, cc, flags) orelse return null;
+            return matchCb(cont, input, np, caps, flags);
+        },
+        .dot => {
+            const np = consumeDotB(input, pos, flags) orelse return null;
+            return matchCb(cont, input, np, caps, flags);
+        },
+        .anchor_start => return if (testBol(input, pos, flags)) matchCb(cont, input, pos, caps, flags) else null,
+        .anchor_end => return if (testEol(input, pos, flags)) matchCb(cont, input, pos, caps, flags) else null,
+        .word_boundary => return if (atWordBoundary(input, pos)) matchCb(cont, input, pos, caps, flags) else null,
+        .non_word_boundary => return if (!atWordBoundary(input, pos)) matchCb(cont, input, pos, caps, flags) else null,
+        .seq => |nodes| return matchSeqB(nodes, nodes.len, input, pos, caps, flags, cont),
+        .alt => |arms| {
+            for (arms) |*arm| {
+                const saved = caps.*;
+                if (matchNb(arm, input, pos, caps, flags, cont)) |end| return end;
+                caps.* = saved;
+            }
+            return null;
+        },
+        .group => |g| {
+            if (g.idx >= MAX_CAPTURES) return matchNb(g.inner, input, pos, caps, flags, cont);
+            const saved = caps[g.idx];
+            // In backward matching `pos` is the group's right edge (its end).
+            const close = Cont{ .kind = .{ .close_cap = .{ .idx = g.idx, .start = pos } }, .next = cont };
+            const r = matchNb(g.inner, input, pos, caps, flags, &close);
+            if (r == null) caps[g.idx] = saved;
+            return r;
+        },
+        .non_capturing => |inner| return matchNb(inner, input, pos, caps, flags, cont),
+        .modifier => |m| {
+            var scoped = flags.*;
+            if (m.add.ignore_case) scoped.ignore_case = true;
+            if (m.add.multiline) scoped.multiline = true;
+            if (m.add.dotall) scoped.dotall = true;
+            if (m.remove.ignore_case) scoped.ignore_case = false;
+            if (m.remove.multiline) scoped.multiline = false;
+            if (m.remove.dotall) scoped.dotall = false;
+            const restore = Cont{ .kind = .{ .set_flags = flags }, .next = cont };
+            return matchNb(m.inner, input, pos, caps, &scoped, &restore);
+        },
+        .quant => |q| return repMatchB(q.inner, q.min, q.max, !q.lazy, cont, input, pos, caps, flags),
+        .look_ahead => |la| {
+            // A lookahead nested inside a lookbehind reads *forward* from `pos`.
+            const saved = caps.*;
+            const matched = matchN(la.inner, input, pos, caps, flags, null) != null;
+            if (la.negative or !matched) caps.* = saved;
+            if (la.negative) return if (!matched) matchCb(cont, input, pos, caps, flags) else null;
+            return if (matched) matchCb(cont, input, pos, caps, flags) else null;
+        },
+        .look_behind => |lb| {
+            const saved = caps.*;
+            const matched = matchNb(lb.inner, input, pos, caps, flags, null) != null;
+            if (lb.negative or !matched) caps.* = saved;
+            if (lb.negative) return if (!matched) matchCb(cont, input, pos, caps, flags) else null;
+            return if (matched) matchCb(cont, input, pos, caps, flags) else null;
+        },
+        .back_ref_multi => |idxs| {
+            var chosen: ?u32 = null;
+            for (idxs) |i| {
+                if (i >= MAX_CAPTURES) continue;
+                if (!caps[i].unset()) {
+                    chosen = i;
+                    break;
+                }
+            }
+            const idx = chosen orelse return matchCb(cont, input, pos, caps, flags);
+            const np = consumeBackrefB(idx, input, pos, caps, flags) orelse return null;
+            return matchCb(cont, input, np, caps, flags);
+        },
+        .back_ref => |idx| {
+            const np = consumeBackrefB(idx, input, pos, caps, flags) orelse return null;
+            return matchCb(cont, input, np, caps, flags);
+        },
+    }
+}
+
+fn matchQuant(
+    inner: *const RegexNode,
+    min: u32,
+    max: u32,
+    lazy: bool,
+    input: []const u8,
+    start: usize,
+    caps: *[MAX_CAPTURES]CaptureSpan,
+    flags: *const CompiledRegex.Flags,
+) ?usize {
+    // RepeatMatcher resets the quantified atom's own captures before every
+    // repetition, so an earlier iteration's groups cannot leak into a later one.
+    const clear_range = captureRange(inner);
+    // Under g_force_greedy (step-2b retry), lazy quantifiers act greedy so that
+    // the retry can produce a non-empty match.
+    if (lazy and !g_force_greedy) {
+        var count: u32 = 0;
+        var pos = start;
+
+        while (count < min) {
+            const saved_caps = caps.*;
+            clearCaptures(caps, clear_range);
+            const next = matchNode(inner, input, pos, caps, flags) orelse {
+                caps.* = saved_caps;
+                return null;
+            };
+            if (next == pos) {
+                count += 1;
+                if (count >= min) break;
+                return null;
+            }
+            pos = next;
+            count += 1;
+        }
+
+        while (count <= max) {
+            return pos;
+        }
+        return pos;
+    } else {
+        var positions: [1024]usize = undefined;
+        var count: u32 = 0;
+        var pos = start;
+        positions[0] = pos;
+
+        while (count < max) {
+            const saved_caps = caps.*;
+            clearCaptures(caps, clear_range);
+            const next = matchNode(inner, input, pos, caps, flags) orelse {
+                caps.* = saved_caps;
+                break;
+            };
+            count += 1;
+            positions[count] = next;
+            if (next == pos) {
+                if (count >= min and match_step2b) {
+                    // ES §22.2.2.5.1 step 2b: optional iteration is zero-width.
+                    // Discard its captures and try a forced non-empty retry with
+                    // lazy quants acting greedily.
+                    caps.* = saved_caps;
+                    clearCaptures(caps, clear_range);
+                    const old_force = g_force_greedy;
+                    g_force_greedy = true;
+                    const forced = matchNode(inner, input, pos, caps, flags);
+                    g_force_greedy = old_force;
+                    if (forced != null and forced.? > pos) {
+                        positions[count] = forced.?;
+                        pos = forced.?;
+                        if (count >= 1024 - 1) break;
+                        continue;
+                    }
+                    caps.* = saved_caps; // forced also zero-width or failed
+                }
+                break;
+            }
+            pos = next;
+            if (count >= 1024 - 1) break;
+        }
+
+        if (count < min) return null;
+
+        var i = count;
+        while (i >= min) {
+            if (i <= min or true) {
+                return positions[i];
+            }
+            if (i == 0) break;
+            i -= 1;
+        }
+        return positions[if (count >= min) count else min];
     }
 }
 
@@ -3259,6 +3763,30 @@ const ProgBuilder = struct {
 
 /// True if the pattern contains any backreference (anywhere, including inside a
 /// lookaround). Such patterns are NP-hard and use the backtracking engine.
+/// Whether any lookbehind in the pattern encloses a capturing group. The Pike
+/// VM matches a lookbehind's body forward, so a quantified capture inside it
+/// records the wrong (rightmost) iteration; such patterns need the reverse
+/// backtracking matcher to report spec-correct captures. §22.2.2.1.
+fn hasCapturingLookBehind(node: *const RegexNode) bool {
+    return switch (node.*) {
+        .look_behind => |lb| captureRange(lb.inner) != null or hasCapturingLookBehind(lb.inner),
+        .seq => |nodes| blk: {
+            for (nodes) |*c| if (hasCapturingLookBehind(c)) break :blk true;
+            break :blk false;
+        },
+        .alt => |arms| blk: {
+            for (arms) |*c| if (hasCapturingLookBehind(c)) break :blk true;
+            break :blk false;
+        },
+        .group => |g| hasCapturingLookBehind(g.inner),
+        .non_capturing => |inner| hasCapturingLookBehind(inner),
+        .quant => |q| hasCapturingLookBehind(q.inner),
+        .look_ahead => |la| hasCapturingLookBehind(la.inner),
+        .modifier => |m| hasCapturingLookBehind(m.inner),
+        else => false,
+    };
+}
+
 fn hasBackref(node: *const RegexNode) bool {
     return switch (node.*) {
         .back_ref, .back_ref_multi => true,
@@ -3513,9 +4041,9 @@ const PikeVM = struct {
                 self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags),
             .assert_eol => if (testEol(input, sp, flags))
                 self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags),
-            .assert_wb => if (atWordBoundary(input, sp, flags))
+            .assert_wb => if (atWordBoundary(input, sp))
                 self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags),
-            .assert_nwb => if (!atWordBoundary(input, sp, flags))
+            .assert_nwb => if (!atWordBoundary(input, sp))
                 self.addThread(list_pcs, list_caps, list_pos, n_ptr, pc + 1, sp, caps, input, flags),
             .look => |lnode| {
                 var tmp = [_]CaptureSpan{INVALID_CAP} ** MAX_CAPTURES;
@@ -3977,24 +4505,21 @@ pub fn nativeRegExpExec(arena: std.mem.Allocator, this_val: Value, args: []const
     const last_index = try realm_mod.toLengthValue(arena, li_raw);
 
     const use_li = cr.flags.global or cr.flags.sticky;
-    // Step 8: if neither global nor sticky, the search starts at 0. `lastIndex`
-    // is a UTF-16 code-unit index; the matcher works in WTF-8 byte space, so
-    // convert on the way in and back out (astral chars differ between the two).
-    const from_cu: usize = if (use_li) last_index else 0;
+    // Step 8: if neither global nor sticky, the search starts at 0.
+    const from: usize = if (use_li) last_index else 0;
 
     // An out-of-bounds lastIndex fails immediately (and resets when g/y).
-    if (from_cu > string_proto.cuLen(s)) {
+    if (from > s.len) {
         if (use_li) try setLastIndexThrow(arena, this_val, 0);
         return val_mod.makeNull(arena);
     }
 
-    const from: usize = string_proto.cuByteOf(s, from_cu);
     const result = findMatch(cr, s, from) orelse {
         if (use_li) try setLastIndexThrow(arena, this_val, 0);
         return val_mod.makeNull(arena);
     };
 
-    if (use_li) try setLastIndexThrow(arena, this_val, string_proto.cuIndexOfByte(s, result.state.pos));
+    if (use_li) try setLastIndexThrow(arena, this_val, result.state.pos);
 
     const arr_proto = realm_mod.active_array_proto;
     const arr = try JsObject.createArray(arena, arr_proto);

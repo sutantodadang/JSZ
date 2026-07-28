@@ -219,6 +219,17 @@ pub inline fn opGetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     };
 }
 
+/// Object Environment Record GetBindingValue(N) for a `with`-object (§9.1.1.2.6):
+/// HasProperty(bindings, N) THEN Get(bindings, N). HasBinding already resolved
+/// `wobj` (so the property is normally present), but the spec still performs the
+/// HasProperty — observable as a `has` trap on a Proxy environment — before the
+/// Get. Both run user code and can realloc `self.frames`.
+fn withGetBindingValue(self: *BcVm, wobj: Value, name: []const u8) !Value {
+    const key = try val_mod.makeString(self.arena, name);
+    _ = try self.hasProperty(wobj, key);
+    return self.getProp(wobj, name);
+}
+
 /// GetValue for an identifier Reference resolved by name (GET_GLOBAL, and the
 /// fallback for a GET_REF whose token designates nothing reusable).
 fn getBindingByName(self: *BcVm, frame_in: *BcCallFrame, rdst: u8, name: []const u8) !?RunOutcome {
@@ -232,7 +243,7 @@ fn getBindingByName(self: *BcVm, frame_in: *BcCallFrame, rdst: u8, name: []const
         if (try ownWith(self, frame, name)) |wobj| {
             // The [[Get]] runs a getter (re-entrant) → self.frames can realloc,
             // leaving `frame` dangling. Write through the re-fetched top frame.
-            const v = try self.getProp(wobj, name);
+            const v = try withGetBindingValue(self, wobj, name);
             self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
             return null;
         }
@@ -255,7 +266,7 @@ fn getBindingByName(self: *BcVm, frame_in: *BcCallFrame, rdst: u8, name: []const
         error.ConstAssignment => unreachable, // Can't happen on lookup
         error.NotDefined => {
             if (try inheritedWith(self, frame, name)) |wobj| {
-                const v = try self.getProp(wobj, name);
+                const v = try withGetBindingValue(self, wobj, name);
                 self.frames.items[self.frames.items.len - 1].registers[rdst] = v;
                 return null;
             }
@@ -673,8 +684,14 @@ pub inline fn opPutRef(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
     // whether or not the property is still there (creating it when it is not);
     // in strict code a vanished binding is a ReferenceError instead.
     if (token.bits != 0 and token.unbox() == .object) {
+        // SetMutableBinding(N,V,S) for an object env record (§9.1.1.2.5): a plain
+        // HasProperty — observable as a `has` trap on a Proxy env, and distinct
+        // from the unscopables-aware HasBinding the reference resolution already
+        // ran — THEN [[Set]]. A binding that vanished after resolution is a
+        // ReferenceError in strict code; otherwise the [[Set]] still runs.
         const key = try val_mod.makeString(self.arena, name);
-        if (frame.func.is_strict and !try withHasBinding(self, token, key, name)) {
+        const still_exists = try self.hasProperty(token, key);
+        if (frame.func.is_strict and !still_exists) {
             const msg = try std.fmt.allocPrint(self.arena, "{s} is not defined", .{name});
             const exc_val = try self.makeErrorObjectBc("ReferenceError", msg);
             self.last_exception_value = exc_val;
@@ -745,13 +762,22 @@ pub inline fn opSetGlobal(self: *BcVm, frame: *BcCallFrame) !?RunOutcome {
 
 /// PutValue for an identifier Reference resolved by name (SET_GLOBAL, and the
 /// fallback for a PUT_REF whose token no longer designates a binding).
+/// Object Environment Record SetMutableBinding(N,V) for a `with`-object
+/// (§9.1.1.2.5): HasProperty(bindings, N) — observable as a `has` trap on a Proxy
+/// environment — THEN Set(bindings, N, V). Returns the [[Set]] result.
+fn withSetBindingValue(self: *BcVm, wobj: Value, name: []const u8, value: Value) !bool {
+    const key = try val_mod.makeString(self.arena, name);
+    _ = try self.hasProperty(wobj, key);
+    return self.setPropR(wobj, name, value, wobj);
+}
+
 fn setBindingByName(self: *BcVm, frame_in: *BcCallFrame, name: []const u8, value: Value) !?RunOutcome {
     var frame = frame_in;
     const cur_is_strict = frame.func.is_strict;
     // `with` scopes: assign through an object whose [[HasProperty]] is true.
     if (frame.with_stack.items.len > 0) {
         if (try ownWith(self, frame, name)) |wobj| {
-            const ok = try self.setPropR(wobj, name, value, wobj);
+            const ok = try withSetBindingValue(self, wobj, name, value);
             // A failed assignment (e.g. a non-writable property on the with
             // object) is a TypeError in strict code, a silent no-op otherwise.
             if (!ok and cur_is_strict) {
@@ -789,7 +815,7 @@ fn setBindingByName(self: *BcVm, frame_in: *BcCallFrame, name: []const u8, value
             // inherited from the function's definition site still encloses it,
             // and PutValue writes through it before reaching the global object.
             if (try inheritedWith(self, frame, name)) |wobj| {
-                const ok = try self.setPropR(wobj, name, value, wobj);
+                const ok = try withSetBindingValue(self, wobj, name, value);
                 if (!ok and cur_is_strict) {
                     const msg = try std.fmt.allocPrint(self.arena, "Cannot assign to read only property '{s}'", .{name});
                     const exc_val = try self.makeErrorObjectBc("TypeError", msg);
