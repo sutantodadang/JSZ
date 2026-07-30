@@ -1,0 +1,39 @@
+name: Bench
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    name: jsz vs QuickJS vs Node (ubuntu / ReleaseSafe)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig 0.15.2
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install QuickJS
+        run: sudo apt-get update && sudo apt-get install -y quickjs
+
+      - name: Engine versions
+        run: |
+          echo "qjs: $(qjs --help 2>&1 | head -1)"
+          echo "node: $(node --version)"
+
+      - name: Build jsz (ReleaseSafe — the shipped configuration)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run comparison
+        run: |
+          echo "## Benchmark — jsz vs QuickJS vs Node" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          bash bench/run.sh ./zig-out/bin/jsz | tee -a "$GITHUB_STEP_SUMMARY"
