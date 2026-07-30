@@ -54,6 +54,10 @@ pub const Environment = struct {
     /// declarative scope but hoists its vars to `varScope()`, i.e. the
     /// enclosing function or global scope, per EvalDeclarationInstantiation.
     is_var_scope: bool = false,
+    /// Transient GC mark-phase guard: set when this environment's bindings
+    /// have been traced this collection (cleared by the heap afterwards).
+    /// Prevents re-walking shared chains and closure↔env cycles.
+    gc_seen: bool = false,
 
     pub fn init(arena: std.mem.Allocator, parent: ?*Environment) !*Environment {
         const env = try arena.create(Environment);

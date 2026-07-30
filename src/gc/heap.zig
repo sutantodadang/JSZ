@@ -26,6 +26,7 @@ const std = @import("std");
 // Forward-declare to avoid circular imports.
 const JsObject = @import("../object/object.zig").JsObject;
 const Value = @import("../value/value.zig").Value;
+const Environment = @import("../runtime/execution_context.zig").Environment;
 const HandleScope = @import("./handle.zig").HandleScope;
 const shape_mod = @import("../value/shape.zig");
 
@@ -96,6 +97,14 @@ pub const Heap = struct {
     /// Arena intrinsics visited during the current mark phase (their `gc_seen`
     /// flag is set). Cleared after each collection. See markObject.
     arena_seen: std.ArrayListUnmanaged(*JsObject) = .empty,
+    /// Environments whose bindings were traced this mark phase (gc_seen set);
+    /// flags are cleared after each collection alongside arena_seen.
+    env_seen: std.ArrayListUnmanaged(*Environment) = .empty,
+    /// The realm's global environment — a permanent root. Must live on the
+    /// HEAP, not in a VM scan callback: the bytecode VM (and its callback) is
+    /// created per eval, so a host-triggered collection between evals would
+    /// otherwise run with no roots at all and sweep every live global.
+    global_env_root: ?*anyopaque = null,
     /// Explicit mark worklist (gray set). Marking is iterative, not recursive,
     /// so a deep/long object graph cannot overflow the native stack. Retained
     /// across collections so its capacity is reused. See mark().
@@ -176,6 +185,7 @@ pub const Heap = struct {
         self.extra_roots.deinit(self.backing_allocator);
         self.scan_callbacks.deinit(self.backing_allocator);
         self.arena_seen.deinit(self.backing_allocator);
+        self.env_seen.deinit(self.backing_allocator);
         self.mark_worklist.deinit(self.backing_allocator);
         self.weak_containers.deinit(self.backing_allocator);
         self.remembered.deinit(self.backing_allocator);
@@ -443,9 +453,30 @@ pub const Heap = struct {
             // dangling pointer. (Mirrors gc.traceValue for the root-scan path.)
             .bc_function => |c| {
                 if (c.obj) |o| self.markObject(@ptrCast(@alignCast(o)));
+                // The closure's captured environment chain keeps every bound
+                // value reachable: objects referenced ONLY through a captured
+                // binding were previously never traced and got swept
+                // (use-after-free on the next call — found by the soak test).
+                self.markEnvironment(c.env);
             },
             // Other variants are arena-only; nothing to mark.
             else => {},
+        }
+    }
+
+    /// Trace every binding in an environment chain (environments are
+    /// arena-owned, so only their VALUES need marking). gc_seen dedups shared
+    /// chains and closure↔environment cycles within one mark phase; flags are
+    /// reset after the collection via env_seen.
+    pub fn markEnvironment(self: *Heap, env_any: *anyopaque) void {
+        var cur: ?*Environment = @ptrCast(@alignCast(env_any));
+        while (cur) |e| {
+            if (e.gc_seen) break; // a seen env implies its parents were walked
+            e.gc_seen = true;
+            self.env_seen.append(self.backing_allocator, e) catch {};
+            var it = e.bindings.valueIterator();
+            while (it.next()) |b| self.markValue(b.value);
+            cur = e.parent;
         }
     }
 
@@ -502,6 +533,10 @@ pub const Heap = struct {
     /// Shade every root gray (does NOT drain — callers add extra roots, e.g. the
     /// old generation in a minor GC, then drain once).
     fn markRoots(self: *Heap) void {
+        // 0. The global environment (top-level bindings) — always a root,
+        //    even with no VM alive (host gc() between evals).
+        if (self.global_env_root) |e| self.markEnvironment(e);
+
         // 1. extra_roots
         for (self.extra_roots.items) |vptr| {
             self.markValue(vptr.*);
@@ -570,6 +605,8 @@ pub const Heap = struct {
     fn clearArenaSeen(self: *Heap) void {
         for (self.arena_seen.items) |obj| obj.gc_seen = false;
         self.arena_seen.clearRetainingCapacity();
+        for (self.env_seen.items) |env| env.gc_seen = false;
+        self.env_seen.clearRetainingCapacity();
     }
 
     /// Run the runtime's ephemeron / weak-clearing hook, then compact the weak
@@ -662,14 +699,18 @@ pub const Heap = struct {
         self.processWeak();
         self.clearArenaSeen();
 
+        // Clear the remembered set BEFORE sweeping: it holds old-generation
+        // pointers, clearRemembered() dereferences their headers, and the old
+        // sweep below may free exactly those objects (use-after-free). After a
+        // full collect the set is stale anyway — survivors are all old.
+        self.clearRemembered();
+
         const young = self.young_head;
         const old = self.old_head;
         self.young_head = null;
         self.old_head = null;
         self.sweepInto(young, &stats);
         self.sweepInto(old, &stats);
-        // Survivors are all old now; the remembered set (old→young) is stale.
-        self.clearRemembered();
         self.force_major = false;
 
         const end = std.time.nanoTimestamp();

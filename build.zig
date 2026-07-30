@@ -386,6 +386,24 @@ pub fn build(b: *std.Build) void {
     const gc_stress_step = b.step("gc-stress", "Run Phase 3b GC stress test");
     gc_stress_step.dependOn(&run_gc_stress.step);
 
+    // ---------------------------------------------------------------------------
+    // Soak: zig build soak [-- SCALE] — long-running stability gates
+    //   (eval/context/isolate/interrupt churn with bounded-resource assertions)
+    // ---------------------------------------------------------------------------
+    const soak_exe = b.addExecutable(.{
+        .name = "soak",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/soak.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "jsz", .module = mod }},
+        }),
+    });
+    const run_soak = b.addRunArtifact(soak_exe);
+    if (b.args) |soak_args| run_soak.addArgs(soak_args);
+    const soak_step = b.step("soak", "Run the soak test (churn phases with bounded-resource gates)");
+    soak_step.dependOn(&run_soak.step);
+
     // GC perf benchmark (M19): generational vs mark-sweep. zig build gc-bench
     const gc_bench_exe = b.addExecutable(.{
         .name = "gc-bench",
