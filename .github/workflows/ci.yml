@@ -76,19 +76,22 @@ jobs:
       - name: Install valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
 
-      - name: Build (Debug)
-        run: zig build
+      - name: Build (Debug, baseline CPU — valgrind lacks AVX-512 decode)
+        run: zig build -Dcpu=baseline
 
       - name: Memcheck over differential corpus + GC churn
         run: |
           set -u
           fail=0
           run_one() {
+            local code=0
             valgrind --quiet --error-exitcode=99 --leak-check=no \
-              ./zig-out/bin/jsz "$1" >/dev/null 2>vg.err
-            code=$?
-            if [ "$code" = "99" ]; then
-              echo "MEMCHECK FAIL: $1"
+              ./zig-out/bin/jsz "$1" >/dev/null 2>vg.err || code=$?
+            # 0 = ok, 1 = uncaught JS exception (expected for some corpus
+            # files). 99 = memcheck errors. >=128 = crash signal. Anything
+            # other than 0/1 fails the job and dumps diagnostics.
+            if [ "$code" != "0" ] && [ "$code" != "1" ]; then
+              echo "MEMCHECK/CRASH FAIL (exit $code): $1"
               cat vg.err
               fail=1
             fi
