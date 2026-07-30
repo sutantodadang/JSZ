@@ -526,11 +526,21 @@ pub fn nativeJsonParse(arena: std.mem.Allocator, _: Value, args: []const Value) 
     }
     const result = vn.val;
     if (reviver) |rev| {
+        const realm_mod = @import("../realm.zig");
+        // The parsed tree is reachable only from this native frame until the
+        // wrapper holds it — and the wrapper itself must stay rooted while
+        // reviver calls (which can allocate → collect) walk the tree.
+        var result_root: Value = result;
+        if (realm_mod.active_heap) |h| h.addRoot(&result_root) catch {};
+        defer if (realm_mod.active_heap) |h| h.removeRoot(&result_root);
         // Root holder is a wrapper { "": value } so the reviver sees the root.
-        const wrapper = if (@import("../realm.zig").active_heap) |heap|
-            try JsObject.createOnHeap(heap, @import("../realm.zig").active_object_proto)
+        const wrapper = if (realm_mod.active_heap) |heap|
+            try JsObject.createOnHeap(heap, realm_mod.active_object_proto)
         else
-            try JsObject.create(arena, @import("../realm.zig").active_object_proto);
+            try JsObject.create(arena, realm_mod.active_object_proto);
+        var wrapper_root: Value = try val_mod.makeObject(arena, wrapper);
+        if (realm_mod.active_heap) |h| h.addRoot(&wrapper_root) catch {};
+        defer if (realm_mod.active_heap) |h| h.removeRoot(&wrapper_root);
         try wrapper.set("", result);
         return internalizeJSONProperty(arena, wrapper, "", rev, vn.node);
     }
@@ -772,6 +782,11 @@ const JsonParser = struct {
             try JsObject.createOnHeap(heap, realm_mod.active_object_proto)
         else
             try JsObject.create(self.arena, realm_mod.active_object_proto);
+        // Root the container: child parses allocate and can trigger a
+        // collection while `obj` is reachable only from this native frame.
+        var obj_root: Value = try val_mod.makeObject(self.arena, obj);
+        if (realm_mod.active_heap) |h| h.addRoot(&obj_root) catch {};
+        defer if (realm_mod.active_heap) |h| h.removeRoot(&obj_root);
         var entries = std.ArrayList(SrcNode.Entry){};
         self.skipWs();
         if (self.peek() == '}') {
@@ -817,6 +832,10 @@ const JsonParser = struct {
             try JsObject.createArrayOnHeap(heap, realm_mod.active_array_proto)
         else
             try JsObject.createArray(self.arena, realm_mod.active_array_proto);
+        // Root the container across element parses (see parseObjectN).
+        var arr_root: Value = try val_mod.makeObject(self.arena, arr);
+        if (realm_mod.active_heap) |h| h.addRoot(&arr_root) catch {};
+        defer if (realm_mod.active_heap) |h| h.removeRoot(&arr_root);
         var elements = std.ArrayList(*SrcNode){};
         self.skipWs();
         if (self.peek() == ']') {
@@ -1006,6 +1025,10 @@ const JsonParser = struct {
             try JsObject.createOnHeap(heap, realm_mod.active_object_proto)
         else
             try JsObject.create(self.arena, realm_mod.active_object_proto);
+        // Root the container across member parses (see parseObjectN).
+        var obj_root: Value = try val_mod.makeObject(self.arena, obj);
+        if (realm_mod.active_heap) |h| h.addRoot(&obj_root) catch {};
+        defer if (realm_mod.active_heap) |h| h.removeRoot(&obj_root);
 
         self.skipWs();
         if (self.peek() == '}') {
@@ -1046,6 +1069,10 @@ const JsonParser = struct {
             try JsObject.createArrayOnHeap(heap, realm_mod.active_array_proto)
         else
             try JsObject.createArray(self.arena, realm_mod.active_array_proto);
+        // Root the container across element parses (see parseObjectN).
+        var arr_root: Value = try val_mod.makeObject(self.arena, arr);
+        if (realm_mod.active_heap) |h| h.addRoot(&arr_root) catch {};
+        defer if (realm_mod.active_heap) |h| h.removeRoot(&arr_root);
 
         self.skipWs();
         if (self.peek() == ']') {
