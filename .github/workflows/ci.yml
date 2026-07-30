@@ -13,6 +13,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
         optimize: [Debug, ReleaseSafe]
+        include:
+          # ReleaseFast is not what we ship (releases are ReleaseSafe), but it
+          # strips all safety checks — one leg catches optimize-only UB cheaply.
+          - os: ubuntu-latest
+            optimize: ReleaseFast
 
     steps:
       - uses: actions/checkout@v4
@@ -48,3 +53,48 @@ jobs:
       - name: Conformance delta (known-failing flip gate)
         if: matrix.os == 'ubuntu-latest' && matrix.optimize == 'Debug'
         run: zig build conformance-delta -Doptimize=${{ matrix.optimize }}
+
+  # Valgrind memcheck: Zig's Debug builds emit valgrind client requests, and
+  # Zig safety checks do NOT catch use-after-free / uninitialized reads inside
+  # the custom GC heap — memcheck does. Runs the jsz CLI over the differential
+  # corpus plus a GC-churn script. JS-level failures (nonzero jsz exit) are
+  # ignored here; only memcheck errors (exit 99) fail the job.
+  memcheck:
+    name: valgrind memcheck (ubuntu / Debug)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Zig 0.15.2
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build (Debug)
+        run: zig build
+
+      - name: Memcheck over differential corpus + GC churn
+        run: |
+          set -u
+          fail=0
+          run_one() {
+            valgrind --quiet --error-exitcode=99 --leak-check=no \
+              ./zig-out/bin/jsz "$1" >/dev/null 2>vg.err
+            code=$?
+            if [ "$code" = "99" ]; then
+              echo "MEMCHECK FAIL: $1"
+              cat vg.err
+              fail=1
+            fi
+          }
+          for f in tests/diff_corpus/*.js; do
+            run_one "$f"
+          done
+          run_one tests/valgrind_gc_churn.js
+          exit "$fail"
