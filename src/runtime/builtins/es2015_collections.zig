@@ -319,12 +319,10 @@ fn sameValueZero(a: Value, b: Value) bool {
 fn getMapDataBranded(arena: std.mem.Allocator, this_val: Value) anyerror!*MapData {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "Map method called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     if (obj.internal_kind != .map or obj.internal_slot == null) {
         try setTypeError(arena, "Method called on incompatible receiver (not a Map)");
-        unreachable;
     }
     return @ptrCast(@alignCast(obj.internal_slot.?));
 }
@@ -332,12 +330,10 @@ fn getMapDataBranded(arena: std.mem.Allocator, this_val: Value) anyerror!*MapDat
 fn getSetDataBranded(arena: std.mem.Allocator, this_val: Value) anyerror!*SetData {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "Set method called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     if (obj.internal_kind != .set or obj.internal_slot == null) {
         try setTypeError(arena, "Method called on incompatible receiver (not a Set)");
-        unreachable;
     }
     return @ptrCast(@alignCast(obj.internal_slot.?));
 }
@@ -505,7 +501,7 @@ fn isTruthy(v: Value) bool {
     return val_mod.toBoolean(v);
 }
 
-fn setTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror!void {
+fn setTypeError(arena: std.mem.Allocator, msg: []const u8) anyerror!noreturn {
     realm_mod.pending_exception = try makeTypeErrorVal(arena, msg);
     return error.JsException;
 }
@@ -534,7 +530,6 @@ fn iteratorCloseThrowing(arena: std.mem.Allocator, iter: Value) anyerror!void {
     if (ret_fn.bits == 0 or ret_fn.unbox() == .undefined_ or ret_fn.unbox() == .null_) return;
     if (!isCallable(ret_fn)) {
         try setTypeError(arena, "iterator return is not callable");
-        unreachable;
     }
     _ = try function_proto.invokeCallback(arena, iter, ret_fn, &[_]Value{});
 }
@@ -553,7 +548,6 @@ fn jsGet(arena: std.mem.Allocator, obj_val: Value, key: []const u8) anyerror!Val
 fn requireObjectIter(arena: std.mem.Allocator, this_val: Value) anyerror!void {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "Iterator method called on non-object");
-        unreachable;
     }
 }
 
@@ -563,7 +557,6 @@ fn requireObjectIter(arena: std.mem.Allocator, this_val: Value) anyerror!void {
 fn getIteratorDirect(arena: std.mem.Allocator, this_val: Value) anyerror!SourceIter {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "Iterator method called on non-object");
-        unreachable;
     }
     const next_fn = try jsGet(arena, this_val, "next");
     return SourceIter{ .source = this_val, .next_fn = next_fn };
@@ -575,7 +568,6 @@ fn iterStep(arena: std.mem.Allocator, source: Value, next_fn: Value) anyerror!?V
     const result = try function_proto.invokeCallback(arena, source, next_fn, &[_]Value{});
     if (result.bits == 0 or result.unbox() != .object) {
         try setTypeError(arena, "iterator result is not an object");
-        unreachable;
     }
     const done_v = try jsGet(arena, result, "done");
     if (isTruthy(done_v)) return null;
@@ -585,12 +577,10 @@ fn iterStep(arena: std.mem.Allocator, source: Value, next_fn: Value) anyerror!?V
 fn getWeakMapData(arena: std.mem.Allocator, this_val: Value) anyerror!*MapData {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "WeakMap method called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     if (obj.internal_kind != .weakmap or obj.internal_slot == null) {
         try setTypeError(arena, "Method called on incompatible receiver (not a WeakMap)");
-        unreachable;
     }
     return @ptrCast(@alignCast(obj.internal_slot.?));
 }
@@ -598,12 +588,10 @@ fn getWeakMapData(arena: std.mem.Allocator, this_val: Value) anyerror!*MapData {
 fn getWeakSetData(arena: std.mem.Allocator, this_val: Value) anyerror!*SetData {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "WeakSet method called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     if (obj.internal_kind != .weakset or obj.internal_slot == null) {
         try setTypeError(arena, "Method called on incompatible receiver (not a WeakSet)");
-        unreachable;
     }
     return @ptrCast(@alignCast(obj.internal_slot.?));
 }
@@ -614,7 +602,6 @@ pub fn nativeWeakMapSet(arena: std.mem.Allocator, this_val: Value, args: []const
     const data = try getWeakMapData(arena, this_val);
     if (args.len < 1 or !canBeWeakKey(args[0])) {
         try setTypeError(arena, "Invalid value used as weak map key");
-        unreachable;
     }
     const key = args[0];
     const val = if (args.len >= 2) args[1] else try val_mod.makeUndefined(arena);
@@ -659,7 +646,6 @@ pub fn nativeWeakMapGetOrInsert(arena: std.mem.Allocator, this_val: Value, args:
     const data = try getWeakMapData(arena, this_val);
     if (args.len < 1 or !canBeWeakKey(args[0])) {
         try setTypeError(arena, "Invalid value used as weak map key");
-        unreachable;
     }
     const key = args[0];
     const default_val = if (args.len >= 2) args[1] else try val_mod.makeUndefined(arena);
@@ -677,7 +663,6 @@ pub fn nativeWeakMapGetOrInsertComputed(arena: std.mem.Allocator, this_val: Valu
     const cb = if (args.len >= 2) args[1] else Value{};
     if (!isCallable(cb)) {
         try setTypeError(arena, "callbackfn is not callable");
-        unreachable;
     }
     const key = if (args.len >= 1) args[0] else try val_mod.makeUndefined(arena);
     // Step 4: look up key (before weak-key check per spec).
@@ -687,7 +672,6 @@ pub fn nativeWeakMapGetOrInsertComputed(arena: std.mem.Allocator, this_val: Valu
     // Step 5: weak-key check (after lookup per spec).
     if (!canBeWeakKey(key)) {
         try setTypeError(arena, "Invalid value used as weak map key");
-        unreachable;
     }
     // Step 6: call callbackfn(key).
     const computed = try function_proto.invokeCallback(arena, try val_mod.makeUndefined(arena), cb, &.{key});
@@ -710,7 +694,6 @@ pub fn nativeWeakSetAdd(arena: std.mem.Allocator, this_val: Value, args: []const
     const data = try getWeakSetData(arena, this_val);
     if (args.len == 0 or !canBeWeakKey(args[0])) {
         try setTypeError(arena, "Invalid value used as weak set value");
-        unreachable;
     }
     for (data.values.items) |v| if (strictEq(v, args[0])) return this_val;
     try data.values.append(arena, args[0]);
@@ -745,12 +728,10 @@ const WeakRefData = struct {
 fn getWeakRefData(arena: std.mem.Allocator, this_val: Value) anyerror!*WeakRefData {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "WeakRef method called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     if (obj.internal_kind != .weakref or obj.internal_slot == null) {
         try setTypeError(arena, "Method called on incompatible receiver (not a WeakRef)");
-        unreachable;
     }
     return @ptrCast(@alignCast(obj.internal_slot.?));
 }
@@ -802,12 +783,10 @@ const FinRegData = struct {
 fn getFinRegData(arena: std.mem.Allocator, this_val: Value) anyerror!*FinRegData {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "FinalizationRegistry method called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     if (obj.internal_kind != .finalization_registry or obj.internal_slot == null) {
         try setTypeError(arena, "Method called on incompatible receiver (not a FinalizationRegistry)");
-        unreachable;
     }
     return @ptrCast(@alignCast(obj.internal_slot.?));
 }
@@ -840,20 +819,17 @@ pub fn nativeFinRegRegister(arena: std.mem.Allocator, this_val: Value, args: []c
     const target = if (args.len > 0) args[0] else Value{};
     if (!canBeWeakKey(target)) {
         try setTypeError(arena, "Invalid value used as WeakRef target");
-        unreachable;
     }
     const held_value = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
     // Step 4: SameValue(target, heldValue) must be false
     if (strictEq(target, held_value)) {
         try setTypeError(arena, "target and heldValue must not be the same value");
-        unreachable;
     }
     // Step 5: unregisterToken validation
     const token_raw = if (args.len > 2) args[2] else Value{};
     const has_token = token_raw.bits != 0 and token_raw.unbox() != .undefined_;
     if (has_token and !canBeWeakKey(token_raw)) {
         try setTypeError(arena, "Invalid value used as unregisterToken");
-        unreachable;
     }
     try data.cells.append(arena, .{
         .target = target,
@@ -869,7 +845,6 @@ pub fn nativeFinRegUnregister(arena: std.mem.Allocator, this_val: Value, args: [
     const token = if (args.len > 0) args[0] else Value{};
     if (!canBeWeakKey(token)) {
         try setTypeError(arena, "Invalid value used as unregisterToken");
-        unreachable;
     }
     var removed = false;
     var i: usize = 0;
@@ -1025,7 +1000,6 @@ fn iterableWeakInit(
     };
     if (!isCallable(adder)) {
         try setTypeError(arena, adder_name ++ " is not callable");
-        unreachable;
     }
 
     // GetIterator(iterable)
@@ -1064,7 +1038,6 @@ fn iterableWeakInit(
             if (item.bits == 0 or item.unbox() != .object) {
                 closeIterator(arena, iter);
                 try setTypeError(arena, "Iterator value is not an object");
-                unreachable;
             }
             // Get key (index "0") and value (index "1")
             const k: Value = blk: {
@@ -1169,7 +1142,6 @@ pub fn nativeMapForEach(arena: std.mem.Allocator, this_val: Value, args: []const
     const data = try getMapDataBranded(arena, this_val);
     if (args.len == 0 or !isCallable(args[0])) {
         try setTypeError(arena, "Map.prototype.forEach: callbackfn is not callable");
-        unreachable;
     }
     const cb = args[0];
     const cb_this = if (args.len >= 2) args[1] else try val_mod.makeUndefined(arena);
@@ -1212,7 +1184,6 @@ pub fn nativeMapGetOrInsertComputed(arena: std.mem.Allocator, this_val: Value, a
     const cb = if (args.len > 1) args[1] else try val_mod.makeUndefined(arena);
     if (!isCallable(cb)) {
         try setTypeError(arena, "Map.prototype.getOrInsertComputed: callbackfn is not callable");
-        unreachable;
     }
     const key = try canonicalKey(arena, raw_key);
     // Step 5: if key already present, return existing value (no callback).
@@ -1279,7 +1250,6 @@ pub fn nativeSetForEach(arena: std.mem.Allocator, this_val: Value, args: []const
     const data = try getSetDataBranded(arena, this_val);
     if (args.len == 0 or !isCallable(args[0])) {
         try setTypeError(arena, "Set.prototype.forEach: callbackfn is not callable");
-        unreachable;
     }
     const cb = args[0];
     const cb_this = if (args.len >= 2) args[1] else try val_mod.makeUndefined(arena);
@@ -1375,7 +1345,6 @@ pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
     // Step 2: if Type(O) is not Object, throw a TypeError (spec 24.1.5.2.1).
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "Map Iterator next called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     // Brand check: %MapIteratorPrototype%.next on a non-iterator receiver (e.g. a
@@ -1383,7 +1352,6 @@ pub fn nativeMapIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
     // confusion → segfault).
     if (obj.internal_kind != .map_iterator or obj.internal_slot == null) {
         try setTypeError(arena, "Method called on incompatible receiver (not a Map Iterator)");
-        unreachable;
     }
     const iter: *MapIterData = @ptrCast(@alignCast(obj.internal_slot.?));
     if (iter.done or iter.index >= iter.map.keys.items.len) {
@@ -1413,14 +1381,12 @@ pub fn nativeSetIteratorNext(arena: std.mem.Allocator, this_val: Value, _: []con
     // Step 2: if Type(O) is not Object, throw a TypeError (spec 24.2.5.2.1).
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "Set Iterator next called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     // Brand check (see nativeMapIteratorNext): non-iterator receiver → TypeError,
     // never a wrong-type @ptrCast.
     if (obj.internal_kind != .set_iterator or obj.internal_slot == null) {
         try setTypeError(arena, "Method called on incompatible receiver (not a Set Iterator)");
-        unreachable;
     }
     const iter: *SetIterData = @ptrCast(@alignCast(obj.internal_slot.?));
     if (iter.done or iter.index >= iter.set.values.items.len) {
@@ -1459,11 +1425,9 @@ fn getSetRecord(arena: std.mem.Allocator, other: Value) anyerror!SetRecord {
     // Step 1: obj must be an Object.
     if (other.bits == 0 or other.unbox() != .object) {
         try setTypeError(arena, "argument must be a Set-like object");
-        unreachable;
     }
     const ctx = realm_mod.active_context orelse {
         try setTypeError(arena, "no active context");
-        unreachable;
     };
     // Step 2: rawSize = Get(obj, "size"). Observable — invokes accessor getters
     // and walks the prototype chain (class-based set-likes define `size` as a
@@ -1474,7 +1438,6 @@ fn getSetRecord(arena: std.mem.Allocator, other: Value) anyerror!SetRecord {
     // Step 5: numSize is NaN → TypeError (also covers rawSize === undefined).
     if (std.math.isNan(num_size)) {
         try setTypeError(arena, "Set-like object must have a numeric size");
-        unreachable;
     }
     // Step 6: intSize = ToIntegerOrInfinity(numSize) (truncate toward zero).
     const int_size = if (std.math.isInf(num_size)) num_size else std.math.trunc(num_size);
@@ -1484,13 +1447,11 @@ fn getSetRecord(arena: std.mem.Allocator, other: Value) anyerror!SetRecord {
     const has_v = try ctx.getProp(arena, other, "has");
     if (!isCallable(has_v)) {
         try setTypeError(arena, "Set-like object must have a callable has");
-        unreachable;
     }
     // Step 10: keys = Get(obj, "keys"); must be callable.
     const keys_v = try ctx.getProp(arena, other, "keys");
     if (!isCallable(keys_v)) {
         try setTypeError(arena, "Set-like object must have a callable keys");
-        unreachable;
     }
     return .{ .obj = other, .has = has_v, .keys = keys_v, .size = int_size };
 }
@@ -1548,12 +1509,10 @@ fn openKeysIterator(arena: std.mem.Allocator, rec: SetRecord) !KeysIter {
     const iter = try function_proto.invokeCallback(arena, rec.obj, rec.keys, &.{});
     if (iter.bits == 0 or iter.unbox() != .object) {
         try setTypeError(arena, "keys() did not return an object");
-        unreachable;
     }
     const next_fn = try readPropObs(arena, iter, "next");
     if (!isCallable(next_fn)) {
         try setTypeError(arena, "keys() iterator has no callable next");
-        unreachable;
     }
     return .{ .iter = iter, .next_fn = next_fn };
 }
@@ -1739,7 +1698,6 @@ pub fn nativeMapGroupBy(arena: std.mem.Allocator, _: Value, args: []const Value)
     // Map.groupBy(items, callbackfn)
     if (args.len < 2 or !isCallable(args[1])) {
         try setTypeError(arena, "Map.groupBy: callbackfn must be callable");
-        unreachable;
     }
     const items = args[0];
     const cb = args[1];
@@ -1789,7 +1747,6 @@ pub fn nativeObjectGroupBy(arena: std.mem.Allocator, _: Value, args: []const Val
     // Object.groupBy(items, callbackfn)
     if (args.len < 2 or !isCallable(args[1])) {
         try setTypeError(arena, "Object.groupBy: callbackfn must be callable");
-        unreachable;
     }
     const items = args[0];
     const cb = args[1];
@@ -1964,12 +1921,10 @@ fn makeIteratorHelper(arena: std.mem.Allocator, d: *IterHelperData) !Value {
 fn getIterHelperData(arena: std.mem.Allocator, this_val: Value) anyerror!*IterHelperData {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "Iterator Helper method called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     if (obj.internal_kind != .iterator_helper or obj.internal_slot == null) {
         try setTypeError(arena, "Iterator Helper method called on wrong type");
-        unreachable;
     }
     return @ptrCast(@alignCast(obj.internal_slot.?));
 }
@@ -1997,13 +1952,11 @@ fn nativeIterTagGet(arena: std.mem.Allocator, _: Value, _: []const Value) anyerr
 fn iterProtoIgnoringSetter(arena: std.mem.Allocator, this_val: Value, v: Value, is_tag: bool) anyerror!Value {
     if (this_val.bits == 0 or this_val.unbox() != .object) {
         try setTypeError(arena, "Iterator.prototype setter called on non-object");
-        unreachable;
     }
     const obj = this_val.toPtr().object;
     if (active_iterator_proto) |home| {
         if (obj == home) {
             try setTypeError(arena, "Cannot assign to read-only property of %Iterator.prototype%");
-            unreachable;
         }
     }
     const all: PropAttr = .{ .writable = true, .enumerable = true, .configurable = true };
@@ -2014,7 +1967,6 @@ fn iterProtoIgnoringSetter(arena: std.mem.Allocator, this_val: Value, v: Value, 
         } else {
             if (!obj.extensible) {
                 try setTypeError(arena, "Cannot define property on non-extensible object");
-                unreachable;
             }
             _ = try obj.defineOwnDataSym(sym, v, all);
         }
@@ -2024,7 +1976,6 @@ fn iterProtoIgnoringSetter(arena: std.mem.Allocator, this_val: Value, v: Value, 
         } else {
             if (!obj.extensible) {
                 try setTypeError(arena, "Cannot define property on non-extensible object");
-                unreachable;
             }
             _ = try obj.defineOwnData("constructor", v, all);
         }
@@ -2166,7 +2117,6 @@ fn nativeWrapReturn(arena: std.mem.Allocator, this_val: Value, _: []const Value)
         return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     if (!isCallable(ret_fn)) {
         try setTypeError(arena, "return is not callable");
-        unreachable;
     }
     return function_proto.invokeCallback(arena, d.source, ret_fn, &[_]Value{});
 }
@@ -3314,7 +3264,6 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
     // own next() while it is still running is a TypeError, not infinite recursion.
     if (d.running) {
         try setTypeError(arena, "Iterator helper is already running");
-        unreachable;
     }
     if (d.done) return makeIteratorResult(arena, try val_mod.makeUndefined(arena), true);
     d.started = true;
@@ -3488,7 +3437,6 @@ fn nativeIterHelperNext(arena: std.mem.Allocator, this_val: Value, _: []const Va
                     if (it.bits == 0 or it.unbox() != .object) {
                         d.done = true;
                         try setTypeError(arena, "Iterator.concat: [Symbol.iterator]() returned a non-object");
-                        unreachable;
                     }
                     const nf = jsGet(arena, it, "next") catch |e| {
                         d.done = true;
@@ -3708,7 +3656,6 @@ fn nativeIterHelperReturn(arena: std.mem.Allocator, this_val: Value, _: []const 
         this_val.toPtr().object.internal_slot == null)
     {
         try setTypeError(arena, "Iterator Helper method called on wrong type");
-        unreachable;
     }
     if (this_val.bits != 0 and this_val.unbox() == .object) {
         const obj = this_val.toPtr().object;
@@ -3719,7 +3666,6 @@ fn nativeIterHelperReturn(arena: std.mem.Allocator, this_val: Value, _: []const 
                 // inner iterator's own return() calls back) is a TypeError.
                 if (d.running) {
                     try setTypeError(arena, "Iterator helper is already running");
-                    unreachable;
                 }
                 if (!d.done) {
                     d.done = true;
@@ -3739,7 +3685,6 @@ fn nativeIterHelperReturn(arena: std.mem.Allocator, this_val: Value, _: []const 
             } else if (d.kind == .zip or d.kind == .zipKeyed) {
                 if (d.running) {
                     try setTypeError(arena, "Iterator helper is already running");
-                    unreachable;
                 }
                 if (!d.done) {
                     d.done = true;
@@ -3762,7 +3707,6 @@ fn nativeIterHelperReturn(arena: std.mem.Allocator, this_val: Value, _: []const 
                     d.done = true;
                     if (d.running) {
                         try setTypeError(arena, "Iterator helper is already running");
-                        unreachable;
                     }
                     d.running = true;
                     defer d.running = false;
@@ -3792,7 +3736,6 @@ fn nativeIterMap(arena: std.mem.Allocator, this_val: Value, args: []const Value)
     if (!isCallable(cb)) {
         closeIterator(arena, this_val);
         try setTypeError(arena, "Iterator.prototype.map: callback is not a function");
-        unreachable;
     }
     const it = try getIteratorDirect(arena, this_val);
     const d = try arena.create(IterHelperData);
@@ -3806,7 +3749,6 @@ fn nativeIterFilter(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (!isCallable(cb)) {
         closeIterator(arena, this_val);
         try setTypeError(arena, "Iterator.prototype.filter: callback is not a function");
-        unreachable;
     }
     const it = try getIteratorDirect(arena, this_val);
     const d = try arena.create(IterHelperData);
@@ -3863,7 +3805,6 @@ fn nativeIterFlatMap(arena: std.mem.Allocator, this_val: Value, args: []const Va
     if (!isCallable(cb)) {
         closeIterator(arena, this_val);
         try setTypeError(arena, "Iterator.prototype.flatMap: callback is not a function");
-        unreachable;
     }
     const it = try getIteratorDirect(arena, this_val);
     const d = try arena.create(IterHelperData);
@@ -3881,7 +3822,6 @@ fn nativeIterReduce(arena: std.mem.Allocator, this_val: Value, args: []const Val
     if (!isCallable(reducer)) {
         closeIterator(arena, this_val);
         try setTypeError(arena, "Iterator.prototype.reduce: reducer is not a function");
-        unreachable;
     }
     const it = try getIteratorDirect(arena, this_val);
     const undef = try val_mod.makeUndefined(arena);
@@ -3906,7 +3846,6 @@ fn nativeIterReduce(arena: std.mem.Allocator, this_val: Value, args: []const Val
     }
     if (!has_acc) {
         try setTypeError(arena, "Iterator.prototype.reduce: reduce of empty iterator with no initial value");
-        unreachable;
     }
     return acc;
 }
@@ -3936,7 +3875,6 @@ fn nativeIterForEach(arena: std.mem.Allocator, this_val: Value, args: []const Va
     if (!isCallable(cb)) {
         closeIterator(arena, this_val);
         try setTypeError(arena, "Iterator.prototype.forEach: callback is not a function");
-        unreachable;
     }
     const it = try getIteratorDirect(arena, this_val);
     const undef = try val_mod.makeUndefined(arena);
@@ -3960,7 +3898,6 @@ fn nativeIterSome(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (!isCallable(cb)) {
         closeIterator(arena, this_val);
         try setTypeError(arena, "Iterator.prototype.some: callback is not a function");
-        unreachable;
     }
     const it = try getIteratorDirect(arena, this_val);
     var counter: u64 = 0;
@@ -3989,7 +3926,6 @@ fn nativeIterEvery(arena: std.mem.Allocator, this_val: Value, args: []const Valu
     if (!isCallable(cb)) {
         closeIterator(arena, this_val);
         try setTypeError(arena, "Iterator.prototype.every: callback is not a function");
-        unreachable;
     }
     const it = try getIteratorDirect(arena, this_val);
     var counter: u64 = 0;
@@ -4016,7 +3952,6 @@ fn nativeIterFind(arena: std.mem.Allocator, this_val: Value, args: []const Value
     if (!isCallable(cb)) {
         closeIterator(arena, this_val);
         try setTypeError(arena, "Iterator.prototype.find: callback is not a function");
-        unreachable;
     }
     const it = try getIteratorDirect(arena, this_val);
     var counter: u64 = 0;
@@ -4051,7 +3986,6 @@ fn iterJoinToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
         .bigint => try val_mod.bigIntToString(arena, v.unbox().bigint),
         .symbol => {
             try setTypeError(arena, "Cannot convert a Symbol value to a string");
-            unreachable;
         },
         else => blk: {
             const prim = (try coercion.toPrimitive(arena, v, .string)) orelse v;
