@@ -6681,3 +6681,42 @@ test "Phase 12 boxed S6: self-recursion runs native-to-native (direct dispatch)"
     const r = try runJitScript(src);
     try std.testing.expectEqual(@as(f64, 5), r.unbox().number);
 }
+
+test "JIT boxed division compiles a hot leaf and stays exact" {
+    const compiler_mod = @import("../bytecode/compiler.zig");
+    const ast_mod = @import("../parser/ast.zig");
+    const parser_mod = @import("../parser/parser.zig");
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        "function half(x){ return x/2; } var r=0; for(var i=0;i<60;i++){ r=half(7); } r;";
+    var parser = parser_mod.Parser.init(src, arena);
+    const parsed = parser.parseScript();
+    const statements = switch (parsed) {
+        .ok => |value| value,
+        .err => return error.ParseFailed,
+    };
+    const program = ast_mod.Program{ .body = statements };
+    const main_func = try compiler_mod.compileProgram(arena, &program, "<test>");
+
+    var realm = try Realm.init(arena);
+    defer realm.deinit();
+
+    var jit = jit_mod.JitCompiler.initMode(std.testing.allocator, .experimental);
+    defer jit.deinit();
+
+    var vm = BcVm.init(arena, &realm);
+    vm.jit = &jit;
+    const outcome = try vm.run(main_func, @ptrCast(realm.global_env));
+    const result = switch (outcome) {
+        .ok => |value| value,
+        else => return error.DidNotComplete,
+    };
+    try std.testing.expectEqual(@as(f64, 3.5), result.unbox().number);
+    if (comptime build_options.jit_enabled) {
+        try std.testing.expect(jit.compiled > 0);
+    }
+}

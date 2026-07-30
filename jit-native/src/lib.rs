@@ -622,7 +622,7 @@ pub(crate) fn emit_is_number(fb: &mut FunctionBuilder, v: Value) -> Value {
 
 /// Decode a boxed number to f64 (branchless select): SMI payload as f64, or the
 /// offset-double. Caller guards `isNumber`.
-fn emit_to_f64(fb: &mut FunctionBuilder, v: Value) -> Value {
+pub(crate) fn emit_to_f64(fb: &mut FunctionBuilder, v: Value) -> Value {
     let is = emit_is_smi(fb, v);
     let xi = emit_unbox_smi(fb, v);
     let xf = fb.ins().fcvt_from_sint(types::F64, xi);
@@ -634,7 +634,7 @@ fn emit_to_f64(fb: &mut FunctionBuilder, v: Value) -> Value {
 /// Box an f64 back to a `Value` exactly as `value.zig:makeNumber`: an SMI when it
 /// is an integer in i32 range AND not `-0`, else an offset-double. Fragments the
 /// CFG; returns the boxed value and the merge block.
-fn emit_box_f64(fb: &mut FunctionBuilder, f: Value) -> (Value, Block) {
+pub(crate) fn emit_box_f64(fb: &mut FunctionBuilder, f: Value) -> (Value, Block) {
     let smi_blk = fb.create_block();
     let dbl_blk = fb.create_block();
     let done = fb.create_block();
@@ -795,7 +795,7 @@ fn compile_int_block_impl(request: CompileRequest<'_>) -> Option<*const c_void> 
     let mut pc = 0usize;
     while pc < code.len() {
         let op = code[pc];
-        let size = int_instr_size(op)?;
+        let size = int_instr_size(op).or_else(|| if boxed { numeric::boxed_instr_size(op) } else { None })?;
         if pc + size > code.len() {
             return None; // truncated
         }
@@ -950,7 +950,7 @@ fn compile_int_block_impl(request: CompileRequest<'_>) -> Option<*const c_void> 
                 terminated = false;
             }
             let op = code[pc];
-            let size = int_instr_size(op)?;
+            let size = int_instr_size(op).or_else(|| if boxed { numeric::boxed_instr_size(op) } else { None })?;
             let next = pc + size;
             match op {
                 OP_LOAD_K => {
@@ -1034,7 +1034,7 @@ fn compile_int_block_impl(request: CompileRequest<'_>) -> Option<*const c_void> 
                         },
                     );
                 }
-                op if numeric::instr_size(op).is_some() => {
+                op if numeric::instr_size(op).is_some() || (boxed && numeric::boxed_instr_size(op).is_some()) => {
                     cur = numeric::emit(
                         &mut fb,
                         numeric::EmitRequest {

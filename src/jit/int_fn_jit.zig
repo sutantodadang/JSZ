@@ -449,6 +449,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
             .HOIST_LEX => {},
             .INIT_LEX => {},
             .ADD, .SUB, .MUL, .BIT_AND, .BIT_OR, .BIT_XOR, .SHL, .SHR, .USHR, .BIT_NOT, .TO_NUMERIC, .INC, .DEC => {},
+            .DIV, .MOD, .NEG => if (!boxed) return .never,
             .MOVE, .RETURN, .JMP, .JMP_IF_TRUE, .JMP_IF_FALSE => {},
             .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE, .NOT => {
                 // Boolean containment: the result reg (operand 0) must be read by
