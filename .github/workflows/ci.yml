@@ -50,6 +50,9 @@ jobs:
       - name: Embedding example compiles + runs
         run: zig build example-embed -Doptimize=${{ matrix.optimize }}
 
+      - name: C ABI example compiles + runs (examples/embed.c via libjsz)
+        run: zig build example-capi -Doptimize=${{ matrix.optimize }}
+
       - name: Conformance delta (known-failing flip gate)
         if: matrix.os == 'ubuntu-latest' && matrix.optimize == 'Debug'
         run: zig build conformance-delta -Doptimize=${{ matrix.optimize }}

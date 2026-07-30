@@ -343,6 +343,37 @@ host sees total = 2
 `globalObject`/`getProperty`/`valueToDisplayString` end to end — read it
 alongside this document.
 
+## Embedding from C (and Rust, Go, ...)
+
+A C ABI wraps the same Isolate/Context/eval surface for any language with a
+C FFI. Build the shared library and header, then link `-ljsz`:
+
+```sh
+$ zig build capi          # zig-out: libjsz.{so,dylib} / jsz.dll+jsz.lib, include/jsz.h
+$ zig build example-capi  # compile + run examples/embed.c (the CI gate)
+```
+
+```c
+#include "jsz.h"
+
+jsz_isolate *iso = jsz_isolate_new();
+jsz_context *ctx = jsz_context_new(iso);
+jsz_context_set_limits(ctx, 64 << 20, 10 * 1000 * 1000, 100); /* untrusted input */
+if (jsz_eval(ctx, "6 * 7", NULL) == JSZ_OK)
+    printf("%s\n", jsz_last_string(ctx)); /* "42" */
+jsz_context_free(ctx);
+jsz_isolate_free(iso);
+```
+
+Status codes: `JSZ_OK` / `JSZ_EXCEPTION` / `JSZ_PARSE_ERROR` / `JSZ_ERR_NOMEM`.
+`jsz_last_string` returns the result's display string (or the error message)
+and stays valid until the next `jsz_eval` on that context; `jsz_last_number`
+extracts a JS number result. Sources are copied on eval, so the caller may
+free them immediately. The full contract is documented in
+[include/jsz.h](../include/jsz.h); `examples/embed.c` is the runnable
+reference. Native-function registration across the C boundary is not exposed
+yet — embed from Zig if you need host callbacks today.
+
 ## Further reading
 
 - [docs/getting-started.md](getting-started.md) — zero-to-running tutorial
