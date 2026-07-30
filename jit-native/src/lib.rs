@@ -21,6 +21,9 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 
+mod bitwise;
+mod numeric;
+
 /// Build a fresh JIT module configured for the host ISA.
 fn make_module() -> Option<JITModule> {
     let mut flag_builder = settings::builder();
@@ -368,6 +371,12 @@ pub struct PropSite {
 
 /// Encoded instruction byte length for the supported opcodes; `None` aborts.
 fn int_instr_size(op: u8) -> Option<usize> {
+    if let Some(size) = bitwise::instr_size(op) {
+        return Some(size);
+    }
+    if let Some(size) = numeric::instr_size(op) {
+        return Some(size);
+    }
     Some(match op {
         OP_LOAD_K => 4,
         OP_LOAD_TRUE | OP_LOAD_FALSE | OP_LOAD_UNDEF => 2,
@@ -444,7 +453,16 @@ pub unsafe extern "C" fn jsz_clif_compile_int_block(
     } else {
         unsafe { std::slice::from_raw_parts(kidx_to_slot, n_kidx) }
     };
-    compile_int_block_impl(code, slots, false, &[], 0, 0, 0, 0).unwrap_or(std::ptr::null())
+    compile_int_block_impl(CompileRequest {
+        code,
+        kidx_to_slot: slots,
+        boxed: false,
+        prop_sites: &[],
+        get_helper: 0,
+        set_helper: 0,
+        call_helper: 0,
+    })
+    .unwrap_or(std::ptr::null())
 }
 
 /// Phase 12 boxed tier — compile the same opcode subset as
@@ -476,7 +494,7 @@ pub unsafe extern "C" fn jsz_clif_compile_boxed_block(
     get_helper: u64,
     set_helper: u64,
     call_helper: u64,
-    closure_helper: u64,
+    _closure_helper: u64,
 ) -> *const c_void {
     if code.is_null() || len == 0 {
         return std::ptr::null();
@@ -492,8 +510,16 @@ pub unsafe extern "C" fn jsz_clif_compile_boxed_block(
     } else {
         unsafe { std::slice::from_raw_parts(prop_sites, n_prop_sites) }
     };
-    compile_int_block_impl(code, slots, true, sites, get_helper, set_helper, call_helper, closure_helper)
-        .unwrap_or(std::ptr::null())
+    compile_int_block_impl(CompileRequest {
+        code,
+        kidx_to_slot: slots,
+        boxed: true,
+        prop_sites: sites,
+        get_helper,
+        set_helper,
+        call_helper,
+    })
+    .unwrap_or(std::ptr::null())
 }
 
 /// Largest integer exactly representable as an f64 (`2^53`). A JS number stays
@@ -548,13 +574,13 @@ const I32_MIN_I64: i64 = -2147483648;
 const I32_MAX_I64: i64 = 2147483647;
 
 /// `(bits & NumberTag) == NumberTag` — true when `v` is an inline int32 SMI.
-fn emit_is_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
+pub(crate) fn emit_is_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
     let masked = fb.ins().band_imm(v, NUMBER_TAG as i64);
     fb.ins().icmp_imm(IntCC::Equal, masked, NUMBER_TAG as i64)
 }
 
 /// Decode an SMI payload: `sext_i64(i32(bits & 0xffffffff))`. Caller guards isSmi.
-fn emit_unbox_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
+pub(crate) fn emit_unbox_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
     let lo = fb.ins().band_imm(v, 0xffff_ffff);
     let i32v = fb.ins().ireduce(types::I32, lo);
     fb.ins().sextend(types::I64, i32v)
@@ -563,7 +589,7 @@ fn emit_unbox_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
 /// Box an i64 back to a `Value` exactly as `value.zig:makeNumber`: an SMI when it
 /// fits i32, else an offset-double. Fragments the CFG (range branch) — returns
 /// the boxed value and the merge block; the caller must set its current block.
-fn emit_box_i64(fb: &mut FunctionBuilder, r: Value) -> (Value, Block) {
+pub(crate) fn emit_box_i64(fb: &mut FunctionBuilder, r: Value) -> (Value, Block) {
     let smi_blk = fb.create_block();
     let dbl_blk = fb.create_block();
     let done = fb.create_block();
@@ -589,7 +615,7 @@ fn emit_box_i64(fb: &mut FunctionBuilder, r: Value) -> (Value, Block) {
 }
 
 /// `(bits & NumberTag) != 0` — true when `v` is any number (SMI or double).
-fn emit_is_number(fb: &mut FunctionBuilder, v: Value) -> Value {
+pub(crate) fn emit_is_number(fb: &mut FunctionBuilder, v: Value) -> Value {
     let masked = fb.ins().band_imm(v, NUMBER_TAG as i64);
     fb.ins().icmp_imm(IntCC::NotEqual, masked, 0)
 }
@@ -740,19 +766,28 @@ fn slot_of(kidx_to_slot: &[i32], kidx: u16) -> Option<i32> {
     }
 }
 
-fn compile_int_block_impl(
-    code: &[u8],
-    kidx_to_slot: &[i32],
+struct CompileRequest<'a> {
+    code: &'a [u8],
+    kidx_to_slot: &'a [i32],
     boxed: bool,
-    prop_sites: &[PropSite],
+    prop_sites: &'a [PropSite],
     get_helper: u64,
     set_helper: u64,
     call_helper: u64,
-    // Kept in the ABI for compatibility; boxed NEW_CLOSURE now always
-    // fine-deopts instead of calling a closure-creation trampoline.
-    _closure_helper: u64,
-) -> Option<*const c_void> {
+}
+
+fn compile_int_block_impl(request: CompileRequest<'_>) -> Option<*const c_void> {
     use std::collections::BTreeSet;
+
+    let CompileRequest {
+        code,
+        kidx_to_slot,
+        boxed,
+        prop_sites,
+        get_helper,
+        set_helper,
+        call_helper,
+    } = request;
 
     // ---- Pass 1: validate + decode reach, collect basic-block leaders. ----
     let mut leaders: BTreeSet<usize> = BTreeSet::new();
@@ -904,15 +939,15 @@ fn compile_int_block_impl(
         let mut pc = 0usize;
         while pc < code.len() {
             // Entering a new basic block?
-            if let Some(&blk) = blocks.get(&pc) {
-                if blk != cur {
-                    if !terminated {
-                        fb.ins().jump(blk, &[]); // fallthrough edge
-                    }
-                    fb.switch_to_block(blk);
-                    cur = blk;
-                    terminated = false;
+            if let Some(&blk) = blocks.get(&pc)
+                && blk != cur
+            {
+                if !terminated {
+                    fb.ins().jump(blk, &[]); // fallthrough edge
                 }
+                fb.switch_to_block(blk);
+                cur = blk;
+                terminated = false;
             }
             let op = code[pc];
             let size = int_instr_size(op)?;
@@ -984,6 +1019,34 @@ fn compile_int_block_impl(
                         cur = cont;
                         store_reg(&mut fb, code[pc + 1], res);
                     }
+                }
+                op if bitwise::instr_size(op).is_some() => {
+                    cur = bitwise::emit(
+                        &mut fb,
+                        bitwise::EmitRequest {
+                            code,
+                            pc,
+                            boxed,
+                            current_block: cur,
+                            fine_deopt_block,
+                            flags,
+                            regs,
+                        },
+                    );
+                }
+                op if numeric::instr_size(op).is_some() => {
+                    cur = numeric::emit(
+                        &mut fb,
+                        numeric::EmitRequest {
+                            code,
+                            pc,
+                            boxed,
+                            current_block: cur,
+                            fine_deopt_block,
+                            flags,
+                            regs,
+                        },
+                    );
                 }
                 OP_INC | OP_DEC => {
                     let v = load_reg(&mut fb, code[pc + 2]);

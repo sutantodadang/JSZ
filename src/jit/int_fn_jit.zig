@@ -30,6 +30,7 @@ const std = @import("std");
 const val_mod = @import("../value/value.zig");
 const Value = val_mod.Value;
 const BcFunction = @import("../bytecode/function.zig").BcFunction;
+const Environment = @import("../runtime/execution_context.zig").Environment;
 const opcodes = @import("../bytecode/opcodes.zig");
 const Op = opcodes.Op;
 
@@ -218,6 +219,9 @@ pub const JitPlan = struct {
     consts: []i64,
     /// Number of distinct function-local variable slots.
     n_slots: u16,
+    /// Prefix of `local_names` owned by the function. Remaining slots are
+    /// read-only captures refreshed from the defining environment on every run.
+    n_owned_slots: u16,
     num_regs: u16,
     arity: u16,
     /// Boxed mode: slots carry `Value.bits`, the result is a boxed `Value`, and
@@ -329,6 +333,23 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
             return false;
         }
     }.f;
+    const n_owned_slots: u16 = @intCast(local_names.items.len);
+    if (boxed) {
+        var capture_pc: usize = 0;
+        while (capture_pc < code.len) {
+            const capture_op: Op = @enumFromInt(code[capture_pc]);
+            const capture_size = opcodes.instrSize(capture_op);
+            if (capture_pc + capture_size > code.len) return .never;
+            if (capture_op == .GET_GLOBAL) {
+                const kidx = readU16(code, capture_pc + 2);
+                if (kidx >= constants.len) return .never;
+                const name = constString(constants[kidx]) orelse return .never;
+                if (isLocalName(local_names.items, name) == null)
+                    try local_names.append(arena, name);
+            }
+            capture_pc += capture_size;
+        }
+    }
     const n_slots: u16 = @intCast(local_names.items.len);
 
     // ---- Pass B: build kidx→slot map (-1 = not a local) and the i64 const pool. ----
@@ -386,7 +407,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
             },
             .SET_GLOBAL, .DEFINE_GLOBAL => {
                 const kidx = readU16(code, pc + 1);
-                if (kidx >= constants.len or kidx_to_slot[kidx] < 0) return .never;
+                if (kidx >= constants.len or kidx_to_slot[kidx] < 0 or kidx_to_slot[kidx] >= n_owned_slots) return .never;
             },
             .GET_PROP => {
                 if (!boxed) return .never;
@@ -427,7 +448,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
             .HOIST_VAR => {},
             .HOIST_LEX => {},
             .INIT_LEX => {},
-            .ADD, .SUB, .MUL, .INC, .DEC => {},
+            .ADD, .SUB, .MUL, .BIT_AND, .BIT_OR, .BIT_XOR, .SHL, .SHR, .USHR, .BIT_NOT, .TO_NUMERIC, .INC, .DEC => {},
             .MOVE, .RETURN, .JMP, .JMP_IF_TRUE, .JMP_IF_FALSE => {},
             .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE, .NOT => {
                 // Boolean containment: the result reg (operand 0) must be read by
@@ -452,6 +473,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
         .code_fn = code_fn,
         .consts = consts_i64,
         .n_slots = n_slots,
+        .n_owned_slots = n_owned_slots,
         .num_regs = func.num_regs,
         .arity = func.arity,
         .boxed = boxed,
@@ -479,14 +501,25 @@ pub const RunOut = union(enum) {
 /// re-entrant calls); the region's register/local buffers are published as a GC
 /// root frame for the duration so a callee's allocation/`__gc__()` can't free
 /// cells the native code still holds.
-pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, args: []const Value, vm: ?*anyopaque) !RunOut {
+pub const RunContext = struct {
+    args: []const Value,
+    vm: ?*anyopaque,
+    env: *Environment,
+};
+
+pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, context: RunContext) !RunOut {
     const regs = try arena.alloc(i64, if (plan.num_regs > 0) plan.num_regs else 1);
     @memset(regs, 0);
     const locals = try arena.alloc(i64, if (plan.n_slots > 0) plan.n_slots else 1);
     @memset(locals, 0);
     var i: usize = 0;
-    while (i < args.len and i < plan.n_slots) : (i += 1) {
-        locals[i] = if (plan.boxed) @bitCast(args[i].bits) else args[i].smiValue();
+    while (i < context.args.len and i < plan.n_owned_slots) : (i += 1) {
+        locals[i] = if (plan.boxed) @bitCast(context.args[i].bits) else context.args[i].smiValue();
+    }
+    i = plan.n_owned_slots;
+    while (i < plan.n_slots) : (i += 1) {
+        const captured = context.env.lookup(plan.local_names[i]) catch return .deopt;
+        locals[i] = @bitCast(captured.bits);
     }
     // Publish this region's buffers as GC roots (non-moving collector → mark-only)
     // and the VM for the CALL trampoline; restore the parent on exit (supports
@@ -494,7 +527,7 @@ pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, args: []const Value, 
     var root_frame = JitRootFrame{ .regs = regs, .locals = locals, .parent = active_jit_frame };
     const saved_vm = active_jit_vm;
     active_jit_frame = &root_frame;
-    active_jit_vm = vm;
+    active_jit_vm = context.vm;
     defer {
         active_jit_frame = root_frame.parent;
         active_jit_vm = saved_vm;

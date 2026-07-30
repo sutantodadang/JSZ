@@ -30,8 +30,11 @@ test "S6: JIT direct native-to-native call avoids interpreter frame" {
 
     const result = ctx.eval(
         \\function leaf(x) { return x + 1; }
-        \\function caller(f, x) { return f(x); }
-        \\leaf(0);
+        \\function caller(f, x) {
+        \\  var result = 0;
+        \\  for (var i = 0; i < 40; i++) { result = f(x); }
+        \\  return result;
+        \\}
         \\caller(leaf, 41);
     , "<jit-s6-direct-call>");
     const v = switch (result) {
@@ -97,7 +100,7 @@ test "S8: JIT fine-deopt resumes mid-function (string concat) without corrupting
     // the old top-frame patch corrupted the caller (index-out-of-bounds panic).
     const result = ctx.eval(
         \\function cat(s) { return s + '!'; }
-        \\cat('a');
+        \\for (var i = 0; i < 40; i++) { cat('a'); }
         \\cat('b');
     , "<jit-s8-fine-deopt-resume>");
     const v = switch (result) {
@@ -298,8 +301,9 @@ test "Phase 9: experimental JIT fast-forwards a hot counter loop and matches the
 
 test "Phase 9: experimental JIT leaves non-matching loops to the interpreter (correct, no fast-forward)" {
     const a = std.testing.allocator;
-    // Body has an extra statement (s = s + i), so the template does not match.
-    const src = "var i = 0, s = 0; while (i < 3000) { i = i + 1; s = s + i; } s;";
+    // DIV is outside both the closed-form template and the current Cranelift
+    // integer subset, so this loop must remain interpreted.
+    const src = "var i = 0, s = 0; while (i < 3000) { i = i + 1; s = s + (i / 2); } s;";
     const baseline = try evalToF64Mode(a, src, .bc);
     var compiled: usize = 0;
     const jit = try evalExperimental(a, src, &compiled);

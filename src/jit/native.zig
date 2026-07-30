@@ -178,12 +178,20 @@ const OP_GET_GLOBAL: u8 = 6;
 const OP_SET_GLOBAL: u8 = 7;
 const OP_MUL: u8 = 12;
 const OP_ADD: u8 = 10;
+const OP_BIT_AND: u8 = 16;
+const OP_BIT_OR: u8 = 17;
+const OP_BIT_XOR: u8 = 18;
+const OP_SHL: u8 = 19;
+const OP_SHR: u8 = 20;
+const OP_USHR: u8 = 21;
+const OP_BIT_NOT: u8 = 23;
 const OP_INC: u8 = 24;
 const OP_LT: u8 = 30;
 const OP_JMP: u8 = 36;
 const OP_JMP_IF_FALSE: u8 = 38;
 const OP_RETURN: u8 = 45;
 const OP_CALL: u8 = 44;
+const OP_TO_NUMERIC: u8 = 89;
 const no_locals = &[_]i32{};
 
 fn i16lo(v: i16) u8 {
@@ -237,6 +245,96 @@ test "Phase 12: int-block compiler uses LOAD_K constants and arithmetic" {
     var resume_pc: u32 = 0xFFFFFFFF;
     try std.testing.expectEqual(@as(i64, 42), f(&regs, &[_]i64{ 6, 7 }, &[_]i64{}, &deopt, &resume_pc));
     try std.testing.expectEqual(@as(i32, 0), deopt);
+}
+
+test "JIT int-block implements JavaScript int32 bitwise and shift semantics" {
+    const BinaryCase = struct {
+        op: u8,
+        lhs: i64,
+        rhs: i64,
+        expected: i64,
+    };
+    const cases = [_]BinaryCase{
+        .{ .op = OP_BIT_AND, .lhs = 0x1234, .rhs = 0xff, .expected = 0x34 },
+        .{ .op = OP_BIT_OR, .lhs = 0x1200, .rhs = 0x34, .expected = 0x1234 },
+        .{ .op = OP_BIT_XOR, .lhs = -1, .rhs = 0xff, .expected = -256 },
+        .{ .op = OP_SHL, .lhs = 1, .rhs = 33, .expected = 2 },
+        .{ .op = OP_SHR, .lhs = -8, .rhs = 1, .expected = -4 },
+        .{ .op = OP_USHR, .lhs = -1, .rhs = 0, .expected = 4_294_967_295 },
+    };
+
+    for (cases) |case| {
+        const code = [_]u8{ case.op, 2, 0, 1, OP_RETURN, 2 };
+        const f = compileIntBlock(&code, no_locals) orelse return error.IntBlockReturnedNull;
+        var regs = [_]i64{ case.lhs, case.rhs, 0 };
+        var deopt: i32 = 0;
+        var resume_pc: u32 = 0xFFFFFFFF;
+        const result = f(&regs, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc);
+        try std.testing.expectEqual(case.expected, result);
+        try std.testing.expectEqual(@as(i32, 0), deopt);
+    }
+
+    const not_code = [_]u8{ OP_BIT_NOT, 1, 0, OP_RETURN, 1 };
+    const not_fn = compileIntBlock(&not_code, no_locals) orelse return error.IntBlockReturnedNull;
+    var not_regs = [_]i64{ 0, 0 };
+    var deopt: i32 = 0;
+    var resume_pc: u32 = 0xFFFFFFFF;
+    try std.testing.expectEqual(@as(i64, -1), not_fn(&not_regs, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc));
+}
+
+test "JIT boxed bitwise keeps int32 results and unsigned shift range" {
+    const and_code = [_]u8{ OP_BIT_AND, 2, 0, 1, OP_RETURN, 2 };
+    const and_fn = compileBoxedBlock(&and_code, no_locals) orelse return error.BoxedBlockReturnedNull;
+    var and_regs = [_]i64{ boxSmi(0x1234), boxSmi(0xff), 0 };
+    var deopt: i32 = 0;
+    var resume_pc: u32 = 0xFFFFFFFF;
+    const and_result = and_fn(&and_regs, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc);
+    try std.testing.expectEqual(@as(i32, 0), deopt);
+    try std.testing.expect(isBoxedSmi(and_result));
+    try std.testing.expectEqual(@as(i32, 0x34), unboxSmi(and_result));
+
+    const ushr_code = [_]u8{ OP_USHR, 2, 0, 1, OP_RETURN, 2 };
+    const ushr_fn = compileBoxedBlock(&ushr_code, no_locals) orelse return error.BoxedBlockReturnedNull;
+    var ushr_regs = [_]i64{ boxSmi(-1), boxSmi(0), 0 };
+    deopt = 0;
+    const ushr_result = ushr_fn(&ushr_regs, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc);
+    try std.testing.expectEqual(@as(i32, 0), deopt);
+    try std.testing.expect(isBoxedDouble(ushr_result));
+    try std.testing.expectEqual(@as(f64, 4_294_967_295), unboxDouble(ushr_result));
+}
+
+test "JIT boxed bitwise fine-deopts non-SMI operands" {
+    const code = [_]u8{ OP_BIT_XOR, 2, 0, 1, OP_RETURN, 2 };
+    const f = compileBoxedBlock(&code, no_locals) orelse return error.BoxedBlockReturnedNull;
+    var regs = [_]i64{ boxDouble(1.5), boxSmi(1), 0 };
+    var deopt: i32 = 0;
+    var resume_pc: u32 = 0xFFFFFFFF;
+    _ = f(&regs, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc);
+    try std.testing.expectEqual(@as(i32, 3), deopt);
+    try std.testing.expectEqual(@as(u32, 0), resume_pc);
+}
+
+test "JIT ToNumeric preserves numeric values and deopts other boxed values" {
+    const code = [_]u8{ OP_TO_NUMERIC, 1, 0, OP_RETURN, 1 };
+    const int_fn = compileIntBlock(&code, no_locals) orelse return error.IntBlockReturnedNull;
+    var int_regs = [_]i64{ 42, 0 };
+    var deopt: i32 = 0;
+    var resume_pc: u32 = 0xFFFFFFFF;
+    try std.testing.expectEqual(@as(i64, 42), int_fn(&int_regs, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc));
+
+    const boxed_fn = compileBoxedBlock(&code, no_locals) orelse return error.BoxedBlockReturnedNull;
+    var boxed_regs = [_]i64{ boxDouble(1.5), 0 };
+    deopt = 0;
+    const numeric = boxed_fn(&boxed_regs, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc);
+    try std.testing.expectEqual(@as(i32, 0), deopt);
+    try std.testing.expectEqual(@as(f64, 1.5), unboxDouble(numeric));
+
+    var null_regs = [_]i64{ NB_NULL, 0 };
+    deopt = 0;
+    resume_pc = 0xFFFFFFFF;
+    _ = boxed_fn(&null_regs, &[_]i64{}, &[_]i64{}, &deopt, &resume_pc);
+    try std.testing.expectEqual(@as(i32, 3), deopt);
+    try std.testing.expectEqual(@as(u32, 0), resume_pc);
 }
 
 test "Phase 12: int-block compiler bails on an unsupported opcode" {
