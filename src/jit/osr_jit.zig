@@ -187,11 +187,11 @@ pub fn analyze(
             .HOIST_VAR => {},
             .HOIST_LEX => {},
             .INIT_LEX => {},
-            .ADD, .SUB, .MUL => {
+            .ADD, .SUB, .MUL, .BIT_AND, .BIT_OR, .BIT_XOR, .SHL, .SHR, .USHR => {
                 if (!regsRead(code, pc, op, &reg_written)) return null;
                 reg_written[code[pc + 1]] = true;
             },
-            .INC, .DEC => {
+            .BIT_NOT, .TO_NUMERIC, .INC, .DEC => {
                 if (!regsRead(code, pc, op, &reg_written)) return null;
                 reg_written[code[pc + 1]] = true;
             },
@@ -329,8 +329,8 @@ fn internExit(buf: *[MAX_EXITS]usize, n: *usize, target: usize) ?usize {
 fn regsRead(code: []const u8, pc: usize, op: Op, reg_written: *const [256]bool) bool {
     return switch (op) {
         .MOVE => reg_written[code[pc + 2]],
-        .INC, .DEC, .NOT => reg_written[code[pc + 2]],
-        .ADD, .SUB, .MUL, .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE => reg_written[code[pc + 2]] and reg_written[code[pc + 3]],
+        .BIT_NOT, .TO_NUMERIC, .INC, .DEC, .NOT => reg_written[code[pc + 2]],
+        .ADD, .SUB, .MUL, .BIT_AND, .BIT_OR, .BIT_XOR, .SHL, .SHR, .USHR, .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE => reg_written[code[pc + 2]] and reg_written[code[pc + 3]],
         else => true,
     };
 }

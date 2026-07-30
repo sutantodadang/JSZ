@@ -30,6 +30,7 @@ const std = @import("std");
 const val_mod = @import("../value/value.zig");
 const Value = val_mod.Value;
 const BcFunction = @import("../bytecode/function.zig").BcFunction;
+const Environment = @import("../runtime/execution_context.zig").Environment;
 const opcodes = @import("../bytecode/opcodes.zig");
 const Op = opcodes.Op;
 
@@ -54,6 +55,8 @@ extern fn jsz_clif_compile_boxed_block(
     set_helper: u64,
     call_helper: u64,
     closure_helper: u64,
+    getelem_helper: u64,
+    setelem_helper: u64,
 ) ?*const anyopaque;
 
 /// One property-access site, baked into the native code (mirror of the Rust
@@ -186,6 +189,42 @@ fn jsz_jit_set_own(recv_bits: u64, key_ptr: [*]const u8, key_len: usize, ic_raw:
     miss.* = 0;
 }
 
+/// Dynamic (computed-key) property read for `GET_PROP_DYN` (`a[i]`). Always
+/// re-enters the interpreter's full dynamic-get machinery (ToPropertyKey,
+/// arrays, strings, proxies) — a computed key is generally polymorphic, so
+/// unlike `jsz_jit_get_prop` there is no inline-cache fast path here. Miss
+/// protocol matches `jsz_jit_get_prop`.
+fn jsz_jit_get_elem(recv_bits: u64, key_bits: u64, miss: *i32) callconv(.c) u64 {
+    const vmptr = active_jit_vm orelse {
+        miss.* = 1;
+        return 0;
+    };
+    const bc_vm_mod = @import("../vm/bc_vm.zig");
+    const bvm: *bc_vm_mod.BcVm = @ptrCast(@alignCast(vmptr));
+    const out = bvm.jitGetElemSlow(Value{ .bits = recv_bits }, Value{ .bits = key_bits }) catch {
+        miss.* = 2; // ToPropertyKey coercion / getter / proxy trap threw
+        return 0;
+    };
+    miss.* = 0;
+    return out.bits;
+}
+
+/// Dynamic (computed-key) property store for `SET_PROP_DYN` (`a[i]=v`).
+/// Symmetric with `jsz_jit_get_elem`; miss protocol matches `jsz_jit_set_own`.
+fn jsz_jit_set_elem(recv_bits: u64, key_bits: u64, val_bits: u64, miss: *i32) callconv(.c) void {
+    const vmptr = active_jit_vm orelse {
+        miss.* = 1;
+        return;
+    };
+    const bc_vm_mod = @import("../vm/bc_vm.zig");
+    const bvm: *bc_vm_mod.BcVm = @ptrCast(@alignCast(vmptr));
+    bvm.jitSetElemSlow(Value{ .bits = recv_bits }, Value{ .bits = key_bits }, Value{ .bits = val_bits }) catch {
+        miss.* = 2; // ToPropertyKey coercion / setter / proxy trap threw
+        return;
+    };
+    miss.* = 0;
+}
+
 /// S4: a node in the chain of register/local buffers belonging to JIT regions
 /// that are currently on the stack (innermost first). Published by `run` so the
 /// GC can scan boxed cell pointers held in native register files across a
@@ -205,7 +244,9 @@ fn compileNative(code: []const u8, kidx_to_slot: []const i32, boxed: bool, prop_
         const sites_ptr: ?[*]const PropSite = if (prop_sites.len == 0) null else prop_sites.ptr;
         const get_helper: u64 = @intFromPtr(&jsz_jit_get_prop);
         const set_helper: u64 = @intFromPtr(&jsz_jit_set_own);
-        break :blk jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, sites_ptr, prop_sites.len, get_helper, set_helper, call_helper, closure_helper);
+        const getelem_helper: u64 = @intFromPtr(&jsz_jit_get_elem);
+        const setelem_helper: u64 = @intFromPtr(&jsz_jit_set_elem);
+        break :blk jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, sites_ptr, prop_sites.len, get_helper, set_helper, call_helper, closure_helper, getelem_helper, setelem_helper);
     } else jsz_clif_compile_int_block(code.ptr, code.len, map_ptr, kidx_to_slot.len);
     return @ptrCast(p orelse return null);
 }
@@ -218,6 +259,9 @@ pub const JitPlan = struct {
     consts: []i64,
     /// Number of distinct function-local variable slots.
     n_slots: u16,
+    /// Prefix of `local_names` owned by the function. Remaining slots are
+    /// read-only captures refreshed from the defining environment on every run.
+    n_owned_slots: u16,
     num_regs: u16,
     arity: u16,
     /// Boxed mode: slots carry `Value.bits`, the result is a boxed `Value`, and
@@ -329,6 +373,23 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
             return false;
         }
     }.f;
+    const n_owned_slots: u16 = @intCast(local_names.items.len);
+    if (boxed) {
+        var capture_pc: usize = 0;
+        while (capture_pc < code.len) {
+            const capture_op: Op = @enumFromInt(code[capture_pc]);
+            const capture_size = opcodes.instrSize(capture_op);
+            if (capture_pc + capture_size > code.len) return .never;
+            if (capture_op == .GET_GLOBAL) {
+                const kidx = readU16(code, capture_pc + 2);
+                if (kidx >= constants.len) return .never;
+                const name = constString(constants[kidx]) orelse return .never;
+                if (isLocalName(local_names.items, name) == null)
+                    try local_names.append(arena, name);
+            }
+            capture_pc += capture_size;
+        }
+    }
     const n_slots: u16 = @intCast(local_names.items.len);
 
     // ---- Pass B: build kidx→slot map (-1 = not a local) and the i64 const pool. ----
@@ -386,7 +447,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
             },
             .SET_GLOBAL, .DEFINE_GLOBAL => {
                 const kidx = readU16(code, pc + 1);
-                if (kidx >= constants.len or kidx_to_slot[kidx] < 0) return .never;
+                if (kidx >= constants.len or kidx_to_slot[kidx] < 0 or kidx_to_slot[kidx] >= n_owned_slots) return .never;
             },
             .GET_PROP => {
                 if (!boxed) return .never;
@@ -427,7 +488,9 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
             .HOIST_VAR => {},
             .HOIST_LEX => {},
             .INIT_LEX => {},
-            .ADD, .SUB, .MUL, .INC, .DEC => {},
+            .ADD, .SUB, .MUL, .BIT_AND, .BIT_OR, .BIT_XOR, .SHL, .SHR, .USHR, .BIT_NOT, .TO_NUMERIC, .INC, .DEC => {},
+            .DIV, .MOD, .NEG => if (!boxed) return .never,
+            .GET_PROP_DYN, .SET_PROP_DYN => if (!boxed) return .never,
             .MOVE, .RETURN, .JMP, .JMP_IF_TRUE, .JMP_IF_FALSE => {},
             .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE, .NOT => {
                 // Boolean containment: the result reg (operand 0) must be read by
@@ -452,6 +515,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
         .code_fn = code_fn,
         .consts = consts_i64,
         .n_slots = n_slots,
+        .n_owned_slots = n_owned_slots,
         .num_regs = func.num_regs,
         .arity = func.arity,
         .boxed = boxed,
@@ -479,14 +543,25 @@ pub const RunOut = union(enum) {
 /// re-entrant calls); the region's register/local buffers are published as a GC
 /// root frame for the duration so a callee's allocation/`__gc__()` can't free
 /// cells the native code still holds.
-pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, args: []const Value, vm: ?*anyopaque) !RunOut {
+pub const RunContext = struct {
+    args: []const Value,
+    vm: ?*anyopaque,
+    env: *Environment,
+};
+
+pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, context: RunContext) !RunOut {
     const regs = try arena.alloc(i64, if (plan.num_regs > 0) plan.num_regs else 1);
     @memset(regs, 0);
     const locals = try arena.alloc(i64, if (plan.n_slots > 0) plan.n_slots else 1);
     @memset(locals, 0);
     var i: usize = 0;
-    while (i < args.len and i < plan.n_slots) : (i += 1) {
-        locals[i] = if (plan.boxed) @bitCast(args[i].bits) else args[i].smiValue();
+    while (i < context.args.len and i < plan.n_owned_slots) : (i += 1) {
+        locals[i] = if (plan.boxed) @bitCast(context.args[i].bits) else context.args[i].smiValue();
+    }
+    i = plan.n_owned_slots;
+    while (i < plan.n_slots) : (i += 1) {
+        const captured = context.env.lookup(plan.local_names[i]) catch return .deopt;
+        locals[i] = @bitCast(captured.bits);
     }
     // Publish this region's buffers as GC roots (non-moving collector → mark-only)
     // and the VM for the CALL trampoline; restore the parent on exit (supports
@@ -494,7 +569,7 @@ pub fn run(arena: std.mem.Allocator, plan: *const JitPlan, args: []const Value, 
     var root_frame = JitRootFrame{ .regs = regs, .locals = locals, .parent = active_jit_frame };
     const saved_vm = active_jit_vm;
     active_jit_frame = &root_frame;
-    active_jit_vm = vm;
+    active_jit_vm = context.vm;
     defer {
         active_jit_frame = root_frame.parent;
         active_jit_vm = saved_vm;

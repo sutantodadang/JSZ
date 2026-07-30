@@ -21,6 +21,9 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 
+mod bitwise;
+mod numeric;
+
 /// Build a fresh JIT module configured for the host ISA.
 fn make_module() -> Option<JITModule> {
     let mut flag_builder = settings::builder();
@@ -349,6 +352,8 @@ const OP_RETURN_UNDEF: u8 = 46;
 const OP_HALT: u8 = 47;
 const OP_SET_PROP: u8 = 50;
 const OP_GET_PROP: u8 = 51;
+const OP_SET_PROP_DYN: u8 = 52;
+const OP_GET_PROP_DYN: u8 = 53;
 
 /// One property-access site (boxed tier S3/S8): at bytecode offset `pc`, a
 /// `GET_PROP`/`SET_PROP` accesses property `key` consulting the live inline
@@ -368,6 +373,12 @@ pub struct PropSite {
 
 /// Encoded instruction byte length for the supported opcodes; `None` aborts.
 fn int_instr_size(op: u8) -> Option<usize> {
+    if let Some(size) = bitwise::instr_size(op) {
+        return Some(size);
+    }
+    if let Some(size) = numeric::instr_size(op) {
+        return Some(size);
+    }
     Some(match op {
         OP_LOAD_K => 4,
         OP_LOAD_TRUE | OP_LOAD_FALSE | OP_LOAD_UNDEF => 2,
@@ -384,6 +395,7 @@ fn int_instr_size(op: u8) -> Option<usize> {
         OP_RETURN_UNDEF | OP_HALT => 1,
         OP_GET_PROP => 5,
         OP_SET_PROP => 5,
+        OP_SET_PROP_DYN | OP_GET_PROP_DYN => 4,
         OP_CALL => 4,
         OP_NEW_CLOSURE => 4,
         _ => return None,
@@ -444,7 +456,18 @@ pub unsafe extern "C" fn jsz_clif_compile_int_block(
     } else {
         unsafe { std::slice::from_raw_parts(kidx_to_slot, n_kidx) }
     };
-    compile_int_block_impl(code, slots, false, &[], 0, 0, 0, 0).unwrap_or(std::ptr::null())
+    compile_int_block_impl(CompileRequest {
+        code,
+        kidx_to_slot: slots,
+        boxed: false,
+        prop_sites: &[],
+        get_helper: 0,
+        set_helper: 0,
+        call_helper: 0,
+        getelem_helper: 0,
+        setelem_helper: 0,
+    })
+    .unwrap_or(std::ptr::null())
 }
 
 /// Phase 12 boxed tier — compile the same opcode subset as
@@ -476,7 +499,9 @@ pub unsafe extern "C" fn jsz_clif_compile_boxed_block(
     get_helper: u64,
     set_helper: u64,
     call_helper: u64,
-    closure_helper: u64,
+    _closure_helper: u64,
+    getelem_helper: u64,
+    setelem_helper: u64,
 ) -> *const c_void {
     if code.is_null() || len == 0 {
         return std::ptr::null();
@@ -492,8 +517,18 @@ pub unsafe extern "C" fn jsz_clif_compile_boxed_block(
     } else {
         unsafe { std::slice::from_raw_parts(prop_sites, n_prop_sites) }
     };
-    compile_int_block_impl(code, slots, true, sites, get_helper, set_helper, call_helper, closure_helper)
-        .unwrap_or(std::ptr::null())
+    compile_int_block_impl(CompileRequest {
+        code,
+        kidx_to_slot: slots,
+        boxed: true,
+        prop_sites: sites,
+        get_helper,
+        set_helper,
+        call_helper,
+        getelem_helper,
+        setelem_helper,
+    })
+    .unwrap_or(std::ptr::null())
 }
 
 /// Largest integer exactly representable as an f64 (`2^53`). A JS number stays
@@ -548,13 +583,13 @@ const I32_MIN_I64: i64 = -2147483648;
 const I32_MAX_I64: i64 = 2147483647;
 
 /// `(bits & NumberTag) == NumberTag` — true when `v` is an inline int32 SMI.
-fn emit_is_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
+pub(crate) fn emit_is_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
     let masked = fb.ins().band_imm(v, NUMBER_TAG as i64);
     fb.ins().icmp_imm(IntCC::Equal, masked, NUMBER_TAG as i64)
 }
 
 /// Decode an SMI payload: `sext_i64(i32(bits & 0xffffffff))`. Caller guards isSmi.
-fn emit_unbox_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
+pub(crate) fn emit_unbox_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
     let lo = fb.ins().band_imm(v, 0xffff_ffff);
     let i32v = fb.ins().ireduce(types::I32, lo);
     fb.ins().sextend(types::I64, i32v)
@@ -563,7 +598,7 @@ fn emit_unbox_smi(fb: &mut FunctionBuilder, v: Value) -> Value {
 /// Box an i64 back to a `Value` exactly as `value.zig:makeNumber`: an SMI when it
 /// fits i32, else an offset-double. Fragments the CFG (range branch) — returns
 /// the boxed value and the merge block; the caller must set its current block.
-fn emit_box_i64(fb: &mut FunctionBuilder, r: Value) -> (Value, Block) {
+pub(crate) fn emit_box_i64(fb: &mut FunctionBuilder, r: Value) -> (Value, Block) {
     let smi_blk = fb.create_block();
     let dbl_blk = fb.create_block();
     let done = fb.create_block();
@@ -589,14 +624,14 @@ fn emit_box_i64(fb: &mut FunctionBuilder, r: Value) -> (Value, Block) {
 }
 
 /// `(bits & NumberTag) != 0` — true when `v` is any number (SMI or double).
-fn emit_is_number(fb: &mut FunctionBuilder, v: Value) -> Value {
+pub(crate) fn emit_is_number(fb: &mut FunctionBuilder, v: Value) -> Value {
     let masked = fb.ins().band_imm(v, NUMBER_TAG as i64);
     fb.ins().icmp_imm(IntCC::NotEqual, masked, 0)
 }
 
 /// Decode a boxed number to f64 (branchless select): SMI payload as f64, or the
 /// offset-double. Caller guards `isNumber`.
-fn emit_to_f64(fb: &mut FunctionBuilder, v: Value) -> Value {
+pub(crate) fn emit_to_f64(fb: &mut FunctionBuilder, v: Value) -> Value {
     let is = emit_is_smi(fb, v);
     let xi = emit_unbox_smi(fb, v);
     let xf = fb.ins().fcvt_from_sint(types::F64, xi);
@@ -608,7 +643,7 @@ fn emit_to_f64(fb: &mut FunctionBuilder, v: Value) -> Value {
 /// Box an f64 back to a `Value` exactly as `value.zig:makeNumber`: an SMI when it
 /// is an integer in i32 range AND not `-0`, else an offset-double. Fragments the
 /// CFG; returns the boxed value and the merge block.
-fn emit_box_f64(fb: &mut FunctionBuilder, f: Value) -> (Value, Block) {
+pub(crate) fn emit_box_f64(fb: &mut FunctionBuilder, f: Value) -> (Value, Block) {
     let smi_blk = fb.create_block();
     let dbl_blk = fb.create_block();
     let done = fb.create_block();
@@ -740,19 +775,32 @@ fn slot_of(kidx_to_slot: &[i32], kidx: u16) -> Option<i32> {
     }
 }
 
-fn compile_int_block_impl(
-    code: &[u8],
-    kidx_to_slot: &[i32],
+struct CompileRequest<'a> {
+    code: &'a [u8],
+    kidx_to_slot: &'a [i32],
     boxed: bool,
-    prop_sites: &[PropSite],
+    prop_sites: &'a [PropSite],
     get_helper: u64,
     set_helper: u64,
     call_helper: u64,
-    // Kept in the ABI for compatibility; boxed NEW_CLOSURE now always
-    // fine-deopts instead of calling a closure-creation trampoline.
-    _closure_helper: u64,
-) -> Option<*const c_void> {
+    getelem_helper: u64,
+    setelem_helper: u64,
+}
+
+fn compile_int_block_impl(request: CompileRequest<'_>) -> Option<*const c_void> {
     use std::collections::BTreeSet;
+
+    let CompileRequest {
+        code,
+        kidx_to_slot,
+        boxed,
+        prop_sites,
+        get_helper,
+        set_helper,
+        call_helper,
+        getelem_helper,
+        setelem_helper,
+    } = request;
 
     // ---- Pass 1: validate + decode reach, collect basic-block leaders. ----
     let mut leaders: BTreeSet<usize> = BTreeSet::new();
@@ -760,7 +808,7 @@ fn compile_int_block_impl(
     let mut pc = 0usize;
     while pc < code.len() {
         let op = code[pc];
-        let size = int_instr_size(op)?;
+        let size = int_instr_size(op).or_else(|| if boxed { numeric::boxed_instr_size(op) } else { None })?;
         if pc + size > code.len() {
             return None; // truncated
         }
@@ -885,6 +933,28 @@ fn compile_int_block_impl(
             ss.params.push(AbiParam::new(ptr_ty)); // miss ptr (*i32)
             fb.import_signature(ss)
         };
+        // Signature of the Zig dynamic-key property READ callback (GET_PROP_DYN)
+        // `fn(recv: u64, key: u64, miss: *i32) -> u64`. Unlike `helper_sig` there
+        // is no IC — a computed key is polymorphic, so this always re-enters the
+        // interpreter's full dynamic-get machinery.
+        let getelem_sig = {
+            let mut gs = module.make_signature();
+            gs.params.push(AbiParam::new(types::I64)); // recv bits
+            gs.params.push(AbiParam::new(types::I64)); // key bits
+            gs.params.push(AbiParam::new(ptr_ty)); // miss ptr (*i32)
+            gs.returns.push(AbiParam::new(types::I64)); // value bits
+            fb.import_signature(gs)
+        };
+        // Signature of the Zig dynamic-key property STORE callback (SET_PROP_DYN)
+        // `fn(recv: u64, key: u64, val: u64, miss: *i32) -> void`.
+        let setelem_sig = {
+            let mut ses = module.make_signature();
+            ses.params.push(AbiParam::new(types::I64)); // recv bits
+            ses.params.push(AbiParam::new(types::I64)); // key bits
+            ses.params.push(AbiParam::new(types::I64)); // val bits
+            ses.params.push(AbiParam::new(ptr_ty)); // miss ptr (*i32)
+            fb.import_signature(ses)
+        };
         // Signature of the Zig CALL trampoline
         // `fn(regs: [*]i64, base: u32, nargs: u32, ret_dst: u32, deopt: *i32)`.
         // It reads callee/args from `regs`, re-enters the interpreter, writes the
@@ -904,18 +974,18 @@ fn compile_int_block_impl(
         let mut pc = 0usize;
         while pc < code.len() {
             // Entering a new basic block?
-            if let Some(&blk) = blocks.get(&pc) {
-                if blk != cur {
-                    if !terminated {
-                        fb.ins().jump(blk, &[]); // fallthrough edge
-                    }
-                    fb.switch_to_block(blk);
-                    cur = blk;
-                    terminated = false;
+            if let Some(&blk) = blocks.get(&pc)
+                && blk != cur
+            {
+                if !terminated {
+                    fb.ins().jump(blk, &[]); // fallthrough edge
                 }
+                fb.switch_to_block(blk);
+                cur = blk;
+                terminated = false;
             }
             let op = code[pc];
-            let size = int_instr_size(op)?;
+            let size = int_instr_size(op).or_else(|| if boxed { numeric::boxed_instr_size(op) } else { None })?;
             let next = pc + size;
             match op {
                 OP_LOAD_K => {
@@ -984,6 +1054,34 @@ fn compile_int_block_impl(
                         cur = cont;
                         store_reg(&mut fb, code[pc + 1], res);
                     }
+                }
+                op if bitwise::instr_size(op).is_some() => {
+                    cur = bitwise::emit(
+                        &mut fb,
+                        bitwise::EmitRequest {
+                            code,
+                            pc,
+                            boxed,
+                            current_block: cur,
+                            fine_deopt_block,
+                            flags,
+                            regs,
+                        },
+                    );
+                }
+                op if numeric::instr_size(op).is_some() || (boxed && numeric::boxed_instr_size(op).is_some()) => {
+                    cur = numeric::emit(
+                        &mut fb,
+                        numeric::EmitRequest {
+                            code,
+                            pc,
+                            boxed,
+                            current_block: cur,
+                            fine_deopt_block,
+                            flags,
+                            regs,
+                        },
+                    );
                 }
                 OP_INC | OP_DEC => {
                     let v = load_reg(&mut fb, code[pc + 2]);
@@ -1215,6 +1313,64 @@ fn compile_int_block_impl(
                         callee,
                         &[recv, key_p, key_l, ic_p, val, deopt_ptr],
                     );
+                    let missed = fb.ins().load(types::I32, flags, deopt_ptr, 0);
+                    let cont = fb.create_block();
+                    let slow = fb.create_block();
+                    fb.ins().brif(missed, slow, &[], cont, &[]);
+                    fb.switch_to_block(slow);
+                    let is_throw = fb.ins().icmp_imm(IntCC::Equal, missed, 2);
+                    let pc_prop = fb.ins().iconst(types::I32, pc as i64);
+                    fb.ins()
+                        .brif(is_throw, throw_block, &[], fine_deopt_block, &[pc_prop.into()]);
+                    fb.switch_to_block(cont);
+                    cur = cont;
+                }
+                OP_GET_PROP_DYN => {
+                    // Dynamic-key read (`a[i]`): no static site / IC — always call
+                    // the re-entrant helper, which runs the interpreter's full
+                    // ToPropertyKey + [[Get]] machinery. Miss flag: 0 = ok, 2 =
+                    // threw (propagate), anything else = fine-deopt (exact-PC
+                    // interpreter resume).
+                    if !boxed {
+                        return None;
+                    }
+                    let rdst = code[pc + 1];
+                    let robj = code[pc + 2];
+                    let rkey = code[pc + 3];
+                    let recv = load_reg(&mut fb, robj);
+                    let key = load_reg(&mut fb, rkey);
+                    let callee = fb.ins().iconst(ptr_ty, getelem_helper as i64);
+                    let call = fb
+                        .ins()
+                        .call_indirect(getelem_sig, callee, &[recv, key, deopt_ptr]);
+                    let result = fb.inst_results(call)[0];
+                    let missed = fb.ins().load(types::I32, flags, deopt_ptr, 0);
+                    let cont = fb.create_block();
+                    let slow = fb.create_block();
+                    fb.ins().brif(missed, slow, &[], cont, &[]);
+                    fb.switch_to_block(slow);
+                    let is_throw = fb.ins().icmp_imm(IntCC::Equal, missed, 2);
+                    let pc_prop = fb.ins().iconst(types::I32, pc as i64);
+                    fb.ins()
+                        .brif(is_throw, throw_block, &[], fine_deopt_block, &[pc_prop.into()]);
+                    fb.switch_to_block(cont);
+                    cur = cont;
+                    store_reg(&mut fb, rdst, result);
+                }
+                OP_SET_PROP_DYN => {
+                    // Dynamic-key store (`a[i]=v`): symmetric with GET_PROP_DYN.
+                    if !boxed {
+                        return None;
+                    }
+                    let robj = code[pc + 1];
+                    let rkey = code[pc + 2];
+                    let rval = code[pc + 3];
+                    let recv = load_reg(&mut fb, robj);
+                    let key = load_reg(&mut fb, rkey);
+                    let val = load_reg(&mut fb, rval);
+                    let callee = fb.ins().iconst(ptr_ty, setelem_helper as i64);
+                    fb.ins()
+                        .call_indirect(setelem_sig, callee, &[recv, key, val, deopt_ptr]);
                     let missed = fb.ins().load(types::I32, flags, deopt_ptr, 0);
                     let cont = fb.create_block();
                     let slow = fb.create_block();
