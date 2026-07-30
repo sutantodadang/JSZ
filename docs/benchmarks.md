@@ -51,14 +51,12 @@ engines.
 - jsz numbers use **ReleaseSafe** (what releases ship) with the JIT off —
   the default configuration a user gets.
 
-## Known gaps the suite deliberately exposes
-
-- `sort.js` is capped at 5k elements because jsz's `Array.prototype.sort`
-  is currently **O(n²)** (insertion-style). 10k elements already cost ~6 s.
-  The workload stays small so the table stays runnable, but the gap remains
-  visible until the sort is rewritten (planned: pdq/merge hybrid).
-
 ## Bugs this suite has already caught
+
+- `Array.prototype.sort` was **O(n²)** (pure insertion sort): 10k comparator
+  elements took ~5.9 s. Caught by `sort.js` on the suite's first run; fixed
+  with a stable bottom-up merge sort (10k → 37 ms, ~160×), after which
+  `sort.js` was raised from its 5k cap to 50k elements.
 
 - `JSON.parse` segfault: nursery GC during recursive descent collected
   container objects reachable only from the native parser frame
