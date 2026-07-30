@@ -2303,7 +2303,7 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
             const length = taCurrentLen(std_td);
             const res = try makeArrayBuffer(arena, length * esize);
             _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
-            const dst = getTd(val_mod.makeObject(arena, this_obj) catch unreachable) orelse unreachable;
+            const dst = getTd(try val_mod.makeObject(arena, this_obj)) orelse unreachable;
             var i: usize = 0;
             while (i < length) : (i += 1) {
                 const ev = try taLoad(arena, std_td, i);
@@ -2321,7 +2321,7 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
             const length = list.items.len;
             const res = try makeArrayBuffer(arena, length * esize);
             _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
-            const dst = getTd(val_mod.makeObject(arena, this_obj) catch unreachable) orelse unreachable;
+            const dst = getTd(try val_mod.makeObject(arena, this_obj)) orelse unreachable;
             var i: usize = 0;
             while (i < length) : (i += 1) {
                 const ev = list.items[i];
@@ -2342,7 +2342,7 @@ fn makeTypedArray(arena: std.mem.Allocator, kind: TAKind, this_val: Value, args:
         const length: usize = if (len_f <= 0) 0 else if (len_f > 9007199254740991.0) 9007199254740991 else @intFromFloat(len_f);
         const res = try makeArrayBuffer(arena, length * esize);
         _ = try finishTypedArray(arena, this_obj, kind, res.obj, res.data, 0, length, false);
-        const dst = getTd(val_mod.makeObject(arena, this_obj) catch unreachable) orelse unreachable;
+        const dst = getTd(try val_mod.makeObject(arena, this_obj)) orelse unreachable;
         var i: usize = 0;
         while (i < length) : (i += 1) {
             const key = try std.fmt.allocPrint(arena, "{d}", .{i});
@@ -2386,7 +2386,7 @@ fn allocTA(arena: std.mem.Allocator, kind: TAKind, length: usize) !struct { obj:
     const obj = try newObject(arena, proto);
     const res = try makeArrayBuffer(arena, length * kind.elemSize());
     _ = try finishTypedArray(arena, obj, kind, res.obj, res.data, 0, length, false);
-    const td = getTd(val_mod.makeObject(arena, obj) catch unreachable).?;
+    const td = getTd(try val_mod.makeObject(arena, obj)).?;
     return .{ .obj = obj, .td = td };
 }
 

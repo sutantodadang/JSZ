@@ -52,7 +52,7 @@ fn rawJsonToString(arena: std.mem.Allocator, v_in: Value) anyerror![]const u8 {
 /// wrap it in a frozen null-prototype object carrying an [[IsRawJSON]] slot.
 pub fn nativeJsonRawJSON(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
     const realm_mod = @import("../realm.zig");
-    const text = if (args.len > 0) args[0] else val_mod.makeUndefined(arena) catch unreachable;
+    const text = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     const json_string = try rawJsonToString(arena, text);
 
     // Empty, or leading/trailing JSON whitespace → SyntaxError.
@@ -135,7 +135,7 @@ fn isObj(v: Value) bool {
 /// [[Get]](holder, key) via the active context so getters / proxy traps fire.
 fn getV(arena: std.mem.Allocator, holder: Value, key: []const u8) anyerror!Value {
     if (rt.active_context) |c| return c.getProp(arena, holder, key);
-    if (isObj(holder)) return holder.toPtr().object.get(key) orelse (val_mod.makeUndefined(arena) catch unreachable);
+    if (isObj(holder)) return holder.toPtr().object.get(key) orelse try val_mod.makeUndefined(arena);
     return val_mod.makeUndefined(arena);
 }
 
@@ -437,7 +437,7 @@ fn serializeArray(st: *SerState, v: Value, indent: []const u8) anyerror![]const 
 }
 
 pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Value) anyerror!Value {
-    const value0 = if (args.len > 0) args[0] else (val_mod.makeUndefined(arena) catch unreachable);
+    const value0 = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
 
     // Replacer (args[1]): a callable is a function replacer; an array is a
     // property-name allowlist (each element ToString'd, in order).
@@ -510,7 +510,7 @@ pub fn nativeJsonParse(arena: std.mem.Allocator, _: Value, args: []const Value) 
     // JSON.parse(text[, reviver]): text is coerced via ToString (§25.5.1 step 1),
     // so a Number/Boolean/null/object argument parses its string form, and a
     // Symbol throws a TypeError.
-    const arg0 = if (args.len > 0) args[0] else (val_mod.makeUndefined(arena) catch unreachable);
+    const arg0 = if (args.len > 0) args[0] else try val_mod.makeUndefined(arena);
     if (arg0.bits != 0 and arg0.unbox() == .symbol)
         return throwTypeErrorMsg(arena, "Cannot convert a Symbol value to a string");
     const src: []const u8 = try rt.stringPrimitive(arena, arg0);
@@ -599,7 +599,7 @@ fn internalizeJSONProperty(arena: std.mem.Allocator, holder: *JsObject, name: []
     var val = if (realm_mod.active_context) |c|
         try c.getProp(arena, holder_v, name)
     else
-        holder.get(name) orelse val_mod.makeUndefined(arena) catch unreachable;
+        holder.get(name) orelse try val_mod.makeUndefined(arena);
     if (val.bits != 0 and val.unbox() == .object) {
         const val_obj = val.toPtr().object;
         if (try jsonIsArray(val_obj)) {

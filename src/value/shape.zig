@@ -216,7 +216,7 @@ pub fn globalManager() *ShapeManager {
     if (global_manager == null) {
         shape_cap = .{};
         global_arena = std.heap.ArenaAllocator.init(shape_cap.allocator());
-        global_manager = ShapeManager.init(global_arena.?.allocator()) catch unreachable;
+        global_manager = ShapeManager.init(global_arena.?.allocator()) catch @panic("jsz: out of memory initializing global shape store");
     }
     return &global_manager.?;
 }
