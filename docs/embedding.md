@@ -367,12 +367,29 @@ jsz_isolate_free(iso);
 
 Status codes: `JSZ_OK` / `JSZ_EXCEPTION` / `JSZ_PARSE_ERROR` / `JSZ_ERR_NOMEM`.
 `jsz_last_string` returns the result's display string (or the error message)
-and stays valid until the next `jsz_eval` on that context; `jsz_last_number`
-extracts a JS number result. Sources are copied on eval, so the caller may
-free them immediately. The full contract is documented in
-[include/jsz.h](../include/jsz.h); `examples/embed.c` is the runnable
-reference. Native-function registration across the C boundary is not exposed
-yet — embed from Zig if you need host callbacks today.
+and stays valid until the next `jsz_eval` on that context; `jsz_last_value`
+returns the result as a `jsz_value` handle. Sources are copied on eval, so
+the caller may free them immediately.
+
+The full surface (see [include/jsz.h](../include/jsz.h) for contracts, and
+`examples/embed.c` for a runnable reference that exercises all of it):
+
+- **Native functions** — `jsz_register_function(ctx, name, fn, userdata)`
+  exposes a C callback as a global JS function; nonzero return throws a
+  catchable JS exception. Re-entrant eval from inside a callback works.
+- **Values** — `jsz_number/string/boolean/undefined/null` constructors,
+  `jsz_typeof` + `jsz_is_*` / `jsz_as_*` inspectors.
+- **Objects & arrays** — `jsz_object_new`/`jsz_array_new`,
+  `jsz_get`/`jsz_set` (raw data properties; getters and proxy traps do not
+  fire), `jsz_get_index`/`jsz_set_index`/`jsz_array_length`,
+  `jsz_set_global`/`jsz_get_global`.
+- **GC rooting** — object handles held only by C are invisible to the GC:
+  `jsz_protect`/`jsz_unprotect` root them across evals and collections.
+- **Calling JS from C** — `jsz_call(ctx, fn, args, argc, &result)` with full
+  VM semantics (closures, try/catch-able exceptions, microtasks).
+- **JSON bridge** — `jsz_json_encode`/`jsz_json_decode`, the convenient way
+  to move structured data across the boundary.
+- **Modules** — `jsz_eval_module` for ES-module sources.
 
 ## Further reading
 
