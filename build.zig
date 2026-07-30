@@ -282,6 +282,52 @@ pub fn build(b: *std.Build) void {
     embed_step.dependOn(&run_embed.step);
 
     // ---------------------------------------------------------------------------
+    // C ABI: zig build capi        -> shared libjsz + include/jsz.h in zig-out
+    //        zig build example-capi -> compile + run examples/embed.c (gate)
+    // ---------------------------------------------------------------------------
+    const capi_mod = b.createModule(.{
+        .root_source_file = b.path("src/capi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    capi_mod.addImport("build_options", build_options_mod);
+
+    const capi_shared = b.addLibrary(.{
+        .name = "jsz",
+        .root_module = capi_mod,
+        .linkage = .dynamic,
+    });
+    capi_shared.linkLibC();
+    if (enable_jit) jit_link.link(capi_shared);
+    const capi_step = b.step("capi", "Build the C ABI shared library and install include/jsz.h");
+    capi_step.dependOn(&b.addInstallArtifact(capi_shared, .{}).step);
+    capi_step.dependOn(&b.addInstallFile(b.path("include/jsz.h"), "include/jsz.h").step);
+
+    // The C example links the static variant so it runs with no DLL path setup.
+    const capi_static = b.addLibrary(.{
+        .name = "jsz_static",
+        .root_module = capi_mod,
+        .linkage = .static,
+    });
+    capi_static.linkLibC();
+    if (enable_jit) jit_link.link(capi_static);
+
+    const capi_example_exe = b.addExecutable(.{
+        .name = "embed-c",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    capi_example_exe.addCSourceFile(.{ .file = b.path("examples/embed.c"), .flags = &.{"-std=c99"} });
+    capi_example_exe.addIncludePath(b.path("include"));
+    capi_example_exe.linkLibrary(capi_static);
+    const run_capi_example = b.addRunArtifact(capi_example_exe);
+    const capi_example_step = b.step("example-capi", "Build and run examples/embed.c against the C ABI");
+    capi_example_step.dependOn(&run_capi_example.step);
+
+    // ---------------------------------------------------------------------------
     // Docs: zig build docs  (autodoc via -femit-docs on the module test artifact)
     // ---------------------------------------------------------------------------
     const docs_mod_test = b.addTest(.{ .root_module = mod });
