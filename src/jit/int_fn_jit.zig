@@ -55,6 +55,8 @@ extern fn jsz_clif_compile_boxed_block(
     set_helper: u64,
     call_helper: u64,
     closure_helper: u64,
+    getelem_helper: u64,
+    setelem_helper: u64,
 ) ?*const anyopaque;
 
 /// One property-access site, baked into the native code (mirror of the Rust
@@ -187,6 +189,42 @@ fn jsz_jit_set_own(recv_bits: u64, key_ptr: [*]const u8, key_len: usize, ic_raw:
     miss.* = 0;
 }
 
+/// Dynamic (computed-key) property read for `GET_PROP_DYN` (`a[i]`). Always
+/// re-enters the interpreter's full dynamic-get machinery (ToPropertyKey,
+/// arrays, strings, proxies) — a computed key is generally polymorphic, so
+/// unlike `jsz_jit_get_prop` there is no inline-cache fast path here. Miss
+/// protocol matches `jsz_jit_get_prop`.
+fn jsz_jit_get_elem(recv_bits: u64, key_bits: u64, miss: *i32) callconv(.c) u64 {
+    const vmptr = active_jit_vm orelse {
+        miss.* = 1;
+        return 0;
+    };
+    const bc_vm_mod = @import("../vm/bc_vm.zig");
+    const bvm: *bc_vm_mod.BcVm = @ptrCast(@alignCast(vmptr));
+    const out = bvm.jitGetElemSlow(Value{ .bits = recv_bits }, Value{ .bits = key_bits }) catch {
+        miss.* = 2; // ToPropertyKey coercion / getter / proxy trap threw
+        return 0;
+    };
+    miss.* = 0;
+    return out.bits;
+}
+
+/// Dynamic (computed-key) property store for `SET_PROP_DYN` (`a[i]=v`).
+/// Symmetric with `jsz_jit_get_elem`; miss protocol matches `jsz_jit_set_own`.
+fn jsz_jit_set_elem(recv_bits: u64, key_bits: u64, val_bits: u64, miss: *i32) callconv(.c) void {
+    const vmptr = active_jit_vm orelse {
+        miss.* = 1;
+        return;
+    };
+    const bc_vm_mod = @import("../vm/bc_vm.zig");
+    const bvm: *bc_vm_mod.BcVm = @ptrCast(@alignCast(vmptr));
+    bvm.jitSetElemSlow(Value{ .bits = recv_bits }, Value{ .bits = key_bits }, Value{ .bits = val_bits }) catch {
+        miss.* = 2; // ToPropertyKey coercion / setter / proxy trap threw
+        return;
+    };
+    miss.* = 0;
+}
+
 /// S4: a node in the chain of register/local buffers belonging to JIT regions
 /// that are currently on the stack (innermost first). Published by `run` so the
 /// GC can scan boxed cell pointers held in native register files across a
@@ -206,7 +244,9 @@ fn compileNative(code: []const u8, kidx_to_slot: []const i32, boxed: bool, prop_
         const sites_ptr: ?[*]const PropSite = if (prop_sites.len == 0) null else prop_sites.ptr;
         const get_helper: u64 = @intFromPtr(&jsz_jit_get_prop);
         const set_helper: u64 = @intFromPtr(&jsz_jit_set_own);
-        break :blk jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, sites_ptr, prop_sites.len, get_helper, set_helper, call_helper, closure_helper);
+        const getelem_helper: u64 = @intFromPtr(&jsz_jit_get_elem);
+        const setelem_helper: u64 = @intFromPtr(&jsz_jit_set_elem);
+        break :blk jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, sites_ptr, prop_sites.len, get_helper, set_helper, call_helper, closure_helper, getelem_helper, setelem_helper);
     } else jsz_clif_compile_int_block(code.ptr, code.len, map_ptr, kidx_to_slot.len);
     return @ptrCast(p orelse return null);
 }
@@ -450,6 +490,7 @@ pub fn analyze(arena: std.mem.Allocator, func: *const BcFunction, boxed: bool, c
             .INIT_LEX => {},
             .ADD, .SUB, .MUL, .BIT_AND, .BIT_OR, .BIT_XOR, .SHL, .SHR, .USHR, .BIT_NOT, .TO_NUMERIC, .INC, .DEC => {},
             .DIV, .MOD, .NEG => if (!boxed) return .never,
+            .GET_PROP_DYN, .SET_PROP_DYN => if (!boxed) return .never,
             .MOVE, .RETURN, .JMP, .JMP_IF_TRUE, .JMP_IF_FALSE => {},
             .EQ, .NEQ, .SEQ, .SNEQ, .LT, .LE, .GT, .GE, .NOT => {
                 // Boolean containment: the result reg (operand 0) must be read by

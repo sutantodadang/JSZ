@@ -17,7 +17,7 @@ extern fn jsz_clif_compile_guarded_iadd() ?*const anyopaque;
 extern fn jsz_clif_compile_accumulate_loop() ?*const anyopaque;
 extern fn jsz_clif_compile_int_block(code: [*]const u8, len: usize, kidx_to_slot: ?[*]const i32, n_kidx: usize) ?*const anyopaque;
 const PropSite = extern struct { pc: u32, key_len: u32, key_ptr: u64, ic_ptr: u64 };
-extern fn jsz_clif_compile_boxed_block(code: [*]const u8, len: usize, kidx_to_slot: ?[*]const i32, n_kidx: usize, prop_sites: ?[*]const PropSite, n_prop_sites: usize, get_helper: u64, set_helper: u64, call_helper: u64, closure_helper: u64) ?*const anyopaque;
+extern fn jsz_clif_compile_boxed_block(code: [*]const u8, len: usize, kidx_to_slot: ?[*]const i32, n_kidx: usize, prop_sites: ?[*]const PropSite, n_prop_sites: usize, get_helper: u64, set_helper: u64, call_helper: u64, closure_helper: u64, getelem_helper: u64, setelem_helper: u64) ?*const anyopaque;
 
 /// Native `fn(i64, i64) -> i64` compiled by Cranelift.
 pub const AddFn = *const fn (i64, i64) callconv(.c) i64;
@@ -92,8 +92,10 @@ pub fn compileIntBlock(code: []const u8, kidx_to_slot: []const i32) ?IntBlockFn 
 /// returned i64 is itself a boxed `Value`. Null on unsupported opcode / non-local.
 pub fn compileBoxedBlock(code: []const u8, kidx_to_slot: []const i32) ?IntBlockFn {
     const map_ptr: ?[*]const i32 = if (kidx_to_slot.len == 0) null else kidx_to_slot.ptr;
-    // These FFI tests exercise the int-subset only (no property access).
-    const p = jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, null, 0, 0, 0, 0, 0) orelse return null;
+    // These FFI tests exercise the int-subset only (no property access). Null
+    // helpers are safe: with no prop_sites/DYN ops emitted, the pointers are
+    // never called.
+    const p = jsz_clif_compile_boxed_block(code.ptr, code.len, map_ptr, kidx_to_slot.len, null, 0, 0, 0, 0, 0, 0, 0) orelse return null;
     return @ptrCast(p);
 }
 
