@@ -1767,7 +1767,7 @@ pub const BcVm = struct {
                 // USING_* opcodes exist only for JIT ordinal stability — the
                 // parser-desugar approach handles `using`/`await using` at the
                 // AST level and never emits these. Reaching one is a bug.
-                .USING_ENTER, .USING_ADD, .USING_DISPOSE, .USING_DISPOSE_THROW => unreachable,
+                .USING_ENTER, .USING_ADD, .USING_DISPOSE, .USING_DISPOSE_THROW => @panic("jsz: USING_* opcode reached the interpreter (never emitted; compiler bug)"),
                 .INSTANCEOF => if (try exception_ops.opInstanceof(self, frame)) |o| return o,
                 .NEW_INSTANCE => if (try exception_ops.opNewInstance(self, frame)) |o| return o,
                 .NEW_INSTANCE_SPREAD => if (try exception_ops.opNewInstanceSpread(self, frame)) |o| return o,

@@ -15,7 +15,7 @@ const uprops = @import("unicode_prop_tables.zig");
 
 /// Throw a TypeError with `msg` and return error.JsException.
 /// Used by coerceThis for null/undefined/Symbol receivers.
-fn throwTypeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror![]const u8 {
+fn throwTypeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror!noreturn {
     const JsObject = @import("../../object/object.zig").JsObject;
     const obj = try JsObject.create(arena, realm_mod.typeErrorProto());
     try obj.set("name", try val_mod.makeString(arena, "TypeError"));
@@ -24,7 +24,7 @@ fn throwTypeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror![]const
     return error.JsException;
 }
 
-fn throwRangeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror![]const u8 {
+fn throwRangeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror!noreturn {
     const JsObject = @import("../../object/object.zig").JsObject;
     const obj = try JsObject.create(arena, realm_mod.rangeErrorProto());
     try obj.set("name", try val_mod.makeString(arena, "RangeError"));
@@ -44,14 +44,14 @@ fn throwRangeErrorStr(arena: std.mem.Allocator, msg: []const u8) anyerror![]cons
 /// - object            → ToPrimitive(hint: string) then re-stringify; falls back
 ///                       to "[object Object]" when toPrimitive returns null/object
 fn coerceThis(arena: std.mem.Allocator, this_val: Value) anyerror![]const u8 {
-    if (this_val.bits == 0) return throwTypeErrorStr(arena, "String.prototype method called on null or undefined");
+    if (this_val.bits == 0) return try throwTypeErrorStr(arena, "String.prototype method called on null or undefined");
     switch (this_val.unbox()) {
-        .undefined_, .null_ => return throwTypeErrorStr(arena, "String.prototype method called on null or undefined"),
+        .undefined_, .null_ => return try throwTypeErrorStr(arena, "String.prototype method called on null or undefined"),
         .string => |s| return s,
         .number => |n| return try val_mod.formatNumber(arena, n),
         .boolean => |b| return if (b) "true" else "false",
         .bigint => |bi| return try val_mod.bigIntToString(arena, bi),
-        .symbol => return throwTypeErrorStr(arena, "Cannot convert a Symbol value to a string"),
+        .symbol => return try throwTypeErrorStr(arena, "Cannot convert a Symbol value to a string"),
         .object => {
             const prim_maybe = try coercion_mod.toPrimitive(arena, this_val, .string);
             if (prim_maybe) |prim| {
@@ -61,7 +61,7 @@ fn coerceThis(arena: std.mem.Allocator, this_val: Value) anyerror![]const u8 {
             }
             // ToPrimitive could not produce a primitive (toString/valueOf/
             // @@toPrimitive all non-callable) → ToString throws TypeError.
-            return throwTypeErrorStr(arena, "Cannot convert object to primitive value");
+            return try throwTypeErrorStr(arena, "Cannot convert object to primitive value");
         },
         // Callable receivers: ToString goes through the full ToPrimitive(string),
         // trying "toString" then "valueOf" (with the callable itself as `this`, so
@@ -72,7 +72,7 @@ fn coerceThis(arena: std.mem.Allocator, this_val: Value) anyerror![]const u8 {
             if (prim_maybe) |prim| {
                 if (coercion_mod.isPrimitive(prim)) return try coerceThis(arena, prim);
             }
-            return throwTypeErrorStr(arena, "Cannot convert object to primitive value");
+            return try throwTypeErrorStr(arena, "Cannot convert object to primitive value");
         },
     }
 }
@@ -89,8 +89,7 @@ fn argToString(arena: std.mem.Allocator, v: Value) anyerror![]const u8 {
         .undefined_ => return "undefined",
         .bigint => |bi| return try val_mod.bigIntToString(arena, bi),
         .symbol => {
-            _ = try throwTypeErrorStr(arena, "Cannot convert a Symbol value to a string");
-            unreachable;
+            try throwTypeErrorStr(arena, "Cannot convert a Symbol value to a string");
         },
         .object, .function, .bc_function, .native_function => {
             const prim = (try coercion_mod.toPrimitive(arena, v, .string)) orelse return "[object Object]";
@@ -127,13 +126,11 @@ fn clampToLen(pos: f64, len: usize) usize {
 /// ES RequireObjectCoercible: TypeError for null / undefined receivers.
 fn requireObjectCoercible(arena: std.mem.Allocator, v: Value) anyerror!void {
     if (v.bits == 0) {
-        _ = try throwTypeErrorStr(arena, "String.prototype method called on null or undefined");
-        unreachable;
+        try throwTypeErrorStr(arena, "String.prototype method called on null or undefined");
     }
     switch (v.unbox()) {
         .undefined_, .null_ => {
-            _ = try throwTypeErrorStr(arena, "String.prototype method called on null or undefined");
-            unreachable;
+            try throwTypeErrorStr(arena, "String.prototype method called on null or undefined");
         },
         else => {},
     }
@@ -157,8 +154,7 @@ fn getSymMethodOf(arena: std.mem.Allocator, v: Value, sym: Value) anyerror!?Valu
         else => {},
     }
     if (!isCallable(m)) {
-        _ = try throwTypeErrorStr(arena, "value is not a function");
-        unreachable;
+        try throwTypeErrorStr(arena, "value is not a function");
     }
     return m;
 }
@@ -187,8 +183,7 @@ fn makeRegExpFor(arena: std.mem.Allocator, pattern_val: Value, flags: []const u8
 /// user override of RegExp.prototype[@@match/@@search/@@matchAll]) and call it.
 fn invokeRegExpSym(arena: std.mem.Allocator, rx: Value, sym: Value, arg: Value) anyerror!Value {
     const m = (try getSymMethodOf(arena, rx, sym)) orelse {
-        _ = try throwTypeErrorStr(arena, "RegExp method is not callable");
-        unreachable;
+        try throwTypeErrorStr(arena, "RegExp method is not callable");
     };
     return function_proto_mod.invokeCallback(arena, rx, m, &[_]Value{arg});
 }
@@ -870,13 +865,11 @@ pub fn nativeMatchAll(arena: std.mem.Allocator, this_val: Value, args: []const V
                 .undefined_, .null_ => true,
                 else => false,
             }) {
-                _ = try throwTypeErrorStr(arena, "RegExp flags is undefined or null");
-                unreachable;
+                try throwTypeErrorStr(arena, "RegExp flags is undefined or null");
             }
             const flags_str = try argToString(arena, flags_val);
             if (std.mem.indexOfScalar(u8, flags_str, 'g') == null) {
-                _ = try throwTypeErrorStr(arena, "String.prototype.matchAll called with a non-global RegExp argument");
-                unreachable;
+                try throwTypeErrorStr(arena, "String.prototype.matchAll called with a non-global RegExp argument");
             }
         }
         if (realm_mod.active_sym_match_all) |sym| {
@@ -961,13 +954,11 @@ pub fn nativeReplaceAll(arena: std.mem.Allocator, this_val: Value, args: []const
                 .undefined_, .null_ => true,
                 else => false,
             }) {
-                _ = try throwTypeErrorStr(arena, "RegExp flags is undefined or null");
-                unreachable;
+                try throwTypeErrorStr(arena, "RegExp flags is undefined or null");
             }
             const flags_str = try argToString(arena, flags_val);
             if (std.mem.indexOfScalar(u8, flags_str, 'g') == null) {
-                _ = try throwTypeErrorStr(arena, "String.prototype.replaceAll called with a non-global RegExp argument");
-                unreachable;
+                try throwTypeErrorStr(arena, "String.prototype.replaceAll called with a non-global RegExp argument");
             }
         }
         if (realm_mod.active_sym_replace) |sym| {
@@ -1968,8 +1959,7 @@ pub fn nativeNormalize(arena: std.mem.Allocator, this_val: Value, args: []const 
     else if (std.mem.eql(u8, form, "NFKD"))
         .nfkd
     else {
-        _ = try throwRangeErrorStr(arena, "The normalization form should be one of NFC, NFD, NFKC, NFKD.");
-        unreachable;
+        try throwRangeErrorStr(arena, "The normalization form should be one of NFC, NFD, NFKC, NFKD.");
     };
 
     const compat = (nf == .nfkc or nf == .nfkd);

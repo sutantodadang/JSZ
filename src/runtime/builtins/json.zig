@@ -56,20 +56,20 @@ pub fn nativeJsonRawJSON(arena: std.mem.Allocator, _: Value, args: []const Value
     const json_string = try rawJsonToString(arena, text);
 
     // Empty, or leading/trailing JSON whitespace → SyntaxError.
-    if (json_string.len == 0) return throwSyntaxError(arena, "JSON.rawJSON: empty string");
+    if (json_string.len == 0) return try throwSyntaxError(arena, "JSON.rawJSON: empty string");
     const first = json_string[0];
     const last = json_string[json_string.len - 1];
     for ([_]u8{ ' ', '\t', '\n', '\r' }) |ws| {
-        if (first == ws or last == ws) return throwSyntaxError(arena, "JSON.rawJSON: leading or trailing whitespace");
+        if (first == ws or last == ws) return try throwSyntaxError(arena, "JSON.rawJSON: leading or trailing whitespace");
     }
 
     // Must parse as a single JSON value whose outermost value is not object/array.
-    if (first == '{' or first == '[') return throwSyntaxError(arena, "JSON.rawJSON: value must not be an object or array");
+    if (first == '{' or first == '[') return try throwSyntaxError(arena, "JSON.rawJSON: value must not be an object or array");
     var parser = JsonParser{ .src = json_string, .pos = 0, .arena = arena, .track = false };
     parser.skipWs();
     _ = parser.parseValue() catch |e| return e;
     parser.skipWs();
-    if (parser.pos < parser.src.len) return throwSyntaxError(arena, "JSON.parse: unexpected trailing characters");
+    if (parser.pos < parser.src.len) return try throwSyntaxError(arena, "JSON.parse: unexpected trailing characters");
 
     const obj = if (realm_mod.active_heap) |heap|
         try JsObject.createOnHeap(heap, null)
@@ -340,7 +340,6 @@ fn serializeProperty(st: *SerState, holder: Value, key: []const u8, indent: []co
         .string => |s| return try quotedString(arena, s),
         .bigint => {
             try throwStringifyTypeErrorMsg(arena, "Do not know how to serialize a BigInt");
-            unreachable;
         },
         .object => |obj| {
             // ES2025 json-parse-with-source: a rawJSON object emits its raw text.
@@ -386,7 +385,6 @@ fn checkCycle(st: *SerState, obj: *JsObject) anyerror!void {
     for (st.seen.items) |a| {
         if (a == obj) {
             try throwStringifyTypeErrorMsg(st.arena, "Converting circular structure to JSON");
-            unreachable;
         }
     }
 }
@@ -486,7 +484,7 @@ pub fn nativeJsonStringify(arena: std.mem.Allocator, _: Value, args: []const Val
     return val_mod.makeUndefined(arena);
 }
 
-fn throwStringifyTypeErrorMsg(arena: std.mem.Allocator, msg: []const u8) anyerror!void {
+fn throwStringifyTypeErrorMsg(arena: std.mem.Allocator, msg: []const u8) anyerror!noreturn {
     const realm_mod = @import("../realm.zig");
     const obj = if (realm_mod.active_heap) |heap|
         try JsObject.createOnHeap(heap, realm_mod.typeErrorProto())
@@ -524,7 +522,7 @@ pub fn nativeJsonParse(arena: std.mem.Allocator, _: Value, args: []const Value) 
     const vn = parser.parseValueN() catch |e| return e;
     parser.skipWs();
     if (parser.pos < parser.src.len) {
-        return throwSyntaxError(arena, "JSON.parse: unexpected trailing characters");
+        return try throwSyntaxError(arena, "JSON.parse: unexpected trailing characters");
     }
     const result = vn.val;
     if (reviver) |rev| {
@@ -715,7 +713,7 @@ fn jsonSynErr(arena: std.mem.Allocator, msg: []const u8) anyerror {
     return error.JsException;
 }
 
-fn throwSyntaxError(arena: std.mem.Allocator, msg: []const u8) anyerror!Value {
+fn throwSyntaxError(arena: std.mem.Allocator, msg: []const u8) anyerror!noreturn {
     // Build a SyntaxError object via the Phase 4a prototype.
     const realm_mod = @import("../realm.zig");
     const proto: ?*JsObject = realm_mod.syntaxErrorProto();
@@ -878,18 +876,16 @@ const JsonParser = struct {
 
     fn expectChar(self: *JsonParser, c: u8) anyerror!void {
         const got = self.consume() orelse {
-            _ = try throwSyntaxError(self.arena, "JSON.parse: unexpected end of input");
-            unreachable;
+            try throwSyntaxError(self.arena, "JSON.parse: unexpected end of input");
         };
         if (got != c) {
-            _ = try throwSyntaxError(self.arena, "JSON.parse: unexpected character");
-            unreachable;
+            try throwSyntaxError(self.arena, "JSON.parse: unexpected character");
         }
     }
 
     fn parseValue(self: *JsonParser) anyerror!Value {
         self.skipWs();
-        const c = self.peek() orelse return throwSyntaxError(self.arena, "JSON.parse: unexpected end of input");
+        const c = self.peek() orelse return try throwSyntaxError(self.arena, "JSON.parse: unexpected end of input");
         return switch (c) {
             '"' => self.parseString(),
             '{' => self.parseObject(),
@@ -898,14 +894,14 @@ const JsonParser = struct {
             'f' => self.parseLiteral("false", try val_mod.makeBool(self.arena, false)),
             'n' => self.parseLiteral("null", try val_mod.makeNull(self.arena)),
             '-', '0'...'9' => self.parseNumber(),
-            else => throwSyntaxError(self.arena, "JSON.parse: unexpected character"),
+            else => try throwSyntaxError(self.arena, "JSON.parse: unexpected character"),
         };
     }
 
     fn parseLiteral(self: *JsonParser, lit: []const u8, result: Value) anyerror!Value {
-        if (self.pos + lit.len > self.src.len) return throwSyntaxError(self.arena, "JSON.parse: unexpected end of input");
+        if (self.pos + lit.len > self.src.len) return try throwSyntaxError(self.arena, "JSON.parse: unexpected end of input");
         if (!std.mem.eql(u8, self.src[self.pos .. self.pos + lit.len], lit)) {
-            return throwSyntaxError(self.arena, "JSON.parse: invalid literal");
+            return try throwSyntaxError(self.arena, "JSON.parse: invalid literal");
         }
         self.pos += lit.len;
         return result;
@@ -915,13 +911,13 @@ const JsonParser = struct {
         try self.expectChar('"');
         var buf = std.ArrayList(u8){};
         while (true) {
-            const c = self.consume() orelse return throwSyntaxError(self.arena, "JSON.parse: unterminated string");
+            const c = self.consume() orelse return try throwSyntaxError(self.arena, "JSON.parse: unterminated string");
             if (c == '"') break;
             // The JSON string grammar forbids unescaped control characters
             // U+0000..U+001F (§25.5.1 JSONString production).
-            if (c < 0x20) return throwSyntaxError(self.arena, "JSON.parse: unescaped control character in string");
+            if (c < 0x20) return try throwSyntaxError(self.arena, "JSON.parse: unescaped control character in string");
             if (c == '\\') {
-                const esc = self.consume() orelse return throwSyntaxError(self.arena, "JSON.parse: unterminated escape");
+                const esc = self.consume() orelse return try throwSyntaxError(self.arena, "JSON.parse: unterminated escape");
                 switch (esc) {
                     '"' => try buf.append(self.arena, '"'),
                     '\\' => try buf.append(self.arena, '\\'),
@@ -932,17 +928,17 @@ const JsonParser = struct {
                     'b' => try buf.append(self.arena, 0x08),
                     'f' => try buf.append(self.arena, 0x0C),
                     'u' => {
-                        if (self.pos + 4 > self.src.len) return throwSyntaxError(self.arena, "JSON.parse: invalid unicode escape");
+                        if (self.pos + 4 > self.src.len) return try throwSyntaxError(self.arena, "JSON.parse: invalid unicode escape");
                         const hex = self.src[self.pos .. self.pos + 4];
                         self.pos += 4;
                         const code = std.fmt.parseInt(u16, hex, 16) catch
-                            return throwSyntaxError(self.arena, "JSON.parse: invalid unicode escape");
+                            return try throwSyntaxError(self.arena, "JSON.parse: invalid unicode escape");
                         var seq: [4]u8 = undefined;
                         const n = std.unicode.utf8Encode(code, &seq) catch
-                            return throwSyntaxError(self.arena, "JSON.parse: invalid codepoint");
+                            return try throwSyntaxError(self.arena, "JSON.parse: invalid codepoint");
                         try buf.appendSlice(self.arena, seq[0..n]);
                     },
-                    else => return throwSyntaxError(self.arena, "JSON.parse: invalid escape sequence"),
+                    else => return try throwSyntaxError(self.arena, "JSON.parse: invalid escape sequence"),
                 }
             } else {
                 try buf.append(self.arena, c);
@@ -962,7 +958,7 @@ const JsonParser = struct {
                     if (dd >= '0' and dd <= '9') self.pos += 1 else break;
                 }
             } else {
-                return throwSyntaxError(self.arena, "JSON.parse: invalid number");
+                return try throwSyntaxError(self.arena, "JSON.parse: invalid number");
             }
         }
         if (self.peek() == '.') {
@@ -977,7 +973,7 @@ const JsonParser = struct {
                 } else break;
             }
             if (frac_digits == 0)
-                return throwSyntaxError(self.arena, "JSON.parse: invalid number");
+                return try throwSyntaxError(self.arena, "JSON.parse: invalid number");
         }
         if (self.peek()) |e| {
             if (e == 'e' or e == 'E') {
@@ -994,12 +990,12 @@ const JsonParser = struct {
                     } else break;
                 }
                 if (exp_digits == 0)
-                    return throwSyntaxError(self.arena, "JSON.parse: invalid number");
+                    return try throwSyntaxError(self.arena, "JSON.parse: invalid number");
             }
         }
         const num_str = self.src[start..self.pos];
         const n = std.fmt.parseFloat(f64, num_str) catch
-            return throwSyntaxError(self.arena, "JSON.parse: invalid number");
+            return try throwSyntaxError(self.arena, "JSON.parse: invalid number");
         return val_mod.makeNumber(self.arena, n);
     }
 
@@ -1019,12 +1015,12 @@ const JsonParser = struct {
 
         while (true) {
             self.skipWs();
-            if (self.peek() != '"') return throwSyntaxError(self.arena, "JSON.parse: expected string key");
+            if (self.peek() != '"') return try throwSyntaxError(self.arena, "JSON.parse: expected string key");
             const key_val = try self.parseString();
             const key_str = if (key_val.bits != 0 and key_val.unbox() == .string)
                 key_val.toPtr().string
             else
-                return throwSyntaxError(self.arena, "JSON.parse: expected string key");
+                return try throwSyntaxError(self.arena, "JSON.parse: expected string key");
 
             self.skipWs();
             try self.expectChar(':');
@@ -1032,12 +1028,12 @@ const JsonParser = struct {
             const val_ = try self.parseValue();
             try obj.set(key_str, val_);
             self.skipWs();
-            const next = self.peek() orelse return throwSyntaxError(self.arena, "JSON.parse: unexpected end of object");
+            const next = self.peek() orelse return try throwSyntaxError(self.arena, "JSON.parse: unexpected end of object");
             if (next == '}') {
                 self.pos += 1;
                 break;
             }
-            if (next != ',') return throwSyntaxError(self.arena, "JSON.parse: expected ',' or '}'");
+            if (next != ',') return try throwSyntaxError(self.arena, "JSON.parse: expected ',' or '}'");
             self.pos += 1;
         }
         return val_mod.makeObject(self.arena, obj);
@@ -1065,12 +1061,12 @@ const JsonParser = struct {
             try arr.set(key, elem);
             idx += 1;
             self.skipWs();
-            const next = self.peek() orelse return throwSyntaxError(self.arena, "JSON.parse: unexpected end of array");
+            const next = self.peek() orelse return try throwSyntaxError(self.arena, "JSON.parse: unexpected end of array");
             if (next == ']') {
                 self.pos += 1;
                 break;
             }
-            if (next != ',') return throwSyntaxError(self.arena, "JSON.parse: expected ',' or ']'");
+            if (next != ',') return try throwSyntaxError(self.arena, "JSON.parse: expected ',' or ']'");
             self.pos += 1;
         }
         arr.array_length = idx;
