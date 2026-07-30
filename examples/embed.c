@@ -116,6 +116,67 @@ int main(void) {
     expect(strcmp(jsz_last_string(ctx), "101,102,103") == 0, "map over native fn");
     expect(add_calls == 5, "counter followed the map calls");
 
+    /* Objects and arrays built from C */
+    jsz_value obj = jsz_object_new(ctx);
+    expect(jsz_is_object(obj) && !jsz_is_array(obj), "object_new");
+    expect(jsz_set(ctx, obj, "name", jsz_string(ctx, "widget")) == JSZ_OK, "set name");
+    expect(jsz_set(ctx, obj, "count", jsz_number(ctx, 3)) == JSZ_OK, "set count");
+    expect(strcmp(jsz_as_string(ctx, jsz_get(ctx, obj, "name")), "widget") == 0, "get name");
+    expect(jsz_typeof(jsz_get(ctx, obj, "count")) == JSZ_TYPE_NUMBER, "typeof count");
+    expect(jsz_is_undefined(jsz_get(ctx, obj, "missing")), "absent prop undefined");
+
+    jsz_value arr = jsz_array_new(ctx);
+    expect(jsz_is_array(arr), "array_new");
+    for (uint32_t i = 0; i < 4; i++)
+        expect(jsz_set_index(ctx, arr, i, jsz_number(ctx, i * 10)) == JSZ_OK, "set_index");
+    expect(jsz_array_length(ctx, arr) == 4, "array length 4");
+    expect(jsz_as_number(jsz_get_index(ctx, arr, 2)) == 20.0, "get_index 2");
+
+    /* Cross the boundary: C-built data visible to JS, protected across GC */
+    expect(jsz_set(ctx, obj, "items", arr) == JSZ_OK, "attach array to object");
+    expect(jsz_protect(ctx, obj) == JSZ_OK, "protect obj");
+    jsz_gc(ctx); /* obj+arr must survive: only C (and the root) reference them */
+    expect(jsz_set_global(ctx, "widget", obj) == JSZ_OK, "set_global widget");
+    expect(jsz_eval(ctx,
+        "widget.name + ':' + widget.count + ':' + widget.items.join('-')",
+        NULL) == JSZ_OK, "JS reads C-built object");
+    expect(strcmp(jsz_last_string(ctx), "widget:3:0-10-20-30") == 0, "widget contents");
+    jsz_unprotect(ctx, obj);
+
+    /* get_global + last_value */
+    expect(jsz_eval(ctx, "({ answer: 42 })", NULL) == JSZ_OK, "eval object literal");
+    jsz_value ans = jsz_last_value(ctx);
+    expect(jsz_is_object(ans), "last_value is object");
+    expect(jsz_as_number(jsz_get(ctx, ans, "answer")) == 42.0, "last_value.answer");
+    expect(jsz_is_function(jsz_get_global(ctx, "hostAdd")), "get_global finds native fn");
+
+    /* Call a JS closure from C */
+    expect(jsz_eval(ctx,
+        "var mkAdder = function (base) { return function (x) { return base + x; } };"
+        "var add7 = mkAdder(7); 0",
+        NULL) == JSZ_OK, "define closure");
+    jsz_value add7 = jsz_get_global(ctx, "add7");
+    expect(jsz_is_function(add7), "add7 is function");
+    jsz_value cargs[1] = { jsz_number(ctx, 35) };
+    jsz_value cres = jsz_undefined(ctx);
+    expect(jsz_call(ctx, add7, cargs, 1, &cres) == JSZ_OK, "jsz_call ok");
+    expect(jsz_as_number(cres) == 42.0, "closure result 42");
+    jsz_value bad = jsz_get_global(ctx, "hostFail");
+    expect(jsz_call(ctx, bad, NULL, 0, NULL) == JSZ_EXCEPTION, "jsz_call exception");
+
+    /* JSON bridge */
+    const char *enc = jsz_json_encode(ctx, ans);
+    expect(enc != NULL && strcmp(enc, "{\"answer\":42}") == 0, "json_encode");
+    jsz_value dec = jsz_json_decode(ctx, "{\"a\":[1,2,3],\"b\":\"x\"}");
+    expect(jsz_is_object(dec), "json_decode object");
+    expect(jsz_array_length(ctx, jsz_get(ctx, dec, "a")) == 3, "decoded array len");
+    expect(jsz_is_undefined(jsz_json_decode(ctx, "{oops")), "json_decode bad input");
+
+    /* ES module eval */
+    expect(jsz_eval_module(ctx,
+        "const three = 3; export default three;", "mod.js") == JSZ_OK,
+        "eval_module");
+
     jsz_gc(ctx);
 
     jsz_context_free(ctx);
