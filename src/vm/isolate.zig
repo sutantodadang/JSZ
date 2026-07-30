@@ -339,6 +339,11 @@ pub const IsolateImpl = struct {
         try defineRealmIntrinsics(realm, arena);
 
         try realm.registerRoots();
+        // The global environment must be a HEAP-level root: the bytecode VM
+        // (and its scan callback) exists only per eval, so a host-triggered
+        // collection between evals would otherwise see no roots and sweep
+        // every live top-level binding.
+        self.heap.global_env_root = realm.global_env;
         self.realm = realm;
         return realm;
     }

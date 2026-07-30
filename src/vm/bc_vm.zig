@@ -5613,30 +5613,52 @@ fn asyncGenYieldReturnReject(arena: std.mem.Allocator, _: Value, args: []const V
 /// Walks all register arrays and env chains in open call frames.
 fn bcVmScanCallback(ctx: *anyopaque, mark_fn: *const fn (*JsObject) void) void {
     const vm: *BcVm = @ptrCast(@alignCast(ctx));
-    for (vm.frames.items) |*frame| {
-        // Registers
-        for (frame.registers) |reg| {
-            gc_mod.traceValue(reg, mark_fn);
+    // Heap-aware path: heap.markValueLive also traces a closure's CAPTURED
+    // ENVIRONMENT chain (with cycle-safe dedup), which the plain mark_fn
+    // tracers cannot — objects reachable only through a captured binding were
+    // swept and later dereferenced (found by the soak test). The mark_fn
+    // fallback below is kept for heapless VMs (unit tests).
+    if (vm.heap) |h| {
+        for (vm.frames.items) |*frame| {
+            for (frame.registers) |reg| h.markValueLive(reg);
+            h.markValueLive(frame.this_val);
+            for (frame.with_stack.items) |wobj| h.markValueLive(wobj);
+            h.markEnvironment(frame.env);
         }
-        // this_val
-        gc_mod.traceValue(frame.this_val, mark_fn);
-        // `with` object scopes are live across the body of the statement.
-        for (frame.with_stack.items) |wobj| gc_mod.traceValue(wobj, mark_fn);
-        // Environment chain
-        gc_mod.traceEnvironment(frame.env, mark_fn);
-    }
-    // W2: suspended generator frames are off the active stack but still live.
-    for (vm.generators.items) |state| {
-        if (state.done) continue;
-        for (state.frame.registers) |reg| gc_mod.traceValue(reg, mark_fn);
-        gc_mod.traceValue(state.frame.this_val, mark_fn);
-        for (state.frame.with_stack.items) |wobj| gc_mod.traceValue(wobj, mark_fn);
-        gc_mod.traceEnvironment(state.frame.env, mark_fn);
-    }
-    // W2-async: keep each in-flight async function's result promise alive while
-    // it is pending (its suspended frame is scanned via `generators` above).
-    for (vm.async_ctxs.items) |actx| {
-        gc_mod.traceValue(actx.result, mark_fn);
+        for (vm.generators.items) |state| {
+            if (state.done) continue;
+            for (state.frame.registers) |reg| h.markValueLive(reg);
+            h.markValueLive(state.frame.this_val);
+            for (state.frame.with_stack.items) |wobj| h.markValueLive(wobj);
+            h.markEnvironment(state.frame.env);
+        }
+        for (vm.async_ctxs.items) |actx| h.markValueLive(actx.result);
+    } else {
+        for (vm.frames.items) |*frame| {
+            // Registers
+            for (frame.registers) |reg| {
+                gc_mod.traceValue(reg, mark_fn);
+            }
+            // this_val
+            gc_mod.traceValue(frame.this_val, mark_fn);
+            // `with` object scopes are live across the body of the statement.
+            for (frame.with_stack.items) |wobj| gc_mod.traceValue(wobj, mark_fn);
+            // Environment chain
+            gc_mod.traceEnvironment(frame.env, mark_fn);
+        }
+        // W2: suspended generator frames are off the active stack but still live.
+        for (vm.generators.items) |state| {
+            if (state.done) continue;
+            for (state.frame.registers) |reg| gc_mod.traceValue(reg, mark_fn);
+            gc_mod.traceValue(state.frame.this_val, mark_fn);
+            for (state.frame.with_stack.items) |wobj| gc_mod.traceValue(wobj, mark_fn);
+            gc_mod.traceEnvironment(state.frame.env, mark_fn);
+        }
+        // W2-async: keep each in-flight async function's result promise alive while
+        // it is pending (its suspended frame is scanned via `generators` above).
+        for (vm.async_ctxs.items) |actx| {
+            gc_mod.traceValue(actx.result, mark_fn);
+        }
     }
     // Phase 12 S4: boxed JIT regions on the stack hold live cell pointers in their
     // native register/local buffers (e.g. across a re-entrant CALL whose callee may

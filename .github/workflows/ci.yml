@@ -57,6 +57,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.optimize == 'Debug'
         run: zig build conformance-delta -Doptimize=${{ matrix.optimize }}
 
+      - name: Soak (churn phases, bounded-resource gates)
+        if: matrix.os == 'ubuntu-latest'
+        run: zig build soak -Doptimize=${{ matrix.optimize }}
+
+      - name: Soak under GC stress (64 KB nursery — collections every few allocs)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          JSZ_GC_STRESS: '65536'
+        run: zig build soak -Doptimize=${{ matrix.optimize }}
+
   # Valgrind memcheck: Zig's Debug builds emit valgrind client requests, and
   # Zig safety checks do NOT catch use-after-free / uninitialized reads inside
   # the custom GC heap — memcheck does. Runs the jsz CLI over the differential
