@@ -486,3 +486,38 @@ test "gc: WeakMap value survives while key is live (ephemeron) (bc)" {
     }
 }
 
+
+test "integration: JSON.parse survives GC during parse (regression)" {
+    // Regression: parseObject/parseArray built containers reachable only from
+    // the native parser frame; a nursery collection mid-parse swept them and
+    // the next obj.set wrote to a freed object (segfault). Containers are now
+    // rooted via heap.addRoot for the duration of the parse. A 64 KB nursery
+    // forces many collections over a ~1 MB document.
+    var iso = try Isolate.init(std.testing.allocator);
+    defer iso.deinit();
+    var ctx = try iso.newContext();
+    defer ctx.deinit();
+    ctx.gcConfigure(64 * 1024, 8, false);
+    const src =
+        \\var a = [];
+        \\for (var i = 0; i < 20000; i++) a.push({ id: i, s: "v" + i });
+        \\var back = JSON.parse(JSON.stringify(a));
+        \\var o = JSON.parse('{"a":[1,2,{"b":"x"}],"c":3}', function (k, v) {
+        \\  return typeof v === "number" ? v * 2 : v;
+        \\});
+        \\back.length + o.a[2].b + o.c;
+    ;
+    const result = ctx.eval(src, "<test>");
+    switch (result) {
+        .ok => |v| {
+            const s = try root.valueToDisplayString(std.testing.allocator, v);
+            defer std.testing.allocator.free(s);
+            try std.testing.expectEqualStrings("20000x6", s);
+        },
+        .exception => |e| {
+            std.debug.print("exception: {s}\n", .{e.message});
+            return error.JsException;
+        },
+        else => return error.UnexpectedResult,
+    }
+}
