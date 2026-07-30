@@ -775,8 +775,7 @@ fn sortCompare(arena: std.mem.Allocator, x: Value, y: Value, cmp_fn: ?Value) !f6
     };
 }
 
-fn sortValues(arena: std.mem.Allocator, elems: []Value, cmp_fn: ?Value) !void {
-    // Stable insertion sort (test262 requires stability).
+fn insertionSortValues(arena: std.mem.Allocator, elems: []Value, cmp_fn: ?Value) !void {
     var i: usize = 1;
     while (i < elems.len) : (i += 1) {
         const cur = elems[i];
@@ -787,6 +786,52 @@ fn sortValues(arena: std.mem.Allocator, elems: []Value, cmp_fn: ?Value) !void {
             j -= 1;
         }
         elems[j] = cur;
+    }
+}
+
+/// Merge elems[lo..mid] and elems[mid..hi] (each already sorted) using
+/// scratch for the left run. Ties take the left element, which together with
+/// bottom-up merging keeps the sort stable.
+fn mergeRuns(arena: std.mem.Allocator, elems: []Value, scratch: []Value, lo: usize, mid: usize, hi: usize, cmp_fn: ?Value) !void {
+    @memcpy(scratch[lo..mid], elems[lo..mid]);
+    var i = lo;
+    var j = mid;
+    var k = lo;
+    while (i < mid and j < hi) : (k += 1) {
+        if (try sortCompare(arena, scratch[i], elems[j], cmp_fn) <= 0) {
+            elems[k] = scratch[i];
+            i += 1;
+        } else {
+            elems[k] = elems[j];
+            j += 1;
+        }
+    }
+    while (i < mid) : ({
+        i += 1;
+        k += 1;
+    }) elems[k] = scratch[i];
+    // Right-run leftovers are already in place.
+}
+
+fn sortValues(arena: std.mem.Allocator, elems: []Value, cmp_fn: ?Value) !void {
+    // Stable bottom-up merge sort (test262 requires stability): insertion-sort
+    // runs of RUN, then merge widths RUN, 2*RUN, ... A throwing comparator
+    // propagates out; callers only write back to the array after success, so
+    // the array is untouched on abrupt completion. The previous pure insertion
+    // sort was O(n^2) — 10k comparator elements took ~6 s.
+    const RUN: usize = 16;
+    if (elems.len <= RUN) return insertionSortValues(arena, elems, cmp_fn);
+    var start: usize = 0;
+    while (start < elems.len) : (start += RUN) {
+        try insertionSortValues(arena, elems[start..@min(start + RUN, elems.len)], cmp_fn);
+    }
+    const scratch = try arena.alloc(Value, elems.len);
+    var width: usize = RUN;
+    while (width < elems.len) : (width *= 2) {
+        var lo: usize = 0;
+        while (lo + width < elems.len) : (lo += 2 * width) {
+            try mergeRuns(arena, elems, scratch, lo, lo + width, @min(lo + 2 * width, elems.len), cmp_fn);
+        }
     }
 }
 
