@@ -75,6 +75,51 @@ bool jsz_last_number(jsz_context *ctx, double *out);
 /* Force a full garbage-collection cycle. */
 void jsz_gc(jsz_context *ctx);
 
+/* ---------------------------------------------------------- native fns --- */
+
+/* Value handle: a pointer-boxed engine value. bits == 0 means undefined.
+ * Handles from jsz_number/jsz_string/... stay valid for the context's
+ * lifetime; handles received as callback arguments are only guaranteed for
+ * the duration of that callback. */
+typedef struct { uint64_t bits; } jsz_value;
+
+/* A C function callable from JS.
+ *   ctx      — the calling context (usable for jsz_number/jsz_string/...)
+ *   userdata — the pointer given to jsz_register_function, verbatim
+ *   args     — argc call arguments (may be NULL when argc == 0)
+ *   result   — write the return value here; leave untouched for undefined
+ * Return 0 for a normal return. A nonzero return throws a JS exception
+ * "native function failed (code N)" that JS can catch. Re-entrancy (calling
+ * jsz_eval from inside a callback) is supported. */
+typedef int (*jsz_native_fn)(jsz_context *ctx, void *userdata,
+                             const jsz_value *args, size_t argc,
+                             jsz_value *result);
+
+/* Register `fn` as a global JS function named `name`. May be called before
+ * or between evals. Returns JSZ_OK or JSZ_ERR_NOMEM. */
+int jsz_register_function(jsz_context *ctx, const char *name,
+                          jsz_native_fn fn, void *userdata);
+
+/* ------------------------------------------------------------ value API --- */
+
+/* Constructors (context-owned; the string is copied). */
+jsz_value jsz_number(jsz_context *ctx, double n);
+jsz_value jsz_string(jsz_context *ctx, const char *s);
+jsz_value jsz_boolean(jsz_context *ctx, bool b);
+jsz_value jsz_undefined(jsz_context *ctx);
+jsz_value jsz_null(jsz_context *ctx);
+
+/* Inspection. */
+bool jsz_is_number(jsz_value v);
+bool jsz_is_string(jsz_value v);
+bool jsz_is_bool(jsz_value v);
+bool jsz_is_undefined(jsz_value v);
+double jsz_as_number(jsz_value v);            /* 0 for non-numbers */
+bool jsz_as_bool(jsz_value v);
+/* Display string of any value (ToString-for-printing). Owned by the context;
+ * valid until jsz_context_free. NULL on failure. */
+const char *jsz_as_string(jsz_context *ctx, jsz_value v);
+
 #ifdef __cplusplus
 }
 #endif
